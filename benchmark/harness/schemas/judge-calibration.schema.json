@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://freellama.local/schemas/judge-calibration.schema.json",
+  "type": "object",
+  "required": ["schema_version", "judge_model", "checked_at", "expires_at", "case_count", "metrics", "gates", "passed"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "judge_model": {"type": "string", "minLength": 1},
+    "checked_at": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"},
+    "expires_at": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"},
+    "case_count": {"type": "integer", "minimum": 1},
+    "metrics": {"type": "object", "required": ["pairwise_agreement", "weighted_kappa", "order_swap_consistency"]},
+    "gates": {"type": "object", "required": ["minimum_cases", "pairwise_agreement", "weighted_kappa", "order_swap_consistency"]},
+    "passed": {"type": "boolean"}
+  },
+  "additionalProperties": true
+}

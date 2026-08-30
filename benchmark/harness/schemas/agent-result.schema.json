@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://freellama.local/schemas/agent-result.schema.json",
+  "type": "object",
+  "required": ["final_answer"],
+  "properties": {
+    "final_answer": {"type": "string"},
+    "tool_calls": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": {"type": "string"},
+          "raw_name": {"type": "string"},
+          "arguments": {"type": "object"},
+          "status": {"enum": ["ok", "error", "failed", "timeout"]},
+          "duration_ms": {"type": "number"},
+          "result": {}
+        },
+        "additionalProperties": true
+      }
+    },
+    "usage": {
+      "type": "object",
+      "properties": {
+        "input_tokens": {"type": ["integer", "null"]},
+        "output_tokens": {"type": ["integer", "null"]},
+        "cache_read_tokens": {"type": ["integer", "null"]},
+        "cache_write_tokens": {"type": ["integer", "null"]}
+      },
+      "additionalProperties": true
+    },
+    "provider_metrics": {"type": "object"},
+    "model_metadata": {"type": "object"}
+  },
+  "additionalProperties": true
+}

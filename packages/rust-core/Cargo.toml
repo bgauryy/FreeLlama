@@ -1,0 +1,45 @@
+[package]
+name = "freellama-core"
+description = "Local Ollama model gateway, router, and embeddable Rust library — the whole solution"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# The lib keeps the name `freellama`, so `use freellama::...` is unchanged for every consumer
+# (the CLI, the integration tests, and the napi addon) despite the package rename.
+[lib]
+name = "freellama"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+# Off by default: napi's FFI symbols only resolve inside a running Node process, so the standalone
+# CLI must never link them. Build the Node addon with
+# `cargo build --release -p freellama-core --features napi`.
+napi = ["dep:napi", "dep:napi-derive", "dep:napi-build"]
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+base64.workspace = true
+clap.workspace = true
+napi = { workspace = true, optional = true }
+napi-derive = { workspace = true, optional = true }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+toml.workspace = true
+uuid.workspace = true
+
+[build-dependencies]
+napi-build = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = "3.20"
+tower = { version = "0.5", features = ["util"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "benchmark": "freellama-real-repos-10",
+  "as_of": "2026-08-24",
+  "goal": "Compare installed local models as coding agents on pinned, real Python repositories using identical prompts, tools, limits, and deterministic checks.",
+  "primary_kpi": "deterministic_score",
+  "dimensions": {
+    "quality": "Weighted deterministic correctness across all applicable challenges.",
+    "speed": "Median end-to-end wall time and output tokens per second, reported separately from correctness.",
+    "tools": "Successful tool-call rate, retries, failures, and calls per solved task.",
+    "reasoning": "Scores on R05, R07, and R08, which require execution tracing, causal diagnosis, and boundary reasoning.",
+    "task_understanding": "Scores on R01, R02, and R09 plus instruction compliance such as no-edit constraints.",
+    "complex_coding": "R10 end-to-end correctness with the public API and focused regressions preserved."
+  },
+  "controls": {
+    "temperature": 0,
+    "seed": 42,
+    "trials_for_publishable_claims": 3,
+    "minimum_smoke_trials": 1,
+    "repository_revisions": {
+      "itsdangerous": "672971d66a2ef9f85151e53283113f33d642dabd",
+      "click": "2c8cd3ac958a7eb316d67f2d316c27086c4c0369"
+    },
+    "judge_policy": "Deterministic checks are authoritative. Any LLM judge score is advisory until a dated calibration artifact passes."
+  },
+  "gates": {
+    "harness_reference_solution": "100% deterministic score",
+    "mutation_sensitivity": "Each injected bug must fail before repair and pass after repair",
+    "coverage": "Every completion-capable model gets all ten tasks; embedding-only models are explicitly not applicable",
+    "reporting": "Show coverage, errors, timeouts, token use, tool statistics, and per-category scores; never rank missing coverage as zero-quality"
+  }
+}

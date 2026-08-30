@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://freellama.local/schemas/aggregate.schema.json",
+  "type": "object",
+  "required": ["schema_version", "generated_at", "suite", "methodology", "models", "common_tasks", "pairwise_comparisons", "pareto"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "generated_at": {"type": "string"},
+    "suite": {"type": "object", "required": ["id", "version"]},
+    "methodology": {"type": "object"},
+    "models": {"type": "array", "items": {"type": "object", "required": ["id", "coverage", "deterministic_pass_rate", "pass_at_1", "pass_power_3", "timing", "usage", "categories", "tiers", "judge", "common_task_metrics", "tasks"]}},
+    "common_tasks": {"type": "array", "items": {"type": "string"}},
+    "pairwise_comparisons": {"type": "array"},
+    "pareto": {"type": "object", "required": ["quality_leaders", "efficiency_leaders", "dominated"]}
+  },
+  "additionalProperties": true
+}

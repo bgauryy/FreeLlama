@@ -1,0 +1,176 @@
+{
+  "schema_version": 1,
+  "suite_id": "freellama-real-repos-10",
+  "suite_version": "1.0.0",
+  "created_at": "2026-08-24",
+  "last_reviewed_at": "2026-08-24",
+  "review_due_at": "2026-09-23",
+  "visibility": "public_development",
+  "fixture": "../../../.octocode/benchmarks/source-repos",
+  "tasks": [
+    {
+      "id": "R01",
+      "title": "ItsDangerous API orientation",
+      "tier": "basic",
+      "category": "task_understanding",
+      "prompt": "Inspect the ItsDangerous repository. Report the primary serializer class, the exact method names it uses to serialize-and-sign and verify-and-deserialize, and the file that exposes its public top-level API. Cite exact repository-relative paths. Do not edit files.",
+      "requirements": ["filesystem", "tools"],
+      "timeout_seconds": 180,
+      "checks": [
+        {"type": "response_contains", "values": ["itsdangerous/src/itsdangerous/serializer.py", "Serializer", "dumps", "loads", "itsdangerous/src/itsdangerous/__init__.py"], "weight": 3},
+        {"type": "evidence_paths_exist", "minimum": 2, "weight": 1},
+        {"type": "tool_required_any", "names": ["search", "read"], "weight": 1},
+        {"type": "no_changes", "weight": 1}
+      ],
+      "rubric": ["The public API is identified correctly", "Claims cite exact paths", "No workspace mutation occurs"]
+    },
+    {
+      "id": "R02",
+      "title": "Click formatter constants",
+      "tier": "basic",
+      "category": "tool_use",
+      "prompt": "Use targeted repository tools to find Click's HelpFormatter default maximum width, its minimum automatically computed width, and the global test override for terminal width. Report all three with the owning file. Do not edit files.",
+      "requirements": ["filesystem", "tools"],
+      "timeout_seconds": 180,
+      "checks": [
+        {"type": "response_contains", "values": ["click/src/click/formatting.py", "80", "50", "FORCED_WIDTH"], "weight": 3},
+        {"type": "evidence_paths_exist", "minimum": 1, "weight": 1},
+        {"type": "tool_required_any", "names": ["search", "read"], "weight": 1},
+        {"type": "no_changes", "weight": 1}
+      ],
+      "rubric": ["All constants are exact", "The search is targeted", "No mutation occurs"]
+    },
+    {
+      "id": "R03",
+      "title": "URL-safe base64 regression",
+      "tier": "basic",
+      "category": "bug_fixing",
+      "prompt": "ItsDangerous URL-safe base64 encoding now removes padding from the wrong side and corrupts some payloads. Diagnose and implement the smallest fix, preserve the public API, and run the focused encoding tests. Do not edit tests.",
+      "requirements": ["filesystem", "shell", "tools"],
+      "timeout_seconds": 300,
+      "fixture_mutations": [
+        {"path": "itsdangerous/src/itsdangerous/encoding.py", "old": "return base64.urlsafe_b64encode(string).rstrip(b\"=\")", "new": "return base64.urlsafe_b64encode(string).lstrip(b\"=\")"}
+      ],
+      "checks": [
+        {"type": "verifier", "task": "R03", "weight": 5},
+        {"type": "max_changed_files", "value": 1, "weight": 1}
+      ],
+      "rubric": ["Round trips and padding behavior are restored", "The patch is minimal", "Focused tests pass"]
+    },
+    {
+      "id": "R04",
+      "title": "Signer verification regression",
+      "tier": "core",
+      "category": "bug_fixing",
+      "prompt": "ItsDangerous rejects valid newly signed values and valid rotated-key values. Find the regression in signature verification, make the smallest safe fix without changing public APIs or algorithms, and run the focused signer tests.",
+      "requirements": ["filesystem", "shell", "tools"],
+      "timeout_seconds": 360,
+      "fixture_mutations": [
+        {"path": "itsdangerous/src/itsdangerous/signer.py", "old": "            if self.algorithm.verify_signature(key, value, sig):\n                return True", "new": "            if self.algorithm.verify_signature(key, value, sig):\n                return False"}
+      ],
+      "checks": [
+        {"type": "verifier", "task": "R04", "weight": 5},
+        {"type": "max_changed_files", "value": 2, "weight": 1}
+      ],
+      "rubric": ["Valid and rotated-key signatures verify", "Tampering remains rejected", "Public behavior is preserved"]
+    },
+    {
+      "id": "R05",
+      "title": "Click execution-path trace",
+      "tier": "core",
+      "category": "reasoning",
+      "prompt": "Trace Click command execution from Command.main through context creation and invocation, including how standalone mode handles exceptions and exits. Name the ordered symbols and cite exact repository-relative paths. Do not edit files.",
+      "requirements": ["filesystem", "tools"],
+      "timeout_seconds": 300,
+      "checks": [
+        {"type": "response_contains", "values": ["click/src/click/core.py", "main", "make_context", "invoke", "Context", "standalone_mode"], "weight": 4},
+        {"type": "evidence_paths_exist", "minimum": 1, "weight": 1},
+        {"type": "no_changes", "weight": 1}
+      ],
+      "rubric": ["The call sequence is correct", "Exception and exit behavior is explained", "Evidence is exact"]
+    },
+    {
+      "id": "R06",
+      "title": "ANSI help-table alignment",
+      "tier": "core",
+      "category": "bug_fixing",
+      "prompt": "Click help-table columns become misaligned when a cell contains ANSI styling because invisible escape bytes are counted as visible width. Locate the owning calculation, implement the smallest fix, and run the focused formatting tests.",
+      "requirements": ["filesystem", "shell", "tools"],
+      "timeout_seconds": 360,
+      "fixture_mutations": [
+        {"path": "click/src/click/formatting.py", "old": "widths[idx] = max(widths.get(idx, 0), term_len(col))", "new": "widths[idx] = max(widths.get(idx, 0), len(col))"}
+      ],
+      "checks": [
+        {"type": "verifier", "task": "R06", "weight": 5},
+        {"type": "max_changed_files", "value": 2, "weight": 1}
+      ],
+      "rubric": ["Width reflects visible characters", "Plain text behavior does not regress", "Focused tests pass"]
+    },
+    {
+      "id": "R07",
+      "title": "Tampered token root cause",
+      "tier": "advanced",
+      "category": "bug_finding",
+      "prompt": "Without changing code, explain why a tampered URLSafeSerializer token raises BadSignature. Trace dump and load payload handling, the optional compression marker, base64 processing, signer splitting, and signature verification. State the trigger, violated invariant, divergence boundary, and one alternate cause you ruled out. Cite exact paths.",
+      "requirements": ["filesystem", "tools"],
+      "timeout_seconds": 420,
+      "checks": [
+        {"type": "response_contains", "values": ["itsdangerous/src/itsdangerous/url_safe.py", "dump_payload", "load_payload", "base64", "itsdangerous/src/itsdangerous/signer.py", "verify_signature", "BadSignature", "invariant", "alternate"], "weight": 5},
+        {"type": "evidence_paths_exist", "minimum": 2, "weight": 1},
+        {"type": "no_changes", "weight": 1}
+      ],
+      "rubric": ["The causal chain is accurate", "The divergence boundary is precise", "An alternate cause is genuinely ruled out"]
+    },
+    {
+      "id": "R08",
+      "title": "Timestamp exact-boundary bug",
+      "tier": "advanced",
+      "category": "reasoning_and_fixing",
+      "prompt": "A TimestampSigner value exactly max_age seconds old must remain valid, while older values must expire. Fix the boundary regression, preserve negative-age handling and the public API, and verify the exact boundary behavior plus relevant timed-signature behavior.",
+      "requirements": ["filesystem", "shell", "tools"],
+      "timeout_seconds": 420,
+      "fixture_mutations": [
+        {"path": "itsdangerous/src/itsdangerous/timed.py", "old": "            if age > max_age:", "new": "            if age >= max_age:"}
+      ],
+      "checks": [
+        {"type": "verifier", "task": "R08", "weight": 5},
+        {"type": "max_changed_files", "value": 2, "weight": 1}
+      ],
+      "rubric": ["The exact boundary is accepted", "Older and negative-age cases remain correct", "The change is minimal"]
+    },
+    {
+      "id": "R09",
+      "title": "Efficient cross-repository research",
+      "tier": "advanced",
+      "category": "efficiency",
+      "prompt": "Using targeted searches and reads, report five exact facts across both repositories: ItsDangerous's default key derivation, default separator, and URL-safe compression library; Click's HelpFormatter default max_width; and how Click controls whether a callable default_map value is invoked. Cite at least three exact repository-relative source paths. Do not edit files.",
+      "requirements": ["filesystem", "tools"],
+      "timeout_seconds": 360,
+      "checks": [
+        {"type": "response_contains", "values": ["django-concat", "b\".\"", "zlib", "80", "call", "itsdangerous/src/itsdangerous/signer.py", "itsdangerous/src/itsdangerous/url_safe.py", "click/src/click/core.py"], "weight": 5},
+        {"type": "evidence_paths_exist", "minimum": 3, "weight": 1},
+        {"type": "tool_required_any", "names": ["search", "read"], "weight": 1},
+        {"type": "no_changes", "weight": 1}
+      ],
+      "rubric": ["All five facts are exact", "Each claim is grounded", "Research avoids broad redundant reads"]
+    },
+    {
+      "id": "R10",
+      "title": "Click default-map end-to-end regression",
+      "tier": "complex",
+      "category": "end_to_end",
+      "prompt": "Click's default_map handling has two related regressions: explicit falsy values such as 0 and None are treated as missing, and callable values execute even when the caller requests call=False. Reproduce and trace the precedence and UNSET-sentinel behavior, implement the smallest robust fix, run focused default tests, and provide a concise handoff. Do not edit tests.",
+      "requirements": ["filesystem", "shell", "tools"],
+      "timeout_seconds": 600,
+      "fixture_mutations": [
+        {"path": "click/src/click/core.py", "old": "            and name in self.default_map\n            and self.default_map[name] is not UNSET", "new": "            and name in self.default_map\n            and bool(self.default_map[name])"},
+        {"path": "click/src/click/core.py", "old": "        value = self.default_map[name]\n\n        if call and callable(value):\n            return value()", "new": "        value = self.default_map[name]\n\n        if callable(value):\n            return value()"}
+      ],
+      "checks": [
+        {"type": "verifier", "task": "R10", "weight": 6},
+        {"type": "max_changed_files", "value": 3, "weight": 1}
+      ],
+      "rubric": ["Falsy and None defaults retain presence semantics", "call=False does not invoke callables", "Focused regressions pass and the handoff is coherent"]
+    }
+  ]
+}

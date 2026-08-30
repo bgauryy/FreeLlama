@@ -1,0 +1,22 @@
+schema_version = 1
+
+# Candidate order is a quality contract, not a speed heuristic. Add a model only
+# after it passes the held-out suite for that task on this machine. The first
+# candidate is preferred for objective=quality; objective=balanced may retain a
+# resident qualified candidate to avoid a model transition.
+# Qwen 3.8 passed all five injected code-repair tasks in the dated local
+# repository-agent smoke suite. Keep diagnosis-only `coding` and general
+# `tools` unqualified: it failed those explanation and lookup tasks.
+[policies.code_repair]
+qualified_models = ["qwen3.8:27b-mlx"]
+
+# Add browser and broader tool policies only after their held-out suites qualify
+# them. The exploratory browser smoke test is not sufficient evidence.
+# [policies.browser]
+# qualified_models = ["qwen3.8:27b-mlx"]
+
+[policies.embedding]
+qualified_models = ["nomic-embed-text:latest"]
+
+# Completion, coding, tools, browser, vision, and long-context candidates remain
+# intentionally absent until their private held-out suites qualify them.

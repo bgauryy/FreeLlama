@@ -1,0 +1,20 @@
+{
+  "name": "freellama-native-build",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Build-only manifest for the napi-rs native addon compiled from packages/rust-core/packages/rust-core/src/napi.rs. Not published \u2014 the compiled binary is written into packages/mcp/native, which is the publishable unit.",
+  "napi": {
+    "binaryName": "freellama",
+    "targets": [
+      "aarch64-apple-darwin",
+      "x86_64-apple-darwin"
+    ]
+  },
+  "scripts": {
+    "build": "napi build --platform --release --manifest-path packages/rust-core/Cargo.toml --features napi --no-js --no-dts-header --dts .napi-generated.d.ts -o packages/mcp/native && rm -f packages/mcp/native/.napi-generated.d.ts"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^3.8.6"
+  },
+  "license": "Apache-2.0 OR MIT"
+}

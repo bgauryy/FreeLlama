@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "name": "ollama-mlx-regressions",
+  "defaults": {
+    "seed": 260823,
+    "temperature": 0.0,
+    "num_predict": 32,
+    "num_ctx": 8192,
+    "timeout_seconds": 180,
+    "target_improvement": 0.20
+  },
+  "scenarios": [
+    {
+      "kind": "prefix_reuse",
+      "id": "prefix-reuse",
+      "prefix": "Stable repository context. Preserve exact behavior and answer briefly. ",
+      "prefix_repetitions": 256,
+      "turns": [
+        "Return the word alpha.",
+        "Return the word beta.",
+        "Return the word gamma."
+      ]
+    },
+    {
+      "kind": "deterministic_restore",
+      "id": "cache-restore",
+      "prompt": "At temperature zero, return exactly: cache stable",
+      "perturbation": "At temperature zero, return exactly: different branch"
+    },
+    {
+      "kind": "cache_growth",
+      "id": "cache-growth",
+      "prefix": "Independent cache-growth probe token. ",
+      "prompt_repetitions": [64, 128, 256, 512]
+    },
+    {
+      "kind": "runner_reload",
+      "id": "runner-reload",
+      "prompt": "Return exactly: runner ready",
+      "repetitions": 2
+    },
+    {
+      "kind": "model_transition",
+      "id": "model-transition",
+      "prompt": "Return exactly: transition complete",
+      "repetitions": 2
+    }
+  ]
+}
+

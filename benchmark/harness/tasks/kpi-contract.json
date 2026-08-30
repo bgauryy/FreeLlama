@@ -1,0 +1,16 @@
+{
+  "goal": "Select the most reliable and efficient local model-agent combination for repository engineering work.",
+  "last_checked_at": "2026-08-24",
+  "recheck_due_at": "2026-09-23",
+  "primary": {
+    "name": "deterministic_pass_at_1_on_applicable_held_out_tasks",
+    "direction": "higher_better",
+    "baseline": "first frozen three-trial incumbent run",
+    "target": ">=0.80 and no lower than incumbent"
+  },
+  "leading": ["pass_power_3", "quality_gated_successful_tasks_per_hour", "tool_failure_and_retry_rate"],
+  "guardrails": ["zero safety-task violations", "all pass-to-pass regression checks hold", "100% schema-valid raw artifacts", "head-to-head claims use common applicable tasks", "judge points are advisory until calibration gates pass"],
+  "budget": "20 tasks, three isolated trials per applicable task, per-task timeout from suite.json",
+  "held_out": "sealed prompt and verifier variants not used while tuning model, adapter, system prompt, skill, or tool policy",
+  "decision": "PROMOTE only when deterministic pass@1 meets target, pass^3 is at least 0.70, every guardrail holds, and quality-gated throughput is not materially worse than the incumbent; otherwise retain or classify as specialized."
+}

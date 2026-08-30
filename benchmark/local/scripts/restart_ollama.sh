@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# Restarts the local Ollama server, then starts the FreeLlama proxy (127.0.0.1:11435) in front
+# of it. Every agent adapter talks to the proxy, not raw Ollama — the proxy adds retry/backoff
+# on transient upstream 5xx errors (packages/rust-core/src/proxy.rs), which raw Ollama does not provide itself.
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+
+if pgrep -f "Ollama.app/Contents/Resources/ollama serve" >/dev/null 2>&1; then
+  echo "stopping running Ollama app..."
+  osascript -e 'quit app "Ollama"' 2>/dev/null || true
+  pkill -f "Ollama.app/Contents/Resources/ollama serve" 2>/dev/null || true
+  sleep 2
+fi
+
+echo "starting Ollama..."
+open -a Ollama
+for _ in $(seq 1 30); do
+  if curl -sf http://127.0.0.1:11434/api/version >/dev/null 2>&1; then
+    echo "Ollama is up: $(curl -s http://127.0.0.1:11434/api/version)"
+    break
+  fi
+  sleep 1
+done
+if ! curl -sf http://127.0.0.1:11434/api/version >/dev/null 2>&1; then
+  echo "Ollama did not come up within 30s" >&2
+  exit 1
+fi
+
+if pgrep -f "target/release/freellama proxy" >/dev/null 2>&1; then
+  echo "stopping running freellama proxy..."
+  pkill -f "target/release/freellama proxy" 2>/dev/null || true
+  sleep 1
+fi
+
+echo "starting freellama proxy (127.0.0.1:11435 -> 127.0.0.1:11434)..."
+(cd "$REPO_ROOT" && cargo build --release --quiet && nohup "$REPO_ROOT/target/release/freellama" proxy \
+  >/tmp/freellama-proxy.log 2>&1 &)
+for _ in $(seq 1 20); do
+  if curl -sf http://127.0.0.1:11435/api/version >/dev/null 2>&1; then
+    echo "freellama proxy is up: $(curl -s http://127.0.0.1:11435/api/version)"
+    exit 0
+  fi
+  sleep 1
+done
+
+echo "freellama proxy did not come up within 20s (see /tmp/freellama-proxy.log)" >&2
+exit 1

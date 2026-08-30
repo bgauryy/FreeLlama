@@ -1,0 +1,25 @@
+/target/
+.DS_Store
+*.log
+.venv
+.ruff_cache
+.pytest_cache
+__pycache__
+node_modules
+*.node
+.napi-generated.d.ts
+packages/mcp/dist/
+
+# Local agent workspaces — not part of the repo
+.octocode/
+.claude/
+
+# Python bytecode — 371 of these had accumulated because only __pycache__/ was ignored,
+# and .pyc files also appear outside it.
+*.pyc
+
+# Yarn Berry: keep releases/, ignore local install state & caches
+.yarn/install-state.gz
+.yarn/cache
+.yarn/unplugged
+.yarn/build-state.yml

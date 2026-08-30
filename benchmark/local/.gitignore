@@ -1,0 +1,7 @@
+# Cloned target repos: the runner (prepare_repo.sh) clones these fresh each time,
+# never checked in, never touched by the local LLM agents themselves.
+.context/
+# Generated per-run artifacts (trial JSON, workspaces, dashboard)
+results/
+# Per-model generated matrix files (derived from the template at run time)
+tasks/.generated/

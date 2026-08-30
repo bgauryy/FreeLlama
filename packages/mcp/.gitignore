@@ -1,0 +1,3 @@
+
+# Build-time copies of benchmark/local/scripts adapters (source of truth lives there).
+adapters/

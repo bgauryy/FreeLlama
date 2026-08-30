@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://freellama.local/schemas/matrix.schema.json",
+  "type": "object",
+  "required": ["schema_version", "models"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "judge_model": {"type": ["string", "null"]},
+    "judge_calibration": {"type": ["string", "null"]},
+    "models": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["id", "agent", "agent_command", "capabilities"],
+        "properties": {
+          "id": {"type": "string"},
+          "agent": {"type": "string"},
+          "agent_command": {"type": "string"},
+          "capabilities": {"type": "array", "items": {"enum": ["filesystem", "shell", "tools", "skills", "mcp"]}, "uniqueItems": true}
+          ,"judge_model": {"type": ["string", "null"]}
+          ,"judge_calibration": {"type": ["string", "null"]}
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "additionalProperties": false
+}

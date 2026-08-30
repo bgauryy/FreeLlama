@@ -1,0 +1,35 @@
+[workspace]
+resolver = "3"
+members = ["packages/rust-core", "packages/cli"]
+
+# Shared across both crates so versions cannot drift between the library and the CLI that wraps it.
+[workspace.package]
+version = "0.2.0"
+edition = "2024"
+license = "Apache-2.0 OR MIT"
+rust-version = "1.85"
+
+[workspace.lints.rust]
+# `napi.rs` is the sole FFI boundary and opts out explicitly with its own `#![allow(unsafe_code)]`.
+# Everywhere else stays deny-level.
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
+
+[workspace.dependencies]
+anyhow = "1.0"
+axum = "0.8"
+base64 = "0.22"
+clap = { version = "4.6", features = ["derive"] }
+napi = { version = "2", default-features = false, features = ["napi4", "async", "tokio_rt", "serde-json"] }
+napi-derive = { version = "2" }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tokio = { version = "1.53", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+toml = "0.9"
+uuid = { version = "1.18", features = ["serde", "v4"] }
+napi-build = { version = "2" }

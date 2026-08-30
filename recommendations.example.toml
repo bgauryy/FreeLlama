@@ -1,0 +1,47 @@
+schema_version = 1
+reviewed_at = "2026-08-24"
+review_due_at = "2026-09-23"
+
+# These estimates document a reviewed local starting point, not a universal
+# quality ranking. Recheck tags, sizes, capabilities, and held-out evidence
+# before publishing this catalog for another machine.
+
+[[models]]
+name = "qwen3.8:27b-mlx"
+summary = "Primary local code-repair candidate: passed all five injected repairs in the 2026-08-24 repository-agent smoke suite; not qualified for diagnosis-only reasoning."
+tasks = ["code_repair"]
+capabilities = ["completion", "tools", "vision", "thinking"]
+max_context_tokens = 262144
+estimated_download_bytes = 18174721847
+minimum_memory_bytes = 22558375636
+priority = 5
+
+[[models]]
+name = "qwen2.5:0.5b"
+summary = "Small local intent, completion, and tool-capable smoke model."
+tasks = ["completion", "coding", "tools"]
+capabilities = ["completion", "tools"]
+max_context_tokens = 32768
+estimated_download_bytes = 397000000
+minimum_memory_bytes = 1073741824
+priority = 20
+
+[[models]]
+name = "nomic-embed-text:latest"
+summary = "Small local embedding model for semantic search and retrieval."
+tasks = ["embedding"]
+capabilities = ["embedding"]
+max_context_tokens = 2048
+estimated_download_bytes = 274000000
+minimum_memory_bytes = 536870912
+priority = 10
+
+[[models]]
+name = "gemma3:4b"
+summary = "Reviewed multimodal option for completion, vision, and long-context work."
+tasks = ["completion", "vision", "long_context"]
+capabilities = ["completion", "vision"]
+max_context_tokens = 131072
+estimated_download_bytes = 3300000000
+minimum_memory_bytes = 5368709120
+priority = 30

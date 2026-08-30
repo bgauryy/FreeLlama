@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "judge_model": null,
+  "judge_calibration": null,
+  "models": [
+    {
+      "id": "__MODEL_SLUG__-octocode",
+      "agent": "octocode-cli-agent-v1",
+      "agent_command": "env FREELLAMA_TARGET_MODEL=__MODEL__ FREELLAMA_OLLAMA_ENDPOINT=http://127.0.0.1:11435 python3 /Users/guybary/Documents/code/FreeLlama/benchmark/local/scripts/octocode_agent.py",
+      "capabilities": ["filesystem", "shell", "tools"]
+    },
+    {
+      "id": "__MODEL_SLUG__-bash",
+      "agent": "bash-shell-agent-v1",
+      "agent_command": "env FREELLAMA_TARGET_MODEL=__MODEL__ FREELLAMA_OLLAMA_ENDPOINT=http://127.0.0.1:11435 python3 /Users/guybary/Documents/code/FreeLlama/benchmark/local/scripts/bash_agent.py",
+      "capabilities": ["filesystem", "shell", "tools"]
+    }
+  ]
+}

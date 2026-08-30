@@ -1,0 +1,35 @@
+{
+  "name": "freellama-mcp-server",
+  "version": "0.2.0",
+  "description": "MCP server exposing FreeLlama core as tools, via native NAPI bindings into packages/rust-core.",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "freellama-mcp-server": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "native",
+    "adapters",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc && node scripts/bundle-adapters.mjs",
+    "start": "node dist/index.js",
+    "test": "node test/smoke-test.mjs && node test/smoke-test-protocol.mjs && node test/smoke-test-delegate.mjs",
+    "prepublishOnly": "npm --prefix .. run build && npm run build",
+    "build:native": "npm --prefix ../.. run build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.2"
+  },
+  "license": "Apache-2.0 OR MIT"
+}

@@ -1,0 +1,1125 @@
+{
+  "schema_version": 1,
+  "suite_id": "freellama-local-octocode-vs-bash-30",
+  "suite_version": "1.0.0",
+  "created_at": "2026-08-27",
+  "last_reviewed_at": "2026-08-27",
+  "review_due_at": "2026-09-26",
+  "visibility": "public_development",
+  "fixture": "../.context",
+  "tasks": [
+    {
+      "id": "L01",
+      "title": "click: Group base class",
+      "tier": "basic",
+      "category": "task_understanding",
+      "prompt": "Inspect the click repository. Where is the `Group` class defined? Report the exact repository-relative file path and the name of the base class it directly extends. Do not edit files.",
+      "requirements": [
+        "filesystem",
+        "tools"
+      ],
+      "timeout_seconds": 240,
+      "checks": [
+        {
+          "type": "response_contains",
+          "values": [
+            "click/src/click/core.py",
+            "Group",
+            "Command"
+          ],
+          "weight": 3
+        },
+        {
+          "type": "evidence_paths_exist",
+          "minimum": 1,
+          "weight": 1
+        },
+        {
+          "type": "no_changes",
+          "weight": 1
+        }
+      ],
+      "rubric": [
+        "The answer states the correct fact(s) with exact repository-relative paths",
+        "Claims are supported by evidence gathered via tool calls, not guessed",
+        "No workspace mutation occurs"
+      ]
+    },
+    {
+      "id": "L02",
+      "title": "click: progress bar rendering",
+      "tier": "basic",
+      "category": "tool_use",
+      "prompt": "click's `progressbar()` context manager (in click/src/click/termui.py) delegates the actual rendering to a class defined in a different module. Name that module (repository-relative path) and the exact class name. Do not edit files.",
+      "requirements": [
+        "filesystem",
+        "tools"
+      ],
+      "timeout_seconds": 240,
+      "checks": [
+        {
+          "type": "response_contains",
+          "values": [
+            "click/src/click/_termui_impl.py",
+            "ProgressBar"
+          ],
+          "weight": 3
+        },
+        {
+          "type": "evidence_paths_exist",
+          "minimum": 1,
+          "weight": 1
+        },
+        {
+          "type": "no_changes",
+          "weight": 1
+        }
+      ],
+      "rubric": [
+        "The answer states the correct fact(s) with exact repository-relative paths",
+        "Claims are supported by evidence gathered via tool calls, not guessed",
+        "No workspace mutation occurs"
+      ]
+    },
+    {
+      "id": "L03",
+      "title": "click: @click.command() mechanics",
+      "tier": "core",
+      "category": "reasoning",
+      "prompt": "Explain how the @click.command() decorator (in click/src/click/decorators.py) turns a plain function into a Command instance. Name the exact attribute the decorator reads from the function to collect @option/@argument decorations, and the default command class used when cls is not given. Do not edit files.",
+      "requirements": [
+        "filesystem",
+        "tools"
+      ],
+      "timeout_seconds": 240,
+      "checks": [
+        {
+          "type": "response_contains",
+          "values": [
+            "__click_params__",
+            "Command",
+            "decorators.py"
+          ],
+          "weight": 3
+        },
+        {
+          "type": "evidence_paths_exist",
+          "minimum": 1,
+          "weight": 1
+        },
+        {
+          "type": "no_changes",
+          "weight": 1
+        }
+      ],
+      "rubric": [
+        "The answer states the correct fact(s) with exact repository-relative paths",
+        "Claims are supported by evidence gathered via tool calls, not guessed",
+        "No workspace mutation occurs"
+      ]
+    },
+    {
+      "id": "L04",
+      "title": "click: shell completion classes",
+      "tier": "core",
+      "category": "task_understanding",
+      "prompt": "click supports four shell-completion targets. Name the four completion classes defined in click/src/click/shell_completion.py and the shared base class they all extend. Do not edit files.",
+      "requirements": [
+        "filesystem",
+        "tools"
+      ],
+      "timeout_seconds": 240,
+      "checks": [
+        {
+          "type": "response_contains",
+          "values": [
+            "BashComplete",
+            "ZshComplete",
+            "FishComplete",
+            "PowerShellComplete",
+            "ShellComplete"
+          ],
+          "weight": 3
+        },
+        {
+          "type": "evidence_paths_exist",
+          "minimum": 1,
+          "weight": 1
+        },
+        {
+          "type": "no_changes",
+          "weight": 1
+        }
+      ],
+      "rubric": [
+        "The answer states the correct fact(s) with exact repository-relative paths",
+        "Claims are supported by evidence gathered via tool calls, not guessed",
+        "No workspace mutation occurs"
+      ]
+    },
+    {
+      "id": "L05",
+      "title": "click: ParameterSource ordering",
+      "tier": "core",
+      "category": "reasoning",
+      "prompt": "List every member of the ParameterSource enum in click/src/click/core.py, in the order they are defined, and explain what the ordering guarantees (per the class docstring) about comparing sources with <. Do not edit files.",
+      "requirements": [
+        "filesystem",
+        "tools"
+      ],
+      "timeout_seconds": 240,
+      "checks": [
+        {
+          "type": "response_contains",
+          "values": [
+            "PROMPT",
+            "COMMANDLINE",
+            "ENVIRONMENT",
+            "DEFAULT_MAP",
+            "DEFAULT"
+          ],
+          "weight": 3
+        },
+        {
+          "type": "evidence_paths_exist",
+          "minimum": 1,
+          "weight": 1
+        },
+        {
+          "type": "no_changes",
+          "weight": 1
+        }
+      ],
+      "rubric": [
+        "The answer states the correct fact(s) with exact repository-relative paths",
+        "Claims are supported by evidence gathered via tool calls, not guessed",
+        "No workspace mutation occurs"
+      ]
+    },
+    {
+      "id": "L06",
+      "title": "click: no_args_is_help handling",
+      "tier": "core",
+      "category": "reasoning",
+      "prompt": "Trace what happens when a Group is invoked with no arguments and no_args_is_help is true. Cite the file where this check occurs for Group, and explain why the same check also appears separately for a plain Command, and how Group computes its own default for that flag. Do not edit files.",
+      "requirements": [
+        "filesystem",
+        "tools"
+      ],
+      "timeout_seconds": 240,
+      "checks": [
+        {
+          "type": "response_contains",
+          "values": [
+            "core.py",
+            "no_args_is_help",
+            "Group",
+            "Command"
+          ],
+          "weight": 3
+        },
+        {
+          "type": "evidence_paths_exist",
+          "minimum": 1,
+          "weight": 1
+        },
+        {
+          "type": "no_changes",
+          "weight": 1
+        }
+      ],
+      "rubric": [
+        "The answer states the correct fact(s) with exact repository-relative paths",
+        "Claims are supported by evidence gathered via tool calls, not guessed",
+        "No workspace mutation occurs"
+      ]
+    },
+    {
+      "id": "L07",
+      "title": "click: help text terminal width",
+      "tier": "advanced",
+      "category": "efficiency",
+      "prompt": "click's help output wraps to the terminal width. Find the exact file and line where click calls shutil.get_terminal_size() to compute this width, and report the hard minimum width it clamps to in that same expression. Do not edit files.",
+      "requirements": [
+        "filesystem",
+        "tools"
+      ],
+      "timeout_seconds": 240,
+      "checks": [
+        {
+          "type": "response_contains",
+          "values": [
+            "formatting.py",
+            "get_terminal_size",
+            "50"
+          ],
+          "weight": 3
+        },
+        {
+          "type": "evidence_paths_exist",
+          "minimum": 1,
+          "weight": 1
+        },
+        {
+          "type": "no_changes",
+          "weight": 1
+        }
+      ],
+      "rubric": [
+        "The answer states the correct fact(s) with exact repository-relative paths",
+        "Claims are supported by evidence gathered via tool calls, not guessed",
+        "No workspace mutation occurs"
+      ]
+    },
+    {
+      "id": "L08",
+      "title": "click: custom text wrapper",
+      "tier": "advanced",
+      "category": "reasoning",
+      "prompt": "click's help text wrapping (wrap_text in click/src/click/formatting.py) relies on a custom subclass of Python's standard textwrap.TextWrapper. Name the file and exact class name of that subclass, and state what changed about how width is measured as of version 8.4.0 per wrap_text's own versionchanged note. Do not edit files.",
+      "requirements": [
+        "filesystem",
+        "tools"
+      ],
+      "timeout_seconds": 240,
+      "checks": [
+        {
+          "type": "response_contains",
+          "values": [
+            "_textwrap.py",
+            "TextWrapper",
+            "ANSI"
+          ],
+          "weight": 3
+        },
+        {
+          "type": "evidence_paths_exist",
+          "minimum": 1,
+          "weight": 1
+        },
+        {
+          "type": "no_changes",
+          "weight": 1
+        }
+      ],
+      "rubric": [
+        "The answer states the correct fact(s) with exact repository-relative paths",
+        "Claims are supported by evidence gathered via tool calls, not guessed",
+        "No workspace mutation occurs"
+      ]
+    },
+    {
+      "id": "L09",
+      "title": "click: main() to callback call chain",
+      "tier": "advanced",
+      "category": "end_to_end",
+      "prompt": "Trace click's execution chain for a Group with one subcommand invoked from the command line, starting at BaseCommand.main(). Name, in order, every method call from main() down to the subcommand's own callback executing -- mention make_context, Group.invoke, resolve_command, and ctx.invoke. All of this is in one file -- cite it. Do not edit files.",
+      "requirements": [
+        "filesystem",
+        "tools"
+      ],
+      "timeout_seconds": 240,
+      "checks": [
+        {
+          "type": "response_contains",
+          "values": [
+            "core.py",
+            "make_context",
+            "resolve_command",
+            "ctx.invoke"
+          ],
+          "weight": 3
+        },
+        {
+          "type": "evidence_paths_exist",
+          "minimum": 1,
+          "weight": 1
+        },
+        {
+          "type": "no_changes",
+          "weight": 1
+        }
+      ],
+      "rubric": [
+        "The answer states the correct fact(s) with exact repository-relative paths",
+        "Claims are supported by evidence gathered via tool calls, not guessed",
+        "No workspace mutation occurs"
+      ]
+    },
+    {
+      "id": "L10",
+      "title": "click: parameter source storage",
+      "tier": "complex",
+      "category": "reasoning",
+      "prompt": "Context tracks where each parameter's value came from. Name the exact private attribute on Context that stores this mapping, its declared type, and the two public methods used to read and write it. Cite the file. Do not edit files.",
+      "requirements": [
+        "filesystem",
+        "tools"
+      ],
+      "timeout_seconds": 240,
+      "checks": [
+        {
+          "type": "response_contains",
+          "values": [
+            "_parameter_source",
+            "set_parameter_source",
+            "get_parameter_source",
+            "core.py"
+          ],
+          "weight": 3
+        },
+        {
+          "type": "evidence_paths_exist",
+          "minimum": 1,
+          "weight": 1
+        },
+        {
+          "type": "no_changes",
+          "weight": 1
+        }
+      ],
+      "rubric": [
+        "The answer states the correct fact(s) with exact repository-relative paths",
+        "Claims are supported by evidence gathered via tool calls, not guessed",
+        "No workspace mutation occurs"
+      ]
+    },
+    {
+      "id": "Z01",
+      "title": "zustand: createStore location",
+      "tier": "basic",
+      "category": "task_understanding",
+      "prompt": "Inspect the zustand repository. Where is createStore defined, and which file does zustand/src/react.ts's useStore import it from? Report repository-relative paths. Do not edit files.",
+      "requirements": [
+        "filesystem",
+        "tools"
+      ],
+      "timeout_seconds": 240,
+      "checks": [
+        {
+          "type": "response_contains",
+          "values": [
+            "zustand/src/vanilla.ts",
+            "createStore",
+            "react.ts"
+          ],
+          "weight": 3
+        },
+        {
+          "type": "evidence_paths_exist",
+          "minimum": 1,
+          "weight": 1
+        },
+        {
+          "type": "no_changes",
+          "weight": 1
+        }
+      ],
+      "rubric": [
+        "The answer states the correct fact(s) with exact repository-relative paths",
+        "Claims are supported by evidence gathered via tool calls, not guessed",
+        "No workspace mutation occurs"
+      ]
+    },
+    {
+      "id": "Z02",
+      "title": "zustand: React subscription hook",
+      "tier": "basic",
+      "category": "tool_use",
+      "prompt": "Which React hook does zustand's useStore (in zustand/src/react.ts) call internally to subscribe a component to external store changes? Do not edit files.",
+      "requirements": [
+        "filesystem",
+        "tools"
+      ],
+      "timeout_seconds": 240,
+      "checks": [
+        {
+          "type": "response_contains",
+          "values": [
+            "useSyncExternalStore",
+            "react.ts"
+          ],
+          "weight": 3
+        },
+        {
+          "type": "evidence_paths_exist",
+          "minimum": 1,
+          "weight": 1
+        },
+        {
+          "type": "no_changes",
+          "weight": 1
+        }
+      ],
+      "rubric": [
+        "The answer states the correct fact(s) with exact repository-relative paths",
+        "Claims are supported by evidence gathered via tool calls, not guessed",
+        "No workspace mutation occurs"
+      ]
+    },
+    {
+      "id": "Z03",
+      "title": "zustand: useSyncExternalStore arguments",
+      "tier": "core",
+      "category": "reasoning",
+      "prompt": "What are the three arguments passed to React.useSyncExternalStore inside useStore (zustand/src/react.ts), and which store method backs each one? Do not edit files.",
+      "requirements": [
+        "filesystem",
+        "tools"
+      ],
+      "timeout_seconds": 240,
+      "checks": [
+        {
+          "type": "response_contains",
+          "values": [
+            "subscribe",
+            "getState",
+            "getInitialState"
+          ],
+          "weight": 3
+        },
+        {
+          "type": "evidence_paths_exist",
+          "minimum": 1,
+          "weight": 1
+        },
+        {
+          "type": "no_changes",
+          "weight": 1
+        }
+      ],
+      "rubric": [
+        "The answer states the correct fact(s) with exact repository-relative paths",
+        "Claims are supported by evidence gathered via tool calls, not guessed",
+        "No workspace mutation occurs"
+      ]
+    },
+    {
+      "id": "Z04",
+      "title": "zustand: create() return type",
+      "tier": "core",
+      "category": "task_understanding",
+      "prompt": "Name the exact TypeScript type alias returned by zustand's create(), as declared in zustand/src/react.ts. Do not edit files.",
+      "requirements": [
+        "filesystem",
+        "tools"
+      ],
+      "timeout_seconds": 240,
+      "checks": [
+        {
+          "type": "response_contains",
+          "values": [
+            "UseBoundStore",
+            "react.ts"
+          ],
+          "weight": 3
+        },
+        {
+          "type": "evidence_paths_exist",
+          "minimum": 1,
+          "weight": 1
+        },
+        {
+          "type": "no_changes",
+          "weight": 1
+        }
+      ],
+      "rubric": [
+        "The answer states the correct fact(s) with exact repository-relative paths",
+        "Claims are supported by evidence gathered via tool calls, not guessed",
+        "No workspace mutation occurs"
+      ]
+    },
+    {
+      "id": "Z05",
+      "title": "zustand: shallow() Map/Set comparison",
+      "tier": "core",
+      "category": "reasoning",
+      "prompt": "How does zustand's shallow() compare two Map/Set-like values? Name the helper function (file + name) and describe its short-circuit on size. Do not edit files.",
+      "requirements": [
+        "filesystem",
+        "tools"
+      ],
+      "timeout_seconds": 240,
+      "checks": [
+        {
+          "type": "response_contains",
+          "values": [
+            "compareEntries",
+            "shallow.ts",
+            "size"
+          ],
+          "weight": 3
+        },
+        {
+          "type": "evidence_paths_exist",
+          "minimum": 1,
+          "weight": 1
+        },
+        {
+          "type": "no_changes",
+          "weight": 1
+        }
+      ],
+      "rubric": [
+        "The answer states the correct fact(s) with exact repository-relative paths",
+        "Claims are supported by evidence gathered via tool calls, not guessed",
+        "No workspace mutation occurs"
+      ]
+    },
+    {
+      "id": "Z06",
+      "title": "zustand: useShallow render caching",
+      "tier": "core",
+      "category": "reasoning",
+      "prompt": "How does useShallow (zustand/src/react/shallow.ts) avoid recomputing on every render when the shallow-equal result hasn't changed? Name the React hook it uses to persist state across renders. Do not edit files.",
+      "requirements": [
+        "filesystem",
+        "tools"
+      ],
+      "timeout_seconds": 240,
+      "checks": [
+        {
+          "type": "response_contains",
+          "values": [
+            "useRef",
+            "shallow.ts",
+            "useShallow"
+          ],
+          "weight": 3
+        },
+        {
+          "type": "evidence_paths_exist",
+          "minimum": 1,
+          "weight": 1
+        },
+        {
+          "type": "no_changes",
+          "weight": 1
+        }
+      ],
+      "rubric": [
+        "The answer states the correct fact(s) with exact repository-relative paths",
+        "Claims are supported by evidence gathered via tool calls, not guessed",
+        "No workspace mutation occurs"
+      ]
+    },
+    {
+      "id": "Z07",
+      "title": "zustand: persist middleware default storage",
+      "tier": "advanced",
+      "category": "efficiency",
+      "prompt": "The persist middleware (zustand/src/middleware/persist.ts) defaults to a particular Web Storage API when no storage option is given. Cite the exact default expression and the function used to wrap it into a PersistStorage. Do not edit files.",
+      "requirements": [
+        "filesystem",
+        "tools"
+      ],
+      "timeout_seconds": 240,
+      "checks": [
+        {
+          "type": "response_contains",
+          "values": [
+            "createJSONStorage",
+            "window.localStorage",
+            "persist.ts"
+          ],
+          "weight": 3
+        },
+        {
+          "type": "evidence_paths_exist",
+          "minimum": 1,
+          "weight": 1
+        },
+        {
+          "type": "no_changes",
+          "weight": 1
+        }
+      ],
+      "rubric": [
+        "The answer states the correct fact(s) with exact repository-relative paths",
+        "Claims are supported by evidence gathered via tool calls, not guessed",
+        "No workspace mutation occurs"
+      ]
+    },
+    {
+      "id": "Z08",
+      "title": "zustand: combine middleware immutability",
+      "tier": "advanced",
+      "category": "reasoning",
+      "prompt": "The combine middleware (zustand/src/middleware/combine.ts) merges initial state with a StateCreator's return value. Cite its one-line implementation and explain why Object.assign({}, initialState, ...) uses a fresh {} rather than mutating initialState directly. Do not edit files.",
+      "requirements": [
+        "filesystem",
+        "tools"
+      ],
+      "timeout_seconds": 240,
+      "checks": [
+        {
+          "type": "response_contains",
+          "values": [
+            "Object.assign",
+            "initialState",
+            "combine.ts"
+          ],
+          "weight": 3
+        },
+        {
+          "type": "evidence_paths_exist",
+          "minimum": 1,
+          "weight": 1
+        },
+        {
+          "type": "no_changes",
+          "weight": 1
+        }
+      ],
+      "rubric": [
+        "The answer states the correct fact(s) with exact repository-relative paths",
+        "Claims are supported by evidence gathered via tool calls, not guessed",
+        "No workspace mutation occurs"
+      ]
+    },
+    {
+      "id": "Z09",
+      "title": "zustand: subscribeWithSelector type augmentation",
+      "tier": "advanced",
+      "category": "end_to_end",
+      "prompt": "subscribeWithSelector (zustand/src/middleware/subscribeWithSelector.ts) augments a store's subscribe method with a selector-based overload. Name the two call signatures it adds, and the TypeScript mechanism it uses to extend the base StoreMutators interface. Do not edit files.",
+      "requirements": [
+        "filesystem",
+        "tools"
+      ],
+      "timeout_seconds": 240,
+      "checks": [
+        {
+          "type": "response_contains",
+          "values": [
+            "declare module",
+            "StoreMutators",
+            "subscribeWithSelector.ts"
+          ],
+          "weight": 3
+        },
+        {
+          "type": "evidence_paths_exist",
+          "minimum": 1,
+          "weight": 1
+        },
+        {
+          "type": "no_changes",
+          "weight": 1
+        }
+      ],
+      "rubric": [
+        "The answer states the correct fact(s) with exact repository-relative paths",
+        "Claims are supported by evidence gathered via tool calls, not guessed",
+        "No workspace mutation occurs"
+      ]
+    },
+    {
+      "id": "Z10",
+      "title": "zustand: devtools stack trace parsing",
+      "tier": "complex",
+      "category": "reasoning",
+      "prompt": "Trace how devtools (zustand/src/middleware/devtools.ts) matches a Redux DevTools action back to its caller. Name the function responsible, and the two regex patterns it uses to parse a stack trace line (one per JS engine family). Do not edit files.",
+      "requirements": [
+        "filesystem",
+        "tools"
+      ],
+      "timeout_seconds": 240,
+      "checks": [
+        {
+          "type": "response_contains",
+          "values": [
+            "findCallerName",
+            "v8StackLineRe",
+            "geckoStackLineRe"
+          ],
+          "weight": 3
+        },
+        {
+          "type": "evidence_paths_exist",
+          "minimum": 1,
+          "weight": 1
+        },
+        {
+          "type": "no_changes",
+          "weight": 1
+        }
+      ],
+      "rubric": [
+        "The answer states the correct fact(s) with exact repository-relative paths",
+        "Claims are supported by evidence gathered via tool calls, not guessed",
+        "No workspace mutation occurs"
+      ]
+    },
+    {
+      "id": "O01",
+      "title": "openui: CLI framework",
+      "tier": "basic",
+      "category": "task_understanding",
+      "prompt": "Inspect the openui repository. The openui-cli package (packages/openui-cli/src/index.ts) defines its commands using a third-party CLI framework library. Name it and cite the import line. Do not edit files.",
+      "requirements": [
+        "filesystem",
+        "tools"
+      ],
+      "timeout_seconds": 240,
+      "checks": [
+        {
+          "type": "response_contains",
+          "values": [
+            "commander",
+            "openui-cli/src/index.ts"
+          ],
+          "weight": 3
+        },
+        {
+          "type": "evidence_paths_exist",
+          "minimum": 1,
+          "weight": 1
+        },
+        {
+          "type": "no_changes",
+          "weight": 1
+        }
+      ],
+      "rubric": [
+        "The answer states the correct fact(s) with exact repository-relative paths",
+        "Claims are supported by evidence gathered via tool calls, not guessed",
+        "No workspace mutation occurs"
+      ]
+    },
+    {
+      "id": "O02",
+      "title": "openui: tokenizer entry point",
+      "tier": "basic",
+      "category": "tool_use",
+      "prompt": "In @openuidev/lang-core, which single function (and file) turns raw openui-lang source text into a list of tokens? Do not edit files.",
+      "requirements": [
+        "filesystem",
+        "tools"
+      ],
+      "timeout_seconds": 240,
+      "checks": [
+        {
+          "type": "response_contains",
+          "values": [
+            "tokenize",
+            "lexer.ts"
+          ],
+          "weight": 3
+        },
+        {
+          "type": "evidence_paths_exist",
+          "minimum": 1,
+          "weight": 1
+        },
+        {
+          "type": "no_changes",
+          "weight": 1
+        }
+      ],
+      "rubric": [
+        "The answer states the correct fact(s) with exact repository-relative paths",
+        "Claims are supported by evidence gathered via tool calls, not guessed",
+        "No workspace mutation occurs"
+      ]
+    },
+    {
+      "id": "O03",
+      "title": "openui: monorepo package names",
+      "tier": "core",
+      "category": "task_understanding",
+      "prompt": "Name the exact npm package names (as declared in each package.json) for the CLI package and the React component package in the openui monorepo. Do not edit files.",
+      "requirements": [
+        "filesystem",
+        "tools"
+      ],
+      "timeout_seconds": 240,
+      "checks": [
+        {
+          "type": "response_contains",
+          "values": [
+            "@openuidev/cli",
+            "@openuidev/react-ui"
+          ],
+          "weight": 3
+        },
+        {
+          "type": "evidence_paths_exist",
+          "minimum": 1,
+          "weight": 1
+        },
+        {
+          "type": "no_changes",
+          "weight": 1
+        }
+      ],
+      "rubric": [
+        "The answer states the correct fact(s) with exact repository-relative paths",
+        "Claims are supported by evidence gathered via tool calls, not guessed",
+        "No workspace mutation occurs"
+      ]
+    },
+    {
+      "id": "O04",
+      "title": "openui: lazy builtins",
+      "tier": "core",
+      "category": "reasoning",
+      "prompt": "lang-core's public API re-exports a LAZY_BUILTINS set alongside BUILTINS. Cite the file where both are defined and name the one builtin currently in LAZY_BUILTINS. Do not edit files.",
+      "requirements": [
+        "filesystem",
+        "tools"
+      ],
+      "timeout_seconds": 240,
+      "checks": [
+        {
+          "type": "response_contains",
+          "values": [
+            "LAZY_BUILTINS",
+            "Each",
+            "builtins.ts"
+          ],
+          "weight": 3
+        },
+        {
+          "type": "evidence_paths_exist",
+          "minimum": 1,
+          "weight": 1
+        },
+        {
+          "type": "no_changes",
+          "weight": 1
+        }
+      ],
+      "rubric": [
+        "The answer states the correct fact(s) with exact repository-relative paths",
+        "Claims are supported by evidence gathered via tool calls, not guessed",
+        "No workspace mutation occurs"
+      ]
+    },
+    {
+      "id": "O05",
+      "title": "openui: reserved call names",
+      "tier": "core",
+      "category": "reasoning",
+      "prompt": "Two call names are reserved outside the normal builtin set in builtins.ts. Name them and the exact constant that declares them. Do not edit files.",
+      "requirements": [
+        "filesystem",
+        "tools"
+      ],
+      "timeout_seconds": 240,
+      "checks": [
+        {
+          "type": "response_contains",
+          "values": [
+            "RESERVED_CALLS",
+            "Query",
+            "Mutation"
+          ],
+          "weight": 3
+        },
+        {
+          "type": "evidence_paths_exist",
+          "minimum": 1,
+          "weight": 1
+        },
+        {
+          "type": "no_changes",
+          "weight": 1
+        }
+      ],
+      "rubric": [
+        "The answer states the correct fact(s) with exact repository-relative paths",
+        "Claims are supported by evidence gathered via tool calls, not guessed",
+        "No workspace mutation occurs"
+      ]
+    },
+    {
+      "id": "O06",
+      "title": "openui: reactive Store shape",
+      "tier": "advanced",
+      "category": "reasoning",
+      "prompt": "runtime/store.ts defines a Store interface and a createStore() factory. Cite the file and list every member the Store interface declares. Do not edit files.",
+      "requirements": [
+        "filesystem",
+        "tools"
+      ],
+      "timeout_seconds": 240,
+      "checks": [
+        {
+          "type": "response_contains",
+          "values": [
+            "store.ts",
+            "getSnapshot",
+            "subscribe",
+            "initialize"
+          ],
+          "weight": 3
+        },
+        {
+          "type": "evidence_paths_exist",
+          "minimum": 1,
+          "weight": 1
+        },
+        {
+          "type": "no_changes",
+          "weight": 1
+        }
+      ],
+      "rubric": [
+        "The answer states the correct fact(s) with exact repository-relative paths",
+        "Claims are supported by evidence gathered via tool calls, not guessed",
+        "No workspace mutation occurs"
+      ]
+    },
+    {
+      "id": "O07",
+      "title": "openui: private evaluator helpers",
+      "tier": "advanced",
+      "category": "reasoning",
+      "prompt": "runtime/evaluator.ts exports an evaluate() function alongside several module-private helpers. Name the two internal (unexported) helper functions used to inline an element node and a prop node respectively. Do not edit files.",
+      "requirements": [
+        "filesystem",
+        "tools"
+      ],
+      "timeout_seconds": 240,
+      "checks": [
+        {
+          "type": "response_contains",
+          "values": [
+            "evaluateElementInline",
+            "evaluatePropInline",
+            "evaluator.ts"
+          ],
+          "weight": 3
+        },
+        {
+          "type": "evidence_paths_exist",
+          "minimum": 1,
+          "weight": 1
+        },
+        {
+          "type": "no_changes",
+          "weight": 1
+        }
+      ],
+      "rubric": [
+        "The answer states the correct fact(s) with exact repository-relative paths",
+        "Claims are supported by evidence gathered via tool calls, not guessed",
+        "No workspace mutation occurs"
+      ]
+    },
+    {
+      "id": "O08",
+      "title": "openui: variable substitution in AST",
+      "tier": "advanced",
+      "category": "efficiency",
+      "prompt": "Which module-private function in runtime/evaluator.ts substitutes a bound variable reference inside an AST node (used, for example, when evaluating the lazy Each builtin over a loop variable)? Cite its exact signature (parameter names and types). Do not edit files.",
+      "requirements": [
+        "filesystem",
+        "tools"
+      ],
+      "timeout_seconds": 240,
+      "checks": [
+        {
+          "type": "response_contains",
+          "values": [
+            "substituteRef",
+            "varName",
+            "evaluator.ts"
+          ],
+          "weight": 3
+        },
+        {
+          "type": "evidence_paths_exist",
+          "minimum": 1,
+          "weight": 1
+        },
+        {
+          "type": "no_changes",
+          "weight": 1
+        }
+      ],
+      "rubric": [
+        "The answer states the correct fact(s) with exact repository-relative paths",
+        "Claims are supported by evidence gathered via tool calls, not guessed",
+        "No workspace mutation occurs"
+      ]
+    },
+    {
+      "id": "O09",
+      "title": "openui: CLI generate command wiring",
+      "tier": "advanced",
+      "category": "end_to_end",
+      "prompt": "Trace how the CLI's generate command is wired: which two named symbols does packages/openui-cli/src/index.ts import from ./commands/generate, and what are their exact declared signatures/kinds in that file (an interface and a function)? Do not edit files.",
+      "requirements": [
+        "filesystem",
+        "tools"
+      ],
+      "timeout_seconds": 240,
+      "checks": [
+        {
+          "type": "response_contains",
+          "values": [
+            "GenerateOptions",
+            "runGenerate",
+            "generate.ts"
+          ],
+          "weight": 3
+        },
+        {
+          "type": "evidence_paths_exist",
+          "minimum": 1,
+          "weight": 1
+        },
+        {
+          "type": "no_changes",
+          "weight": 1
+        }
+      ],
+      "rubric": [
+        "The answer states the correct fact(s) with exact repository-relative paths",
+        "Claims are supported by evidence gathered via tool calls, not guessed",
+        "No workspace mutation occurs"
+      ]
+    },
+    {
+      "id": "O10",
+      "title": "openui: shared parser module",
+      "tier": "complex",
+      "category": "reasoning",
+      "prompt": "Both packages/lang-core/src/index.ts and packages/lang-core/src/parser/index.ts re-export a createParser/parse pair. Name the underlying file both ultimately resolve to, and list the three named exports shared between the two index files. Do not edit files.",
+      "requirements": [
+        "filesystem",
+        "tools"
+      ],
+      "timeout_seconds": 240,
+      "checks": [
+        {
+          "type": "response_contains",
+          "values": [
+            "createParser",
+            "createStreamingParser",
+            "parse",
+            "parser.ts"
+          ],
+          "weight": 3
+        },
+        {
+          "type": "evidence_paths_exist",
+          "minimum": 1,
+          "weight": 1
+        },
+        {
+          "type": "no_changes",
+          "weight": 1
+        }
+      ],
+      "rubric": [
+        "The answer states the correct fact(s) with exact repository-relative paths",
+        "Claims are supported by evidence gathered via tool calls, not guessed",
+        "No workspace mutation occurs"
+      ]
+    }
+  ]
+}

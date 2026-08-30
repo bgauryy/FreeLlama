@@ -1,0 +1,7 @@
+{
+  "name": "freellama-native",
+  "private": true,
+  "type": "commonjs",
+  "main": "index.js",
+  "types": "index.d.ts"
+}

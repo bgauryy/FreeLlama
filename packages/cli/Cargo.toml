@@ -1,0 +1,24 @@
+[package]
+name = "freellama-cli"
+description = "Command-line interface for FreeLlama — proxy, serve, route, benchmark"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# The binary keeps the name `freellama`; only the package name changed.
+[[bin]]
+name = "freellama"
+path = "src/main.rs"
+
+[dependencies]
+freellama = { package = "freellama-core", path = "../rust-core" }
+anyhow.workspace = true
+clap.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

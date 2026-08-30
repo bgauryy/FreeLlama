@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://freellama.local/schemas/trial.schema.json",
+  "type": "object",
+  "required": ["schema_version", "runner_version", "benchmark_date", "suite_review", "suite_visibility", "suite_id", "suite_version", "run_id", "model", "task", "trial", "status", "timing", "usage", "trajectory", "workspace", "grading", "artifacts"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "runner_version": {"type": "string"},
+    "benchmark_date": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"},
+    "suite_review": {"type": "object", "required": ["last_reviewed_at", "review_due_at", "fresh"]},
+    "suite_visibility": {"enum": ["public_development", "private_held_out"]},
+    "suite_id": {"type": "string"},
+    "suite_version": {"type": "string"},
+    "run_id": {"type": "string"},
+    "model": {"type": "object", "required": ["id"], "properties": {"id": {"type": "string"}, "agent": {"type": "string"}, "metadata": {"type": "object"}}},
+    "task": {"type": "object", "required": ["id", "title", "tier", "category", "requirements"]},
+    "trial": {"type": "integer", "minimum": 1},
+    "status": {"enum": ["passed", "failed", "error", "timeout", "not_applicable"]},
+    "timing": {"type": "object", "required": ["wall_ms"], "properties": {"wall_ms": {"type": "number", "minimum": 0}, "cpu_user_ms": {"type": ["number", "null"]}, "cpu_system_ms": {"type": ["number", "null"]}, "peak_rss_kb": {"type": ["number", "null"]}}},
+    "usage": {"type": "object", "required": ["prompt_chars", "response_chars", "tool_result_chars"], "properties": {"prompt_chars": {"type": "integer"}, "response_chars": {"type": "integer"}, "tool_result_chars": {"type": "integer"}, "input_tokens": {"type": ["integer", "null"]}, "output_tokens": {"type": ["integer", "null"]}, "cache_read_tokens": {"type": ["integer", "null"]}, "cache_write_tokens": {"type": ["integer", "null"]}, "cache_hit_ratio": {"type": ["number", "null"]}}},
+    "trajectory": {"type": "object", "required": ["tool_calls", "tool_call_count", "failed_tool_calls", "retries"], "properties": {"tool_calls": {"type": "array"}, "tool_call_count": {"type": "integer"}, "failed_tool_calls": {"type": "integer"}, "retries": {"type": "integer"}}},
+    "workspace": {"type": "object", "required": ["changed_files", "change_count", "baseline_hash", "final_hash"]},
+    "grading": {"type": "object", "required": ["deterministic", "judge", "efficiency", "composite"]},
+    "artifacts": {"type": "object", "required": ["trial_json", "stdout", "stderr", "prompt"]}
+  },
+  "additionalProperties": true
+}
