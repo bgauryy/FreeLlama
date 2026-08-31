@@ -610,7 +610,7 @@ fn ollama_cli_output(executable: &Path) -> std::io::Result<(String, String)> {
 ///
 /// Single source of truth for the two timeout knobs. `FREELLAMA_CONTROL_TIMEOUT_SECONDS` (30s,
 /// small reads of in-memory state) and `FREELLAMA_TASK_TIMEOUT_SECONDS` (900s, a real generation)
-/// were each parsed by three separate copies of this function — in `napi.rs`, `platform.rs` and
+/// were each parsed by three separate copies of this function — in `napi.rs`, `platform/mod.rs` and
 /// the CLI. All three happened to agree on the defaults, so nothing was broken; but one contract
 /// maintained in three places is a divergence waiting to happen, and nothing would have caught it.
 ///

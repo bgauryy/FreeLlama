@@ -307,4 +307,4 @@ proxy added 0.330ms median transport overhead and no speedup. **Use Ollama direc
 raw speed for one exact model.** FreeLlama's value is the token offload above, plus policy,
 admission, and evidence.
 
-For endpoint details, run `cargo run -- --help` or inspect `packages/rust-core/src/platform.rs`.
+For endpoint details, run `cargo run -- --help` or inspect `packages/rust-core/src/platform/`.

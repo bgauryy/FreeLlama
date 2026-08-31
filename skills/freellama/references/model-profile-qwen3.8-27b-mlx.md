@@ -28,7 +28,7 @@ Cost: 1 tool call, 2,035 input / 256 output tokens. **This is the killer use cas
 verifiable-by-construction (it cites paths you can check).**
 
 ### 2. Long-context retrieval — ✅ Strong
-Given the full `packages/rust-core/src/platform.rs` (11,499 prompt tokens) and asked to find a specific special-cased
+Given the full `platform` module (11,499 prompt tokens, now split across `packages/rust-core/src/platform/{mod,routing,intent}.rs`) and asked to find a specific special-cased
 model/task/num_ctx combination buried in the middle. **Correct model tag, correct num_ctx value,
 correct containing function, verbatim code citation** — 7.4s to answer. Minor terminology looseness
 (called the containing function's name when the precise identifier was a local variable inside it)

@@ -182,7 +182,7 @@ flat file for sqlite-vec or LanceDB when it outgrows one.
 
 Measured over 242 chunks of this repo's Rust source, top-1 retrieval got 2 of 3. The failure is
 worth more than the successes: *"how does it avoid loading two models into memory"* returned
-`lib.rs` instead of `platform.rs`, and has now missed in two independent runs. `platform.rs` never
+`lib.rs` instead of `platform/mod.rs`, and has now missed in two independent runs. `platform/mod.rs` never
 uses the phrase — it says `managed_execution`, `RwLock`, "admission permit". **Embeddings match how
 text is phrased, and code routinely names a concept in vocabulary that looks nothing like the
 question.** When you can guess the identifier, grep finds it instantly and exactly. Reach for

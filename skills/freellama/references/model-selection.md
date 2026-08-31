@@ -10,10 +10,10 @@ agent-facing equivalent is `search_models`.)
   16384 for ≥2GB, 32768 for small models), capped by the model's own advertised context.
   `BenchmarkConfiguration` defaults: `num_predict=128`, `temperature=0`, `seed=42`, `think=false`,
   `keep_alive="5m"`.
-- `packages/rust-core/src/platform.rs::profile()` — per-task-type tuning (e.g. Browser→64 tokens, Tools→256,
+- `packages/rust-core/src/platform/routing.rs::profile()` — per-task-type tuning (e.g. Browser→64 tokens, Tools→256,
   CodeRepair→2048, Embedding→0), plus a `qwen_repair_profile` special-case pinning `num_ctx=8192`
   for `qwen3.8:27b-mlx` on code-repair specifically.
-- `packages/rust-core/src/platform.rs`'s `managed_execution: Arc<RwLock<()>>` — resident-model tasks take a shared read
+- `packages/rust-core/src/platform/mod.rs`'s `managed_execution: Arc<RwLock<()>>` — resident-model tasks take a shared read
   lock (can run concurrently), a model-swap (nonresident) task takes an exclusive write lock, so
   model transitions don't race each other.
 

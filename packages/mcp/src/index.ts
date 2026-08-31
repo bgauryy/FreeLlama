@@ -344,7 +344,7 @@ const objectiveParam = z
   .enum(["fastest", "balanced", "quality"])
   .optional()
   .describe('"balanced"/"quality" need a configured policy; "fastest" does not');
-// The server grades every route decision (`route_evidence` in packages/rust-core/src/platform.rs): "medium" only
+// The server grades every route decision (`route_evidence` in packages/rust-core/src/platform/routing.rs): "medium" only
 // when the task has BOTH a configured policy and benchmark data, "low" otherwise — there is no
 // "high". A "low"/capability_metadata_only decision is exactly what returned `qwen2.5:0.5b` for
 // code repair on this machine. Unchecked, that answer comes back looking like any other.
@@ -615,7 +615,7 @@ server.registerTool(
       minConfidence: minConfidenceParam,
     },
     // NOT marked read-only, despite "decision only": passing `sessionId` makes the server bind
-    // that session to the selected model (packages/rust-core/src/platform.rs `route()` -> `sessions.write().bind`),
+    // that session to the selected model (packages/rust-core/src/platform/mod.rs `route()` -> `sessions.write().bind`),
     // which is a real state change. Without `sessionId` it is pure computation, but annotations
     // are per-tool, not per-argument, so the honest answer is the conservative one. Additive
     // (never removes anything) and idempotent (re-binding the same pair is a no-op).

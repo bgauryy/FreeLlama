@@ -77,7 +77,7 @@ fn jitter() -> Duration {
 
 /// Backoff before retrying `attempt` (1-indexed): `RETRY_BASE_DELAY * 2^(attempt-1)` plus jitter.
 ///
-/// Shared with the managed-task path in `platform.rs` so both retry-capable callers use one
+/// Shared with the managed-task path in `platform/mod.rs` so both retry-capable callers use one
 /// backoff policy rather than drifting apart — the passthrough and the managed plane hit the same
 /// Ollama, and a divergent schedule on one of them is a bug nobody would notice until it hurt.
 pub(crate) fn retry_delay(attempt: u32) -> Duration {
