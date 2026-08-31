@@ -1,232 +1,160 @@
-# Task delegation: what to offload to the local model, guided by the big LLM
+# What to offload, what to keep, and how to read the answer
 
-Load before choosing what to hand the `delegate_research` MCP tool, or before trusting its answer
-unsupervised.
+Load before choosing what to hand `run_task` or `delegate_research`, or before trusting an answer
+unsupervised. Every claim below traces to a measurement in this repo unless marked as external.
 
-This is the decision framework for any large/frontier orchestrating model (etc.) orchestrating a local
-model via `packages/mcp`'s tools. It's grounded primarily in evidence gathered *in this repo, this
-session* — not just general industry practice — with external research filling in the parts not
-directly tested here.
+## This is delegation, not distillation
 
-## This is delegation, not distillation — they're different techniques
-
-**Knowledge distillation** is a *training-time* technique: collect a large "teacher" model's
-outputs on many examples, then fine-tune a smaller "student" model to mimic them, permanently
-baking some of the teacher's capability into the student's weights
+**Knowledge distillation** is a *training-time* technique: collect a teacher model's outputs, then
+fine-tune a student to mimic them, baking capability into weights
 ([Lightly](https://www.lightly.ai/blog/knowledge-distillation),
-[Springer](https://link.springer.com/article/10.1007/s10462-025-11423-3)). FreeLlama does none of
-this today — there's no fine-tuning pipeline, no training data collection, no student model being
-updated.
+[Springer](https://link.springer.com/article/10.1007/s10462-025-11423-3)). FreeLlama does none of it
+— no fine-tuning, no training-data collection, no student being updated.
 
-**What `delegate_research` does is runtime task delegation**: the small model runs as-is, un-modified,
-and simply gets handed narrow, verifiable work it's already good at — no training involved. This is
-sometimes described loosely as "distillation-style usage" in casual conversation, but it's a
-different technique (orchestration/routing) with a different cost profile: no training cost, no
-permanent capability transfer, but also no improvement to the small model itself — every session
-starts from the same competence baseline documented in `model-profile-qwen3.8-27b-mlx.md`.
+**What `delegate_research` does is runtime task delegation**: the small model runs as-is and is
+handed narrow, verifiable work it is already good at. Different cost profile: no training cost, no
+permanent capability transfer — and no improvement to the small model either. Every session starts
+from the same competence baseline in `references/model-profile-qwen3.8-27b-mlx.md`. Real distillation
+(collecting verified question/answer pairs and fine-tuning) is separate, unbuilt work.
 
-If you actually wanted distillation (a small model that gets *better* over time at your specific
-tasks), that's separate, unbuilt work: collecting (question, verified-correct-answer) pairs from
-sessions like this one and fine-tuning on them — plausible future work, not something delegation
-alone gives you.
+## The two offload tools
 
-## Two offloading tools: `run_task` and `delegate_research`
+`route` / `doctor` / `models` / `search_models` only make *selection* decisions — they never do work.
 
-`route`/`doctor`/`models` only make a *selection* decision — they never do work. (`recommend` is
-not on the MCP surface; it exists over HTTP and in the CLI only. Use `search_models`.)
-Two other tools do: `run_task` routes and executes an ordinary chat/completion/embedding call in
-one shot — the general-purpose offload path. `delegate_research` is the specialized one: it hands
-a question to a local model wired up with the `octocode` CLI and returns a grounded, citable
-answer with an evidence trail, at the cost of a heavier subprocess spawn. Use `run_task` by
-default; reach for `delegate_research` specifically when you need the citable evidence trail (a
-code-research question you want to be able to spot-check) rather than just an answer.
-Verified end-to-end: a real question about this repo's own `Cargo.toml` answered correctly in one
-call, 8K tokens spent entirely on the local model, zero cost to the orchestrator's own context.
+- **`run_task`** routes and executes one chat/generate/embed/vision call in one shot from content
+  **you** supply. The general-purpose path. Use it by default.
+- **`delegate_research`** hands a question to a local model wired to a shell (or `octocode`) agent
+  inside `workspacePath` and returns a grounded, citable answer with an evidence trail — at the cost
+  of a heavier subprocess spawn. Reach for it specifically when you need the citable trail.
 
-## Delegate freely (verified, high confidence)
+Verified end-to-end: a real question about FreeLlama's own [`Cargo.toml`](https://github.com/bgauryy/FreeLlama/blob/main/Cargo.toml) answered correctly in one
+call, 8K tokens spent entirely on the local model, zero cost to the orchestrator's context.
 
-- **Grounded code search / "where is X" / "what does Y do" / "find every call site of Z"** —
-  98.9% measured accuracy across 100+ real questions on real codebases (`model-profile-qwen3.8-27b-mlx.md`),
-  because the model must cite file:line evidence, which makes wrongness cheap to catch and mostly
-  self-correcting (a wrong citation is obviously wrong on inspection).
-- **Long-context fact retrieval** — verified correct on an 11K-token file with a specific fact
-  buried in the middle, 7.4s.
-- **Honesty-sensitive lookups** ("does X exist") — verified it refuses to fabricate under direct
-  pressure (a nonexistent function name, a fictional historical event).
-- **Summarization, refactoring suggestions, unit-test generation, documentation drafts** —
-  not directly tested in this repo, but consistent with the accuracy pattern above (retrieval- and
-  generation-heavy, not judgment-heavy) and matches general industry guidance: "leverage massive
-  local context windows for development tasks such as refactoring, generating unit tests, and
-  documentation" ([nOps](https://www.nops.io/blog/llm-cost-optimization-tips/)).
+## Delegate freely — verified, high confidence
 
-## Delegate with mandatory verification (real failure modes measured here)
+- **Grounded code search** ("where is X", "what does Y do", "every call site of Z") — 98.9% measured
+  accuracy across 100+ real questions on real codebases, because the model must cite `file:line`,
+  which makes wrongness cheap to catch and mostly self-correcting.
+- **Long-context fact retrieval** — correct on an 11K-token file with the fact buried mid-file, 7.4s.
+- **Honesty-sensitive lookups** ("does X exist") — refuses to fabricate under direct pressure,
+  tested with a nonexistent function name and a fictional historical event.
+- **Summarization, refactoring suggestions, unit-test generation, doc drafts** — not directly tested
+  here, but retrieval- and generation-shaped rather than judgment-shaped, and consistent with
+  general guidance on using large local context windows for exactly this
+  ([nOps](https://www.nops.io/blog/llm-cost-optimization-tips/)).
 
-- **Code review / bug-finding** — only ~67% real accuracy on this model: it hallucinated a
-  nonexistent control-flow bug and made a factual error about a well-known crate's API, **stated
-  with the same confident tone as its correct findings**. Use it to generate review candidates,
-  never to approve them. Re-derive the ground truth for anything it flags before acting on it.
-- **Multi-step arithmetic/logic with a "twist"** (re-splitting a bill, an age-ratio puzzle) — 3
-  real errors out of 100 challenges, all in this category. Simple lookups and single-step
-  arithmetic were fine; problems requiring two chained computations were where it broke.
-- **Anything where `route --objective fastest` picked the model with no policy configured** —
-  verified to pick by capability metadata alone (a 0.5B model was selected for code-repair). Only
-  trust `balanced`/`quality` routes backed by an evaluated policy, or an explicitly named model.
+## Delegate only with mandatory verification
+
+- **Code review / bug-finding** — ~67% real accuracy. It hallucinated a nonexistent control-flow bug
+  and misstated a well-known crate's API, **in the same confident tone as its correct findings**.
+  Use it to generate review candidates, never to approve them.
+- **Multi-step arithmetic or logic with a twist** — 3 errors out of 100 challenges, all in this
+  category. Single-step arithmetic was fine; two chained computations were where it broke.
+- **Anything picked by a zero-config `route --objective fastest`** — it selects on capability
+  metadata alone. → `references/model-selection.md`
 
 ## Don't bother delegating
 
-- **Trivial tasks cheaper to just do inline.** Research confirms multi-agent/delegation overhead
-  is real: "agent teams use ~7x more tokens than standard sessions" and un-optimized multi-agent
-  systems can consume "4-15x more tokens than simple single calls"
-  ([MindStudio](https://www.mindstudio.ai/blog/ai-orchestrator-cheaper-sub-agent-models)). A
-  question answerable from context already in hand, or a one-line lookup, isn't worth a
-  subprocess spawn + model load + tool-call round trip (this repo's own measurements: ~10-100s and
-  several thousand tokens *on the local side* per `delegate_research` call). Delegate when the
-  question requires reading real files the orchestrator doesn't already have loaded — that's where
-  the token savings (on the *orchestrator's* side) actually materialize.
-- **Reasoning tasks without `think:true`.** A local model call with thinking disabled will guess
-  fast and wrong on anything requiring actual multi-step reasoning (verified: instant wrong
-  answers on math word problems with `think:false`). `delegate_research`'s underlying adapter
-  already forces the right mode for grounded search; don't reuse the same pattern for pure
-  reasoning tasks without checking which mode is active.
+- **Trivial work.** A question answerable from context in hand, or a one-line lookup, is not worth a
+  subprocess spawn, model load, and tool-call round trip (~10-100s and several thousand tokens on
+  the local side). Delegation overhead is real and externally documented: agent teams use ~7× more
+  tokens than standard sessions, and un-optimized multi-agent systems 4-15× more than single calls
+  ([MindStudio](https://www.mindstudio.ai/blog/ai-orchestrator-cheaper-sub-agent-models)).
+- **Reasoning without `think:true`.** With thinking disabled the model guesses fast and wrong on
+  anything multi-step (verified: instant wrong answers on math word problems).
+  `delegate_research`'s adapter already forces the right mode for grounded search — do not reuse
+  that pattern for pure reasoning without checking which mode is active.
 
-## Cost-reduction hierarchy (external best practice, not yet tested here)
+## What the local model is genuinely cheapest at
 
-Applies above and beyond task-type delegation, per current guidance
-([Wavect](https://wavect.io/blog/reduce-llm-token-costs-2026/),
-[Obvious Works](https://www.obviousworks.ch/en/token-optimization-saves-up-to-80-percent-llm-costs/)):
-
-1. **Prompt caching** first (up to ~90% off cached input) — applies to the orchestrator's own
-   calls, not the local model.
-2. **Confidence-gated waterfall routing** — try the cheap/local model first, escalate to the
-   frontier model only when the local answer looks uncertain or the task is out of the local
-   model's verified-good zone above. Reported industry result: ~95% of frontier quality at
-   75-85% lower cost.
-3. **Right-sizing**: open-weight local models run "15 to 30x cheaper per token" than frontier
-   APIs when the task is actually in their competence zone — which is exactly why getting the
-   competence zone right (the sections above) matters more than the raw cost ratio.
-
-## Practical rule of thumb
-
-> Delegate anything the local model can *prove* by citing evidence you can check in one glance.
-> Keep anything requiring judgment, synthesis across ambiguous tradeoffs, or multi-step reasoning
-> without visible work — or verify it exhaustively before trusting it, exactly as this whole
-> document was built: every claim above traces back to a specific test in this session, not to
-> the model's or a vendor's own claims about itself.
-
-Next: see `references/model-profile-qwen3.8-27b-mlx.md` for the underlying per-field evidence, or
-`references/disk-cleanup.md` for the human-approval rule `ollama_delete` shares with this tool.
-
-## Sources
-
-- [How to Cut LLM Token Costs in 2026: Routing, Caching, Compression, and the Right Model](https://wavect.io/blog/reduce-llm-token-costs-2026/)
-- [How to Build an AI Orchestrator That Delegates to Cheaper Sub-Agent Models](https://www.mindstudio.ai/blog/ai-orchestrator-cheaper-sub-agent-models)
-- [Token optimization 2026: Saving up to 80% LLM costs](https://www.obviousworks.ch/en/token-optimization-saves-up-to-80-percent-llm-costs/)
-- [LLM Cost Optimization: 10 Tips to Reduce AI Inference & Token Costs](https://www.nops.io/blog/llm-cost-optimization-tips/)
-- `model-profile-qwen3.8-27b-mlx.md` (this skill) — the underlying verified evidence for every
-  "delegate freely" / "verify first" claim above.
-
-## What the local model is genuinely cheapest at — measured, and one negative result
-
-Ranked by value per second on this machine. The ordering matters more than the numbers: the
-cheapest work is the work that is *not a generation task*.
+Ranked by value per second. The ordering matters more than the numbers: **the cheapest work is the
+work that is not a generation task.**
 
 | Work | Measured | Verdict |
 |---|---|---|
 | **Embeddings** via `run_task` | 322 chunks / 159k local tokens in **9.6s** (30ms/chunk), 0 tokens returned | Strongest use by a wide margin — no sampling, so nothing to hallucinate |
-| Near-duplicate / clustering | 96 documents embedded in **2.9s** (31ms/doc) | Strong. Finds overlap with *no keyword*, which grep cannot do |
-| Image work | ~17-45s per image on `qwen3.8:27b-mlx` | Works, but not fast |
-| One grounded question | 7-40s for ~150 tokens back | Worth it past ~1k tokens of source; see the economics above |
-| **Semantic search over code** | **Lost to grep** | **Do not use** |
+| Near-duplicate / clustering | 96 documents embedded in **2.9s** (31ms/doc) | Strong. Finds overlap with *no keyword*, which `grep` cannot do |
+| Image work | ~10-45s per image | Works, but not fast |
+| One grounded question | 7-62s for ~150-450 tokens back | Worth it past ~1k tokens of source |
+| **Semantic search over code** | **Lost to `grep`** | **Do not use** |
 
 ### The negative result, recorded so it is not rediscovered
 
-Two separate attempts to use a local model for *finding relevant code* both failed against plain
-`grep`:
+Two attempts to use a local model for *finding relevant code* both lost to plain `grep`:
 
-- **Local model as a file filter**: 4/6 recall across 153 files, taking 24-39s. `grep` is exact and
-  instant. `gemma4:12b-mlx` and `qwen3.8:27b-mlx` scored the same 4/6 — the larger model did not
-  help, because ranking files is not the thing model size buys you.
-- **Embedding search on a keyword-shaped question**: asked "how does it avoid loading two models
-  into memory at the same time", the correct file did not appear in the top 3.
+- **Local model as a file filter**: 4/6 recall across 153 files, 24-39s. `grep` is exact and
+  instant. `gemma4:12b-mlx` and `qwen3.8:27b-mlx` scored the *same* 4/6 — ranking files is not what
+  model size buys you.
+- **Embedding search**: over 152 chunks with 6 questions and known-correct files, `nomic-embed-text`
+  scored 5/6 recall@3. Re-run over 242 chunks of this repo's Rust source, top-1 got 2 of 3.
 
-**Correction, from a larger sample.** That bullet rested on a *single* question. Re-run properly
-over 152 chunks with 6 questions and known-correct files, `nomic-embed-text` scored **5/6
-recall@3** — materially better than one failure suggested. The honest boundary is narrower than
-"embeddings lose to grep": **grep wins when you know the keyword**, which for code you usually do.
-Embeddings win when there is no keyword — grouping, deduplication, classification, similarity.
+The failure is worth more than the successes. *"How does it avoid loading two models into memory"*
+returned `lib.rs` instead of `platform/mod.rs`, and has now missed in two independent runs, because
+`platform/mod.rs` never uses that phrase — it says `managed_execution`, `RwLock`, "admission
+permit". **Embeddings match how text is phrased, and code routinely names a concept in vocabulary
+that looks nothing like the question.**
 
-Model choice matters, and popularity does not predict it: `qwen3-embedding` ranks first on
-ollama.com and scored **4/6 at 3.5x the indexing cost** of `nomic-embed-text` (5/6, 274MB).
-`embeddinggemma:300m` tied on quality at twice the size.
+So the honest boundary is narrower than "embeddings lose to grep": **`grep` wins when you know the
+keyword, which for code you usually do. Embeddings win when there is no keyword** — grouping,
+deduplication, classification, similarity. Same lesson the octocode-vs-bash benchmark recorded from
+the other direction: the structured search tool lost to raw shell on every model tested.
 
-This is the same lesson the octocode-vs-bash benchmark already recorded from the other direction:
-the structured search tool lost to raw shell on every model tested. **For code, deterministic
-search beats a local model on accuracy, latency, and cost simultaneously.** Reach for embeddings
-when there is no keyword to search for — grouping, dedup, classification — not when there is.
+### Similarity is a candidate, not a verdict
 
-### Caution: similarity is a candidate, not a verdict
+The duplicate-document scan rated two of this repo's docs at 0.949 similarity. Inspection showed
+they are not redundant at all — one documents admission permits, the catalog cache, and the product
+boundary, none of which appear in the other. High cosine similarity means *"about the same
+subject"*, not *"one can be deleted"*. Read the candidates before acting on a score.
 
-The duplicate-document scan above rated `README.md` and `docs/ARCHITECTURE.md` at 0.949 similarity.
-Inspection showed they are not redundant at all — ARCHITECTURE.md documents admission permits, the
-30-second catalog cache, and the product boundary, none of which appear in README. High cosine
-similarity means *"about the same subject"*, not *"one can be deleted"*. Always read the candidates
-before acting on a score.
+### Local RAG, if you actually need it
 
-## Local RAG, if you actually need it
-
-`examples/local-rag.sh` is a working ~40-line pattern: `freellama task --task embedding
---input-file` produces the vectors, and `jq` does cosine + top-k. **FreeLlama owns no vector
-store**, deliberately — persistence is a standing non-goal, and a stale index fails *silently*,
-returning confidently wrong files as the corpus drifts. You own storage and staleness; swap the
-flat file for sqlite-vec or LanceDB when it outgrows one.
-
-Measured over 242 chunks of this repo's Rust source, top-1 retrieval got 2 of 3. The failure is
-worth more than the successes: *"how does it avoid loading two models into memory"* returned
-`lib.rs` instead of `platform/mod.rs`, and has now missed in two independent runs. `platform/mod.rs` never
-uses the phrase — it says `managed_execution`, `RwLock`, "admission permit". **Embeddings match how
-text is phrased, and code routinely names a concept in vocabulary that looks nothing like the
-question.** When you can guess the identifier, grep finds it instantly and exactly. Reach for
-embeddings when you cannot.
-
-## Finding a model you do not have yet
-
-`search_models` is two steps and the second is not optional:
-
-1. **Search** (`capabilities`, `query`) returns *family* names, popular-ordered. A family is **not
-   pullable**. `cloudOnly` marks models that only run on Ollama's hosted service.
-2. **Inspect** (`model: "<family>"`) returns each tag with its size, context window, and
-   `fitsInMemory` computed against this machine — plus the largest tag that fits.
-
-Pulling from step 1 alone means guessing the size, which is how a 143GB tag ends up looking like a
-candidate on a 48GB machine.
-
-Step 2 **fails closed**: with `freellama serve` unreachable there is no machine profile, so memory
-fit cannot be computed and **no tag is recommended** — you get `recommendationUnavailable` saying
-so, rather than a confident pick. This matters because the earlier fail-open version, asked with
-serve down, recommended the 143GB `qwen3-vl:235b`. If you see that field, start `serve` and ask
-again; do not fall back to picking the biggest tag yourself.
+`examples/local-rag.sh` is a working ~40-line pattern: `npx freellama task --task embedding
+--input-file` produces the vectors, `jq` does cosine and top-k. **FreeLlama owns no vector store**,
+deliberately — persistence is a standing non-goal, and a stale index fails *silently*, returning
+confidently wrong files as the corpus drifts. You own storage and staleness; swap the flat file for
+sqlite-vec or LanceDB when it outgrows one.
 
 ## Reading a `delegate_research` result — use the structured half
 
-The response carries two views of the same run. Read the structured one:
-
 | Field | What it gives you |
 |---|---|
-| `verification.recommendation` | `accept` / `verify` / `escalate` |
+| `verification.recommendation` | `accept` / `verify` / `escalate` — see the verdict table in `SKILL.md` |
 | `verification.why` | the reason, computed from what the run did |
 | `citations[]` | `{step, tool, path, command}` per **successful** step — full, unclipped |
 | `successfulToolCallCount` vs `toolCallCount` | how many steps actually read something |
 
-`summary` is the same information as prose, for a model that would rather read a paragraph. Two
-independent small-model callers asked for the structured triple instead, so prefer it: no parsing,
-and nothing lost.
+`summary` carries the same information as prose. Two independent small-model callers asked for the
+structured triple instead, so prefer it: no parsing, and nothing lost.
 
 **`citations[].command` is deliberately not truncated.** It used to be head-sliced at 120
-characters, which cut commands mid-flag — a real trail came back ending
-`--exclude-dir={node_modules,target,.venv,__pycach`, which is unauditable at exactly the moment
-auditing matters. Only the prose line clips now, and it states how many characters it dropped.
-Note the causality: the search-scoping guidance added to the adapters made commands *longer*, which
-is what pushed them past the old limit — a fix in one place surfacing a latent bug in another.
+characters, cutting commands mid-flag — a real trail came back ending
+`--exclude-dir={node_modules,target,.venv,__pycach`, unauditable at exactly the moment auditing
+matters. Only the prose line clips now, and it states how many characters it dropped. Note the
+causality: the search-scoping guidance added to the adapters made commands *longer*, which is what
+pushed them past the old limit — a fix in one place surfacing a latent bug in another.
 
-Failed steps are excluded from `citations` on purpose: a command that errored is not a citation for
-anything. That is the same rule the verdict uses — grounding counts successful calls only.
+Failed steps are excluded from `citations[]` on purpose: a command that errored is not a citation for
+anything. Same rule the verdict uses — grounding counts successful calls only.
+
+## Practical rule of thumb
+
+> Delegate anything the local model can *prove* by citing evidence you can check in one glance.
+> Keep anything needing judgment, synthesis across ambiguous tradeoffs, or multi-step reasoning
+> without visible work — or verify it exhaustively before trusting it.
+
+## Cost-reduction hierarchy (external best practice, not tested here)
+
+Per current guidance ([Wavect](https://wavect.io/blog/reduce-llm-token-costs-2026/),
+[Obvious Works](https://www.obviousworks.ch/en/token-optimization-saves-up-to-80-percent-llm-costs/)):
+
+1. **Prompt caching** first (up to ~90% off cached input) — applies to *your* calls, not the local
+   model's.
+2. **Confidence-gated waterfall routing** — local first, escalate when the answer looks uncertain or
+   the task is outside the verified-good zone above. Reported: ~95% of frontier quality at 75-85%
+   lower cost.
+3. **Right-sizing** — open-weight local models run 15-30× cheaper per token when the task is
+   genuinely in their competence zone, which is why getting that zone right matters more than the
+   raw ratio.
+
+Next: per-field evidence behind every claim here → `references/model-profile-qwen3.8-27b-mlx.md`.
+Choosing the model that does the work → `references/model-selection.md`.

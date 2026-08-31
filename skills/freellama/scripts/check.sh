@@ -3,7 +3,11 @@
 # Read-only: never restarts, kills, or mutates anything. Exit 0 = all checks passed.
 set -uo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+# The skill is standalone: it does not assume it lives inside the FreeLlama checkout. The disk
+# check runs against wherever it is invoked from; the optional binary-freshness check below only
+# runs if you point FREELLAMA_REPO at a checkout.
+CHECK_ROOT="${FREELLAMA_CHECK_ROOT:-$PWD}"
+FREELLAMA_REPO="${FREELLAMA_REPO:-}"
 OLLAMA_ENDPOINT="${OLLAMA_ENDPOINT:-http://127.0.0.1:11434}"
 FREELLAMA_ENDPOINT="${FREELLAMA_ENDPOINT:-http://127.0.0.1:11435}"
 FAILED=0
@@ -17,12 +21,12 @@ echo "== Disk space =="
 # unrelated data is normal and shouldn't nag; genuinely low absolute headroom is what caused a
 # real incident (188Mi free out of 926Gi during a benchmark run — see references/disk-cleanup.md).
 MIN_FREE_GB="${MIN_FREE_GB:-15}"
-disk_line=$(df -g "$REPO_ROOT" 2>/dev/null | tail -1)
+disk_line=$(df -g "$CHECK_ROOT" 2>/dev/null | tail -1)
 free_gb=$(echo "$disk_line" | awk '{print $4}')
 if [ -n "$free_gb" ] && [ "$free_gb" -lt "$MIN_FREE_GB" ] 2>/dev/null; then
-  fail "only ${free_gb}GB free on the volume containing $REPO_ROOT (threshold ${MIN_FREE_GB}GB) — see references/disk-cleanup.md before running anything that copies large fixtures or pulls models"
+  fail "only ${free_gb}GB free on the volume containing $CHECK_ROOT (threshold ${MIN_FREE_GB}GB) — see references/disk-cleanup.md before running anything that copies large fixtures or pulls models"
 else
-  ok "${free_gb:-?}GB free on the volume containing $REPO_ROOT"
+  ok "${free_gb:-?}GB free on the volume containing $CHECK_ROOT"
 fi
 
 echo
@@ -71,7 +75,7 @@ else:
         print("        models can exceed physical RAM and crash the server (this is exactly what broke an")
         print("        earlier benchmark run here: qwen3.8:27b-mlx + qwen2.5:32b as a local judge = ~58GB")
         print("        against 48GB). Keep a judge/second model on a DIFFERENT machine, or don't run one")
-        print("        locally at all — see references/model-selection.md.")
+        print("        locally at all — see references/ollama-config.md.")
         sys.exit(2)  # signal the warning back to the calling shell; see WARNED handling below
 PYEOF
 py_status=$?
@@ -95,7 +99,7 @@ if curl -sf "$FREELLAMA_ENDPOINT/api/version" >/dev/null 2>&1; then
   fi
 else
   warn "nothing listening at $FREELLAMA_ENDPOINT — agents/clients are likely hitting Ollama directly,"
-  warn "  which means no retry/backoff/timeout protection (packages/rust-core/src/proxy.rs). Start it: cargo run --release -- proxy"
+  warn "  which means no retry/backoff/timeout protection (proxy.rs send_with_retries). Start it: freellama proxy"
 fi
 
 echo
@@ -122,17 +126,18 @@ else
 fi
 
 echo
-echo "== Binary freshness =="
-if [ -x "$REPO_ROOT/target/release/freellama" ]; then
-  bin_time=$(stat -f %m "$REPO_ROOT/target/release/freellama" 2>/dev/null || stat -c %Y "$REPO_ROOT/target/release/freellama" 2>/dev/null)
-  src_newest=$(find "$REPO_ROOT/src" -name '*.rs' -newer "$REPO_ROOT/target/release/freellama" 2>/dev/null | head -1)
+echo "== Binary freshness (only when FREELLAMA_REPO points at a checkout) =="
+if [ -z "$FREELLAMA_REPO" ]; then
+  echo "  INFO  FREELLAMA_REPO unset — skipping. Set it to a FreeLlama checkout to check the binary."
+elif [ -x "$FREELLAMA_REPO/target/release/freellama" ]; then
+  src_newest=$(find "$FREELLAMA_REPO/packages" -name '*.rs' -newer "$FREELLAMA_REPO/target/release/freellama" 2>/dev/null | head -1)
   if [ -n "$src_newest" ]; then
-    warn "src/ has changes newer than target/release/freellama ($src_newest) — rebuild: cargo build --release"
+    warn "Rust sources are newer than target/release/freellama ($src_newest) — rebuild: cargo build --release"
   else
-    ok "release binary is up to date with src/"
+    ok "release binary is up to date with packages/**/*.rs"
   fi
 else
-  warn "no release binary at target/release/freellama — build one: cargo build --release"
+  warn "no release binary at $FREELLAMA_REPO/target/release/freellama — build one: cargo build --release"
 fi
 
 echo

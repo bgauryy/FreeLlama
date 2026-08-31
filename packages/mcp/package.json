@@ -19,7 +19,8 @@
   "scripts": {
     "build": "tsc && node scripts/bundle-adapters.mjs",
     "start": "node dist/index.js",
-    "test": "node test/smoke-test.mjs && node test/smoke-test-protocol.mjs && node test/smoke-test-delegate.mjs",
+    "test": "node test/tool-map-drift.mjs && node test/smoke-test.mjs && node test/smoke-test-protocol.mjs && node test/smoke-test-delegate.mjs",
+    "test:ci": "node test/tool-map-drift.mjs",
     "prepublishOnly": "npm --prefix .. run build && npm run build",
     "build:native": "npm --prefix ../.. run build"
   },

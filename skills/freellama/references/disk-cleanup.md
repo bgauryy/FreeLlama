@@ -1,56 +1,55 @@
-# Disk cleanup: what's automated, what isn't, and why
+# Disk cleanup: what may be deleted, and what must never be
 
-Load when deleting models, or when changing anything about workspace/fixture retention.
+Load when the disk is tight, when a model looks like a deletion candidate, or before automating any
+retention behaviour.
 
-## The incident this is based on
+## The incident behind this policy
 
-A benchmark session filled a 926GB disk to 188Mi free; even small writes failed with `ENOSPC`.
+A benchmark session filled a 926GB disk down to 188Mi free; even small writes failed with `ENOSPC`.
 Causes, in order: **~111GB of installed Ollama models** (duplicate tags of the same model, several
-unused for months) and **benchmark workspace accumulation** (each trial copies ~600MB of fixtures;
-30 questions × 2 agents × re-runs piled up 15-16GB per run, never auto-cleaned).
+unused for months) and **workspace accumulation** — each trial copied ~600MB of fixtures, and 30
+questions × 2 agents × re-runs piled up 15-16GB per run that nothing cleaned.
 
-## What's fixed (automated, safe, no judgment call required)
+## The one safe deletion path
 
-- **`benchmark/local/scripts/run_all.sh` now always passes `--discard-workspaces`** to
-  `run_matrix.py`. This keeps the graded artifacts (`prompt.md`, `stdout.txt`, `stderr.txt`,
-  `agent-result.json`, `trial-N.json`, `aggregate.json`, `index.html`) and deletes the disposable
-  full-repo workspace copy per trial. There is no scenario in this benchmark's design where keeping
-  the post-grading workspace copy is needed — this was purely fixing our own code's behavior, no
-  risk, no downside. This is why it's a default, not a flag you have to remember.
-- **`scripts/check.sh` now warns on low absolute free disk space** (default threshold 15GB, override
-  with `MIN_FREE_GB=<n>`) — so a tightening disk shows up as a WARN/FAIL before commands start
-  failing, not after. Threshold is absolute GB, not percent-used: a dev machine sitting at 90%+ full
-  from unrelated data is normal and shouldn't nag; the incident above was about genuinely low
-  absolute headroom.
-- **`scripts/check.sh` now reports installed models untouched for 3+ months** as an informational
-  list — same "have I used this recently?" heuristic the wider Ollama community recommends for
-  manual quarterly review (see sources below).
+`ollama rm <model>` — or the `ollama_delete` MCP tool — and nothing else. The blob store under
+`~/.ollama/models` is content-addressed and manifest-tracked, so deleting files there directly can
+corrupt the manifest. Nothing in this skill ever touches that directory, and it never will.
 
-## What's deliberately NOT automated, and why
+`ollama_delete` carries `destructiveHint: true` so a client can gate it without parsing prose, and
+it must only be called after a human has named that exact model for deletion in the current
+conversation.
 
-**Automated model deletion was considered and rejected.** A staleness heuristic ("not modified in
-N months → delete") is a real hazard: a model can sit untouched for days or weeks and then become
-exactly what a new task needs (this happened in this very session — `muse-glimmer:30b-mlx` sat idle
-before being needed for a 3-model comparison). Deleting it automatically based on age alone would
-have been actively harmful, not helpful. This mirrors the retry-budget/circuit-breaker decision in
-`references/reliability.md`: the instinct to automate is worth resisting when the risk of a wrong
-automated decision (re-downloading tens of GB, or losing something the user meant to keep) is much
-higher than the cost of a human glancing at a report and deciding.
+## Never automate deletion on a staleness heuristic
 
-Industry practice agrees: the recommended Ollama cleanup workflow is manual review
-("`ollama list`, sorted by modification date, ask 'have I used this in 3 months?'" — or the
-`models` MCP tool (`view: "raw"`) if an agent is connected), not automation — see sources. `ollama rm`
-(or the `ollama_delete` MCP tool) is explicitly the *only* safe deletion path; the model blob store
-under `$HOME/.ollama/models` is content-addressed and manifest-tracked, so deleting files there
-directly (bypassing `ollama rm`/`ollama_delete`) can corrupt the manifest. `ollama_delete`'s own
-tool description enforces the same rule stated above: only on an explicit human instruction naming
-the exact model, never on an automated staleness heuristic. Nothing in this skill ever touches that
-directory directly, and it never will.
+"Not modified in N months → delete" is a real hazard: a model can sit untouched for weeks and then
+be exactly what a new task needs. That happened here — `muse-glimmer:30b-mlx` sat idle before being
+needed for a three-model comparison. Age-based deletion would have been actively harmful.
 
-**Ollama's own disk-backed prompt cache** (`~/.ollama` server logs show `"prompt cache is enabled,
-size limit: 8192 MiB"`) was investigated only as far as confirming it's self-capped by Ollama itself
-— it wasn't a contributor to this incident and doesn't need separate management here. If it ever
-is implicated in a future disk issue, that's a new investigation, not an assumption to build on now.
+This mirrors the retry-budget decision in `references/reliability.md`: the instinct to automate is
+worth resisting when a wrong automated decision (re-downloading tens of GB, or losing something the
+user meant to keep) costs far more than a human glancing at a report. Industry practice agrees — the
+recommended Ollama workflow is manual quarterly review, not automation (sources below).
+
+**So: report candidates, let a human decide.** `scripts/check.sh` does exactly that:
+
+- warns on low **absolute** free space (default 15GB, override `MIN_FREE_GB=<n>`), so a tightening
+  disk surfaces before commands start failing. Absolute rather than percent-used on purpose: a dev
+  machine sitting at 90% full from unrelated data is normal and should not nag.
+- lists installed models untouched for 3+ months as **informational only** — the same "have I used
+  this recently?" prompt the wider Ollama community recommends for manual review.
+- never deletes anything, restarts anything, or mutates state. Read-only by construction.
+
+`models {view:"raw"}` gives an agent the same estate listing when one is connected.
+
+## Not a factor: Ollama's own prompt cache
+
+Ollama's disk-backed prompt cache self-caps (its server log states `"prompt cache is enabled, size
+limit: 8192 MiB"`). It did not contribute to the incident above and needs no management here. If it
+is ever implicated, that is a new investigation, not an assumption to build on now.
+
+Next: freeing *memory* rather than disk → `references/ollama-config.md`. Deciding which model to keep
+in the first place → `references/model-selection.md`.
 
 ## Sources
 

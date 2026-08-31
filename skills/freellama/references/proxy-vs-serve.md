@@ -1,38 +1,50 @@
 # `freellama proxy` vs `freellama serve`
 
-Load when choosing which mode to run, or when a `/_freellama/v1/*` call returns 404 and you need
-to know whether that route exists at all.
+Load when choosing which mode to run, or when a `/_freellama/v1/*` call 404s and you need to know
+whether that route exists at all.
 
-Both bind `127.0.0.1:11435` by default (pick one, not both — the second will fail to bind).
+Both bind `127.0.0.1:11435` by default — pick one, not both; the second fails to bind.
 
-| | `freellama proxy` | `freellama serve` |
+| | `npx freellama proxy` | `npx freellama serve` |
 |---|---|---|
-| Passthrough to Ollama | Yes, with retry/backoff/timeout | Yes, same code path (composes `proxy::app()` as its fallback) |
-| `/_freellama/v1/{machine,models,routes,natural-routes,sessions,tasks}` | No — 404 | Yes |
-| Use when | You only need a more reliable Ollama endpoint (a benchmark, a script calling `/api/chat` directly) | You want model discovery, task-aware routing, or session affinity |
+| Ollama passthrough (`/api/*`) | Yes, with retry/backoff/timeout | Yes, same code path — it composes `proxy::app()` as its fallback |
+| `/_freellama/v1/{health,machine,models,recommendations,routes,natural-routes,sessions,tasks}` | No — 404 | Yes |
+| Retry on the managed task path (`/tasks`) | n/a — route does not exist | Yes, same backoff schedule as passthrough |
+| Use when | You only need a more reliable Ollama endpoint (a benchmark, a script calling `/api/chat` directly) | You want model discovery, task-aware routing, admission control, or session affinity |
 
-Verify which one you're pointed at: call `doctor` (it carries the machine profile) — success means `serve`, a
-connection/404 error means `proxy` — or `curl -sf $ENDPOINT/_freellama/v1/machine` without an
-agent (200 means `serve`, 404 means `proxy`). `scripts/check.sh` does this automatically.
+Every MCP tool except `doctor`, `ollama_manage` and `ollama_delete` needs `serve`; those three talk
+to Ollama directly and work without it.
 
-## The one gap this doesn't cover
+## Which one am I pointed at?
 
-The retry/backoff/timeout logic lives entirely in `packages/rust-core/src/proxy.rs` (`send_with_retries`). `serve`'s
-passthrough route reuses it (`platform/mod.rs` composes `proxy::app()` as its fallback), so raw
-`/api/chat` calls through `serve` ARE protected. But `forward_managed_task` in `packages/rust-core/src/platform/mod.rs`
-(behind `/_freellama/v1/tasks`) builds its own separate `reqwest::Client` and does **not** call
-through `send_with_retries` — managed-task requests get no retry protection today. If you rely on
-`/tasks` under a flaky Ollama, this is the first place to look; it hasn't been fixed because nothing
-in this repo currently exercises that path under load.
+- With an agent: call `doctor`. It carries a machine profile on success; `machine_unavailable`
+  with a stated reason means `serve` is not up.
+- Without one: `curl -sf $ENDPOINT/_freellama/v1/health` — 200 means `serve`, 404 means `proxy`.
+- `scripts/check.sh` does this automatically and labels which mode is running.
 
 ## Starting either one
 
 ```bash
-cargo build --release
-./target/release/freellama proxy    # or: cargo run --release -- proxy
-./target/release/freellama serve --recommendation-catalog recommendations.example.toml
+npx freellama proxy                                   # passthrough + retry only
+npx freellama serve --policy-file platform.toml \
+                    --benchmark-report bench-all.json # add these to make minConfidence "medium" reachable
 ```
 
-`benchmark/local/scripts/restart_ollama.sh` starts `proxy` mode specifically, because the benchmark
-adapters only need `/api/chat` passthrough — they pick their own model per adapter and don't need
-routing.
+In a checkout the npm launcher runs `target/release/freellama` if it is there, so
+`cargo build --release` then `npx freellama …` works unpacked.
+
+## Retry coverage — both paths, one schedule
+
+Retry/backoff/timeout live in
+[`proxy.rs`](https://github.com/bgauryy/FreeLlama/blob/main/packages/rust-core/src/proxy.rs)
+(`send_with_retries`), and `serve`'s passthrough reuses it, so raw `/api/chat` calls through `serve`
+are protected. The managed task path behind `/_freellama/v1/tasks` uses its own
+`platform::post_json_with_retries` but shares `proxy::retry_delay` and `proxy::MAX_ATTEMPTS` — one
+schedule, deliberately not duplicated.
+
+The two keep separate `reqwest::Client`s on purpose: a managed generation needs a 900s budget while
+discovery calls need 30s. **This asymmetry used to be worse than a mere gap** — the managed path was
+retry-less, and it holds the `managed_execution` admission permit across the upstream call, so a
+bare failure also threw away a slot it had already queued for. → `references/reliability.md`
+
+Next: symptom rather than a mode choice → `references/troubleshooting.md`.
