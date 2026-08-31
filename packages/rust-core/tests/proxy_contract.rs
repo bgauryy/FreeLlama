@@ -52,7 +52,11 @@ async fn spawn_flaky_upstream(fail_count: usize) -> (String, Arc<AtomicUsize>) {
         async move {
             let seen = counter.fetch_add(1, Ordering::SeqCst) + 1;
             if seen <= fail_count {
-                (StatusCode::INTERNAL_SERVER_ERROR, "transient upstream error").into_response()
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "transient upstream error",
+                )
+                    .into_response()
             } else {
                 (StatusCode::OK, "{\"ok\":true}").into_response()
             }

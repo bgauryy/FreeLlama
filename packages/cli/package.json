@@ -1,0 +1,21 @@
+{
+  "name": "freellama",
+  "version": "0.2.0",
+  "description": "Local Ollama model gateway, router, and benchmarker \u2014 CLI. Wraps the compiled Rust binary from packages/rust-core.",
+  "type": "module",
+  "bin": {
+    "freellama": "bin/freellama.mjs"
+  },
+  "files": [
+    "bin",
+    "vendor",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "prepack": "node scripts/vendor-binary.mjs"
+  },
+  "license": "Apache-2.0 OR MIT"
+}

@@ -30,7 +30,11 @@ fn max_loaded_models_advisory_silent_when_configured() {
 
 #[test]
 fn checked_in_suite_expands_every_upstream_regression() {
-    let suite = Suite::from_path(concat!(env!("CARGO_MANIFEST_DIR"), "/../../benchmark/suites/ollama-mlx-regressions.json")).unwrap();
+    let suite = Suite::from_path(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../benchmark/suites/ollama-mlx-regressions.json"
+    ))
+    .unwrap();
     let cases = suite.expand().unwrap();
 
     assert!(
@@ -88,4 +92,81 @@ fn comparison_rejects_a_faster_candidate_that_grows_resident_memory() {
     let comparison = compare(&baseline, &candidate, 0.20).unwrap();
     assert_eq!(comparison.guardrails.memory, GuardrailStatus::Fail);
     assert_eq!(comparison.verdict, Verdict::Reject);
+}
+
+/// Every advisory must state what Ollama resolves when the variable is unset. A bare `null` value
+/// with no `effective_default` reads as "off", which is exactly the misreading that produced two
+/// wrong advisories in this table.
+#[test]
+fn every_ollama_env_advisory_states_its_effective_default() {
+    let table = freellama::ollama_env_advisories(|_| None);
+    let entries = table.as_object().expect("advisory table is an object");
+    assert_eq!(
+        entries.len(),
+        11,
+        "doctor documents eleven memory-governing settings: nine OLLAMA_* plus LLAMA_ARG_FIT and \
+         LLAMA_ARG_FIT_TARGET, which govern memory but lack the prefix an auditor greps for"
+    );
+    for (key, entry) in entries {
+        assert!(
+            entry
+                .get("effective_default")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.is_empty()),
+            "{key} has no effective_default — an unset value would read as \"off\""
+        );
+    }
+}
+
+/// Regression: flash attention is NOT off by default. envconfig declares it with
+/// `BoolWithDefault` (the caller supplies the default; plain `Bool` is the one pinned to false)
+/// and docs/faq.mdx states Ollama "uses Flash Attention automatically when the selected backend
+/// and devices support it". Reporting "off" told users to set a variable that is already on, and
+/// implied the `q8_0` KV-cache saving was unavailable to them — a real memory lever, wrongly closed.
+#[test]
+fn flash_attention_is_not_advertised_as_off_by_default() {
+    let table = freellama::ollama_env_advisories(|_| None);
+    let default = table["OLLAMA_FLASH_ATTENTION"]["effective_default"]
+        .as_str()
+        .expect("flash attention advisory");
+    assert!(
+        !default.eq_ignore_ascii_case("off"),
+        "flash attention is auto-enabled on supported backends, not off; got {default:?}"
+    );
+    assert!(
+        default.contains("auto"),
+        "the advisory should say the default is automatic; got {default:?}"
+    );
+}
+
+/// The injected `getenv` must actually reach the table, or the reported `value` would silently be
+/// whatever the host machine has set rather than what the caller asked about.
+#[test]
+fn ollama_env_advisories_report_the_configured_value() {
+    let table = freellama::ollama_env_advisories(|key| {
+        (key == "OLLAMA_MAX_LOADED_MODELS").then(|| "1".to_owned())
+    });
+    assert_eq!(table["OLLAMA_MAX_LOADED_MODELS"]["value"], "1");
+    assert_eq!(
+        table["OLLAMA_NUM_PARALLEL"]["value"],
+        serde_json::Value::Null
+    );
+}
+
+/// `NUM_PARALLEL=1` makes the shared resident admission permit in `platform::run_task` a no-op:
+/// `FreeLlama` lets resident tasks run together, then Ollama serializes them (measured: 1.12x on two
+/// concurrent requests). Anyone reading this advisory to plan capacity has to be told that, or they
+/// will assume the admission layer's concurrency is real.
+#[test]
+fn num_parallel_advisory_explains_the_admission_interaction() {
+    let table = freellama::ollama_env_advisories(|_| None);
+    let note = table["OLLAMA_NUM_PARALLEL"]["note"].as_str().expect("note");
+    assert!(
+        note.contains("SHARED"),
+        "must name the shared admission permit; got {note:?}"
+    );
+    assert!(
+        note.contains("serializes"),
+        "must say Ollama serializes them at the default; got {note:?}"
+    );
 }

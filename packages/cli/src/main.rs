@@ -1,5 +1,5 @@
-use std::time::Duration;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
@@ -24,6 +24,21 @@ struct Cli {
     command: Command,
 }
 
+/// Admission tuning, grouped so `start_platform` stays within a readable argument count.
+#[derive(Debug, Clone, Copy, clap::Args)]
+struct AdmissionArgs {
+    /// Admission budget in cost units — embedding 1, chat 2, vision 4 (default 8, or
+    /// `FREELLAMA_MAX_CONCURRENT_TASKS`). Match it to `OLLAMA_NUM_PARALLEL`: Ollama's default is 1,
+    /// so a higher value bounds the burst rather than buying parallel decoding.
+    #[arg(long)]
+    max_concurrent_tasks: Option<usize>,
+    /// Seconds a task may queue for admission before being refused with 503 (default 120, or
+    /// `FREELLAMA_MAX_QUEUE_WAIT_SECONDS`). Refusing fast matches Ollama's own `ErrMaxQueue`
+    /// contract; waiting forever would hide load as unattributable latency.
+    #[arg(long)]
+    max_queue_wait_seconds: Option<u64>,
+}
+
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Run the localhost model platform and preserve Ollama-compatible endpoints.
@@ -44,6 +59,8 @@ enum Command {
         /// Small local Ollama model that translates natural language into route intent.
         #[arg(long, default_value = "qwen2.5:0.5b")]
         intent_model: String,
+        #[command(flatten)]
+        admission: AdmissionArgs,
     },
     /// List installed local models with capabilities, residency, and local evidence.
     Models {
@@ -74,6 +91,11 @@ enum Command {
         session: Option<String>,
         #[arg(long)]
         context_tokens: Option<u64>,
+        /// Refuse rather than return a route graded below this ("low" or "medium"). "medium"
+        /// needs both a policy file and a benchmark report; without them every route grades "low"
+        /// and this refuses — which is the point.
+        #[arg(long)]
+        min_confidence: Option<String>,
     },
     /// Recommend an installed route or a reviewed, side-effect-free model installation plan.
     Recommend {
@@ -236,6 +258,7 @@ async fn main() -> Result<()> {
             policy_file,
             recommendation_catalog,
             intent_model,
+            admission,
         } => {
             start_platform(
                 listen,
@@ -244,6 +267,7 @@ async fn main() -> Result<()> {
                 policy_file,
                 recommendation_catalog,
                 intent_model,
+                admission,
             )
             .await?;
         }
@@ -263,7 +287,19 @@ async fn main() -> Result<()> {
             model,
             session,
             context_tokens,
-        } => request_route(endpoint, task, objective, model, session, context_tokens).await?,
+            min_confidence,
+        } => {
+            request_route(
+                endpoint,
+                task,
+                objective,
+                model,
+                session,
+                context_tokens,
+                min_confidence,
+            )
+            .await?;
+        }
         Command::Recommend {
             endpoint,
             task,
@@ -390,6 +426,7 @@ async fn start_platform(
     policy_file: Option<PathBuf>,
     recommendation_catalog: Option<PathBuf>,
     intent_model: String,
+    admission: AdmissionArgs,
 ) -> Result<()> {
     // `minConfidence: "medium"` needs BOTH a policy file and a benchmark report, and requiring two
     // explicit flags meant almost nobody ever had them — the gate degraded to refusing
@@ -422,6 +459,18 @@ async fn start_platform(
     if let Some(path) = recommendation_catalog {
         config = config.with_recommendation_catalog(path);
     }
+    if let Some(slots) = admission.max_concurrent_tasks {
+        config = config.with_max_concurrent_tasks(slots);
+    }
+    if let Some(seconds) = admission.max_queue_wait_seconds {
+        config = config.with_max_queue_wait(Duration::from_secs(seconds));
+    }
+    eprintln!(
+        "freellama: admission budget {} cost units (embedding 1, chat 2, vision 4). Raise with \
+         --max-concurrent-tasks, and raise OLLAMA_NUM_PARALLEL with it — Ollama serializes at its \
+         default of 1.",
+        config.resolved_max_concurrent_tasks()
+    );
     serve_platform(config).await
 }
 
@@ -452,8 +501,10 @@ async fn request_route(
     model: Option<String>,
     session: Option<String>,
     context_tokens: Option<u64>,
+    min_confidence: Option<String>,
 ) -> Result<()> {
-    let route = route_input(task, objective, model, session, context_tokens);
+    let mut route = route_input(task, objective, model, session, context_tokens);
+    route.min_confidence = min_confidence;
     print_post(
         &endpoint,
         "/_freellama/v1/routes",
@@ -517,7 +568,11 @@ async fn request_task(
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("read input file {}", path.display()))?;
         let items: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
-        ensure!(!items.is_empty(), "input file {} has no non-empty lines", path.display());
+        ensure!(
+            !items.is_empty(),
+            "input file {} has no non-empty lines",
+            path.display()
+        );
         body["input"] = json!(items);
         return print_post(&endpoint, "/_freellama/v1/tasks", &body).await;
     }
@@ -642,22 +697,18 @@ fn cli_client() -> Client {
 /// wedged, not busy. Overridable via `FREELLAMA_CONTROL_TIMEOUT_SECONDS` (same name the NAPI layer
 /// reads, so one setting covers CLI and MCP alike).
 fn cli_control_timeout() -> Duration {
-    cli_timeout_from_env("FREELLAMA_CONTROL_TIMEOUT_SECONDS", 30)
+    freellama::timeout_from_env(
+        "FREELLAMA_CONTROL_TIMEOUT_SECONDS",
+        freellama::DEFAULT_CONTROL_TIMEOUT_SECS,
+    )
 }
 
 /// Calls that make a model actually generate (`/tasks`, `/natural-routes`). A cold load of a large
 /// model can take minutes, so this has to be generous or it aborts work that would have succeeded.
 fn cli_task_timeout() -> Duration {
-    cli_timeout_from_env("FREELLAMA_TASK_TIMEOUT_SECONDS", 900)
-}
-
-fn cli_timeout_from_env(name: &str, fallback: u64) -> Duration {
-    Duration::from_secs(
-        std::env::var(name)
-            .ok()
-            .and_then(|raw| raw.parse::<u64>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(fallback),
+    freellama::timeout_from_env(
+        "FREELLAMA_TASK_TIMEOUT_SECONDS",
+        freellama::DEFAULT_TASK_TIMEOUT_SECS,
     )
 }
 
@@ -678,19 +729,54 @@ fn explain_transport(endpoint: &str, error: reqwest::Error) -> anyhow::Error {
     error.into()
 }
 
+/// Print a JSON response, or fail with the server's own explanation of why it refused.
+///
+/// `error_for_status()` discards the body, which is where every useful refusal lives — a
+/// `min_confidence` refusal names the grade, the evidence, the model it would have picked and the
+/// two commands that raise the grade, and all of that was being replaced by a bare
+/// "422 Unprocessable Entity". Surface the server's own explanation instead.
+///
+/// A success whose body is not JSON is an error, not silence: printing nothing and exiting 0 would
+/// tell the caller the command worked when nothing was reported.
+async fn print_response(response: reqwest::Response) -> Result<()> {
+    let status = response.status();
+    let body = response.text().await.context("read response body")?;
+    let payload = serde_json::from_str::<Value>(&body).ok();
+    if !status.is_success() {
+        let detail = payload
+            .as_ref()
+            .and_then(|v| v.get("error"))
+            .and_then(Value::as_str)
+            .map_or_else(
+                || {
+                    if body.trim().is_empty() {
+                        status.to_string()
+                    } else {
+                        body.trim().to_owned()
+                    }
+                },
+                ToOwned::to_owned,
+            );
+        anyhow::bail!("{detail}");
+    }
+    let value = payload.with_context(|| {
+        format!(
+            "{status} response from the platform was not JSON: {}",
+            body.trim()
+        )
+    })?;
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
+}
+
 async fn print_get(endpoint: &str, path: &str) -> Result<()> {
     let response = cli_client()
         .get(format!("{}{path}", endpoint.trim_end_matches('/')))
         .timeout(cli_control_timeout())
         .send()
         .await
-        .map_err(|e| explain_transport(endpoint, e))?
-        .error_for_status()?;
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&response.json::<Value>().await?)?
-    );
-    Ok(())
+        .map_err(|e| explain_transport(endpoint, e))?;
+    print_response(response).await
 }
 
 async fn print_post(endpoint: &str, path: &str, body: &Value) -> Result<()> {
@@ -706,13 +792,8 @@ async fn print_post(endpoint: &str, path: &str, body: &Value) -> Result<()> {
         .json(body)
         .send()
         .await
-        .map_err(|e| explain_transport(endpoint, e))?
-        .error_for_status()?;
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&response.json::<Value>().await?)?
-    );
-    Ok(())
+        .map_err(|e| explain_transport(endpoint, e))?;
+    print_response(response).await
 }
 
 /// Print the MCP tool surface alongside its CLI equivalent.
@@ -722,14 +803,46 @@ async fn print_post(endpoint: &str, path: &str, body: &Value) -> Result<()> {
 fn print_tool_map() {
     println!("FreeLlama exposes 8 MCP tools. Equivalents for a CLI-only agent:\n");
     let rows = [
-        ("doctor", "freellama doctor", "Ollama health, the 9 memory env vars, machine profile"),
-        ("models", "freellama models", "installed models, capabilities, residency"),
-        ("route", "freellama route --task <t>", "which model would be picked; no generation"),
-        ("run_task", "freellama task --task <t> --prompt <p>", "route AND execute one call"),
-        ("search_models", "(MCP only)", "browse ollama.com, inspect tags for memory fit"),
-        ("ollama_manage", "ollama pull <m> / ollama stop <m>", "download or unload a model"),
-        ("ollama_delete", "ollama rm <m>", "DESTRUCTIVE. Only when a human names the model"),
-        ("delegate_research", "(MCP only)", "grounded answer from a local model reading files"),
+        (
+            "doctor",
+            "freellama doctor",
+            "Ollama health, the 9 memory env vars, machine profile",
+        ),
+        (
+            "models",
+            "freellama models",
+            "installed models, capabilities, residency",
+        ),
+        (
+            "route",
+            "freellama route --task <t>",
+            "which model would be picked; no generation",
+        ),
+        (
+            "run_task",
+            "freellama task --task <t> --prompt <p>",
+            "route AND execute one call",
+        ),
+        (
+            "search_models",
+            "(MCP only)",
+            "browse ollama.com, inspect tags for memory fit",
+        ),
+        (
+            "ollama_manage",
+            "ollama pull <m> / ollama stop <m>",
+            "download or unload a model",
+        ),
+        (
+            "ollama_delete",
+            "ollama rm <m>",
+            "DESTRUCTIVE. Only when a human names the model",
+        ),
+        (
+            "delegate_research",
+            "(MCP only)",
+            "grounded answer from a local model reading files",
+        ),
     ];
     for (tool, cli, what) in rows {
         println!("  {tool:<18} {cli:<38} {what}");
@@ -751,7 +864,7 @@ async fn installed_models(endpoint: &str) -> Result<Vec<String>> {
         name: String,
     }
     let url = format!("{}/api/tags", endpoint.trim_end_matches('/'));
-    let tags: Tags = Client::new()
+    let tags: Tags = cli_client()
         .get(&url)
         .timeout(cli_control_timeout())
         .send()
@@ -782,7 +895,11 @@ fn base64_encode(bytes: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
         for i in 0..4 {
             if i <= chunk.len() {

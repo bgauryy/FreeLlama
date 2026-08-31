@@ -16,6 +16,18 @@ Flow: `PREFLIGHT → RUN → GRADE → AGGREGATE → REPORT → VERIFY`
 
 These rules were previously duplicated in a `skills/run-benchmark/SKILL.md` workflow map. That file said of itself that it was "the workflow map, not a copy of the mechanics" — so it has been folded in here, next to the mechanics it describes, rather than kept as a second place to look.
 
+## Three benchmark surfaces, different questions
+
+| Directory | Measures | Corpus |
+|---|---|---|
+| `benchmark/harness/` | the generic scoring infrastructure everything else builds on | synthetic `atlas` fixture |
+| `benchmark/local/` | **which model** completes repository work correctly | `click` / `zustand` / `openui`, checked in |
+| `benchmark/holdout/` | **the adapter loop itself**, on repos it was never tuned against | fresh upstream clones in `.clones/` (gitignored) |
+
+Use `holdout/` when the thing being changed is the agent loop or its prompt, not the model — those
+changes are tuned against a corpus and cannot be honestly graded on it. See
+[`holdout/README.md`](../holdout/README.md).
+
 This benchmark compares local models running through coding agents. It answers a practical question: which model-agent combination can complete repository work correctly, repeatedly, and efficiently?
 
 It is not a chat benchmark or a raw tokens-per-second test. A model must run through an agent that can inspect an isolated repository, call tools, edit files, and return a final answer. The benchmark scores the complete system: model, agent loop, prompt, tools, skills, and MCP configuration.

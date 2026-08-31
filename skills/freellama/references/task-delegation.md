@@ -32,7 +32,8 @@ alone gives you.
 
 ## Two offloading tools: `run_task` and `delegate_research`
 
-`route`/`recommend`/`doctor`/`models` only make a *selection* decision — they never do work.
+`route`/`doctor`/`models` only make a *selection* decision — they never do work. (`recommend` is
+not on the MCP surface; it exists over HTTP and in the CLI only. Use `search_models`.)
 Two other tools do: `run_task` routes and executes an ordinary chat/completion/embedding call in
 one shot — the general-purpose offload path. `delegate_research` is the specialized one: it hands
 a question to a local model wired up with the `octocode` CLI and returns a grounded, citable
@@ -181,7 +182,7 @@ flat file for sqlite-vec or LanceDB when it outgrows one.
 
 Measured over 242 chunks of this repo's Rust source, top-1 retrieval got 2 of 3. The failure is
 worth more than the successes: *"how does it avoid loading two models into memory"* returned
-`lib.rs` instead of `platform.rs`, and has now missed in two independent runs. `platform.rs` never
+`lib.rs` instead of `platform/mod.rs`, and has now missed in two independent runs. `platform/mod.rs` never
 uses the phrase — it says `managed_execution`, `RwLock`, "admission permit". **Embeddings match how
 text is phrased, and code routinely names a concept in vocabulary that looks nothing like the
 question.** When you can guess the identifier, grep finds it instantly and exactly. Reach for
@@ -205,3 +206,27 @@ so, rather than a confident pick. This matters because the earlier fail-open ver
 serve down, recommended the 143GB `qwen3-vl:235b`. If you see that field, start `serve` and ask
 again; do not fall back to picking the biggest tag yourself.
 
+## Reading a `delegate_research` result — use the structured half
+
+The response carries two views of the same run. Read the structured one:
+
+| Field | What it gives you |
+|---|---|
+| `verification.recommendation` | `accept` / `verify` / `escalate` |
+| `verification.why` | the reason, computed from what the run did |
+| `citations[]` | `{step, tool, path, command}` per **successful** step — full, unclipped |
+| `successfulToolCallCount` vs `toolCallCount` | how many steps actually read something |
+
+`summary` is the same information as prose, for a model that would rather read a paragraph. Two
+independent small-model callers asked for the structured triple instead, so prefer it: no parsing,
+and nothing lost.
+
+**`citations[].command` is deliberately not truncated.** It used to be head-sliced at 120
+characters, which cut commands mid-flag — a real trail came back ending
+`--exclude-dir={node_modules,target,.venv,__pycach`, which is unauditable at exactly the moment
+auditing matters. Only the prose line clips now, and it states how many characters it dropped.
+Note the causality: the search-scoping guidance added to the adapters made commands *longer*, which
+is what pushed them past the old limit — a fix in one place surfacing a latent bug in another.
+
+Failed steps are excluded from `citations` on purpose: a command that errored is not a citation for
+anything. That is the same rule the verdict uses — grounding counts successful calls only.

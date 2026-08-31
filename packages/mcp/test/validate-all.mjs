@@ -2,15 +2,30 @@
 import assert from "node:assert/strict";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { fileURLToPath } from "node:url";
+
+// Resolve the built server from this file, not the working directory. Every one of these
+// scripts used to pass a bare "dist/index.js", so they only ran from packages/mcp — the
+// command the README documents (`node packages/mcp/test/validate-all.mjs`, from the repo
+// root) failed with MODULE_NOT_FOUND before the server ever started.
+const SERVER_ENTRY = fileURLToPath(new URL("../dist/index.js", import.meta.url));
 const REPO = new URL("../..", import.meta.url).pathname.replace(/\/$/, "");
-const t = new StdioClientTransport({ command: "node", args: ["dist/index.js"] });
+const t = new StdioClientTransport({ command: "node", args: [SERVER_ENTRY] });
 const c = new Client({ name: "validate", version: "1" }); await c.connect(t);
 const call = (n, a = {}, ms = 180000) => c.callTool({ name: n, arguments: a }, undefined, { timeout: ms });
 const pass = [], fail = [];
 const check = (n, ok, d = "") => (ok ? pass : fail).push(n + (d ? ` :: ${d}` : ""));
 
 const d = (await call("doctor")).structuredContent;
-check("doctor: 9 env vars w/ effective defaults", Object.keys(d.ollama_env_config).length === 9);
+// Eleven, not nine: LLAMA_ARG_FIT and LLAMA_ARG_FIT_TARGET govern memory too, and were missed
+// because they lack the OLLAMA_ prefix an auditor greps for. Assert every entry carries an
+// effective_default as well — a bare null reads as "off", which is the misreading that produced
+// two wrong advisories in this table.
+const envCfg = Object.entries(d.ollama_env_config);
+check(
+  "doctor: 11 memory settings, each w/ an effective default",
+  envCfg.length === 11 && envCfg.every(([, v]) => typeof v.effective_default === "string" && v.effective_default),
+);
 check("doctor: absorbed machine profile", !!d.machine?.unified_memory_bytes);
 check("doctor: warning says 3x GPU not unlimited", /3 x GPU count/.test(d.ollama_env_config_warning ?? ""));
 

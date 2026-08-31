@@ -180,7 +180,7 @@ quality falls, requests fail, or model transitions dominate the workload.
 
 Use `cargo run -- bench-all` (`packages/rust-core/src/model_bench.rs`) for model selection evidence:
 
-- [Local-model router RFC](../.octocode/rfc/local-agentic-router/RFC.md)
+- Local-model router RFC — lived in the gitignored `.octocode/` workspace and is no longer in the tree; the shipped design it argued for is [ARCHITECTURE.md](ARCHITECTURE.md)
 
 ## Recommended next work
 

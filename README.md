@@ -1,306 +1,257 @@
 # FreeLlama
 
-FreeLlama is a local model gateway, router, and Rust library for Ollama. It gives applications and agents one localhost endpoint for installed models, then adds model discovery, machine inspection, task-aware routing, natural-language intent routing, session affinity, and evidence-based request profiles.
+**An evidence-aware local-model gateway for Ollama.**
 
-Think of it as a local, private routing layer in front of Ollama. It is OpenRouter-like in purpose, but it routes only among models installed on your machine. Native Ollama and Ollama's OpenAI-compatible endpoints remain available through the same address.
+FreeLlama lets applications and AI agents push work down to local models running on your own
+machine — *without blindly trusting them*. It discovers what your hardware can run, routes
+each task to an installed model, admits local execution only when there's evidence behind the
+choice, and returns a verdict you can check.
 
-## What works
+**Offload work down. Keep judgment up.**
 
-| Capability | Status |
-|---|---|
-| Ollama and OpenAI-compatible API passthrough | Shipped |
-| Local model inventory and capability discovery | Shipped |
-| Machine profile and Ollama diagnostics | Shipped |
-| Structured task and quality-aware routing | Shipped |
-| Natural-language request-to-route conversion | Shipped |
-| Session affinity for applications and agents | Shipped |
-| Managed non-streaming chat and embedding tasks | Shipped |
-| Embeddable Rust router and server modules | Shipped |
-| Reviewed model recommendations and side-effect-free install plans | Shipped |
-| Confirmed model installation and catalog discovery | Planned |
-| Automatic machine-specific policy generation | Planned |
-| MCP tool server (8 tools, routing + lifecycle + research delegation) | Shipped |
-| A2A, durable agents, and autonomous tool execution | Planned |
-| Authentication, TLS, quotas, and public multi-tenant serving | Not supported |
+```mermaid
+flowchart TB
+    F["<b>Frontier model</b><br/>judgment · planning · review"]
+    S["<b>Small model</b> — e.g. Haiku<br/>drives FreeLlama · dispatch + verify"]
+    G["<b>FreeLlama</b><br/>route · admit · verify"]
+    L["<b>Local models</b> (Ollama)<br/>research · vision · embeddings · extraction"]
+    F -->|"a task (~50 tok)"| S
+    S -->|"MCP tool calls"| G
+    G -->|"routed calls"| L
+    L -->|"raw files, vectors, OCR — stay local"| G
+    G -->|"cited answer + verdict"| S
+    S -->|"verified conclusion (~100 tok)"| F
+```
 
-FreeLlama does not make model inference intrinsically faster. It improves how a local system discovers, selects, configures, and reuses models. Benchmark evidence and explicit policy prevent a fast but incorrect model from becoming the default for quality-sensitive work.
+Each hop strips tokens, and the cost of being wrong falls as work moves down. The tier that decides
+what matters stays at the top; the raw data never climbs back up to it.
+
+**Drive the FreeLlama MCP with a small model (for example, Haiku), not the frontier model.** Choosing a tool,
+filling in a path, and reading a verdict is mechanical dispatch, not judgment — exactly what small
+models do well and cheaply, and it keeps the ~3k tokens of tool schema off the frontier model's
+per-turn bill. The frontier model is reserved for when the small model's verdict says to escalate.
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for why this wiring beats attaching the tools to
+the frontier model directly.
+
+## Why use it
+
+Large files, embedding vectors, images, and tool schemas can stay on your machine while the
+expensive orchestrating model receives only the conclusion and the evidence behind it.
+
+The point isn't only that this saves tokens — it's that it controls **what deserves to enter the
+expensive model's context**. The orchestrator never has to ingest whole files, raw OCR, intermediate
+research, or repetitive schemas to benefit from them. Cost savings follow, but so does context
+quality.
+
+Because a local model is roughly **99% accurate on grounded lookups but ~67% on judgment calls — in
+an identical confident tone** — FreeLlama trusts nothing on tone. Every delegated answer carries a
+verdict computed from what the run *did* (which files it read, which model ran), never from
+what the model says about itself.
 
 ## How it works
 
+FreeLlama sits between your orchestrating model and Ollama, and does three things:
+
+1. **Route** — pick an installed model for a task (`coding`, `vision`, `embedding`, …) and an
+   objective (`fastest`, `balanced`, `quality`), returning a bounded Ollama request profile.
+2. **Admit** — bound how many tasks hit Ollama at once, with a real queue and honest backpressure
+   instead of silent pile-ups and timeouts.
+3. **Verify** — grade each routing decision on separate evidence dimensions, and grade each
+   delegated research answer on what the run did.
+
+One task's journey through the gateway:
+
 ```mermaid
 flowchart LR
-    C["Application or agent"] --> F["FreeLlama :11435"]
-    F --> P["FreeLlama control API"]
-    F --> O["Ollama/OpenAI-compatible passthrough"]
-    P --> R["Capability and evidence router"]
-    P --> N["Local natural-language intent model"]
-    N --> R
-    R --> L["Installed-model catalog and machine profile"]
-    R --> OLL["Ollama :11434"]
-    O --> OLL
+    A["task + objective"] --> R{"route"}
+    R -->|"no eligible model"| X["refuse with reason"]
+    R -->|"below --min-confidence"| X
+    R -->|"picked"| Q{"admit"}
+    Q -->|"no slot in time"| B["503 · queue full"]
+    Q -->|"slot granted"| E["execute on Ollama"]
+    E --> V["verify: grade the run"]
+    V --> O["answer + evidence + verdict"]
 ```
 
-FreeLlama exposes its own control plane under `/_freellama/v1`. Every other path passes through to Ollama, including `/api/chat`, `/api/embed`, `/v1/chat/completions`, and `/v1/models`.
+You can use it through any of four surfaces, all built on one core so routing logic lives in exactly
+one place:
 
-The OpenAI-compatible paths are passthrough routes. They require an explicit installed model and do not automatically invoke FreeLlama routing. Use `/_freellama/v1/routes`, `/_freellama/v1/natural-routes`, or `/_freellama/v1/tasks` for managed selection.
-
-## Two ways to run it
-
-FreeLlama's Ollama-facing HTTP surface has two entry points sharing the same default port
-(`127.0.0.1:11435`) — pick one, not both:
-
-| Command | What it exposes | Use when |
+| Surface | What it is | Use it when |
 |---|---|---|
-| `freellama proxy` | Only passthrough to Ollama (with retry/backoff/timeout on transient failures — see `packages/rust-core/src/proxy.rs`). No `/_freellama/v1/*` control routes. | You just want a more reliable Ollama endpoint — e.g. a benchmark or app driving `/api/chat` directly. This is what `benchmark/local/scripts/restart_ollama.sh` runs. |
-| `freellama serve` | The full platform: `/_freellama/v1/{machine,models,routes,natural-routes,sessions,tasks}` **plus** the same retry-protected passthrough as `proxy` (it composes `proxy::app()` as its fallback route). | You want model discovery, task-aware routing, or session affinity — not just a passthrough. |
+| **`freellama-core`** | The Rust library (`packages/rust-core`): router, admission, proxy, benchmark harness | You're embedding the gateway in a Rust application |
+| **`freellama` CLI** | A binary wrapping the core (`packages/cli`) | You're scripting, testing routes, or running `serve` |
+| **MCP server** | 8 tools over stdio (`packages/mcp`) | An MCP-capable agent should offload work to local models |
+| **`freellama` skill** | An orchestration playbook (`skills/freellama`) | An agent needs guidance on *when* and *how* to delegate |
 
-Verified live on this machine: `freellama proxy` returns 404 for `/_freellama/v1/models` (by
-design — it doesn't mount those routes); `freellama serve` answers `/_freellama/v1/machine`,
-`/_freellama/v1/models`, and passthrough (`/api/version`) all correctly on the same port.
-
-**Scope note:** the retry/backoff/timeout fix lives in `packages/rust-core/src/proxy.rs` and is used by both
-passthrough paths above. The managed-task routing path (`forward_managed_task` in
-`packages/rust-core/src/platform.rs`, behind `/_freellama/v1/tasks`) builds its own separate `reqwest::Client` and
-does **not** currently get that same retry protection — a known gap if you rely on managed tasks
-under a flaky Ollama, tracked the same way `docs/OLLAMA_SYSTEM_OPTIMIZATION.md` tracks other
-deferred work.
-
-## What's installed locally right now
-
-`ollama list` on this machine (informational — re-run it yourself, this changes over time;
-the MCP `models` tool reports the same thing with capabilities and VRAM residency):
-
-```
-qwen3.8:27b-mlx           18.2 GB
-nomic-embed-text:latest    0.3 GB
+```mermaid
+flowchart TB
+    subgraph clients["ways to drive it"]
+        CLI["freellama CLI"]
+        MCP["MCP server<br/>(8 tools)"]
+        APP["your Rust app"]
+    end
+    CORE["<b>freellama-core</b><br/>router · admission · proxy"]
+    OLL["Ollama"]
+    CLI --> CORE
+    MCP --> CORE
+    APP --> CORE
+    CORE --> OLL
 ```
 
-`freellama models` (against a running `serve` instance) returns the live, structured version of
-this — including which model is currently resident in VRAM and its advertised context window —
-which is what `packages/rust-core/src/platform.rs`'s routing actually reads to make selection decisions.
+## Install and run
 
-## Start in five minutes
-
-**Prerequisites:** Rust 1.85+, Node 20+, a running Ollama at `http://127.0.0.1:11434`, and at least
-one installed model of ~12B or larger (smaller models are measurably unreliable for research —
-see [`skills/freellama/`](skills/freellama/SKILL.md)).
+Requirements: **Rust 1.85+**, **Node 20+**, a running **Ollama**, and at least one installed model
+of **~12B or larger** — below that, accuracy on research collapses (see [Real
+numbers](#real-numbers)).
 
 ```bash
-git clone <this repo> && cd FreeLlama
-cargo build --release                  # builds freellama-core + the freellama CLI
-npm install && npm run build           # builds the native addon into packages/mcp/native
-npm --prefix packages/mcp install
-npm --prefix packages/mcp run build    # builds the MCP server
+cargo build --release                                   # freellama-core + the freellama CLI
+npm install && npm run build                            # native addon (napi)
+npm --prefix packages/mcp install                       # MCP server deps
+npm --prefix packages/mcp run build                     # MCP server
+
+./target/release/freellama doctor                       # health check — works with nothing else running
+./target/release/freellama serve                        # the gateway, on 127.0.0.1:11435
 ```
 
-Check the machine before anything else — this works with nothing else running:
+`doctor` reports Ollama's health and the memory-governing settings that decide what fits.
+`serve` starts the control plane; `.mcp.json` already registers the MCP server, so an MCP-capable
+agent in this repository picks it up with no extra setup.
 
-```bash
-./target/release/freellama doctor
-```
-
-It reports Ollama reachability, CLI/server version drift, your chip/RAM/disk, and the nine
-`OLLAMA_*` settings **with their effective defaults** (unset means "Ollama picks", not "off" — two
-of those defaults are commonly wrong for a large-model setup).
-
-## Using the CLI
+## Use the CLI
 
 Start the control plane, then drive it from another terminal:
 
 ```bash
-./target/release/freellama serve --recommendation-catalog recommendations.example.toml
-```
-
-```bash
-freellama tools                                  # every MCP tool and its CLI equivalent
-freellama models                                 # installed models, capabilities, residency
-freellama route --task coding --objective fastest
-freellama task --task completion --objective fastest "Reply with exactly OK."
-freellama doctor                                 # works without serve
-```
-
-`doctor` is the only subcommand that runs without `serve`. Every other control-plane command now
-tells you exactly how to start it if it is not running, rather than surfacing a transport error.
-
-**Objectives.** `fastest` needs no configuration. `balanced` and `quality` require a policy file —
-see "Trustworthy routing" below.
-
-### Making routing trustworthy
-
-By default every route grades `confidence: "low"`, because nothing has vouched for any model. To
-get `medium` — and to make `minConfidence: "medium"` useful rather than a switch that refuses
-everything — the router needs **two** inputs:
-
-| Input | Supplies |
-|---|---|
-| a policy file | a *quality* contract: which models are vouched for on this task |
-| a benchmark report | local *functional* measurement, from `freellama bench-all` |
-
-Generate the policy from quality data — never from `bench-all`, which measures throughput:
-
-```bash
-freellama policy-from-eval \
-  --aggregate benchmark/local/results/<model>/aggregate.json \
-  --task coding --min-pass 0.8 --out platform.toml
-
-freellama bench-all --output benchmark-report.json
 freellama serve --recommendation-catalog recommendations.example.toml
+
+freellama models                                        # installed models, capabilities, residency
+freellama route --task coding --objective fastest       # the model this task picks, and why
+freellama task --task completion --objective fastest "Reply with exactly OK."
+freellama tools                                         # every MCP tool and its CLI equivalent
+freellama doctor                                        # the one command that needs no serve
 ```
 
-`serve` picks up `platform.toml` and `benchmark-report.json` from the working directory
-automatically; explicit `--policy-file` / `--benchmark-report` always win. When either is missing it
-says so at startup rather than silently grading everything `low`.
+`fastest` needs no configuration. `balanced` and `quality` require a policy file plus a benchmark
+report — see [`docs/CLI.md`](docs/CLI.md) for `policy-from-eval`, `bench-all`, and objectives.
 
-`policy-from-eval` refuses to manufacture evidence: fewer than three trials is a smoke result
-(`--allow-smoke` marks the output accordingly), aggregates past their review date are rejected, and
-models that are not installed are skipped.
+## Use the MCP server
 
-## Which local models to use
+The server exposes eight tools. The two you reach for most:
 
-Measured on this machine, not inferred from model cards or download counts. Re-derive for your own
-hardware with `freellama models` and `search_models` — the method transfers, the numbers may not.
+- **`run_task`** — routes *and* executes a chat/generate/embed call; output tokens land on the local
+  model, and embedding vectors are withheld from the response by default.
+- **`delegate_research`** — answers a grounded question by letting a local model read files under an
+  allowlisted path, and returns the answer, a citation trail, and an `accept` / `verify` /
+  `escalate` verdict.
 
-### Text, code, and vision — one model covers all of it
+The rest cover diagnostics and lifecycle: `doctor`, `models`, `route`, `search_models`,
+`ollama_manage`, `ollama_delete`. See [`packages/mcp/README.md`](packages/mcp/README.md) for the
+full tool table, configuration, and the security boundary on `delegate_research`.
 
-**`qwen3.8:27b-mlx`** (18 GB). It handles coding, grounded research, image description, OCR, and
-summarisation, and it was both the most accurate *and* the fastest of the large models tested here.
-Vision works properly: it described a UI mockup accurately and transcribed a terminal screenshot
-including an identifier a dedicated OCR model got wrong.
+For agents driving the server, the [`freellama` skill](skills/freellama/SKILL.md) is the playbook:
+when to delegate, how to check the queue first, and how to read the verdict.
 
-`muse-glimmer:30b-mlx` is a credible alternative — it won the largest-sample benchmark in this repo
-(96.7% over 90 trials) — but it is slower and does not add a capability qwen lacks. Running one
-large model rather than two also removed memory contention: qwen's vision latency dropped from ~37s
-to ~14s afterwards.
+## Inspectable routing
 
-**Do not go small for research.** Accuracy collapses below roughly 12B: measured here at 7B 2/8,
-3B 3/8, 0.5B 0/8 on grounded lookups. A fast wrong answer costs more than the tokens it saved,
-which is why `delegate_research` refuses a model measured unusable instead of running it.
+`confidence: "medium"` on its own reads like a calibrated probability. It isn't one — so FreeLlama
+reports the dimensions it's derived from separately:
 
-### Embeddings — the cheapest thing you can run locally
-
-**`nomic-embed-text`** (274 MB). Benchmarked against the alternatives on real retrieval over this
-repo — 152 chunks, 6 questions with known-correct files:
-
-| Model | recall@3 | Index time | Dims | Size |
-|---|---|---|---|---|
-| **`nomic-embed-text`** | **5/6** | **4.2s** | 768 | **274 MB** |
-| `embeddinggemma:300m` | 5/6 | 4.9s | 768 | 622 MB |
-| `qwen3-embedding:0.6b` | 4/6 | 14.8s | 1024 | 639 MB |
-
-Note that **`qwen3-embedding` ranks first on ollama.com and came last here**, at 3.5x the indexing
-cost. Site rank is not retrieval quality — `search_models` returns a `pulls` field precisely so you
-can judge rather than trust position. `embeddinggemma` is a fine substitute; `nomic-embed-text` is
-smaller, faster, and already the most-downloaded embedding model by a wide margin.
-
-Embeddings are the strongest local play by a distance: indexing this repo's source cost **zero**
-tokens returned to the orchestrator and under ten seconds. There is no sampling, so nothing to
-hallucinate. Index once, query many times.
-
-**But use them for the right thing.** For finding code by keyword, `grep` beat embedding search
-here on accuracy, latency and cost simultaneously. Reach for embeddings when there is no keyword to
-search for — grouping, deduplication, classification, semantic similarity.
-
-## Using the MCP server
-
-[`.mcp.json`](.mcp.json) registers it already, so an MCP-capable agent in this repo picks it up with
-no setup. For another client:
-
-```json
-{
-  "mcpServers": {
-    "freellama": {
-      "command": "node",
-      "args": ["/absolute/path/to/FreeLlama/packages/mcp/dist/index.js"]
-    }
-  }
-}
+```
+$ freellama route --task code-repair --objective fastest
+  selected        : qwen3.8:27b-mlx
+  qualityEvidence : none          # no policy vouches for this model on this task
+  taskEvidence    : none          # no functional benchmark measured it
+  hardwareFit     : strong        # fits the requested context
+  confidence      : low           # derived from the above, not asserted
+  rejected        : []            # every losing candidate, with its reason
 ```
 
-Eight tools: `doctor`, `models`, `route`, `search_models`, `run_task`, `ollama_manage`,
-`ollama_delete`, `delegate_research`. Full contract in
-[`packages/mcp/README.md`](packages/mcp/README.md); the orchestration playbook — what to offload,
-to which tier, and what never to delegate — is [`skills/freellama/`](skills/freellama/SKILL.md).
+Confidence is *derived*, never asserted — it's a function of the two evidence inputs you supply:
 
-Four of the eight need `serve` running (`models` installed-view, `route`, `run_task`, and `doctor`'s
-machine profile). The rest talk to Ollama directly or to ollama.com.
-
-## Running everything
-
-```bash
-cargo test                              # 55 Rust tests across core + CLI contracts
-cargo clippy --all-targets              # zero warnings expected
-npm --prefix packages/mcp test          # protocol suite (69 assertions)
-
-# behaviour suite — exercises every tool against the live system; needs serve + Ollama
-node packages/mcp/test/validate-all.mjs
+```mermaid
+flowchart LR
+    P{"policy file<br/>vouches for the model?"}
+    B{"benchmark report<br/>measured the model?"}
+    P -->|yes| B
+    P -->|no| LOW["confidence: low"]
+    B -->|yes| MED["confidence: medium"]
+    B -->|no| LOW
+    MED --> G{"--min-confidence medium?"}
+    LOW --> G
+    G -->|"grade too low"| REF["refuse · name what's missing"]
+    G -->|"grade met / not set"| USE["use the model"]
 ```
 
-`validate-all.mjs` is the one that matters: it asserts what each tool *does*, not that its schema
-parses — that `minConfidence` refuses **before** generating, that embedding vectors are withheld by
-default, that a 143GB model is excluded on a 52GB machine, and that an unusable model is refused
-without being run.
+Pass `--min-confidence medium` and an unjustified route is **refused** — naming the grade, the
+evidence behind it, the model it declined, and the two commands that raise the grade. The
+gate lives in the router itself, so the CLI, the HTTP API, and anyone embedding `freellama-core`
+inherit it. To reach `medium`, give the router a policy file and a benchmark report
+([`docs/CLI.md`](docs/CLI.md)).
 
-## MCP tools: offloading tokens to a local model
+## Real numbers
 
-`packages/mcp/` exposes FreeLlama's control plane, Ollama's lifecycle, and a research-delegation
-tool as 8 MCP tools, so an orchestrating LLM can hand off work instead of spending its own
-context on it. Full tool table, input schemas, and configuration: [`packages/mcp/README.md`](packages/mcp/README.md).
+Measured with real calls on one machine (Apple M4 Pro, 52 GB unified memory). Your figures differ;
+the full accounting is in [`docs/ECONOMICS.md`](docs/ECONOMICS.md).
 
-**The two tools that offload tokens** (`route`/`recommend`/`doctor`/`models` only
-ever make a decision — they never run anything, and cost no local generation):
+**Context isolation** — how much of the work never reaches the orchestrator:
 
-- **`run_task`** routes and executes a chat, completion, embedding, or vision call in one call.
-  Every output token Ollama generates is spent on the local model; the orchestrator only pays for
-  the JSON response wrapper, typically a few hundred tokens regardless of how much the local model
-  generated.
-- **`delegate_research`** hands a grounded code-research question to a local model equipped with
-  the [octocode](https://github.com/bgauryy/octocode) CLI and returns a cited answer. Measured on
-  this machine, real calls: a question answerable from one file spent 4,584 input / 296 output
-  tokens on the local model and returned about 220 tokens to the orchestrator — roughly 95% of the
-  work never entered the orchestrator's context. A question spanning three files spent 26,298
-  input / 849 output tokens locally and returned about 480 — roughly 98% offloaded. The saving
-  scales with how many files the question requires reading.
+| Work | Without FreeLlama | Returned | Kept local |
+|---|---:|---:|---:|
+| 6 grounded code questions | 59,208 tok | 1,742 tok | **97.1%** |
+| 4 text embeddings | 17,600 tok | ~200 tok | **98.9%** |
+| 1 image, OCR, byte-exact | 1,970 tok | 37 tok | **98.1%** |
+| Tool schemas, per turn | 2,987 tok | 0 tok | **100%** |
 
-**Trust boundary, also measured, not assumed**: on 100+ real questions, the same local model
-reached 98.9% accuracy on grounded lookups ("where is X defined," "find every call site of Y")
-because it must cite file:line evidence you can spot-check — but only about 67% on judgment calls
-such as code review or bug-finding, with the same confident tone either way. Delegate lookups
-freely; verify judgment calls yourself before acting on them.
+**Model size matters** — grounded single-file research, accuracy by model size:
 
-## Benchmarking Local Models and Agents
+| Size | Solved (of 8) |
+|---|---:|
+| 0.5B | 0 |
+| 3B | 3 |
+| 7B | 2 |
+| 12B | 6 |
+| 27B | **8** |
 
-FreeLlama includes a flexible benchmarking skill that measures model performance, cost, latency, and token efficiency across frozen task suites. The framework is parameterized to support any agent type.
+Research falls off a cliff below ~12B, and accuracy isn't monotonic at the small end — a fast wrong
+answer costs more than the tokens it saved. Pick a model measured strong for the work.
 
-**Documentation:**
-- **Benchmark skill (workflow map)**: [`benchmark/harness/README.md`](benchmark/harness/README.md) — points into `benchmark/`, where all benchmark material actually lives
-- **Generic harness**: [`benchmark/harness/`](benchmark/harness/README.md) — scripts, schemas, and reference docs the skill above routes to
-- **Example benchmark**: [`benchmark/local/`](benchmark/local/README.md) — octocode CLI vs raw bash on 30 code-research questions across click/zustand/openui, the canonical (only) home for this comparison, built on the harness
-- **Agent types**: [`AGENTS.md`](AGENTS.md) — Available agents (octocode CLI, bash shell)
+**The cost side.** A grounded question takes **7–62 s** (versus ~1 s for a frontier model that
+already holds the file), and latency is turn-dominated: `seconds ≈ 9.8 × tool_calls`. Past ~1k
+tokens of source, the token math wins; below that, read the file yourself.
+
+## What it is not
+
+FreeLlama is **not** a remote-provider marketplace, billing layer, model registry, installation
+executor, agent runtime, or A2A coordinator.
+
+**It also does not make inference faster.** An audit traced a measured 43.9% speedup entirely to
+Ollama's MLX artifact, not to FreeLlama; holding the artifact constant, the proxy added 0.330 ms and
+no speedup. Use Ollama directly if raw speed for one exact model is the only goal.
+
+Ollama runs the models. FreeLlama decides *when* local inference deserves to be used, *which* model
+gets the work, and *what evidence* is allowed back into the orchestrator.
 
 ## Documentation
 
-- [Architecture](docs/ARCHITECTURE.md) — control-plane, passthrough, and Ollama boundaries.
-- [Ollama sidecar rationale](docs/OLLAMA_SIDECAR.md) — why the proxy is a sidecar, not a plugin.
-- [System optimization](docs/OLLAMA_SYSTEM_OPTIMIZATION.md) — what FreeLlama tunes today, what it deliberately doesn't yet.
-- [Agents](AGENTS.md) — Available agent types for benchmarking and research.
-- [**FreeLlama skill**](skills/freellama/SKILL.md) — the orchestration playbook for any agent
-  driving this: which tier to push work to, what never to delegate, and how to check the machine
-  before a large call. Loaded on demand; the MCP instructions point at it.
-- [`packages/rust-core`](packages/rust-core/README.md) — all the logic, embeddable as a Rust library.
-- [`packages/cli`](packages/cli/README.md) — the `freellama` binary.
-- [`packages/mcp`](packages/mcp/README.md) — the MCP server. One Cargo workspace, shared versions.
-- [MCP server](packages/mcp/README.md) — 8 tools (routing, model discovery, Ollama lifecycle, research delegation) built on native NAPI bindings (`packages/rust-core/src/napi.rs`) and the official TypeScript SDK; see "MCP tools: offloading tokens to a local model" above for measured token savings.
+| Doc | What's in it |
+|---|---|
+| [Architecture](docs/ARCHITECTURE.md) | the three tiers, admission and throttling, request paths, product boundary |
+| [Economics](docs/ECONOMICS.md) | the token accounting in full |
+| [CLI](docs/CLI.md) | every subcommand, policy generation, objectives |
+| [Model selection](docs/MODEL_SELECTION.md) | which local models, and how to re-derive it for your machine |
+| [Testing](docs/TESTING.md) | the suites and what each one asserts |
+| [Ollama sidecar](docs/OLLAMA_SIDECAR.md) | why the proxy is a sidecar, not a plugin |
+| [System optimization](docs/OLLAMA_SYSTEM_OPTIMIZATION.md) | what FreeLlama tunes, and what it deliberately doesn't |
+| [MCP server](packages/mcp/README.md) | the 8 tools, build, configuration, security |
+| [FreeLlama skill](skills/freellama/SKILL.md) | the orchestration playbook for an agent driving this |
+| [Agents](AGENTS.md) | the adapter loop, context management, benchmark adapters |
+| [Benchmarks](benchmark/harness/README.md) | the benchmark surfaces and when to use which |
 
-## Verify the repository
+## Security
 
-Last verified on **2026-08-27**: all 39 contract tests (including proxy retry/backoff), formatting, strict Clippy, and live Ollama routing passed. The live checks covered health, 12-model discovery, machine inspection, sessions, structured routing, natural-language routing, Qwen code-repair selection, managed chat inference, native Ollama passthrough, OpenAI-compatible model listing, and a side-effect-free recommendation plan.
+The platform binds to loopback and has no authentication layer. Keep it local. Do not expose port
+`11435` through a public listener or reverse proxy without adding authentication, authorization,
+TLS, rate limits, and tenant isolation.
 
-```bash
-cargo fmt --all -- --check
-cargo test --all-targets
-cargo clippy --all-targets -- -D warnings
-```
-
-The platform binds to loopback and has no authentication layer. Keep it local. Do not expose port `11435` through a public listener or reverse proxy without adding authentication, authorization, TLS, rate limits, and tenant isolation.
-
-The Cargo package declares the `Apache-2.0 OR MIT` license expression.
+Licensed `Apache-2.0 OR MIT`.

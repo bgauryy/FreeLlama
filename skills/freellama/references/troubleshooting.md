@@ -1,8 +1,6 @@
 # Troubleshooting: symptom → cause → fix
 
-Load when something is actually failing and you need symptom-to-cause-to-fix, not a config choice.
-
-All of these were observed and diagnosed live on this machine, not theoretical.
+Load when something is failing. All entries were observed and diagnosed live, not theoretical.
 
 ## `HTTP 500` from `/api/chat`, intermittent
 

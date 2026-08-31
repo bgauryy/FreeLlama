@@ -4,19 +4,10 @@ Load when deleting models, or when changing anything about workspace/fixture ret
 
 ## The incident this is based on
 
-A benchmark session filled a 926GB disk to 100% (188Mi free) while running local-model comparisons.
-Root causes, in order of contribution:
-
-1. **~111GB of installed Ollama models**, several genuine duplicates (three separate tags —
-   `gemma4:12b-mlx`, `gemma4:12b`, `gemma4:latest` — all pointing at essentially the same model),
-   several unused for 6-8 months.
-2. **The benchmark harness's own workspace accumulation.** Each trial copies the full fixture repo
-   set (~600MB: click + zustand + openui) into a fresh disposable workspace, and with 30 questions
-   × 2 agents × several re-runs (including some killed/restarted mid-flight), this piled up to
-   15-16GB per completed run, never cleaned up automatically.
-
-It got bad enough that `df` showed 188Mi free and even small command-output writes started failing
-with `ENOSPC` — a genuinely disruptive failure mode, not just an inconvenience.
+A benchmark session filled a 926GB disk to 188Mi free; even small writes failed with `ENOSPC`.
+Causes, in order: **~111GB of installed Ollama models** (duplicate tags of the same model, several
+unused for months) and **benchmark workspace accumulation** (each trial copies ~600MB of fixtures;
+30 questions × 2 agents × re-runs piled up 15-16GB per run, never auto-cleaned).
 
 ## What's fixed (automated, safe, no judgment call required)
 

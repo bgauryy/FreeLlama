@@ -1,7 +1,6 @@
 //! Machine-aware local-model discovery, routing, sessions, and task execution.
 
 use std::{
-    cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
     net::SocketAddr,
     path::PathBuf,
@@ -18,12 +17,10 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use clap::ValueEnum;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::sync::RwLock;
-use uuid::Uuid;
+use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 
 use crate::{
     model_bench::{AllModelsReport, Capability},
@@ -33,6 +30,19 @@ use crate::{
         load_catalog,
     },
 };
+
+mod intent;
+mod routing;
+
+pub use intent::{RouteIntent, intent_schema, normalize_route_intent, parse_route_intent};
+pub use routing::{
+    CatalogModel, Objective, RouteDecision, RouteEvidence, RouteInput, SessionAffinity, TaskKind,
+    select_route,
+};
+
+// Private helpers the server plane reuses from the pure routing/intent modules.
+use intent::intent_system_prompt;
+use routing::{requested_context, requirements};
 
 const API_ROOT: &str = "/_freellama/v1";
 type CatalogCache = Arc<RwLock<Option<(Instant, Vec<CatalogModel>)>>>;
@@ -45,6 +55,12 @@ pub struct PlatformConfig {
     pub policy_file: Option<PathBuf>,
     pub recommendation_catalog: Option<PathBuf>,
     pub intent_model: String,
+    /// Concurrent managed tasks allowed against Ollama, in cost units. `None` falls back to
+    /// `FREELLAMA_MAX_CONCURRENT_TASKS`, then to 8.
+    pub max_concurrent_tasks: Option<usize>,
+    /// Longest a task may queue for an admission slot before being refused with 503. `None` falls
+    /// back to `FREELLAMA_MAX_QUEUE_WAIT_SECONDS`, then to 120s.
+    pub max_queue_wait: Option<Duration>,
 }
 
 impl PlatformConfig {
@@ -63,7 +79,46 @@ impl PlatformConfig {
             policy_file,
             recommendation_catalog: None,
             intent_model: intent_model.into(),
+            max_concurrent_tasks: None,
+            max_queue_wait: None,
         }
+    }
+
+    /// Cap how long a task may queue for admission before being refused.
+    ///
+    /// Exposed on the config, not env-only, so the refusal path can be tested without mutating
+    /// process environment — which Rust 2024 makes `unsafe`, and this crate denies `unsafe`.
+    #[must_use]
+    pub fn with_max_queue_wait(mut self, wait: Duration) -> Self {
+        self.max_queue_wait = Some(wait);
+        self
+    }
+
+    /// Bound how many managed tasks may be in flight against Ollama at once.
+    ///
+    /// Set it to match `OLLAMA_NUM_PARALLEL`. Ollama's own default is 1, so a higher number here
+    /// does not buy parallel decoding — it keeps the pipe full and bounds the burst. Exposed on the
+    /// config (not env-only) so a test or an embedding application can set it without mutating
+    /// process environment.
+    #[must_use]
+    pub fn with_max_concurrent_tasks(mut self, slots: usize) -> Self {
+        self.max_concurrent_tasks = Some(slots.max(1));
+        self
+    }
+
+    /// The admission budget this config will actually run with, after the
+    /// `FREELLAMA_MAX_CONCURRENT_TASKS` fallback and the semaphore's own ceiling.
+    ///
+    /// Public because the CLI prints the budget at startup: reading `max_concurrent_tasks`
+    /// directly there reported the hardcoded default whenever the env var was the thing setting
+    /// it, so the operator was told 8 while the server ran with something else.
+    #[must_use]
+    pub fn resolved_max_concurrent_tasks(&self) -> usize {
+        self.max_concurrent_tasks
+            .unwrap_or_else(max_concurrent_tasks)
+            // `Semaphore::new` panics above `MAX_PERMITS`, and this number can come from an env
+            // var — a startup panic is the wrong answer to a typo'd `FREELLAMA_MAX_CONCURRENT_TASKS`.
+            .clamp(1, Semaphore::MAX_PERMITS)
     }
 
     #[must_use]
@@ -95,577 +150,6 @@ impl PlatformConfig {
     }
 }
 
-#[derive(
-    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Default, ValueEnum,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum TaskKind {
-    #[default]
-    Completion,
-    Coding,
-    CodeRepair,
-    Tools,
-    Browser,
-    Vision,
-    Embedding,
-    LongContext,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, ValueEnum)]
-#[serde(rename_all = "snake_case")]
-pub enum Objective {
-    Fastest,
-    #[default]
-    Balanced,
-    Quality,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct RouteInput {
-    pub task: TaskKind,
-    pub objective: Objective,
-    pub model: Option<String>,
-    pub session_id: Option<String>,
-    pub required_capabilities: BTreeSet<Capability>,
-    pub context_tokens: Option<u64>,
-}
-
-impl Default for RouteInput {
-    fn default() -> Self {
-        Self {
-            task: TaskKind::Completion,
-            objective: Objective::Balanced,
-            model: None,
-            session_id: None,
-            required_capabilities: BTreeSet::new(),
-            context_tokens: None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct RouteIntent {
-    pub task: TaskKind,
-    pub objective: Objective,
-    pub context_tokens: Option<u64>,
-    pub requires_tools: bool,
-    pub requires_vision: bool,
-}
-
-impl RouteIntent {
-    #[must_use]
-    pub fn into_route_input(self, session_id: Option<String>) -> RouteInput {
-        let mut required_capabilities = BTreeSet::new();
-        if self.requires_tools {
-            required_capabilities.insert(Capability::Tools);
-        }
-        if self.requires_vision {
-            required_capabilities.insert(Capability::Vision);
-        }
-        RouteInput {
-            task: self.task,
-            objective: self.objective,
-            session_id,
-            required_capabilities,
-            context_tokens: self.context_tokens,
-            ..RouteInput::default()
-        }
-    }
-}
-
-/// Return the strict schema used by the local natural-language intent model.
-#[must_use]
-pub fn intent_schema() -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-            "task": {"type": "string", "enum": ["completion", "coding", "code_repair", "tools", "browser", "vision", "embedding", "long_context"]},
-            "objective": {"type": "string", "enum": ["fastest", "balanced", "quality"]},
-            "context_tokens": {"type": ["integer", "null"], "minimum": 512},
-            "requires_tools": {"type": "boolean"},
-            "requires_vision": {"type": "boolean"}
-        },
-        "required": ["task", "objective", "context_tokens", "requires_tools", "requires_vision"]
-    })
-}
-
-/// Parse and validate the local intent model's structured output.
-///
-/// # Errors
-///
-/// Returns an error for malformed JSON, unknown fields, or invalid enum values.
-pub fn parse_route_intent(content: &str) -> Result<RouteIntent> {
-    serde_json::from_str(content).context("parse structured route intent")
-}
-
-/// Apply deterministic guards for explicit, high-impact natural-language constraints.
-#[must_use]
-pub fn normalize_route_intent(mut intent: RouteIntent, text: &str) -> (RouteIntent, Vec<String>) {
-    let text = text.to_ascii_lowercase();
-    let mut adjustments = Vec::new();
-    let has_vision_evidence = contains_any(&text, &["screenshot", "image", "photo", "vision"]);
-    let has_tool_evidence = contains_any(
-        &text,
-        &[
-            "click",
-            "tool call",
-            "function call",
-            "use tools",
-            "search the repository",
-            "edit files",
-        ],
-    );
-    let has_context_evidence = contains_any(
-        &text,
-        &[
-            "context",
-            "token",
-            "large document",
-            "long document",
-            "long input",
-        ],
-    );
-    if let Some((task, reason)) = explicit_task(&text)
-        && intent.task != task
-    {
-        intent.task = task;
-        adjustments.push(reason.to_owned());
-    }
-
-    if contains_any(
-        &text,
-        &[
-            "maximum quality",
-            "maximum answer quality",
-            "best quality",
-            "highest quality",
-            "best evaluated",
-        ],
-    ) && intent.objective != Objective::Quality
-    {
-        intent.objective = Objective::Quality;
-        adjustments.push("explicit_quality_objective".to_owned());
-    } else if contains_any(
-        &text,
-        &[
-            "fast as possible",
-            "fastest",
-            "lowest latency",
-            "low latency",
-        ],
-    ) && intent.objective != Objective::Fastest
-    {
-        intent.objective = Objective::Fastest;
-        adjustments.push("explicit_speed_objective".to_owned());
-    }
-    normalize_inferred_requirements(
-        &mut intent,
-        has_vision_evidence,
-        has_tool_evidence,
-        has_context_evidence,
-        &mut adjustments,
-    );
-    (intent, adjustments)
-}
-
-fn explicit_task(text: &str) -> Option<(TaskKind, &'static str)> {
-    if contains_any(text, &["semantic vector", "embedding", "vector embedding"]) {
-        Some((TaskKind::Embedding, "explicit_embedding_term"))
-    } else if contains_any(
-        text,
-        &[
-            "fix the bug",
-            "bug fix",
-            "repair the code",
-            "implement the fix",
-            "edit files",
-        ],
-    ) {
-        Some((TaskKind::CodeRepair, "explicit_code_repair_term"))
-    } else if contains_any(
-        text,
-        &[
-            "browser",
-            "webpage",
-            "web page",
-            "checkout page",
-            "click the",
-        ],
-    ) {
-        Some((TaskKind::Browser, "explicit_browser_term"))
-    } else if contains_any(
-        text,
-        &[
-            "code review",
-            "codebase",
-            "debug",
-            "rust code",
-            "write code",
-        ],
-    ) {
-        Some((TaskKind::Coding, "explicit_coding_term"))
-    } else {
-        None
-    }
-}
-
-fn normalize_inferred_requirements(
-    intent: &mut RouteIntent,
-    has_vision_evidence: bool,
-    has_tool_evidence: bool,
-    has_context_evidence: bool,
-    adjustments: &mut Vec<String>,
-) {
-    if has_vision_evidence && !intent.requires_vision {
-        intent.requires_vision = true;
-        adjustments.push("explicit_vision_requirement".to_owned());
-    }
-    if (matches!(
-        intent.task,
-        TaskKind::Browser | TaskKind::Tools | TaskKind::CodeRepair
-    ) || has_tool_evidence)
-        && !intent.requires_tools
-    {
-        intent.requires_tools = true;
-        adjustments.push("explicit_tool_requirement".to_owned());
-    }
-    if matches!(intent.task, TaskKind::Embedding) {
-        if intent.requires_tools {
-            intent.requires_tools = false;
-            adjustments.push("embedding_clears_tool_requirement".to_owned());
-        }
-        if intent.requires_vision {
-            intent.requires_vision = false;
-            adjustments.push("embedding_clears_vision_requirement".to_owned());
-        }
-    } else {
-        if matches!(intent.task, TaskKind::Vision) && !intent.requires_vision {
-            intent.requires_vision = true;
-            adjustments.push("vision_task_requires_vision".to_owned());
-        } else if !matches!(intent.task, TaskKind::Vision)
-            && !has_vision_evidence
-            && intent.requires_vision
-        {
-            intent.requires_vision = false;
-            adjustments.push("unsupported_vision_requirement_cleared".to_owned());
-        }
-        if !matches!(
-            intent.task,
-            TaskKind::Browser | TaskKind::Tools | TaskKind::CodeRepair
-        ) && !has_tool_evidence
-            && intent.requires_tools
-        {
-            intent.requires_tools = false;
-            adjustments.push("unsupported_tool_requirement_cleared".to_owned());
-        }
-    }
-    if intent.context_tokens.is_some() && !has_context_evidence {
-        intent.context_tokens = None;
-        adjustments.push("unsupported_context_requirement_cleared".to_owned());
-    } else if intent.context_tokens.is_some_and(|tokens| tokens < 512) {
-        intent.context_tokens = Some(512);
-        adjustments.push("context_requirement_clamped".to_owned());
-    }
-}
-
-fn contains_any(text: &str, needles: &[&str]) -> bool {
-    needles.iter().any(|needle| text.contains(needle))
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CatalogModel {
-    pub name: String,
-    pub size: u64,
-    pub capabilities: BTreeSet<Capability>,
-    pub advertised_context: Option<u64>,
-    pub resident: bool,
-    pub resident_vram: Option<u64>,
-    pub benchmark: BTreeMap<Capability, f64>,
-    pub policy_rank: BTreeMap<TaskKind, usize>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RouteDecision {
-    pub selected_model: String,
-    pub task: TaskKind,
-    pub objective: Objective,
-    pub profile: String,
-    pub required_capabilities: BTreeSet<Capability>,
-    pub options: Value,
-    pub think: Value,
-    pub stream: bool,
-    pub strict_tool_validation: bool,
-    pub resident: bool,
-    pub session_id: Option<String>,
-    pub confidence: String,
-    pub evidence: String,
-    pub reasons: Vec<String>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct SessionAffinity {
-    sessions: BTreeMap<String, Option<String>>,
-}
-
-impl SessionAffinity {
-    #[must_use]
-    pub fn from_pairs(pairs: impl IntoIterator<Item = (String, String)>) -> Self {
-        Self {
-            sessions: pairs
-                .into_iter()
-                .map(|(session, model)| (session, Some(model)))
-                .collect(),
-        }
-    }
-
-    fn create(&mut self) -> String {
-        let id = Uuid::new_v4().to_string();
-        self.sessions.insert(id.clone(), None);
-        id
-    }
-
-    fn contains(&self, id: &str) -> bool {
-        self.sessions.contains_key(id)
-    }
-
-    fn assigned(&self, id: &str) -> Option<&str> {
-        self.sessions.get(id).and_then(Option::as_deref)
-    }
-
-    fn bind(&mut self, id: &str, model: &str) {
-        if let Some(slot) = self.sessions.get_mut(id) {
-            *slot = Some(model.to_owned());
-        }
-    }
-}
-
-/// Select an eligible local model and a bounded Ollama request profile.
-///
-/// # Errors
-///
-/// Returns an error when no installed model satisfies the request contract.
-pub fn select_route(
-    input: &RouteInput,
-    models: &[CatalogModel],
-    sessions: &SessionAffinity,
-) -> Result<RouteDecision> {
-    let required = requirements(input);
-    let capability_eligible = models
-        .iter()
-        .filter(|model| required.is_subset(&model.capabilities))
-        .filter(|model| {
-            input.context_tokens.is_none_or(|requested| {
-                model
-                    .advertised_context
-                    .is_some_and(|available| requested <= available)
-            })
-        })
-        .collect::<Vec<_>>();
-
-    let eligible = if input.model.is_some() || matches!(input.objective, Objective::Fastest) {
-        capability_eligible
-    } else {
-        let qualified = capability_eligible
-            .iter()
-            .copied()
-            .filter(|model| model.policy_rank.contains_key(&input.task))
-            .collect::<Vec<_>>();
-        ensure!(
-            !qualified.is_empty(),
-            "no quality-qualified model exists for this task; configure a task policy, choose --objective fastest, or name an explicit model"
-        );
-        qualified
-    };
-
-    let chosen = if let Some(exact) = input.model.as_deref() {
-        let installed = models.iter().find(|model| model.name == exact);
-        let model = installed.with_context(|| format!("model is not installed: {exact}"))?;
-        ensure!(
-            eligible.iter().any(|candidate| candidate.name == exact),
-            "model is not eligible for the request: {exact}"
-        );
-        model
-    } else if let Some(affine) = input
-        .session_id
-        .as_deref()
-        .and_then(|id| sessions.assigned(id))
-        .and_then(|name| eligible.iter().find(|model| model.name == name).copied())
-    {
-        affine
-    } else {
-        eligible
-            .iter()
-            .copied()
-            .max_by(|left, right| compare_candidates(left, right, input))
-            .context("no installed model is eligible for the request")?
-    };
-
-    let (profile, options, think, stream, strict_tool_validation) = profile(input, chosen);
-    let capability = ranking_capability(input.task);
-    let has_benchmark = chosen.benchmark.contains_key(&capability);
-    let policy_qualified = chosen.policy_rank.contains_key(&input.task);
-    let mut reasons = vec!["installed".to_owned(), "capabilities_satisfied".to_owned()];
-    if input.model.is_some() {
-        reasons.push("explicit_model".to_owned());
-    } else if input
-        .session_id
-        .as_deref()
-        .and_then(|id| sessions.assigned(id))
-        == Some(chosen.name.as_str())
-    {
-        reasons.push("session_affinity".to_owned());
-    } else {
-        if chosen.resident {
-            reasons.push("resident".to_owned());
-        }
-        reasons.push(if policy_qualified {
-            "configured_task_policy".to_owned()
-        } else if has_benchmark {
-            "functional_screen_rank".to_owned()
-        } else {
-            "capability_only_fallback".to_owned()
-        });
-    }
-    let (confidence, evidence) = route_evidence(policy_qualified, has_benchmark);
-    Ok(RouteDecision {
-        selected_model: chosen.name.clone(),
-        task: input.task,
-        objective: input.objective,
-        profile,
-        required_capabilities: required,
-        options,
-        think,
-        stream,
-        strict_tool_validation,
-        resident: chosen.resident,
-        session_id: input.session_id.clone(),
-        confidence: confidence.to_owned(),
-        evidence: evidence.to_owned(),
-        reasons,
-    })
-}
-
-fn route_evidence(policy_qualified: bool, has_benchmark: bool) -> (&'static str, &'static str) {
-    match (policy_qualified, has_benchmark) {
-        (true, true) => ("medium", "configured_task_policy"),
-        (true, false) => ("low", "configured_task_policy"),
-        (false, true) => ("low", "functional_throughput_screen"),
-        (false, false) => ("low", "capability_metadata_only"),
-    }
-}
-
-fn requirements(input: &RouteInput) -> BTreeSet<Capability> {
-    let mut required = input.required_capabilities.clone();
-    required.insert(ranking_capability(input.task));
-    if matches!(
-        input.task,
-        TaskKind::Tools | TaskKind::Browser | TaskKind::CodeRepair
-    ) {
-        required.insert(Capability::Completion);
-        required.insert(Capability::Tools);
-    }
-    required
-}
-
-fn ranking_capability(task: TaskKind) -> Capability {
-    match task {
-        TaskKind::Tools | TaskKind::Browser => Capability::Tools,
-        TaskKind::Vision => Capability::Vision,
-        TaskKind::Embedding => Capability::Embedding,
-        TaskKind::Completion | TaskKind::Coding | TaskKind::CodeRepair | TaskKind::LongContext => {
-            Capability::Completion
-        }
-    }
-}
-
-fn compare_candidates(left: &CatalogModel, right: &CatalogModel, input: &RouteInput) -> Ordering {
-    let capability = ranking_capability(input.task);
-    let left_score = left.benchmark.get(&capability).copied();
-    let right_score = right.benchmark.get(&capability).copied();
-    match input.objective {
-        Objective::Fastest => left_score
-            .unwrap_or(0.0)
-            .total_cmp(&right_score.unwrap_or(0.0))
-            .then_with(|| right.size.cmp(&left.size))
-            .then_with(|| right.name.cmp(&left.name)),
-        Objective::Balanced => left_score
-            .is_some()
-            .cmp(&right_score.is_some())
-            .then_with(|| left.resident.cmp(&right.resident))
-            .then_with(|| {
-                left_score
-                    .unwrap_or(0.0)
-                    .total_cmp(&right_score.unwrap_or(0.0))
-            })
-            .then_with(|| policy_preference(left, right, input.task))
-            .then_with(|| right.name.cmp(&left.name)),
-        Objective::Quality => {
-            policy_preference(left, right, input.task).then_with(|| right.name.cmp(&left.name))
-        }
-    }
-}
-
-fn policy_preference(left: &CatalogModel, right: &CatalogModel, task: TaskKind) -> Ordering {
-    let left_rank = left.policy_rank.get(&task).copied().unwrap_or(usize::MAX);
-    let right_rank = right.policy_rank.get(&task).copied().unwrap_or(usize::MAX);
-    right_rank.cmp(&left_rank)
-}
-
-fn profile(input: &RouteInput, model: &CatalogModel) -> (String, Value, Value, bool, bool) {
-    let qwen_repair_profile =
-        matches!(input.task, TaskKind::CodeRepair) && model.name == "qwen3.8:27b-mlx";
-    let requested_context = if qwen_repair_profile && input.context_tokens.is_none() {
-        8_192
-    } else {
-        requested_context(input)
-    };
-    let num_ctx = requested_context
-        .min(model.advertised_context.unwrap_or(requested_context))
-        .min(u64::from(u32::MAX));
-    let (name, num_predict, think, strict) = match input.task {
-        TaskKind::Browser => ("browser_action", 64, Value::Bool(false), true),
-        TaskKind::Tools => ("tools", 256, Value::Bool(false), true),
-        TaskKind::CodeRepair if qwen_repair_profile => {
-            ("qwen_code_repair", 512, Value::Bool(false), true)
-        }
-        TaskKind::CodeRepair => ("code_repair", 2_048, thinking_or_off(model, "medium"), true),
-        TaskKind::Coding => ("coding", 2_048, thinking_or_off(model, "medium"), false),
-        TaskKind::LongContext => (
-            "long_context",
-            2_048,
-            thinking_or_off(model, "medium"),
-            false,
-        ),
-        TaskKind::Vision => ("vision", 512, Value::Bool(false), false),
-        TaskKind::Embedding => ("embedding", 0, Value::Null, false),
-        TaskKind::Completion => ("completion", 512, Value::Bool(false), false),
-    };
-    let mut options = json!({"num_ctx": num_ctx});
-    if num_predict > 0 {
-        options["num_predict"] = json!(num_predict);
-    }
-    (name.to_owned(), options, think, false, strict)
-}
-
-fn requested_context(input: &RouteInput) -> u64 {
-    input.context_tokens.unwrap_or(match input.task {
-        TaskKind::Browser | TaskKind::Tools | TaskKind::CodeRepair => 8_192,
-        TaskKind::LongContext => 32_768,
-        _ => 16_384,
-    })
-}
-
-fn thinking_or_off(model: &CatalogModel, effort: &str) -> Value {
-    if model.capabilities.contains(&Capability::Thinking) {
-        json!(effort)
-    } else {
-        Value::Bool(false)
-    }
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub struct MachineProfile {
     pub os: String,
@@ -688,6 +172,17 @@ struct PlatformState {
     catalog_cache: CatalogCache,
     intent_model: String,
     managed_execution: Arc<RwLock<()>>,
+    /// Bounds how many managed tasks may be in flight against Ollama at once.
+    ///
+    /// `managed_execution` alone does not do this: resident tasks take a *shared* permit, so any
+    /// number of them could be admitted together and pile into Ollama. Ollama then queues them
+    /// (`OLLAMA_MAX_QUEUE`, default 512) and rejects the overflow with HTTP 503 — and every queued
+    /// request spends its own 900s client budget waiting its turn, so a burst converts into
+    /// timeouts rather than backpressure. A semaphore turns that into a bounded, FIFO wait that the
+    /// caller can actually see.
+    task_slots: Arc<Semaphore>,
+    slots_total: usize,
+    queue_wait: Duration,
 }
 
 #[derive(Debug)]
@@ -728,6 +223,7 @@ pub fn app(config: &PlatformConfig) -> Result<Router> {
     let benchmark = load_benchmark(config.benchmark_report.as_ref())?;
     let policies = load_policies(config.policy_file.as_ref())?;
     let recommendation_catalog = load_catalog(config.recommendation_catalog.as_ref())?;
+    let slots_total = config.resolved_max_concurrent_tasks();
     let state = PlatformState {
         // A client-level backstop, not a nicety. `forward_managed_task` holds the
         // `managed_execution` write lock across its upstream call, so an untimed request against
@@ -747,6 +243,9 @@ pub fn app(config: &PlatformConfig) -> Result<Router> {
         catalog_cache: Arc::new(RwLock::new(None)),
         intent_model: config.intent_model.clone(),
         managed_execution: Arc::new(RwLock::new(())),
+        task_slots: Arc::new(Semaphore::new(slots_total)),
+        slots_total,
+        queue_wait: config.max_queue_wait.unwrap_or_else(max_queue_wait),
     };
     let platform = Router::new()
         .route(&format!("{API_ROOT}/health"), get(health))
@@ -784,8 +283,25 @@ pub async fn serve(config: PlatformConfig) -> Result<()> {
         .context("serve platform")
 }
 
-async fn health() -> Json<Value> {
-    Json(json!({"status": "ok", "version": env!("CARGO_PKG_VERSION")}))
+/// Liveness plus a load-shedding signal.
+///
+/// An orchestrating agent deciding "delegate, queue, or do it myself" needs a cheap read-only
+/// answer to "will a task be admitted right now?". Without it the only way to find out is to
+/// submit and possibly eat a 120s queue wait or a 503. `slots_available` is a snapshot — racy by
+/// nature, advisory by design — but 0 here means "expect to queue", which is exactly the decision
+/// input a caller needs. Standard readiness-endpoint practice, kept on `/health` rather than a new
+/// tool so the surface does not grow.
+async fn health(State(state): State<PlatformState>) -> Json<Value> {
+    Json(json!({
+        "status": "ok",
+        "version": env!("CARGO_PKG_VERSION"),
+        "admission": {
+            "slots_total": state.slots_total,
+            "slots_available": state.task_slots.available_permits(),
+            "max_queue_wait_seconds": state.queue_wait.as_secs(),
+            "costs": {"embedding": 1, "chat": 2, "vision": 4},
+        },
+    }))
 }
 
 async fn machine(State(state): State<PlatformState>) -> Json<MachineProfile> {
@@ -972,10 +488,6 @@ async fn natural_route(
     }))
 }
 
-fn intent_system_prompt() -> &'static str {
-    "Translate the user's natural-language request into the route-intent schema. Use browser for webpage navigation or interaction; code_repair for fixing a repository bug or editing files to implement a repair; coding for code review, explanation, or diagnosis without a requested repair; tools when function calls are required; vision for image-only analysis; embedding for vectors or semantic search; long_context only for explicitly large documents; otherwise completion. Use fastest only when the user explicitly prioritizes speed or latency, quality only when they explicitly prioritize maximum answer quality, and balanced otherwise. Set requires_tools and requires_vision independently. Never choose or name a model."
-}
-
 async fn create_session(State(state): State<PlatformState>) -> Json<Value> {
     let id = state.sessions.write().await.create();
     Json(json!({"session_id": id, "affinity": "model"}))
@@ -1004,6 +516,42 @@ struct TaskInput {
     keep_alive: Option<String>,
 }
 
+/// Wait for an admission slot sized to the task, or refuse.
+///
+/// Returns the held permit, the cost charged, and how long the caller queued.
+async fn admit(
+    state: &PlatformState,
+    task: TaskKind,
+) -> Result<(OwnedSemaphorePermit, u32, u128), ApiError> {
+    let queued = Instant::now();
+    let budget = u32::try_from(state.slots_total).unwrap_or(u32::MAX).max(1);
+    let cost = task_cost(task).min(budget);
+    let wait = state.queue_wait;
+    let permit =
+        match tokio::time::timeout(wait, Arc::clone(&state.task_slots).acquire_many_owned(cost))
+            .await
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => {
+                return Err(ApiError {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    message: "task admission is shutting down".to_owned(),
+                });
+            }
+            Err(_) => {
+                return Err(ApiError {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    message: format!(
+                        "server busy: no admission slot within {}s (task cost {cost} of {budget} \
+                         units). Retry, or raise --max-concurrent-tasks.",
+                        wait.as_secs()
+                    ),
+                });
+            }
+        };
+    Ok((permit, cost, queued.elapsed().as_millis()))
+}
+
 async fn run_task(
     State(state): State<PlatformState>,
     Json(input): Json<TaskInput>,
@@ -1020,13 +568,6 @@ async fn run_task(
     }
     let decision = select_route(&input.route, &models, &sessions).map_err(ApiError::bad_request)?;
     drop(sessions);
-    if let Some(id) = input.route.session_id.as_deref() {
-        state
-            .sessions
-            .write()
-            .await
-            .bind(id, &decision.selected_model);
-    }
 
     let keep_alive = input.keep_alive.unwrap_or_else(|| "5m".to_owned());
     let (path, body) = if matches!(input.route.task, TaskKind::Embedding) {
@@ -1071,9 +612,37 @@ async fn run_task(
         }
         ("/api/chat", body)
     };
+    // Slot first, THEN the transition lock — in both branches. The order matters: if the
+    // non-resident path took the write lock before its slot while resident tasks held slots and
+    // waited on the read lock, the two would deadlock. One consistent order removes that entirely.
+    let (slot, cost, queue_wait_ms) = admit(&state, decision.task).await?;
+
+    // Bind session affinity only AFTER admission succeeds. Binding at routing time meant a task
+    // refused for lack of an admission slot had already pinned the session to a model: the caller
+    // saw a 503 and reasonably concluded nothing happened, while every later request in that
+    // session had silently been redirected. State changes belong after the last thing that can
+    // refuse, not before it.
+    if let Some(id) = input.route.session_id.as_deref() {
+        state
+            .sessions
+            .write()
+            .await
+            .bind(id, &decision.selected_model);
+    }
+
     if decision.resident {
         let _permit = state.managed_execution.read().await;
-        forward_managed_task(&state, decision, path, body, "resident_shared").await
+        forward_managed_task(
+            &state,
+            decision,
+            path,
+            body,
+            "resident_shared",
+            slot,
+            queue_wait_ms,
+            cost,
+        )
+        .await
     } else {
         let _permit = state.managed_execution.write().await;
         forward_managed_task(
@@ -1082,27 +651,83 @@ async fn run_task(
             path,
             body,
             "nonresident_transition_exclusive",
+            slot,
+            queue_wait_ms,
+            cost,
         )
         .await
     }
 }
 
+/// POST JSON upstream, retrying transient failures on the same backoff schedule the passthrough
+/// proxy uses (`proxy::retry_delay`).
+///
+/// The managed-task path was the one retry-capable caller that had no retries: an Ollama 500 —
+/// which it returns under load-model contention, the exact condition managed routing creates —
+/// failed the whole task, while the byte-identical request through the passthrough proxy would
+/// have survived it. The asymmetry was worse than it looks, because the caller holds the
+/// `managed_execution` admission permit across this call: failing bare also threw away an
+/// exclusive slot it had already queued for, so the retry it needed was the expensive one to skip.
+async fn post_json_with_retries(
+    state: &PlatformState,
+    path: &str,
+    body: &Value,
+) -> Result<(StatusCode, Value), ApiError> {
+    let url = format!("{}{path}", state.upstream.trim_end_matches('/'));
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        let more_attempts = attempt < proxy::MAX_ATTEMPTS;
+        match state.client.post(&url).json(body).send().await {
+            Ok(response) if response.status().is_server_error() && more_attempts => {
+                eprintln!(
+                    "managed task retry attempt={attempt} status={} path={path}",
+                    response.status()
+                );
+                tokio::time::sleep(proxy::retry_delay(attempt)).await;
+            }
+            Ok(response) => {
+                let status = response.status();
+                let bytes = response.bytes().await.map_err(ApiError::upstream)?;
+                // A failing Ollama does not always answer in JSON (a wedged runner can return a
+                // plain-text or HTML body). Parsing strictly here used to convert a truthful 500
+                // into a misleading "decode error", hiding the real upstream status from the
+                // caller — so fall back to carrying the body through as text.
+                let value = serde_json::from_slice::<Value>(&bytes).unwrap_or_else(
+                    |_| json!({ "error": String::from_utf8_lossy(&bytes).trim().to_owned() }),
+                );
+                return Ok((status, value));
+            }
+            // A timeout is NOT a transient hiccup here. This client's per-attempt budget is
+            // `platform_task_timeout()` (900s by default), and the caller holds both an admission
+            // slot and — on the non-resident path — the exclusive `managed_execution` write lock
+            // across every attempt. Retrying a timeout would therefore hold the whole managed
+            // plane for up to 3 x 900s, which is exactly the "one hung request deadlocks every
+            // subsequent managed task" failure the client timeout was added to prevent. Connection
+            // errors are still retried: those fail fast and cost nothing to re-pay.
+            Err(error) if more_attempts && !error.is_timeout() => {
+                eprintln!("managed task retry attempt={attempt} error={error:#} path={path}");
+                tokio::time::sleep(proxy::retry_delay(attempt)).await;
+            }
+            Err(error) => return Err(ApiError::upstream(error)),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn forward_managed_task(
     state: &PlatformState,
     decision: RouteDecision,
     path: &str,
     body: Value,
     admission_mode: &str,
+    // Held for the duration of the upstream call, then dropped. Taking it by value rather than by
+    // reference makes the lifetime the compiler's problem instead of a comment's.
+    slot: OwnedSemaphorePermit,
+    queue_wait_ms: u128,
+    cost: u32,
 ) -> Result<Json<Value>, ApiError> {
-    let response = state
-        .client
-        .post(format!("{}{path}", state.upstream.trim_end_matches('/')))
-        .json(&body)
-        .send()
-        .await
-        .map_err(ApiError::upstream)?;
-    let status = response.status();
-    let value = response.json::<Value>().await.map_err(ApiError::upstream)?;
+    let (status, value) = post_json_with_retries(state, path, &body).await?;
     if !status.is_success() {
         return Err(ApiError {
             status,
@@ -1110,9 +735,20 @@ async fn forward_managed_task(
         });
     }
     let metrics = runtime_metrics(&value);
+    let slots_total = state.slots_total;
+    // Report throttling rather than hiding it. A caller that fans out embeddings needs to know it
+    // is queueing here — otherwise the only symptom is latency it cannot attribute.
+    let slots_available = state.task_slots.available_permits();
+    drop(slot);
     Ok(Json(json!({
         "route": decision,
-        "admission": {"mode": admission_mode},
+        "admission": {
+            "mode": admission_mode,
+            "queue_wait_ms": queue_wait_ms,
+            "slots_total": slots_total,
+            "slots_available_during_call": slots_available,
+            "cost": cost,
+        },
         "metrics": metrics,
         "response": value
     })))
@@ -1271,25 +907,71 @@ async fn refresh_residency(
 /// Upper bound on a managed generation forwarded to Ollama. Overridable via
 /// `FREELLAMA_TASK_TIMEOUT_SECONDS` — the same name the CLI and the NAPI layer read, so one
 /// setting covers every path that can make a model generate.
-fn platform_task_timeout() -> Duration {
+/// Admission cost of a task, in slot units.
+///
+/// A flat per-request count is the wrong unit for local inference: a 274MB embedding and an 18GB
+/// vision generation are not interchangeable, and counting them the same lets four vision calls in
+/// where four embeddings belong. `FreeLlama` can weight them because it is the only layer that knows
+/// what the task *is* — Ollama receives an opaque HTTP request and can only see memory after it has
+/// already committed to loading something.
+///
+/// Deliberately coarse. These are relative costs, not a memory model; Ollama owns the real
+/// memory-fit decision (`server/sched.go` evicts when a load is predicted to exceed 80% of free
+/// memory) and duplicating that here would mean maintaining a worse copy of it.
+fn task_cost(task: TaskKind) -> u32 {
+    match task {
+        // No sampling, tiny models, milliseconds. Batch freely.
+        TaskKind::Embedding => 1,
+        // Full generation, and on this machine the vision model is the 18GB one.
+        TaskKind::Vision => 4,
+        _ => 2,
+    }
+}
+
+/// Longest a task may wait for an admission slot before being refused.
+///
+/// Ollama does not block when saturated: `getRunner` does a non-blocking send onto its pending
+/// channel and returns `ErrMaxQueue` ("server busy, please try again") the instant it is full.
+/// An unbounded wait here would convert that honest, actionable signal into an invisible pile-up,
+/// where the only symptom is latency the caller cannot attribute. Match the upstream contract.
+fn max_queue_wait() -> Duration {
     Duration::from_secs(
-        std::env::var("FREELLAMA_TASK_TIMEOUT_SECONDS")
+        std::env::var("FREELLAMA_MAX_QUEUE_WAIT_SECONDS")
             .ok()
             .and_then(|raw| raw.parse::<u64>().ok())
             .filter(|value| *value > 0)
-            .unwrap_or(900),
+            .unwrap_or(120),
+    )
+}
+
+/// Total admission budget in slot units. Default 8 — enough for two concurrent generations or
+/// eight embeddings.
+///
+/// Set this to match your `OLLAMA_NUM_PARALLEL`. Ollama's own default is **1**, so extra
+/// concurrency here does not buy parallel decoding — it only keeps the pipe full and bounds the
+/// burst. Raising `OLLAMA_NUM_PARALLEL` multiplies KV-cache memory by the context length, so raise
+/// both together and check `models{view:"resident"}` after.
+fn max_concurrent_tasks() -> usize {
+    std::env::var("FREELLAMA_MAX_CONCURRENT_TASKS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(8)
+}
+
+fn platform_task_timeout() -> Duration {
+    crate::timeout_from_env(
+        "FREELLAMA_TASK_TIMEOUT_SECONDS",
+        crate::DEFAULT_TASK_TIMEOUT_SECS,
     )
 }
 
 /// Discovery calls (`/api/tags`, `/api/ps`, `/api/show`) read small in-memory state and must never
 /// inherit the generation-sized budget above.
 fn platform_control_timeout() -> Duration {
-    Duration::from_secs(
-        std::env::var("FREELLAMA_CONTROL_TIMEOUT_SECONDS")
-            .ok()
-            .and_then(|raw| raw.parse::<u64>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(30),
+    crate::timeout_from_env(
+        "FREELLAMA_CONTROL_TIMEOUT_SECONDS",
+        crate::DEFAULT_CONTROL_TIMEOUT_SECS,
     )
 }
 

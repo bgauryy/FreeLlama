@@ -25,6 +25,19 @@ absorbs it.
   be consumed once. Response bodies remain streamed — only the (typically small, JSON) request side
   gives up pure streaming.
 
+- **Shared by both callers.** The passthrough (`proxy::send_with_retries`) and the managed-task
+  path (`platform::post_json_with_retries`, behind `/_freellama/v1/tasks`) use one backoff schedule,
+  `proxy::retry_delay`. They keep separate `reqwest::Client`s on purpose — a managed generation needs
+  a 900s budget, discovery calls need 30s — but the retry policy itself is deliberately not
+  duplicated: they hit the same Ollama, and a schedule that drifted on one of them is the kind of
+  bug nobody notices until it hurts. The managed path was retry-less until this was unified, which
+  was the worse half of the asymmetry, because it holds the `managed_execution` admission permit
+  across the upstream call: a bare failure also threw away a slot it had already queued for.
+- **Upstream error bodies survive.** A wedged Ollama runner does not always answer in JSON. The
+  managed path parses leniently and falls back to carrying the body through as text, so a truthful
+  500 stays a 500 instead of collapsing into a misleading 502 "decode error" that points debugging
+  at the wrong layer.
+
 ## What's deliberately NOT implemented, and why
 
 - **No circuit breaker / retry budget.** These matter most for high-concurrency multi-tenant

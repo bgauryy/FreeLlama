@@ -1,7 +1,8 @@
 # Picking and configuring models smartly
 
-Load when picking a model for a task, co-residenting models, or before running `bench-all`/
-`route`/`recommend`.
+Load when picking a model for a task, co-residenting models, or before running `bench-all` or
+`route`. (There is no `recommend` MCP tool — it exists over HTTP and in the CLI only; the
+agent-facing equivalent is `search_models`.)
 
 ## Where "smart" configuration actually lives
 
@@ -9,10 +10,10 @@ Load when picking a model for a task, co-residenting models, or before running `
   16384 for ≥2GB, 32768 for small models), capped by the model's own advertised context.
   `BenchmarkConfiguration` defaults: `num_predict=128`, `temperature=0`, `seed=42`, `think=false`,
   `keep_alive="5m"`.
-- `packages/rust-core/src/platform.rs::profile()` — per-task-type tuning (e.g. Browser→64 tokens, Tools→256,
+- `packages/rust-core/src/platform/routing.rs::profile()` — per-task-type tuning (e.g. Browser→64 tokens, Tools→256,
   CodeRepair→2048, Embedding→0), plus a `qwen_repair_profile` special-case pinning `num_ctx=8192`
   for `qwen3.8:27b-mlx` on code-repair specifically.
-- `packages/rust-core/src/platform.rs`'s `managed_execution: Arc<RwLock<()>>` — resident-model tasks take a shared read
+- `packages/rust-core/src/platform/mod.rs`'s `managed_execution: Arc<RwLock<()>>` — resident-model tasks take a shared read
   lock (can run concurrently), a model-swap (nonresident) task takes an exclusive write lock, so
   model transitions don't race each other.
 
@@ -74,7 +75,7 @@ Three models were removed after testing, and the reasons are worth keeping:
 message and is forwarded verbatim to Ollama — verified live, same test image, through the full
 MCP → `run_task` → `/_freellama/v1/tasks` → Ollama chain, correctly identified. Before this, the
 only way to send an image through this project was a raw `/api/generate` call that bypassed
-FreeLlama's routing entirely; `route`/`recommend`'s `requiredCapabilities: ["vision"]` picked a
+FreeLlama's routing entirely; `route`'s `requiredCapabilities: ["vision"]` picked a
 capable model correctly, but there was no way to actually hand it an image until `images` was
 added to `run_task`.
 
@@ -133,8 +134,8 @@ unlimited" is precisely the mistake corrected above.
 | `OLLAMA_MAX_LOADED_MODELS` | 3 x GPU count | See above |
 | `OLLAMA_CONTEXT_LENGTH` | VRAM-tiered: 4k under 24GiB, 32k for 24-48GiB, **256k at 48GiB+** | The largest single memory lever. FreeLlama's routing always sends an explicit `num_ctx`, so anything going through `serve` is insulated — but a direct Ollama call on this 48GB machine inherits a 256k context |
 | `OLLAMA_NUM_PARALLEL` | 1 | Memory scales by `NUM_PARALLEL x context_length`. Raising it multiplies KV-cache memory; it does not merely add scheduling slots |
-| `OLLAMA_KV_CACHE_TYPE` | `f16` | `q8_0` roughly halves KV-cache memory at a given context length (needs `OLLAMA_FLASH_ATTENTION`) |
-| `OLLAMA_FLASH_ATTENTION` | off | Prerequisite for KV-cache quantization |
+| `OLLAMA_KV_CACHE_TYPE` | `f16` | `q8_0` roughly halves KV-cache memory at a given context length. Needs flash attention, which is already on — so this is usually available without setting anything |
+| `OLLAMA_FLASH_ATTENTION` | **auto — on where the backend supports it, Metal included** | Not `off`. See the verification note at the end of this file |
 | `OLLAMA_KEEP_ALIVE` | `5m` | How long a model holds memory after its last request |
 | `OLLAMA_MAX_QUEUE` | 512 | Requests queued before Ollama starts rejecting |
 | `OLLAMA_LOAD_TIMEOUT` | `5m` | A cold load of a large model can take minutes. Any client timeout below this gives up while Ollama is still working — the reason FreeLlama's task-path timeout is 900s while its control-plane timeout is 30s |
@@ -191,8 +192,8 @@ with their effective defaults; this is the interpretation.
 | Setting | Now | Recommended | Why |
 |---|---|---|---|
 | `OLLAMA_MAX_LOADED_MODELS` | unset → **3** | **1** | Two ~20GB models are installed. Three co-resident is ~60GB against 52GB of unified memory. This exact condition already crashed this machine |
-| `OLLAMA_FLASH_ATTENTION` | unset → off | **1** | Prerequisite for KV-cache quantisation below |
-| `OLLAMA_KV_CACHE_TYPE` | unset → `f16` | **`q8_0`** | Roughly halves KV-cache memory at a given context length. Matters most because of the row below |
+| `OLLAMA_FLASH_ATTENTION` | unset → **auto (on, on Metal)** | leave unset | Already on where supported; setting `1` changes nothing here, `0` would disable the row below |
+| `OLLAMA_KV_CACHE_TYPE` | unset → `f16` | **`q8_0`** | Roughly halves KV-cache memory at a given context length, and its prerequisite is already satisfied. Matters most because of the row below |
 | `OLLAMA_CONTEXT_LENGTH` | unset → **256K** | consider an explicit value | The VRAM-tiered default reaches 256K at 48GB+. FreeLlama's routing always sends an explicit `num_ctx`, so anything through `serve` is insulated — but a direct `/api/chat` call inherits 256K and the KV cache that implies |
 | `OLLAMA_KEEP_ALIVE` | unset → `5m` | fine | Per-request `keep_alive` already overrides it; use `"0"` for one-offs |
 | `OLLAMA_LOAD_TIMEOUT` | unset → `5m` | fine | A cold 20GB load can genuinely take minutes; this is why FreeLlama's task-path timeout is 900s |
@@ -272,3 +273,32 @@ It refuses to manufacture evidence it does not have:
 Provenance (source aggregate, benchmark date, threshold, trial count per model) is written into the
 generated file, so a stale contract is visible without archaeology.
 
+## Verified against upstream on 2026-08-31 — two advisories were wrong
+
+Re-checked all nine `doctor` advisories against `docs/faq.mdx`, `docs/context-length.mdx` and
+`envconfig/config.go` at ollama/ollama main, plus the installed build (server 0.33.2).
+Seven matched exactly. Three things are worth carrying forward.
+
+**`OLLAMA_FLASH_ATTENTION` was documented as `off`; it is auto-enabled on supported backends,
+Metal included.** The tables above now say so directly. The lesson worth keeping is *why* it was
+wrong: the variable is declared `BoolWithDefault("OLLAMA_FLASH_ATTENTION")`, whose whole purpose is
+to let the caller supply the default (plain `Bool` is the one pinned to `false`), and the `false`
+visible in envconfig's describe-map is a help-listing display value, not the runtime resolution.
+**Same error as the `MAX_LOADED_MODELS` sentinel: a declaration is not a resolved value.** Pinned by
+`flash_attention_is_not_advertised_as_off_by_default` in `tests/suite_contract.rs`.
+
+**The CLI's own `--help` can be the stale source.** The installed CLI (0.13.5) prints
+`OLLAMA_CONTEXT_LENGTH ... (default: 4096)`, while the running server (0.33.2) and
+`docs/context-length.mdx` both use the VRAM-tiered default (4k / 32k / 256k). `ollama serve
+--help` is only authoritative when the CLI and server are the *same* build — `doctor` already
+reports that mismatch, so read the two together.
+
+**`num_ctx=8192` is below upstream's floor for this workload.** `docs/context-length.mdx` says
+plainly: "Tasks which require large context like web search, **agents**, and coding tools should be
+set to at least 64000 tokens." Both research adapters run at 8192, 8x under that, which is exactly
+why long runs silently overflowed the window (see `AGENTS.md`, Context management). Raising it
+multiplies KV-cache memory, so it is a real trade-off on a 48GB box — but the mitigation upstream
+recommends is available and unused here: `OLLAMA_KV_CACHE_TYPE=q8_0` is "approximately 1/2 the
+memory of f16 with a very small loss in precision ... recommended", and it needs flash attention,
+which per the correction above is already on. Measured on this machine during a sustained
+delegation run, resident memory grew from 19.5GB to 27GB on KV cache alone at `num_ctx=8192`.

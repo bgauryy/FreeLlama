@@ -13,7 +13,7 @@ packages/mcp/dist/
 # Local agent workspaces — not part of the repo
 .octocode/
 .claude/
-
+.clones
 # Python bytecode — 371 of these had accumulated because only __pycache__/ was ignored,
 # and .pyc files also appear outside it.
 *.pyc
@@ -23,3 +23,9 @@ packages/mcp/dist/
 .yarn/cache
 .yarn/unplugged
 .yarn/build-state.yml
+
+# Prebuilt CLI binary staged at prepack; the source of truth is target/release.
+packages/cli/vendor/
+
+# Cloned upstream repos used as held-out eval corpora — never part of this repo
+.clones/

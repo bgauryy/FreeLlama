@@ -18,8 +18,8 @@ agent (200 means `serve`, 404 means `proxy`). `scripts/check.sh` does this autom
 ## The one gap this doesn't cover
 
 The retry/backoff/timeout logic lives entirely in `packages/rust-core/src/proxy.rs` (`send_with_retries`). `serve`'s
-passthrough route reuses it (`platform.rs` composes `proxy::app()` as its fallback), so raw
-`/api/chat` calls through `serve` ARE protected. But `forward_managed_task` in `packages/rust-core/src/platform.rs`
+passthrough route reuses it (`platform/mod.rs` composes `proxy::app()` as its fallback), so raw
+`/api/chat` calls through `serve` ARE protected. But `forward_managed_task` in `packages/rust-core/src/platform/mod.rs`
 (behind `/_freellama/v1/tasks`) builds its own separate `reqwest::Client` and does **not** call
 through `send_with_retries` — managed-task requests get no retry protection today. If you rely on
 `/tasks` under a flaky Ollama, this is the first place to look; it hasn't been fixed because nothing
