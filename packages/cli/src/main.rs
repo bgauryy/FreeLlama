@@ -1,5 +1,5 @@
-use std::time::Duration;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
@@ -517,7 +517,11 @@ async fn request_task(
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("read input file {}", path.display()))?;
         let items: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
-        ensure!(!items.is_empty(), "input file {} has no non-empty lines", path.display());
+        ensure!(
+            !items.is_empty(),
+            "input file {} has no non-empty lines",
+            path.display()
+        );
         body["input"] = json!(items);
         return print_post(&endpoint, "/_freellama/v1/tasks", &body).await;
     }
@@ -722,14 +726,46 @@ async fn print_post(endpoint: &str, path: &str, body: &Value) -> Result<()> {
 fn print_tool_map() {
     println!("FreeLlama exposes 8 MCP tools. Equivalents for a CLI-only agent:\n");
     let rows = [
-        ("doctor", "freellama doctor", "Ollama health, the 9 memory env vars, machine profile"),
-        ("models", "freellama models", "installed models, capabilities, residency"),
-        ("route", "freellama route --task <t>", "which model would be picked; no generation"),
-        ("run_task", "freellama task --task <t> --prompt <p>", "route AND execute one call"),
-        ("search_models", "(MCP only)", "browse ollama.com, inspect tags for memory fit"),
-        ("ollama_manage", "ollama pull <m> / ollama stop <m>", "download or unload a model"),
-        ("ollama_delete", "ollama rm <m>", "DESTRUCTIVE. Only when a human names the model"),
-        ("delegate_research", "(MCP only)", "grounded answer from a local model reading files"),
+        (
+            "doctor",
+            "freellama doctor",
+            "Ollama health, the 9 memory env vars, machine profile",
+        ),
+        (
+            "models",
+            "freellama models",
+            "installed models, capabilities, residency",
+        ),
+        (
+            "route",
+            "freellama route --task <t>",
+            "which model would be picked; no generation",
+        ),
+        (
+            "run_task",
+            "freellama task --task <t> --prompt <p>",
+            "route AND execute one call",
+        ),
+        (
+            "search_models",
+            "(MCP only)",
+            "browse ollama.com, inspect tags for memory fit",
+        ),
+        (
+            "ollama_manage",
+            "ollama pull <m> / ollama stop <m>",
+            "download or unload a model",
+        ),
+        (
+            "ollama_delete",
+            "ollama rm <m>",
+            "DESTRUCTIVE. Only when a human names the model",
+        ),
+        (
+            "delegate_research",
+            "(MCP only)",
+            "grounded answer from a local model reading files",
+        ),
     ];
     for (tool, cli, what) in rows {
         println!("  {tool:<18} {cli:<38} {what}");
@@ -782,7 +818,11 @@ fn base64_encode(bytes: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
         for i in 0..4 {
             if i <= chunk.len() {

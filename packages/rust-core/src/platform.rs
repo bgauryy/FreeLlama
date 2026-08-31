@@ -1087,6 +1087,54 @@ async fn run_task(
     }
 }
 
+/// POST JSON upstream, retrying transient failures on the same backoff schedule the passthrough
+/// proxy uses (`proxy::retry_delay`).
+///
+/// The managed-task path was the one retry-capable caller that had no retries: an Ollama 500 —
+/// which it returns under load-model contention, the exact condition managed routing creates —
+/// failed the whole task, while the byte-identical request through the passthrough proxy would
+/// have survived it. The asymmetry was worse than it looks, because the caller holds the
+/// `managed_execution` admission permit across this call: failing bare also threw away an
+/// exclusive slot it had already queued for, so the retry it needed was the expensive one to skip.
+async fn post_json_with_retries(
+    state: &PlatformState,
+    path: &str,
+    body: &Value,
+) -> Result<(StatusCode, Value), ApiError> {
+    let url = format!("{}{path}", state.upstream.trim_end_matches('/'));
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        let more_attempts = attempt < proxy::MAX_ATTEMPTS;
+        match state.client.post(&url).json(body).send().await {
+            Ok(response) if response.status().is_server_error() && more_attempts => {
+                eprintln!(
+                    "managed task retry attempt={attempt} status={} path={path}",
+                    response.status()
+                );
+                tokio::time::sleep(proxy::retry_delay(attempt)).await;
+            }
+            Ok(response) => {
+                let status = response.status();
+                let bytes = response.bytes().await.map_err(ApiError::upstream)?;
+                // A failing Ollama does not always answer in JSON (a wedged runner can return a
+                // plain-text or HTML body). Parsing strictly here used to convert a truthful 500
+                // into a misleading "decode error", hiding the real upstream status from the
+                // caller — so fall back to carrying the body through as text.
+                let value = serde_json::from_slice::<Value>(&bytes).unwrap_or_else(
+                    |_| json!({ "error": String::from_utf8_lossy(&bytes).trim().to_owned() }),
+                );
+                return Ok((status, value));
+            }
+            Err(error) if more_attempts => {
+                eprintln!("managed task retry attempt={attempt} error={error:#} path={path}");
+                tokio::time::sleep(proxy::retry_delay(attempt)).await;
+            }
+            Err(error) => return Err(ApiError::upstream(error)),
+        }
+    }
+}
+
 async fn forward_managed_task(
     state: &PlatformState,
     decision: RouteDecision,
@@ -1094,15 +1142,7 @@ async fn forward_managed_task(
     body: Value,
     admission_mode: &str,
 ) -> Result<Json<Value>, ApiError> {
-    let response = state
-        .client
-        .post(format!("{}{path}", state.upstream.trim_end_matches('/')))
-        .json(&body)
-        .send()
-        .await
-        .map_err(ApiError::upstream)?;
-    let status = response.status();
-    let value = response.json::<Value>().await.map_err(ApiError::upstream)?;
+    let (status, value) = post_json_with_retries(state, path, &body).await?;
     if !status.is_success() {
         return Err(ApiError {
             status,

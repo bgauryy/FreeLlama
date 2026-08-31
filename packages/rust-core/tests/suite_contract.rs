@@ -30,7 +30,11 @@ fn max_loaded_models_advisory_silent_when_configured() {
 
 #[test]
 fn checked_in_suite_expands_every_upstream_regression() {
-    let suite = Suite::from_path(concat!(env!("CARGO_MANIFEST_DIR"), "/../../benchmark/suites/ollama-mlx-regressions.json")).unwrap();
+    let suite = Suite::from_path(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../benchmark/suites/ollama-mlx-regressions.json"
+    ))
+    .unwrap();
     let cases = suite.expand().unwrap();
 
     assert!(

@@ -1144,6 +1144,13 @@ const MODEL_EVIDENCE: Record<string, ModelGrade> = (() => {
  */
 function assessDelegatedAnswer(
   question: string,
+  /**
+   * Count of tool calls that actually **succeeded**. Not the raw call count: a run whose commands
+   * all errored, or which only repeated an earlier call, read nothing — and a verdict computed
+   * from "it made 3 calls" would have graded that `accept` while the answer was pure recall. That
+   * is precisely the failure this function exists to catch, so it must not be fed a number that
+   * counts failures as evidence.
+   */
   evidenceCount: number,
   model: string,
 ): {
@@ -1334,16 +1341,39 @@ server.registerTool(
         killSignal: "SIGKILL",
       });
       liveDelegates.add(running.child);
+      // The adapter exits non-zero for its *own* failures — the model returned prose instead of
+      // JSON, the endpoint was unreachable — but it still writes result.json first, with the real
+      // diagnosis in `final_answer`. Letting the exec rejection propagate replaced that diagnosis
+      // with "Command failed: python3 …", which names the wrong layer and hides the evidence trail
+      // showing how far the run actually got. Capture it and prefer the adapter's own account.
+      let adapterError: unknown = null;
       try {
         await running;
+      } catch (error) {
+        adapterError = error;
       } finally {
         liveDelegates.delete(running.child);
       }
-      const raw = await readFile(resultFile, "utf8");
+      let raw: string;
+      try {
+        raw = await readFile(resultFile, "utf8");
+      } catch {
+        // No result file at all: a hard kill (the SIGKILL timeout above) or a crash before the
+        // adapter could write. Here the exec error genuinely is the best account available.
+        return errorResult(
+          adapterError ??
+            new Error(
+              "research adapter exited without writing a result file — it was killed before it " +
+                `could report. Check that the model is loadable and that ${DEFAULT_DELEGATE_TIMEOUT_SECONDS}s ` +
+                "is enough for this question.",
+            ),
+        );
+      }
       const result = JSON.parse(raw) as {
         final_answer: string;
         tool_calls: Array<{
           raw_name?: string;
+          status?: string;
           arguments?: { tool?: string; command?: string; queries?: { path?: string } };
         }>;
         usage: { input_tokens: number | null; output_tokens: number | null };
@@ -1361,21 +1391,40 @@ server.registerTool(
         return {
           step: index + 1,
           tool: call.arguments?.tool ?? call.raw_name ?? "?",
+          // The adapters record "ok" | "error" | "repeat" per call. Carrying it through is what
+          // lets a reader tell a run that read three files from one that failed three commands —
+          // indistinguishable in the trail before, and graded identically.
+          status: call.status ?? "ok",
           path: target ? path.relative(resolvedWorkspace, target) : null,
           detail: call.arguments?.command ?? null,
         };
       });
+      const succeeded = evidence.filter((step) => step.status === "ok");
+      const failed = evidence.length - succeeded.length;
       const evidenceText = evidence
         .map(
           (step) =>
-            `  ${step.step}. ${step.tool}${step.path ? ` -> ${step.path}` : ""}` +
+            `  ${step.step}. ${step.tool}${step.status === "ok" ? "" : ` [${step.status}]`}` +
+            `${step.path ? ` -> ${step.path}` : ""}` +
             `${step.detail ? `: ${step.detail.slice(0, 120)}` : ""}`,
         )
         .join("\n");
-      const verification = assessDelegatedAnswer(question, evidence.length, chosenModel);
+      if (adapterError) {
+        return errorResult(
+          new Error(
+            `research adapter failed: ${result.final_answer}` +
+              (evidenceText ? `\nEvidence collected before the failure:\n${evidenceText}` : ""),
+          ),
+        );
+      }
+      // Grade on what actually read something. A run of failed commands is ungrounded no matter
+      // how many of them there were.
+      const verification = assessDelegatedAnswer(question, succeeded.length, chosenModel);
       const summary =
         `${result.final_answer}\n\n` +
-        `[delegated: ${result.tool_calls.length} tool call(s), ` +
+        `[delegated: ${result.tool_calls.length} tool call(s)` +
+        (failed > 0 ? `, ${failed} of which did not succeed` : "") +
+        `, ` +
         `${result.usage.input_tokens ?? "?"} input / ${result.usage.output_tokens ?? "?"} ` +
         "output tokens spent on the local model]\n" +
         (evidenceText
@@ -1393,6 +1442,7 @@ server.registerTool(
           verification,
           answer: result.final_answer,
           toolCallCount: result.tool_calls.length,
+          successfulToolCallCount: succeeded.length,
           usage: {
             inputTokens: result.usage.input_tokens,
             outputTokens: result.usage.output_tokens,

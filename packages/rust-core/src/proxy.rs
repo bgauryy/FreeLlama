@@ -24,13 +24,13 @@ use tokio::sync::Mutex as AsyncMutex;
 /// Matches the general-purpose default cited across retry-policy guidance for slow (LLM-scale,
 /// not microservice-RPC-scale) calls: enough to ride out a brief hiccup, few enough that a
 /// persistent outage still fails in bounded time.
-const MAX_ATTEMPTS: u32 = 3;
+pub(crate) const MAX_ATTEMPTS: u32 = 3;
 /// Exponential backoff base; attempt `n` (1-indexed) waits `RETRY_BASE_DELAY * 2^(n-1)` plus
 /// jitter, so `[200ms, 400ms]` becomes the base sequence. Jitter avoids synchronized retries
 /// across concurrent callers piling back onto a recovering upstream at the same instant.
-const RETRY_BASE_DELAY: Duration = Duration::from_millis(200);
+pub(crate) const RETRY_BASE_DELAY: Duration = Duration::from_millis(200);
 /// Upper bound on added random jitter per retry.
-const RETRY_JITTER_MAX: Duration = Duration::from_millis(100);
+pub(crate) const RETRY_JITTER_MAX: Duration = Duration::from_millis(100);
 /// Minimum time between two automatic Ollama restart attempts. Guards against a restart storm if
 /// Ollama is down for an extended period and keeps failing every request — one attempt, then a
 /// long cooldown before trying again, not a loop hammering `open -a Ollama`.
@@ -60,7 +60,9 @@ fn default_restart_ollama() -> Pin<Box<dyn Future<Output = ()> + Send>> {
         })
         .await;
         tokio::time::sleep(Duration::from_secs(2)).await;
-        let _ = std::process::Command::new("open").args(["-a", "Ollama"]).spawn();
+        let _ = std::process::Command::new("open")
+            .args(["-a", "Ollama"])
+            .spawn();
     })
 }
 
@@ -71,6 +73,15 @@ fn jitter() -> Duration {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.subsec_nanos());
     RETRY_JITTER_MAX * (nanos % 1000) / 1000
+}
+
+/// Backoff before retrying `attempt` (1-indexed): `RETRY_BASE_DELAY * 2^(attempt-1)` plus jitter.
+///
+/// Shared with the managed-task path in `platform.rs` so both retry-capable callers use one
+/// backoff policy rather than drifting apart — the passthrough and the managed plane hit the same
+/// Ollama, and a divergent schedule on one of them is a bug nobody would notice until it hurt.
+pub(crate) fn retry_delay(attempt: u32) -> Duration {
+    RETRY_BASE_DELAY * 2u32.pow(attempt.saturating_sub(1)) + jitter()
 }
 /// Request bodies are buffered (not streamed) so a failed attempt can be resent byte-for-byte.
 /// Ollama chat/generate payloads are JSON, not large uploads, so this bound is generous.
@@ -279,12 +290,15 @@ async fn send_with_retries(
                     response.status(),
                     target.path()
                 );
-                tokio::time::sleep(RETRY_BASE_DELAY * 2u32.pow(attempt - 1) + jitter()).await;
+                tokio::time::sleep(retry_delay(attempt)).await;
             }
             Ok(response) => return Ok(response),
             Err(error) if retryable_more_attempts => {
-                eprintln!("proxy retry attempt={attempt} error={error:#} path={}", target.path());
-                tokio::time::sleep(RETRY_BASE_DELAY * 2u32.pow(attempt - 1) + jitter()).await;
+                eprintln!(
+                    "proxy retry attempt={attempt} error={error:#} path={}",
+                    target.path()
+                );
+                tokio::time::sleep(retry_delay(attempt)).await;
             }
             Err(error) => return Err(error).context("forward request to Ollama"),
         }

@@ -1,5 +1,12 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { fileURLToPath } from "node:url";
+
+// Resolve the built server from this file, not the working directory. Every one of these
+// scripts used to pass a bare "dist/index.js", so they only ran from packages/mcp — the
+// command the README documents (`node packages/mcp/test/validate-all.mjs`, from the repo
+// root) failed with MODULE_NOT_FOUND before the server ever started.
+const SERVER_ENTRY = fileURLToPath(new URL("../dist/index.js", import.meta.url));
 
 const WORKSPACE = "/Users/guybary/Documents/code/FreeLlama";
 const MODEL = "qwen3.8:27b-mlx";
@@ -11,7 +18,7 @@ const questions = [
 ];
 
 async function callDelegate(questionIndex, question) {
-  const transport = new StdioClientTransport({ command: "node", args: ["dist/index.js"] });
+  const transport = new StdioClientTransport({ command: "node", args: [SERVER_ENTRY] });
   const client = new Client({ name: "test-client", version: "0.0.1" });
   await client.connect(transport);
 

@@ -18,6 +18,14 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from agent_context import REPEAT_NOTICE, call_signature, clip, fit_to_context
+
+# Both limits used to be tail-only slices (`observation[-3000:]`), which kept the end of a command's
+# output and discarded the beginning — the wrong half for `ls`, `grep -n`, or `head`. `clip` keeps
+# both ends; see agent_context.py.
+RESULT_CLIP_CHARS = 2000
+OBSERVATION_CLIP_CHARS = 3000
+
 DENYLIST = re.compile(
     r"\bsudo\b|\brm\s+-rf\s+/(?!\S)|:\(\)\s*\{.*:\|:.*\}|\bcurl\b|\bwget\b|\bnc\b|\bssh\b|>\s*/dev/(sd|nvme|disk)",
     re.IGNORECASE,
@@ -90,6 +98,7 @@ def main() -> int:
     metrics = {"load_ms": 0.0, "prompt_eval_ms": 0.0, "eval_ms": 0.0}
     answer = ""
     failure: str | None = None
+    context_compactions = 0
     chat_options = {"temperature": 0, "seed": 42, "num_ctx": 8192, "num_predict": 512}
 
     def call_model() -> dict[str, Any]:
@@ -114,6 +123,7 @@ def main() -> int:
         metrics["eval_ms"] += float(response.get("eval_duration", 0)) / 1_000_000
         return response
 
+    seen_calls: dict[str, int] = {}
     for _ in range(max_turns):
         try:
             response = call_model()
@@ -126,23 +136,33 @@ def main() -> int:
             break
         started = time.perf_counter()
         command_text = str(action.get("command", ""))
-        try:
-            observation = run_shell(workspace, command_text)
-            status = "ok"
-        except (OSError, ValueError, subprocess.TimeoutExpired) as error:
-            observation = f"tool error: {type(error).__name__}: {error}"
-            status = "error"
+        # An exact repeat costs a turn out of ten AND a second copy of an observation the model has
+        # already seen. Answer it from the prior step instead of re-running the command.
+        signature = call_signature({"command": command_text})
+        if signature in seen_calls:
+            observation = REPEAT_NOTICE
+            status = "repeat"
+        else:
+            try:
+                observation = run_shell(workspace, command_text)
+                status = "ok"
+            except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+                observation = f"tool error: {type(error).__name__}: {error}"
+                status = "error"
+            seen_calls[signature] = len(calls) + 1
         calls.append({
             "name": "shell",
             "raw_name": action.get("action", ""),
             "arguments": {"command": command_text},
             "status": status,
             "duration_ms": round((time.perf_counter() - started) * 1000, 3),
-            "result": observation[-2000:],
+            "result": clip(observation, RESULT_CLIP_CHARS),
         })
         messages.append({"role": "assistant", "content": json.dumps(action, ensure_ascii=False)})
         remaining = max_turns - len(calls)
-        messages.append({"role": "user", "content": f"Observation:\n{observation[-3000:]}\n\nCommands remaining: {remaining}. Finish now if the task is answerable; do not repeat prior commands."})
+        messages.append({"role": "user", "content": f"Observation:\n{clip(observation, OBSERVATION_CLIP_CHARS)}\n\nCommands remaining: {remaining}. Finish now if the task is answerable; do not repeat prior commands."})
+        messages, compacted = fit_to_context(messages, num_ctx=chat_options["num_ctx"], num_predict=chat_options["num_predict"])
+        context_compactions += 1 if compacted else 0
     else:
         messages.append({"role": "user", "content": "Command budget is exhausted. Return exactly a finish JSON action now using the evidence collected. Do not request another command."})
         try:
@@ -168,6 +188,7 @@ def main() -> int:
             "num_ctx": chat_options["num_ctx"],
             "num_predict": chat_options["num_predict"],
             "max_turns": max_turns,
+            "context_compactions": context_compactions,
             "cache_token_metrics": "not_reported_by_ollama",
         },
     }

@@ -51,7 +51,10 @@ fn timeout_from_env(name: &str, fallback: u64) -> Duration {
 }
 
 fn control_timeout() -> Duration {
-    timeout_from_env("FREELLAMA_CONTROL_TIMEOUT_SECONDS", DEFAULT_CONTROL_TIMEOUT_SECS)
+    timeout_from_env(
+        "FREELLAMA_CONTROL_TIMEOUT_SECONDS",
+        DEFAULT_CONTROL_TIMEOUT_SECS,
+    )
 }
 
 fn task_timeout() -> Duration {
@@ -223,7 +226,13 @@ pub async fn recommend(
         "context_tokens": context_tokens,
         "required_capabilities": required_capabilities.unwrap_or_default(),
     });
-    let value = post_json(&endpoint, "/_freellama/v1/recommendations", &body, control_timeout()).await?;
+    let value = post_json(
+        &endpoint,
+        "/_freellama/v1/recommendations",
+        &body,
+        control_timeout(),
+    )
+    .await?;
     pretty(&value)
 }
 
@@ -300,6 +309,12 @@ pub async fn natural_route(
     if let Some(session_id) = session_id {
         body["session_id"] = Value::String(session_id);
     }
-    let value = post_json(&endpoint, "/_freellama/v1/natural-routes", &body, task_timeout()).await?;
+    let value = post_json(
+        &endpoint,
+        "/_freellama/v1/natural-routes",
+        &body,
+        task_timeout(),
+    )
+    .await?;
     pretty(&value)
 }

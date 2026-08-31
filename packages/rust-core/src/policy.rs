@@ -106,7 +106,9 @@ pub fn qualify_from_aggregate(
 
     let mut qualified: Vec<Qualified> = Vec::new();
     for entry in &aggregate.models {
-        let Some(pass) = entry.pass_at_1 else { continue };
+        let Some(pass) = entry.pass_at_1 else {
+            continue;
+        };
         if pass < min_pass {
             continue;
         }
@@ -188,7 +190,8 @@ pub fn render_policy(
             .join(", ");
         let _ = writeln!(out, "qualified_models = [{list}]");
         for q in models {
-            let _ = writeln!(out, 
+            let _ = writeln!(
+                out,
                 "# {} — pass_at_1 {:.3} over {} trial(s){}",
                 q.model,
                 q.pass_at_1,

@@ -852,3 +852,125 @@ fn explicit_bug_fix_terms_select_code_repair_and_require_tools() {
             .any(|value| value == "explicit_code_repair_term")
     );
 }
+
+/// Discovery routes every managed task needs before it can pick a model. Shared by the
+/// managed-task reliability tests below so each one only has to describe its own `/api/embed`
+/// behaviour.
+fn discovery_routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
+    Router::new()
+        .route(
+            "/api/tags",
+            get(|| async {
+                Json(json!({"models": [{"name": "embed-model", "size": 274_000_000}]}))
+            }),
+        )
+        .route("/api/ps", get(|| async { Json(json!({"models": []})) }))
+        .route(
+            "/api/show",
+            post(|| async {
+                Json(json!({
+                    "capabilities": ["embedding"],
+                    "model_info": {"test.context_length": 2048}
+                }))
+            }),
+        )
+}
+
+fn embedding_task_request() -> Request<Body> {
+    Request::post("/_freellama/v1/tasks")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"task":"embedding","objective":"fastest","model":"embed-model","input":"hello"}"#,
+        ))
+        .unwrap()
+}
+
+/// Ollama returns 500 under load-model contention — the exact condition managed routing creates
+/// when it transitions models. The passthrough proxy has always ridden that out; the managed path
+/// used to fail the whole task on the first one, *and* throw away the admission permit it was
+/// holding. One retry must be enough to succeed.
+#[tokio::test]
+async fn managed_task_retries_a_transient_upstream_500() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mock = discovery_routes()
+        .route(
+            "/api/embed",
+            post(|State(calls): State<Arc<AtomicUsize>>| async move {
+                let seen = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                if seen == 1 {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": "model is loading"})),
+                    )
+                } else {
+                    (StatusCode::OK, Json(json!({"embeddings": [[0.1, 0.2]]})))
+                }
+            }),
+        )
+        .with_state(calls.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("http://{}", listener.local_addr().unwrap());
+    let mock_task = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    let platform = app(&PlatformConfig::new(
+        "127.0.0.1:11435",
+        upstream,
+        None,
+        None,
+        "qwen2.5:0.5b",
+    ))
+    .unwrap();
+
+    let response = platform.oneshot(embedding_task_request()).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "the managed task should have retried the transient 500 exactly once"
+    );
+    mock_task.abort();
+}
+
+/// A wedged Ollama runner does not always answer in JSON. Parsing strictly turned a truthful 500
+/// into a 502 "decode error", which hid the real upstream status from the caller and pointed
+/// debugging at the wrong layer. The status must survive, and the body must come through as text.
+#[tokio::test]
+async fn managed_task_preserves_a_non_json_upstream_error() {
+    let mock = discovery_routes::<()>()
+        .route(
+            "/api/embed",
+            post(|| async {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "<html>502 Bad Gateway</html>",
+                )
+            }),
+        )
+        .with_state(());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("http://{}", listener.local_addr().unwrap());
+    let mock_task = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    let platform = app(&PlatformConfig::new(
+        "127.0.0.1:11435",
+        upstream,
+        None,
+        None,
+        "qwen2.5:0.5b",
+    ))
+    .unwrap();
+
+    let response = platform.oneshot(embedding_task_request()).await.unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "the upstream status must survive rather than collapsing into a decode error"
+    );
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert!(
+        body["error"].as_str().unwrap().contains("502 Bad Gateway"),
+        "the upstream body should be carried through, got {body}"
+    );
+    mock_task.abort();
+}

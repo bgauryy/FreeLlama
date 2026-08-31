@@ -23,7 +23,8 @@ fn slug_matches_the_harness_convention() {
 #[test]
 fn refuses_a_smoke_run_as_evidence() {
     let f = aggregate(1, 0.9, true);
-    let err = qualify_from_aggregate(f.path(), &["qwen3.8:27b-mlx".into()], 0.8, false).unwrap_err();
+    let err =
+        qualify_from_aggregate(f.path(), &["qwen3.8:27b-mlx".into()], 0.8, false).unwrap_err();
     assert!(
         err.to_string().contains("smoke result"),
         "expected a smoke-run refusal, got: {err}"
@@ -41,14 +42,16 @@ fn accepts_a_smoke_run_only_when_asked() {
 #[test]
 fn refuses_an_aggregate_past_its_review_window() {
     let f = aggregate(3, 0.9, false);
-    let err = qualify_from_aggregate(f.path(), &["qwen3.8:27b-mlx".into()], 0.8, false).unwrap_err();
+    let err =
+        qualify_from_aggregate(f.path(), &["qwen3.8:27b-mlx".into()], 0.8, false).unwrap_err();
     assert!(err.to_string().contains("review window"), "got: {err}");
 }
 
 #[test]
 fn refuses_when_nothing_clears_the_bar() {
     let f = aggregate(3, 0.5, true);
-    let err = qualify_from_aggregate(f.path(), &["qwen3.8:27b-mlx".into()], 0.8, false).unwrap_err();
+    let err =
+        qualify_from_aggregate(f.path(), &["qwen3.8:27b-mlx".into()], 0.8, false).unwrap_err();
     assert!(err.to_string().contains("cleared"), "got: {err}");
 }
 

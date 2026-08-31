@@ -26,9 +26,21 @@ fn cli_tool_map_lists_every_registered_mcp_tool() {
         "expected at least 8 registered MCP tools, found {}: {registered:?}",
         registered.len()
     );
+    // Scope the search to `print_tool_map`'s body so a tool name mentioned incidentally elsewhere
+    // in the CLI cannot satisfy this check.
+    let map_start = cli
+        .find("fn print_tool_map()")
+        .expect("print_tool_map() not found in the CLI source");
+    let map_body = &cli[map_start..];
+    let map_body = &map_body[..map_body.find("\n}\n").map_or(map_body.len(), |end| end)];
+
     for tool in &registered {
+        // Match the bare string literal, not `("{tool}",` — the rows are a tuple table, and
+        // `cargo fmt` splits those across lines as soon as one row grows past the width limit.
+        // Keying on the paren made a pure formatting pass fail a *synchronization* check, which
+        // is a false alarm about the one thing this test exists to detect.
         assert!(
-            cli.contains(&format!("(\"{tool}\",")),
+            map_body.contains(&format!("\"{tool}\",")),
             "`freellama tools` does not list the registered MCP tool `{tool}` — update print_tool_map()"
         );
     }

@@ -14,10 +14,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+pub mod model_bench;
 #[cfg(feature = "napi")]
 #[allow(unsafe_code)]
 pub mod napi;
-pub mod model_bench;
 pub mod platform;
 pub mod policy;
 pub mod proxy;
@@ -543,7 +543,10 @@ pub fn parse_ollama_cli_version(
 /// Ollama app actually runs under (`launchctl setenv`, not a shell export), which is why
 /// `std::env::var` here would read the wrong process's environment entirely.
 fn launchctl_getenv(name: &str) -> Option<String> {
-    let output = Command::new("launchctl").args(["getenv", name]).output().ok()?;
+    let output = Command::new("launchctl")
+        .args(["getenv", name])
+        .output()
+        .ok()?;
     output
         .status
         .success()

@@ -19,8 +19,15 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from agent_context import REPEAT_NOTICE, call_signature, clip, fit_to_context
+
 OCTOCODE_TOOLS = {"localViewStructure", "localFindFiles", "localSearchCode", "localGetFileContent", "lspGetSemantics"}
 PATH_KEYS = ("path", "uri")
+# Both limits used to be tail-only slices (`observation[-3000:]`), which kept the end of a tool
+# result and discarded the beginning — the wrong half for a directory tree, a grep hit list, or a
+# file read. `clip` keeps both ends; see agent_context.py.
+RESULT_CLIP_CHARS = 2000
+OBSERVATION_CLIP_CHARS = 3000
 
 
 def request_json(url: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -89,10 +96,12 @@ localFindFiles - find files/dirs by name, glob, regex, or type; returns paths on
   queries: path (string, required, absolute), names (array of globs), pathPattern (glob over full
   path), regex (basename regex), entryType ("f"|"d"), excludeDir (array, e.g. ["node_modules",".git"]).
 
-localSearchCode - search file contents for text/regex/AST patterns; returns file+line matches.
+localSearchCode - search file contents for text/regex; returns file+line matches. Your main tool.
   queries: path (string, required, absolute), keywords (string; literal or regex search term),
-  mode ("paginated"|"discovery"|"detailed"|"structural"), include/exclude (glob arrays),
+  mode ("paginated"|"discovery"|"detailed"), include/exclude (glob arrays),
   caseInsensitive (bool), maxFiles (int).
+  Do NOT pass mode "structural" with keywords — structural (AST) search takes `pattern`/`rule`
+  instead and hard-errors on keywords, costing you a turn for nothing.
 
 localGetFileContent - read one file or a line range/matched slice of it.
   queries: path (string, required, absolute), fullContent (bool; small files only), startLine +
@@ -103,6 +112,11 @@ lspGetSemantics - LSP semantic queries: definitions, references, callers/callees
   queries: uri (string, required, absolute path), type ("definition"|"references"|"callers"|
   "callees"|"documentSymbols"|"hover"|...), symbolName (exact identifier), lineHint (int; get this
   from a prior search/documentSymbols call, never guess it).
+  Language coverage is uneven and it does NOT tell you when it is missing: it reports
+  serverAvailable=true and then returns zero symbols for a language it cannot actually analyse
+  (verified here — TypeScript returns a full outline, Rust returns totalSymbols=0 on the same
+  call). Treat one empty result as "unsupported here", not "no such symbol", and switch to
+  localSearchCode instead of retrying. Prefer localSearchCode first in any case.
 
 Finish with: {{"action":"finish","answer":"concise final answer with repository-relative evidence"}}
 
@@ -128,6 +142,7 @@ def main() -> int:
     metrics = {"load_ms": 0.0, "prompt_eval_ms": 0.0, "eval_ms": 0.0}
     answer = ""
     failure: str | None = None
+    context_compactions = 0
     chat_options = {"temperature": 0, "seed": 42, "num_ctx": 8192, "num_predict": 512}
 
     def call_model() -> dict[str, Any]:
@@ -152,6 +167,7 @@ def main() -> int:
         metrics["eval_ms"] += float(response.get("eval_duration", 0)) / 1_000_000
         return response
 
+    seen_calls: dict[str, int] = {}
     for _ in range(max_turns):
         try:
             response = call_model()
@@ -165,23 +181,34 @@ def main() -> int:
         started = time.perf_counter()
         tool_name = str(action.get("tool", ""))
         queries = action.get("queries", {}) if isinstance(action.get("queries"), dict) else {}
-        try:
-            observation = run_octocode(workspace, tool_name, queries)
-            status = "ok"
-        except (OSError, ValueError, subprocess.TimeoutExpired) as error:
-            observation = f"tool error: {type(error).__name__}: {error}"
-            status = "error"
+        # An exact repeat costs a turn out of ten AND a second copy of an observation the model
+        # has already seen. Answer it from the prior step instead of re-running the subprocess.
+        signature = call_signature({"tool": tool_name, "queries": queries})
+        repeated = signature in seen_calls
+        if repeated:
+            observation = REPEAT_NOTICE
+            status = "repeat"
+        else:
+            try:
+                observation = run_octocode(workspace, tool_name, queries)
+                status = "ok"
+            except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+                observation = f"tool error: {type(error).__name__}: {error}"
+                status = "error"
+            seen_calls[signature] = len(calls) + 1
         calls.append({
             "name": f"mcp.octocode.{tool_name}" if tool_name else "mcp.octocode.unknown",
             "raw_name": action.get("action", ""),
             "arguments": {"tool": tool_name, "queries": queries},
             "status": status,
             "duration_ms": round((time.perf_counter() - started) * 1000, 3),
-            "result": observation[-2000:],
+            "result": clip(observation, RESULT_CLIP_CHARS),
         })
         messages.append({"role": "assistant", "content": json.dumps(action, ensure_ascii=False)})
         remaining = max_turns - len(calls)
-        messages.append({"role": "user", "content": f"Observation:\n{observation[-3000:]}\n\nTool calls remaining: {remaining}. Finish now if the task is answerable; do not repeat prior calls."})
+        messages.append({"role": "user", "content": f"Observation:\n{clip(observation, OBSERVATION_CLIP_CHARS)}\n\nTool calls remaining: {remaining}. Finish now if the task is answerable; do not repeat prior calls."})
+        messages, compacted = fit_to_context(messages, num_ctx=chat_options["num_ctx"], num_predict=chat_options["num_predict"])
+        context_compactions += 1 if compacted else 0
     else:
         messages.append({"role": "user", "content": "Tool budget is exhausted. Return exactly a finish JSON action now using the evidence collected. Do not request another tool."})
         try:
@@ -207,6 +234,7 @@ def main() -> int:
             "num_ctx": chat_options["num_ctx"],
             "num_predict": chat_options["num_predict"],
             "max_turns": max_turns,
+            "context_compactions": context_compactions,
             "cache_token_metrics": "not_reported_by_ollama",
         },
     }
