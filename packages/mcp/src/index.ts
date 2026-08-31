@@ -30,152 +30,47 @@
  *   - Already-known one-liner -> don't delegate; the ~10-100s round trip costs more than it saves.
  */
 import { type ChildProcess, execFile } from "node:child_process";
-import { createRequire } from "node:module";
-import { existsSync, readFileSync } from "node:fs";
-import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import {
+  REPO_ROOT,
+  RESEARCH_ADAPTERS,
+  type ResearchAdapter,
+  DEFAULT_RESEARCH_ADAPTER,
+  DEFAULT_SERVE_ENDPOINT,
+  DEFAULT_DELEGATE_MODEL,
+  DEFAULT_DELEGATE_MAX_TURNS,
+  DEFAULT_DELEGATE_TIMEOUT_SECONDS,
+  DEFAULT_PULL_TIMEOUT_SECONDS,
+  DEFAULT_OLLAMA_FETCH_TIMEOUT_SECONDS,
+  assertAllowedWorkspace,
+} from "./config.js";
+import { doctor, machine, listModels, route, runTask, SERVER_VERSION } from "./native.js";
+import {
+  ollamaFetch,
+  endpointParam,
+  ollamaEndpointParam,
+  taskParam,
+  objectiveParam,
+  minConfidenceParam,
+  belowConfidence,
+  requiredCapabilitiesParam,
+  clipText,
+  structuredResult,
+  parsedResult,
+  errorResult,
+  summarizeEmbeddings,
+} from "./helpers.js";
+import { parseModelSearch, parseModelTags } from "./model-search.js";
+import { MODEL_EVIDENCE, assessDelegatedAnswer } from "./delegate.js";
 
 const execFileAsync = promisify(execFile);
-/**
- * Repo root, found by walking up to the directory containing `Cargo.toml`.
- *
- * This used to be `path.resolve(import.meta.url, "../../../")` — a hardcoded depth, which meant
- * relocating this package (say under a `packages/` monorepo layout) would silently resolve
- * REPO_ROOT one level short. That is not a cosmetic bug: REPO_ROOT is the default for
- * `ALLOWED_RESEARCH_ROOTS`, so a wrong value silently widens the directory boundary
- * `delegate_research` is allowed to read. Anchoring on a marker file makes the location a
- * non-issue. Falls back to the old relative guess if no marker is found.
- */
-function findRepoRoot(): string {
-  let dir = path.dirname(fileURLToPath(import.meta.url));
-  for (let depth = 0; depth < 10; depth += 1) {
-    if (existsSync(path.join(dir, "Cargo.toml"))) return dir;
-    const parent = path.dirname(dir);
-    if (parent === dir) break;
-    dir = parent;
-  }
-  return path.resolve(fileURLToPath(import.meta.url), "../../../");
-}
-
-const REPO_ROOT = findRepoRoot();
-// Two interchangeable research adapters. They take an identical env interface and write an
-// identical result shape, so which one runs is purely a routing decision — and this repo's own
-// benchmark settles it. From `benchmark/local/results/*/aggregate.json` (30 questions x 3 repos,
-// same model, same tasks, one variable):
-//
-//   model                  bash pass@1   octocode pass@1   bash median   octocode median
-//   qwen3.8:27b-mlx           86.7%          86.7%            19.6s          55.6s
-//   muse-glimmer:30b-mlx      96.7%          63.3%            28.3s         103.0s
-//   gemma4:12b-mlx             6.7%           0.0%              —              —
-//
-// bash wins or ties on every model, at 116.5 vs 53.8 successful tasks/hour. Confirmed again live
-// on a single question: 15.7s / 791 input tokens (bash) vs ~40s / 7,761 (octocode). Hence the
-// default below. `octocode` stays available because its structured search may still suit
-// questions the flat 30-question suite doesn't represent — but it has to be asked for.
-//
-// Resolution order matters for a PUBLISHED install. In-repo the adapters live in `benchmark/`,
-// which is their single source of truth; `npm run build` copies them into `adapters/` so the
-// packed tarball carries them too. Without that copy `delegate_research` is dead on arrival once
-// installed from npm — `files` ships only `dist`/`native`, so the python would simply not be there
-// and every call would fail with ENOENT.
-const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-
-function adapterPath(file: string): string {
-  const bundled = path.join(PACKAGE_ROOT, "adapters", file);
-  if (existsSync(bundled)) return bundled;
-  return path.join(REPO_ROOT, "benchmark/local/scripts", file);
-}
-
-const RESEARCH_ADAPTERS = {
-  bash: adapterPath("bash_agent.py"),
-  octocode: adapterPath("octocode_agent.py"),
-} as const;
-type ResearchAdapter = keyof typeof RESEARCH_ADAPTERS;
-
-const DEFAULT_RESEARCH_ADAPTER: ResearchAdapter =
-  process.env.FREELLAMA_MCP_DEFAULT_ADAPTER === "octocode" ? "octocode" : "bash";
-
-function envInt(name: string, fallback: number): number {
-  const raw = process.env[name];
-  if (!raw) return fallback;
-  const parsed = Number.parseInt(raw, 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
-}
-
-// Every default below is a starting point, not a structural assumption — override via env var
-// rather than editing source, so a different deployment (different port, different default
-// model, tighter/looser timeouts) never needs a recompile.
-const DEFAULT_OLLAMA_ENDPOINT = process.env.FREELLAMA_OLLAMA_ENDPOINT ?? "http://127.0.0.1:11434";
-// Same env var name the Rust side (packages/rust-core/src/napi.rs) uses for its own serve-endpoint default — one
-// name, one meaning, across both languages.
-const DEFAULT_SERVE_ENDPOINT = process.env.FREELLAMA_SERVE_ENDPOINT ?? "http://127.0.0.1:11435";
-const DEFAULT_DELEGATE_MODEL = process.env.FREELLAMA_MCP_DEFAULT_MODEL ?? "qwen3.8:27b-mlx";
-const DEFAULT_DELEGATE_MAX_TURNS = envInt("FREELLAMA_MCP_MAX_TURNS", 8);
-const DEFAULT_DELEGATE_TIMEOUT_SECONDS = envInt("FREELLAMA_MCP_DELEGATE_TIMEOUT_SECONDS", 180);
-const DEFAULT_PULL_TIMEOUT_SECONDS = envInt("FREELLAMA_MCP_PULL_TIMEOUT_SECONDS", 1200);
-const DEFAULT_OLLAMA_FETCH_TIMEOUT_SECONDS = envInt("FREELLAMA_MCP_FETCH_TIMEOUT_SECONDS", 30);
-
-// `delegate_research` grants a local model read access to whatever directory it's pointed at.
-// Without a boundary, an orchestrator (or a bug, or a compromised orchestrator) could point it at
-// $HOME or / and have a local model read arbitrary files on the machine — verified live: an
-// unconstrained version of this tool happily listed a real $HOME (Desktop, Documents, Library...).
-// Default to just this repo; extend via a colon-separated allowlist, never accept "anything".
-const ALLOWED_RESEARCH_ROOTS = (process.env.FREELLAMA_MCP_ALLOWED_ROOTS ?? REPO_ROOT)
-  .split(":")
-  .filter(Boolean)
-  .map((root) => path.resolve(root));
-
-// Resolved once, lazily, and through symlinks — see `assertAllowedWorkspace`. A root that can't
-// be resolved (typo'd env var, deleted directory) falls back to its lexical form rather than
-// disappearing from the allowlist, so a broken entry can never silently widen the boundary.
-let resolvedRootsPromise: Promise<string[]> | null = null;
-function allowedResearchRoots(): Promise<string[]> {
-  resolvedRootsPromise ??= Promise.all(
-    ALLOWED_RESEARCH_ROOTS.map(async (root) => {
-      try {
-        return await realpath(root);
-      } catch {
-        return root;
-      }
-    }),
-  );
-  return resolvedRootsPromise;
-}
-
-async function assertAllowedWorkspace(workspacePath: string): Promise<string> {
-  // `realpath`, not just `path.resolve`: resolve() is pure string arithmetic, so a symlink placed
-  // inside an allowed root and pointing at $HOME (or /) passes a prefix check while actually
-  // handing the local model everything on the other side of the link. The roots go through
-  // realpath too, or the comparison would fail legitimately on macOS, where paths like /tmp are
-  // themselves symlinks.
-  let resolved: string;
-  try {
-    resolved = await realpath(path.resolve(workspacePath));
-  } catch {
-    throw new Error(
-      `workspacePath "${workspacePath}" does not exist or is not readable. It must be an ` +
-        "absolute path to a directory that exists on this machine.",
-    );
-  }
-  const roots = await allowedResearchRoots();
-  const allowed = roots.some(
-    (root) => resolved === root || resolved.startsWith(`${root}${path.sep}`),
-  );
-  if (!allowed) {
-    throw new Error(
-      `workspacePath "${workspacePath}" resolves to "${resolved}", which is outside the allowed ` +
-        `research roots (${roots.join(", ")}). Set FREELLAMA_MCP_ALLOWED_ROOTS ` +
-        "(colon-separated) to extend this if you genuinely need to research another directory.",
-    );
-  }
-  return resolved;
-}
 
 // `delegate_research` spawns a python subprocess that can run for minutes. If this server goes
 // away first — client disconnect, Ctrl-C, a supervisor restart — an untracked child keeps a local
@@ -214,50 +109,6 @@ for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
   });
 }
 
-// Default (CJS) import — the native binding module doesn't declare static named exports
-// (`index.js` re-exports a `require()`'d `.node` file), so a named `import { doctor } from ...`
-// is not reliably detectable by Node's CJS/ESM interop. Destructuring after a default import
-// sidesteps that entirely.
-import native from "../native/index.js";
-const { doctor, machine, listModels, route, runTask } = native as {
-  doctor: (endpoint?: string | null) => Promise<string>;
-  machine: (endpoint?: string | null) => Promise<string>;
-  listModels: (endpoint?: string | null) => Promise<string>;
-  route: (
-    endpoint: string | null | undefined,
-    task: string,
-    objective?: string | null,
-    model?: string | null,
-    sessionId?: string | null,
-    contextTokens?: number | null,
-    requiredCapabilities?: string[] | null,
-    minConfidence?: string | null,
-  ) => Promise<string>;
-  runTask: (
-    endpoint: string | null | undefined,
-    task: string,
-    objective?: string | null,
-    model?: string | null,
-    sessionId?: string | null,
-    contextTokens?: number | null,
-    requiredCapabilities?: string[] | null,
-    prompt?: string | null,
-    images?: string[] | null,
-    messages?: unknown | null,
-    input?: unknown | null,
-    tools?: unknown | null,
-    keepAlive?: string | null,
-    minConfidence?: string | null,
-  ) => Promise<string>;
-};
-
-// Single source of truth for the version — a hardcoded literal here silently drifts from the
-// package it ships in (it already had: this file said 0.1.0 while the crate it wraps was 0.2.0).
-// package.json is always present in an npm tarball regardless of the `files` allowlist, and
-// `../package.json` resolves to the package root from `dist/index.js`.
-const { version: SERVER_VERSION } = createRequire(import.meta.url)("../package.json") as {
-  version: string;
-};
 
 // Guidance that applies ACROSS tools lives here, not repeated in each description. Measured
 // motivation: the tool list is re-sent on every request — it was 7,431 tokens across 13 tools,
@@ -265,8 +116,9 @@ const { version: SERVER_VERSION } = createRequire(import.meta.url)("../package.j
 // facts in the descriptions.
 const INSTRUCTIONS = `Offload token-heavy, non-reasoning work to local Ollama models.
 Optimise for quality and token reduction; latency is the tiebreak.
-For the full orchestration playbook — tiering work across you / a cheap cloud model / local Ollama,
-and what each tier must never be given — read the freellama skill (skills/freellama/SKILL.md).
+For the full orchestration playbook — the five flows, the tiering across you / a cheap cloud model /
+local Ollama, and what each tier must never be given — load the \`freellama\` skill (in this repo:
+skills/freellama/SKILL.md).
 
 DELEGATE WHEN
 A delegated answer costs a roughly fixed ~150 tokens whatever the input size, so past ~1k tokens
@@ -306,159 +158,6 @@ const server = new McpServer(
   { instructions: INSTRUCTIONS },
 );
 
-async function ollamaFetch(
-  endpoint: string | undefined,
-  path: string,
-  init: { method?: string; body?: unknown; timeoutMs?: number } = {},
-): Promise<unknown> {
-  const base = (endpoint ?? DEFAULT_OLLAMA_ENDPOINT).replace(/\/$/, "");
-  const controller = new AbortController();
-  const timeout = setTimeout(
-    () => controller.abort(),
-    init.timeoutMs ?? DEFAULT_OLLAMA_FETCH_TIMEOUT_SECONDS * 1000,
-  );
-  try {
-    const response = await fetch(`${base}${path}`, {
-      method: init.method ?? "GET",
-      headers: init.body ? { "content-type": "application/json" } : undefined,
-      body: init.body ? JSON.stringify(init.body) : undefined,
-      signal: controller.signal,
-    });
-    const text = await response.text();
-    if (!response.ok) {
-      throw new Error(`Ollama ${init.method ?? "GET"} ${path} -> HTTP ${response.status}: ${text}`);
-    }
-    return text ? JSON.parse(text) : {};
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-// Self-evident params carry no `.describe()`: the name says it, the default is in the server
-// instructions, and every description is re-sent on every request. Only params whose BEHAVIOUR
-// isn't obvious from the name keep one.
-const endpointParam = z.string().optional().describe("serve endpoint, default :11435");
-const ollamaEndpointParam = z.string().optional().describe("Ollama endpoint, default :11434");
-const taskParam = z.string().describe('e.g. completion, code_repair, vision, embedding');
-const objectiveParam = z
-  .enum(["fastest", "balanced", "quality"])
-  .optional()
-  .describe('"balanced"/"quality" need a configured policy; "fastest" does not');
-// The server grades every route decision (`route_evidence` in packages/rust-core/src/platform/routing.rs): "medium" only
-// when the task has BOTH a configured policy and benchmark data, "low" otherwise — there is no
-// "high". A "low"/capability_metadata_only decision is exactly what returned `qwen2.5:0.5b` for
-// code repair on this machine. Unchecked, that answer comes back looking like any other.
-const CONFIDENCE_RANK: Record<string, number> = { low: 1, medium: 2 };
-
-const minConfidenceParam = z
-  .enum(["low", "medium"])
-  .optional()
-  .describe('Fail closed below this. "medium" needs a policy AND benchmark data; "low" (default) accepts capability metadata alone. The refusal names what was missing');
-
-/**
- * Fail closed when a route decision isn't backed well enough for what the caller asked.
- *
- * Returns an error result rather than throwing, so the refusal reaches the caller as a normal
- * tool result carrying the rejected decision — the point is to hand back enough to decide what to
- * do next, not merely to say no.
- */
-function belowConfidence(decision: Record<string, unknown>, minConfidence?: "low" | "medium") {
-  if (!minConfidence) return null;
-  const actual = typeof decision.confidence === "string" ? decision.confidence : "low";
-  if ((CONFIDENCE_RANK[actual] ?? 1) >= (CONFIDENCE_RANK[minConfidence] ?? 1)) return null;
-  return errorResult(
-    new Error(
-      `Route refused: confidence is "${actual}" (evidence: ${decision.evidence}), below the ` +
-        `requested minimum "${minConfidence}". Selected model would have been ` +
-        `"${decision.selected_model}" for reasons [${(decision.reasons as string[] | undefined)?.join(", ")}].\n` +
-        "This is a fail-closed refusal, not a failure: the local router cannot justify this pick. " +
-        "Escalate to your own model, pass an explicit `model`, or run `bench-all` and configure a " +
-        "task policy to raise the evidence level.",
-    ),
-  );
-}
-
-const requiredCapabilitiesParam = z
-  .array(z.string())
-  .optional()
-  .describe('e.g. ["vision"], ["tools"]. Fails closed rather than picking a model that can\'t do it');
-
-// Pretty-printing is easier for a model to read but is pure overhead once a payload is large:
-// a single 768-dim embedding measured 10,293 bytes compact vs 17,471 pretty — ~1,800 wasted
-// tokens of indentation for zero information. Stay pretty while it's cheap, go compact when it
-// isn't.
-/**
- * Clip text to `limit` characters, keeping BOTH ends and saying how much was dropped.
- *
- * Four call sites each rolled their own `slice()`, three of them with no marker — so a reader could
- * not tell a complete value from a cut one. That is how a `delegate_research` evidence line came
- * back as `... --exclude-dir={node_modules,target,.venv,__pycach`: a hard 120-char head slice
- * through the middle of a command, which is unauditable precisely when auditing matters.
- *
- * Head-biased because the start of a command or message identifies it, with a tail so the target
- * of a long `grep` survives. Mirrors `agent_context.clip` on the adapter side, deliberately: the
- * same rule on both sides of the boundary.
- */
-function clipText(text: string, limit: number): string {
-  if (text.length <= limit) return text;
-  const marker = `… [${text.length - limit} more chars] …`;
-  const usable = Math.max(limit - marker.length, 0);
-  if (usable === 0) return text.slice(0, limit);
-  const head = Math.floor((usable * 2) / 3);
-  return text.slice(0, head) + marker + text.slice(-(usable - head));
-}
-
-const PRETTY_PRINT_MAX_BYTES = 8 * 1024;
-
-function serialize(value: unknown): string {
-  const compact = JSON.stringify(value);
-  return compact.length > PRETTY_PRINT_MAX_BYTES ? compact : JSON.stringify(value, null, 2);
-}
-
-// Results carry both `structuredContent` (the parsed object) and the serialized JSON as a text
-// block, per the spec's backwards-compatibility SHOULD. No `outputSchema` is declared — see below.
-function structuredResult(value: Record<string, unknown>) {
-  return {
-    content: [{ type: "text" as const, text: serialize(value) }],
-    structuredContent: value,
-  };
-}
-
-// The Rust/native layer and Ollama both return JSON text. Parse it once here so the object can be
-// handed back as `structuredContent` instead of being re-parsed by every consumer. A payload that
-// doesn't parse is a genuine failure, not something to pass through as opaque text — and error
-// results are exempt from output-schema validation, so reporting it that way is also the only
-// shape that can't turn into a protocol-level McpError.
-function parsedResult(raw: string) {
-  let value: unknown;
-  try {
-    value = JSON.parse(raw);
-  } catch (error) {
-    return errorResult(
-      new Error(
-        `upstream returned a payload that is not valid JSON: ${
-          error instanceof Error ? error.message : String(error)
-        }\n${clipText(raw, 2000)}`,
-      ),
-    );
-  }
-  if (value === null || typeof value !== "object" || Array.isArray(value)) {
-    return errorResult(new Error(`expected a JSON object from upstream, got: ${clipText(raw, 500)}`));
-  }
-  return structuredResult(value as Record<string, unknown>);
-}
-
-function errorResult(error: unknown) {
-  const message = error instanceof Error ? error.message : String(error);
-  return { content: [{ type: "text" as const, text: message }], isError: true };
-}
-
-// Output schemas were removed deliberately. They cost ~1,086 tokens on EVERY request to buy
-// client-side JSON-Schema validation — and that validation was itself a hazard: a strict schema
-// turned any undeclared upstream field into a hard `McpError` (caught live when /api/show returned
-// an undocumented `requires` field). Verified against the SDK: `structuredContent` still reaches
-// the client with no `outputSchema` declared, so callers keep the parsed object and lose only the
-// validation. Reinstate per-tool if a consumer needs machine-checked output.
 
 
 server.registerTool(
@@ -642,82 +341,6 @@ server.registerTool(
   },
 );
 
-/**
- * Parse ollama.com/search result cards.
- *
- * There is no JSON API — `Accept: application/json` still returns HTML, and `/api/search`,
- * `/search.json`, and the registry `_catalog` endpoint all 404. So this parses the rendered page,
- * which means it is inherently coupled to Ollama's markup and can break on a redesign. Failures
- * surface as "0 results" rather than an exception, so the tool degrades to unhelpful instead of
- * broken; the shape it depends on is one <li> per model, each containing a /library/<name> link.
- */
-function parseModelSearch(html: string) {
-  const results = [];
-  for (const block of html.split(/<li\s/).slice(1)) {
-    const name = block.match(/href="\/library\/([^"]+)"/)?.[1];
-    if (!name) continue;
-    const description =
-      block
-        .match(/<p class="max-w-lg[^"]*">([\s\S]*?)<\/p>/)?.[1]
-        ?.replace(/<[^>]+>/g, "")
-        .replace(/&#39;/g, "'")
-        .replace(/&amp;/g, "&")
-        .replace(/&quot;/g, '"')
-        .replace(/\s+/g, " ")
-        .trim() ?? "";
-    // Indigo chips are runtime capabilities; the cyan "cloud" chip means the model runs on
-    // Ollama's hosted service, NOT on this machine — the distinction that matters most here.
-    const capabilities = [...block.matchAll(/text-(?:indigo-600|cyan-500)[^>]*>([a-z]+)<\/span>/g)].map(
-      (m) => m[1],
-    );
-    const stat = (label: string) =>
-      block.match(
-        new RegExp(`<span >([\\d.,KMB]+)<\\/span>\\s*<span class="hidden sm:flex">&nbsp;${label}`),
-      )?.[1] ?? null;
-    results.push({
-      name,
-      description: clipText(description, 160),
-      capabilities,
-      pulls: stat("Pulls"),
-      tags: stat("Tag"),
-      cloudOnly: capabilities.includes("cloud"),
-    });
-  }
-  return results;
-}
-
-/**
- * Parse the tag table on ollama.com/library/<name>.
- *
- * This is the step search cannot cover: search returns FAMILY names (`gemma4`), and a family is
- * not pullable — you pull a tag (`gemma4:12b`), and only the tag carries the size that decides
- * whether it fits in memory. The page renders each tag twice (a mobile row and a desktop grid);
- * the mobile row is the one with everything on a single line, so it is what gets parsed.
- */
-function parseModelTags(html: string, family: string) {
-  const tags = [];
-  const seen = new Set<string>();
-  const row = /<a href="\/library\/([^"]+)" class="sm:hidden[\s\S]*?<p class="flex text-neutral-500">([^<]*)<\/p>/g;
-  for (const m of html.matchAll(row)) {
-    const tag = m[1];
-    if (seen.has(tag)) continue;
-    seen.add(tag);
-    const meta = m[2].replace(/&middot;/g, "·").split("·").map((x) => x.trim());
-    const sizeText = meta.find((x) => /^[\d.]+\s?[MG]B$/i.test(x)) ?? null;
-    const bytes = sizeText
-      ? Number.parseFloat(sizeText) * (/GB/i.test(sizeText) ? 1e9 : 1e6)
-      : null;
-    tags.push({
-      tag,
-      size: sizeText,
-      sizeBytes: bytes,
-      context: meta.find((x) => /context window/i.test(x))?.replace(/\s*context window\s*/i, "") ?? null,
-      modalities: meta.find((x) => /^(Text|Image|Audio)/i.test(x)) ?? null,
-      updated: meta.at(-1) ?? null,
-    });
-  }
-  return { family, tags };
-}
 
 server.registerTool(
   "search_models",
@@ -916,44 +539,6 @@ server.registerTool(
 // `search_models` now covers the same ground from the live library with per-tag memory fit.
 // Restore by re-registering a tool that calls recommend() from the native binding.
 
-/**
- * Strip the raw embedding matrix out of a `run_task` result, leaving enough to verify the call
- * worked (how many vectors, what dimensionality, the leading values of the first one).
- *
- * `run_task` advertises that the orchestrator "pays only the JSON wrapper (~hundreds of tokens,
- * regardless of output size)". For embeddings that was not true: measured against a live server,
- * one 768-dim `nomic-embed-text` vector came back as 17,471 bytes of pretty-printed JSON — about
- * 4,400 tokens, into the context of the model that was supposed to be *offloading* work. A batch
- * of twenty inputs would have been ~90k. Vectors are also the one kind of output a language model
- * can do nothing useful with by reading it.
- *
- * Returns `null` when there is no embedding matrix to strip, so non-embedding tasks pass through
- * untouched.
- */
-function summarizeEmbeddings(payload: Record<string, unknown>): Record<string, unknown> | null {
-  const response = payload.response;
-  if (response === null || typeof response !== "object") return null;
-  const { embeddings, ...rest } = response as Record<string, unknown>;
-  if (!Array.isArray(embeddings) || embeddings.length === 0) return null;
-  const first = embeddings[0];
-  const dimensions = Array.isArray(first) ? first.length : null;
-  return {
-    ...payload,
-    response: {
-      ...rest,
-      embeddings_omitted: {
-        count: embeddings.length,
-        dimensions,
-        preview: Array.isArray(first) ? first.slice(0, 8) : null,
-        note:
-          "Vectors withheld to keep them out of the orchestrator's context — pass " +
-          "`returnEmbeddings: true` to get the full matrix (a single 768-dim vector is ~4,400 " +
-          "tokens). `preview` is the first 8 values of the first vector, enough to confirm the " +
-          "call really produced numbers.",
-      },
-    },
-  };
-}
 
 server.registerTool(
   "run_task",
@@ -1162,149 +747,6 @@ server.registerTool(
  * Measured 2026-08-30, 8 grounded single-file lookups against this repo, `bash` adapter:
  *   qwen3.8:27b-mlx 8/8 | gemma4:12b-mlx 6/8 | llama3.2:3b 3/8 | qwen2.5:7b 2/8 | qwen2.5:0.5b 0/8
  */
-/**
- * Per-model research grades, loaded from disk — never compiled in.
- *
- * These are one machine's benchmark results. Baking them into a shipped server would make the
- * binary carry someone else's measurements as if they were universal, and they would rot silently
- * the moment models changed. The server carries the *mechanism*; the data lives in
- * `benchmark/evidence/model-evidence.json` (override with FREELLAMA_MCP_MODEL_EVIDENCE).
- *
- * Empty by default. A model with no entry is treated as unmeasured, which yields a `verify`
- * verdict — the correct answer when nothing is known, and a safer default than assuming strength.
- */
-type ModelGrade = { grade: "strong" | "weak" | "unusable"; note: string };
-
-const MODEL_EVIDENCE: Record<string, ModelGrade> = (() => {
-  const configured = process.env.FREELLAMA_MCP_MODEL_EVIDENCE;
-  const candidates = [
-    configured,
-    path.join(REPO_ROOT, "benchmark/evidence/model-evidence.json"),
-  ].filter((x): x is string => Boolean(x));
-  for (const file of candidates) {
-    try {
-      if (!existsSync(file)) continue;
-      const parsed = JSON.parse(readFileSync(file, "utf8")) as { models?: Record<string, ModelGrade> };
-      return parsed.models ?? {};
-    } catch {
-      // A malformed evidence file must not stop the server: an empty table degrades every verdict
-      // to `verify`, which is conservative rather than wrong.
-    }
-  }
-  return {};
-})();
-
-/**
- * Classify how far a delegated answer should be trusted, from observable facts only.
- *
- * The measured problem this exists to solve: the local model is 98.9% accurate on grounded
- * lookups and only ~67% on judgment calls, and it uses **the same confident tone for both** — so
- * the answer text alone carries no signal about which one you got. Everything here is derived
- * from what actually happened (did it read any files? how many?) plus one clearly-labelled
- * heuristic on the question's shape. Nothing is inferred from the model's own self-report, which
- * is exactly the thing that isn't reliable.
- *
- * This never escalates on its own. It emits a recommendation the orchestrator acts on, matching
- * how the rest of this server treats state-changing decisions.
- */
-function assessDelegatedAnswer(
-  question: string,
-  /**
-   * Count of tool calls that actually **succeeded**. Not the raw call count: a run whose commands
-   * all errored, or which only repeated an earlier call, read nothing — and a verdict computed
-   * from "it made 3 calls" would have graded that `accept` while the answer was pure recall. That
-   * is precisely the failure this function exists to catch, so it must not be fed a number that
-   * counts failures as evidence.
-   */
-  evidenceCount: number,
-  model: string,
-): {
-  recommendation: "accept" | "verify" | "escalate";
-  grounded: boolean;
-  why: string;
-  measuredBaseRate: string;
-} {
-  const grounded = evidenceCount > 0;
-  const evidence = MODEL_EVIDENCE[model];
-
-  // The model gates everything else. No amount of grounding rescues a model measured at 0-38%,
-  // and an unmeasured model has no base rate to quote in the first place.
-  if (evidence?.grade === "unusable") {
-    return {
-      recommendation: "escalate",
-      grounded,
-      why:
-        `${model} is not viable for research on this machine (${evidence.note}). It answers fast ` +
-        "and confidently while being wrong — a fast wrong answer is not a speed win. Re-run with " +
-        "qwen3.8:27b-mlx, or answer it yourself.",
-      measuredBaseRate: `${model}: ${evidence.note}`,
-    };
-  }
-  if (!evidence) {
-    return {
-      recommendation: "verify",
-      grounded,
-      why:
-        `${model} has no measured accuracy in this repo's benchmarks, so no base rate applies to ` +
-        "this answer. Treat it as unverified until it has been evaluated — accuracy fell off a " +
-        "cliff below ~12B in the models that were measured.",
-      measuredBaseRate: "no measured base rate for this model",
-    };
-  }
-  if (evidence.grade === "weak" && grounded) {
-    return {
-      recommendation: "verify",
-      grounded,
-      why:
-        `${model} holds up on simple single-file lookups but not beyond (${evidence.note}). ` +
-        "Check the evidence trail, or re-run on qwen3.8:27b-mlx if the answer matters.",
-      measuredBaseRate: `${model}: ${evidence.note}`,
-    };
-  }
-  if (!grounded) {
-    return {
-      recommendation: "escalate",
-      grounded: false,
-      why:
-        "The model answered without reading a single file, so this is parametric recall, not " +
-        "research — the failure mode where `run_task` was verified inventing wrong facts about " +
-        "this project's own architecture. Re-ask with a narrower question, or answer it yourself.",
-      measuredBaseRate: "ungrounded answers have no measured accuracy — they were never the tested path",
-    };
-  }
-  // Judgment questions are the ~67% bucket. This is a keyword heuristic, not a classifier, and is
-  // labelled as one: it errs toward asking for verification, which costs a read, not a wrong answer.
-  const judgmentSignals = /\b(should|better|best|worth|review|assess|evaluate|improve|opinion|recommend|why is|is it (good|safe|correct)|design|refactor)\b/i;
-  if (judgmentSignals.test(question)) {
-    return {
-      recommendation: "verify",
-      grounded: true,
-      why:
-        "The question reads as a judgment call (keyword heuristic), which is the ~67%-accurate " +
-        "bucket rather than the 98.9% one — and the tone is identical either way. Check the " +
-        "evidence trail against the claim before acting on it.",
-      measuredBaseRate: `${model}: ~67% on judgment calls vs 98.9% on grounded lookups`,
-    };
-  }
-  if (evidenceCount > 5) {
-    return {
-      recommendation: "verify",
-      grounded: true,
-      why:
-        `${evidenceCount} tool calls is outside the 1-5 file envelope this tool was measured on. ` +
-        "Wide searches are where it drifts; spot-check the evidence trail.",
-      measuredBaseRate: `${model}: 98.9% on grounded lookups, measured within a 1-5 file scope`,
-    };
-  }
-  return {
-    recommendation: "accept",
-    grounded: true,
-    why:
-      `Grounded in ${evidenceCount} tool call(s) within the measured 1-5 file envelope, the ` +
-      `question is lookup-shaped, and ${model} is measured strong for this (${evidence.note}).`,
-    measuredBaseRate: `${model}: 98.9% on grounded lookups (100+ questions)`,
-  };
-}
 
 server.registerTool(
   "delegate_research",

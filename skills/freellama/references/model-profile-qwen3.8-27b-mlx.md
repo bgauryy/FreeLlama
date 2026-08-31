@@ -28,7 +28,7 @@ Cost: 1 tool call, 2,035 input / 256 output tokens. **This is the killer use cas
 verifiable-by-construction (it cites paths you can check).**
 
 ### 2. Long-context retrieval — ✅ Strong
-Given the full `platform` module (11,499 prompt tokens, now split across `packages/rust-core/src/platform/{mod,routing,intent}.rs`) and asked to find a specific special-cased
+Given the full `platform` module (11,499 prompt tokens, now split across [`packages/rust-core/src/platform/`](https://github.com/bgauryy/FreeLlama/blob/main/packages/rust-core/src/platform)) and asked to find a specific special-cased
 model/task/num_ctx combination buried in the middle. **Correct model tag, correct num_ctx value,
 correct containing function, verbatim code citation** — 7.4s to answer. Minor terminology looseness
 (called the containing function's name when the precise identifier was a local variable inside it)
@@ -54,7 +54,7 @@ reasoning. Reserve `think:false` for tool-orchestration/retrieval tasks where th
 just be overhead, not the actual work product.**
 
 ### 6. Unsupervised code review — ❌ Unreliable, verify everything
-Given the real `send_with_retries` retry function from `packages/rust-core/src/proxy.rs` and asked to find bugs.
+Given the real `send_with_retries` retry function from [`proxy.rs`](https://github.com/bgauryy/FreeLlama/blob/main/packages/rust-core/src/proxy.rs) and asked to find bugs.
 Produced 6 findings; checked each against the actual code and the `bytes` crate's real semantics:
 
 | Claim | Verdict |
@@ -71,7 +71,7 @@ inference from an incomplete snippet, three were legitimate with varying real-wo
 **A blind trust-the-review workflow would act on a fake bug about a third of the time.**
 
 ### 7. Structured JSON tool-calling & agentic tool use — ✅ Good, with real cost tradeoffs
-From the formal 30-question benchmark (see `benchmark/local/`), comparing the same model with a
+From the formal 30-question benchmark (see [`benchmark/local/`](https://github.com/bgauryy/FreeLlama/blob/main/benchmark/local)), comparing the same model with a
 purpose-built tool (octocode) vs. raw bash:
 
 | Agent | Pass rate | Median tool calls | Median tokens in/out | Median time |
@@ -164,7 +164,7 @@ number — the same discipline as the 100-challenge run, and it mattered even mo
 
 | Category | Count | Finding |
 |---|---|---|
-| Grader too strict | 9 | **Model was correct.** `octocode` resolves paths relative to a detected sub-project root (e.g. `openui`'s own `package.json`), so it reported `packages/lang-core/src/library.ts` instead of `openui/packages/lang-core/src/library.ts` — same file, verified by construction, my exact-string grader was wrong. |
+| Grader too strict | 9 | **Model was correct.** `octocode` resolves paths relative to a detected sub-project root (e.g. the sub-project's own `package.json`), so it reported `packages/lang-core/src/library.ts` instead of `openui/packages/lang-core/src/library.ts` — same file, verified by construction, my exact-string grader was wrong. |
 | Infra: HTTP 500, retries exhausted | 11 | Real infra failures — exhausted both the proxy's 3 retries and the adapter's 2 extra retries. Nearly identical stats across all 11 (~622 tokens, 1 tool call, ~24-28s) — points to a *sustained* degraded window, not isolated blips. |
 | Infra: hard timeout | 1 | `zustand-immer` — 0 tool calls, 0 tokens, full 180s timeout, complete non-response. |
 | Genuine model error | 1 | `click-echo` — answered `termui.py`, real answer is `utils.py`. Confused `echo` with the similarly-named `echo_via_pager` (which *is* in `termui.py`) — a real but understandable mistake. |
@@ -191,7 +191,7 @@ the reported relative path resolves to a real, unique file instead.
 
 All findings above are reproducible: challenges 1-6 were run live against `qwen3.8:27b-mlx` through
 `http://127.0.0.1:11435/api/chat` (the FreeLlama proxy) this session; challenge 7 and the tool-usage
-table are computed directly from `benchmark/local/results/*/*/raw/*/trial-*.json` — re-run
+table are computed directly from the harness's per-trial JSON output — re-run
 `python3` over those files to reproduce the counts.
 
 Next: see `references/task-delegation.md` for how these findings translate into a delegate/verify

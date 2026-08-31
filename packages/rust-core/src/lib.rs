@@ -565,7 +565,7 @@ fn launchctl_getenv(name: &str) -> Option<String> {
 ///
 /// A cap of 3 is still far too many for large models on unified memory: 3 x ~22GB does not fit in
 /// 48GB, which is the condition that let this project co-resident two large models and crash the
-/// server (see `skills/freellama/references/model-selection.md`). The advisory stands; only its
+/// server (see `skills/freellama/references/ollama-config.md`). The advisory stands; only its
 /// stated reason needed correcting. Pure function so it's unit-testable without shelling out to
 /// `launchctl`.
 #[must_use]

@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref so a fast follow-up push doesn't queue behind a stale one.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: rust (fmt · clippy · test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Formatting first: cheapest signal, fails fastest.
+      - name: cargo fmt
+        run: cargo fmt --all --check
+
+      # Deny warnings in CI. The workspace lints (all + pedantic) are warn-level locally so a WIP
+      # build isn't blocked; CI is where they become mandatory. napi stays off (default features),
+      # since its FFI symbols only link inside a Node process.
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace
+
+  mcp:
+    name: mcp (build · typecheck · drift)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The MCP server loads a native addon compiled from packages/rust-core/src/napi.rs, so this
+      # job needs a Rust toolchain too.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      # Build the native addon into packages/mcp/native (root build script drives napi).
+      - name: Build native addon
+        run: |
+          npm ci
+          npm run build
+
+      # Build and typecheck the MCP server, then run the offline drift check. The Ollama-backed
+      # smoke tests (smoke-test, smoke-test-protocol, smoke-test-delegate) need a live Ollama and a
+      # pulled model, so they run locally via `npm test`, not here.
+      - name: Build and check MCP server
+        working-directory: packages/mcp
+        run: |
+          npm ci
+          npm run build
+          npm run test:ci
