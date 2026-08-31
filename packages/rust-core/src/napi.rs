@@ -34,31 +34,23 @@ const DEFAULT_OLLAMA_ENDPOINT: &str = "http://127.0.0.1:11434";
 /// Timeout for the decision-only control-plane calls (machine/models/routes/recommendations).
 /// These are pure computation on an in-memory model list; anything past a few seconds means the
 /// server is wedged, not busy. Overridable via `FREELLAMA_CONTROL_TIMEOUT_SECONDS`.
-const DEFAULT_CONTROL_TIMEOUT_SECS: u64 = 30;
 /// Timeout for the two calls that make a model actually generate. A cold load of a large model can
 /// legitimately take minutes — Ollama's own `OLLAMA_LOAD_TIMEOUT` is 5m before it even gives up on
 /// the load — so this has to be generous or it would abort work that was going to succeed.
 /// Overridable via `FREELLAMA_TASK_TIMEOUT_SECONDS`.
-const DEFAULT_TASK_TIMEOUT_SECS: u64 = 900;
-
-fn timeout_from_env(name: &str, fallback: u64) -> Duration {
-    let seconds = std::env::var(name)
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(fallback);
-    Duration::from_secs(seconds)
-}
 
 fn control_timeout() -> Duration {
-    timeout_from_env(
+    crate::timeout_from_env(
         "FREELLAMA_CONTROL_TIMEOUT_SECONDS",
-        DEFAULT_CONTROL_TIMEOUT_SECS,
+        crate::DEFAULT_CONTROL_TIMEOUT_SECS,
     )
 }
 
 fn task_timeout() -> Duration {
-    timeout_from_env("FREELLAMA_TASK_TIMEOUT_SECONDS", DEFAULT_TASK_TIMEOUT_SECS)
+    crate::timeout_from_env(
+        "FREELLAMA_TASK_TIMEOUT_SECONDS",
+        crate::DEFAULT_TASK_TIMEOUT_SECS,
+    )
 }
 
 fn endpoint_or_default(endpoint: Option<String>) -> String {
@@ -112,18 +104,27 @@ async fn get_json(endpoint: &str, path: &str, timeout: Duration) -> Result<Value
 }
 
 async fn post_json(endpoint: &str, path: &str, body: &Value, timeout: Duration) -> Result<Value> {
-    client()
+    let response = client()
         .post(format!("{}{path}", endpoint.trim_end_matches('/')))
         .timeout(timeout)
         .json(body)
         .send()
         .await
-        .map_err(to_napi_err)?
-        .error_for_status()
-        .map_err(to_napi_err)?
-        .json::<Value>()
-        .await
-        .map_err(to_napi_err)
+        .map_err(to_napi_err)?;
+    // `error_for_status()` discards the body — and the body is where every useful refusal lives.
+    // A `min_confidence` refusal names the grade, the evidence, the model it would have picked and
+    // the two commands that raise the grade; all of that was collapsing into a bare
+    // "HTTP status client error (422)". Same defect, same fix as the CLI's `print_response`.
+    let status = response.status();
+    let value = response.json::<Value>().await.map_err(to_napi_err)?;
+    if !status.is_success() {
+        let detail = value
+            .get("error")
+            .and_then(Value::as_str)
+            .map_or_else(|| value.to_string(), ToOwned::to_owned);
+        return Err(napi::Error::from_reason(detail));
+    }
+    Ok(value)
 }
 
 fn pretty(value: &Value) -> Result<String> {
@@ -188,8 +189,12 @@ pub async fn route(
     session_id: Option<String>,
     context_tokens: Option<i64>,
     required_capabilities: Option<Vec<String>>,
+    min_confidence: Option<String>,
 ) -> Result<String> {
     let endpoint = endpoint_or_default(endpoint);
+    // Forwarded so the CORE gate does the refusing. The MCP layer used to gate client-side with
+    // its own rank map, where an unknown grade defaulted to rank 1 and silently passed — the same
+    // fail-open bug the core gate was built to close. One gate, in the router, for every caller.
     let body = json!({
         "task": task,
         "objective": objective.unwrap_or_else(|| "balanced".to_owned()),
@@ -197,6 +202,7 @@ pub async fn route(
         "session_id": session_id,
         "context_tokens": context_tokens,
         "required_capabilities": required_capabilities.unwrap_or_default(),
+        "min_confidence": min_confidence,
     });
     let value = post_json(&endpoint, "/_freellama/v1/routes", &body, control_timeout()).await?;
     pretty(&value)
@@ -272,9 +278,11 @@ pub async fn run_task(
     input: Option<Value>,
     tools: Option<Value>,
     keep_alive: Option<String>,
+    min_confidence: Option<String>,
 ) -> Result<String> {
     let endpoint = endpoint_or_default(endpoint);
     let body = json!({
+        "min_confidence": min_confidence,
         "task": task,
         "objective": objective.unwrap_or_else(|| "balanced".to_owned()),
         "model": model,

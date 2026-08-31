@@ -3,12 +3,12 @@
 Exposes FreeLlama's local-LLM control plane, and Ollama's full lifecycle, as
 [MCP](https://modelcontextprotocol.io) tools, built on the official
 [`@modelcontextprotocol/typescript-sdk`](https://github.com/modelcontextprotocol/typescript-sdk).
-Five tools (`doctor`/`models`/`route`/`recommend`/`run_task`) are
-thin wrappers over native NAPI bindings straight into the Rust core (`../packages/rust-core/src/napi.rs`) — no HTTP
-round trip from Node to a CLI subprocess, no reimplemented logic. Five more (`ollama_*`) talk to
-Ollama's own HTTP API directly for lifecycle operations FreeLlama's routing layer doesn't cover
-(listing residency, inspecting a model, pulling, force-unloading, deleting). One
-(`delegate_research`) offloads grounded research questions to a local model.
+**Eight tools.** Four (`doctor`/`models`/`route`/`run_task`) are thin wrappers over native NAPI
+bindings straight into the Rust core (`../rust-core/src/napi.rs`) — no HTTP round trip from Node to
+a CLI subprocess, no reimplemented logic. Two (`ollama_manage`/`ollama_delete`) talk to Ollama's
+own HTTP API for lifecycle operations the routing layer doesn't cover. One (`search_models`)
+queries ollama.com. One (`delegate_research`) offloads grounded research questions to a local
+model and returns a verdict computed from what the run did.
 
 ## Architecture
 
@@ -126,15 +126,14 @@ nature — run them manually when touching the lifecycle tools or the env-var de
 
 | Tool | Needs `freellama serve`? | What it does |
 |---|---|---|
-| `doctor` | Optional — Ollama half needs none; the absorbed machine profile needs serve | Ollama reachability, CLI/server version match, the 9 memory-governing env vars, plus chip/unified memory/CPU/disk when serve is up |
+| `doctor` | Optional — Ollama half needs none; the absorbed machine profile needs serve | Ollama reachability, CLI/server version match, and the **11 memory-governing settings** (nine `OLLAMA_*` plus `LLAMA_ARG_FIT`/`LLAMA_ARG_FIT_TARGET`, which govern memory but lack the prefix an auditor greps for), each with its *effective* default. Plus chip/unified memory/CPU/disk when serve is up |
 | `models` | `view: "installed"` (default) does; the other three don't | Four views of the local estate: `installed` (capabilities, VRAM, context, policy_rank), `resident` (loaded now + derived GPU/CPU split), `detail` (one model in depth, real max context), `raw` (plain `GET /api/tags`). Absorbed the former `list_models`/`ollama_ps`/`ollama_show` — see "Merging tools" |
-| `route` | Yes | Deterministic model selection for a task/objective; accepts `requiredCapabilities` |
-| `recommend` | Yes | Side-effect-free install plan from the curated catalog (never runs `ollama pull`) |
+| `route` | Yes | Deterministic model selection for a task/objective; accepts `requiredCapabilities` and `minConfidence` (forwarded to the **core** gate — the refusal names the grade, evidence, would-be model, and the two commands that raise the grade). Every decision reports its evidence dimensions (`quality_evidence`, `task_evidence`, `hardware_fit`) and a `rejected[]` list naming why each losing candidate lost |
 | `search_models` | No — queries ollama.com | Search the public model library. Popular-ordered by default; flags `cloudOnly` models that cannot run locally, and cross-references what is already installed |
 | `run_task` | Yes | **Routes AND executes** a chat/generate/embed call in one shot — the one routing-plane tool that does real work, not just a decision. Embedding results withhold the raw vectors by default (`returnEmbeddings: true` to get them) — see "Keeping results small" below |
 | `ollama_manage` | No — direct to Ollama | `action: "pull"` downloads a model (blocks until done); `action: "stop"` force-unloads it from memory now. Both additive and idempotent |
 | `ollama_delete` | No — direct to Ollama | `DELETE /api/delete`: **destructive**, permanently removes a model. Only call on an explicit human instruction naming the exact model — never on an automated staleness heuristic |
-| `delegate_research` | No — spawns `octocode_agent.py` directly | Hands a grounded code-research question to a local model + octocode with a citable evidence trail. Prefer `run_task` for an ordinary chat/completion/embedding call — this is the heavier-weight, specialized path. See `skills/freellama/references/task-delegation.md` for what to trust it with. |
+| `delegate_research` | No — spawns the research adapter directly | Hands a grounded code-research question to a local model with a citable evidence trail. Read `structuredContent`: `verification` (recommendation + why) and `citations[]` (`{step, tool, path, command}`, full and unclipped) — `summary` is the same thing as prose. Prefer `run_task` for an ordinary chat/completion/embedding call — this is the heavier-weight, specialized path. See `skills/freellama/references/task-delegation.md` for what to trust it with. |
 
 ### No annotations, no output schemas, no titles
 
@@ -432,7 +431,7 @@ the request is actually doing:
 
 | Path | Timeout | Env override | Why |
 |---|---|---|---|
-| `models` / `route` / `recommend` | 30s | `FREELLAMA_CONTROL_TIMEOUT_SECONDS` | Pure computation over an in-memory model list; seconds means wedged, not busy |
+| `models` / `route` | 30s | `FREELLAMA_CONTROL_TIMEOUT_SECONDS` | Pure computation over an in-memory model list; seconds means wedged, not busy |
 | `run_task` (and `naturalRoute` in the native binding) | 900s | `FREELLAMA_TASK_TIMEOUT_SECONDS` | A model actually generates. Ollama's own `OLLAMA_LOAD_TIMEOUT` is 5m *before it gives up on the load alone*, so a short budget here aborts work that was going to succeed |
 | `doctor` | 30s | — | It is the tool you reach for when something else is already timing out |
 
@@ -447,7 +446,8 @@ runs and a real error isn't buried under an EPIPE trace.
 
 ### Ollama configuration this server knows about
 
-`doctor` reports nine `OLLAMA_*` settings, each with its **effective** default — because
+`doctor` reports eleven memory-governing settings — nine `OLLAMA_*` plus `LLAMA_ARG_FIT` and
+`LLAMA_ARG_FIT_TARGET` — each with its **effective** default, because
 `launchctl getenv` returning empty means "Ollama picks", which is not the same as "off". That
 distinction is not academic: an earlier version of the `OLLAMA_MAX_LOADED_MODELS` advisory read
 the `0` in Ollama's `envconfig/config.go` and reported the default as *unlimited*. The `0` is a
@@ -489,7 +489,7 @@ it is already listed in the repo-root `package.json`'s `napi.targets`. Other pla
 Rust toolchain and a local `npm run build` from the repo root.
 
 `doctor`/`ollama_*`/`models` (in its no-serve views) accept an optional `ollamaEndpoint` argument (default
-`http://127.0.0.1:11434`, raw Ollama). `models`/`route`/`recommend`
+`http://127.0.0.1:11434`, raw Ollama). `models`/`route`
 accept an optional `endpoint` argument (default `http://127.0.0.1:11435`, the FreeLlama proxy).
 Start the server the latter group depends on with `cargo run --release -- serve
 --recommendation-catalog recommendations.example.toml` from the repo root — see

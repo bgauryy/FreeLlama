@@ -7,6 +7,7 @@
 // how to build one, instead of a bare ENOENT from deep inside a spawn.
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -30,7 +31,25 @@ if (!binary) {
 
 // Pass through stdio and the exit code: this is a launcher, not a wrapper that reinterprets output.
 const child = spawn(binary, process.argv.slice(2), { stdio: "inherit" });
-child.on("exit", (code, signal) => process.exit(signal ? 1 : (code ?? 0)));
+
+// Forward termination to the child. Without this, a supervisor (or `kill`) that signals the npx
+// process by PID kills only this launcher, and `freellama serve` is orphaned still holding its
+// listener — the next start then fails with "address already in use" and nothing explains why.
+// Ctrl-C already reaches both via the process group; this covers the targeted-signal case.
+for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+  process.on(signal, () => {
+    if (!child.killed) child.kill(signal);
+  });
+}
+
+// Reproduce the shell's own convention for a signalled child (128 + signal number) so callers can
+// tell "interrupted" from "failed"; both used to collapse into a bare 1.
+child.on("exit", (code, signal) => {
+  if (signal) {
+    process.exit(128 + (os.constants.signals[signal] ?? 15));
+  }
+  process.exit(code ?? 0);
+});
 child.on("error", (err) => {
   console.error(`freellama: failed to start ${binary}: ${err.message}`);
   process.exit(1);

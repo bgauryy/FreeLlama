@@ -10,6 +10,9 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from agent_context import (  # noqa: E402
     CHARS_PER_TOKEN,
+    ObservationStore,
+    paginate,
+    page_footer,
     call_signature,
     clip,
     context_budget,
@@ -109,6 +112,59 @@ check(
 # --- budgeting sanity --------------------------------------------------------------------------
 check("token estimate scales with length", messages_tokens([{"role": "user", "content": "z" * (CHARS_PER_TOKEN * 100)}]) >= 100)
 check("budget never goes negative", context_budget(256, 512) == 0)
+
+
+# --- pagination: the point is that NOTHING is lost -------------------------------------------
+big = "\n".join(f"src/mod_{i}.py:{i}: def handler_{i}(request, ctx):" for i in range(900))
+pages = []
+p, total = 1, None
+while True:
+    chunk, got, tot = paginate(big, p)
+    total = tot
+    pages.append(chunk)
+    if got >= tot:
+        break
+    p += 1
+rejoined = "".join(pages)
+check("pagination covers a large observation in several pages", total > 1, f"total={total}")
+check(
+    "REASSEMBLED PAGES ARE BYTE-IDENTICAL TO THE INPUT — no data loss",
+    rejoined == big,
+    f"{len(rejoined)} chars vs {len(big)} original",
+)
+check("no page exceeds the page budget by more than one line", all(len(c) <= 3000 + 120 for c in pages))
+check(
+    "pages split on line boundaries, never mid-line",
+    all(c.endswith("\n") for c in pages[:-1]),
+)
+check("a short observation is a single page", paginate("one line")[2] == 1)
+check("empty input is one empty page", paginate("") == ("", 1, 1))
+check("page numbers clamp instead of erroring", paginate(big, 9999)[1] == total)
+
+# --- the footer must tell the model how to get the rest --------------------------------------
+foot = page_footer(step=3, page=1, total=4, total_chars=len(big))
+check("footer names the page and the total", "page 1 of 4" in foot)
+check("footer gives an exact next-page action", '"action":"page","step":3,"page":2' in foot)
+check("footer states nothing was discarded", "nothing discarded" in foot)
+check("footer says paging does not re-run the command", "does NOT re-run" in foot)
+check("a single page gets no footer at all", page_footer(1, 1, 1, 10) == "")
+
+# --- the store keeps everything retrievable -------------------------------------------------
+store = ObservationStore()
+store.put(1, big)
+store.put(2, "small")
+body, footer = store.view(1, 2)
+check("store serves an arbitrary page of a stored observation", body in pages and body == pages[1])
+check("store's footer advertises page 3 next", '"page":3' in footer)
+check("store returns the full short observation with no footer", store.view(2) == ("small", ""))
+check(
+    "store round-trips the original exactly",
+    store.get(1) == big,
+    "the full text must remain retrievable, that is what makes paging lossless",
+)
+missing_body, _ = store.view(99)
+check("an unknown step explains itself rather than returning empty", "no stored output" in missing_body)
+check("an unknown step lists the steps that do exist", "1, 2" in missing_body)
 
 print()
 if FAILURES:

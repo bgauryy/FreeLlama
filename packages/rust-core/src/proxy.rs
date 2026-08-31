@@ -13,7 +13,7 @@ use axum::{
     Router,
     body::{Body, to_bytes},
     extract::{Request, State},
-    http::{HeaderMap, HeaderName, HeaderValue, Response, StatusCode, Uri},
+    http::{HeaderMap, Response, StatusCode, Uri},
     response::IntoResponse,
     routing::any,
 };
@@ -387,10 +387,11 @@ fn filtered_headers(input: &HeaderMap) -> HeaderMap {
     let mut output = HeaderMap::new();
     for (name, value) in input {
         if !HOP_BY_HOP.contains(&name.as_str()) {
-            output.append(
-                HeaderName::from_bytes(name.as_str().as_bytes()).expect("HTTP header name"),
-                HeaderValue::from_bytes(value.as_bytes()).expect("HTTP header value"),
-            );
+            // Clone, don't round-trip through bytes. The input is a `HeaderMap`, so every name and
+            // value here was already validated when it was parsed; re-parsing them only added two
+            // `expect()` calls — the sole panic sites in the proxy — to re-derive what the type
+            // system already guarantees, on every proxied request in both directions.
+            output.append(name.clone(), value.clone());
         }
     }
     output

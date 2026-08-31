@@ -606,6 +606,111 @@ fn ollama_cli_output(executable: &Path) -> std::io::Result<(String, String)> {
     Ok((stdout, stderr))
 }
 
+/// Read a timeout from the environment, falling back to `fallback` seconds.
+///
+/// Single source of truth for the two timeout knobs. `FREELLAMA_CONTROL_TIMEOUT_SECONDS` (30s,
+/// small reads of in-memory state) and `FREELLAMA_TASK_TIMEOUT_SECONDS` (900s, a real generation)
+/// were each parsed by three separate copies of this function — in `napi.rs`, `platform.rs` and
+/// the CLI. All three happened to agree on the defaults, so nothing was broken; but one contract
+/// maintained in three places is a divergence waiting to happen, and nothing would have caught it.
+///
+/// Zero and unparseable values fall back rather than disabling the timeout: a `Client` with no
+/// timeout hangs forever against a server that accepts the connection and never answers, which is
+/// the failure this exists to prevent.
+#[must_use]
+pub fn timeout_from_env(name: &str, fallback: u64) -> Duration {
+    Duration::from_secs(
+        std::env::var(name)
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(fallback),
+    )
+}
+
+/// Default for `FREELLAMA_CONTROL_TIMEOUT_SECONDS` — discovery calls read small in-memory state.
+pub const DEFAULT_CONTROL_TIMEOUT_SECS: u64 = 30;
+/// Default for `FREELLAMA_TASK_TIMEOUT_SECONDS` — a cold load plus a real generation.
+pub const DEFAULT_TASK_TIMEOUT_SECS: u64 = 900;
+
+/// The eleven settings that govern local-model memory, each with the default Ollama actually
+/// resolves when the variable is unset.
+///
+/// Nine are `OLLAMA_*`; the last two are `LLAMA_ARG_FIT*`, which are just as memory-governing and
+/// were missed precisely because they do not carry the prefix an auditor greps for.
+///
+/// Extracted from `doctor` so it can be tested without a live Ollama. That matters more than it
+/// sounds: this table has shipped a wrong advisory twice. `OLLAMA_MAX_LOADED_MODELS` was reported
+/// as "unlimited" because envconfig declares `0` and only `server/sched.go` resolves that sentinel
+/// to `3 x GPU count`; `OLLAMA_FLASH_ATTENTION` was reported as "off" because envconfig's
+/// describe-map displays `false`, while the variable is declared with `BoolWithDefault` — whose
+/// entire purpose is to let the caller supply the default — and the FAQ states Ollama enables
+/// flash attention automatically on supported backends. Both are the same error: reading a
+/// declaration and calling it a resolved value.
+///
+/// `getenv` is injected so tests can drive the table without touching `launchctl`.
+pub fn ollama_env_advisories<F>(getenv: F) -> Value
+where
+    F: Fn(&str) -> Option<String>,
+{
+    json!({
+        "OLLAMA_MAX_LOADED_MODELS": {
+            "value": getenv("OLLAMA_MAX_LOADED_MODELS"),
+            "effective_default": "3 x GPU count (envconfig's 0 is a sentinel resolved in server/sched.go)",
+        },
+        "OLLAMA_NUM_PARALLEL": {
+            "value": getenv("OLLAMA_NUM_PARALLEL"),
+            "effective_default": "1",
+            "note": "Memory scales by OLLAMA_NUM_PARALLEL x context length — raising it multiplies KV-cache memory, it does not just add scheduling slots. At the default of 1, FreeLlama's own concurrency is unreachable: `/_freellama/v1/tasks` grants resident tasks a SHARED admission permit precisely so they can run together (only cold transitions take the exclusive one), but Ollama then serializes them anyway. Measured here: two concurrent requests against an already-resident model returned 1.12x, i.e. no gain. Raise this to overlap resident work, and pair it with OLLAMA_KV_CACHE_TYPE=q8_0 so the extra KV cache roughly pays for itself.",
+        },
+        "OLLAMA_KEEP_ALIVE": {
+            "value": getenv("OLLAMA_KEEP_ALIVE"),
+            "effective_default": "5m",
+        },
+        "OLLAMA_CONTEXT_LENGTH": {
+            "value": getenv("OLLAMA_CONTEXT_LENGTH"),
+            "effective_default": "VRAM-tiered: 4k under 24GiB, 32k for 24-48GiB, 256k at 48GiB+",
+            "note": "The single largest memory lever. FreeLlama's own routing always sends an explicit num_ctx, so tasks routed through `serve` are unaffected — but anything talking to Ollama directly inherits this default.",
+        },
+        "OLLAMA_KV_CACHE_TYPE": {
+            "value": getenv("OLLAMA_KV_CACHE_TYPE"),
+            "effective_default": "f16",
+            "note": "q8_0 roughly halves KV-cache memory for a given context length. It needs flash attention, which is auto-enabled on supported backends (Metal included) — so it is usually available without setting anything else. Why it matters more than it looks: prefix KV-cache reuse is real and measured here (a warm 2,462-token prefix re-served in 281ms vs 18,631ms cold, surviving interleaved conversations), so KV memory is what keeps conversations warm. Halving it buys double the cacheable context — which also makes context compaction (a byte-prefix edit that invalidates the cache from that point) rare.",
+        },
+        "OLLAMA_FLASH_ATTENTION": {
+            "value": getenv("OLLAMA_FLASH_ATTENTION"),
+            "effective_default": "auto — enabled when the backend and device support it (Metal does)",
+            "note": "Not off. envconfig declares this with `BoolWithDefault`, whose whole point is that the CALLER supplies the default (plain `Bool` is the one hardcoded to false), and docs/faq.mdx states Ollama 'uses Flash Attention automatically when the selected backend and devices support it'. The `false` visible in envconfig's describe-map is the help-listing display value, not the runtime resolution. This is the same mistake this project already documented for OLLAMA_MAX_LOADED_MODELS: a declaration is not a resolved value. Set 0 to force it off, 1 to force it on.",
+        },
+        "OLLAMA_MAX_QUEUE": {
+            "value": getenv("OLLAMA_MAX_QUEUE"),
+            "effective_default": "512",
+        },
+        "OLLAMA_LOAD_TIMEOUT": {
+            "value": getenv("OLLAMA_LOAD_TIMEOUT"),
+            "effective_default": "5m",
+            "note": "A cold load of a large model can legitimately take minutes; any client timeout below this will give up while Ollama is still working.",
+        },
+        "OLLAMA_GPU_OVERHEAD": {
+            "value": getenv("OLLAMA_GPU_OVERHEAD"),
+            "effective_default": "0",
+        },
+        // Not OLLAMA_-prefixed, and therefore easy to miss when auditing "the OLLAMA_* settings" —
+        // but these two govern memory as directly as anything above, so leaving them out made the
+        // audit incomplete on exactly the axis it exists to cover.
+        "LLAMA_ARG_FIT": {
+            "value": getenv("LLAMA_ARG_FIT"),
+            "effective_default": "on",
+            "note": "llama.cpp automatically fits any memory option you did not set. That is usually what you want, but it means an unset num_ctx or batch size is chosen for you at load time — so a 'why did this model load smaller than I asked' question starts here. Set it off only if you intend to specify every memory option yourself.",
+        },
+        "LLAMA_ARG_FIT_TARGET": {
+            "value": getenv("LLAMA_ARG_FIT_TARGET"),
+            "effective_default": "unset — llama.cpp picks its own margin",
+            "note": "Target free VRAM margin per device, in MiB, that the automatic fit above aims to leave. On unified memory this is headroom taken from the same pool the OS and everything else uses, which is why Ollama's own loader also refuses a model predicted past 80% of free memory (server/sched.go).",
+        },
+    })
+}
+
 /// Query the diagnostic endpoints required by the harness.
 ///
 /// # Errors
@@ -651,55 +756,17 @@ pub async fn doctor(endpoint: &str) -> Result<Value> {
         diagnostic.resolved_path = resolved_path.map(|path| path.display().to_string());
         Some(diagnostic)
     });
-    let ollama_max_loaded_models = launchctl_getenv("OLLAMA_MAX_LOADED_MODELS");
-    let ollama_env_config_warning = max_loaded_models_advisory(ollama_max_loaded_models.as_deref());
+    let env_config = ollama_env_advisories(launchctl_getenv);
+    // Read the value back out of the table rather than calling `launchctl getenv` a second time
+    // for the same variable — one subprocess spawn per doctor run, not two, and no way for the
+    // advisory and the reported value to disagree.
+    let ollama_env_config_warning =
+        max_loaded_models_advisory(env_config["OLLAMA_MAX_LOADED_MODELS"]["value"].as_str());
     // Previously only 3 of Ollama's 16 `OLLAMA_*` variables were reported, and the three that
     // dominate memory were not among them. Each entry below carries its effective default, because
     // `launchctl getenv` returning empty means "Ollama picks" — which is not the same as "off",
     // and reporting a bare null invites exactly the misreading that produced the wrong
     // MAX_LOADED_MODELS advisory above.
-    let env_config = json!({
-        "OLLAMA_MAX_LOADED_MODELS": {
-            "value": ollama_max_loaded_models,
-            "effective_default": "3 x GPU count (envconfig's 0 is a sentinel resolved in server/sched.go)",
-        },
-        "OLLAMA_NUM_PARALLEL": {
-            "value": launchctl_getenv("OLLAMA_NUM_PARALLEL"),
-            "effective_default": "1",
-            "note": "Memory scales by OLLAMA_NUM_PARALLEL x context length — raising it multiplies KV-cache memory, it does not just add scheduling slots.",
-        },
-        "OLLAMA_KEEP_ALIVE": {
-            "value": launchctl_getenv("OLLAMA_KEEP_ALIVE"),
-            "effective_default": "5m",
-        },
-        "OLLAMA_CONTEXT_LENGTH": {
-            "value": launchctl_getenv("OLLAMA_CONTEXT_LENGTH"),
-            "effective_default": "VRAM-tiered: 4k under 24GiB, 32k for 24-48GiB, 256k at 48GiB+",
-            "note": "The single largest memory lever. FreeLlama's own routing always sends an explicit num_ctx, so tasks routed through `serve` are unaffected — but anything talking to Ollama directly inherits this default.",
-        },
-        "OLLAMA_KV_CACHE_TYPE": {
-            "value": launchctl_getenv("OLLAMA_KV_CACHE_TYPE"),
-            "effective_default": "f16",
-            "note": "q8_0 roughly halves KV-cache memory for a given context length; requires OLLAMA_FLASH_ATTENTION.",
-        },
-        "OLLAMA_FLASH_ATTENTION": {
-            "value": launchctl_getenv("OLLAMA_FLASH_ATTENTION"),
-            "effective_default": "off",
-        },
-        "OLLAMA_MAX_QUEUE": {
-            "value": launchctl_getenv("OLLAMA_MAX_QUEUE"),
-            "effective_default": "512",
-        },
-        "OLLAMA_LOAD_TIMEOUT": {
-            "value": launchctl_getenv("OLLAMA_LOAD_TIMEOUT"),
-            "effective_default": "5m",
-            "note": "A cold load of a large model can legitimately take minutes; any client timeout below this will give up while Ollama is still working.",
-        },
-        "OLLAMA_GPU_OVERHEAD": {
-            "value": launchctl_getenv("OLLAMA_GPU_OVERHEAD"),
-            "effective_default": "0",
-        },
-    });
     Ok(json!({
         "endpoint": endpoint,
         "version": version,

@@ -158,3 +158,97 @@ REPEAT_NOTICE = (
     "(identical call already made this run — its result is above and was not re-executed. "
     "Use a different call, or finish now with the evidence already collected.)"
 )
+
+
+# How many unparseable turns to try to repair before giving up on the run. A model that emits prose
+# instead of JSON once will usually correct when told so explicitly; aborting on the first one threw
+# away an entire delegation — including every tool result already gathered — and surfaced as
+# "model did not return a valid JSON action", which reads like model weakness rather than a loop
+# with no error recovery.
+MAX_PARSE_REPAIRS = 2
+
+PARSE_REPAIR_NOTICE = (
+    "Your last reply was not a valid JSON action, so it was discarded. Reply with EXACTLY one JSON "
+    "object and nothing else — no prose before or after, no markdown fence. Use the action shapes "
+    "given in your instructions. If you already have enough evidence, send the finish action now."
+)
+
+# ---------------------------------------------------------------------------------------------
+# Pagination — the alternative to throwing data away
+#
+# Clipping an observation is silent data loss the model can never recover: a routine
+# `grep -rn "def " .` over jinja produces ~27,000 characters, and a 3,000-character clip discarded
+# 89% of it. The model cannot ask for the rest, cannot tell how much it is missing, and will
+# happily conclude "not found" from a window that never contained the answer.
+#
+# Pagination keeps every byte. The full observation is retained, the model is shown one page plus
+# an exact instruction for requesting the next, and asking for page 2 re-serves stored text rather
+# than re-running the command — so paging costs a turn, never a duplicate subprocess.
+# ---------------------------------------------------------------------------------------------
+
+# Characters per page shown to the model. Roughly 750 tokens — small enough that several pages fit
+# in an 8K window alongside the system prompt, large enough that most observations are one page.
+OBSERVATION_PAGE_CHARS = 3000
+
+
+def paginate(text: str, page: int = 1, page_size: int = OBSERVATION_PAGE_CHARS) -> tuple[str, int, int]:
+    """Return `(chunk, page, total_pages)`, splitting on line boundaries.
+
+    Line-aware on purpose: these observations are grep hits, directory listings and file slices,
+    where a chunk cut mid-line yields a truncated path or a half identifier — exactly the kind of
+    fragment that gets misread as data rather than as damage.
+    """
+    if not text:
+        return "", 1, 1
+    lines = text.splitlines(keepends=True)
+    pages: list[list[str]] = [[]]
+    size = 0
+    for line in lines:
+        # A single line longer than a page gets its own page rather than being split.
+        if size and size + len(line) > page_size:
+            pages.append([])
+            size = 0
+        pages[-1].append(line)
+        size += len(line)
+    total = max(1, len(pages))
+    page = max(1, min(page, total))
+    return "".join(pages[page - 1]), page, total
+
+
+def page_footer(step: int, page: int, total: int, total_chars: int) -> str:
+    """Tell the model exactly how to get the rest — or that there is no rest."""
+    if total <= 1:
+        return ""
+    remaining = total - page
+    nxt = page + 1 if remaining else 1
+    return (
+        f'\n\n[page {page} of {total} — {total_chars} characters total, nothing discarded. '
+        f'For the next page send exactly: {{"action":"page","step":{step},"page":{nxt}}} '
+        f"— that re-reads stored output and does NOT re-run the command.]"
+    )
+
+
+class ObservationStore:
+    """Keeps every observation in full so any page can be served later.
+
+    This is what makes pagination lossless rather than a nicer-looking clip: the text stays here
+    whole, and the conversation only ever holds the page the model asked for.
+    """
+
+    def __init__(self) -> None:
+        self._by_step: dict[int, str] = {}
+
+    def put(self, step: int, text: str) -> None:
+        self._by_step[step] = text
+
+    def get(self, step: int) -> str | None:
+        return self._by_step.get(step)
+
+    def view(self, step: int, page: int = 1) -> tuple[str, str]:
+        """Return `(body, footer)` for one page of a stored observation."""
+        text = self._by_step.get(step)
+        if text is None:
+            known = ", ".join(str(k) for k in sorted(self._by_step)) or "none yet"
+            return (f"no stored output for step {step} (known steps: {known})", "")
+        chunk, page, total = paginate(text, page)
+        return chunk, page_footer(step, page, total, len(text))

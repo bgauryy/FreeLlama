@@ -231,6 +231,7 @@ const { doctor, machine, listModels, route, runTask } = native as {
     sessionId?: string | null,
     contextTokens?: number | null,
     requiredCapabilities?: string[] | null,
+    minConfidence?: string | null,
   ) => Promise<string>;
   runTask: (
     endpoint: string | null | undefined,
@@ -246,6 +247,7 @@ const { doctor, machine, listModels, route, runTask } = native as {
     input?: unknown | null,
     tools?: unknown | null,
     keepAlive?: string | null,
+    minConfidence?: string | null,
   ) => Promise<string>;
 };
 
@@ -385,6 +387,27 @@ const requiredCapabilitiesParam = z
 // a single 768-dim embedding measured 10,293 bytes compact vs 17,471 pretty — ~1,800 wasted
 // tokens of indentation for zero information. Stay pretty while it's cheap, go compact when it
 // isn't.
+/**
+ * Clip text to `limit` characters, keeping BOTH ends and saying how much was dropped.
+ *
+ * Four call sites each rolled their own `slice()`, three of them with no marker — so a reader could
+ * not tell a complete value from a cut one. That is how a `delegate_research` evidence line came
+ * back as `... --exclude-dir={node_modules,target,.venv,__pycach`: a hard 120-char head slice
+ * through the middle of a command, which is unauditable precisely when auditing matters.
+ *
+ * Head-biased because the start of a command or message identifies it, with a tail so the target
+ * of a long `grep` survives. Mirrors `agent_context.clip` on the adapter side, deliberately: the
+ * same rule on both sides of the boundary.
+ */
+function clipText(text: string, limit: number): string {
+  if (text.length <= limit) return text;
+  const marker = `… [${text.length - limit} more chars] …`;
+  const usable = Math.max(limit - marker.length, 0);
+  if (usable === 0) return text.slice(0, limit);
+  const head = Math.floor((usable * 2) / 3);
+  return text.slice(0, head) + marker + text.slice(-(usable - head));
+}
+
 const PRETTY_PRINT_MAX_BYTES = 8 * 1024;
 
 function serialize(value: unknown): string {
@@ -415,12 +438,12 @@ function parsedResult(raw: string) {
       new Error(
         `upstream returned a payload that is not valid JSON: ${
           error instanceof Error ? error.message : String(error)
-        }\n${raw.slice(0, 2000)}`,
+        }\n${clipText(raw, 2000)}`,
       ),
     );
   }
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
-    return errorResult(new Error(`expected a JSON object from upstream, got: ${raw.slice(0, 500)}`));
+    return errorResult(new Error(`expected a JSON object from upstream, got: ${clipText(raw, 500)}`));
   }
   return structuredResult(value as Record<string, unknown>);
 }
@@ -603,7 +626,10 @@ server.registerTool(
   async ({ endpoint, task, objective, model, sessionId, contextTokens, requiredCapabilities, minConfidence }) => {
     try {
       const result = parsedResult(
-        await route(endpoint, task, objective, model, sessionId, contextTokens, requiredCapabilities),
+        // minConfidence is forwarded so the CORE gate refuses, with its actionable message naming
+        // the two commands that raise the grade. The belowConfidence() check below stays only as a
+        // fallback for servers older than the core gate.
+        await route(endpoint, task, objective, model, sessionId, contextTokens, requiredCapabilities, minConfidence),
       );
       if ("structuredContent" in result) {
         const refusal = belowConfidence(result.structuredContent, minConfidence);
@@ -650,7 +676,7 @@ function parseModelSearch(html: string) {
       )?.[1] ?? null;
     results.push({
       name,
-      description: description.length > 160 ? `${description.slice(0, 160)}...` : description,
+      description: clipText(description, 160),
       capabilities,
       pulls: stat("Pulls"),
       tags: stat("Tag"),
@@ -763,7 +789,8 @@ server.registerTool(
     try {
       if (model) {
         const family = model.split(":")[0];
-        const { tags } = parseModelTags(await fetchPage(`https://ollama.com/library/${family}`), family);
+        const familyPage = await fetchPage(`https://ollama.com/library/${family}`);
+        const { tags } = parseModelTags(familyPage, family);
         const { installed, memoryBytes } = await localState();
         // "Fits" is not "size < RAM". A model needs room for its KV cache and for whatever else is
         // resident, and this machine has crashed by co-residenting two large models. 60% of total
@@ -779,10 +806,24 @@ server.registerTool(
         // then happily recommends a 143GB model on a 48GB machine. A fit recommendation without a
         // memory figure is worse than none, so only rank when the budget is actually known.
         const runnable = annotated.filter((t) => t.fitsInMemory === true && !/cloud/.test(t.tag));
-        // Bigger is better for research quality (accuracy collapses below ~12B), so recommend the
-        // largest tag that still fits the budget.
+        // "Bigger is better" is a *generative* rule and applying it to an embedding family
+        // inverted this repo's own measurement. Measured here on real retrieval over this repo
+        // (152 chunks, 6 questions with known-correct files): nomic-embed-text at 274MB scored
+        // 5/6 recall@3 in 4.2s, while qwen3-embedding:0.6b — 2.3x the size — scored 4/6 at 3.5x
+        // the indexing cost. Recommending the largest embedding tag that fits therefore pointed
+        // at a 4.7GB model, ~17x the measured winner, for worse recall. Embeddings have no
+        // accuracy cliff to clear: there is no sampling, so the size premium buys nothing.
+        // Two independent signals, because either alone misfires: a generative model's blurb can
+        // mention embeddings in passing (so require several hits — measured 82 on
+        // /library/qwen3-embedding versus 0 on /library/gemma3), and not every embedding family
+        // is named for it (`all-minilm` is not).
+        const embeddingMentions = (familyPage.match(/embedding/gi) ?? []).length;
+        const isEmbeddingFamily = embeddingMentions >= 3 || /embed/i.test(family);
+        const sized = runnable.filter((t) => t.sizeBytes);
         const best = budget
-          ? runnable.filter((t) => t.sizeBytes).sort((a, b) => (b.sizeBytes ?? 0) - (a.sizeBytes ?? 0))[0]
+          ? isEmbeddingFamily
+            ? sized.sort((a, b) => (a.sizeBytes ?? 0) - (b.sizeBytes ?? 0))[0]
+            : sized.sort((a, b) => (b.sizeBytes ?? 0) - (a.sizeBytes ?? 0))[0]
           : undefined;
         return structuredResult({
           family,
@@ -806,21 +847,41 @@ server.registerTool(
             ? undefined
             : "No machine profile (freellama serve unreachable), so memory fit could not be checked and no tag is recommended. Start serve, or read the sizes yourself.",
           recommendation: best
-            ? {
-                tag: best.tag,
-                why:
-                  `Largest tag that fits the ~60% memory budget${memoryBytes ? ` of ${Math.round(memoryBytes / 1e9)}GB` : ""}. ` +
-                  "Bigger is better here — research accuracy collapses below ~12B.",
-                configure:
-                  "Send an explicit num_ctx rather than inheriting Ollama's default, which is " +
-                  'VRAM-tiered and reaches 256K on a 48GB machine. Use keepAlive:"0" for one-off ' +
-                  "calls so it does not hold memory after.",
-                caution:
-                  "Do not co-resident this with another large model — that has crashed this " +
-                  "machine. Check `models{view:\"resident\"}` first. Also note this repo measured a " +
-                  "GGUF build BEATING its -mlx counterpart for the same family, so do not assume " +
-                  "a suffix is better; benchmark the packaging, don't infer it from the name.",
-              }
+            ? isEmbeddingFamily
+              ? {
+                  tag: best.tag,
+                  why:
+                    "Smallest tag that fits — this is an embedding family, where bigger is NOT " +
+                    "better. Measured on real retrieval over this repo: nomic-embed-text (274MB) " +
+                    "scored 5/6 recall@3 in 4.2s, while qwen3-embedding:0.6b (2.3x the size) " +
+                    "scored 4/6 at 3.5x the indexing cost. Embeddings do no sampling, so there is " +
+                    "no accuracy cliff for size to buy you past.",
+                  configure:
+                    'Batch your inputs in one `run_task` call and use keepAlive:"0" — an embedding ' +
+                    "model has no reason to hold memory after the vectors are computed. Leave " +
+                    "returnEmbeddings off unless you are storing the vectors yourself.",
+                  caution:
+                    "Index once, query many times, and own the staleness: FreeLlama stores no " +
+                    "vectors, and a stale index fails silently by returning confidently wrong " +
+                    "files. Also, if you know the keyword, grep beat embedding search here on " +
+                    "accuracy, latency and cost at the same time — reach for embeddings when " +
+                    "there is no keyword to search for.",
+                }
+              : {
+                  tag: best.tag,
+                  why:
+                    `Largest tag that fits the ~60% memory budget${memoryBytes ? ` of ${Math.round(memoryBytes / 1e9)}GB` : ""}. ` +
+                    "Bigger is better here — research accuracy collapses below ~12B.",
+                  configure:
+                    "Send an explicit num_ctx rather than inheriting Ollama's default, which is " +
+                    'VRAM-tiered and reaches 256K on a 48GB machine. Use keepAlive:"0" for one-off ' +
+                    "calls so it does not hold memory after.",
+                  caution:
+                    "Do not co-resident this with another large model — that has crashed this " +
+                    "machine. Check `models{view:\"resident\"}` first. Also note this repo measured a " +
+                    "GGUF build BEATING its -mlx counterpart for the same family, so do not assume " +
+                    "a suffix is better; benchmark the packaging, don't infer it from the name.",
+                }
             : null,
         });
       }
@@ -953,7 +1014,10 @@ server.registerTool(
       // trip when the option is actually used.
       if (minConfidence) {
         const preview = parsedResult(
-          await route(endpoint, task, objective, model, sessionId, contextTokens, requiredCapabilities),
+          // minConfidence is forwarded so the CORE gate refuses, with its actionable message naming
+        // the two commands that raise the grade. The belowConfidence() check below stays only as a
+        // fallback for servers older than the core gate.
+        await route(endpoint, task, objective, model, sessionId, contextTokens, requiredCapabilities, minConfidence),
         );
         if ("structuredContent" in preview) {
           const refusal = belowConfidence(preview.structuredContent, minConfidence);
@@ -975,6 +1039,7 @@ server.registerTool(
           input,
           tools,
           keepAlive,
+          minConfidence,
         ),
       );
       if (!returnEmbeddings && "structuredContent" in result) {
@@ -1057,8 +1122,8 @@ server.registerTool(
   {
     description:
       "DESTRUCTIVE AND IRREVERSIBLE. Permanently removes an installed model; only a re-download " +
-      "brings it back. This server advertises no tool annotations, so nothing else marks this as " +
-      "dangerous — treat this sentence as the guard. NEVER call it on a staleness heuristic " +
+      "brings it back. Also carries `destructiveHint: true` so a client can gate it without " +
+      "parsing this text. NEVER call it on a staleness heuristic " +
       "(\"unused N days\"): idle does not mean unneeded. ONLY call it after a human has named this " +
       "exact model for deletion in the current conversation",
     inputSchema: {
@@ -1067,10 +1132,10 @@ server.registerTool(
     },
     // Ollama answers DELETE /api/delete with an empty body, so there is nothing to echo — the
     // useful structured answer is which model this call removed.
-    // The only tool in this server that sets `destructiveHint`. Machine-readable on purpose:
-    // the prose warning below can't be acted on by a client deciding whether to prompt a human.
-    // Only deviations from the spec defaults are declared; restating a default says nothing.
-    // matches the spec default, stated anyway: the one tool where silence is the wrong kind of terse
+    // The only tool here that sets `destructiveHint` to TRUE (four others set it false).
+    // Machine-readable on purpose: the prose warning above can't be acted on by a client deciding
+    // whether to prompt a human. `destructiveHint: true` is the spec default and is restated
+    // anyway — this is the one tool where silence is the wrong kind of terse.
     annotations: { destructiveHint: true, idempotentHint: true },
   },
   async ({ model, ollamaEndpoint }) => {
@@ -1250,7 +1315,9 @@ server.registerTool(
       "(accept/verify/escalate) computed from what the run did AND which model ran — not the " +
       "model's self-report. `escalate` = it read no files at all (recall, not research) OR the " +
       "model is measured too weak to trust here. Best shape: " +
-      "1-5 files, lookup not judgment. ~98% token reduction. Can fail outright; check isError and " +
+      "1-5 files, lookup not judgment. ~98% token reduction. Read `structuredContent` rather than " +
+      "the prose: `verification` gives recommendation + why, and `citations` gives the full " +
+      "unclipped commands and paths behind the answer. Can fail outright; check isError and " +
       "retry once before concluding it's unanswerable",
     inputSchema: {
       question: z
@@ -1354,22 +1421,7 @@ server.registerTool(
       } finally {
         liveDelegates.delete(running.child);
       }
-      let raw: string;
-      try {
-        raw = await readFile(resultFile, "utf8");
-      } catch {
-        // No result file at all: a hard kill (the SIGKILL timeout above) or a crash before the
-        // adapter could write. Here the exec error genuinely is the best account available.
-        return errorResult(
-          adapterError ??
-            new Error(
-              "research adapter exited without writing a result file — it was killed before it " +
-                `could report. Check that the model is loadable and that ${DEFAULT_DELEGATE_TIMEOUT_SECONDS}s ` +
-                "is enough for this question.",
-            ),
-        );
-      }
-      const result = JSON.parse(raw) as {
+      type AdapterResult = {
         final_answer: string;
         tool_calls: Array<{
           raw_name?: string;
@@ -1378,6 +1430,25 @@ server.registerTool(
         }>;
         usage: { input_tokens: number | null; output_tokens: number | null };
       };
+      let result: AdapterResult;
+      try {
+        // Read AND parse under one guard. A SIGKILL at the timeout can land mid-write, leaving a
+        // truncated result.json — reading it succeeds and only the parse fails, so guarding the
+        // read alone reported "Unexpected end of JSON input" and threw away the timeout diagnosis
+        // that actually explains the run.
+        result = JSON.parse(await readFile(resultFile, "utf8")) as AdapterResult;
+      } catch {
+        // No usable result file: a hard kill (the SIGKILL timeout above) or a crash before the
+        // adapter could finish writing. Here the exec error genuinely is the best account.
+        return errorResult(
+          adapterError ??
+            new Error(
+              "research adapter exited without writing a readable result file — it was killed " +
+                `before it could report. Check that the model is loadable and that ${DEFAULT_DELEGATE_TIMEOUT_SECONDS}s ` +
+                "is enough for this question.",
+            ),
+        );
+      }
       // Surface the evidence trail (which tool, which path) so the orchestrator can spot-check
       // *how* the answer was reached without re-deriving it — verifier independence in practice,
       // not just in principle. A citable but unread-through answer is exactly the failure mode
@@ -1401,14 +1472,26 @@ server.registerTool(
       });
       const succeeded = evidence.filter((step) => step.status === "ok");
       const failed = evidence.length - succeeded.length;
+      // `evidence[].detail` above is the FULL command, deliberately unclipped: the structured half
+      // exists to be audited, and a command cut mid-flag cannot be. Only the prose line below is
+      // clipped, and it says how much it dropped.
       const evidenceText = evidence
         .map(
           (step) =>
             `  ${step.step}. ${step.tool}${step.status === "ok" ? "" : ` [${step.status}]`}` +
             `${step.path ? ` -> ${step.path}` : ""}` +
-            `${step.detail ? `: ${step.detail.slice(0, 120)}` : ""}`,
+            `${step.detail ? `: ${clipText(step.detail, 400)}` : ""}`,
         )
         .join("\n");
+      // The compact machine-readable half. Two independent small-model callers asked for exactly
+      // this shape — recommendation, why, citations — rather than parsing it back out of the prose.
+      // Successful steps only: a failed command is not a citation for anything.
+      const citations = succeeded.map((step) => ({
+        step: step.step,
+        tool: step.tool,
+        path: step.path,
+        command: step.detail,
+      }));
       if (adapterError) {
         return errorResult(
           new Error(
@@ -1441,6 +1524,9 @@ server.registerTool(
           adapter: chosenAdapter,
           verification,
           answer: result.final_answer,
+          // recommendation + why live under `verification`; `citations` completes the triple so a
+          // caller never has to read `summary` to act on the result.
+          citations,
           toolCallCount: result.tool_calls.length,
           successfulToolCallCount: succeeded.length,
           usage: {

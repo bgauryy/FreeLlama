@@ -11,7 +11,9 @@ for each condition.
 This is a new, self-contained benchmark. It reuses the scoring/aggregation engine already in this
 repo (`benchmark/harness/scripts/{run.py,run_matrix.py,aggregate.py,render_html.py}`) but adds:
 
-- two new agent adapters (`scripts/octocode_agent.py`, `scripts/bash_agent.py`)
+- two new agent adapters (`scripts/octocode_agent.py`, `scripts/bash_agent.py`), sharing
+  `scripts/agent_context.py` for context budgeting, output clipping and JSON-repair — contracts in
+  `scripts/test_agent_context.py` (`python3 scripts/test_agent_context.py`)
 - one new 30-question task suite spanning 3 repos (`tasks/octocode-vs-bash-30.json`)
 - one new matrix pairing both adapters against the same model (`tasks/octocode-vs-bash-matrix.json`)
 - its own pinned clones of the three target repos, cloned by the **runner**, never by the agents
@@ -43,6 +45,8 @@ benchmark/local/
 ├── scripts/
 │   ├── prepare_repo.sh             <- RUNNER-only: clones/pins all 3 repos into .context/
 │   ├── restart_ollama.sh           <- restarts the local Ollama server
+│   ├── agent_context.py            <- shared: context budget, head+tail clipping, repeat + JSON repair
+│   ├── test_agent_context.py       <- contracts for the above (no model needed)
 │   ├── octocode_agent.py           <- Agent A adapter (Ollama + octocode CLI)
 │   ├── bash_agent.py               <- Agent B adapter (Ollama + raw shell only)
 │   └── run_all.sh                  <- runs everything for one model: matrix -> aggregate -> render
@@ -88,3 +92,23 @@ lives, so past runs stay discoverable even after you've moved on to testing a di
 
 See `docs/01-flow.md` for what each step actually does, and `docs/05-grading-and-judge.md` for how
 the (non-local, post-hoc) LLM judge pass works.
+
+## Adapter loop behaviour these numbers depend on
+
+Both adapters share `scripts/agent_context.py`. Three of its behaviours change results materially,
+so a run recorded before they existed is not comparable to one after:
+
+- **Context budgeting.** At `num_ctx=8192` a 10-turn conversation overflows the window, and Ollama
+  truncates silently *from the front* — dropping the system prompt, after which the agent stops
+  emitting JSON. Runs recorded before this was fixed understate the model.
+- **Head+tail clipping.** Observations used to be tail-sliced (`observation[-3000:]`), discarding the
+  start of every directory listing, grep result and file read.
+- **JSON repair.** A single unparseable turn used to abort the whole run and discard every tool
+  result already gathered. It is now corrected in place, bounded at two repairs.
+
+The adapter prompts also scope searches away from `node_modules`/`target`/`.venv` and treat
+`fixtures/` and `mocks/` as scaffolding. Because those prompts were tuned against this repo and the
+`.context/` corpora, adapter changes must be graded on [`benchmark/holdout/`](../holdout/README.md)
+instead — fresh upstream repos the prompts were never fitted to.
+
+See `AGENTS.md` for the full description of each.

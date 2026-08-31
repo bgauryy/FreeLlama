@@ -974,3 +974,574 @@ async fn managed_task_preserves_a_non_json_upstream_error() {
     );
     mock_task.abort();
 }
+
+/// An upstream that records the maximum number of requests in flight simultaneously.
+/// (requests currently in flight, high-water mark).
+type InFlight = Arc<(AtomicUsize, AtomicUsize)>;
+
+fn concurrency_probe() -> (Router<InFlight>, InFlight) {
+    let counters = Arc::new((AtomicUsize::new(0), AtomicUsize::new(0))); // (in_flight, peak)
+    // The model must report as RESIDENT: only then does the managed path take the shared permit.
+    // A non-resident model takes the exclusive transition permit and serializes by design, which
+    // would make this test measure the wrong mechanism.
+    let router = Router::new()
+        .route(
+            "/api/tags",
+            get(|| async {
+                Json(json!({"models": [{"name": "embed-model", "size": 274_000_000}]}))
+            }),
+        )
+        .route(
+            "/api/ps",
+            get(|| async {
+                Json(json!({"models": [{"name": "embed-model", "size_vram": 274_000_000}]}))
+            }),
+        )
+        .route(
+            "/api/show",
+            post(|| async {
+                Json(json!({
+                    "capabilities": ["embedding"],
+                    "model_info": {"test.context_length": 2048}
+                }))
+            }),
+        )
+        .route(
+            "/api/embed",
+            post(|State(c): State<InFlight>| async move {
+                let now = c.0.fetch_add(1, Ordering::SeqCst) + 1;
+                c.1.fetch_max(now, Ordering::SeqCst);
+                // Long enough that genuinely-concurrent requests overlap.
+                tokio::time::sleep(Duration::from_millis(120)).await;
+                c.0.fetch_sub(1, Ordering::SeqCst);
+                Json(json!({"embeddings": [[0.1]]}))
+            }),
+        );
+    (router, counters)
+}
+
+/// The managed path grants resident tasks a SHARED admission permit, so without a slot bound any
+/// number of them reach Ollama together. Ollama then queues them (`OLLAMA_MAX_QUEUE`, 512) and
+/// 503s the overflow, while each queued request burns its own 900s budget waiting. The semaphore
+/// converts that burst into bounded, FIFO backpressure.
+#[tokio::test]
+async fn managed_tasks_never_exceed_the_configured_concurrency() {
+    let (mock, counters) = concurrency_probe();
+    let mock = mock.with_state(counters.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("http://{}", listener.local_addr().unwrap());
+    let mock_task = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    let platform =
+        app(
+            &PlatformConfig::new("127.0.0.1:11435", upstream, None, None, "qwen2.5:0.5b")
+                .with_max_concurrent_tasks(2),
+        )
+        .unwrap();
+
+    // Fire eight at once against a two-slot limit.
+    let mut joins = Vec::new();
+    for _ in 0..8 {
+        let p = platform.clone();
+        joins.push(tokio::spawn(async move {
+            p.oneshot(embedding_task_request()).await.unwrap().status()
+        }));
+    }
+    for j in joins {
+        assert_eq!(j.await.unwrap(), StatusCode::OK);
+    }
+
+    let peak = counters.1.load(Ordering::SeqCst);
+    assert!(
+        peak <= 2,
+        "embeddings cost 1 unit each, so a 2-unit budget admits at most 2; saw {peak} in flight"
+    );
+    assert!(
+        peak >= 2,
+        "the budget should be usable, not serialize to 1 (saw {peak})"
+    );
+    mock_task.abort();
+}
+
+/// Throttling that is invisible is indistinguishable from a slow model. The caller has to be able
+/// to attribute the latency, so the wait and the slot budget are reported on every response.
+#[tokio::test]
+async fn managed_tasks_report_their_queue_wait_and_slot_budget() {
+    let mock = discovery_routes::<()>()
+        .route(
+            "/api/embed",
+            post(|| async { Json(json!({"embeddings": [[0.1]]})) }),
+        )
+        .with_state(());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("http://{}", listener.local_addr().unwrap());
+    let mock_task = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    let platform = app(&PlatformConfig::new(
+        "127.0.0.1:11435",
+        upstream,
+        None,
+        None,
+        "qwen2.5:0.5b",
+    ))
+    .unwrap();
+
+    let response = platform.oneshot(embedding_task_request()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let admission = &body["admission"];
+    assert!(admission["queue_wait_ms"].is_number(), "got {admission}");
+    assert!(
+        admission["slots_total"].as_u64().is_some_and(|n| n > 0),
+        "slot budget must be reported, got {admission}"
+    );
+    mock_task.abort();
+}
+
+/// Cost weighting is the point of the admission budget: a 274MB embedding and an 18GB vision
+/// generation are not interchangeable. Charging both a flat 1 would let four vision calls in where
+/// four embeddings belong. Vision costs 4 units, so a 4-unit budget must serialize them to one at a
+/// time while admitting four embeddings together.
+#[tokio::test]
+async fn vision_tasks_cost_more_admission_than_embeddings() {
+    let counters: InFlight = Arc::new((AtomicUsize::new(0), AtomicUsize::new(0)));
+    let mock = Router::new()
+        .route(
+            "/api/tags",
+            get(|| async {
+                Json(json!({"models": [{"name": "seer", "size": 18_000_000_000_u64}]}))
+            }),
+        )
+        .route(
+            "/api/ps",
+            get(|| async {
+                Json(json!({"models": [{"name": "seer", "size_vram": 18_000_000_000_u64}]}))
+            }),
+        )
+        .route(
+            "/api/show",
+            post(|| async {
+                Json(json!({
+                    "capabilities": ["completion", "vision"],
+                    "model_info": {"test.context_length": 4096}
+                }))
+            }),
+        )
+        .route(
+            "/api/chat",
+            post(|State(c): State<InFlight>| async move {
+                let now = c.0.fetch_add(1, Ordering::SeqCst) + 1;
+                c.1.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(120)).await;
+                c.0.fetch_sub(1, Ordering::SeqCst);
+                Json(json!({"message": {"role": "assistant", "content": "seen"}}))
+            }),
+        )
+        .with_state(counters.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("http://{}", listener.local_addr().unwrap());
+    let mock_task = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    let platform =
+        app(
+            &PlatformConfig::new("127.0.0.1:11435", upstream, None, None, "qwen2.5:0.5b")
+                .with_max_concurrent_tasks(4),
+        )
+        .unwrap();
+
+    let mut joins = Vec::new();
+    for _ in 0..4 {
+        let p = platform.clone();
+        joins.push(tokio::spawn(async move {
+            p.oneshot(
+                Request::post("/_freellama/v1/tasks")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"task":"vision","model":"seer","prompt":"describe","images":["aGk="]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+        }));
+    }
+    for j in joins {
+        assert_eq!(j.await.unwrap(), StatusCode::OK);
+    }
+
+    assert_eq!(
+        counters.1.load(Ordering::SeqCst),
+        1,
+        "vision costs the whole 4-unit budget, so the four calls must serialize"
+    );
+    mock_task.abort();
+}
+
+/// Saturation must refuse, not wait forever. Ollama's own scheduler does a non-blocking send onto
+/// its pending channel and returns `ErrMaxQueue` ("server busy, please try again") the instant it
+/// is full; an unbounded wait here would turn that honest signal into an invisible pile-up whose
+/// only symptom is latency the caller cannot attribute.
+#[tokio::test]
+async fn a_saturated_admission_queue_refuses_instead_of_waiting_forever() {
+    let mock = discovery_routes::<()>()
+        .route(
+            "/api/embed",
+            post(|| async {
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                Json(json!({"embeddings": [[0.1]]}))
+            }),
+        )
+        .with_state(());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("http://{}", listener.local_addr().unwrap());
+    let mock_task = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    let platform =
+        app(
+            &PlatformConfig::new("127.0.0.1:11435", upstream, None, None, "qwen2.5:0.5b")
+                .with_max_concurrent_tasks(1)
+                .with_max_queue_wait(Duration::from_millis(50)),
+        )
+        .unwrap();
+
+    // One task holds the single slot for 400ms; the second cannot get in within 50ms.
+    let holder = {
+        let p = platform.clone();
+        tokio::spawn(async move { p.oneshot(embedding_task_request()).await.unwrap().status() })
+    };
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let refused = platform.oneshot(embedding_task_request()).await.unwrap();
+
+    assert_eq!(
+        refused.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a saturated queue must refuse fast, matching Ollama's ErrMaxQueue contract"
+    );
+    let body: Value =
+        serde_json::from_slice(&to_bytes(refused.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let message = body["error"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("server busy") && message.contains("cost"),
+        "the refusal should name the cost and budget so it is actionable, got {message:?}"
+    );
+    assert_eq!(
+        holder.await.unwrap(),
+        StatusCode::OK,
+        "the holder still completes"
+    );
+    mock_task.abort();
+}
+
+/// The confidence gate must live in the core, not in one consumer.
+///
+/// It was implemented only in the TypeScript MCP wrapper, so `freellama route`, the HTTP API and
+/// anyone embedding `freellama-core` as a library got a router with no fail-closed protection —
+/// while the README described `minConfidence` as a property of the platform. Enforcing it inside
+/// `select_route` makes every caller inherit it.
+#[test]
+fn min_confidence_is_enforced_by_the_router_itself() {
+    let models = vec![candidate(
+        "qwen3.8:27b-mlx",
+        18_000_000_000,
+        &[Capability::Completion, Capability::Tools],
+        false,
+    )];
+    let input = RouteInput {
+        task: TaskKind::CodeRepair,
+        objective: Objective::Fastest,
+        min_confidence: Some("medium".to_owned()),
+        ..RouteInput::default()
+    };
+
+    let refused = select_route(&input, &models, &SessionAffinity::default());
+    let error = refused.expect_err("a low-confidence route must be refused, not returned");
+    let text = error.to_string();
+    assert!(text.contains("route refused"), "got {text}");
+    assert!(
+        text.contains("evidence:"),
+        "the refusal must name the evidence behind the grade, got {text}"
+    );
+    assert!(
+        text.contains("qwen3.8:27b-mlx"),
+        "the refusal must name the model it would have picked, got {text}"
+    );
+    assert!(
+        text.contains("bench-all") && text.contains("policy-from-eval"),
+        "the refusal must name both inputs that raise the grade, got {text}"
+    );
+}
+
+/// Without the gate the same route succeeds — proving the refusal is caused by `min_confidence`
+/// and not by the candidate being ineligible for some other reason.
+#[test]
+fn the_same_route_succeeds_when_no_minimum_is_requested() {
+    let models = vec![candidate(
+        "qwen3.8:27b-mlx",
+        18_000_000_000,
+        &[Capability::Completion, Capability::Tools],
+        false,
+    )];
+    let input = RouteInput {
+        task: TaskKind::CodeRepair,
+        objective: Objective::Fastest,
+        ..RouteInput::default()
+    };
+
+    let decision = select_route(&input, &models, &SessionAffinity::default()).unwrap();
+    assert_eq!(decision.selected_model, "qwen3.8:27b-mlx");
+    assert_eq!(decision.confidence, "low");
+}
+
+/// An unrecognised *minimum* must fail closed, not open.
+///
+/// Ranking an unknown string lowest silently disables the gate: `min_confidence: "high"` — the
+/// most natural typo, since "high" is the grade this router does not issue — would have accepted
+/// every "low" route while looking exactly like a satisfied floor. The CLI takes this value as a
+/// free-form string, so nothing else validates it.
+#[test]
+fn an_unknown_confidence_grade_fails_closed() {
+    let models = vec![candidate(
+        "qwen3.8:27b-mlx",
+        18_000_000_000,
+        &[Capability::Completion, Capability::Tools],
+        false,
+    )];
+    let input = RouteInput {
+        task: TaskKind::CodeRepair,
+        objective: Objective::Fastest,
+        min_confidence: Some("high".to_owned()),
+        ..RouteInput::default()
+    };
+    let error = select_route(&input, &models, &SessionAffinity::default())
+        .expect_err("an unknown minimum must refuse, never silently accept everything");
+    let text = error.to_string();
+    assert!(
+        text.contains("unknown min_confidence") && text.contains("high"),
+        "the refusal must name the unusable value, got {text}"
+    );
+}
+
+/// The grades the router does issue are still accepted as minimums.
+#[test]
+fn a_low_minimum_accepts_a_low_route() {
+    let models = vec![candidate(
+        "qwen3.8:27b-mlx",
+        18_000_000_000,
+        &[Capability::Completion, Capability::Tools],
+        false,
+    )];
+    let input = RouteInput {
+        task: TaskKind::CodeRepair,
+        objective: Objective::Fastest,
+        min_confidence: Some("low".to_owned()),
+        ..RouteInput::default()
+    };
+    let decision = select_route(&input, &models, &SessionAffinity::default()).unwrap();
+    assert_eq!(decision.confidence, "low");
+}
+
+/// A task refused for lack of an admission slot must not have mutated session affinity.
+///
+/// Binding at routing time meant a 503'd request had already pinned the session to a model: the
+/// caller saw a refusal and reasonably concluded nothing happened, while every later request in
+/// that session had silently been redirected. State changes belong after the last thing that can
+/// refuse.
+#[tokio::test]
+async fn a_refused_task_does_not_bind_session_affinity() {
+    let mock = discovery_routes::<()>()
+        .route(
+            "/api/embed",
+            post(|| async {
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                Json(json!({"embeddings": [[0.1]]}))
+            }),
+        )
+        .with_state(());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("http://{}", listener.local_addr().unwrap());
+    let mock_task = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    let platform =
+        app(
+            &PlatformConfig::new("127.0.0.1:11435", upstream, None, None, "qwen2.5:0.5b")
+                .with_max_concurrent_tasks(1)
+                .with_max_queue_wait(Duration::from_millis(50)),
+        )
+        .unwrap();
+
+    // Open a real session.
+    let created = platform
+        .clone()
+        .oneshot(
+            Request::post("/_freellama/v1/sessions")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let created: Value =
+        serde_json::from_slice(&to_bytes(created.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let session = created["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+
+    let bound_task = |session: String| {
+        Request::post("/_freellama/v1/tasks")
+            .header("content-type", "application/json")
+            .body(Body::from(format!(
+                r#"{{"task":"embedding","objective":"fastest","model":"embed-model","input":"x","session_id":"{session}"}}"#
+            )))
+            .unwrap()
+    };
+
+    // Saturate the single slot, then let a second request be refused.
+    let holder = {
+        let p = platform.clone();
+        let s = session.clone();
+        tokio::spawn(async move { p.oneshot(bound_task(s)).await.unwrap().status() })
+    };
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    // A DIFFERENT model, so a stray bind would be visible.
+    let refused = platform
+        .clone()
+        .oneshot(
+            Request::post("/_freellama/v1/tasks")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"task":"embedding","objective":"fastest","model":"embed-model","input":"y","session_id":"{session}"}}"#
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(holder.await.unwrap(), StatusCode::OK);
+    mock_task.abort();
+}
+
+/// `confidence` must be derivable from the dimensions, not a standalone opaque grade.
+///
+/// A single word invites being read as a calibrated probability. It is not one: `medium` means "a
+/// policy vouched for this model on this task" AND "a functional benchmark exists" — two different
+/// claims about two different kinds of evidence. Reporting them separately is what makes the router
+/// inspectable, and lets a caller disagree with the collapse rather than only with the verdict.
+#[test]
+fn routing_reports_its_evidence_dimensions_separately() {
+    let models = vec![candidate(
+        "qwen3.8:27b-mlx",
+        18_000_000_000,
+        &[Capability::Completion, Capability::Tools],
+        false,
+    )];
+    let decision = select_route(
+        &RouteInput {
+            task: TaskKind::CodeRepair,
+            objective: Objective::Fastest,
+            ..RouteInput::default()
+        },
+        &models,
+        &SessionAffinity::default(),
+    )
+    .unwrap();
+
+    // Every dimension is reported, and none is silently absent.
+    for (name, value) in [
+        ("quality_evidence", &decision.quality_evidence),
+        ("task_evidence", &decision.task_evidence),
+        ("hardware_fit", &decision.hardware_fit),
+    ] {
+        assert!(!value.is_empty(), "{name} must be reported, got empty");
+    }
+    // `medium` requires BOTH quality and task evidence; anything less must not claim it.
+    if decision.confidence == "medium" {
+        assert_eq!(decision.quality_evidence, "strong");
+        assert_eq!(decision.task_evidence, "strong");
+    } else {
+        assert!(
+            decision.quality_evidence != "strong" || decision.task_evidence != "strong",
+            "confidence should have been medium given both dimensions strong"
+        );
+    }
+}
+
+/// A losing candidate must come back with a reason. Naming only the winner makes the comparison
+/// unauditable — a caller cannot tell a considered rejection from a model that was never seen.
+#[test]
+fn rejected_candidates_are_reported_with_a_reason() {
+    let models = vec![
+        candidate(
+            "big",
+            18_000_000_000,
+            &[Capability::Completion, Capability::Tools],
+            true,
+        ),
+        candidate(
+            "small",
+            900_000_000,
+            &[Capability::Completion, Capability::Tools],
+            false,
+        ),
+    ];
+    let decision = select_route(
+        &RouteInput {
+            task: TaskKind::CodeRepair,
+            objective: Objective::Fastest,
+            ..RouteInput::default()
+        },
+        &models,
+        &SessionAffinity::default(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        decision.rejected.len(),
+        1,
+        "one candidate lost, it must be listed"
+    );
+    let loser = &decision.rejected[0];
+    assert_ne!(loser["model"].as_str().unwrap(), decision.selected_model);
+    assert!(
+        loser["reason"].as_str().is_some_and(|r| !r.is_empty()),
+        "a rejection without a reason is not inspectable, got {loser}"
+    );
+}
+
+/// `/health` must carry the load-shedding signal. An agent deciding "delegate, queue, or do it
+/// myself" needs a cheap read-only answer to "will a task be admitted right now?" — without it the
+/// only way to find out is to submit and possibly eat the full queue wait or a 503.
+#[tokio::test]
+async fn health_reports_admission_capacity() {
+    let mock = discovery_routes::<()>().with_state(());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("http://{}", listener.local_addr().unwrap());
+    let mock_task = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    let platform =
+        app(
+            &PlatformConfig::new("127.0.0.1:11435", upstream, None, None, "qwen2.5:0.5b")
+                .with_max_concurrent_tasks(5),
+        )
+        .unwrap();
+
+    let response = platform
+        .oneshot(
+            Request::get("/_freellama/v1/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["admission"]["slots_total"], 5);
+    assert_eq!(
+        body["admission"]["slots_available"], 5,
+        "idle server must report full capacity"
+    );
+    assert!(
+        body["admission"]["max_queue_wait_seconds"]
+            .as_u64()
+            .is_some()
+    );
+    assert_eq!(body["admission"]["costs"]["vision"], 4);
+    mock_task.abort();
+}

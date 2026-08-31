@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use axum::{
     Json, Router,
     extract::State,
@@ -22,7 +22,7 @@ use clap::ValueEnum;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::sync::RwLock;
+use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 use uuid::Uuid;
 
 use crate::{
@@ -45,6 +45,12 @@ pub struct PlatformConfig {
     pub policy_file: Option<PathBuf>,
     pub recommendation_catalog: Option<PathBuf>,
     pub intent_model: String,
+    /// Concurrent managed tasks allowed against Ollama, in cost units. `None` falls back to
+    /// `FREELLAMA_MAX_CONCURRENT_TASKS`, then to 8.
+    pub max_concurrent_tasks: Option<usize>,
+    /// Longest a task may queue for an admission slot before being refused with 503. `None` falls
+    /// back to `FREELLAMA_MAX_QUEUE_WAIT_SECONDS`, then to 120s.
+    pub max_queue_wait: Option<Duration>,
 }
 
 impl PlatformConfig {
@@ -63,7 +69,46 @@ impl PlatformConfig {
             policy_file,
             recommendation_catalog: None,
             intent_model: intent_model.into(),
+            max_concurrent_tasks: None,
+            max_queue_wait: None,
         }
+    }
+
+    /// Cap how long a task may queue for admission before being refused.
+    ///
+    /// Exposed on the config, not env-only, so the refusal path can be tested without mutating
+    /// process environment — which Rust 2024 makes `unsafe`, and this crate denies `unsafe`.
+    #[must_use]
+    pub fn with_max_queue_wait(mut self, wait: Duration) -> Self {
+        self.max_queue_wait = Some(wait);
+        self
+    }
+
+    /// Bound how many managed tasks may be in flight against Ollama at once.
+    ///
+    /// Set it to match `OLLAMA_NUM_PARALLEL`. Ollama's own default is 1, so a higher number here
+    /// does not buy parallel decoding — it keeps the pipe full and bounds the burst. Exposed on the
+    /// config (not env-only) so a test or an embedding application can set it without mutating
+    /// process environment.
+    #[must_use]
+    pub fn with_max_concurrent_tasks(mut self, slots: usize) -> Self {
+        self.max_concurrent_tasks = Some(slots.max(1));
+        self
+    }
+
+    /// The admission budget this config will actually run with, after the
+    /// `FREELLAMA_MAX_CONCURRENT_TASKS` fallback and the semaphore's own ceiling.
+    ///
+    /// Public because the CLI prints the budget at startup: reading `max_concurrent_tasks`
+    /// directly there reported the hardcoded default whenever the env var was the thing setting
+    /// it, so the operator was told 8 while the server ran with something else.
+    #[must_use]
+    pub fn resolved_max_concurrent_tasks(&self) -> usize {
+        self.max_concurrent_tasks
+            .unwrap_or_else(max_concurrent_tasks)
+            // `Semaphore::new` panics above `MAX_PERMITS`, and this number can come from an env
+            // var — a startup panic is the wrong answer to a typo'd `FREELLAMA_MAX_CONCURRENT_TASKS`.
+            .clamp(1, Semaphore::MAX_PERMITS)
     }
 
     #[must_use]
@@ -129,6 +174,14 @@ pub struct RouteInput {
     pub session_id: Option<String>,
     pub required_capabilities: BTreeSet<Capability>,
     pub context_tokens: Option<u64>,
+    /// Refuse the route rather than return one graded below this.
+    ///
+    /// This gate used to live only in the TypeScript MCP wrapper, so the CLI, the HTTP API and
+    /// anyone embedding `freellama-core` as a library got a router with no fail-closed protection
+    /// at all — while the documentation described it as a property of the platform. It belongs
+    /// where the decision is made, not in one of three consumers.
+    #[serde(default)]
+    pub min_confidence: Option<String>,
 }
 
 impl Default for RouteInput {
@@ -136,6 +189,7 @@ impl Default for RouteInput {
         Self {
             task: TaskKind::Completion,
             objective: Objective::Balanced,
+            min_confidence: None,
             model: None,
             session_id: None,
             required_capabilities: BTreeSet::new(),
@@ -402,6 +456,13 @@ pub struct RouteDecision {
     pub session_id: Option<String>,
     pub confidence: String,
     pub evidence: String,
+    /// The dimensions `confidence` is derived from, reported separately so routing is inspectable
+    /// rather than a single word a caller may mistake for a calibrated probability.
+    pub quality_evidence: String,
+    pub task_evidence: String,
+    pub hardware_fit: String,
+    /// Every other eligible candidate and why it lost.
+    pub rejected: Vec<Value>,
     pub reasons: Vec<String>,
 }
 
@@ -529,7 +590,17 @@ pub fn select_route(
             "capability_only_fallback".to_owned()
         });
     }
-    let (confidence, evidence) = route_evidence(policy_qualified, has_benchmark);
+    // `fits` is knowable here only as "we did not exclude it for context"; the memory budget lives
+    // in the machine profile, so this dimension is honest about being weaker than the other two.
+    // Unknown when the model advertises no context window — reported as "unknown", never as a pass.
+    let fits = chosen
+        .advertised_context
+        .map(|window| requested_context(input) <= window);
+    let graded = route_evidence(policy_qualified, has_benchmark, fits);
+    enforce_min_confidence(input, graded.confidence, graded.evidence, &chosen.name)?;
+    // Why every other eligible candidate lost. Without this the router is a black box that names a
+    // winner; with it, a caller can see the comparison and disagree with it.
+    let rejected = rejected_candidates(&eligible, &chosen.name, input.task, capability);
     Ok(RouteDecision {
         selected_model: chosen.name.clone(),
         task: input.task,
@@ -542,18 +613,138 @@ pub fn select_route(
         strict_tool_validation,
         resident: chosen.resident,
         session_id: input.session_id.clone(),
-        confidence: confidence.to_owned(),
-        evidence: evidence.to_owned(),
+        confidence: graded.confidence.to_owned(),
+        evidence: graded.evidence.to_owned(),
+        quality_evidence: graded.quality_evidence.to_owned(),
+        task_evidence: graded.task_evidence.to_owned(),
+        hardware_fit: graded.hardware_fit.to_owned(),
+        rejected,
         reasons,
     })
 }
 
-fn route_evidence(policy_qualified: bool, has_benchmark: bool) -> (&'static str, &'static str) {
-    match (policy_qualified, has_benchmark) {
+/// Refuse a route graded below the caller's requested minimum.
+///
+/// Deliberately verbose: a refusal the caller cannot act on is just an error. It names the grade,
+/// the evidence behind it, the model that would have been chosen, and the two inputs that raise
+/// the grade.
+///
+/// # Errors
+///
+/// Returns an error when `min_confidence` is set and the graded confidence ranks below it.
+fn enforce_min_confidence(
+    input: &RouteInput,
+    confidence: &str,
+    evidence: &str,
+    would_select: &str,
+) -> Result<()> {
+    let Some(minimum) = input.min_confidence.as_deref() else {
+        return Ok(());
+    };
+    // An unrecognised *minimum* must not silently disable the gate. Ranking it lowest would make
+    // `min_confidence: "high"` — or any typo — accept every route, which is precisely the
+    // fail-open behaviour this function exists to prevent, and the caller would never see it
+    // because a passing gate is indistinguishable from no gate.
+    let Some(required) = confidence_rank(minimum) else {
+        bail!(
+            "unknown min_confidence \"{minimum}\": the router grades routes \"low\" or \"medium\" \
+             only — there is no \"high\". Refusing rather than ignoring the setting, because an \
+             ignored floor looks exactly like a satisfied one."
+        );
+    };
+    ensure!(
+        confidence_rank(confidence).unwrap_or(0) >= required,
+        "route refused: confidence is \"{confidence}\" (evidence: {evidence}), below the requested \
+         minimum \"{minimum}\". Would have selected \"{would_select}\". This is a fail-closed \
+         refusal, not a failure — the router cannot justify this pick. Lower `min_confidence`, or \
+         raise the evidence level with a policy file (`freellama policy-from-eval`) AND a \
+         benchmark report (`freellama bench-all`) — note that naming an explicit `model` does NOT \
+         raise the grade, because the grade measures the evidence, not who chose."
+    );
+    Ok(())
+}
+
+/// Ordering over confidence grades. `None` means the string is not a grade this router issues.
+fn confidence_rank(grade: &str) -> Option<u8> {
+    match grade {
+        "low" => Some(1),
+        "medium" => Some(2),
+        _ => None,
+    }
+}
+
+/// Why every eligible candidate other than the winner lost.
+///
+/// Naming only the winner makes the comparison unauditable: a caller cannot distinguish a
+/// considered rejection from a model the router never looked at.
+fn rejected_candidates(
+    eligible: &[&CatalogModel],
+    chosen: &str,
+    task: TaskKind,
+    capability: Capability,
+) -> Vec<Value> {
+    eligible
+        .iter()
+        .filter(|m| m.name != chosen)
+        .map(|m| {
+            json!({
+                "model": m.name,
+                "reason": if m.policy_rank.contains_key(&task) {
+                    "policy_qualified_but_ranked_lower"
+                } else if m.benchmark.contains_key(&capability) {
+                    "benchmarked_but_not_policy_qualified"
+                } else {
+                    "capability_metadata_only"
+                },
+                "resident": m.resident,
+            })
+        })
+        .collect()
+}
+
+/// The independent dimensions a route is graded on, reported separately.
+///
+/// `confidence: "medium"` on its own invites being read as a calibrated probability. It is not one:
+/// it means "a policy vouched for this model on this task" AND "a functional benchmark exists" —
+/// two different claims about two different kinds of evidence, collapsed into one word. Collapsing
+/// them is what makes routing uninspectable, so the dimensions are now first-class and `confidence`
+/// is *derived* from them rather than being the only thing reported.
+#[derive(Debug, Clone, Serialize)]
+pub struct RouteEvidence {
+    /// A policy file vouched for this model on this task.
+    pub quality_evidence: &'static str,
+    /// A functional benchmark measured this model on the ranking capability.
+    pub task_evidence: &'static str,
+    /// The model fits the machine's memory budget with room for its KV cache.
+    pub hardware_fit: &'static str,
+    /// Legacy single-word summary, derived from the three above. Kept so existing callers and the
+    /// `min_confidence` gate keep working.
+    pub confidence: &'static str,
+    /// The strongest evidence class behind the pick, for one-line logging.
+    pub evidence: &'static str,
+}
+
+fn route_evidence(
+    policy_qualified: bool,
+    has_benchmark: bool,
+    fits: Option<bool>,
+) -> RouteEvidence {
+    let (confidence, evidence) = match (policy_qualified, has_benchmark) {
         (true, true) => ("medium", "configured_task_policy"),
         (true, false) => ("low", "configured_task_policy"),
         (false, true) => ("low", "functional_throughput_screen"),
         (false, false) => ("low", "capability_metadata_only"),
+    };
+    RouteEvidence {
+        quality_evidence: if policy_qualified { "strong" } else { "none" },
+        task_evidence: if has_benchmark { "strong" } else { "none" },
+        hardware_fit: match fits {
+            Some(true) => "strong",
+            Some(false) => "insufficient_context",
+            None => "unknown",
+        },
+        confidence,
+        evidence,
     }
 }
 
@@ -688,6 +879,17 @@ struct PlatformState {
     catalog_cache: CatalogCache,
     intent_model: String,
     managed_execution: Arc<RwLock<()>>,
+    /// Bounds how many managed tasks may be in flight against Ollama at once.
+    ///
+    /// `managed_execution` alone does not do this: resident tasks take a *shared* permit, so any
+    /// number of them could be admitted together and pile into Ollama. Ollama then queues them
+    /// (`OLLAMA_MAX_QUEUE`, default 512) and rejects the overflow with HTTP 503 — and every queued
+    /// request spends its own 900s client budget waiting its turn, so a burst converts into
+    /// timeouts rather than backpressure. A semaphore turns that into a bounded, FIFO wait that the
+    /// caller can actually see.
+    task_slots: Arc<Semaphore>,
+    slots_total: usize,
+    queue_wait: Duration,
 }
 
 #[derive(Debug)]
@@ -728,6 +930,7 @@ pub fn app(config: &PlatformConfig) -> Result<Router> {
     let benchmark = load_benchmark(config.benchmark_report.as_ref())?;
     let policies = load_policies(config.policy_file.as_ref())?;
     let recommendation_catalog = load_catalog(config.recommendation_catalog.as_ref())?;
+    let slots_total = config.resolved_max_concurrent_tasks();
     let state = PlatformState {
         // A client-level backstop, not a nicety. `forward_managed_task` holds the
         // `managed_execution` write lock across its upstream call, so an untimed request against
@@ -747,6 +950,9 @@ pub fn app(config: &PlatformConfig) -> Result<Router> {
         catalog_cache: Arc::new(RwLock::new(None)),
         intent_model: config.intent_model.clone(),
         managed_execution: Arc::new(RwLock::new(())),
+        task_slots: Arc::new(Semaphore::new(slots_total)),
+        slots_total,
+        queue_wait: config.max_queue_wait.unwrap_or_else(max_queue_wait),
     };
     let platform = Router::new()
         .route(&format!("{API_ROOT}/health"), get(health))
@@ -784,8 +990,25 @@ pub async fn serve(config: PlatformConfig) -> Result<()> {
         .context("serve platform")
 }
 
-async fn health() -> Json<Value> {
-    Json(json!({"status": "ok", "version": env!("CARGO_PKG_VERSION")}))
+/// Liveness plus a load-shedding signal.
+///
+/// An orchestrating agent deciding "delegate, queue, or do it myself" needs a cheap read-only
+/// answer to "will a task be admitted right now?". Without it the only way to find out is to
+/// submit and possibly eat a 120s queue wait or a 503. `slots_available` is a snapshot — racy by
+/// nature, advisory by design — but 0 here means "expect to queue", which is exactly the decision
+/// input a caller needs. Standard readiness-endpoint practice, kept on `/health` rather than a new
+/// tool so the surface does not grow.
+async fn health(State(state): State<PlatformState>) -> Json<Value> {
+    Json(json!({
+        "status": "ok",
+        "version": env!("CARGO_PKG_VERSION"),
+        "admission": {
+            "slots_total": state.slots_total,
+            "slots_available": state.task_slots.available_permits(),
+            "max_queue_wait_seconds": state.queue_wait.as_secs(),
+            "costs": {"embedding": 1, "chat": 2, "vision": 4},
+        },
+    }))
 }
 
 async fn machine(State(state): State<PlatformState>) -> Json<MachineProfile> {
@@ -1004,6 +1227,42 @@ struct TaskInput {
     keep_alive: Option<String>,
 }
 
+/// Wait for an admission slot sized to the task, or refuse.
+///
+/// Returns the held permit, the cost charged, and how long the caller queued.
+async fn admit(
+    state: &PlatformState,
+    task: TaskKind,
+) -> Result<(OwnedSemaphorePermit, u32, u128), ApiError> {
+    let queued = Instant::now();
+    let budget = u32::try_from(state.slots_total).unwrap_or(u32::MAX).max(1);
+    let cost = task_cost(task).min(budget);
+    let wait = state.queue_wait;
+    let permit =
+        match tokio::time::timeout(wait, Arc::clone(&state.task_slots).acquire_many_owned(cost))
+            .await
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => {
+                return Err(ApiError {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    message: "task admission is shutting down".to_owned(),
+                });
+            }
+            Err(_) => {
+                return Err(ApiError {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    message: format!(
+                        "server busy: no admission slot within {}s (task cost {cost} of {budget} \
+                         units). Retry, or raise --max-concurrent-tasks.",
+                        wait.as_secs()
+                    ),
+                });
+            }
+        };
+    Ok((permit, cost, queued.elapsed().as_millis()))
+}
+
 async fn run_task(
     State(state): State<PlatformState>,
     Json(input): Json<TaskInput>,
@@ -1020,13 +1279,6 @@ async fn run_task(
     }
     let decision = select_route(&input.route, &models, &sessions).map_err(ApiError::bad_request)?;
     drop(sessions);
-    if let Some(id) = input.route.session_id.as_deref() {
-        state
-            .sessions
-            .write()
-            .await
-            .bind(id, &decision.selected_model);
-    }
 
     let keep_alive = input.keep_alive.unwrap_or_else(|| "5m".to_owned());
     let (path, body) = if matches!(input.route.task, TaskKind::Embedding) {
@@ -1071,9 +1323,37 @@ async fn run_task(
         }
         ("/api/chat", body)
     };
+    // Slot first, THEN the transition lock — in both branches. The order matters: if the
+    // non-resident path took the write lock before its slot while resident tasks held slots and
+    // waited on the read lock, the two would deadlock. One consistent order removes that entirely.
+    let (slot, cost, queue_wait_ms) = admit(&state, decision.task).await?;
+
+    // Bind session affinity only AFTER admission succeeds. Binding at routing time meant a task
+    // refused for lack of an admission slot had already pinned the session to a model: the caller
+    // saw a 503 and reasonably concluded nothing happened, while every later request in that
+    // session had silently been redirected. State changes belong after the last thing that can
+    // refuse, not before it.
+    if let Some(id) = input.route.session_id.as_deref() {
+        state
+            .sessions
+            .write()
+            .await
+            .bind(id, &decision.selected_model);
+    }
+
     if decision.resident {
         let _permit = state.managed_execution.read().await;
-        forward_managed_task(&state, decision, path, body, "resident_shared").await
+        forward_managed_task(
+            &state,
+            decision,
+            path,
+            body,
+            "resident_shared",
+            slot,
+            queue_wait_ms,
+            cost,
+        )
+        .await
     } else {
         let _permit = state.managed_execution.write().await;
         forward_managed_task(
@@ -1082,6 +1362,9 @@ async fn run_task(
             path,
             body,
             "nonresident_transition_exclusive",
+            slot,
+            queue_wait_ms,
+            cost,
         )
         .await
     }
@@ -1126,7 +1409,14 @@ async fn post_json_with_retries(
                 );
                 return Ok((status, value));
             }
-            Err(error) if more_attempts => {
+            // A timeout is NOT a transient hiccup here. This client's per-attempt budget is
+            // `platform_task_timeout()` (900s by default), and the caller holds both an admission
+            // slot and — on the non-resident path — the exclusive `managed_execution` write lock
+            // across every attempt. Retrying a timeout would therefore hold the whole managed
+            // plane for up to 3 x 900s, which is exactly the "one hung request deadlocks every
+            // subsequent managed task" failure the client timeout was added to prevent. Connection
+            // errors are still retried: those fail fast and cost nothing to re-pay.
+            Err(error) if more_attempts && !error.is_timeout() => {
                 eprintln!("managed task retry attempt={attempt} error={error:#} path={path}");
                 tokio::time::sleep(proxy::retry_delay(attempt)).await;
             }
@@ -1135,12 +1425,18 @@ async fn post_json_with_retries(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn forward_managed_task(
     state: &PlatformState,
     decision: RouteDecision,
     path: &str,
     body: Value,
     admission_mode: &str,
+    // Held for the duration of the upstream call, then dropped. Taking it by value rather than by
+    // reference makes the lifetime the compiler's problem instead of a comment's.
+    slot: OwnedSemaphorePermit,
+    queue_wait_ms: u128,
+    cost: u32,
 ) -> Result<Json<Value>, ApiError> {
     let (status, value) = post_json_with_retries(state, path, &body).await?;
     if !status.is_success() {
@@ -1150,9 +1446,20 @@ async fn forward_managed_task(
         });
     }
     let metrics = runtime_metrics(&value);
+    let slots_total = state.slots_total;
+    // Report throttling rather than hiding it. A caller that fans out embeddings needs to know it
+    // is queueing here — otherwise the only symptom is latency it cannot attribute.
+    let slots_available = state.task_slots.available_permits();
+    drop(slot);
     Ok(Json(json!({
         "route": decision,
-        "admission": {"mode": admission_mode},
+        "admission": {
+            "mode": admission_mode,
+            "queue_wait_ms": queue_wait_ms,
+            "slots_total": slots_total,
+            "slots_available_during_call": slots_available,
+            "cost": cost,
+        },
         "metrics": metrics,
         "response": value
     })))
@@ -1311,25 +1618,71 @@ async fn refresh_residency(
 /// Upper bound on a managed generation forwarded to Ollama. Overridable via
 /// `FREELLAMA_TASK_TIMEOUT_SECONDS` — the same name the CLI and the NAPI layer read, so one
 /// setting covers every path that can make a model generate.
-fn platform_task_timeout() -> Duration {
+/// Admission cost of a task, in slot units.
+///
+/// A flat per-request count is the wrong unit for local inference: a 274MB embedding and an 18GB
+/// vision generation are not interchangeable, and counting them the same lets four vision calls in
+/// where four embeddings belong. `FreeLlama` can weight them because it is the only layer that knows
+/// what the task *is* — Ollama receives an opaque HTTP request and can only see memory after it has
+/// already committed to loading something.
+///
+/// Deliberately coarse. These are relative costs, not a memory model; Ollama owns the real
+/// memory-fit decision (`server/sched.go` evicts when a load is predicted to exceed 80% of free
+/// memory) and duplicating that here would mean maintaining a worse copy of it.
+fn task_cost(task: TaskKind) -> u32 {
+    match task {
+        // No sampling, tiny models, milliseconds. Batch freely.
+        TaskKind::Embedding => 1,
+        // Full generation, and on this machine the vision model is the 18GB one.
+        TaskKind::Vision => 4,
+        _ => 2,
+    }
+}
+
+/// Longest a task may wait for an admission slot before being refused.
+///
+/// Ollama does not block when saturated: `getRunner` does a non-blocking send onto its pending
+/// channel and returns `ErrMaxQueue` ("server busy, please try again") the instant it is full.
+/// An unbounded wait here would convert that honest, actionable signal into an invisible pile-up,
+/// where the only symptom is latency the caller cannot attribute. Match the upstream contract.
+fn max_queue_wait() -> Duration {
     Duration::from_secs(
-        std::env::var("FREELLAMA_TASK_TIMEOUT_SECONDS")
+        std::env::var("FREELLAMA_MAX_QUEUE_WAIT_SECONDS")
             .ok()
             .and_then(|raw| raw.parse::<u64>().ok())
             .filter(|value| *value > 0)
-            .unwrap_or(900),
+            .unwrap_or(120),
+    )
+}
+
+/// Total admission budget in slot units. Default 8 — enough for two concurrent generations or
+/// eight embeddings.
+///
+/// Set this to match your `OLLAMA_NUM_PARALLEL`. Ollama's own default is **1**, so extra
+/// concurrency here does not buy parallel decoding — it only keeps the pipe full and bounds the
+/// burst. Raising `OLLAMA_NUM_PARALLEL` multiplies KV-cache memory by the context length, so raise
+/// both together and check `models{view:"resident"}` after.
+fn max_concurrent_tasks() -> usize {
+    std::env::var("FREELLAMA_MAX_CONCURRENT_TASKS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(8)
+}
+
+fn platform_task_timeout() -> Duration {
+    crate::timeout_from_env(
+        "FREELLAMA_TASK_TIMEOUT_SECONDS",
+        crate::DEFAULT_TASK_TIMEOUT_SECS,
     )
 }
 
 /// Discovery calls (`/api/tags`, `/api/ps`, `/api/show`) read small in-memory state and must never
 /// inherit the generation-sized budget above.
 fn platform_control_timeout() -> Duration {
-    Duration::from_secs(
-        std::env::var("FREELLAMA_CONTROL_TIMEOUT_SECONDS")
-            .ok()
-            .and_then(|raw| raw.parse::<u64>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(30),
+    crate::timeout_from_env(
+        "FREELLAMA_CONTROL_TIMEOUT_SECONDS",
+        crate::DEFAULT_CONTROL_TIMEOUT_SECS,
     )
 }
 

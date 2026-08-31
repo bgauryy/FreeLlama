@@ -18,13 +18,21 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from agent_context import REPEAT_NOTICE, call_signature, clip, fit_to_context
+from agent_context import (
+    MAX_PARSE_REPAIRS,
+    PARSE_REPAIR_NOTICE,
+    REPEAT_NOTICE,
+    ObservationStore,
+    call_signature,
+    fit_to_context,
+    paginate,
+    page_footer,
+)
 
-# Both limits used to be tail-only slices (`observation[-3000:]`), which kept the end of a command's
-# output and discarded the beginning — the wrong half for `ls`, `grep -n`, or `head`. `clip` keeps
-# both ends; see agent_context.py.
-RESULT_CLIP_CHARS = 2000
-OBSERVATION_CLIP_CHARS = 3000
+# Nothing is clipped any more. `calls[].result` is written to result.json on disk and read by the
+# MCP layer — it never enters the model's context, so there was never a reason to shorten it. What
+# the MODEL sees is paginated instead: one page plus an exact instruction for fetching the next.
+# See the pagination section of agent_context.py for why clipping was data loss, not economy.
 
 DENYLIST = re.compile(
     r"\bsudo\b|\brm\s+-rf\s+/(?!\S)|:\(\)\s*\{.*:\|:.*\}|\bcurl\b|\bwget\b|\bnc\b|\bssh\b|>\s*/dev/(sd|nvme|disk)",
@@ -75,11 +83,33 @@ def system_prompt() -> str:
     return """You are a local coding agent in an isolated benchmark workspace containing a pinned repository, rooted at the current directory. You solve tasks using ONLY raw POSIX shell commands — no editors, no special tools, no network access. Return exactly one JSON object per turn:
 
 {"action":"shell","command":"one shell command, e.g. grep -n \\"class Group\\" click/src/click/core.py"}
+{"action":"page","step":2,"page":2}
 {"action":"finish","answer":"concise final answer with repository-relative evidence"}
+
+Long output is PAGINATED, never truncated: you are shown page 1 and told the total. Nothing is
+discarded, so "not found" is only a real answer once you have seen every page you need. Send the
+page action to read another page of a previous step — it re-reads stored output and does not re-run
+the command, so it is cheaper than repeating the search.
 
 Use standard Unix utilities: ls, find, cat, grep, sed, awk, head, tail, wc, tree (if present). Chain
 with pipes if needed, but keep each turn to a single shell invocation. Never edit files. Be decisive:
-most tasks need 2-6 commands. Call finish as soon as the requested facts are established."""
+most tasks need 2-6 commands. Call finish as soon as the requested facts are established.
+
+SCOPE YOUR SEARCHES. A real workspace holds far more than its source, and an unscoped grep drowns
+the answer in vendored and generated files. Always exclude them:
+  grep -rn "PATTERN" . --exclude-dir={node_modules,target,.venv,venv,dist,build,.git,vendor,__pycache__,.octocode,site-packages}
+Matches under fixtures/, test/fixtures/, mocks/ or examples/ are usually scaffolding, NOT the real
+implementation — a mock named like the thing you are looking for is a trap, not an answer. Prefer
+src/, packages/*/src/, lib/ and the repo root, and name the file you took the answer from.
+If a search returns nothing, widen the pattern before concluding the thing does not exist: absence
+of a grep hit is weak evidence, and "not found" is only a real answer once you have looked in the
+source directories.
+ASKED FOR A DEFAULT? Find where it is DECLARED, not where it appears. A value like a port or a
+timeout is scattered across tests, docs and examples that merely pass it; those are occurrences, not
+the default. The declaration is an attribute or initializer — `default_value = `, `unwrap_or(`,
+`const `, `static `, a settings schema, a clap/argparse arg. Grep for the declaration form, and if
+you can only find occurrences, say which file you took it from and that you did not find a
+declaration. Test files (`tests/`, `*_test.*`, `*_contract.*`) define nothing — they consume it."""
 
 
 def main() -> int:
@@ -89,6 +119,11 @@ def main() -> int:
     result_path = Path(os.environ["FREELLAMA_AGENT_RESULT"])
     endpoint = os.environ.get("FREELLAMA_OLLAMA_ENDPOINT", "http://127.0.0.1:11434").rstrip("/")
     max_turns = int(os.environ.get("FREELLAMA_AGENT_MAX_TURNS", "10"))
+    # Tunable because the right value is machine-dependent: prefix KV-cache reuse is real (a warm
+    # prefix re-serves in ~0.3s vs ~19s cold), so a LARGER window is cheaper than it looks — and it
+    # avoids fit_to_context compaction, which edits the byte prefix and invalidates the cache from
+    # that point. With OLLAMA_KV_CACHE_TYPE=q8_0, 16384 costs the same KV memory as 8192 at f16.
+    num_ctx = int(os.environ.get("FREELLAMA_AGENT_NUM_CTX", "8192"))
     messages: list[dict[str, str]] = [
         {"role": "system", "content": system_prompt()},
         {"role": "user", "content": prompt},
@@ -99,7 +134,7 @@ def main() -> int:
     answer = ""
     failure: str | None = None
     context_compactions = 0
-    chat_options = {"temperature": 0, "seed": 42, "num_ctx": 8192, "num_predict": 512}
+    chat_options = {"temperature": 0, "seed": 42, "num_ctx": num_ctx, "num_predict": 512}
 
     def call_model() -> dict[str, Any]:
         # The proxy already retries transient upstream 5xx errors (packages/rust-core/src/proxy.rs); this loop is a
@@ -124,13 +159,46 @@ def main() -> int:
         return response
 
     seen_calls: dict[str, int] = {}
+    observations = ObservationStore()
+    parse_failures = 0
     for _ in range(max_turns):
+        # Transport failures are terminal (call_model already retried them). A *parse* failure is
+        # not: tell the model what was wrong with its reply and let it correct itself, keeping every
+        # tool result gathered so far.
         try:
             response = call_model()
-            action = parse_action(str(response.get("message", {}).get("content", "")))
-        except (HTTPError, URLError, TimeoutError, ValueError, json.JSONDecodeError) as error:
+        except (HTTPError, URLError, TimeoutError) as error:
             failure = f"agent response failed: {type(error).__name__}: {error}"
             break
+        raw = str(response.get("message", {}).get("content", ""))
+        try:
+            action = parse_action(raw)
+        except (ValueError, json.JSONDecodeError) as error:
+            parse_failures += 1
+            if parse_failures > MAX_PARSE_REPAIRS:
+                failure = f"agent gave {parse_failures} unparseable replies: {type(error).__name__}: {error}"
+                break
+            messages.append({"role": "assistant", "content": raw[:500]})
+            messages.append({"role": "user", "content": PARSE_REPAIR_NOTICE})
+            messages, compacted = fit_to_context(messages, num_ctx=chat_options["num_ctx"], num_predict=chat_options["num_predict"])
+            context_compactions += 1 if compacted else 0
+            continue
+        parse_failures = 0
+        # Paging re-serves stored output. It costs a turn but never a subprocess, and no byte of
+        # any observation is ever unreachable — which is the whole point of paginating instead of
+        # clipping.
+        if action["action"] == "page":
+            try:
+                want_step = int(action.get("step", 0))
+                want_page = int(action.get("page", 1))
+            except (TypeError, ValueError):
+                want_step, want_page = 0, 1
+            body, footer = observations.view(want_step, want_page)
+            messages.append({"role": "assistant", "content": json.dumps(action, ensure_ascii=False)})
+            messages.append({"role": "user", "content": f"Observation (step {want_step}):\n{body}{footer}"})
+            messages, compacted = fit_to_context(messages, num_ctx=chat_options["num_ctx"], num_predict=chat_options["num_predict"])
+            context_compactions += 1 if compacted else 0
+            continue
         if action["action"] == "finish":
             answer = str(action.get("answer", "")).strip()
             break
@@ -156,11 +224,15 @@ def main() -> int:
             "arguments": {"command": command_text},
             "status": status,
             "duration_ms": round((time.perf_counter() - started) * 1000, 3),
-            "result": clip(observation, RESULT_CLIP_CHARS),
+            "result": observation,
         })
         messages.append({"role": "assistant", "content": json.dumps(action, ensure_ascii=False)})
         remaining = max_turns - len(calls)
-        messages.append({"role": "user", "content": f"Observation:\n{clip(observation, OBSERVATION_CLIP_CHARS)}\n\nCommands remaining: {remaining}. Finish now if the task is answerable; do not repeat prior commands."})
+        step = len(calls)
+        observations.put(step, observation)
+        body, shown_page, total_pages = paginate(observation)
+        footer = page_footer(step, shown_page, total_pages, len(observation))
+        messages.append({"role": "user", "content": f"Observation (step {step}):\n{body}{footer}\n\nCommands remaining: {remaining}. Finish now if the task is answerable; do not repeat prior commands."})
         messages, compacted = fit_to_context(messages, num_ctx=chat_options["num_ctx"], num_predict=chat_options["num_predict"])
         context_compactions += 1 if compacted else 0
     else:
