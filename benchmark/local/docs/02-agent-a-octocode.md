@@ -11,8 +11,7 @@ the `octocode` CLI (`octocode tools <name> --queries '<json>' --compact`), which
 installed globally on this machine (`octocode v17.0.1`, `which octocode`). The adapter shells out to
 whichever tool the model names.
 
-Per the task ask ("add short prompt for the tools to use — basically their description and input
-schema"), the system prompt embeds a condensed version of the real tool descriptions/schemas
+The system prompt embeds a condensed version of the real tool descriptions and schemas
 (fetched verbatim via `octocode tools <name> --scheme` — see the research trail in this session; the
 full, un-condensed text lives in `octocode tools <name> --scheme` on this machine, run it directly
 for the authoritative version). Only the five **local** tools are exposed — `ghSearchCode` /
@@ -21,7 +20,7 @@ for the authoritative version). Only the five **local** tools are exposed — `g
 ## Exact system prompt used by the adapter
 
 ```
-You are a local coding agent in an isolated benchmark workspace at <WORKSPACE>. You may not read or
+You are a local coding agent in an isolated benchmark workspace at WORKSPACE_PATH. You may not read or
 search files directly — you can only call the `octocode` local tools below. Return exactly one JSON
 object per turn.
 
@@ -61,8 +60,7 @@ read-only tools. Call finish as soon as the requested facts are established.
 ## How a tool call is executed
 
 The adapter takes the model's `{"tool": "...", "queries": {...}}`, resolves any `path`/`uri` field
-against the workspace root (rejecting anything that would escape it, same `safe_path()` discipline
-`ollama_repo_agent.py` already uses), then runs:
+against the workspace root, rejects any path that escapes it, and then runs:
 
 ```
 npx octocode tools <tool-name> --queries '<resolved-json>' --compact

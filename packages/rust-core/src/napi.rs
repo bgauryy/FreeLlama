@@ -34,11 +34,6 @@ const DEFAULT_OLLAMA_ENDPOINT: &str = "http://127.0.0.1:11434";
 /// Timeout for the decision-only control-plane calls (machine/models/routes/recommendations).
 /// These are pure computation on an in-memory model list; anything past a few seconds means the
 /// server is wedged, not busy. Overridable via `FREELLAMA_CONTROL_TIMEOUT_SECONDS`.
-/// Timeout for the two calls that make a model actually generate. A cold load of a large model can
-/// legitimately take minutes — Ollama's own `OLLAMA_LOAD_TIMEOUT` is 5m before it even gives up on
-/// the load — so this has to be generous or it would abort work that was going to succeed.
-/// Overridable via `FREELLAMA_TASK_TIMEOUT_SECONDS`.
-
 fn control_timeout() -> Duration {
     crate::timeout_from_env(
         "FREELLAMA_CONTROL_TIMEOUT_SECONDS",
@@ -46,6 +41,10 @@ fn control_timeout() -> Duration {
     )
 }
 
+/// Timeout for the two calls that make a model actually generate. A cold load of a large model can
+/// legitimately take minutes — Ollama's own `OLLAMA_LOAD_TIMEOUT` is 5m before it even gives up on
+/// the load — so this has to be generous or it would abort work that was going to succeed.
+/// Overridable via `FREELLAMA_TASK_TIMEOUT_SECONDS`.
 fn task_timeout() -> Duration {
     crate::timeout_from_env(
         "FREELLAMA_TASK_TIMEOUT_SECONDS",
@@ -89,9 +88,22 @@ fn client() -> Client {
     CLIENT.get_or_init(Client::new).clone()
 }
 
+fn authenticated(request: reqwest::RequestBuilder) -> Result<reqwest::RequestBuilder> {
+    let Some(path) = std::env::var_os("FREELLAMA_AUTH_TOKEN_FILE") else {
+        return Ok(request);
+    };
+    let token = std::fs::read_to_string(&path).map_err(to_napi_err)?;
+    let token = token.trim();
+    if token.len() < 32 || token.chars().any(char::is_whitespace) {
+        return Err(Error::from_reason(
+            "FREELLAMA_AUTH_TOKEN_FILE must contain one token of at least 32 bytes",
+        ));
+    }
+    Ok(request.bearer_auth(token))
+}
+
 async fn get_json(endpoint: &str, path: &str, timeout: Duration) -> Result<Value> {
-    client()
-        .get(format!("{}{path}", endpoint.trim_end_matches('/')))
+    authenticated(client().get(format!("{}{path}", endpoint.trim_end_matches('/'))))?
         .timeout(timeout)
         .send()
         .await
@@ -104,27 +116,39 @@ async fn get_json(endpoint: &str, path: &str, timeout: Duration) -> Result<Value
 }
 
 async fn post_json(endpoint: &str, path: &str, body: &Value, timeout: Duration) -> Result<Value> {
-    let response = client()
-        .post(format!("{}{path}", endpoint.trim_end_matches('/')))
-        .timeout(timeout)
-        .json(body)
-        .send()
-        .await
-        .map_err(to_napi_err)?;
+    let response =
+        authenticated(client().post(format!("{}{path}", endpoint.trim_end_matches('/'))))?
+            .timeout(timeout)
+            .json(body)
+            .send()
+            .await
+            .map_err(to_napi_err)?;
     // `error_for_status()` discards the body — and the body is where every useful refusal lives.
     // A `min_confidence` refusal names the grade, the evidence, the model it would have picked and
     // the two commands that raise the grade; all of that was collapsing into a bare
     // "HTTP status client error (422)". Same defect, same fix as the CLI's `print_response`.
     let status = response.status();
-    let value = response.json::<Value>().await.map_err(to_napi_err)?;
+    // Axum's extractor failures are text/plain, while application refusals are JSON. Reading JSON
+    // unconditionally turned a useful compatibility error (for example, an older running server
+    // rejecting a newly added field) into the opaque "error decoding response body".
+    let text = response.text().await.map_err(to_napi_err)?;
+    let value = serde_json::from_str::<Value>(&text);
     if !status.is_success() {
-        let detail = value
-            .get("error")
-            .and_then(Value::as_str)
-            .map_or_else(|| value.to_string(), ToOwned::to_owned);
+        let detail = value.as_ref().map_or_else(
+            |_| text.clone(),
+            |json| {
+                json.get("error")
+                    .and_then(Value::as_str)
+                    .map_or_else(|| json.to_string(), ToOwned::to_owned)
+            },
+        );
         return Err(napi::Error::from_reason(detail));
     }
-    Ok(value)
+    value.map_err(|error| {
+        napi::Error::from_reason(format!(
+            "FreeLlama returned HTTP {status} with invalid JSON: {error}"
+        ))
+    })
 }
 
 fn pretty(value: &Value) -> Result<String> {
@@ -144,7 +168,7 @@ pub async fn doctor(endpoint: Option<String>) -> Result<String> {
     pretty(&report)
 }
 
-/// Machine profile (chip, unified memory, CPU count, disk) as seen by a running `freellama serve`.
+/// Machine profile (chip, host memory, memory kind, CPU count, and disk) from `freellama serve`.
 ///
 /// # Errors
 ///
@@ -181,6 +205,7 @@ pub async fn list_models(endpoint: Option<String>) -> Result<String> {
 /// Returns an error if `freellama serve` isn't reachable at `endpoint`, or rejects the request
 /// (e.g. an unknown task/objective, or no eligible model).
 #[napi]
+#[allow(clippy::too_many_arguments)]
 pub async fn route(
     endpoint: Option<String>,
     task: String,
@@ -190,6 +215,8 @@ pub async fn route(
     context_tokens: Option<i64>,
     required_capabilities: Option<Vec<String>>,
     min_confidence: Option<String>,
+    execution_preference: Option<String>,
+    min_placement_evidence: Option<String>,
 ) -> Result<String> {
     let endpoint = endpoint_or_default(endpoint);
     // Forwarded so the CORE gate does the refusing. The MCP layer used to gate client-side with
@@ -203,6 +230,8 @@ pub async fn route(
         "context_tokens": context_tokens,
         "required_capabilities": required_capabilities.unwrap_or_default(),
         "min_confidence": min_confidence,
+        "execution_preference": execution_preference.unwrap_or_else(|| "auto".to_owned()),
+        "min_placement_evidence": min_placement_evidence.unwrap_or_else(|| "configured".to_owned()),
     });
     let value = post_json(&endpoint, "/_freellama/v1/routes", &body, control_timeout()).await?;
     pretty(&value)
@@ -222,6 +251,8 @@ pub async fn recommend(
     model: Option<String>,
     context_tokens: Option<i64>,
     required_capabilities: Option<Vec<String>>,
+    execution_preference: Option<String>,
+    min_placement_evidence: Option<String>,
 ) -> Result<String> {
     let endpoint = endpoint_or_default(endpoint);
     let body = json!({
@@ -231,6 +262,8 @@ pub async fn recommend(
         "session_id": Value::Null,
         "context_tokens": context_tokens,
         "required_capabilities": required_capabilities.unwrap_or_default(),
+        "execution_preference": execution_preference.unwrap_or_else(|| "auto".to_owned()),
+        "min_placement_evidence": min_placement_evidence.unwrap_or_else(|| "configured".to_owned()),
     });
     let value = post_json(
         &endpoint,
@@ -256,7 +289,6 @@ pub async fn recommend(
 /// an optional JSON array of tool/function definitions for function-calling tasks. `keep_alive`
 /// overrides Ollama's default model residency window (e.g. `"0"` to unload immediately after this
 /// call, `"-1"` for infinite) — omit it to keep the server's own default.
-///
 /// # Errors
 ///
 /// Returns an error if `freellama serve` isn't reachable at `endpoint`, or rejects the request
@@ -279,6 +311,8 @@ pub async fn run_task(
     tools: Option<Value>,
     keep_alive: Option<String>,
     min_confidence: Option<String>,
+    execution_preference: Option<String>,
+    min_placement_evidence: Option<String>,
 ) -> Result<String> {
     let endpoint = endpoint_or_default(endpoint);
     let body = json!({
@@ -295,8 +329,24 @@ pub async fn run_task(
         "input": input,
         "tools": tools,
         "keep_alive": keep_alive,
+        "execution_preference": execution_preference.unwrap_or_else(|| "auto".to_owned()),
+        "min_placement_evidence": min_placement_evidence.unwrap_or_else(|| "configured".to_owned()),
     });
     let value = post_json(&endpoint, "/_freellama/v1/tasks", &body, task_timeout()).await?;
+    pretty(&value)
+}
+
+/// Object-based managed task API for callers that need the complete task contract without a long,
+/// ABI-fragile positional argument list. The request is forwarded to `/_freellama/v1/tasks`, where
+/// the typed Rust server validates routing fields, message history, and advanced Ollama controls.
+///
+/// # Errors
+///
+/// Returns an error if `freellama serve` is unreachable or rejects the request.
+#[napi]
+pub async fn run_task_request(endpoint: Option<String>, request: Value) -> Result<String> {
+    let endpoint = endpoint_or_default(endpoint);
+    let value = post_json(&endpoint, "/_freellama/v1/tasks", &request, task_timeout()).await?;
     pretty(&value)
 }
 

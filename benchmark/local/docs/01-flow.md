@@ -2,10 +2,11 @@
 
 ```
  1. prepare_repo.sh   RUNNER-only: clone+pin click, zustand, openui into .context/ (gitignored)
- 2. restart_ollama.sh kill + relaunch Ollama, then build+start the FreeLlama proxy in front of
-                        it (127.0.0.1:11435 -> 127.0.0.1:11434). Both agents talk to the proxy, not
-                        raw Ollama — it adds retry-with-backoff on transient 5xx errors
-                        (packages/rust-core/src/proxy.rs), which fixed a real ~8% infra-flakiness rate (see
+ 2. restart_ollama.sh kill + relaunch Ollama, then keep 127.0.0.1:11435 in front of it
+                        (existing `freellama serve`, or a passthrough `freellama proxy`). Both
+                        agents talk to 11435, not raw Ollama. The sidecar retries 500/502/504
+                        load blips, not 503 busy (`packages/rust-core/src/proxy.rs`) — that
+                        cut a real ~8% infra-flakiness rate on 500s (see
                         docs/05-grading-and-judge.md)
  3. run_matrix.py      runs the 2 agents SEQUENTIALLY (never in parallel), each fully working
                         through all 30 questions one at a time before the next agent starts:
@@ -50,24 +51,25 @@ adapter contract both `octocode_agent.py` and `bash_agent.py` implement:
   entry's `id` (`<model-slug>-octocode` / `<model-slug>-bash`), which must stay unique per entry so
   results don't collide, but isn't itself a valid `ollama` tag.
 - Drive a chat loop against `FREELLAMA_OLLAMA_ENDPOINT` (default `http://127.0.0.1:11434`, but
-  `run_all.sh` sets it to the FreeLlama proxy at `http://127.0.0.1:11435` — see above), using
-  `/api/chat`, `format:"json"`, temperature 0, seed 42, `num_ctx 8192`, `num_predict 512`, max 10
-  turns — identical decoding settings for both agents, so the only variable being measured is the
-  tool surface.
+  `run_all.sh` sets it to `http://127.0.0.1:11435` through the serve or proxy step), using
+  `/api/chat`, `format:"json"`, with shared validated defaults: temperature 0, seed 42,
+  `num_ctx 8192`, `num_predict 512`, max 10 turns. Every operational setting has a
+  `FREELLAMA_AGENT_*` override, but matched comparisons must give both adapters the same overrides
+  so the only variable being measured is the tool surface.
 - Normalize every tool invocation into `tool_calls[]` (`name`, `arguments`, `status`, `duration_ms`,
   `result`) and token counts into `usage{input_tokens,output_tokens}`.
 - Exit 0 on success, 1 on failure; never edit files outside the workspace copy.
 
-## Changing things later
+## Change the benchmark
 
 - **Different model:** `./scripts/run_all.sh --model <ollama-tag>` — one flag, no file edits.
   `run_all.sh` fills `tasks/octocode-vs-bash-matrix.template.json`'s `__MODEL__`/`__MODEL_SLUG__`
   placeholders and writes the concrete matrix to `tasks/.generated/matrix-<slug>.json` (gitignored,
-  regenerated every run). Each model's results land in their own `results/<slug>/`, and the run gets
-  logged to `runs/index.jsonl` (run_id, model, date, pass rate, results path) — so testing several
-  models never overwrites a prior model's data or loses track of which run_id used which model.
-- **More trials:** `./scripts/run_all.sh --trials 3` (default 1; the existing real-repos-10 suite
-  uses 3 for publishable reliability — see `benchmark/harness/references/methodology.md`).
+  regenerated every run). Each model's results land in its own `results/<slug>/`, and the script
+  appends the run ID, model, date, pass rate, and results path to `runs/index.jsonl`. Git does not
+  track this generated ledger unless you add it intentionally.
+- **More trials:** `./scripts/run_all.sh --trials 3` (default 1; use three trials for publishable
+  reliability — see `benchmark/harness/references/methodology.md`).
 - **Different/more questions:** edit `tasks/octocode-vs-bash-30.json` and add a matching
   `docs/questions/<repo>/QN.md`; keep `checks[]` tool-name-agnostic (no `tool_required_any`/
   `tool_forbidden`) so the two agents are graded on outcome, not on which tool family they used —

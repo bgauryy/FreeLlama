@@ -2,14 +2,20 @@
   "name": "freellama-mcp-server",
   "version": "0.2.0",
   "description": "MCP server exposing FreeLlama core as tools, via native NAPI bindings into packages/rust-core.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bgauryy/FreeLlama.git",
+    "directory": "packages/mcp"
+  },
+  "homepage": "https://github.com/bgauryy/FreeLlama#readme",
+  "bugs": "https://github.com/bgauryy/FreeLlama/issues",
+  "keywords": ["mcp", "ollama", "local-llm", "coding-agent"],
   "engines": {
     "node": ">=20.0.0"
   },
   "type": "module",
   "main": "dist/index.js",
-  "bin": {
-    "freellama-mcp-server": "dist/index.js"
-  },
+  "bin": "dist/index.js",
   "files": [
     "dist",
     "native",
@@ -17,20 +23,30 @@
     "README.md"
   ],
   "scripts": {
-    "build": "tsc && node scripts/bundle-adapters.mjs",
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc --noEmit",
     "start": "node dist/index.js",
-    "test": "node test/tool-map-drift.mjs && node test/smoke-test.mjs && node test/smoke-test-protocol.mjs && node test/smoke-test-delegate.mjs",
-    "test:ci": "node test/tool-map-drift.mjs",
-    "prepublishOnly": "npm --prefix .. run build && npm run build",
-    "build:native": "npm --prefix ../.. run build"
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:integration": "vitest run -c vitest.integration.config.ts",
+    "test:e2e": "vitest run -c vitest.e2e.config.ts",
+    "prepublishOnly": "yarn typecheck && yarn --cwd ../.. build:native && yarn build && yarn test",
+    "build:native": "yarn --cwd ../.. build:native"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
     "zod": "^3.24.1"
   },
+  "license": "Apache-2.0 OR MIT",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/",
+    "provenance": true
+  },
   "devDependencies": {
     "@types/node": "^22.10.0",
-    "typescript": "^5.7.2"
-  },
-  "license": "Apache-2.0 OR MIT"
+    "esbuild": "^0.28.2",
+    "typescript": "^5.7.2",
+    "vitest": "^4.1.11"
+  }
 }

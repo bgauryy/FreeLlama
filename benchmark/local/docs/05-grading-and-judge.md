@@ -1,12 +1,12 @@
-# Grading and the LLM judge
+# Deterministic grading and the LLM judge
 
-Two separate measurement passes, run in strict sequence, never mixed:
+The benchmark supports two separate measurement passes. `run_all.sh` performs only the first:
 
 1. **While the local models run:** deterministic checks + resource metrics only. No LLM judging
    happens on-device. This was a deliberate fix — see "Why no local judge" below.
-2. **After both local agents have completely finished all 30 questions:** a non-local, frontier
-   model (Claude or Codex — never one of the models under test) independently judges every answer
-   against the verified reference. This is the orchestrator's job, not a step in the local run.
+2. **Optional post-hoc review:** after both local agents finish all 30 questions, an independent,
+   non-local model can judge each answer against the verified reference. This manual orchestrator
+   step is not implemented by `run_all.sh` and is not part of the deterministic score.
 
 ## Who runs what (important)
 
@@ -16,23 +16,24 @@ Two separate measurement passes, run in strict sequence, never mixed:
 - **Subjects under test:** local models only (`qwen3.8:27b-mlx` via the octocode agent, then via
   the bash agent), run **one at a time, question by question, never in parallel** — `run.py`
   iterates tasks in a plain sequential loop and `run_matrix.py` runs matrix entries one after
-  another via a blocking `subprocess.run`; there is no concurrency to disable, but see below for why
-  running them back-to-back without a resident second model is what makes this safe.
+  another through a blocking `subprocess.run`; there is no concurrency to deactivate. The
+  [no-local-judge rationale](#why-no-local-judge) explains why the benchmark runs them back-to-back
+  without a resident second model.
 - **Results are durable per question, not batched at the end:** `run.py` writes one `trial-N.json`
   the moment each question's grading finishes, and prints a `{"task":...,"status":...,"score":...}`
-  line to stdout as it happens — so progress and per-question stats are visible and on disk
-  throughout the run, not just after everything completes.
+  line to stdout as it happens, so progress and per-question stats are visible and on disk
+  throughout the run rather than only after everything completes.
 
 ## Why no local judge
 
 The first attempt at this benchmark set `judge_model: "qwen2.5:32b"` in the matrix, so
-`distilled_judge.py` would score every trial locally right after it ran. On this machine (48GB
+`distilled_judge.py` scored every trial locally after it ran. On this machine (48GB
 unified memory) that meant Ollama had to keep the ~30GB agent model (`qwen3.8:27b-mlx`) resident
 *and* load a second ~28GB judge model for every single trial — ~58GB against a 48GB budget. The
 result was intermittent `HTTP 500` crashes from Ollama's server (visible in
 `~/.ollama/logs/server.log`), which corrupted roughly a third of that run's trials — those trials
 failed because the *infrastructure* fell over, not because the agent's tool choice was worse. That's
-a real bug, not a measurement. Local-on-local judging on hardware this size just isn't safe for this
+a real bug, not a measurement. Local-on-local judging on hardware this size isn't safe for this
 benchmark, so it's removed from the matrix entirely (`"judge_model": null`) and moved to a separate,
 later phase using a model that was never resident on the same machine as the models being judged.
 
@@ -40,20 +41,18 @@ later phase using a model that was never resident on the same machine as the mod
 
 Removing the local judge fixed most of the flakiness, but not all of it: a follow-up run (judge
 removed, single model resident, plenty of memory headroom) still hit `HTTP 500` on ~8% of trials
-(5/60) — Ollama itself is occasionally flaky under sustained multi-turn tool-calling load,
-independent of memory pressure. `docs/OLLAMA_SYSTEM_OPTIMIZATION.md` already documents this as a
-known gap: FreeLlama's own docs list "no retry/backoff logic" as something the project doesn't do
-yet. Since this benchmark's whole point includes measuring the two agents fairly, an infra crash
-silently corrupting one condition's trials more than the other's would bias the very thing being
-measured — and it did (4 of the 5 infra errors landed on the octocode agent's longer, more
+(5/60). At that point, FreeLlama did not retry transient upstream failures. Since this benchmark's
+whole point includes measuring the two agents fairly, an infrastructure crash
+silently corrupting one condition's trials more than the other's biased the comparison: 4 of the 5
+infrastructure errors landed on the octocode agent's longer, more
 context-heavy conversations).
 
 The fix went into the actual product, not a benchmark-local workaround: `packages/rust-core/src/proxy.rs` (FreeLlama's
 existing Ollama-compatible sidecar) gained retry-with-backoff on transient upstream failures
-(5xx responses or connection errors — up to 3 attempts, linear backoff), added test-first
+(HTTP 500/502/504 or connection errors — up to 3 attempts; **not** 503 busy), added test-first
 (`packages/rust-core/tests/proxy_contract.rs::proxy_retries_transient_upstream_errors_and_eventually_succeeds` /
 `...gives_up_after_max_attempts_on_persistent_failure`, both red before the fix, green after, no
-regressions across the full 39-test suite). `scripts/restart_ollama.sh` now also builds and starts
+regressions in the full Rust suite). `scripts/restart_ollama.sh` also builds and starts
 this proxy (`127.0.0.1:11435 -> 127.0.0.1:11434`), and both agent adapters point
 `FREELLAMA_OLLAMA_ENDPOINT` at the proxy instead of Ollama directly — so retries are transparent to
 the adapters and identical for both agents.

@@ -41,6 +41,28 @@ pub enum Objective {
     Quality,
 }
 
+/// A caller's backend preference. Operators retain authority over which exact models are assigned
+/// to the CPU backend; this value only chooses among models that are already eligible there.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionPreference {
+    #[default]
+    Auto,
+    PreferCpu,
+    PreferGpu,
+}
+
+/// Minimum proof required before a route may be returned. `Observed` intentionally refuses a
+/// cold model: warm it once with configured evidence, inspect the receipt, then require physical
+/// evidence for subsequent work where CPU/GPU placement is a hard constraint.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum PlacementEvidence {
+    #[default]
+    Configured,
+    Observed,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RouteInput {
@@ -50,6 +72,10 @@ pub struct RouteInput {
     pub session_id: Option<String>,
     pub required_capabilities: BTreeSet<Capability>,
     pub context_tokens: Option<u64>,
+    /// Prefer an operator-configured backend without forcing an ineligible route.
+    pub execution_preference: ExecutionPreference,
+    /// Whether an operator assignment is enough, or matching `/api/ps` evidence is required.
+    pub min_placement_evidence: PlacementEvidence,
     /// Refuse the route rather than return one graded below this.
     ///
     /// This gate used to live only in the TypeScript MCP wrapper, so the CLI, the HTTP API and
@@ -70,6 +96,8 @@ impl Default for RouteInput {
             session_id: None,
             required_capabilities: BTreeSet::new(),
             context_tokens: None,
+            execution_preference: ExecutionPreference::Auto,
+            min_placement_evidence: PlacementEvidence::Configured,
         }
     }
 }
@@ -137,7 +165,7 @@ impl SessionAffinity {
         self.sessions.contains_key(id)
     }
 
-    fn assigned(&self, id: &str) -> Option<&str> {
+    pub(super) fn assigned(&self, id: &str) -> Option<&str> {
         self.sessions.get(id).and_then(Option::as_deref)
     }
 
@@ -181,7 +209,7 @@ pub fn select_route(
             .collect::<Vec<_>>();
         ensure!(
             !qualified.is_empty(),
-            "no quality-qualified model exists for this task; configure a task policy, choose --objective fastest, or name an explicit model"
+            "no quality-qualified model exists for this task; configure a task policy (`freellama policy-from-eval`), choose objective \"fastest\" (CLI: --objective fastest; MCP: objective:\"fastest\"), or name an explicit model. Run `freellama doctor` — unset OLLAMA_MAX_LOADED_MODELS / OLLAMA_KV_CACHE_TYPE is a machine-config gap, not a missing model"
         );
         qualified
     };
@@ -235,12 +263,7 @@ pub fn select_route(
             "capability_only_fallback".to_owned()
         });
     }
-    // `fits` is knowable here only as "we did not exclude it for context"; the memory budget lives
-    // in the machine profile, so this dimension is honest about being weaker than the other two.
-    // Unknown when the model advertises no context window — reported as "unknown", never as a pass.
-    let fits = chosen
-        .advertised_context
-        .map(|window| requested_context(input) <= window);
+    let (fits, reasons) = sent_window_fit(input, chosen, &options, reasons);
     let graded = route_evidence(policy_qualified, has_benchmark, fits);
     enforce_min_confidence(input, graded.confidence, graded.evidence, &chosen.name)?;
     // Why every other eligible candidate lost. Without this the router is a black box that names a
@@ -266,6 +289,29 @@ pub fn select_route(
         rejected,
         reasons,
     })
+}
+
+/// Grade the window we will actually send.
+///
+/// The task profile default (16k for chat, 2k for embeddings) is often larger than a small
+/// model's advertised context; `profile()` already clamps `num_ctx` down. Comparing the
+/// *unclamped* default made a 370MB embed that ran at 2048 / 100% GPU report
+/// `insufficient_context` — a false alarm agents then ignore. Memory-budget fit lives in the
+/// machine profile / recommend path, not this field.
+fn sent_window_fit(
+    input: &RouteInput,
+    chosen: &CatalogModel,
+    options: &Value,
+    mut reasons: Vec<String>,
+) -> (Option<bool>, Vec<String>) {
+    let sent_ctx = options.get("num_ctx").and_then(Value::as_u64);
+    if sent_ctx.is_some_and(|n| requested_context(input) > n) {
+        reasons.push("context_clamped_to_advertised".to_owned());
+    }
+    let fits = chosen
+        .advertised_context
+        .map(|window| sent_ctx.is_some_and(|n| n <= window));
+    (fits, reasons)
 }
 
 /// Refuse a route graded below the caller's requested minimum.
@@ -360,7 +406,8 @@ pub struct RouteEvidence {
     pub quality_evidence: &'static str,
     /// A functional benchmark measured this model on the ranking capability.
     pub task_evidence: &'static str,
-    /// The model fits the machine's memory budget with room for its KV cache.
+    /// Sent `num_ctx` vs the model's advertised window (`strong` / `insufficient_context` /
+    /// `unknown`). Not RAM or KV-cache headroom — that lives on `recommend` / `machine`.
     pub hardware_fit: &'static str,
     /// Legacy single-word summary, derived from the three above. Kept so existing callers and the
     /// `min_confidence` gate keep working.
@@ -490,6 +537,9 @@ pub(super) fn requested_context(input: &RouteInput) -> u64 {
     input.context_tokens.unwrap_or(match input.task {
         TaskKind::Browser | TaskKind::Tools | TaskKind::CodeRepair => 8_192,
         TaskKind::LongContext => 32_768,
+        // Embeddings are not chat: nomic-embed-text advertises 2048. Using the 16k chat default
+        // made every embed look like a context miss even after clamp.
+        TaskKind::Embedding => 2_048,
         _ => 16_384,
     })
 }

@@ -539,9 +539,9 @@ pub fn parse_ollama_cli_version(
     }
 }
 
-/// Reads an `OLLAMA_*` variable from the launchd per-user domain — the environment the macOS
-/// Ollama app actually runs under (`launchctl setenv`, not a shell export), which is why
-/// `std::env::var` here would read the wrong process's environment entirely.
+/// Reads an `OLLAMA_*` variable from the launchd per-user domain used by Ollama.app on macOS.
+/// Other platforms never call this fallback.
+#[cfg(target_os = "macos")]
 fn launchctl_getenv(name: &str) -> Option<String> {
     let output = Command::new("launchctl")
         .args(["getenv", name])
@@ -554,6 +554,36 @@ fn launchctl_getenv(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// Best-effort config visibility without pretending `FreeLlama` can inspect a remote process.
+///
+/// A colocated service commonly shares its environment with `FreeLlama`, so check this process
+/// first on every OS. Ollama.app is launched outside that environment on macOS, where launchd is
+/// the only supported extra source available without elevated process inspection.
+fn ollama_environment_getenv(name: &str) -> Option<String> {
+    env::var(name)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            #[cfg(target_os = "macos")]
+            {
+                launchctl_getenv(name)
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                None
+            }
+        })
+}
+
+fn ollama_environment_source() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "best effort: FreeLlama process environment, then macOS launchd session environment; a separately launched Ollama process can still differ"
+    } else {
+        "best effort: FreeLlama process environment; a separately launched Ollama service or remote endpoint can differ"
+    }
+}
+
 /// Advise when `OLLAMA_MAX_LOADED_MODELS` is unset.
 ///
 /// The `0` that `envconfig/config.go` declares as this variable's default is a *sentinel*, not an
@@ -563,28 +593,27 @@ fn launchctl_getenv(name: &str) -> Option<String> {
 /// default without following the sentinel through the scheduler. Ollama's own FAQ states the 3
 /// directly.)
 ///
-/// A cap of 3 is still far too many for large models on unified memory: 3 x ~22GB does not fit in
-/// 48GB, which is the condition that let this project co-resident two large models and crash the
-/// server (see `skills/freellama/references/ollama-config.md`). The advisory stands; only its
-/// stated reason needed correcting. Pure function so it's unit-testable without shelling out to
-/// `launchctl`.
+/// Whether that cap fits depends on model sizes, host RAM, accelerator memory, and backend type.
+/// The advisory is deliberately machine-neutral; `doctor` reports the local capacity and resident
+/// runners separately. Pure function so it is unit-testable without inspecting process state.
 #[must_use]
 pub fn max_loaded_models_advisory(raw: Option<&str>) -> Option<String> {
     raw.is_none_or(str::is_empty).then(|| {
         "OLLAMA_MAX_LOADED_MODELS is unset, so Ollama picks its own default: the 0 in \
          envconfig/config.go is a sentinel that server/sched.go resolves to 3 x GPU count, i.e. \
-         an effective cap of 3 on a single-GPU machine. That is a cap, but not a useful one for \
-         large models on unified memory — 3 x ~22GB does not fit in 48GB. Set it with \
-         `launchctl setenv OLLAMA_MAX_LOADED_MODELS 1` (then restart the Ollama app) if this \
-         machine should never co-resident two large models."
+         an effective cap of 3 on a single-GPU or CPU-only machine. Capacity is not inferred from \
+         that count: three large models may exceed host RAM or accelerator memory, while a large \
+         model plus small helpers may fit. Set an explicit value in each Ollama process's service \
+         environment after measuring this machine, then restart that process."
             .to_owned()
     })
 }
 
 fn find_path_command(name: &str) -> Option<PathBuf> {
     let paths = env::var_os("PATH")?;
+    let executable = format!("{name}{}", std::env::consts::EXE_SUFFIX);
     env::split_paths(&paths)
-        .map(|directory| directory.join(name))
+        .map(|directory| directory.join(&executable))
         .find(|candidate| candidate.is_file())
 }
 
@@ -648,7 +677,7 @@ pub const DEFAULT_TASK_TIMEOUT_SECS: u64 = 900;
 /// flash attention automatically on supported backends. Both are the same error: reading a
 /// declaration and calling it a resolved value.
 ///
-/// `getenv` is injected so tests can drive the table without touching `launchctl`.
+/// `getenv` is injected so tests can drive the table without touching the host environment.
 pub fn ollama_env_advisories<F>(getenv: F) -> Value
 where
     F: Fn(&str) -> Option<String>,
@@ -661,7 +690,7 @@ where
         "OLLAMA_NUM_PARALLEL": {
             "value": getenv("OLLAMA_NUM_PARALLEL"),
             "effective_default": "1",
-            "note": "Memory scales by OLLAMA_NUM_PARALLEL x context length — raising it multiplies KV-cache memory, it does not just add scheduling slots. At the default of 1, FreeLlama's own concurrency is unreachable: `/_freellama/v1/tasks` grants resident tasks a SHARED admission permit precisely so they can run together (only cold transitions take the exclusive one), but Ollama then serializes them anyway. Measured here: two concurrent requests against an already-resident model returned 1.12x, i.e. no gain. Raise this to overlap resident work, and pair it with OLLAMA_KV_CACHE_TYPE=q8_0 so the extra KV cache roughly pays for itself.",
+            "note": "Memory scales by OLLAMA_NUM_PARALLEL x context length — raising it multiplies KV-cache memory, it does not just add scheduling slots. At the default of 1, FreeLlama's SHARED resident permits cannot create parallel decoding within the same Ollama backend: measured here, Ollama serializes two concurrent requests against one resident model, producing only 1.12x. Separate CPU and GPU Ollama processes can still overlap through FreeLlama's independent backend admission pools. Raise this only for same-backend overlap, and pair it with OLLAMA_KV_CACHE_TYPE=q8_0 so the extra KV cache roughly pays for itself.",
         },
         "OLLAMA_KEEP_ALIVE": {
             "value": getenv("OLLAMA_KEEP_ALIVE"),
@@ -675,7 +704,7 @@ where
         "OLLAMA_KV_CACHE_TYPE": {
             "value": getenv("OLLAMA_KV_CACHE_TYPE"),
             "effective_default": "f16",
-            "note": "q8_0 roughly halves KV-cache memory for a given context length. It needs flash attention, which is auto-enabled on supported backends (Metal included) — so it is usually available without setting anything else. Why it matters more than it looks: prefix KV-cache reuse is real and measured here (a warm 2,462-token prefix re-served in 281ms vs 18,631ms cold, surviving interleaved conversations), so KV memory is what keeps conversations warm. Halving it buys double the cacheable context — which also makes context compaction (a byte-prefix edit that invalidates the cache from that point) rare.",
+            "note": "q8_0 roughly halves KV-cache memory for a given context length; Ollama describes the precision loss as very small and recommends q8_0 when memory pressure matters. It still changes a process-wide numerical setting, so qualify model quality before rollout. It needs flash attention, which is auto-enabled on supported backends (Metal included). Prefix KV-cache reuse is real and measured here (a warm 2,462-token prefix re-served in 281ms vs 18,631ms cold), so halving KV memory can double cacheable context and reduce cache-invalidating compaction.",
         },
         "OLLAMA_FLASH_ATTENTION": {
             "value": getenv("OLLAMA_FLASH_ATTENTION"),
@@ -756,31 +785,30 @@ pub async fn doctor(endpoint: &str) -> Result<Value> {
         diagnostic.resolved_path = resolved_path.map(|path| path.display().to_string());
         Some(diagnostic)
     });
-    let env_config = ollama_env_advisories(launchctl_getenv);
-    // Read the value back out of the table rather than calling `launchctl getenv` a second time
-    // for the same variable — one subprocess spawn per doctor run, not two, and no way for the
-    // advisory and the reported value to disagree.
+    let env_config = ollama_env_advisories(ollama_environment_getenv);
+    // Read the value back out of the table rather than probing the selected environment source a
+    // second time, so the advisory and reported value cannot disagree.
     let ollama_env_config_warning =
         max_loaded_models_advisory(env_config["OLLAMA_MAX_LOADED_MODELS"]["value"].as_str());
     // Previously only 3 of Ollama's 16 `OLLAMA_*` variables were reported, and the three that
     // dominate memory were not among them. Each entry below carries its effective default, because
-    // `launchctl getenv` returning empty means "Ollama picks" — which is not the same as "off",
-    // and reporting a bare null invites exactly the misreading that produced the wrong
-    // MAX_LOADED_MODELS advisory above.
+    // A missing best-effort value can mean "Ollama picks" or that a separately launched service
+    // has an environment this process cannot see. Either interpretation differs from "off".
     Ok(json!({
         "endpoint": endpoint,
         "version": version,
         "ollama_cli": cli,
         "running": running,
         "ollama_env_config": env_config,
-        // Stated rather than implied: `launchctl getenv` reads the launchd session environment,
-        // which is what the Ollama.app inherits. A server started from a shell
-        // (`OLLAMA_CONTEXT_LENGTH=64000 ollama serve`) has its variables in that process's
-        // environment only, where launchctl cannot see them — verified. A `null` value below
-        // therefore means "not set via launchd", not "definitely unset". Ollama exposes no
-        // endpoint reporting its own effective config, so this is a real limit, not an oversight.
-        "ollama_env_config_source": "launchctl getenv (launchd session env, i.e. what Ollama.app inherits). A server launched from a shell with inline env vars will show null here even when the values are set in its own process environment.",
+        // Ollama exposes no endpoint for the server's resolved environment. Report the exact
+        // visibility boundary so a null is never mistaken for proof that a separate service (or
+        // a remote endpoint) left the setting unset.
+        "ollama_env_config_source": ollama_environment_source(),
         "ollama_env_config_warning": ollama_env_config_warning,
+        // Local OS discovery — does not need `freellama serve`. MCP used to fetch this from serve
+        // and report `machine: null` whenever serve was down, which hid the chip/RAM exactly when
+        // you were diagnosing a broken setup.
+        "machine": crate::platform::machine_profile(endpoint),
     }))
 }
 

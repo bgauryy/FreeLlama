@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Restarts the local Ollama server, then starts the FreeLlama proxy (127.0.0.1:11435) in front
-# of it. Every agent adapter talks to the proxy, not raw Ollama — the proxy adds retry/backoff
-# on transient upstream 5xx errors (packages/rust-core/src/proxy.rs), which raw Ollama does not provide itself.
+# Restarts the local Ollama server, then ensures something is listening on 127.0.0.1:11435
+# (existing `freellama serve`, or a passthrough `freellama proxy`). Adapters talk to 11435, not
+# raw Ollama: the sidecar retries 500/502/504 load blips (not 503 busy) — see
+# packages/rust-core/src/proxy.rs.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
@@ -31,6 +32,11 @@ if pgrep -f "target/release/freellama proxy" >/dev/null 2>&1; then
   echo "stopping running freellama proxy..."
   pkill -f "target/release/freellama proxy" 2>/dev/null || true
   sleep 1
+fi
+
+if curl -sf http://127.0.0.1:11435/api/version >/dev/null 2>&1; then
+  echo "127.0.0.1:11435 already up (freellama serve or leftover proxy) — not starting another listener"
+  exit 0
 fi
 
 echo "starting freellama proxy (127.0.0.1:11435 -> 127.0.0.1:11434)..."

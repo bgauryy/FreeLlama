@@ -11,7 +11,7 @@ mkdirSync(dst, { recursive: true });
 let n = 0;
 // agent_context.py is imported by both adapters at runtime — omitting it turns a packed
 // install into an ImportError on the first delegate_research call.
-for (const f of ["agent_context.py", "bash_agent.py", "octocode_agent.py"]) {
+for (const f of ["agent_context.py", "agent_transport.py", "bash_agent.py", "octocode_agent.py"]) {
   const from = path.join(src, f);
   if (!existsSync(from)) {
     console.error(`bundle-adapters: missing ${from} — delegate_research will not work when packed`);

@@ -241,7 +241,31 @@ fn normalize_inferred_requirements(
 }
 
 fn contains_any(text: &str, needles: &[&str]) -> bool {
-    needles.iter().any(|needle| text.contains(needle))
+    needles.iter().any(|needle| {
+        text.match_indices(needle).any(|(start, matched)| {
+            let mut end = start + matched.len();
+            let starts_at_boundary = text[..start]
+                .chars()
+                .next_back()
+                .is_none_or(|character| !character.is_alphanumeric());
+            // Intent terms are written in their singular form, but ordinary plural forms should
+            // still count. Only consume a trailing `s` when it is itself at a word boundary, so
+            // `photos` matches `photo` while `photosynthesis` remains unrelated.
+            if text[end..].starts_with('s')
+                && text[end + 1..]
+                    .chars()
+                    .next()
+                    .is_none_or(|character| !character.is_alphanumeric())
+            {
+                end += 1;
+            }
+            let ends_at_boundary = text[end..]
+                .chars()
+                .next()
+                .is_none_or(|character| !character.is_alphanumeric());
+            starts_at_boundary && ends_at_boundary
+        })
+    })
 }
 
 pub(super) fn intent_system_prompt() -> &'static str {

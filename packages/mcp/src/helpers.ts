@@ -1,11 +1,51 @@
 // Shared MCP result helpers, Zod parameter schemas, the confidence gate, and payload trimming.
+import { existsSync, realpathSync, statSync } from "node:fs";
+import path from "node:path";
 import { z } from "zod";
-import { DEFAULT_OLLAMA_ENDPOINT, DEFAULT_OLLAMA_FETCH_TIMEOUT_SECONDS } from "./config.js";
+import { DEFAULT_OLLAMA_ENDPOINT, DEFAULT_OLLAMA_FETCH_TIMEOUT_SECONDS, DEFAULT_PULL_TIMEOUT_SECONDS } from "./config.js";
+
+/**
+ * Find the first existing file explicitly named in a shell command, confined to the workspace.
+ *
+ * Bash-agent calls carry only a command string, unlike Octocode calls with a structured path.
+ * This deliberately does not guess from globs, `find -name`, or answer prose: a citation path is
+ * emitted only when the command itself contains an existing file path inside the allowed root.
+ */
+export function extractExistingWorkspacePath(command: string, workspace: string): string | null {
+  let root: string;
+  try {
+    root = realpathSync(workspace);
+  } catch {
+    return null;
+  }
+  const tokens = command.match(/(?:[^\s"'\\]+|"(?:\\.|[^"])*"|'[^']*')+/g) ?? [];
+  const patternFlags = new Set(["-name", "-iname", "-path", "-ipath", "-regex", "-iregex", "-wholename"]);
+  for (let index = 0; index < tokens.length; index += 1) {
+    const raw = tokens[index] ?? "";
+    if (index > 0 && patternFlags.has(tokens[index - 1] ?? "")) continue;
+    const token = raw
+      .replace(/^["']|["']$/g, "")
+      .replace(/[|;&)]+$/g, "")
+      .replace(/:\d+(?::\d+)?$/, "");
+    if (!token || token.startsWith("-") || /[*?$`]/.test(token)) continue;
+    const candidate = path.isAbsolute(token) ? token : path.resolve(root, token);
+    if (!existsSync(candidate)) continue;
+    try {
+      const resolved = realpathSync(candidate);
+      const relative = path.relative(root, resolved);
+      const withinRoot = relative && relative !== ".." && !relative.startsWith(`..${path.sep}`);
+      if (withinRoot && statSync(resolved).isFile()) return relative;
+    } catch {
+      // A raced-away or unreadable token is not citation evidence; inspect the next token.
+    }
+  }
+  return null;
+}
 
 export async function ollamaFetch(
   endpoint: string | undefined,
   path: string,
-  init: { method?: string; body?: unknown; timeoutMs?: number } = {},
+  init: { method?: string; body?: unknown; timeoutMs?: number; parse?: "json" | "ndjson" } = {},
 ): Promise<unknown> {
   const base = (endpoint ?? DEFAULT_OLLAMA_ENDPOINT).replace(/\/$/, "");
   const controller = new AbortController();
@@ -24,32 +64,129 @@ export async function ollamaFetch(
     if (!response.ok) {
       throw new Error(`Ollama ${init.method ?? "GET"} ${path} -> HTTP ${response.status}: ${text}`);
     }
-    return text ? JSON.parse(text) : {};
+    if (!text) return {};
+    if (init.parse === "ndjson") return text;
+    return JSON.parse(text);
   } finally {
     clearTimeout(timeout);
   }
 }
 
+/**
+ * Collapse Ollama `/api/pull` NDJSON into one object an agent can read.
+ *
+ * `stream: false` hid every byte of a multi-GB download behind a blocking wait. Each NDJSON
+ * line is a status snapshot (`pulling manifest`, layer digest, `completed`/`total`). Keep the
+ * last line and the last line that had a byte total so the tool result reports percent done
+ * (or `success` for an already-installed tag) instead of a silent hang.
+ */
+export function summarizeOllamaPullStream(text: string): Record<string, unknown> {
+  const events: Record<string, unknown>[] = [];
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const parsed = JSON.parse(trimmed) as unknown;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        events.push(parsed as Record<string, unknown>);
+      }
+    } catch {
+      // Non-JSON noise on the stream is ignored; the last valid event is the result.
+    }
+  }
+  if (events.length === 0) {
+    if (!text.trim()) return { status: "empty" };
+    try {
+      const parsed = JSON.parse(text) as unknown;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
+    } catch {
+      return { status: "unparsed", raw: clipText(text, 500) };
+    }
+    return { status: "unparsed", raw: clipText(text, 500) };
+  }
+  const last = events[events.length - 1] ?? {};
+  const withBytes = [...events]
+    .reverse()
+    .find((event) => typeof event.total === "number" && (event.total as number) > 0);
+  const completed = typeof withBytes?.completed === "number" ? (withBytes.completed as number) : null;
+  const total = typeof withBytes?.total === "number" ? (withBytes.total as number) : null;
+  const percent =
+    completed != null && total != null && total > 0
+      ? Math.round((completed / total) * 1000) / 10
+      : null;
+  // Ollama reports failures as an {"error": ...} event on an HTTP 200 stream (verified live: a
+  // bogus tag yields `pulling manifest` then `{"error":"pull model manifest: ..."}`), so nothing
+  // at the transport layer fails. Without this, a failed pull came back success-shaped.
+  const status = typeof last.error === "string" && last.error ? "error" : last.status;
+  return {
+    ...last,
+    ...(status === undefined ? {} : { status }),
+    progress: {
+      events: events.length,
+      completed,
+      total,
+      percent,
+      lastStatus: last.status ?? null,
+    },
+  };
+}
+
+export async function ollamaPull(
+  endpoint: string | undefined,
+  model: string,
+  timeoutSeconds?: number,
+): Promise<Record<string, unknown>> {
+  const raw = await ollamaFetch(endpoint, "/api/pull", {
+    method: "POST",
+    body: { name: model, stream: true },
+    timeoutMs: (timeoutSeconds ?? DEFAULT_PULL_TIMEOUT_SECONDS) * 1000,
+    parse: "ndjson",
+  });
+  if (typeof raw === "string") return summarizeOllamaPullStream(raw);
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) return raw as Record<string, unknown>;
+  return { status: "empty" };
+}
+
 // Self-evident params carry no `.describe()`: the name says it, the default is in the server
 // instructions, and every description is re-sent on every request. Only params whose BEHAVIOUR
 // isn't obvious from the name keep one.
-export const endpointParam = z.string().optional().describe("serve endpoint, default :11435");
-export const ollamaEndpointParam = z.string().optional().describe("Ollama endpoint, default :11434");
-export const taskParam = z.string().describe('e.g. completion, code_repair, vision, embedding');
+export const endpointParam = z.string().min(1).optional().describe("serve endpoint, default :11435");
+export const ollamaEndpointParam = z.string().min(1).optional().describe("Ollama endpoint, default :11434");
+export const TASK_KINDS = [
+  "completion",
+  "coding",
+  "code_repair",
+  "tools",
+  "browser",
+  "vision",
+  "embedding",
+  "long_context",
+] as const;
+export const taskParam = z.enum(TASK_KINDS).describe("Exact managed task profile.");
 export const objectiveParam = z
   .enum(["fastest", "balanced", "quality"])
   .optional()
-  .describe('"balanced"/"quality" need a configured policy; "fastest" does not');
-// The server grades every route decision (`route_evidence` in packages/rust-core/src/platform/routing.rs): "medium" only
-// when the task has BOTH a configured policy and benchmark data, "low" otherwise — there is no
-// "high". A "low"/capability_metadata_only decision is exactly what returned `qwen2.5:0.5b` for
-// code repair on this machine. Unchecked, that answer comes back looking like any other.
+  .describe('"balanced"/"quality" need a policy; "fastest" does not');
+export const executionPreferenceParam = z
+  .enum(["auto", "prefer_cpu", "prefer_gpu"])
+  .optional()
+  .describe(
+    'Backend hint. "auto" uses guarded runtime feedback; prefer_* falls back when no eligible operator-assigned model exists.',
+  );
+export const minPlacementEvidenceParam = z
+  .enum(["configured", "observed"])
+  .optional()
+  .describe('"observed" fails closed unless Ollama /api/ps confirms the selected processor');
+// Router grades only "low" | "medium". A low/capability-only pick once selected a far-too-small
+// model for a demanding task — the answer still looked confident.
 const CONFIDENCE_RANK: Record<string, number> = { low: 1, medium: 2 };
 
 export const minConfidenceParam = z
   .enum(["low", "medium"])
   .optional()
-  .describe('Fail closed below this. "medium" needs a policy AND benchmark data; "low" (default) accepts capability metadata alone. The refusal names what was missing');
+  .describe('Fail closed below this. "medium" needs policy AND benchmark; "low" accepts capability metadata.');
 
 /**
  * Fail closed when a route decision isn't backed well enough for what the caller asked.
@@ -61,7 +198,9 @@ export const minConfidenceParam = z
 export function belowConfidence(decision: Record<string, unknown>, minConfidence?: "low" | "medium") {
   if (!minConfidence) return null;
   const actual = typeof decision.confidence === "string" ? decision.confidence : "low";
-  if ((CONFIDENCE_RANK[actual] ?? 1) >= (CONFIDENCE_RANK[minConfidence] ?? 1)) return null;
+  // Unknown grades rank 0, matching the core gate (`unwrap_or(0)`). Ranking them as "low"
+  // would fail-open against `minConfidence: "low"`.
+  if ((CONFIDENCE_RANK[actual] ?? 0) >= (CONFIDENCE_RANK[minConfidence] ?? 0)) return null;
   return errorResult(
     new Error(
       `Route refused: confidence is "${actual}" (evidence: ${decision.evidence}), below the ` +
@@ -74,10 +213,19 @@ export function belowConfidence(decision: Record<string, unknown>, minConfidence
   );
 }
 
+export const REQUIRED_CAPABILITIES = [
+  "completion",
+  "tools",
+  "vision",
+  "audio",
+  "thinking",
+  "embedding",
+] as const;
 export const requiredCapabilitiesParam = z
-  .array(z.string())
+  .array(z.enum(REQUIRED_CAPABILITIES))
+  .max(REQUIRED_CAPABILITIES.length)
   .optional()
-  .describe('e.g. ["vision"], ["tools"]. Fails closed rather than picking a model that can\'t do it');
+  .describe('Additional hard requirements, e.g. ["vision"] or ["tools"]. Fails closed if unmet.');
 
 // Pretty-printing is easier for a model to read but is pure overhead once a payload is large:
 // a single 768-dim embedding measured 10,293 bytes compact vs 17,471 pretty — ~1,800 wasted
@@ -147,6 +295,57 @@ export function parsedResult(raw: string) {
 export function errorResult(error: unknown) {
   const message = error instanceof Error ? error.message : String(error);
   return { content: [{ type: "text" as const, text: message }], isError: true };
+}
+
+const adapterCallSchema = z
+  .object({
+    raw_name: z.string().optional(),
+    status: z.string().optional(),
+    arguments: z
+      .object({
+        tool: z.string().optional(),
+        command: z.string().optional(),
+        queries: z.object({ path: z.string().optional() }).passthrough().optional(),
+      })
+      .passthrough()
+      .optional(),
+  })
+  .passthrough();
+
+const adapterResultSchema = z.object({
+  final_answer: z.string(),
+  tool_calls: z.array(adapterCallSchema).default([]),
+  usage: z
+    .object({
+      input_tokens: z.number().nullable().optional(),
+      output_tokens: z.number().nullable().optional(),
+    })
+    .passthrough()
+    .default({}),
+  model_metadata: z
+    .object({
+      context_compactions: z.number().int().nonnegative().optional(),
+      runtime_config: z.record(z.string(), z.unknown()).optional(),
+      context_management: z
+        .object({
+          token_counting: z.enum(["configured_estimate", "model_calibrated_estimate"]),
+          estimate_scale: z.number().positive(),
+          calibration_samples: z.number().int().nonnegative(),
+          pinned_overflow: z.enum(["error", "clip"]),
+          compactions: z.number().int().nonnegative(),
+        })
+        .passthrough()
+        .optional(),
+    })
+    .passthrough()
+    .optional(),
+});
+
+export type AdapterResult = z.infer<typeof adapterResultSchema>;
+
+/** Parse adapter result.json. Valid JSON missing `final_answer`/`tool_calls` used to throw later. */
+export function parseAdapterResult(raw: string): AdapterResult {
+  return adapterResultSchema.parse(JSON.parse(raw));
 }
 
 // Output schemas were removed deliberately. They cost ~1,086 tokens on EVERY request to buy

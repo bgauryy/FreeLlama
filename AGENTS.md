@@ -39,13 +39,11 @@ files by pattern, code search, semantic content retrieval, and LSP-based queries
   "ask again or search instead", never "unsupported". `localSearchCode` needs no index and cannot
   be cold, which is why it stays the default.
 
-**Decoding/runtime config:** `temperature=0`, `seed=42`, `num_predict=512`,
-`tool_timeout_seconds=45` are hardcoded constants — edit them in `octocode_agent.py` directly.
-Two values read the environment: `max_turns` from `FREELLAMA_AGENT_MAX_TURNS` (default 10;
-`delegate_research` sets 8), and `num_ctx` from `FREELLAMA_AGENT_NUM_CTX` (default 8192). The
-window is tunable because prefix KV-cache reuse is real and measured (~0.3s warm vs ~19s cold), so
-a larger window is cheaper than it looks and avoids cache-invalidating compaction; with
-`OLLAMA_KV_CACHE_TYPE=q8_0`, 16384 costs the KV memory 8192 costs at f16.
+**Decoding/runtime config:** defaults are `temperature=0`, `seed=42`, `num_predict=512`,
+`tool_timeout_seconds=45`, `max_turns=10` (`delegate_research` sets 8), and `num_ctx=8192`.
+All operational values are validated environment settings; use the `delegate_research.agent`
+object for per-call overrides. See **Adapter configuration schema** below. Safety confinement and
+the JSON-only action contract are invariants, not configuration knobs.
 
 **Use when:** You need an agent to answer code-research questions efficiently, with access to
 structured code navigation and semantic understanding. The tool provides exact paths and evidence,
@@ -73,9 +71,9 @@ awk, etc). No specialized tools; must solve problems using only what the shell p
 - ❌ Blocked (regex denylist in the script): `sudo`, `rm -rf /`, `curl`, `wget`, `nc`, `ssh`, fork
   bombs, device-file redirects.
 
-**Decoding/runtime config (same rules as above):** `temperature=0`, `seed=42`, `num_predict=512`,
-`command_timeout_seconds=30` hardcoded; `max_turns` from `FREELLAMA_AGENT_MAX_TURNS` (default 10)
-and `num_ctx` from `FREELLAMA_AGENT_NUM_CTX` (default 8192).
+**Decoding/runtime config (same schema as above):** the Bash tool timeout defaults to 30 seconds;
+every other default matches Octocode. Override `FREELLAMA_AGENT_TOOL_TIMEOUT_SECONDS` when the
+tool surface needs a different deadline.
 
 **Use when:** You want to measure how well a model can solve code-research problems using only
 primitive shell tools, without specialized language-aware features. Useful as a baseline or to
@@ -110,8 +108,8 @@ When the benchmark harness (`benchmark/harness/scripts/run.py`) runs an agent:
    - `FREELLAMA_OLLAMA_ENDPOINT` — HTTP endpoint of Ollama (or the FreeLlama proxy)
    - `FREELLAMA_BENCH_WORKSPACE` / `FREELLAMA_BENCH_PROMPT` / `FREELLAMA_AGENT_RESULT` — paths for
      the disposable workspace copy, the question text, and where to write the result JSON
-   - Everything else (temperature, seed, timeouts, truncation limits) is a hardcoded constant in
-     the adapter script itself, not read from the environment
+   - Runtime, retry, pagination, and context-policy settings are validated from `FREELLAMA_AGENT_*`;
+     invalid combinations fail before an Ollama call and name the rejected setting
 
 2. **Task loop** — For each question/task:
    - Agent receives the task prompt and a disposable copy of the fixture repos
@@ -160,8 +158,9 @@ flowchart TD
     DUP -->|"no"| RUN["execute, store FULL output"]
     RUN --> PAGE["show page 1 + next-page action"]
     NOTE --> FIT
-    PAGE --> FIT["fit_to_context()<br/>pin system + question,<br/>compact oldest observations"]
-    FIT --> C
+    PAGE --> FIT["fit_to_context()<br/>preserve system + question bytes,<br/>compact oldest observations"]
+    FIT -->|"fits"| C
+    FIT -->|"pinned content cannot fit"| DIE3["fail closed before Ollama truncates"]
 ```
 
 | Behaviour | Without it |
@@ -185,22 +184,42 @@ returns prose instead of JSON. The run is recorded as `model did not return a JS
 parsing failure that reads like model weakness but is really a harness bug. Any benchmark number
 gathered from a long run before this was fixed understates the model.
 
-`fit_to_context` runs after every turn and:
+`fit_to_context` runs before the first call and after every turn. It:
 
-- **pins** the system prompt and the original question — the two messages Ollama would delete first;
+- **byte-preserves** the system prompt and original question by default — the two messages Ollama
+  would delete first; if they cannot fit, the adapter errors before calling Ollama;
 - **compacts** older observations to a one-line breadcrumb, oldest first, so every step the agent
   took stays visible even when its full text is gone;
 - **keeps the two most recent observations verbatim**, since those are what the model is reasoning
   over right now;
 - **clips the recent ones too**, looping until the estimate actually fits, if even they overflow.
 
-Budgeting uses a 4-characters-per-token estimate minus `num_predict` and a 256-token margin.
-Ollama reports no token count until after a call, so an estimate is the only option; it rounds up,
-which trims slightly early — the safe direction, because over-trimming is visible and
-under-trimming is silent. Each result reports `model_metadata.context_compactions`, so a run that
-needed compaction is distinguishable from one that never came close.
+The first call uses the configured 4-characters-per-token estimate. Ollama has no stable preflight
+tokenizer endpoint; after each successful call, the budgeter calibrates upward from Ollama's own
+`prompt_eval_count` and never becomes less conservative. The input budget reserves `num_predict`
+plus a configurable 256-token margin. Emergency clipping retains 80% of the *current* largest
+observation per pass, repeating until it fits; 80% is not the activation threshold. Setting
+`FREELLAMA_AGENT_PINNED_OVERFLOW=clip` opts into the older last-resort pinned clipping behavior.
 
-Contracts: `benchmark/local/scripts/test_agent_context.py` (`python3 test_agent_context.py`).
+Each result reports `model_metadata.context_management`: resolved policy, counting mode
+(`configured_estimate` or `model_calibrated_estimate`), calibration scale/sample count, estimated
+input budget, and compaction count.
+
+## Adapter configuration schema
+
+| Area | Environment variables |
+|---|---|
+| Loop/model | `MAX_TURNS`, `NUM_CTX`, `NUM_PREDICT`, `TEMPERATURE`, `SEED`, `THINK`, `KEEP_ALIVE` |
+| Deadlines/retry | `REQUEST_TIMEOUT_SECONDS`, `TOOL_TIMEOUT_SECONDS`, `RETRY_ATTEMPTS`, `RETRY_BACKOFF_SECONDS`, `MAX_PARSE_REPAIRS`, `PARSE_REPAIR_ECHO_CHARS` |
+| Budget estimate | `CHARS_PER_TOKEN`, `SAFETY_MARGIN_TOKENS`, `IMAGE_TOKEN_ESTIMATE` |
+| Compaction/paging | `KEEP_RECENT`, `COMPACT_PREVIEW_CHARS`, `COMPACT_RETAIN_RATIO`, `CLIP_HEAD_RATIO`, `OBSERVATION_PAGE_CHARS`, `PINNED_OVERFLOW` |
+
+Prefix each table entry with `FREELLAMA_AGENT_`. The MCP `delegate_research.agent` object exposes
+the same fields in camelCase. Defaults and validation live once in `AgentRuntimeConfig` and
+`ContextPolicy`; both adapters consume those shared schemas.
+
+Contracts: `benchmark/local/scripts/test_agent_context.py` (63 context/pagination contracts) and
+`test_agent_actions.py` (strict Bash and Octocode action shapes).
 
 ## Extending with a new agent
 

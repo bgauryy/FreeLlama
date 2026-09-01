@@ -91,6 +91,42 @@ async fn proxy_retries_transient_upstream_errors_and_eventually_succeeds() {
     );
 }
 
+/// 503 is "busy, shed load" — retrying it through the passthrough would amplify the same
+/// saturation the managed path already refuses to retry.
+#[tokio::test]
+async fn proxy_does_not_retry_upstream_503() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = calls.clone();
+    let router = Router::new().fallback(any(move |State(()): State<()>| {
+        let counter = counter.clone();
+        async move {
+            counter.fetch_add(1, Ordering::SeqCst);
+            (StatusCode::SERVICE_UNAVAILABLE, "busy").into_response()
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let config = ProxyConfig::new("127.0.0.1:0", format!("http://{addr}"), false);
+    let proxy = app(config).unwrap();
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/chat")
+        .body(Body::from("{}"))
+        .unwrap();
+    let response = proxy.oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "503 must not be retried on the passthrough proxy"
+    );
+}
+
 /// Spawns an upstream that accepts the connection but never responds (holds it open past
 /// `hang_for`), to exercise the proxy's per-request timeout independent of retry logic.
 async fn spawn_hanging_upstream(hang_for: std::time::Duration) -> String {

@@ -4,18 +4,17 @@ import { existsSync } from "node:fs";
 import { realpath } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { homedir } from "node:os";
 
 /**
  * Repo root, found by walking up to the directory containing `Cargo.toml`.
  *
- * This used to be `path.resolve(import.meta.url, "../../../")` — a hardcoded depth, which meant
- * relocating this package (say under a `packages/` monorepo layout) would silently resolve
- * REPO_ROOT one level short. That is not a cosmetic bug: REPO_ROOT is the default for
- * `ALLOWED_RESEARCH_ROOTS`, so a wrong value silently widens the directory boundary
- * `delegate_research` is allowed to read. Anchoring on a marker file makes the location a
- * non-issue. Falls back to the old relative guess if no marker is found.
+ * Anchoring on `Cargo.toml` makes the checkout location a non-issue. A published install has
+ * no marker in the tarball — do **not** fall back to a relative `../` guess, which from `dist/`
+ * resolved to `node_modules` and silently became the default `ALLOWED_RESEARCH_ROOTS`.
+ * Unmarked installs must set `FREELLAMA_MCP_ALLOWED_ROOTS`.
  */
-function findRepoRoot(): string {
+function findRepoRoot(): string | undefined {
   let dir = path.dirname(fileURLToPath(import.meta.url));
   for (let depth = 0; depth < 10; depth += 1) {
     if (existsSync(path.join(dir, "Cargo.toml"))) return dir;
@@ -23,31 +22,17 @@ function findRepoRoot(): string {
     if (parent === dir) break;
     dir = parent;
   }
-  return path.resolve(fileURLToPath(import.meta.url), "../../../");
+  // No marker: a published install must not guess. The old relative fallback from `dist/`
+  // resolved to `node_modules`, which silently became the default research allowlist.
+  return undefined;
 }
 
-export const REPO_ROOT = findRepoRoot();
-// Two interchangeable research adapters. They take an identical env interface and write an
-// identical result shape, so which one runs is purely a routing decision — and this repo's own
-// benchmark settles it. From `benchmark/local/results/*/aggregate.json` (30 questions x 3 repos,
-// same model, same tasks, one variable):
-//
-//   model                  bash pass@1   octocode pass@1   bash median   octocode median
-//   qwen3.8:27b-mlx           86.7%          86.7%            19.6s          55.6s
-//   muse-glimmer:30b-mlx      96.7%          63.3%            28.3s         103.0s
-//   gemma4:12b-mlx             6.7%           0.0%              —              —
-//
-// bash wins or ties on every model, at 116.5 vs 53.8 successful tasks/hour. Confirmed again live
-// on a single question: 15.7s / 791 input tokens (bash) vs ~40s / 7,761 (octocode). Hence the
-// default below. `octocode` stays available because its structured search may still suit
-// questions the flat 30-question suite doesn't represent — but it has to be asked for.
-//
-// Resolution order matters for a PUBLISHED install. In-repo the adapters live in `benchmark/`,
-// which is their single source of truth; `npm run build` copies them into `adapters/` so the
-// packed tarball carries them too. Without that copy `delegate_research` is dead on arrival once
-// installed from npm — `files` ships only `dist`/`native`, so the python would simply not be there
-// and every call would fail with ENOENT.
+export const REPO_ROOT = findRepoRoot() ?? path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+// Two interchangeable research adapters. Same env contract and result shape. In-repo
+// measurements: bash tied or beat octocode on every model, and was faster — hence the default.
+// `octocode` remains for structured search when asked. Numbers: benchmark/local/results.
 export const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+// `npm run build` copies adapters into adapters/ so a published tarball still has them.
 
 function adapterPath(file: string): string {
   const bundled = path.join(PACKAGE_ROOT, "adapters", file);
@@ -78,18 +63,29 @@ export const DEFAULT_OLLAMA_ENDPOINT = process.env.FREELLAMA_OLLAMA_ENDPOINT ?? 
 // Same env var name the Rust side (packages/rust-core/src/napi.rs) uses for its own serve-endpoint default — one
 // name, one meaning, across both languages.
 export const DEFAULT_SERVE_ENDPOINT = process.env.FREELLAMA_SERVE_ENDPOINT ?? "http://127.0.0.1:11435";
+// docs/MODEL_SELECTION.md owns the measured default; override per machine.
 export const DEFAULT_DELEGATE_MODEL = process.env.FREELLAMA_MCP_DEFAULT_MODEL ?? "qwen3.8:27b-mlx";
 export const DEFAULT_DELEGATE_MAX_TURNS = envInt("FREELLAMA_MCP_MAX_TURNS", 8);
 export const DEFAULT_DELEGATE_TIMEOUT_SECONDS = envInt("FREELLAMA_MCP_DELEGATE_TIMEOUT_SECONDS", 180);
 export const DEFAULT_PULL_TIMEOUT_SECONDS = envInt("FREELLAMA_MCP_PULL_TIMEOUT_SECONDS", 1200);
 export const DEFAULT_OLLAMA_FETCH_TIMEOUT_SECONDS = envInt("FREELLAMA_MCP_FETCH_TIMEOUT_SECONDS", 30);
+export const DEFAULT_TOKEN_CALIBRATION_DIR =
+  process.env.FREELLAMA_AGENT_TOKEN_CALIBRATION_DIR ??
+  path.join(
+    process.env.XDG_DATA_HOME ??
+      (process.platform === "win32"
+        ? (process.env.LOCALAPPDATA ?? path.join(homedir(), "AppData", "Local"))
+        : path.join(homedir(), ".local", "share")),
+    "freellama",
+    "token-calibration",
+  );
 
 // `delegate_research` grants a local model read access to whatever directory it's pointed at.
 // Without a boundary, an orchestrator (or a bug, or a compromised orchestrator) could point it at
 // $HOME or / and have a local model read arbitrary files on the machine — verified live: an
 // unconstrained version of this tool happily listed a real $HOME (Desktop, Documents, Library...).
 // Default to just this repo; extend via a colon-separated allowlist, never accept "anything".
-const ALLOWED_RESEARCH_ROOTS = (process.env.FREELLAMA_MCP_ALLOWED_ROOTS ?? REPO_ROOT)
+const ALLOWED_RESEARCH_ROOTS = (process.env.FREELLAMA_MCP_ALLOWED_ROOTS ?? findRepoRoot() ?? "")
   .split(":")
   .filter(Boolean)
   .map((root) => path.resolve(root));
@@ -127,6 +123,13 @@ export async function assertAllowedWorkspace(workspacePath: string): Promise<str
     );
   }
   const roots = await allowedResearchRoots();
+  if (roots.length === 0) {
+    throw new Error(
+      `workspacePath "${workspacePath}" is rejected because no research roots are configured. ` +
+        "Set FREELLAMA_MCP_ALLOWED_ROOTS (colon-separated absolute paths) to the directories " +
+        "`delegate_research` may read. In a FreeLlama checkout this defaults to the repo root.",
+    );
+  }
   const allowed = roots.some(
     (root) => resolved === root || resolved.startsWith(`${root}${path.sep}`),
   );

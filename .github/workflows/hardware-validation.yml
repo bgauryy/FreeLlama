@@ -1,0 +1,43 @@
+name: Hardware validation
+
+on:
+  workflow_dispatch:
+
+jobs:
+  live:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: apple-metal
+            labels: '["self-hosted","macOS","ARM64","freellama-metal"]'
+          - name: linux-nvidia
+            labels: '["self-hosted","Linux","X64","freellama-nvidia"]'
+          - name: linux-amd
+            labels: '["self-hosted","Linux","X64","freellama-amd"]'
+          - name: windows-nvidia
+            labels: '["self-hosted","Windows","X64","freellama-nvidia"]'
+    runs-on: ${{ fromJSON(matrix.labels) }}
+    environment: hardware-${{ matrix.name }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate prepared CPU/GPU services
+        shell: bash
+        env:
+          FREELLAMA_HARDWARE_ENDPOINT: ${{ vars.FREELLAMA_HARDWARE_ENDPOINT }}
+          FREELLAMA_HARDWARE_GPU_MODEL: ${{ vars.FREELLAMA_HARDWARE_GPU_MODEL }}
+          FREELLAMA_HARDWARE_CPU_MODEL: ${{ vars.FREELLAMA_HARDWARE_CPU_MODEL }}
+          FREELLAMA_HARDWARE_AUTH_TOKEN_FILE: ${{ vars.FREELLAMA_HARDWARE_AUTH_TOKEN_FILE }}
+        run: |
+          python3 benchmark/hardware/run_validation.py \
+            --endpoint "${FREELLAMA_HARDWARE_ENDPOINT:-http://127.0.0.1:11435}" \
+            --gpu-model "$FREELLAMA_HARDWARE_GPU_MODEL" \
+            --cpu-model "$FREELLAMA_HARDWARE_CPU_MODEL" \
+            --auth-token-file "$FREELLAMA_HARDWARE_AUTH_TOKEN_FILE" \
+            --output ".octocode/hardware/${{ matrix.name }}.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hardware-${{ matrix.name }}
+          path: .octocode/hardware/${{ matrix.name }}.json
+          if-no-files-found: error

@@ -50,7 +50,7 @@ fn catalog_builds_safe_ranked_install_plans() {
             required_capabilities: &required_capabilities,
             requested_context: 4096,
             installed_models: &installed_models,
-            unified_memory_bytes: Some(4000),
+            memory_bytes: Some(4000),
             available_disk_bytes: Some(4000),
         },
     );

@@ -1,0 +1,96 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: darwin-arm64
+          - runner: macos-15-intel
+            target: darwin-x64
+          - runner: ubuntu-24.04
+            target: linux-x64
+          - runner: ubuntu-24.04-arm
+            target: linux-arm64
+          - runner: windows-2025
+            target: win32-x64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: yarn
+      - run: corepack enable
+      - run: yarn install --immutable
+      - run: cargo test --workspace
+      - run: cargo build --release -p freellama-cli
+      - run: yarn build:native
+      - name: Stage target
+        shell: bash
+        run: |
+          mkdir -p release-target
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            cp target/release/freellama.exe release-target/
+          else
+            cp target/release/freellama release-target/
+          fi
+          cp packages/mcp/native/*.node release-target/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: release-target
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          cache: yarn
+      - run: corepack enable
+      - run: yarn install --immutable
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+      - run: node scripts/assemble-release.mjs release-artifacts release
+      - run: yarn workspace freellama-mcp-server build
+      - run: yarn typecheck && yarn test && cargo test --workspace
+      - run: node scripts/verify-release-packages.mjs
+      - name: Pack npm distributions
+        run: |
+          npm pack ./packages/cli --ignore-scripts --pack-destination release
+          npm pack ./packages/mcp --ignore-scripts --pack-destination release
+      - name: Publish npm distributions
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          test -n "$NODE_AUTH_TOKEN" || { echo "NPM_TOKEN is required for the first publication"; exit 1; }
+          npm publish ./packages/cli --ignore-scripts --provenance --access public
+          npm publish ./packages/mcp --ignore-scripts --provenance --access public
+      - name: Publish GitHub release assets
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true

@@ -1,76 +1,139 @@
-# freellama-core
+# `freellama-core`
 
-The whole solution as an embeddable Rust library: model discovery, task-aware routing, session
-affinity, admission control, benchmarking, install planning, and a policy generator. The CLI
-(`packages/cli`) and the MCP server (`packages/mcp`, via NAPI) are both thin shells over this.
+`freellama-core` is the embeddable Rust implementation behind the CLI and MCP server. It owns model
+discovery, deterministic routing, session affinity, admission control, managed execution,
+benchmarking, recommendation planning, and policy generation.
 
-The crate is named `freellama-core`; the library is `freellama`, so consumers write
-`use freellama::…`.
+The crate is named `freellama-core`; its library is named `freellama`, so consumers import
+`freellama::…`.
 
-## Modules
+## Follow the core flow
+
+```mermaid
+flowchart LR
+    C["CLI or NAPI caller"] --> P["platform"]
+    P --> D["discover primary and optional CPU catalogs"]
+    D --> R["filter, rank, and grade route"]
+    R --> A["admission budget and backend transition lock"]
+    A --> O["execute on assigned Ollama backend"]
+    O --> X["auditable response or refusal"]
+```
 
 | Module | Responsibility |
 |---|---|
-| `platform` | The control plane: `/_freellama/v1/*` routes, model discovery, `select_route`, sessions, managed task execution, admission control |
-| `proxy` | Ollama-compatible passthrough with retry, exponential backoff + jitter, per-attempt timeout, and opt-in restart |
-| `model_bench` | Throughput benchmarking across installed models (`bench-all`) |
-| `recommend` | Side-effect-free install plans from a reviewed catalog — never pulls |
-| `policy` | Turns a *quality* benchmark aggregate into a routing policy; see "Evidence" below |
-| `napi` | The sole FFI boundary. Feature-gated off by default |
-| `lib` | `doctor`, frozen-suite running, and comparison |
+| `platform` | Control API, discovery, routing, sessions, managed task execution, and admission |
+| `proxy` | Ollama-compatible passthrough, retries, timeout, jitter, and optional restart |
+| `model_bench` | Capability-grouped throughput measurements across installed models |
+| `recommend` | Side-effect-free installation plans from a reviewed catalog |
+| `policy` | Routing-policy generation from quality-evaluation aggregates |
+| `napi` | Feature-gated Node.js binding and the only FFI boundary |
+| `lib` | Diagnostics, frozen-suite execution, and build comparison |
 
-## Two ideas worth knowing before reading the code
+## Understand admission
 
-**Admission control is a lock, not a queue.** `platform::run_task` takes a *shared* read permit when
-the selected model is already resident and an *exclusive* write permit when it is not, so a cold
-load can never race an active stream. Every HTTP client in the crate sets a timeout, and that is
-load-bearing rather than tidy: an untimed request here would hold the exclusive permit forever and
-deadlock every subsequent managed task.
+The platform combines an independent weighted semaphore and transition lock for each configured
+backend. Embedding costs 1, chat costs 2, and vision costs 4 (capped to the pool size).
 
-**Confidence is earned, not asserted.** `route_evidence` returns `medium` only when a task has both
-a configured policy *and* benchmark data:
+- A resident model takes a shared lock on its assigned backend.
+- A cold model takes an exclusive lock on its assigned backend.
+- Independent CPU and GPU backends can therefore progress concurrently.
+- A task that cannot acquire its weighted permit before the queue deadline receives HTTP 503.
 
-```
-(policy, benchmark) -> medium  configured_task_policy
-(policy, -)         -> low     configured_task_policy
-(-, benchmark)      -> low     functional_throughput_screen
-(-, -)              -> low     capability_metadata_only
-```
+The primary/GPU pool defaults to two weighted units; the optional CPU pool defaults to one. An
+embedding costs 1, ordinary chat costs 2, and vision costs 4 capped to the pool size. Runtime
+feedback records successful resident-task work-unit latency by task and backend: decode
+nanoseconds/output token for generation and total nanoseconds/input token for embeddings. Only
+after three samples exist on each backend and one is more than 10% faster may `auto` steer; it never
+does so for quality routing, explicit models, or session-pinned routes.
 
-A policy without measurement is an unverified claim; measurement without a policy is throughput
-with nobody vouching for correctness. `policy::qualify_from_aggregate` therefore reads *pass rates*
-from a harness aggregate, never `bench-all`'s tokens-per-second — generating a contract from
-throughput would relabel speed as quality and make `medium` pass while meaning nothing. It refuses
-smoke runs (fewer than three trials), aggregates past their review date, and models that are not
-installed.
+Every upstream HTTP client has a timeout. Without it, a stalled request could retain an exclusive
+transition lock and block later managed tasks.
 
-## Building
+## Understand confidence
 
-```bash
-cargo build --release              # library + the CLI in the sibling crate
-cargo test                         # contract tests in tests/
-cargo clippy --all-targets         # zero warnings expected
-```
+Confidence is derived from evidence, not from model metadata alone:
 
-The Node addon is a separate, feature-gated build — napi's FFI symbols only resolve inside a
-running Node process, so the standalone binary must never link them:
+| Policy for task | Local benchmark | Confidence | Evidence label |
+|---|---|---|---|
+| Yes | Yes | Medium | `configured_task_policy` |
+| Yes | No | Low | `configured_task_policy` |
+| No | Yes | Low | `functional_throughput_screen` |
+| No | No | Low | `capability_metadata_only` |
 
-```bash
-npm --prefix ../.. run build       # -> packages/mcp/native/freellama.<triple>.node
-```
+`policy::qualify_from_aggregate` reads correctness pass rates from a harness aggregate. It never
+uses `bench-all` throughput as a quality signal. It also refuses expired evidence, fewer than three
+trials unless explicitly marked as smoke data, and models that are not installed.
 
-`unsafe_code` is `deny` crate-wide; `napi.rs` is the one module that opts out explicitly, because
-napi-derive's generated glue requires it.
-
-## Embedding it
+## Embed the platform
 
 ```rust
-use freellama::platform::{PlatformConfig, serve};
+use freellama::platform::{serve, PlatformConfig};
 
-let config = PlatformConfig::new("127.0.0.1:11435", "http://127.0.0.1:11434", None, None, "…")
-    .with_recommendation_catalog("recommendations.example.toml");
+let config = PlatformConfig::new(
+    "127.0.0.1:11435",
+    "http://127.0.0.1:11434",
+    None,
+    None,
+    "…",
+)
+.with_recommendation_catalog("recommendations.example.toml")
+.with_cpu_backend(
+    "http://127.0.0.1:11436",
+    vec!["nomic-embed-text:latest".to_owned()],
+)
+.with_feedback_file("/var/lib/freellama/feedback.json")
+.with_auth_token("replace-with-a-secret-of-at-least-32-bytes");
+
 serve(config).await?;
 ```
 
-`proxy::serve` runs the passthrough alone. `platform::serve` composes it as a fallback route, so
-`serve` is a superset of `proxy` — see `skills/freellama/references/proxy-vs-serve.md`.
+The CPU backend is optional. When configured, exact assigned model names use it and receive
+`options.num_gpu=0` on managed requests. Raw `/api/*` and `/v1/*` passthrough always uses the primary
+upstream. See [CPU and GPU model routing](../../docs/CPU_GPU_ROUTING.md) for the operational
+contract.
+
+`/_freellama/v1/health` exposes the `explicit_cpu_assignment` contract and configured backends.
+Tests pin that receipt, CPU option injection for tasks and intent interpretation, and byte-exact raw
+passthrough to the primary backend.
+
+Bearer authentication, when configured, covers control and passthrough routes. Binding a
+nonloopback address requires both an authentication token and explicit remote opt-in. Aggregate
+placement feedback can use a bounded, versioned, atomically replaced snapshot; corrupt or
+unsupported snapshots fail startup instead of silently resetting routing evidence.
+
+Managed `/_freellama/v1/tasks` requests accept Ollama's structured message objects without reducing
+them to role/content pairs. Their nested `request_options` supports `format`, `think`, `options`,
+`logprobs`, and `top_logprobs`. The route's `context_tokens` owns `num_ctx`, and backend placement
+owns `num_gpu`; callers cannot override those two keys through `options`. Raw passthrough remains the
+full-control escape hatch, including streaming.
+
+Installed-model metadata includes a derived `model_type`: `generative`, `multimodal`,
+`embedding_only`, or `unknown`. It is a display summary only. Capability filtering and routing use
+Ollama's additive capability set, and unrecognized future values are not converted into a known
+routable capability.
+
+`proxy::serve` runs passthrough alone. `platform::serve` composes the proxy as its fallback, making
+the platform a strict superset of the proxy.
+
+## Build and verify
+
+```bash
+cargo build --release
+cargo test
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+```
+
+The Node addon is a separate feature-gated build because its FFI symbols resolve only inside Node:
+
+```bash
+yarn --cwd ../.. build:native
+```
+
+This writes `packages/mcp/native/freellama.<triple>.node`. The crate denies unsafe code except in
+`napi.rs`, where generated NAPI glue requires an explicit exception.
+
+Machine discovery is OS-specific behind one serialized contract: `memory_bytes` is total host RAM,
+while `unified_memory_bytes` is populated only on a known unified-memory host. Recommendations use
+the former as a conservative preflight. They never equate host RAM with discrete-GPU VRAM; Ollama's
+resident-runner data remains the execution proof.

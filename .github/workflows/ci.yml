@@ -12,8 +12,12 @@ concurrency:
 
 jobs:
   rust:
-    name: rust (fmt · clippy · test)
-    runs-on: ubuntu-latest
+    name: rust ${{ matrix.os }} (fmt · clippy · test)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
@@ -37,9 +41,13 @@ jobs:
       - name: cargo test
         run: cargo test --workspace
 
-  mcp:
-    name: mcp (build · typecheck · drift)
-    runs-on: ubuntu-latest
+  js:
+    name: js ${{ matrix.os }} (native build · typecheck · unit tests)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
@@ -50,23 +58,30 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # Yarn 4 via corepack (yarnPath is pinned in .yarnrc.yml); one install covers every workspace.
+      - name: Enable corepack
+        run: corepack enable
+
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
-          cache: npm
+          node-version: 22
+          cache: yarn
 
-      # Build the native addon into packages/mcp/native (root build script drives napi).
+      - name: Install JS dependencies
+        run: yarn install --immutable
+
+      # Native addon into packages/mcp/native, then the server itself (esbuild).
       - name: Build native addon
-        run: |
-          npm ci
-          npm run build
+        run: yarn build:native
 
-      # Build and typecheck the MCP server, then run the offline drift check. The Ollama-backed
-      # smoke tests (smoke-test, smoke-test-protocol, smoke-test-delegate) need a live Ollama and a
-      # pulled model, so they run locally via `npm test`, not here.
-      - name: Build and check MCP server
-        working-directory: packages/mcp
-        run: |
-          npm ci
-          npm run build
-          npm run test:ci
+      - name: Build MCP server
+        run: yarn workspace freellama-mcp-server build
+
+      - name: Typecheck
+        run: yarn typecheck
+
+      # Unit tier only: pure-function tests plus the tool-map drift guard, fully offline.
+      # The integration/e2e tiers (yarn test:integration / test:e2e) need a live Ollama with
+      # pulled models, so they run locally, not here.
+      - name: Unit tests
+        run: yarn test

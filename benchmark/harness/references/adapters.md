@@ -2,7 +2,7 @@
 
 Load when connecting a CLI or agent harness. Why: normalization makes unlike agents comparable.
 
-`run.py` expands `{model}`, `{prompt_file}`, `{workspace}`, and `{result_file}` in `--agent-command`. It also exports those values as `FREELLAMA_BENCH_MODEL`, `FREELLAMA_BENCH_PROMPT`, `FREELLAMA_BENCH_WORKSPACE`, and `FREELLAMA_AGENT_RESULT`.
+`run.py` expands `{model}`, `{prompt_file}`, `{workspace}`, and `{result_file}` in `--agent-command`, and replaces `__REPO_ROOT__` with this checkout (needed because the adapter's cwd is the disposable workspace, not the repo). It also exports those values as `FREELLAMA_BENCH_MODEL`, `FREELLAMA_BENCH_PROMPT`, `FREELLAMA_BENCH_WORKSPACE`, and `FREELLAMA_AGENT_RESULT`.
 
 An adapter may write this JSON to `{result_file}`:
 

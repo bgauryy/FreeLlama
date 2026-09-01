@@ -7,15 +7,21 @@ changes, but it does not make an individual model decode faster.
 This page explains the active request flow, the settings Ollama owns, the
 current machine audit, and the optimization work that remains.
 
+The architecture is portable across Ollama's Metal, CUDA, ROCm, Vulkan, and CPU paths. The audit
+later on this page is intentionally Mac-specific. FreeLlama discovers host RAM per operating system
+and keeps device selection in each Ollama process; it does not translate one machine's memory tier,
+core count, or benchmark into another machine's defaults.
+
 ## Decision
 
 Use stock Ollama as the inference runtime. Keep FreeLlama as an optional Rust
 control plane for evidence-qualified routing, bounded request profiles, session
 affinity, and policy enforcement.
 
-Do not advertise FreeLlama as an accelerator or an Ollama inference plugin. The
-current implementation does not tune kernels, split work between the CPU and
-GPU, manage macOS memory pressure, or improve tokens per second.
+Do not advertise FreeLlama as an accelerator or an Ollama inference plugin. It does not tune
+kernels, split one model's layers across CPU and GPU, manage macOS memory pressure, or improve that
+model's tokens per second. It can assign different models to isolated CPU and GPU-capable Ollama
+processes, allowing independent workloads to overlap.
 
 ## Request flow
 
@@ -23,10 +29,10 @@ FreeLlama has four distinct paths:
 
 | Request | FreeLlama work | Ollama work | Result |
 |---|---|---|---|
-| Native `/api/*` or `/v1/*` | Streams bytes through the compatibility proxy | Performs normal inference and scheduling | Exact Ollama response |
+| Native `/api/*` or `/v1/*` | Streams bytes to the primary compatibility upstream | Performs normal inference and scheduling | Exact Ollama response |
 | `POST /_freellama/v1/routes` | Discovers models, filters capabilities, and applies policy | Supplies installed-model and residency data | Model and request profile; no inference |
 | `POST /_freellama/v1/natural-routes` | Normalizes a schema-bound intent, then runs the deterministic router | Runs the small intent model | Model and request profile; selected task does not run |
-| `POST /_freellama/v1/tasks` | Selects a route, applies managed-task admission, and constructs one bounded request | Runs one non-streaming chat or embedding request | Route receipt, admission mode, prompt-free metrics, and Ollama response |
+| `POST /_freellama/v1/tasks` | Selects a route and backend, applies managed-task admission, and constructs one bounded request | Runs one nonstreaming chat or embedding request on the assigned process | Route receipt, placement, admission mode, prompt-free metrics, and Ollama response |
 
 The natural-language path is intentionally two-stage. The small model cannot
 name a final model. It returns only a task, objective, context hint, and tool or
@@ -42,9 +48,10 @@ test verifies embedding option parity.
 
 ## What Ollama already optimizes
 
-On Apple silicon, Ollama provides the following behavior without FreeLlama:
+Across supported backends, Ollama provides the following behavior without FreeLlama:
 
-- The native macOS binary includes Metal GPU acceleration.
+- The runtime selects supported acceleration such as Metal, CUDA, ROCm, or Vulkan from the host and
+  its process-level device visibility.
 - The scheduler fits model, context, and compute allocations to available
   device memory.
 - The runner selects CPU threads and GPU execution; applications do not need to
@@ -64,21 +71,22 @@ shows that a change improves completed tasks per hour without memory pressure.
 
 ## Current Mac audit
 
-This audit captures the following snapshot from August 23, 2026. Treat it as machine
+This audit captures the following snapshot from September 1, 2026. Treat it as machine
 evidence, not a portable default.
 
 | Item | Observed value | Interpretation |
 |---|---|---|
 | Hardware | Apple M4 Pro, 14 CPU cores, 48 GB unified memory | CPU and GPU share the memory system |
 | macOS | 15.7.2 | Native Ollama supports this Apple-silicon system |
-| Ollama server | 0.33.2 (was 0.32.15 when first measured) | Active application server on `127.0.0.1:11434`. Re-read with `doctor` rather than trusting this row |
-| First CLI on `PATH` | Homebrew 0.13.5 | Version mismatch; fix before relying on CLI-specific behavior |
+| Ollama server | 0.33.2 | Active application server on `127.0.0.1:11434`; re-read with `doctor` rather than trusting this row |
+| First CLI on `PATH` | `/usr/local/bin/ollama`, 0.33.2 | Matches the active server |
 | Metal device budget | 36 GiB reported by Ollama | This is the scheduler's observed device budget, not all 48 GB |
 | Default context | 32,768 tokens | Ollama selected its 24–48 GiB device-memory tier |
 | Parallel requests | 1 | Appropriate baseline for interactive and large-model tests |
 | Keep-alive | 5 minutes | Ollama default |
-| Loaded-model limit | Automatic | Ollama decides from available memory |
-| Flash Attention | Automatic and enabled for the inspected GGUF runner | Forcing the environment flag is not proven to improve this path |
+| Loaded-model limit | `OLLAMA_MAX_LOADED_MODELS=2` | Explicit service configuration for the measured topology |
+| K/V-cache type | `OLLAMA_KV_CACHE_TYPE=q8_0` | Explicit memory-saving configuration; requalify quality per important model |
+| Flash Attention | `OLLAMA_FLASH_ATTENTION=1` | Explicitly enabled; required for quantized K/V cache |
 | GGUF CPU threads | 10 worker threads | Ollama selected the 10 performance cores rather than all 14 cores |
 | MLX | GPU runner observed | MLX models use their own runner path, not the GGUF tuning path |
 | Power mode | Automatic on battery and AC power | High Power Mode remains an unmeasured experiment |
@@ -87,25 +95,19 @@ The server log also showed Metal fusion, concurrent Metal execution, graph
 optimization, and automatic parameter fitting. FreeLlama must not claim these
 as its own optimizations.
 
-### Resolve the CLI mismatch
+### Verify CLI and server alignment
 
-The Ollama application CLI is available at `/usr/local/bin/ollama`, while the
-first CLI on this machine is the older Homebrew installation at
-`/opt/homebrew/bin/ollama`.
-
-For one shell session, put the application CLI first on `PATH`. Then verify both
-versions:
+The selected CLI is `/usr/local/bin/ollama`, and both the CLI and active server report 0.33.2.
+Verify this alignment after changing Ollama installations or service definitions:
 
 ```bash
-export PATH="/usr/local/bin:$PATH"
-hash -r
+command -v ollama
 ollama --version
 curl --silent http://127.0.0.1:11434/api/version
 ```
 
-The client and server versions must match before testing a CLI feature. This
-mismatch does not prove an inference slowdown, but it can produce incompatible
-commands, flags, or diagnostics.
+The client and server versions must match before you test a CLI feature. A mismatch does not prove
+an inference slowdown, but it can produce incompatible commands, flags, or diagnostics.
 
 ## What FreeLlama adds today
 
@@ -116,8 +118,13 @@ The active Rust implementation adds:
 - fail-closed quality routing when the policy has no qualified model;
 - task-specific context, output, thinking, and tool-validation profiles;
 - session affinity and preference for an eligible resident model;
-- shared execution permits for resident managed tasks and an exclusive permit
-  for nonresident managed-task transitions;
+- separate transition locks for primary and CPU backends, with shared execution permits for
+  resident tasks and an exclusive permit for a cold transition;
+- exact-model placement on an optional second CPU Ollama process, including `num_gpu=0` for its
+  managed requests;
+- guarded agent placement preferences plus a normalized, three-warm-sample, 10%-advantage feedback
+  loop for `fastest` and `balanced` work;
+- independent weighted GPU and CPU admission pools, so a GPU burst cannot starve a CPU helper;
 - prompt-free load, prompt-processing, and output-generation metrics derived
   from Ollama's response fields;
 - a local natural-language intent interpreter that cannot choose a model;
@@ -126,20 +133,28 @@ The active Rust implementation adds:
 These features can reduce reloads or avoid an unsuitable model. They do not
 change the selected model's prompt-processing or decode rate.
 
-## What FreeLlama does not add yet
+The measured dual-backend workload improved median completion time from 37.997 to 28.233 seconds
+(1.346 times, or 25.70%). Qwen reported 19,175,677,668 GPU-resident bytes, Nomic reported zero,
+and all requests carried correct backend receipts with zero FreeLlama queue wait. One of three
+parallel trials was slower than sequential, so this remains a workload-level optimization rather
+than an inference-speed claim.
 
-The current implementation does not provide:
+## Unsupported optimizations
+
+FreeLlama does not provide:
 
 - memory-pressure admission or a minimum-free-memory guard;
 - transition coordination for native passthrough requests or processes that
   bypass the managed `tasks` endpoint;
 - live thermal, power-mode, or swap-aware routing;
-- online token-rate, error-rate, or load-duration scoring;
+- online token-rate, error-rate, or cold-load-duration scoring;
 - per-engine tuning for GGUF compared with MLX;
 - dynamic `keep_alive` or concurrency limits by workload;
 - an atomic natural-language route-and-run operation;
 - held-out quality policies for completion, coding, tools, browser, vision, or
-  long-context tasks in the example policy.
+  long-context tasks in the example policy;
+- quality-aware or thermal-aware CPU/GPU load balancing. Automatic placement uses persisted,
+  prompt-free warm-latency aggregates only within exact operator-owned assignments.
 
 The RFC describes several of these capabilities as planned phases. Do not treat
 the RFC as evidence that they have shipped.
@@ -150,14 +165,15 @@ Use this table before changing Ollama or FreeLlama:
 
 | Candidate change | Default decision | Reason |
 |---|---|---|
-| Force CPU and GPU layers manually | Do not add | Ollama already fits and offloads the model; partial CPU fallback usually reduces decode throughput |
+| Force layers of one model between CPU and GPU | Do not add | Ollama already fits and offloads the model; partial CPU fallback usually reduces decode throughput |
+| Assign different models to isolated CPU and GPU-capable processes | Supported, benchmark per workload | Process isolation is reliable, but CPU speed and shared-memory pressure still determine whether overlap helps |
 | Add macOS kernel or `sysctl` tuning | Do not add | Ollama does not document a supported, product-specific kernel setting. Unified-memory behavior belongs to macOS and Metal |
 | Run Ollama in Docker on macOS | Do not use for performance | Docker Desktop does not provide Ollama GPU acceleration on macOS |
 | Increase context globally | Do not add | Context memory grows with length; set the smallest sufficient `num_ctx` per request |
 | Set parallel requests above 1 | Benchmark first | It can improve concurrent throughput but multiplies context memory and can hurt interactive latency |
 | Pin multiple 18–21 GB models | Do not add by default | The observed 36 GiB Metal budget cannot safely establish that two heavy models plus contexts fit |
 | Force Flash Attention | Benchmark per engine and model | The inspected GGUF path already enabled it automatically; MLX has a different runner |
-| Use `q8_0` K/V cache | Qualification experiment | It can reduce GGUF context memory. This global setting can change quality, especially for high-GQA models |
+| Use `q8_0` K/V cache | **8/10; qualify, then prefer for parallel/long-context work** | Ollama documents roughly half the KV memory of `f16` with very small precision loss; it is the practical companion to higher `OLLAMA_NUM_PARALLEL`, but it remains a process-wide quality tradeoff |
 | Use `q4_0` K/V cache | Reject as a default | It saves more memory with a larger possible quality loss |
 | Enable High Power Mode | Sustained-load experiment only | Apple documents higher sustained performance. Local token-rate and energy effects are not measured |
 | Keep the small intent model resident | Keep bounded | It reduces routing latency but consumes memory and can affect a large-model transition |
@@ -178,26 +194,26 @@ fixed prompts, fixed output budgets, exact-output guardrails, quality guardrails
 memory, swap, and failure counts. A higher token rate is not an improvement if
 quality falls, requests fail, or model transitions dominate the workload.
 
-Use `cargo run -- bench-all` (`packages/rust-core/src/model_bench.rs`) for model selection evidence:
+Use `cargo run -- bench-all` (`packages/rust-core/src/model_bench.rs`) for model selection evidence.
+Use [CPU and GPU model routing](CPU_GPU_ROUTING.md) for the separate-process benchmark and
+verification procedure.
 
 - Local-model router RFC — lived in the gitignored `.octocode/` workspace and is no longer in the tree; the shipped design it argued for is [ARCHITECTURE.md](ARCHITECTURE.md)
 
 ## Recommended next work
 
-1. Extend `doctor` with the resolved CLI path and effective Ollama settings that
-   are observable without reading prompts. It already reports CLI and server
-   versions and whether they match.
-2. Persist prompt rate, decode rate, load time, resident bytes, selected engine,
-   and failures in bounded, prompt-free receipts. Task responses expose rates
-   but don't store them.
+1. Keep the CLI executable aligned with the active Ollama server; `doctor` reports the selected
+   path, both versions, and effective memory-related settings.
+2. Back up the versioned prompt-free feedback snapshot with the policy and deployed binary.
+   Verified warm work-unit latency and queue wait survive restart; raw prompts are never stored.
 3. Implement memory admission only after a frozen alternating-model workload
    reproduces pressure losses. Keep Ollama as the final loading authority.
 4. Extend transition coordination only if managed streaming or another parsed
    execution path needs it. Native passthrough remains Ollama-owned.
 5. Evaluate request-specific context and residency profiles before testing
    global Flash Attention, K/V cache, or concurrency changes.
-6. Add a hardware-and-engine profile only when its held-out workload beats the
-   stock configuration and preserves quality.
+6. Promote a hardware-and-engine profile only after `benchmark/hardware/run_validation.py` and its
+   held-out quality workload pass on a real self-hosted runner.
 
 ## Sources
 
