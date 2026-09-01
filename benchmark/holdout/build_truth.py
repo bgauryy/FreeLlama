@@ -87,6 +87,22 @@ def path_forms(path: Path) -> list[str]:
     return [path.name] + ["/".join(parts[i:]) for i in range(len(parts))]
 
 
+def unique_distinctive_caller(
+    sites: set[tuple[Path, str]], target: str
+) -> tuple[Path, str] | None:
+    """Return one gradable caller, but only when the real call graph is unambiguous.
+
+    Distinctiveness is an answer-grading constraint, not a call-graph filter. Applying it before
+    the uniqueness check hid real generic-named callers such as ``prepare`` and ``parse`` and
+    turned multi-answer questions into falsely singular cases.
+    """
+    callers = {(source, caller) for source, caller in sites if caller != target}
+    if len(callers) != 1:
+        return None
+    caller = next(iter(callers))
+    return caller if distinctive(caller[1]) else None
+
+
 class Index:
     """One pass over the package: definitions, call sites, imports, class bases."""
 
@@ -230,10 +246,10 @@ def build(repo: str) -> list[dict]:
         defined = idx.unique_func(target)
         if not defined:
             continue
-        callers = {(p, fn) for p, fn in sites if fn != target and distinctive(fn)}
-        if len(callers) != 1:
-            continue  # exactly one caller keeps the answer unambiguous
-        cp, cn = next(iter(callers))
+        caller = unique_distinctive_caller(sites, target)
+        if caller is None:
+            continue  # exactly one real, gradable caller keeps the answer unambiguous
+        cp, cn = caller
         if cp == defined:
             continue  # must be cross-file to count as multi-hop
         add("callsite",

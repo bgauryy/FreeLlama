@@ -1,73 +1,113 @@
-# freellama
+# `freellama` CLI package
 
-The `freellama` CLI. Install-free via npx:
+This package is prepared to publish the `freellama` command through npm. Version 0.2.0 is not
+published to a registry. In a checkout after `yarn install`, `npx` resolves the workspace package;
+otherwise, use the release binary built at `target/release/freellama`. The JavaScript launcher
+locates the compiled Rust binary and hands the current process to it. Routing and execution logic
+remain in [`freellama-core`](../rust-core/README.md).
+
+```mermaid
+flowchart LR
+    N["npx freellama …"] --> J["Node launcher"]
+    J -->|"published package"| V["vendor/platform/freellama"]
+    J -->|"repository checkout"| T["target/release/freellama"]
+    V --> R["Rust CLI"]
+    T --> R
+    R --> C["freellama-core"]
+```
+
+## Run it
 
 ```bash
 npx freellama doctor
+npx freellama auth-token --out ~/.local/share/freellama/auth.token
+npx freellama serve \
+  --recommendation-catalog recommendations.example.toml \
+  --auth-token-file ~/.local/share/freellama/auth.token \
+  --feedback-file ~/.local/share/freellama/feedback.json
 ```
 
-This npm package is a launcher: it ships the compiled Rust binary from
-[`packages/rust-core`](../rust-core/README.md) and hands the process to it. In a checkout it finds
-`target/release/freellama` instead, so the same commands work without packing. On a platform with
-no prebuilt binary it names what it looked for and tells you to run `cargo build --release`.
-
-The `freellama` binary. A thin shell over [`freellama-core`](../rust-core/README.md) — it only
-touches the library's public API, which is why it lives in its own crate and why the napi build
-never has to compile it.
-
-## Get oriented
+`doctor` works without the control plane. It reports Ollama reachability, CLI/server version drift,
+portable host hardware and disk discovery, and effective memory-related settings. `memory_bytes`
+is total host RAM; `unified_memory_bytes` is present only when the memory is known to be shared with
+the accelerator. In another terminal, inspect or execute:
 
 ```bash
-npx freellama tools     # every MCP tool and the CLI command that does the same thing
-npx freellama doctor    # the only subcommand that runs without `serve`
+npx freellama models
+npx freellama route --task coding --objective fastest
+npx freellama task --task completion --objective fastest "Reply with exactly OK."
 ```
 
-`doctor` first, always: it reports Ollama reachability, CLI/server version drift, your
-chip/RAM/disk, and the nine `OLLAMA_*` settings **with their effective defaults**. Unset means
-"Ollama picks", not "off", and two of those defaults are commonly wrong for a large-model setup.
+Read the repository [CLI reference](../../docs/CLI.md) for the complete command map, task kinds, routing
+confidence, policy generation, and admission controls.
 
-## Run the control plane
+## Run separate CPU and GPU backends
+
+`serve` can assign exact models to a second loopback Ollama process:
 
 ```bash
-npx freellama serve --recommendation-catalog recommendations.example.toml
+npx freellama serve \
+  --upstream http://127.0.0.1:11434 \
+  --cpu-upstream http://127.0.0.1:11436 \
+  --cpu-model nomic-embed-text:latest
 ```
 
-Then, from another terminal:
+Managed tasks for assigned models use the CPU backend; other managed models and raw Ollama
+passthrough use the primary backend. See [CPU and GPU model routing](../../docs/CPU_GPU_ROUTING.md)
+for the process setup, verification steps, and measured concurrency result.
+
+The primary admission pool defaults to two weighted units and the independent CPU pool to one.
+These are conservative work-cost limits, not values derived from the development machine. Override
+them with `--max-concurrent-tasks` and `--cpu-max-concurrent-tasks`. `route`, `recommend`, and
+`task` also accept `--execution-preference auto|prefer-cpu|prefer-gpu`; this only chooses among
+models already eligible on the requested backend and reports any fallback in the execution receipt.
+`--min-placement-evidence observed` fails closed unless resident `/api/ps` evidence matches; use
+the default `configured` for the first bounded warm-up.
+
+The health endpoint advertises the backend, guarded-preference, and three-sample runtime-feedback
+contracts plus per-backend admission capacity. Treat a missing contract as a stale running binary,
+then rebuild and restart before testing placement.
+
+Authentication covers both control routes and raw Ollama passthrough. A nonloopback listener also
+requires `--allow-remote`; terminate TLS and add tenant authorization outside FreeLlama. The CLI
+persists bounded aggregate feedback by default. Use `--ephemeral-feedback` only for disposable
+runs. See the [production runbook](../../docs/PRODUCTION.md).
+
+## Build the launcher and binary
+
+Run `npx freellama init` for a side-effect-free first-run receipt: it checks Ollama, inventories
+installed tags, inspects serve health, and prints the next steps without downloading anything.
+
+From the repository root:
 
 ```bash
-npx freellama models                                   # capabilities, residency, policy rank
-npx freellama route --task coding --objective fastest  # decision only, no generation
-npx freellama task --task completion "Reply with exactly OK."
-npx freellama bench-all --output benchmark-report.json
+yarn install
+yarn build
 ```
 
-Every control-plane subcommand needs `serve`. If it is not running they say so and name the command
-that starts it, rather than surfacing a raw transport error.
+`yarn build` compiles the Rust release binary and copies it to
+`packages/cli/vendor/<platform>/freellama`. In a checkout, the launcher also recognizes
+`target/release/freellama`, which supports development without packing the npm package.
 
-## Make `balanced` and `quality` work
+On an unsupported platform, the launcher reports every path it checked and tells the operator to
+run `cargo build --release`. Node.js 20 or newer is required.
 
-`fastest` needs no configuration. The other objectives — and `minConfidence: "medium"` on the MCP
-side — require a routing policy plus a benchmark report:
+## Test packaging behavior
 
 ```bash
-npx freellama policy-from-eval \
-  --aggregate benchmark/local/results/<model>/aggregate.json \
-  --task coding --min-pass 0.8 --out platform.toml
-
-npx freellama bench-all --output benchmark-report.json
-npx freellama serve --recommendation-catalog recommendations.example.toml
+yarn workspace freellama test
 ```
 
-`serve` discovers `platform.toml` and `benchmark-report.json` in the working directory
-automatically; `--policy-file` / `--benchmark-report` override that. When either is missing it says
-so at startup instead of silently grading every route `low`.
+The launcher tests cover binary selection, argument and signal forwarding, unsupported-platform
+errors, and the files included in the package. Core CLI contracts live in
+`packages/rust-core/tests/cli_contract.rs`.
 
-`policy-from-eval` reads **pass rates**, never `bench-all`'s throughput, and refuses to manufacture
-evidence: fewer than three trials is a smoke result (`--allow-smoke` marks the output), aggregates
-past their review date are rejected, and uninstalled models are skipped.
+## Understand CLI and MCP differences
 
-## What the CLI does not have
+```bash
+npx freellama tools
+```
 
-`search_models` and `delegate_research` are MCP-only. `freellama tools` says so rather than
-pretending parity — and a contract test parses the MCP server's source to make sure that table
-cannot drift out of date.
+The output is contract-tested against the MCP server source. `delegate_research` and the online
+model-library view are MCP-only. Control-plane startup, proxy startup, sessions, recommendation,
+benchmarks, policy generation, and frozen-suite comparison are CLI-only.

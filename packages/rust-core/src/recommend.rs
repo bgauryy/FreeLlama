@@ -65,7 +65,7 @@ pub struct InstallationPlanRequest<'a> {
     pub required_capabilities: &'a BTreeSet<Capability>,
     pub requested_context: u64,
     pub installed_models: &'a BTreeSet<String>,
-    pub unified_memory_bytes: Option<u64>,
+    pub memory_bytes: Option<u64>,
     pub available_disk_bytes: Option<u64>,
 }
 
@@ -189,10 +189,14 @@ pub fn installation_plans(
         .filter(|model| request.required_capabilities.is_subset(&model.capabilities))
         .filter(|model| request.requested_context <= model.max_context_tokens)
         .map(|model| {
-            let memory_fit = fit(model.minimum_memory_bytes, request.unified_memory_bytes);
+            let memory_fit = fit(model.minimum_memory_bytes, request.memory_bytes);
             let disk_fit = fit(model.estimated_download_bytes, request.available_disk_bytes);
             let mut warnings = Vec::new();
-            warning(&mut warnings, memory_fit, "unified memory");
+            warning(
+                &mut warnings,
+                memory_fit,
+                "host memory (accelerator-memory fit remains Ollama-owned)",
+            );
             warning(&mut warnings, disk_fit, "available disk");
             InstallPlan {
                 model: model.name.clone(),

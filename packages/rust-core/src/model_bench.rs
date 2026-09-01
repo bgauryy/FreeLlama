@@ -39,7 +39,8 @@ pub enum Capability {
 }
 
 impl Capability {
-    fn parse(value: &str) -> Self {
+    #[must_use]
+    pub fn parse(value: &str) -> Self {
         match value {
             "completion" => Self::Completion,
             "tools" => Self::Tools,
@@ -48,6 +49,41 @@ impl Capability {
             "thinking" => Self::Thinking,
             "embedding" => Self::Embedding,
             _ => Self::Other,
+        }
+    }
+}
+
+/// Coarse inventory classification derived from Ollama's additive capabilities.
+///
+/// This is intentionally descriptive only. Routing must continue to use the full capability set:
+/// a multimodal model is still eligible for ordinary text and coding work.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelType {
+    Generative,
+    Multimodal,
+    EmbeddingOnly,
+    #[default]
+    Unknown,
+}
+
+impl ModelType {
+    #[must_use]
+    pub fn from_capabilities(capabilities: impl IntoIterator<Item = Capability>) -> Self {
+        let capabilities = capabilities.into_iter().collect::<BTreeSet<_>>();
+        if capabilities.contains(&Capability::Embedding)
+            && !capabilities.contains(&Capability::Completion)
+        {
+            Self::EmbeddingOnly
+        } else if capabilities.contains(&Capability::Completion)
+            && (capabilities.contains(&Capability::Vision)
+                || capabilities.contains(&Capability::Audio))
+        {
+            Self::Multimodal
+        } else if capabilities.contains(&Capability::Completion) {
+            Self::Generative
+        } else {
+            Self::Unknown
         }
     }
 }
@@ -61,6 +97,8 @@ pub struct ModelMetadata {
     pub parameter_size: String,
     pub quantization: String,
     pub capabilities: Vec<Capability>,
+    #[serde(default)]
+    pub model_type: ModelType,
     pub advertised_context: Option<u64>,
 }
 
@@ -83,7 +121,11 @@ enum CaseKind {
     Embedding,
 }
 
-/// Build a fixed, capability-specific case plan using a memory-safe Apple Silicon profile.
+/// Build a fixed, capability-specific case plan using conservative model-size tiers.
+///
+/// These tiers make benchmark cases comparable across machines. They are not a hardware profile
+/// or a claim that a model fits; recommendation and task routing perform that separate check
+/// against the discovered host-memory budget and the context actually sent.
 #[must_use]
 pub fn benchmark_plan(model: &ModelMetadata) -> Vec<BenchCase> {
     let context = if model.size >= 16_000_000_000 {
@@ -366,13 +408,16 @@ async fn discover_models(client: &Client, endpoint: &str) -> Result<Vec<ModelMet
             .json::<Value>()
             .await?;
         let details = show.get("details").cloned().unwrap_or(Value::Null);
-        let capabilities = show
+        // Unknown upstream strings stay visible in raw `/api/show`, but must not collapse into one
+        // routable `Other` value: two unrelated future capabilities are not interchangeable.
+        let capabilities: Vec<Capability> = show
             .get("capabilities")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
             .filter_map(Value::as_str)
             .map(Capability::parse)
+            .filter(|capability| *capability != Capability::Other)
             .collect();
         let advertised_context =
             show.get("model_info")
@@ -382,6 +427,7 @@ async fn discover_models(client: &Client, endpoint: &str) -> Result<Vec<ModelMet
                         .find(|(key, _)| key.ends_with(".context_length"))
                         .and_then(|(_, value)| value.as_u64())
                 });
+        let model_type = ModelType::from_capabilities(capabilities.iter().copied());
         models.push(ModelMetadata {
             name: name.to_owned(),
             size,
@@ -390,6 +436,7 @@ async fn discover_models(client: &Client, endpoint: &str) -> Result<Vec<ModelMet
             parameter_size: string_field(&details, "parameter_size"),
             quantization: string_field(&details, "quantization_level"),
             capabilities,
+            model_type,
             advertised_context,
         });
     }

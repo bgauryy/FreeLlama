@@ -12,7 +12,7 @@
 export function doctor(endpoint?: string | undefined | null): Promise<string>;
 
 /**
- * Machine profile (chip, unified memory, CPU count, disk) as seen by a running `freellama serve`.
+ * Machine profile (chip, host memory, memory kind, CPU count, and disk) from `freellama serve`.
  * @param endpoint FreeLlama serve endpoint, defaults to http://127.0.0.1:11435
  */
 export function machine(endpoint?: string | undefined | null): Promise<string>;
@@ -32,6 +32,10 @@ export function listModels(endpoint?: string | undefined | null): Promise<string
  * @param sessionId Optional session id for model affinity
  * @param contextTokens Optional minimum context window required
  * @param requiredCapabilities Optional list of capabilities the model must advertise (e.g. ["vision"])
+ * @param minConfidence Optional floor ("low" | "medium"); the core gate refuses below it
+ * @param executionPreference Guarded backend hint: "auto" | "prefer_cpu" | "prefer_gpu"
+ * @param minPlacementEvidence "configured" (default) or fail-closed physical "observed"
+ * @param minPlacementEvidence "configured" (default) or fail-closed physical "observed"
  */
 export function route(
   endpoint: string | undefined | null,
@@ -41,6 +45,9 @@ export function route(
   sessionId?: string | undefined | null,
   contextTokens?: number | undefined | null,
   requiredCapabilities?: Array<string> | undefined | null,
+  minConfidence?: string | undefined | null,
+  executionPreference?: string | undefined | null,
+  minPlacementEvidence?: string | undefined | null,
 ): Promise<string>;
 
 /**
@@ -51,6 +58,8 @@ export function route(
  * @param model Optional explicit model name to filter to
  * @param contextTokens Optional minimum context window required
  * @param requiredCapabilities Optional list of capabilities the model must advertise (e.g. ["vision"])
+ * @param executionPreference Guarded backend hint: "auto" | "prefer_cpu" | "prefer_gpu"
+ * @param minPlacementEvidence "configured" (default) or fail-closed physical "observed"
  */
 export function recommend(
   endpoint: string | undefined | null,
@@ -59,6 +68,8 @@ export function recommend(
   model?: string | undefined | null,
   contextTokens?: number | undefined | null,
   requiredCapabilities?: Array<string> | undefined | null,
+  executionPreference?: string | undefined | null,
+  minPlacementEvidence?: string | undefined | null,
 ): Promise<string>;
 
 /**
@@ -78,6 +89,8 @@ export function recommend(
  * @param input Embedding input (string or array of strings), for task "embedding"
  * @param tools Optional tool/function definitions for function-calling tasks
  * @param keepAlive Overrides Ollama's model residency window, e.g. "0" or "-1"
+ * @param minConfidence Optional floor ("low" | "medium"); the core gate refuses before generation
+ * @param executionPreference Guarded backend hint: "auto" | "prefer_cpu" | "prefer_gpu"
  */
 export function runTask(
   endpoint: string | undefined | null,
@@ -93,6 +106,20 @@ export function runTask(
   input?: unknown | undefined | null,
   tools?: unknown | undefined | null,
   keepAlive?: string | undefined | null,
+  minConfidence?: string | undefined | null,
+  executionPreference?: string | undefined | null,
+  minPlacementEvidence?: string | undefined | null,
+): Promise<string>;
+
+/**
+ * Object-based managed task API. Supports the full typed task request including lossless message
+ * history and request_options (format, think, runtime options, logprobs).
+ * @param endpoint FreeLlama serve endpoint, defaults to http://127.0.0.1:11435
+ * @param request Complete `/_freellama/v1/tasks` request object
+ */
+export function runTaskRequest(
+  endpoint: string | undefined | null,
+  request: unknown,
 ): Promise<string>;
 
 /**

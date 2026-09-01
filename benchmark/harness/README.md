@@ -18,15 +18,7 @@ These rules were previously duplicated in a `skills/run-benchmark/SKILL.md` work
 
 ## Three benchmark surfaces, different questions
 
-| Directory | Measures | Corpus |
-|---|---|---|
-| `benchmark/harness/` | the generic scoring infrastructure everything else builds on | synthetic `atlas` fixture |
-| `benchmark/local/` | **which model** completes repository work correctly | `click` / `zustand` / `openui`, checked in |
-| `benchmark/holdout/` | **the adapter loop itself**, on repos it was never tuned against | fresh upstream clones in `.clones/` (gitignored) |
-
-Use `holdout/` when the thing being changed is the agent loop or its prompt, not the model — those
-changes are tuned against a corpus and cannot be honestly graded on it. See
-[`holdout/README.md`](../holdout/README.md).
+See [`benchmark/README.md`](../README.md) for the harness / local / holdout split. This file is the scoring workflow for `harness/` only.
 
 This benchmark compares local models running through coding agents. It answers a practical question: which model-agent combination can complete repository work correctly, repeatedly, and efficiently?
 
@@ -47,15 +39,12 @@ For successful tasks, the report also records wall time, token usage when suppli
 
 See [`references/tasks.md`](references/tasks.md) for suite coverage and [`references/methodology.md`](references/methodology.md) for scoring rules.
 
-The additional `tasks/real-repos-10.json` suite contains ten coding challenges against pinned Click and ItsDangerous revisions. It measures task understanding, targeted tools, repository tracing, bug diagnosis, five injected repairs, cross-repository research, and one complex two-defect repair. Its local Ollama adapter is `scripts/ollama_repo_agent.py`.
-
 ## Verification status
 
 - Harness acceptance test: **passed on 2026-08-24**.
 - Golden-reference smoke run: **20 of 20 tasks passed on 2026-08-24**; all 42 generated JSON artifacts validated.
 - Public suite content review: **2026-08-23**.
 - Next required suite review: **2026-09-22**. The runner rejects stale publishable runs.
-- Real repository smoke campaign: **12 installed artifacts checked on 2026-08-24**. The golden reference passed 10/10, every injected defect failed unrepaired, and all 234 final JSON artifacts validated. See `.octocode/benchmarks/real-repos-2026-08-24/index.html` and `.octocode/evals/2026-08-24-real-repository-agent-benchmark.md`.
 
 The golden reference proves that the harness, tasks, graders, aggregation, and report work together. Never report its score as candidate-model performance.
 
@@ -109,23 +98,10 @@ Build a focused dashboard without changing the authoritative aggregate:
 ```bash
 python3 scripts/render_html.py \
   --aggregate <results>/aggregate.json \
-  --suite tasks/real-repos-10.json \
+  --suite tasks/suite.json \
   --output <results>/selected-models.html \
-  --model qwen3.8:27b-mlx --model muse-glimmer:30b-mlx
+  --model <first-model> --model <second-model>
 ```
-
-Run the pinned real-repository smoke matrix with the bundled Ollama agent:
-
-```bash
-python3 scripts/run_matrix.py \
-  --matrix tasks/real-repos-matrix.json \
-  --suite tasks/real-repos-10.json \
-  --trials 1 \
-  --discard-workspaces --skip-complete \
-  --results ../../../.octocode/benchmarks/real-repos-2026-08-24
-```
-
-`--skip-complete` makes an interrupted sequential campaign safely restartable. `--discard-workspaces` preserves prompts, normalized agent results, diffs, trial JSON, and logs while deleting copied repository workspaces.
 
 Use one trial only for a smoke check. Use three isolated trials per applicable task for a publishable comparison.
 

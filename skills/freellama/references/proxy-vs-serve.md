@@ -1,50 +1,26 @@
-# `freellama proxy` vs `freellama serve`
+# Proxy or serve
 
-Load when choosing which mode to run, or when a `/_freellama/v1/*` call 404s and you need to know
-whether that route exists at all.
+Load when choosing a mode or a control route returns 404. Why: both default to port 11435 but expose
+different contracts.
 
-Both bind `127.0.0.1:11435` by default — pick one, not both; the second fails to bind.
+| Need | `proxy` | `serve` |
+|---|---:|---:|
+| Raw `/api/*` retry/backoff/timeout | Yes | Yes |
+| Managed discovery, routes, tasks, health | No | Yes |
+| CPU model assignment and feedback | No | Yes |
 
-| | `npx freellama proxy` | `npx freellama serve` |
-|---|---|---|
-| Ollama passthrough (`/api/*`) | Yes, with retry/backoff/timeout | Yes, same code path — it composes `proxy::app()` as its fallback |
-| `/_freellama/v1/{health,machine,models,recommendations,routes,natural-routes,sessions,tasks}` | No — 404 | Yes |
-| Retry on the managed task path (`/tasks`) | n/a — route does not exist | Yes, same backoff schedule as passthrough |
-| Use when | You only need a more reliable Ollama endpoint (a benchmark, a script calling `/api/chat` directly) | You want model discovery, task-aware routing, admission control, or session affinity |
+`run_task`, `delegate_research`, installed/resident models, and control health need `serve`.
+Research-adapter model turns now use managed `coding` tasks so they share routing, independent
+backend admission, physical-placement receipts, and feedback protection. `doctor`, direct
+lifecycle tools, model detail/raw views, and library search do not require `serve`.
 
-Every MCP tool except `doctor`, `ollama_manage` and `ollama_delete` needs `serve`; those three talk
-to Ollama directly and work without it.
+For dual backend work, configure `serve --cpu-upstream ... --cpu-model <exact-tag>`. Managed catalog
+and tasks honor it; raw passthrough remains on the primary upstream. Require current health
+contracts before trusting placement. `doctor` reads chip and host RAM through macOS `sysctl`, Linux
+`/proc`, or Windows system APIs. Only a non-null `unified_memory_bytes` says that host memory is
+known to be shared with the accelerator.
 
-## Which one am I pointed at?
+Retry implementation details and historical asymmetry: `assets/evidence/proxy-vs-serve.md`.
 
-- With an agent: call `doctor`. It carries a machine profile on success; `machine_unavailable`
-  with a stated reason means `serve` is not up.
-- Without one: `curl -sf $ENDPOINT/_freellama/v1/health` — 200 means `serve`, 404 means `proxy`.
-- `scripts/check.sh` does this automatically and labels which mode is running.
-
-## Starting either one
-
-```bash
-npx freellama proxy                                   # passthrough + retry only
-npx freellama serve --policy-file platform.toml \
-                    --benchmark-report bench-all.json # add these to make minConfidence "medium" reachable
-```
-
-In a checkout the npm launcher runs `target/release/freellama` if it is there, so
-`cargo build --release` then `npx freellama …` works unpacked.
-
-## Retry coverage — both paths, one schedule
-
-Retry/backoff/timeout live in
-[`proxy.rs`](https://github.com/bgauryy/FreeLlama/blob/main/packages/rust-core/src/proxy.rs)
-(`send_with_retries`), and `serve`'s passthrough reuses it, so raw `/api/chat` calls through `serve`
-are protected. The managed task path behind `/_freellama/v1/tasks` uses its own
-`platform::post_json_with_retries` but shares `proxy::retry_delay` and `proxy::MAX_ATTEMPTS` — one
-schedule, deliberately not duplicated.
-
-The two keep separate `reqwest::Client`s on purpose: a managed generation needs a 900s budget while
-discovery calls need 30s. **This asymmetry used to be worse than a mere gap** — the managed path was
-retry-less, and it holds the `managed_execution` admission permit across the upstream call, so a
-bare failure also threw away a slot it had already queued for. → `references/reliability.md`
-
-Next: symptom rather than a mode choice → `references/troubleshooting.md`.
+Next: backend choice → `references/resource-routing.md`; failure diagnosis →
+`references/troubleshooting.md`.

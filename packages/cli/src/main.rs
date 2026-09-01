@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -5,13 +6,17 @@ use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 use freellama::{
     RunConfig, Suite, compare, doctor,
-    model_bench::{BenchConfig, benchmark_all},
-    platform::{Objective, PlatformConfig, RouteInput, TaskKind, serve as serve_platform},
+    model_bench::{BenchConfig, Capability, benchmark_all},
+    platform::{
+        ExecutionPreference, Objective, PlacementEvidence, PlatformConfig, RouteInput, TaskKind,
+        serve as serve_platform,
+    },
     proxy::{ProxyConfig, serve},
     run_suite, validate_endpoints, write_json,
 };
 use reqwest::Client;
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -27,11 +32,14 @@ struct Cli {
 /// Admission tuning, grouped so `start_platform` stays within a readable argument count.
 #[derive(Debug, Clone, Copy, clap::Args)]
 struct AdmissionArgs {
-    /// Admission budget in cost units — embedding 1, chat 2, vision 4 (default 8, or
-    /// `FREELLAMA_MAX_CONCURRENT_TASKS`). Match it to `OLLAMA_NUM_PARALLEL`: Ollama's default is 1,
-    /// so a higher value bounds the burst rather than buying parallel decoding.
-    #[arg(long)]
+    /// Primary/GPU admission budget in weighted units — embedding 1, chat 2, vision 4 (default 2,
+    /// or `FREELLAMA_MAX_CONCURRENT_TASKS`). This is not a literal task count.
+    #[arg(long, alias = "gpu-admission-slots")]
     max_concurrent_tasks: Option<usize>,
+    /// CPU-backend admission budget in weighted units (default 1, or
+    /// `FREELLAMA_CPU_MAX_CONCURRENT_TASKS`).
+    #[arg(long)]
+    cpu_max_concurrent_tasks: Option<usize>,
     /// Seconds a task may queue for admission before being refused with 503 (default 120, or
     /// `FREELLAMA_MAX_QUEUE_WAIT_SECONDS`). Refusing fast matches Ollama's own `ErrMaxQueue`
     /// contract; waiting forever would hide load as unattributable latency.
@@ -39,14 +47,59 @@ struct AdmissionArgs {
     max_queue_wait_seconds: Option<u64>,
 }
 
+/// Ollama backend placement, grouped so device-specific routing stays an explicit serve concern.
+#[derive(Debug, Clone, clap::Args)]
+struct BackendArgs {
+    #[arg(long, default_value = "http://127.0.0.1:11434")]
+    upstream: String,
+    /// Optional second loopback Ollama process forced to CPU. Managed tasks using a model
+    /// named by --cpu-model are sent here; raw Ollama-compatible endpoints stay on --upstream.
+    #[arg(long)]
+    cpu_upstream: Option<String>,
+    /// Model to assign to --cpu-upstream. Repeat for multiple models.
+    #[arg(long, requires = "cpu_upstream")]
+    cpu_model: Vec<String>,
+}
+
+/// Production state and network boundary for `serve`.
+#[derive(Debug, Clone, clap::Args)]
+struct ProductionArgs {
+    /// Versioned adaptive-feedback snapshot. Defaults to the platform data directory.
+    #[arg(long)]
+    feedback_file: Option<PathBuf>,
+    /// Disable feedback persistence explicitly (primarily for disposable tests).
+    #[arg(long, conflicts_with = "feedback_file")]
+    ephemeral_feedback: bool,
+    /// File containing a bearer token of at least 32 bytes. The token is never accepted on the
+    /// command line, where process inspection could expose it.
+    #[arg(long)]
+    auth_token_file: Option<PathBuf>,
+    /// Permit a non-loopback listener. Requires --auth-token-file (or
+    /// `FREELLAMA_AUTH_TOKEN_FILE`).
+    #[arg(long)]
+    allow_remote: bool,
+}
+
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Inspect prerequisites and print a side-effect-free first-run plan. Never pulls a model.
+    Init {
+        #[arg(long, default_value = "http://127.0.0.1:11434")]
+        ollama_endpoint: String,
+        #[arg(long, default_value = "http://127.0.0.1:11435")]
+        serve_endpoint: String,
+    },
+    /// Generate a strong bearer token into a new mode-0600 file. Refuses to overwrite.
+    AuthToken {
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// Run the localhost model platform and preserve Ollama-compatible endpoints.
     Serve {
         #[arg(long, default_value = "127.0.0.1:11435")]
         listen: String,
-        #[arg(long, default_value = "http://127.0.0.1:11434")]
-        upstream: String,
+        #[command(flatten)]
+        backends: BackendArgs,
         /// Optional machine-local benchmark report used for evidence-backed ranking.
         #[arg(long)]
         benchmark_report: Option<PathBuf>,
@@ -61,6 +114,8 @@ enum Command {
         intent_model: String,
         #[command(flatten)]
         admission: AdmissionArgs,
+        #[command(flatten)]
+        production: ProductionArgs,
     },
     /// List installed local models with capabilities, residency, and local evidence.
     Models {
@@ -83,6 +138,8 @@ enum Command {
         endpoint: String,
         #[arg(long, value_enum, default_value_t = TaskKind::Completion)]
         task: TaskKind,
+        /// `balanced`/`quality` need a task policy; without one the router refuses. Use `fastest`
+        /// until `freellama policy-from-eval` has produced one.
         #[arg(long, value_enum, default_value_t = Objective::Balanced)]
         objective: Objective,
         #[arg(long)]
@@ -91,11 +148,20 @@ enum Command {
         session: Option<String>,
         #[arg(long)]
         context_tokens: Option<u64>,
+        /// Prefer an operator-configured backend. Falls back safely when it has no eligible model.
+        #[arg(long, value_enum, default_value_t = ExecutionPreference::Auto)]
+        execution_preference: ExecutionPreference,
+        /// Require matching Ollama /api/ps proof instead of trusting only backend assignment.
+        #[arg(long, value_enum, default_value_t = PlacementEvidence::Configured)]
+        min_placement_evidence: PlacementEvidence,
         /// Refuse rather than return a route graded below this ("low" or "medium"). "medium"
         /// needs both a policy file and a benchmark report; without them every route grades "low"
         /// and this refuses — which is the point.
         #[arg(long)]
         min_confidence: Option<String>,
+        /// Extra capability the model must advertise (repeatable), e.g. `--required-capability vision`.
+        #[arg(long = "required-capability")]
+        required_capabilities: Vec<String>,
     },
     /// Recommend an installed route or a reviewed, side-effect-free model installation plan.
     Recommend {
@@ -103,6 +169,8 @@ enum Command {
         endpoint: String,
         #[arg(long, value_enum, default_value_t = TaskKind::Completion)]
         task: TaskKind,
+        /// `balanced`/`quality` need a task policy; without one the router refuses. Use `fastest`
+        /// until `freellama policy-from-eval` has produced one.
         #[arg(long, value_enum, default_value_t = Objective::Balanced)]
         objective: Objective,
         /// Restrict installation planning to this exact model tag.
@@ -110,6 +178,13 @@ enum Command {
         model: Option<String>,
         #[arg(long)]
         context_tokens: Option<u64>,
+        /// Prefer an operator-configured backend. Falls back safely when it has no eligible model.
+        #[arg(long, value_enum, default_value_t = ExecutionPreference::Auto)]
+        execution_preference: ExecutionPreference,
+        #[arg(long, value_enum, default_value_t = PlacementEvidence::Configured)]
+        min_placement_evidence: PlacementEvidence,
+        #[arg(long = "required-capability")]
+        required_capabilities: Vec<String>,
     },
     /// Translate natural language locally, then return the deterministic route.
     NaturalRoute {
@@ -128,6 +203,8 @@ enum Command {
         endpoint: String,
         #[arg(long, value_enum, default_value_t = TaskKind::Completion)]
         task: TaskKind,
+        /// `balanced`/`quality` need a task policy; without one the router refuses. Use `fastest`
+        /// until `freellama policy-from-eval` has produced one.
         #[arg(long, value_enum, default_value_t = Objective::Balanced)]
         objective: Objective,
         #[arg(long)]
@@ -136,6 +213,12 @@ enum Command {
         session: Option<String>,
         #[arg(long)]
         context_tokens: Option<u64>,
+        /// Prefer an operator-configured backend. Falls back safely when it has no eligible model.
+        #[arg(long, value_enum, default_value_t = ExecutionPreference::Auto)]
+        execution_preference: ExecutionPreference,
+        /// `observed` fails closed unless the selected resident model matches physical placement.
+        #[arg(long, value_enum, default_value_t = PlacementEvidence::Configured)]
+        min_placement_evidence: PlacementEvidence,
         /// Attach an image (repeatable). Required for `--task vision`: without one the model is
         /// routed correctly but has nothing to look at, and says so.
         #[arg(long = "image")]
@@ -144,6 +227,11 @@ enum Command {
         /// Batching is far cheaper than one request per line.
         #[arg(long)]
         input_file: Option<PathBuf>,
+        /// Refuse rather than run a route graded below this ("low" or "medium").
+        #[arg(long)]
+        min_confidence: Option<String>,
+        #[arg(long = "required-capability")]
+        required_capabilities: Vec<String>,
     },
     /// Run an optional Ollama-compatible telemetry and policy sidecar.
     Proxy {
@@ -246,29 +334,47 @@ enum Command {
     },
 }
 
+struct PlatformStartArgs {
+    listen: String,
+    backends: BackendArgs,
+    benchmark_report: Option<PathBuf>,
+    policy_file: Option<PathBuf>,
+    recommendation_catalog: Option<PathBuf>,
+    intent_model: String,
+    admission: AdmissionArgs,
+    production: ProductionArgs,
+}
+
 #[tokio::main]
 #[allow(clippy::too_many_lines)] // Keep the exhaustive CLI dispatch visible in one place.
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
+        Command::Init {
+            ollama_endpoint,
+            serve_endpoint,
+        } => initialize(ollama_endpoint, serve_endpoint).await?,
+        Command::AuthToken { out } => generate_auth_token(&out)?,
         Command::Serve {
             listen,
-            upstream,
+            backends,
             benchmark_report,
             policy_file,
             recommendation_catalog,
             intent_model,
             admission,
+            production,
         } => {
-            start_platform(
+            start_platform(PlatformStartArgs {
                 listen,
-                upstream,
+                backends,
                 benchmark_report,
                 policy_file,
                 recommendation_catalog,
                 intent_model,
                 admission,
-            )
+                production,
+            })
             .await?;
         }
         Command::Models { endpoint } => {
@@ -287,7 +393,10 @@ async fn main() -> Result<()> {
             model,
             session,
             context_tokens,
+            execution_preference,
+            min_placement_evidence,
             min_confidence,
+            required_capabilities,
         } => {
             request_route(
                 endpoint,
@@ -296,7 +405,10 @@ async fn main() -> Result<()> {
                 model,
                 session,
                 context_tokens,
+                execution_preference,
+                min_placement_evidence,
                 min_confidence,
+                required_capabilities,
             )
             .await?;
         }
@@ -306,7 +418,23 @@ async fn main() -> Result<()> {
             objective,
             model,
             context_tokens,
-        } => request_recommendation(endpoint, task, objective, model, context_tokens).await?,
+            execution_preference,
+            min_placement_evidence,
+            required_capabilities,
+        } => {
+            let route = route_input(
+                task,
+                objective,
+                model,
+                None,
+                context_tokens,
+                execution_preference,
+                min_placement_evidence,
+                &required_capabilities,
+                None,
+            );
+            request_recommendation(endpoint, route).await?;
+        }
         Command::NaturalRoute {
             text,
             endpoint,
@@ -320,8 +448,12 @@ async fn main() -> Result<()> {
             model,
             session,
             context_tokens,
+            execution_preference,
+            min_placement_evidence,
             images,
             input_file,
+            min_confidence,
+            required_capabilities,
         } => {
             request_task(
                 prompt,
@@ -331,8 +463,12 @@ async fn main() -> Result<()> {
                 model,
                 session,
                 context_tokens,
+                execution_preference,
+                min_placement_evidence,
                 images,
                 input_file,
+                min_confidence,
+                required_capabilities,
             )
             .await?;
         }
@@ -419,21 +555,17 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn start_platform(
-    listen: String,
-    upstream: String,
-    benchmark_report: Option<PathBuf>,
-    policy_file: Option<PathBuf>,
-    recommendation_catalog: Option<PathBuf>,
-    intent_model: String,
-    admission: AdmissionArgs,
-) -> Result<()> {
+async fn start_platform(args: PlatformStartArgs) -> Result<()> {
     // `minConfidence: "medium"` needs BOTH a policy file and a benchmark report, and requiring two
     // explicit flags meant almost nobody ever had them — the gate degraded to refusing
     // everything. Fall back to conventional paths so the common case works, and say which
     // files were picked up so the behaviour is never silent.
-    let policy_file = policy_file.or_else(|| discover_config("platform.toml"));
-    let benchmark_report = benchmark_report.or_else(|| discover_config("benchmark-report.json"));
+    let policy_file = args
+        .policy_file
+        .or_else(|| discover_config("platform.toml"));
+    let benchmark_report = args
+        .benchmark_report
+        .or_else(|| discover_config("benchmark-report.json"));
     if let Some(p) = &policy_file {
         eprintln!("freellama: using policy file {}", p.display());
     }
@@ -450,28 +582,234 @@ async fn start_platform(
     }
 
     let mut config = PlatformConfig::new(
-        listen,
-        upstream,
+        args.listen,
+        args.backends.upstream,
         benchmark_report,
         policy_file,
-        intent_model,
+        args.intent_model,
     );
-    if let Some(path) = recommendation_catalog {
+    if let Some(cpu_upstream) = args.backends.cpu_upstream {
+        eprintln!(
+            "freellama: assigning {} model(s) to CPU Ollama at {cpu_upstream}",
+            args.backends.cpu_model.len()
+        );
+        config = config.with_cpu_backend(cpu_upstream, args.backends.cpu_model);
+    }
+    if let Some(path) = args.recommendation_catalog {
         config = config.with_recommendation_catalog(path);
     }
-    if let Some(slots) = admission.max_concurrent_tasks {
+    if let Some(slots) = args.admission.max_concurrent_tasks {
         config = config.with_max_concurrent_tasks(slots);
     }
-    if let Some(seconds) = admission.max_queue_wait_seconds {
+    if let Some(slots) = args.admission.cpu_max_concurrent_tasks {
+        config = config.with_cpu_max_concurrent_tasks(slots);
+    }
+    if let Some(seconds) = args.admission.max_queue_wait_seconds {
         config = config.with_max_queue_wait(Duration::from_secs(seconds));
     }
+    if !args.production.ephemeral_feedback {
+        let path = args
+            .production
+            .feedback_file
+            .or_else(|| std::env::var_os("FREELLAMA_FEEDBACK_FILE").map(PathBuf::from))
+            .or_else(default_feedback_file)
+            .context(
+                "cannot determine a feedback path; pass --feedback-file or --ephemeral-feedback",
+            )?;
+        eprintln!(
+            "freellama: persisting bounded placement feedback at {}",
+            path.display()
+        );
+        config = config.with_feedback_file(path);
+    }
+    let token_file = args
+        .production
+        .auth_token_file
+        .or_else(|| std::env::var_os("FREELLAMA_AUTH_TOKEN_FILE").map(PathBuf::from));
+    if let Some(path) = token_file {
+        let token = read_auth_token(&path)?;
+        eprintln!(
+            "freellama: bearer authentication enabled from {}",
+            path.display()
+        );
+        config = config.with_auth_token(token);
+    }
+    if args.production.allow_remote {
+        config = config.with_remote_access(true);
+    }
     eprintln!(
-        "freellama: admission budget {} cost units (embedding 1, chat 2, vision 4). Raise with \
-         --max-concurrent-tasks, and raise OLLAMA_NUM_PARALLEL with it — Ollama serializes at its \
-         default of 1.",
-        config.resolved_max_concurrent_tasks()
+        "freellama: per-backend admission budgets: GPU {} units, CPU {} units (embedding 1, chat \
+         2, vision 4). These are weighted units, not literal task counts; pair same-model GPU \
+         concurrency changes with OLLAMA_NUM_PARALLEL and KV-cache validation.",
+        config.resolved_max_concurrent_tasks(),
+        config.resolved_cpu_max_concurrent_tasks()
     );
     serve_platform(config).await
+}
+
+fn default_feedback_file() -> Option<PathBuf> {
+    if cfg!(target_os = "windows") {
+        return std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .map(|path| path.join("FreeLlama").join("feedback.json"));
+    }
+    std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
+        .map(|path| path.join("freellama").join("feedback.json"))
+}
+
+fn read_auth_token(path: &std::path::Path) -> Result<String> {
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("inspect authentication token file {}", path.display()))?;
+    ensure!(
+        metadata.is_file(),
+        "authentication token path must be a file"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        ensure!(
+            metadata.permissions().mode().trailing_zeros() >= 6,
+            "authentication token file {} must not be accessible by group or others (chmod 600)",
+            path.display()
+        );
+    }
+    let token = std::fs::read_to_string(path)
+        .with_context(|| format!("read authentication token file {}", path.display()))?;
+    let token = token.trim().to_owned();
+    ensure!(
+        token.len() >= 32,
+        "authentication token must be at least 32 bytes"
+    );
+    ensure!(
+        !token.chars().any(char::is_whitespace),
+        "authentication token must not contain whitespace"
+    );
+    Ok(token)
+}
+
+fn generate_auth_token(path: &std::path::Path) -> Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create token directory {}", parent.display()))?;
+    }
+    let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("create new authentication token file {}", path.display()))?;
+    writeln!(file, "{token}").context("write authentication token")?;
+    file.sync_all().context("sync authentication token")?;
+    println!("Created authentication token file {}", path.display());
+    Ok(())
+}
+
+/// Side-effect-free first-run receipt. Initialization must discover the real host and inventory
+/// before discussing a model, and discovery must never be interpreted as pull permission.
+async fn initialize(ollama_endpoint: String, serve_endpoint: String) -> Result<()> {
+    let diagnostics = match doctor(&ollama_endpoint).await {
+        Ok(value) => json!({"status": "ok", "report": value}),
+        Err(error) => json!({"status": "blocked", "error": error.to_string()}),
+    };
+    let client = Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .context("build init HTTP client")?;
+    let tags = match client
+        .get(format!(
+            "{}/api/tags",
+            ollama_endpoint.trim_end_matches('/')
+        ))
+        .send()
+        .await
+    {
+        Ok(response) if response.status().is_success() => response
+            .json::<Value>()
+            .await
+            .unwrap_or_else(|error| json!({"error": error.to_string()})),
+        Ok(response) => json!({"error": format!("HTTP {}", response.status())}),
+        Err(error) => json!({"error": error.to_string()}),
+    };
+    let health_request = client.get(format!(
+        "{}/_freellama/v1/health",
+        serve_endpoint.trim_end_matches('/')
+    ));
+    let health = match authenticate_request(health_request)?.send().await {
+        Ok(response) if response.status().is_success() => {
+            response.json::<Value>().await.unwrap_or_else(
+                |error| json!({"status": "stale_or_invalid", "error": error.to_string()}),
+            )
+        }
+        Ok(response) => json!({"status": "unavailable", "http_status": response.status().as_u16()}),
+        Err(error) => json!({"status": "unavailable", "error": error.to_string()}),
+    };
+    let installed_models = tags
+        .get("models")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|model| {
+            model
+                .get("name")
+                .or_else(|| model.get("model"))
+                .and_then(Value::as_str)
+        })
+        .collect::<Vec<_>>();
+    let ollama_ready = diagnostics["status"] == "ok" && tags.get("error").is_none();
+    let serve_ready = health["status"] == "ok";
+    let mut next_steps = Vec::new();
+    if !ollama_ready {
+        next_steps.push(json!({
+            "action": "install_or_start_ollama",
+            "instruction": "Install Ollama from https://ollama.com/download, or start `ollama serve`, then rerun `freellama init`."
+        }));
+    } else if installed_models.is_empty() {
+        next_steps.push(json!({
+            "action": "choose_model",
+            "instruction": "Describe the workload, modality, quality, context, download, disk, and memory constraints. Inspect exact tags and ask approval before `ollama pull`."
+        }));
+    }
+    if ollama_ready && !serve_ready {
+        next_steps.push(json!({
+            "action": "start_freellama",
+            "instruction": format!("Start `freellama serve --upstream {ollama_endpoint}`; add a second loopback Ollama and exact --cpu-model tags only after placement trials.")
+        }));
+    }
+    if serve_ready && !installed_models.is_empty() {
+        next_steps.push(json!({
+            "action": "verify_managed_task",
+            "instruction": "Preview with `freellama route --objective fastest`, run one bounded task with configured placement evidence, inspect execution.observation, then require observed evidence where placement matters."
+        }));
+        next_steps.push(json!({
+            "action": "configure_mcp",
+            "instruction": "Build packages/mcp, launch packages/mcp/dist/index.js over stdio, call doctor, then list installed/resident models before delegating."
+        }));
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "status": if ollama_ready { "ready" } else { "blocked" },
+            "ollama_endpoint": ollama_endpoint,
+            "serve_endpoint": serve_endpoint,
+            "diagnostics": diagnostics,
+            "installed_models": installed_models,
+            "serve_health": health,
+            "next_steps": next_steps,
+            "side_effects_performed": false,
+            "model_pull_requires_exact_tag_approval": true
+        }))?
+    );
+    Ok(())
 }
 
 async fn print_doctor(endpoint: &str) -> Result<()> {
@@ -494,6 +832,7 @@ async fn request_natural_route(
     print_post(&endpoint, "/_freellama/v1/natural-routes", &body).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn request_route(
     endpoint: String,
     task: TaskKind,
@@ -501,10 +840,22 @@ async fn request_route(
     model: Option<String>,
     session: Option<String>,
     context_tokens: Option<u64>,
+    execution_preference: ExecutionPreference,
+    min_placement_evidence: PlacementEvidence,
     min_confidence: Option<String>,
+    required_capabilities: Vec<String>,
 ) -> Result<()> {
-    let mut route = route_input(task, objective, model, session, context_tokens);
-    route.min_confidence = min_confidence;
+    let route = route_input(
+        task,
+        objective,
+        model,
+        session,
+        context_tokens,
+        execution_preference,
+        min_placement_evidence,
+        &required_capabilities,
+        min_confidence,
+    );
     print_post(
         &endpoint,
         "/_freellama/v1/routes",
@@ -513,14 +864,7 @@ async fn request_route(
     .await
 }
 
-async fn request_recommendation(
-    endpoint: String,
-    task: TaskKind,
-    objective: Objective,
-    model: Option<String>,
-    context_tokens: Option<u64>,
-) -> Result<()> {
-    let route = route_input(task, objective, model, None, context_tokens);
+async fn request_recommendation(endpoint: String, route: RouteInput) -> Result<()> {
     print_post(
         &endpoint,
         "/_freellama/v1/recommendations",
@@ -541,10 +885,24 @@ async fn request_task(
     model: Option<String>,
     session: Option<String>,
     context_tokens: Option<u64>,
+    execution_preference: ExecutionPreference,
+    min_placement_evidence: PlacementEvidence,
     images: Vec<PathBuf>,
     input_file: Option<PathBuf>,
+    min_confidence: Option<String>,
+    required_capabilities: Vec<String>,
 ) -> Result<()> {
-    let route = route_input(task, objective, model, session, context_tokens);
+    let route = route_input(
+        task,
+        objective,
+        model,
+        session,
+        context_tokens,
+        execution_preference,
+        min_placement_evidence,
+        &required_capabilities,
+        min_confidence,
+    );
     let mut body = serde_json::to_value(route)?;
 
     // Ollama takes images as base64 with no data-URI prefix, attached to the user message.
@@ -586,12 +944,17 @@ async fn request_task(
     print_post(&endpoint, "/_freellama/v1/tasks", &body).await
 }
 
+#[allow(clippy::too_many_arguments)]
 fn route_input(
     task: TaskKind,
     objective: Objective,
     model: Option<String>,
     session_id: Option<String>,
     context_tokens: Option<u64>,
+    execution_preference: ExecutionPreference,
+    min_placement_evidence: PlacementEvidence,
+    required_capabilities: &[String],
+    min_confidence: Option<String>,
 ) -> RouteInput {
     RouteInput {
         task,
@@ -599,7 +962,13 @@ fn route_input(
         model,
         session_id,
         context_tokens,
-        ..RouteInput::default()
+        execution_preference,
+        min_placement_evidence,
+        required_capabilities: required_capabilities
+            .iter()
+            .map(|s| Capability::parse(s))
+            .collect(),
+        min_confidence,
     }
 }
 
@@ -770,8 +1139,8 @@ async fn print_response(response: reqwest::Response) -> Result<()> {
 }
 
 async fn print_get(endpoint: &str, path: &str) -> Result<()> {
-    let response = cli_client()
-        .get(format!("{}{path}", endpoint.trim_end_matches('/')))
+    let request = cli_client().get(format!("{}{path}", endpoint.trim_end_matches('/')));
+    let response = authenticate_request(request)?
         .timeout(cli_control_timeout())
         .send()
         .await
@@ -786,14 +1155,22 @@ async fn print_post(endpoint: &str, path: &str, body: &Value) -> Result<()> {
     } else {
         cli_control_timeout()
     };
-    let response = cli_client()
+    let request = cli_client()
         .post(format!("{}{path}", endpoint.trim_end_matches('/')))
         .timeout(timeout)
-        .json(body)
+        .json(body);
+    let response = authenticate_request(request)?
         .send()
         .await
         .map_err(|e| explain_transport(endpoint, e))?;
     print_response(response).await
+}
+
+fn authenticate_request(request: reqwest::RequestBuilder) -> Result<reqwest::RequestBuilder> {
+    let Some(path) = std::env::var_os("FREELLAMA_AUTH_TOKEN_FILE").map(PathBuf::from) else {
+        return Ok(request);
+    };
+    Ok(request.bearer_auth(read_auth_token(&path)?))
 }
 
 /// Print the MCP tool surface alongside its CLI equivalent.
@@ -801,32 +1178,22 @@ async fn print_post(endpoint: &str, path: &str, body: &Value) -> Result<()> {
 /// Hand-maintained rather than generated from the MCP server, so the CLI keeps no Node dependency.
 /// The trade-off is that adding or removing a tool means updating this table.
 fn print_tool_map() {
-    println!("FreeLlama exposes 8 MCP tools. Equivalents for a CLI-only agent:\n");
+    println!("FreeLlama exposes 6 MCP tools. Equivalents for a CLI-only agent:\n");
     let rows = [
         (
             "doctor",
             "freellama doctor",
-            "Ollama health, the 9 memory env vars, machine profile",
+            "Ollama health, 11 memory settings, machine profile",
         ),
         (
             "models",
             "freellama models",
-            "installed models, capabilities, residency",
-        ),
-        (
-            "route",
-            "freellama route --task <t>",
-            "which model would be picked; no generation",
+            "installed estate; view library (ollama.com) is MCP-only",
         ),
         (
             "run_task",
-            "freellama task --task <t> --prompt <p>",
-            "route AND execute one call",
-        ),
-        (
-            "search_models",
-            "(MCP only)",
-            "browse ollama.com, inspect tags for memory fit",
+            "freellama task --task <t> <prompt>",
+            "route AND execute; preview:true is decision-only",
         ),
         (
             "ollama_manage",
@@ -847,7 +1214,10 @@ fn print_tool_map() {
     for (tool, cli, what) in rows {
         println!("  {tool:<18} {cli:<38} {what}");
     }
-    println!("\nCLI-only: serve, proxy, session, bench-all, eval, run, natural-route, recommend.");
+    println!(
+        "\nCLI-only: init, serve, proxy, machine, session, bench-all, policy-from-eval, eval, run, \
+         natural-route, recommend."
+    );
     println!("Orchestration guidance for either surface: skills/freellama/SKILL.md");
 }
 

@@ -2,7 +2,8 @@
 //! manufacture evidence it does not have — the whole point of the tool.
 use std::io::Write;
 
-use freellama::policy::{qualify_from_aggregate, slug};
+use freellama::platform::TaskKind;
+use freellama::policy::{qualify_from_aggregate, render_policy, slug};
 
 fn aggregate(trials: u32, pass: f64, fresh: bool) -> tempfile::NamedTempFile {
     let mut f = tempfile::NamedTempFile::new().unwrap();
@@ -60,4 +61,22 @@ fn ignores_models_that_are_not_installed() {
     let f = aggregate(3, 0.9, true);
     let err = qualify_from_aggregate(f.path(), &["some-other:7b".into()], 0.8, false).unwrap_err();
     assert!(err.to_string().contains("installed here"), "got: {err}");
+}
+
+#[test]
+fn render_policy_writes_a_machine_readable_smoke_flag() {
+    let (qualified, _) = qualify_from_aggregate(
+        aggregate(1, 0.9, true).path(),
+        &["qwen3.8:27b-mlx".into()],
+        0.8,
+        true,
+    )
+    .unwrap();
+    let mut entries = std::collections::BTreeMap::new();
+    entries.insert(TaskKind::Coding, qualified);
+    let rendered = render_policy(&entries, "agg.json", "2026-08-27", 0.8, true);
+    assert!(
+        rendered.contains("smoke = true"),
+        "runtime loader keys on this field, not the comment: {rendered}"
+    );
 }

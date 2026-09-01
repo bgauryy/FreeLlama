@@ -5,7 +5,11 @@
       "args": [
         "packages/mcp/dist/index.js"
       ],
-      "description": "Offload token-heavy, non-reasoning work to local Ollama models. Not a general-purpose MCP and not a judgment substitute. 8 tools: doctor (Ollama health + the 9 memory env vars + machine profile), models (installed/resident/detail/raw), route (free preview; minConfidence:'medium' fails closed instead of picking a weak model), search_models (browse the library, then inspect a family's tags for memory fit), run_task (routes AND executes; withholds raw embedding vectors unless returnEmbeddings:true), ollama_manage (pull|stop), ollama_delete (DESTRUCTIVE), delegate_research (grounded file research, ~98% token reduction, every answer carries accept/verify/escalate). Never delegate to a model below ~12B \u2014 accuracy collapses. Installed models vary per machine: call models{view:'installed'} rather than assuming. Orchestration playbook: skills/freellama/SKILL.md."
+      "env": {
+        "FREELLAMA_AUTH_TOKEN_FILE": "/Users/guybary/.local/share/freellama/auth.token",
+        "FREELLAMA_AGENT_TOKEN_CALIBRATION_DIR": "/Users/guybary/.local/share/freellama/token-calibration"
+      },
+      "description": "Offload token-heavy, non-reasoning work to local Ollama models. Not a general-purpose MCP and not a judgment substitute. 6 tools: doctor (Ollama health + 11 memory settings + machine profile), models (installed/resident/detail/raw/library), run_task (routes AND executes; preview:true is decision-only; withholds raw embedding vectors unless returnEmbeddings:true), ollama_manage (pull|stop), ollama_delete (DESTRUCTIVE), delegate_research (grounded file research, ~98% token reduction, every answer carries accept/verify/escalate). Never delegate to a model below ~12B — accuracy collapses. Installed models vary per machine: call models{view:'installed'} rather than assuming. Orchestration playbook: skills/freellama/SKILL.md."
     }
   }
 }

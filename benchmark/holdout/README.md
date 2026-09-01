@@ -7,14 +7,14 @@ The rest of `benchmark/` measures **models**. This measures the **adapter** — 
 
 FreeLlama's own repository is contaminated as an eval corpus. The adapter prompts (search scoping,
 declaration-vs-occurrence guidance, the JSON repair loop) were all tuned against questions about
-this repo, across repeated runs. Numbers measured there are training-set performance and cannot
+this repository, across repeated runs. Numbers measured there are training-set performance and cannot
 support an accept/reject decision about the adapter.
 
 `benchmark/local/` has the same problem in a milder form: its `click` / `zustand` / `openui` corpora
 are checked into this project's history and have been run many times.
 
 So this harness pulls **fresh upstream repositories** into `.clones/` (gitignored, never part of
-this repo) and grades against ground truth derived from their AST.
+this repository) and grades against ground truth derived from their AST.
 
 ## Two conditions, because the first experiment could not discriminate
 
@@ -50,15 +50,16 @@ intent inference (SWE-QA arXiv:2509.14635, DeepRepoQA arXiv:2608.24221, CoReQA a
 | `advanced` | `callsite`, `import_origin`, `raises` | cross-file / multi-hop |
 
 Note what the dirty condition does to the *regression* tier: "which file defines `X`" has one
-correct answer and three files containing it. Easy questions become hard when the workspace is real.
+correct answer and three files containing it. Regression questions become discriminating when the
+workspace contains realistic build and vendor copies.
 
-## Grading is an accept-set, not one string
+## Accept-set grading
 
 Each case ships several accepted forms. Strict single-form matching is the largest source of false
 negatives in answer grading, and it punishes an answer for being *more* informative — full path
 instead of basename, `Class.method` instead of `method`. No accepted form can be produced by an
-agent that found nothing, so the grader stays honest without being brittle. Answers are normalised
-for case, backticks, quotes and trailing parens first.
+agent that found nothing, so the grader stays honest without being brittle. The grader normalizes
+answers for case, backticks, quotes, and trailing parentheses first.
 
 Every miss carries a `failureSignature` — `no_answer`, `unparseable_reply`,
 `ungrounded_no_tool_calls`, `all_tool_calls_failed`, `turn_budget_exhausted`, `wrong_answer` — so a
@@ -78,13 +79,13 @@ Cases are dropped rather than graded loosely. A complexity case needs a **strict
 with the runner-up, at least 5 branches). A location case needs a symbol defined **exactly once**.
 
 **A grader that can pass by accident is not a grader.** Two earlier iterations of this file produced
-expected values like `10`, `{{`, `%}`, `__init__`, `parse` and `alias` — all of which appear in
-ordinary prose, so a run that found nothing would still have scored a hit. The filters now require
+expected values like `10`, `{{`, `%}`, `__init__`, `parse`, and `alias`—all of which appear in
+ordinary prose, so a run that found nothing can still score a hit. The filters require
 distinctive identifiers (≥6 characters, no dunders, not in `GENERIC_NAMES`) and constants that are
 not bare words. Selection is a fixed stride over a sorted pool, so it is reproducible and not
 cherry-picked.
 
-## Running it
+## Run the evaluation
 
 ```bash
 mkdir -p .clones && cd .clones

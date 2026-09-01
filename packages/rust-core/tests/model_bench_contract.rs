@@ -1,5 +1,5 @@
 use freellama::model_bench::{
-    BenchmarkConfiguration, Capability, ModelMetadata, benchmark_plan, score_cases,
+    BenchmarkConfiguration, Capability, ModelMetadata, ModelType, benchmark_plan, score_cases,
 };
 
 fn model(capabilities: &[Capability], size: u64) -> ModelMetadata {
@@ -11,8 +11,25 @@ fn model(capabilities: &[Capability], size: u64) -> ModelMetadata {
         parameter_size: "1B".to_owned(),
         quantization: "Q4".to_owned(),
         capabilities: capabilities.to_vec(),
+        model_type: ModelType::from_capabilities(capabilities.iter().copied()),
         advertised_context: Some(32_768),
     }
+}
+
+#[test]
+fn model_type_is_derived_from_additive_capabilities() {
+    assert_eq!(
+        ModelType::from_capabilities([Capability::Embedding]),
+        ModelType::EmbeddingOnly
+    );
+    assert_eq!(
+        ModelType::from_capabilities([Capability::Completion, Capability::Vision]),
+        ModelType::Multimodal
+    );
+    assert_eq!(
+        ModelType::from_capabilities([Capability::Completion, Capability::Tools]),
+        ModelType::Generative
+    );
 }
 
 #[test]
@@ -40,7 +57,7 @@ fn score_is_quality_guarded() {
 }
 
 #[test]
-fn large_models_receive_a_memory_safe_mac_profile() {
+fn large_models_receive_a_conservative_cross_machine_profile() {
     let plan = benchmark_plan(&model(&[Capability::Completion], 20_000_000_000));
     assert!(plan.iter().all(|case| case.num_ctx <= 8_192));
 }

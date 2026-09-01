@@ -10,6 +10,16 @@ CHECK_ROOT="${FREELLAMA_CHECK_ROOT:-$PWD}"
 FREELLAMA_REPO="${FREELLAMA_REPO:-}"
 OLLAMA_ENDPOINT="${OLLAMA_ENDPOINT:-http://127.0.0.1:11434}"
 FREELLAMA_ENDPOINT="${FREELLAMA_ENDPOINT:-http://127.0.0.1:11435}"
+FREELLAMA_AUTH_TOKEN_FILE="${FREELLAMA_AUTH_TOKEN_FILE:-}"
+FREELLAMA_CURL_AUTH=()
+if [ -n "$FREELLAMA_AUTH_TOKEN_FILE" ]; then
+  if [ ! -r "$FREELLAMA_AUTH_TOKEN_FILE" ]; then
+    echo "  FAIL  FREELLAMA_AUTH_TOKEN_FILE is not readable: $FREELLAMA_AUTH_TOKEN_FILE"
+    exit 1
+  fi
+  FREELLAMA_AUTH_TOKEN="$(tr -d '\r\n' < "$FREELLAMA_AUTH_TOKEN_FILE")"
+  FREELLAMA_CURL_AUTH=(-H "Authorization: Bearer $FREELLAMA_AUTH_TOKEN")
+fi
 FAILED=0
 WARNED=0
 warn() { echo "  WARN  $1"; WARNED=1; }
@@ -21,8 +31,8 @@ echo "== Disk space =="
 # unrelated data is normal and shouldn't nag; genuinely low absolute headroom is what caused a
 # real incident (188Mi free out of 926Gi during a benchmark run — see references/disk-cleanup.md).
 MIN_FREE_GB="${MIN_FREE_GB:-15}"
-disk_line=$(df -g "$CHECK_ROOT" 2>/dev/null | tail -1)
-free_gb=$(echo "$disk_line" | awk '{print $4}')
+disk_line=$(df -Pk "$CHECK_ROOT" 2>/dev/null | tail -1)
+free_gb=$(echo "$disk_line" | awk '{if ($4 ~ /^[0-9]+$/) printf "%d", $4 / 1024 / 1024}')
 if [ -n "$free_gb" ] && [ "$free_gb" -lt "$MIN_FREE_GB" ] 2>/dev/null; then
   fail "only ${free_gb}GB free on the volume containing $CHECK_ROOT (threshold ${MIN_FREE_GB}GB) — see references/disk-cleanup.md before running anything that copies large fixtures or pulls models"
 else
@@ -41,10 +51,14 @@ fi
 if [ -z "$version_json" ]; then
   warn "skipping CLI/server version cross-check — server unreachable, nothing to compare against"
 elif command -v ollama >/dev/null 2>&1; then
-  cli_version="$(ollama --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+  cli_output="$(ollama --version 2>&1)"
+  cli_version="$(printf '%s\n' "$cli_output" | sed -nE 's/^Warning: client version is ([0-9]+\.[0-9]+\.[0-9]+).*$/\1/p' | head -1)"
+  if [ -z "$cli_version" ]; then
+    cli_version="$(printf '%s\n' "$cli_output" | sed -nE 's/^ollama version is ([0-9]+\.[0-9]+\.[0-9]+).*$/\1/p' | head -1)"
+  fi
   server_version="$(echo "$version_json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("version",""))' 2>/dev/null)"
   if [ -n "$cli_version" ] && [ -n "$server_version" ] && [ "$cli_version" != "$server_version" ]; then
-    warn "ollama CLI ($cli_version) and server ($server_version) versions differ — restart the app after an upgrade"
+    warn "ollama CLI ($cli_version at $(command -v ollama)) and server ($server_version) versions differ — align PATH with the active Ollama installation"
   elif [ -n "$cli_version" ] && [ -n "$server_version" ]; then
     ok "CLI/server version match ($cli_version)"
   else
@@ -55,28 +69,80 @@ else
 fi
 
 echo
+echo "== Ollama KV cache & concurrency =="
+read_ollama_env() {
+  local name="$1"
+  local value="${!name-}"
+  if [ -z "$value" ] && command -v launchctl >/dev/null 2>&1; then
+    value=$(launchctl getenv "$name" 2>/dev/null || true)
+  fi
+  printf '%s' "$value"
+}
+kv_type=$(read_ollama_env OLLAMA_KV_CACHE_TYPE)
+num_parallel=$(read_ollama_env OLLAMA_NUM_PARALLEL)
+max_loaded=$(read_ollama_env OLLAMA_MAX_LOADED_MODELS)
+if [ -z "$kv_type" ]; then
+  warn "OLLAMA_KV_CACHE_TYPE not visible here — effective f16 if it is also unset in the Ollama process; q8_0 uses about half the KV memory, but benchmark model quality before changing it"
+else
+  ok "OLLAMA_KV_CACHE_TYPE=$kv_type"
+fi
+echo "  INFO  OLLAMA_NUM_PARALLEL=${num_parallel:-1 (effective default if unset in Ollama)}"
+if [ -z "$max_loaded" ]; then
+  warn "OLLAMA_MAX_LOADED_MODELS not visible here — effective cap is 3 x GPU count (or 3 for CPU-only) if unset in Ollama; choose an explicit per-process cap from measured model and memory fit"
+else
+  ok "OLLAMA_MAX_LOADED_MODELS=$max_loaded"
+fi
+echo "  INFO  Config visibility is best effort: this shell environment, plus launchd on macOS; a separate service or remote Ollama can differ"
+
+echo
 echo "== Resident models & memory =="
 if ps_json=$(curl -sf "$OLLAMA_ENDPOINT/api/ps" 2>/dev/null); then
   python3 - "$ps_json" <<'PYEOF'
-import json, sys
+import ctypes, json, os, platform, subprocess, sys
+
+def total_memory_bytes():
+    try:
+        if platform.system() == "Darwin":
+            return int(subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True).strip())
+        if platform.system() == "Windows":
+            class MemoryStatus(ctypes.Structure):
+                _fields_ = [("length", ctypes.c_ulong), ("load", ctypes.c_ulong),
+                            ("total", ctypes.c_ulonglong), ("available", ctypes.c_ulonglong),
+                            ("total_page", ctypes.c_ulonglong), ("available_page", ctypes.c_ulonglong),
+                            ("total_virtual", ctypes.c_ulonglong), ("available_virtual", ctypes.c_ulonglong),
+                            ("available_extended", ctypes.c_ulonglong)]
+            status = MemoryStatus()
+            status.length = ctypes.sizeof(status)
+            return status.total if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)) else None
+        return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    except (AttributeError, OSError, ValueError, subprocess.SubprocessError):
+        return None
+
 data = json.loads(sys.argv[1])
 models = data.get("models", [])
 if not models:
     print("  OK    no models currently resident (cold start)")
 else:
-    total = 0
+    total = 0.0
     for m in models:
-        size_gb = m.get("size_vram", m.get("size", 0)) / (1024**3)
+        accelerator_bytes = m.get("size_vram", 0) or 0
+        committed_bytes = accelerator_bytes or m.get("size", 0) or 0
+        size_gb = committed_bytes / (1024**3)
         total += size_gb
-        print(f"  INFO  resident: {m['name']:<28} ~{size_gb:.1f} GB  expires_at={m.get('expires_at','?')}")
-    print(f"  INFO  total resident VRAM: ~{total:.1f} GB")
-    if len(models) > 1:
-        print(f"  WARN  {len(models)} models resident simultaneously — on unified-memory Macs, two large")
-        print("        models can exceed physical RAM and crash the server (this is exactly what broke an")
-        print("        earlier benchmark run here: qwen3.8:27b-mlx + qwen2.5:32b as a local judge = ~58GB")
-        print("        against 48GB). Keep a judge/second model on a DIFFERENT machine, or don't run one")
-        print("        locally at all — see references/ollama-config.md.")
-        sys.exit(2)  # signal the warning back to the calling shell; see WARNED handling below
+        placement = "accelerator" if accelerator_bytes else "host RAM"
+        print(f"  INFO  resident: {m['name']:<28} ~{size_gb:.1f} GiB {placement}  expires_at={m.get('expires_at','?')}")
+    memory = total_memory_bytes()
+    if memory:
+        memory_gib = memory / (1024**3)
+        fraction = total / memory_gib if memory_gib else 0
+        print(f"  INFO  model-memory proxy: ~{total:.1f} GiB of {memory_gib:.1f} GiB host RAM ({fraction:.0%})")
+        if fraction >= 0.8:
+            print("  WARN  resident model sizes are at least 80% of physical RAM; leave headroom for")
+            print("        KV caches, the OS, applications, and discrete-GPU staging. Reduce contexts,")
+            print("        unload helpers, or lower the per-process loaded-model cap.")
+            sys.exit(2)
+    else:
+        print(f"  INFO  model-memory proxy: ~{total:.1f} GiB; physical RAM unavailable, so fit is unverified")
 PYEOF
 py_status=$?
 if [ "$py_status" -eq 2 ]; then
@@ -90,10 +156,48 @@ fi
 
 echo
 echo "== FreeLlama proxy/serve =="
-if curl -sf "$FREELLAMA_ENDPOINT/api/version" >/dev/null 2>&1; then
+if curl -sf "${FREELLAMA_CURL_AUTH[@]}" "$FREELLAMA_ENDPOINT/api/version" >/dev/null 2>&1; then
   ok "reachable at $FREELLAMA_ENDPOINT (passthrough works)"
-  if curl -sf "$FREELLAMA_ENDPOINT/_freellama/v1/machine" >/dev/null 2>&1; then
+  if health_json=$(curl -sf "${FREELLAMA_CURL_AUTH[@]}" "$FREELLAMA_ENDPOINT/_freellama/v1/health" 2>/dev/null); then
     ok "control-plane routes present — this is 'freellama serve' (full platform)"
+    if python3 - "$health_json" <<'PYEOF'
+import json, sys
+health = json.loads(sys.argv[1])
+contracts = health.get("contracts", {})
+backends = health.get("backends", {})
+gpu = backends.get("gpu", {})
+cpu = backends.get("cpu")
+security = health.get("security", {})
+feedback = health.get("feedback", {})
+print(f"  INFO  primary backend: {gpu.get('upstream', '?')} admission={gpu.get('admission', {})}")
+if cpu:
+    print(f"  INFO  CPU backend: {cpu.get('upstream', '?')} models={','.join(cpu.get('models', []))} admission={cpu.get('admission', {})}")
+else:
+    print("  INFO  CPU backend: not configured")
+ok = (
+    contracts.get("hardware_fit") == "sent_num_ctx"
+    and contracts.get("machine_profile") == "portable_host_memory_v2"
+    and contracts.get("model_backends") == "explicit_cpu_assignment"
+    and contracts.get("placement_preference") == "guarded_hint"
+    and contracts.get("placement_observation") == "ollama_api_ps_after_execution"
+    and contracts.get("placement_evidence_gate") == "configured_or_observed"
+    and contracts.get("placement_feedback") == "three_sample_runtime"
+    and contracts.get("placement_feedback_metric") == "normalized_work_unit_10_percent"
+    and contracts.get("placement_feedback_persistence") == "versioned_atomic_snapshot_v1"
+    and contracts.get("authentication") == "optional_bearer_all_routes"
+    and contracts.get("immediate_unload_observation") == "observe_then_unload"
+    and bool(gpu.get("upstream"))
+    and bool(gpu.get("admission", {}).get("slots_total"))
+    and feedback.get("persistence", {}).get("enabled") is True
+    and security.get("remote_access") is False
+)
+sys.exit(0 if ok else 1)
+PYEOF
+    then
+      ok "serve contracts are current (auth, persisted feedback, observation, evidence gate, unload)"
+    else
+      fail "serve is stale or incomplete — rebuild and restart; health lacks the current hardware/backend contracts"
+    fi
   else
     ok "no control-plane routes — this is 'freellama proxy' (passthrough + retry only, by design)"
   fi

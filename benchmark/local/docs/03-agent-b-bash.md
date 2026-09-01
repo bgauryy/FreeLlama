@@ -32,18 +32,18 @@ as Agent A's tool observations. Every invocation is recorded in `tool_calls[]` w
 to `"shell"` (the exact capability name `adapters.md` reserves for this) and the literal command kept
 under `arguments.command`.
 
-A short denylist blocks obviously destructive patterns before execution (`sudo`, `rm -rf /`,
+A short denylist blocks destructive patterns before execution (`sudo`, `rm -rf /`,
 fork-bombs, `curl`/`wget`/`nc` for outbound network, redirection to device files) — not because the
-model is expected to try these, but because an unconstrained shell has no other safety net. The
-workspace itself is a disposable per-trial copy, so anything the command does to files inside it
-(including deleting them) is a legitimate, gradable outcome (`no_changes` / `max_changed_files`
-checks will simply fail that trial), not a safety incident.
+model is expected to try these, but because an unconstrained shell has no other safety net. Contracts:
+`scripts/test_bash_confine.py`. The workspace itself is a disposable per-trial copy, so anything the
+command does to files inside it (including deleting them) is a legitimate, gradable outcome
+(`no_changes` / `max_changed_files` checks fail that trial), not a safety incident.
 
 ## Why this is the fair baseline
 
-This is deliberately the *lowest-common-denominator* research tool: it is what any generic
+This is deliberately the most widely available research tool: it is what any generic
 shell-capable agent has access to with zero setup, and it is the natural point of comparison for
-"does a purpose-built code-research tool (`octocode`) actually help a local model do code research
-faster/more accurately, or is grep-and-cat just as good?" Both agents share everything else (model,
+"does a purpose-built code-research tool (`octocode`) help a local model do code research
+faster or more accurately, or does grep-and-cat perform as well?" Both agents share everything else (model,
 decoding params, turn budget, workspace, questions, grading) so any measured difference in tokens,
 tool-call count, wall time, or pass rate is attributable to the tool surface alone.

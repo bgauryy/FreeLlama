@@ -237,7 +237,11 @@ def run_trial(suite: dict[str, Any], task: dict[str, Any], fixture: Path, script
     before = manifest(workspace)
     started_at = datetime.now(timezone.utc)
     replacements = {"model": args.model, "prompt_file": str(prompt_file), "workspace": str(workspace), "result_file": str(agent_result_path)}
-    command_text = args.agent_command.format(**replacements)
+    # Adapters run with cwd=workspace, so script paths in the matrix cannot be relative.
+    # `__REPO_ROOT__` is this checkout (the directory that contains `benchmark/`), portable
+    # across machines; `{model}` etc. are still expanded by str.format after that.
+    repo_root = Path(__file__).resolve().parents[3]
+    command_text = args.agent_command.replace("__REPO_ROOT__", str(repo_root)).format(**replacements)
     command = shlex.split(command_text)
     environment = os.environ.copy()
     environment.update({

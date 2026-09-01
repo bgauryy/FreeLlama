@@ -1,18 +1,18 @@
 {
   "_comment": "Per-model research grades measured by this repo's benchmarks. Loaded by the MCP server via FREELLAMA_MCP_MODEL_EVIDENCE. Not compiled in: this is machine- and benchmark-specific data, and a shipped server should carry the mechanism, not one machine's results. A model absent here is treated as unmeasured and its answers return a `verify` verdict.",
-  "_source": "benchmark/local/results/*/aggregate.json and .octocode/evals/2026-08-30-small-model-deep-research-eval.md",
+  "_source": "reviewed benchmark/local aggregate results and grounded-lookup evaluations summarized in README.md",
   "models": {
     "qwen3.8:27b-mlx": {
       "grade": "strong",
-      "note": "8/8 on the grounded-lookup eval, 86.7% on the 30-question suite, 1st (7/10) on the real-repository benchmark"
+      "note": "8/8 on the grounded-lookup evaluation and 86.7% on the 30-question suite"
     },
     "muse-glimmer:30b-mlx": {
       "grade": "strong",
-      "note": "96.7% on the 30-question suite with zero failed tool calls; 6/10 on the real-repository benchmark"
+      "note": "96.7% on the 30-question suite with zero failed tool calls"
     },
     "gemma4:12b-mlx": {
       "grade": "weak",
-      "note": "6/8 on single-file lookups, but 6.7% on the 30-question suite and 0/10 on the real-repository benchmark"
+      "note": "6/8 on single-file lookups, but 6.7% on the 30-question suite"
     },
     "qwen2.5:7b": {
       "grade": "unusable",

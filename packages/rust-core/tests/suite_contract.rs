@@ -153,10 +153,8 @@ fn ollama_env_advisories_report_the_configured_value() {
     );
 }
 
-/// `NUM_PARALLEL=1` makes the shared resident admission permit in `platform::run_task` a no-op:
-/// `FreeLlama` lets resident tasks run together, then Ollama serializes them (measured: 1.12x on two
-/// concurrent requests). Anyone reading this advisory to plan capacity has to be told that, or they
-/// will assume the admission layer's concurrency is real.
+/// `NUM_PARALLEL=1` limits concurrency within one Ollama process, but separate CPU and GPU
+/// processes can overlap. The advisory must not collapse those two resource scopes.
 #[test]
 fn num_parallel_advisory_explains_the_admission_interaction() {
     let table = freellama::ollama_env_advisories(|_| None);
@@ -168,5 +166,29 @@ fn num_parallel_advisory_explains_the_admission_interaction() {
     assert!(
         note.contains("serializes"),
         "must say Ollama serializes them at the default; got {note:?}"
+    );
+    assert!(
+        note.contains("Separate CPU and GPU Ollama processes can still overlap"),
+        "must preserve the proven cross-backend concurrency contract; got {note:?}"
+    );
+}
+
+#[test]
+fn q8_kv_cache_advisory_names_both_memory_gain_and_quality_gate() {
+    let table = freellama::ollama_env_advisories(|_| None);
+    let note = table["OLLAMA_KV_CACHE_TYPE"]["note"]
+        .as_str()
+        .expect("note");
+    assert!(
+        note.contains("roughly halves"),
+        "must quantify the memory gain"
+    );
+    assert!(
+        note.contains("very small"),
+        "must report upstream's precision characterization"
+    );
+    assert!(
+        note.contains("qualify model quality"),
+        "must gate the process-wide tradeoff"
     );
 }

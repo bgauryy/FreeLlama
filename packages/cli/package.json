@@ -1,11 +1,17 @@
 {
   "name": "freellama",
   "version": "0.2.0",
-  "description": "Local Ollama model gateway, router, and benchmarker \u2014 CLI. Wraps the compiled Rust binary from packages/rust-core.",
-  "type": "module",
-  "bin": {
-    "freellama": "bin/freellama.mjs"
+  "description": "Local Ollama model gateway, router, and benchmarker — CLI. Wraps the compiled Rust binary from packages/rust-core.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bgauryy/FreeLlama.git",
+    "directory": "packages/cli"
   },
+  "homepage": "https://github.com/bgauryy/FreeLlama#readme",
+  "bugs": "https://github.com/bgauryy/FreeLlama/issues",
+  "keywords": ["ollama", "local-llm", "gateway", "coding-agent"],
+  "type": "module",
+  "bin": "bin/freellama.mjs",
   "files": [
     "bin",
     "vendor",
@@ -15,7 +21,21 @@
     "node": ">=20.0.0"
   },
   "scripts": {
-    "prepack": "node scripts/vendor-binary.mjs"
+    "build": "node scripts/vendor-binary.mjs",
+    "prepack": "node scripts/vendor-binary.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
-  "license": "Apache-2.0 OR MIT"
+  "license": "Apache-2.0 OR MIT",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/",
+    "provenance": true
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.2",
+    "vitest": "^4.1.11"
+  }
 }

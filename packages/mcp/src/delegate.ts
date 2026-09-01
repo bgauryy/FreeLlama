@@ -78,7 +78,7 @@ export function assessDelegatedAnswer(
       why:
         `${model} is not viable for research on this machine (${evidence.note}). It answers fast ` +
         "and confidently while being wrong — a fast wrong answer is not a speed win. Re-run with " +
-        "qwen3.8:27b-mlx, or answer it yourself.",
+        "a ~27B model (see README), or answer it yourself.",
       measuredBaseRate: `${model}: ${evidence.note}`,
     };
   }
@@ -99,7 +99,7 @@ export function assessDelegatedAnswer(
       grounded,
       why:
         `${model} holds up on simple single-file lookups but not beyond (${evidence.note}). ` +
-        "Check the evidence trail, or re-run on qwen3.8:27b-mlx if the answer matters.",
+        "Check the evidence trail, or re-run on a ~27B model (see README) if the answer matters.",
       measuredBaseRate: `${model}: ${evidence.note}`,
     };
   }
@@ -116,7 +116,10 @@ export function assessDelegatedAnswer(
   }
   // Judgment questions are the ~67% bucket. This is a keyword heuristic, not a classifier, and is
   // labelled as one: it errs toward asking for verification, which costs a read, not a wrong answer.
-  const judgmentSignals = /\b(should|better|best|worth|review|assess|evaluate|improve|opinion|recommend|why is|is it (good|safe|correct)|design|refactor)\b/i;
+  // Bare "should" is common in factual documentation questions ("what should a custom loader
+  // subclass?"). Treat explicit requests for a decision as judgment, while letting grounded
+  // contract lookups reach the normal evidence gate.
+  const judgmentSignals = /\b(should (we|i|you)|better|best|worth|review|assess|evaluate|improve|opinion|recommend|why is|is it (good|safe|correct)|design|refactor)\b/i;
   if (judgmentSignals.test(question)) {
     return {
       recommendation: "verify",

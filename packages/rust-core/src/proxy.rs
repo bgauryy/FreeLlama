@@ -173,6 +173,13 @@ impl ProxyConfig {
         );
         let same_port = upstream.port_or_known_default() == Some(listen.port());
         let same_host = upstream.host_str().is_some_and(|host| {
+            // `url` renders IPv6 hosts with brackets while `SocketAddr::ip()` does not. Compare
+            // their canonical bracket-free forms so `[::1]` cannot evade recursive-upstream
+            // detection.
+            let host = host
+                .strip_prefix('[')
+                .and_then(|host| host.strip_suffix(']'))
+                .unwrap_or(host);
             host == listen.ip().to_string()
                 || (listen.ip().is_loopback() && matches!(host, "localhost" | "127.0.0.1" | "::1"))
         });
@@ -262,9 +269,15 @@ async fn forward(State(state): State<ProxyState>, request: Request) -> impl Into
     }
 }
 
-/// Send the request, retrying transient failures (5xx responses, connection errors) with linear
+/// Retry 500/502/504 (load-model blips) but not 503 busy. Shared with managed `/tasks` so a
+/// request through the proxy cannot amplify saturation the admission semaphore is shedding.
+pub(crate) fn retryable_upstream_status(status: StatusCode) -> bool {
+    status.is_server_error() && status != StatusCode::SERVICE_UNAVAILABLE
+}
+
+/// Send the request, retrying transient failures (500/502/504 and connection errors) with exponential
 /// backoff. Ollama occasionally returns a 500 under load-model contention; a same-request retry
-/// is enough to ride that out without surfacing an error to the caller.
+/// is enough to ride that out without surfacing an error to the caller. HTTP 503 is returned as-is.
 async fn send_with_retries(
     state: &ProxyState,
     method: &reqwest::Method,
@@ -284,7 +297,9 @@ async fn send_with_retries(
             .await;
         let retryable_more_attempts = attempt < MAX_ATTEMPTS;
         match outcome {
-            Ok(response) if response.status().is_server_error() && retryable_more_attempts => {
+            Ok(response)
+                if retryable_upstream_status(response.status()) && retryable_more_attempts =>
+            {
                 eprintln!(
                     "proxy retry attempt={attempt} status={} path={}",
                     response.status(),

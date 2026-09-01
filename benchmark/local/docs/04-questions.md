@@ -58,7 +58,7 @@ each pinned revision before being written down.
 
 ## Design notes
 
-- Tiers deliberately widen scope, not just vocabulary difficulty: basic/Q1-Q2 are single-file
+- Tiers deliberately widen scope, not only vocabulary difficulty: basic/Q1-Q2 are single-file
   lookups, core/Q3-Q6 require reading one function/class closely, advanced/Q7-Q9 require
   cross-referencing 2+ locations or a multi-step call chain, complex/Q10 requires connecting a field
   declaration, its initializer, and multiple methods across a large class or module.

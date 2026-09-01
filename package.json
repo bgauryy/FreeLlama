@@ -1,20 +1,45 @@
 {
-  "name": "freellama-native-build",
+  "name": "freellama-workspace",
   "version": "0.2.0",
   "private": true,
-  "description": "Build-only manifest for the napi-rs native addon compiled from packages/rust-core/src/napi.rs. Not published \u2014 the compiled binary is written into packages/mcp/native, which is the publishable unit.",
+  "type": "module",
+  "description": "Workspace root: shared toolchain (vitest, esbuild, tsc) plus the build-only napi manifest for the native addon compiled from packages/rust-core/src/napi.rs. Not published — the compiled binary is written into packages/mcp/native, which is the publishable unit.",
+  "workspaces": [
+    "packages/mcp",
+    "packages/cli"
+  ],
   "napi": {
     "binaryName": "freellama",
     "targets": [
       "aarch64-apple-darwin",
-      "x86_64-apple-darwin"
+      "x86_64-apple-darwin",
+      "x86_64-unknown-linux-gnu",
+      "aarch64-unknown-linux-gnu",
+      "x86_64-unknown-linux-musl",
+      "aarch64-unknown-linux-musl",
+      "x86_64-pc-windows-msvc",
+      "aarch64-pc-windows-msvc"
     ]
   },
   "scripts": {
-    "build": "napi build --platform --release --manifest-path packages/rust-core/Cargo.toml --features napi --no-js --no-dts-header --dts .napi-generated.d.ts -o packages/mcp/native && rm -f packages/mcp/native/.napi-generated.d.ts"
+    "build": "yarn build:rust && yarn build:native && yarn workspaces foreach -A --topological run build",
+    "build:native": "napi build --platform --release --manifest-path packages/rust-core/Cargo.toml --features napi --no-js --no-dts-header --dts .napi-generated.d.ts -o packages/mcp/native && node packages/mcp/scripts/remove-generated-dts.mjs",
+    "build:rust": "cargo build --release",
+    "typecheck": "yarn workspaces foreach -A run typecheck",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:integration": "vitest run -c packages/mcp/vitest.integration.config.ts",
+    "test:e2e": "vitest run -c packages/mcp/vitest.e2e.config.ts",
+    "test:rust": "cargo test --workspace",
+    "test:all": "yarn typecheck && yarn test && yarn test:rust && yarn test:integration && yarn test:e2e",
+    "release:verify": "node scripts/verify-release-packages.mjs"
   },
   "devDependencies": {
-    "@napi-rs/cli": "^3.8.6"
+    "@napi-rs/cli": "^3.8.6",
+    "@types/node": "^22.10.0",
+    "esbuild": "^0.28.2",
+    "typescript": "^5.7.2",
+    "vitest": "^4.1.11"
   },
   "license": "Apache-2.0 OR MIT"
 }

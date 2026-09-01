@@ -1,33 +1,11 @@
 #!/usr/bin/env node
 /**
- * MCP server exposing FreeLlama's local-LLM control plane as tools.
+ * MCP server: thin wrappers over FreeLlama core (NAPI) plus Ollama lifecycle and
+ * grounded research. Tool schemas are re-sent every request — keep them short.
+ * Measured model guidance lives in docs/MODEL_SELECTION.md, not in these descriptions.
  *
- * PURPOSE: lets a large orchestrating model offload HEAVY, well-scoped, NON-reasoning work
- * (bulk file reads, structural search, embeddings, plain completions) to a cheap local Ollama
- * model. Not a general-purpose standalone MCP, not a substitute for the orchestrator's judgment —
- * give the local model a narrow, guided instruction, never an open-ended one (see accuracy split
- * in the decision guide below).
- *
- * Every tool below is a thin wrapper around the native NAPI binding compiled from
- * `../../packages/rust-core/src/napi.rs` (loaded via `../native/index.js`, which itself just re-exports the compiled
- * `../native/freellama.darwin-arm64.node`). Build output lands inside this package (not the repo
- * root) so `packages/mcp/` is self-contained and publishable on its own. The Rust side does the real
- * work — this file only defines the MCP tool schema/description and forwards arguments straight
- * through.
- *
- * `doctor` works standalone against Ollama. `machine`/`listModels`/`route`/`runTask` require a
- * running `freellama serve` instance (default
- * http://127.0.0.1:11435) — they will return a clear connection error otherwise, they won't hang.
- *
- * DECISION GUIDE (measured, not estimated):
- *   - Fact from this codebase (where/what/find) -> `delegate_research`. 1-file lookup: 4,584 in /
- *     296 out local tokens, ~220 returned (95% offloaded). 3-file cross-ref: 26,298 in / 849 out
- *     local, ~480 returned (98%). Accuracy: 98.9% grounded lookups, only ~67% judgment calls —
- *     never delegate judgment unsupervised.
- *   - Ollama needs to actually run something (prompt/chat/embedding/vision) -> `run_task`. Output
- *     tokens land on the local model; orchestrator pays only the JSON wrapper.
- *   - Just need to know which model WOULD be picked -> `route`. Free, no local generation.
- *   - Already-known one-liner -> don't delegate; the ~10-100s round trip costs more than it saves.
+ * doctor: Ollama directly. models library: ollama.com. run_task / installed and resident lists:
+ * need serve (:11435). delegate_research: adapter subprocess + Ollama (or the serve proxy).
  */
 import { type ChildProcess, execFile } from "node:child_process";
 import { existsSync } from "node:fs";
@@ -48,16 +26,21 @@ import {
   DEFAULT_DELEGATE_MAX_TURNS,
   DEFAULT_DELEGATE_TIMEOUT_SECONDS,
   DEFAULT_PULL_TIMEOUT_SECONDS,
+  DEFAULT_TOKEN_CALIBRATION_DIR,
   DEFAULT_OLLAMA_FETCH_TIMEOUT_SECONDS,
   assertAllowedWorkspace,
 } from "./config.js";
-import { doctor, machine, listModels, route, runTask, SERVER_VERSION } from "./native.js";
+import { doctor, machine, listModels, route, runTaskRequest, SERVER_VERSION } from "./native.js";
 import {
   ollamaFetch,
+  ollamaPull,
+  parseAdapterResult,
   endpointParam,
   ollamaEndpointParam,
   taskParam,
   objectiveParam,
+  executionPreferenceParam,
+  minPlacementEvidenceParam,
   minConfidenceParam,
   belowConfidence,
   requiredCapabilitiesParam,
@@ -66,6 +49,7 @@ import {
   parsedResult,
   errorResult,
   summarizeEmbeddings,
+  extractExistingWorkspacePath,
 } from "./helpers.js";
 import { parseModelSearch, parseModelTags } from "./model-search.js";
 import { MODEL_EVIDENCE, assessDelegatedAnswer } from "./delegate.js";
@@ -110,69 +94,42 @@ for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
 }
 
 
-// Guidance that applies ACROSS tools lives here, not repeated in each description. Measured
-// motivation: the tool list is re-sent on every request — it was 7,431 tokens across 13 tools,
-// dwarfing anything a single delegated call saves. Shared caveats stated once here, tool-specific
-// facts in the descriptions.
-const INSTRUCTIONS = `Offload token-heavy, non-reasoning work to local Ollama models.
-Optimise for quality and token reduction; latency is the tiebreak.
-For the full orchestration playbook — the five flows, the tiering across you / a cheap cloud model /
-local Ollama, and what each tier must never be given — load the \`freellama\` skill (in this repo:
-skills/freellama/SKILL.md).
+const INSTRUCTIONS = `Use FreeLlama for governed local Ollama delegation. Playbook:
+skills/freellama/SKILL.md.
 
-DELEGATE WHEN
-A delegated answer costs a roughly fixed ~150 tokens whatever the input size, so past ~1k tokens
-of source it already wins on tokens.
-Hard rules:
-- Use a model measured strong for research; accuracy collapses on small ones. Never trade model
-  size for speed — a cheap wrong answer costs more than the tokens it saved. Installed models
-  differ per machine, so call models{view:"installed"} rather than assuming a name.
-- Judgment work (review, "is this good", design): do it yourself. Local models are markedly worse
-  at it than at grounded lookups, and the tone is identical either way — the text gives no signal.
-- Source under ~1k tokens and you are waiting on it: just read it.
-- Privacy-bound or rate-limited: delegate regardless.
+Ownership: the caller owns task decomposition and concurrent independent calls. The operator owns
+endpoints, exact --cpu-model assignments, settings, and lifecycle approval. FreeLlama qualifies,
+routes only to eligible assigned backends, admits work, and returns receipts. Ollama plus the
+OS/driver load and execute runners on physical CPU/GPU; FreeLlama is not a hardware scheduler.
 
-CHEAPEST LOCAL WORK, best first
-1. Embeddings via run_task — fast, zero tokens back to you, and no sampling
-   so nothing to hallucinate. Index a corpus, then search it. By far the strongest use.
-2. Image work — accurate but not fast; see IMAGES for which model to name.
-3. Bulk transforms you do not block on.
-4. Single questions — see the rules above.
-Never use a local model to pick which files are relevant: it is slower and less accurate than grep.
+Workflow: (1) doctor; if Ollama is unavailable, ask the user to install/start it, then stop.
+(2) Delegate embeddings, OCR/vision, bulk transforms, or grounded lookup past ~1k source tokens;
+keep tiny lookups, architecture/review judgment, and ambiguous synthesis with the caller.
+(3) Inspect models{view:"installed"} and models{view:"resident"}; never guess inventory or fit.
+(4) Prefer a qualified installed model; preview consequential work. (5) If none fits, ask for
+modality, quality, context, latency, privacy, disk/download, and memory constraints. Search
+models{view:"library"}, inspect exact tags and host-memory fit, present at most two, and ask approval
+for one exact tag and reported size before ollama_manage{action:"pull"}. Search or recommendation
+is never download permission. (6) Execute; assignment is not physical proof. Read
+execution.observation; warm with configured evidence, then use minPlacementEvidence:"observed"
+when processor placement is required. Only verified samples train feedback. Read verification and
+citations; discard an escalate result. delegate_research model turns are managed coding tasks.
 
-TRUST
-Pass minConfidence:"medium" to route/run_task to refuse a weakly-justified model instead of acting
-on it. Without a configured policy most routes grade "low" — which is how a far-too-small model
-once got selected for a demanding task. Read the verification verdict on every delegate_research answer — it is
-computed from what the run actually did and which model ran, never from the model's own claim.
-"escalate" means it answered without reading anything.
-
-IMAGES
-qwen3.8:27b-mlx and muse-glimmer:30b-mlx both do real vision — UI and chart description, and
-accurate transcription. ~17-45s per image. qwen is the faster and more accurate of the two.
-The OCR-only and broken vision models were removed, so routing can no longer land on a bad one,
-but naming the model explicitly is still the safe habit.`;
+Known identifier: search directly. Files: delegate_research. run_task has no file access.
+minConfidence:"medium" refuses weak evidence; balanced/quality need policy evidence.`;
 
 const server = new McpServer(
   { name: "freellama", version: SERVER_VERSION },
   { instructions: INSTRUCTIONS },
 );
 
-
-
 server.registerTool(
   "doctor",
   {
     description:
-      "Ollama health + the 9 OLLAMA_* settings that govern memory, each with its EFFECTIVE default " +
-      "(unset means Ollama picks, not off). Warns if MAX_LOADED_MODELS is unset — the cap is then " +
-      "3 x GPU count, and 3 large models don't fit in 48GB. Adds chip/RAM/disk when serve is up. " +
-      "Run FIRST on any error. Free",
+      "Ollama health, 11 memory settings with effective defaults (unset ≠ off), chip/RAM. " +
+      "Warns if MAX_LOADED_MODELS is unset (cap is 3× GPU count). Run first on errors.",
     inputSchema: { endpoint: ollamaEndpointParam, serveEndpoint: endpointParam },
-    // Reads Ollama's version/ps/env endpoints; changes nothing. `openWorldHint` because the
-    // answer depends on a separate process this server does not own.
-    // Only deviations from the spec defaults are declared; restating a default says nothing.
-    // rest = spec defaults
     annotations: { readOnlyHint: true },
   },
   async ({ endpoint, serveEndpoint }) => {
@@ -182,12 +139,17 @@ server.registerTool(
       // Absorbed the former `machine` tool. Attempted, not required: `doctor` must keep working
       // with no `freellama serve` running, because the Ollama half of the diagnostic is exactly
       // the half you need when things are broken. A failure degrades to a stated reason.
+      // Prefer serve's profile when it is up (same portable OS discovery, plus the serve endpoint).
+      // Never replace a native `machine` block with null — that hid chip/RAM when diagnosing
+      // a downed serve, which is when doctor is most useful.
       try {
         report.structuredContent.machine = JSON.parse(await machine(serveEndpoint));
+        delete report.structuredContent.machine_unavailable;
       } catch (error) {
-        report.structuredContent.machine = null;
-        report.structuredContent.machine_unavailable =
-          `freellama serve unreachable, so no machine profile: ${error instanceof Error ? error.message : String(error)}`;
+        if (report.structuredContent.machine == null) {
+          report.structuredContent.machine_unavailable =
+            `freellama serve unreachable, so no machine profile: ${error instanceof Error ? error.message : String(error)}`;
+        }
       }
       return structuredResult(report.structuredContent);
     } catch (error) {
@@ -200,61 +162,116 @@ server.registerTool(
   "models",
   {
     description:
-      "Local model estate. `installed` (default, needs serve): capabilities, VRAM, context, " +
-      "policy_rank — what route's requiredCapabilities filters against. `resident`: loaded now + derived " +
-      "GPU/CPU split; check before any large call, two big models crashed a 48GB box here, and a " +
-      "placement.warning means it spilled to CPU (many times slower, no error). `detail` (needs " +
-      "`model`): true max context, quantization. `raw`: GET /api/tags. Views differ by design",
+      "Installed models, managed resident GPU/CPU split across both backends, one-model detail, " +
+      "raw /api/tags, or ollama.com " +
+      "library. Library is two steps: families, then model:\"<family>\" for tags and memory fit. " +
+      "Inspect installed/resident before searching. Downloads nothing and grants no pull permission.",
     inputSchema: {
       view: z
-        .enum(["installed", "resident", "detail", "raw"])
+        .enum(["installed", "resident", "detail", "raw", "library"])
         .optional()
-.describe('"installed" (default, needs serve) | "resident" | "detail" | "raw"'),
-      model: z.string().optional().describe('required for view "detail"'),
+        .describe('installed (default, needs serve) | resident (needs serve) | detail | raw | library'),
+      model: z.string().min(1).optional().describe('required for view "detail"; for "library", step 2 family name'),
       includeVerbose: z
         .boolean()
         .optional()
-.describe('"detail" only. Adds license/modelfile — the bulk of that payload, never routing-relevant'),
+        .describe('"detail" only. Adds license/modelfile — the bulk of that payload, never routing-relevant'),
+      query: z.string().min(1).optional().describe('"library" step 1: free text, e.g. "qwen", "embed"'),
+      capabilities: z
+        .array(z.enum(["vision", "tools", "thinking", "embedding", "cloud"]))
+        .min(1)
+        .max(5)
+        .optional()
+        .describe('"library" step 1: filter chips; combined as AND by the site'),
+      order: z
+        .enum(["popular", "newest"])
+        .optional()
+        .describe('"library" step 1. default "popular" — prefer it'),
+      limit: z.number().int().positive().max(50).optional().describe('"library" step 1. default 10'),
       endpoint: endpointParam,
       ollamaEndpoint: ollamaEndpointParam,
     },
-    // Permissive by necessity: the list views return {models:[...]}, `detail` returns a flat
-    // model record. One schema covers both rather than splitting a read-only tool back apart.
-    // Only deviations from the spec defaults are declared; restating a default says nothing.
-    // rest = spec defaults
     annotations: { readOnlyHint: true },
   },
-  async ({ view, model, includeVerbose, endpoint, ollamaEndpoint }) => {
+  async ({ view, model, includeVerbose, query, capabilities, order, limit, endpoint, ollamaEndpoint }) => {
     try {
-      switch (view ?? "installed") {
+      const selectedView = view ?? "installed";
+      if (
+        selectedView !== "library" &&
+        [query, capabilities, order, limit].some((value) => value !== undefined)
+      ) {
+        return errorResult(new Error(`view "${selectedView}" does not accept library search fields.`));
+      }
+      if (selectedView !== "detail" && includeVerbose !== undefined) {
+        return errorResult(new Error('`includeVerbose` is valid only for view "detail".'));
+      }
+      if (selectedView !== "detail" && selectedView !== "library" && model !== undefined) {
+        return errorResult(new Error('`model` is valid only for views "detail" and "library".'));
+      }
+      if (
+        selectedView === "library" &&
+        model &&
+        [query, capabilities, order, limit].some((value) => value !== undefined)
+      ) {
+        return errorResult(
+          new Error('Library step 2 accepts only `model` plus endpoint overrides; omit step-1 search fields.'),
+        );
+      }
+
+      switch (selectedView) {
         case "raw":
           return structuredResult((await ollamaFetch(ollamaEndpoint, "/api/tags")) as Record<string, unknown>);
 
         case "resident": {
-          const data = (await ollamaFetch(ollamaEndpoint, "/api/ps")) as {
+          const managed = parsedResult(await listModels(endpoint));
+          if (!("structuredContent" in managed)) return managed;
+          const data = managed.structuredContent as {
             models?: Array<Record<string, unknown>>;
           };
           // Ollama's own docs say to check the GPU/CPU split, but /api/ps exposes only the raw
           // `size`/`size_vram` bytes it is derived from. The CLI computes it; the API doesn't.
-          const models = (data.models ?? []).map((entry) => {
+          const models = (data.models ?? []).filter((entry) => entry.resident === true).map((entry) => {
             const size = typeof entry.size === "number" ? entry.size : null;
-            const vram = typeof entry.size_vram === "number" ? entry.size_vram : null;
+            const vram = typeof entry.resident_vram === "number" ? entry.resident_vram : null;
             if (size === null || vram === null || size === 0) return entry;
             const gpuPercent = Math.round((vram / size) * 100);
+            const execution = entry.execution as {
+              placement?: string;
+              backend?: string;
+              observation?: { processor?: string; status?: string; source?: string };
+            } | undefined;
+            const assignedCpu = execution?.placement === "cpu";
+            const observedProcessor = execution?.observation?.processor;
+            const processor =
+              observedProcessor === "cpu" || observedProcessor === "gpu" || observedProcessor === "mixed"
+                ? observedProcessor
+                : gpuPercent >= 100
+                  ? "gpu"
+                  : gpuPercent <= 0
+                    ? "cpu"
+                    : "mixed";
+            const mismatch = execution?.observation?.status === "mismatch";
             return {
               ...entry,
               placement: {
                 gpu_percent: gpuPercent,
+                assigned: assignedCpu,
                 processor:
-                  gpuPercent >= 100
+                  processor === "gpu"
                     ? "100% GPU"
-                    : gpuPercent <= 0
+                    : processor === "cpu"
                       ? "100% CPU"
                       : `${gpuPercent}% GPU / ${100 - gpuPercent}% CPU`,
-                ...(gpuPercent < 100
+                ...(mismatch
                   ? {
                       warning:
-                        "Partially offloaded to CPU — expect a large slowdown. Free VRAM (`ollama_stop`) or lower the context length.",
+                        `Configured ${execution?.placement ?? "unknown"} backend disagrees with Ollama /api/ps: ` +
+                        `${processor} was physically observed. This sample is excluded from adaptive routing feedback.`,
+                    }
+                  : processor === "mixed"
+                  ? {
+                      warning:
+                        "Partially offloaded to CPU — expect a large slowdown. Free VRAM (`ollama_manage` action \"stop\") or lower the context length.",
                     }
                   : {}),
               },
@@ -265,7 +282,7 @@ server.registerTool(
 
         case "detail": {
           if (!model) {
-            return errorResult(new Error('view "detail" requires a `model` argument, e.g. {view:"detail", model:"qwen3.8:27b-mlx"}.'));
+            return errorResult(new Error('view "detail" needs `model` set to an installed tag.'));
           }
           const data = (await ollamaFetch(ollamaEndpoint, "/api/show", {
             method: "POST",
@@ -285,6 +302,9 @@ server.registerTool(
           });
         }
 
+        case "library":
+          return await libraryLookup({ model, query, capabilities, order, limit, endpoint, ollamaEndpoint });
+
         default:
           return parsedResult(await listModels(endpoint));
       }
@@ -294,91 +314,25 @@ server.registerTool(
   },
 );
 
-server.registerTool(
-  "route",
-  {
-    description:
-      "Which model WOULD be picked, free — no generation. Skip it before `run_task`, which routes " +
-      "internally. CAUTION: `fastest` with no configured policy ranks on capability metadata " +
-      "alone, and picked a 0.5B model for code repair here; pass minConfidence:\"medium\" to " +
-      "refuse that rather than act on it. Nothing eligible? `search_models` finds and size-checks " +
-      "something to install. Needs serve",
-    inputSchema: {
-      endpoint: endpointParam,
-      task: taskParam,
-      objective: objectiveParam,
-      model: z.string().optional().describe("Force this exact installed model name."),
-      sessionId: z.string().optional().describe("Session id for model affinity across calls."),
-      contextTokens: z.number().int().positive().optional().describe("Minimum context window required."),
-      requiredCapabilities: requiredCapabilitiesParam,
-      minConfidence: minConfidenceParam,
-    },
-    // NOT marked read-only, despite "decision only": passing `sessionId` makes the server bind
-    // that session to the selected model (packages/rust-core/src/platform/mod.rs `route()` -> `sessions.write().bind`),
-    // which is a real state change. Without `sessionId` it is pure computation, but annotations
-    // are per-tool, not per-argument, so the honest answer is the conservative one. Additive
-    // (never removes anything) and idempotent (re-binding the same pair is a no-op).
-    // Only deviations from the spec defaults are declared; restating a default says nothing.
-    // not readOnly: sessionId writes affinity
-    annotations: { destructiveHint: false, idempotentHint: true },
-  },
-  async ({ endpoint, task, objective, model, sessionId, contextTokens, requiredCapabilities, minConfidence }) => {
-    try {
-      const result = parsedResult(
-        // minConfidence is forwarded so the CORE gate refuses, with its actionable message naming
-        // the two commands that raise the grade. The belowConfidence() check below stays only as a
-        // fallback for servers older than the core gate.
-        await route(endpoint, task, objective, model, sessionId, contextTokens, requiredCapabilities, minConfidence),
-      );
-      if ("structuredContent" in result) {
-        const refusal = belowConfidence(result.structuredContent, minConfidence);
-        if (refusal) return refusal;
-      }
-      return result;
-    } catch (error) {
-      return errorResult(error);
-    }
-  },
-);
-
-
-server.registerTool(
-  "search_models",
-  {
-    description:
-      "Browse the public Ollama library (ollama.com) for models NOT yet installed — the " +
-      "complement to `models`, which only sees what is already installed.\n" +
-      "TWO STEPS, both required before pulling anything:\n" +
-      "1. SEARCH — omit `model`. Returns FAMILY names (e.g. \"gemma4\"). Popular-ordered by " +
-      'default; `order:"newest"` is rarely wanted, a new model has no track record. Site rank is ' +
-      "NOT pull count (a 26K-pull model can outrank a 1.1M one) — judge with `pulls`, not " +
-      "position. `cloudOnly` means it runs on Ollama's HOSTED service and cannot run locally.\n" +
-      "2. INSPECT — pass `model: \"<family>\"`. A family is NOT pullable; you pull a TAG, and only " +
-      "the tag carries the size that decides whether it fits. Returns every tag with size, " +
-      "context window, modalities, and `fitsInMemory` computed against this machine. NEVER pull " +
-      "from step 1 alone — you would be guessing the size.\n" +
-      "Downloads nothing; `ollama_manage` action \"pull\" does that, only after a human approves.",
-    inputSchema: {
-      model: z
-        .string()
-        .optional()
-        .describe('step 2: a family name from step 1, e.g. "gemma4" — returns its pullable tags'),
-      query: z.string().optional().describe('step 1: free text, e.g. "qwen", "embed"'),
-      capabilities: z
-        .array(z.enum(["vision", "tools", "thinking", "embedding", "cloud"]))
-        .optional()
-        .describe("filter chips; combined as AND by the site"),
-      order: z
-        .enum(["popular", "newest"])
-        .optional()
-        .describe('default "popular" — prefer it, "newest" has no track record'),
-      limit: z.number().int().positive().max(50).optional().describe("default 10"),
-    },
-    // Only deviations from the spec defaults are declared; restating a default says nothing.
-    // reads a public page; changes nothing
-    annotations: { readOnlyHint: true },
-  },
-  async ({ model, query, capabilities, order, limit }) => {
+// `route` was folded into `run_task { preview: true }` — same NAPI `route()` call, no second
+// schema. `search_models` was folded into `models { view: "library" }` — same two-step lookup.
+async function libraryLookup({
+  model,
+  query,
+  capabilities,
+  order,
+  limit,
+  endpoint,
+  ollamaEndpoint,
+}: {
+  model?: string;
+  query?: string;
+  capabilities?: Array<"vision" | "tools" | "thinking" | "embedding" | "cloud">;
+  order?: "popular" | "newest";
+  limit?: number;
+  endpoint?: string;
+  ollamaEndpoint?: string;
+}) {
     const fetchPage = async (url: string) => {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), DEFAULT_OLLAMA_FETCH_TIMEOUT_SECONDS * 1000);
@@ -390,19 +344,18 @@ server.registerTool(
         clearTimeout(timer);
       }
     };
-    // Best-effort local context. Neither failure should sink the lookup: the library is public and
-    // useful even with Ollama down.
     const localState = async () => {
       let installed = new Set<string>();
       let memoryBytes: number | null = null;
       try {
-        const tags = (await ollamaFetch(undefined, "/api/tags")) as { models?: Array<{ name?: string }> };
+        const tags = (await ollamaFetch(ollamaEndpoint, "/api/tags")) as { models?: Array<{ name?: string }> };
         installed = new Set((tags.models ?? []).map((m) => m.name ?? ""));
       } catch {
         /* Ollama unreachable */
       }
       try {
-        memoryBytes = JSON.parse(await machine(undefined)).unified_memory_bytes ?? null;
+        const profile = JSON.parse(await machine(endpoint));
+        memoryBytes = profile.memory_bytes ?? profile.unified_memory_bytes ?? null;
       } catch {
         /* serve unreachable */
       }
@@ -412,34 +365,17 @@ server.registerTool(
     try {
       if (model) {
         const family = model.split(":")[0];
-        const familyPage = await fetchPage(`https://ollama.com/library/${family}`);
+        const familyPage = await fetchPage(`https://ollama.com/library/${encodeURIComponent(family)}`);
         const { tags } = parseModelTags(familyPage, family);
         const { installed, memoryBytes } = await localState();
-        // "Fits" is not "size < RAM". A model needs room for its KV cache and for whatever else is
-        // resident, and this machine has crashed by co-residenting two large models. 60% of total
-        // memory is the ceiling used here for a comfortable single-model fit.
         const budget = memoryBytes ? memoryBytes * 0.6 : null;
         const annotated = tags.map((t) => ({
           ...t,
           installed: installed.has(t.tag),
           fitsInMemory: budget && t.sizeBytes ? t.sizeBytes <= budget : null,
+          fitScope: "host_memory_budget_only",
         }));
-        // Fail CLOSED on an unknown budget. With `serve` unreachable there is no machine profile,
-        // so `fitsInMemory` is null for every tag — and "largest tag that isn't known not to fit"
-        // then happily recommends a 143GB model on a 48GB machine. A fit recommendation without a
-        // memory figure is worse than none, so only rank when the budget is actually known.
         const runnable = annotated.filter((t) => t.fitsInMemory === true && !/cloud/.test(t.tag));
-        // "Bigger is better" is a *generative* rule and applying it to an embedding family
-        // inverted this repo's own measurement. Measured here on real retrieval over this repo
-        // (152 chunks, 6 questions with known-correct files): nomic-embed-text at 274MB scored
-        // 5/6 recall@3 in 4.2s, while qwen3-embedding:0.6b — 2.3x the size — scored 4/6 at 3.5x
-        // the indexing cost. Recommending the largest embedding tag that fits therefore pointed
-        // at a 4.7GB model, ~17x the measured winner, for worse recall. Embeddings have no
-        // accuracy cliff to clear: there is no sampling, so the size premium buys nothing.
-        // Two independent signals, because either alone misfires: a generative model's blurb can
-        // mention embeddings in passing (so require several hits — measured 82 on
-        // /library/qwen3-embedding versus 0 on /library/gemma3), and not every embedding family
-        // is named for it (`all-minilm` is not).
         const embeddingMentions = (familyPage.match(/embedding/gi) ?? []).length;
         const isEmbeddingFamily = embeddingMentions >= 3 || /embed/i.test(family);
         const sized = runnable.filter((t) => t.sizeBytes);
@@ -450,10 +386,7 @@ server.registerTool(
           : undefined;
         return structuredResult({
           family,
-          page: `https://ollama.com/library/${family}`,
-          // Zero tags is ambiguous on its own — the family may be cloud-only (its page renders no
-          // downloadable rows), the name may be wrong, or Ollama may have changed its markup.
-          // Say so rather than returning a bare empty list that reads like "nothing available".
+          page: `https://ollama.com/library/${encodeURIComponent(family)}`,
           ...(tags.length === 0
             ? {
                 tagsUnavailable:
@@ -465,7 +398,6 @@ server.registerTool(
           machineMemoryBytes: memoryBytes,
           fitBudgetBytes: budget,
           tags: annotated,
-          // Stated, not silent: a caller must be able to tell "nothing fits" from "I could not check".
           recommendationUnavailable: budget
             ? undefined
             : "No machine profile (freellama serve unreachable), so memory fit could not be checked and no tag is recommended. Start serve, or read the sizes yourself.",
@@ -493,17 +425,17 @@ server.registerTool(
               : {
                   tag: best.tag,
                   why:
-                    `Largest tag that fits the ~60% memory budget${memoryBytes ? ` of ${Math.round(memoryBytes / 1e9)}GB` : ""}. ` +
-                    "Bigger is better here — research accuracy collapses below ~12B.",
+                    `Largest tag inside the conservative ~60% host-memory preflight${memoryBytes ? ` of ${Math.round(memoryBytes / 1e9)}GB` : ""}. ` +
+                    "This proves neither accelerator fit nor task quality; preview and benchmark before pulling.",
                   configure:
                     "Send an explicit num_ctx rather than inheriting Ollama's default, which is " +
-                    'VRAM-tiered and reaches 256K on a 48GB machine. Use keepAlive:"0" for one-off ' +
+                    'VRAM-tiered and reaches 256K when Ollama reports at least 48 GiB of device memory. Use keepAlive:"0" for one-off ' +
                     "calls so it does not hold memory after.",
                   caution:
-                    "Do not co-resident this with another large model — that has crashed this " +
-                    "machine. Check `models{view:\"resident\"}` first. Also note this repo measured a " +
-                    "GGUF build BEATING its -mlx counterpart for the same family, so do not assume " +
-                    "a suffix is better; benchmark the packaging, don't infer it from the name.",
+                    "Do not co-resident large models until their combined runner sizes, contexts, " +
+                    "KV caches, and OS headroom fit this host. Check `models{view:\"resident\"}` and " +
+                    "accelerator telemetry first; benchmark packaging rather than inferring quality " +
+                    "or speed from a model suffix.",
                 }
             : null,
         });
@@ -512,8 +444,6 @@ server.registerTool(
       const params = new URLSearchParams();
       for (const c of capabilities ?? []) params.append("c", c);
       if (query) params.set("q", query);
-      // Only send `o` for "newest": omitting it IS the popular ordering (verified against the
-      // live site — no-`o` and `o=popular` return identical rankings).
       if (order === "newest") params.set("o", "newest");
       const url = `https://ollama.com/search?${params.toString()}`;
       const parsed = parseModelSearch(await fetchPage(url)).slice(0, limit ?? 10);
@@ -523,56 +453,72 @@ server.registerTool(
         query: url,
         order: order ?? "popular",
         count: parsed.length,
-        nextStep: 'Not pullable yet. Call again with model:"<name>" to get tags, sizes and memory fit.',
+        nextStep: 'Not pullable yet. Call again with view:"library", model:"<name>" to get tags, sizes and memory fit.',
         models: parsed.map((m) => ({ ...m, installed: installedFamilies.has(m.name) })),
       });
     } catch (error) {
       return errorResult(error);
     }
-  },
-);
-
-// `recommend` was removed from the MCP surface (the server route /_freellama/v1/recommendations
-// and the CLI subcommand both remain). It read a hand-maintained catalog and, asked for a vision
-// model, returned exactly one suggestion — `gemma3:4b` — a 4B model, below the ~12B floor this
-// project measured for research. A curated list that must be updated by hand goes stale, and
-// `search_models` now covers the same ground from the live library with per-tag memory fit.
-// Restore by re-registering a tool that calls recommend() from the native binding.
-
+}
 
 server.registerTool(
   "run_task",
   {
     description:
-      "Routes AND executes chat/generate/embed/OCR from content YOU pass in — output tokens land " +
-      "on the local model. NOT GROUNDED: no file access, and verified inventing wrong facts about " +
-      "this repo when given none; use `delegate_research` if it needs a real file read. Images work " +
-      '(name `model: "qwen3.8:27b-mlx"`). Needs serve',
+      "Route and run chat, tools, embeddings, or vision on content you pass. preview:true = decide only. " +
+      "No file access — use delegate_research for that. balanced/quality need a policy; fastest " +
+      "does not. Images require an explicit tested vision model. Needs serve.",
     inputSchema: {
       endpoint: endpointParam,
       task: taskParam,
       objective: objectiveParam,
-      model: z.string().optional().describe("Force this exact installed model name."),
-      sessionId: z.string().optional().describe("Session id for model affinity across calls."),
+      model: z.string().min(1).optional().describe("Force this exact installed model name."),
+      sessionId: z.string().min(1).optional().describe("Session id for model affinity across calls."),
       contextTokens: z.number().int().positive().optional().describe("Minimum context window required."),
+      executionPreference: executionPreferenceParam,
+      minPlacementEvidence: minPlacementEvidenceParam,
       requiredCapabilities: requiredCapabilitiesParam,
-      prompt: z.string().optional(),
-      images: z.array(z.string()).optional().describe('base64, no data-URI prefix. Pair with an explicit vision model'),
-      messages: z
-        .array(z.object({ role: z.string(), content: z.string() }))
+      prompt: z.string().min(1).optional().describe("Chat input when messages is omitted."),
+      images: z
+        .array(z.string().min(1))
+        .min(1)
         .optional()
-        .describe("wins over prompt"),
-      input: z.union([z.string(), z.array(z.string())]).optional().describe("batch it — batching is far cheaper than one call per item"),
-      tools: z.array(z.record(z.unknown())).optional(),
-      keepAlive: z.string().optional().describe('"0" unloads now, "-1" pins, default 5m'),
+        .describe("base64, no data-URI prefix; prompt mode only; requires an explicit tested vision model"),
+      messages: z
+        .array(
+          z
+            .object({ role: z.enum(["system", "user", "assistant", "tool"]), content: z.string() })
+            .passthrough(),
+        )
+        .min(1)
+        .optional()
+        .describe(
+          "wins over prompt; preserves Ollama images, thinking, tool_calls, tool_name, and other message fields",
+        ),
+      input: z
+        .union([z.string().min(1), z.array(z.string().min(1)).min(1)])
+        .optional()
+        .describe('embedding only; batch strings because one call is far cheaper than one call per item'),
+      tools: z.array(z.record(z.unknown())).min(1).optional().describe("Ollama function definitions for chat tasks."),
+      keepAlive: z.string().min(1).optional().describe('"0" unloads now, "-1" pins, default 5m'),
+      format: z
+        .union([z.literal("json"), z.record(z.unknown())])
+        .optional()
+        .describe('Ollama structured output: "json" or a JSON schema object'),
+      think: z
+        .union([z.boolean(), z.enum(["low", "medium", "high"])])
+        .optional()
+        .describe("Override the task profile for thinking-capable models"),
+      options: z
+        .record(z.unknown())
+        .optional()
+        .describe("Advanced Ollama runtime options; num_ctx and num_gpu are routing-owned"),
+      logprobs: z.boolean().optional(),
+      topLogprobs: z.number().int().nonnegative().optional().describe("Requires logprobs:true"),
       minConfidence: minConfidenceParam,
       returnEmbeddings: z.boolean().optional().describe("false (default) withholds the raw vectors; they are large and unreadable to a model"),
+      preview: z.boolean().optional().describe("true = route decision only, no generation"),
     },
-    // Loads a model, spends compute, and binds session affinity when `sessionId` is set — but
-    // adds only; it never removes an installed model or overwrites stored data. Not idempotent:
-    // generation is sampled, so the same arguments give different output.
-    // Only deviations from the spec defaults are declared; restating a default says nothing.
-    // additive; sampled, so not idempotent
     annotations: { destructiveHint: false },
   },
   async ({
@@ -582,6 +528,8 @@ server.registerTool(
     model,
     sessionId,
     contextTokens,
+    executionPreference,
+    minPlacementEvidence,
     requiredCapabilities,
     prompt,
     images,
@@ -589,43 +537,98 @@ server.registerTool(
     input,
     tools,
     keepAlive,
+    format,
+    think,
+    options,
+    logprobs,
+    topLogprobs,
     minConfidence,
     returnEmbeddings,
+    preview,
   }) => {
     try {
+      if (topLogprobs !== undefined && logprobs !== true) {
+        return errorResult(new Error("`topLogprobs` requires `logprobs:true`."));
+      }
+      if (!preview && task === "embedding") {
+        if (input === undefined) return errorResult(new Error('task "embedding" requires `input`.'));
+        if (
+          [prompt, images, messages, tools, format, think, logprobs, topLogprobs].some(
+            (value) => value !== undefined,
+          )
+        ) {
+          return errorResult(
+            new Error('task "embedding" accepts `input`, `options`, and routing fields; chat controls are not valid.'),
+          );
+        }
+      }
+      if (!preview && task !== "embedding") {
+        if (input !== undefined || returnEmbeddings !== undefined) {
+          return errorResult(new Error('`input` and `returnEmbeddings` are valid only for task "embedding".'));
+        }
+        if (prompt === undefined && (messages === undefined || messages.length === 0)) {
+          return errorResult(new Error(`task "${task}" requires \`prompt\` or \`messages\`.`));
+        }
+        if (images !== undefined && messages !== undefined) {
+          return errorResult(
+            new Error("Top-level `images` is valid only with `prompt`; put images inside messages instead."),
+          );
+        }
+        if (images !== undefined && model === undefined) {
+          return errorResult(new Error("Images require an explicit tested vision-capable `model`."));
+        }
+      }
+      if (preview) {
+        const result = parsedResult(
+          await route(endpoint, task, objective, model, sessionId, contextTokens, requiredCapabilities, minConfidence, executionPreference, minPlacementEvidence),
+        );
+        if ("structuredContent" in result) {
+          const refusal = belowConfidence(result.structuredContent, minConfidence);
+          if (refusal) return refusal;
+        }
+        return result;
+      }
       // Gating after the fact would be useless here: by the time `run_task` returns, the tokens
       // are spent. So when the caller sets a floor, preview the decision with a `route` call
       // first — free, no generation — and refuse before anything runs. Only costs the extra round
       // trip when the option is actually used.
       if (minConfidence) {
-        const preview = parsedResult(
+        const decision = parsedResult(
           // minConfidence is forwarded so the CORE gate refuses, with its actionable message naming
         // the two commands that raise the grade. The belowConfidence() check below stays only as a
         // fallback for servers older than the core gate.
-        await route(endpoint, task, objective, model, sessionId, contextTokens, requiredCapabilities, minConfidence),
+        await route(endpoint, task, objective, model, sessionId, contextTokens, requiredCapabilities, minConfidence, executionPreference, minPlacementEvidence),
         );
-        if ("structuredContent" in preview) {
-          const refusal = belowConfidence(preview.structuredContent, minConfidence);
+        if ("structuredContent" in decision) {
+          const refusal = belowConfidence(decision.structuredContent, minConfidence);
           if (refusal) return refusal;
         }
       }
       const result = parsedResult(
-        await runTask(
-          endpoint,
+        await runTaskRequest(endpoint ?? DEFAULT_SERVE_ENDPOINT, {
           task,
-          objective,
+          objective: objective ?? "balanced",
           model,
-          sessionId,
-          contextTokens,
-          requiredCapabilities,
+          session_id: sessionId,
+          context_tokens: contextTokens,
+          required_capabilities: requiredCapabilities ?? [],
           prompt,
           images,
-          messages,
+          messages: messages ?? [],
           input,
           tools,
-          keepAlive,
-          minConfidence,
-        ),
+          keep_alive: keepAlive,
+          min_confidence: minConfidence,
+          execution_preference: executionPreference ?? "auto",
+          min_placement_evidence: minPlacementEvidence ?? "configured",
+          request_options: {
+            format,
+            think,
+            options,
+            logprobs,
+            top_logprobs: topLogprobs,
+          },
+        }),
       );
       if (!returnEmbeddings && "structuredContent" in result) {
         const trimmed = summarizeEmbeddings(result.structuredContent);
@@ -638,36 +641,18 @@ server.registerTool(
   },
 );
 
-// `natural_route` was removed from the MCP surface (the server route `/_freellama/v1/natural-routes`
-// still exists for CLI/HTTP callers). Three reasons, in order of weight:
-//   1. Its consumer here is an LLM, which already knows the task kind — its own description said
-//      "otherwise call `route` directly, one fewer round trip", i.e. it argued against itself.
-//   2. It depends on a separately-installed small intent model. Deleting `qwen2.5:0.5b` broke it
-//      outright (404 from /api/chat), and it stayed broken silently.
-//   3. It cost ~400 tokens of schema on every request to serve a case that never applies here.
-// Restore by re-registering a tool that calls `naturalRoute()` from the native binding, which is
-// still exported and still works.
-
-// --- Direct Ollama lifecycle tools ---
-// Unlike machine/route/recommend/natural_route above, these talk to Ollama directly (no
-// `freellama serve` required) — plain passthrough, no FreeLlama routing logic involved, so
-// there's no reason to route them through the Rust/NAPI layer. The read-only inspection tools
-// that used to live here (`list_models`, `ollama_ps`, `ollama_show`) are now views of the single
-// `models` tool: they shared identical annotations, so merging them costs no honesty and removes
-// two tools' worth of schema from every request. `ollama_delete` deliberately does NOT join a
-// merged lifecycle tool — annotations are per-tool, so folding a destructive action in with pull
-// and stop would force `destructiveHint: true` onto all three, or lie about delete.
+// Ollama lifecycle: talk to Ollama directly (no serve). `models` covers list/ps/show.
+// `ollama_delete` stays its own tool so pull/stop are not marked destructive.
 
 server.registerTool(
   "ollama_manage",
   {
     description:
-      "`pull`: real multi-GB download, only after a human approves a recommended model — never " +
-      "speculatively on a route failure. `stop`: frees VRAM now instead of waiting out keep_alive; " +
-      "reversible, it reloads on next use. Both additive and idempotent. Deleting is NOT here",
+      "pull: download after a human names the tag; streams percent. stop: free VRAM now. " +
+      "Not delete.",
     inputSchema: {
       action: z.enum(["pull", "stop"]).describe('"pull" = disk, "stop" = memory'),
-      model: z.string(),
+      model: z.string().min(1),
       ollamaEndpoint: ollamaEndpointParam,
       timeoutSeconds: z
         .number()
@@ -676,26 +661,28 @@ server.registerTool(
         .optional()
         .describe(`"pull" only. Defaults to ${DEFAULT_PULL_TIMEOUT_SECONDS}s.`),
     },
-    // Both actions only ever add or free — neither removes an installed model or loses data, and
-    // repeating either is a no-op. Identical annotations are exactly why the merge is safe.
-    // Only deviations from the spec defaults are declared; restating a default says nothing.
-    // pull and stop only add or free
     annotations: { destructiveHint: false, idempotentHint: true },
   },
   async ({ action, model, ollamaEndpoint, timeoutSeconds }) => {
     try {
+      if (action === "stop" && timeoutSeconds !== undefined) {
+        return errorResult(new Error('`timeoutSeconds` is valid only for action "pull".'));
+      }
       const data =
         action === "pull"
-          ? await ollamaFetch(ollamaEndpoint, "/api/pull", {
-              method: "POST",
-              body: { name: model, stream: false },
-              timeoutMs: (timeoutSeconds ?? DEFAULT_PULL_TIMEOUT_SECONDS) * 1000,
-            })
+          ? await ollamaPull(ollamaEndpoint, model, timeoutSeconds)
           : await ollamaFetch(ollamaEndpoint, "/api/generate", {
               method: "POST",
               body: { model, keep_alive: 0 },
             });
-      return structuredResult(data as Record<string, unknown>);
+      const payload = data as Record<string, unknown>;
+      // Pull failures arrive as an {"error": ...} event on an HTTP 200 stream, so the fetch
+      // above succeeds; report them as errors or a caller gating on isError believes the model
+      // is installed.
+      if (typeof payload.error === "string" && payload.error) {
+        return errorResult(new Error(`${action} ${model} failed: ${payload.error}`));
+      }
+      return structuredResult(payload);
     } catch (error) {
       return errorResult(error);
     }
@@ -706,21 +693,12 @@ server.registerTool(
   "ollama_delete",
   {
     description:
-      "DESTRUCTIVE AND IRREVERSIBLE. Permanently removes an installed model; only a re-download " +
-      "brings it back. Also carries `destructiveHint: true` so a client can gate it without " +
-      "parsing this text. NEVER call it on a staleness heuristic " +
-      "(\"unused N days\"): idle does not mean unneeded. ONLY call it after a human has named this " +
-      "exact model for deletion in the current conversation",
+      "DESTRUCTIVE AND IRREVERSIBLE. Removes an installed model. Only after a human names this " +
+      "exact tag in the current conversation — never on an idle/staleness heuristic.",
     inputSchema: {
-      model: z.string(),
+      model: z.string().min(1),
       ollamaEndpoint: ollamaEndpointParam,
     },
-    // Ollama answers DELETE /api/delete with an empty body, so there is nothing to echo — the
-    // useful structured answer is which model this call removed.
-    // The only tool here that sets `destructiveHint` to TRUE (four others set it false).
-    // Machine-readable on purpose: the prose warning above can't be acted on by a client deciding
-    // whether to prompt a human. `destructiveHint: true` is the spec default and is restated
-    // anyway — this is the one tool where silence is the wrong kind of terse.
     annotations: { destructiveHint: true, idempotentHint: true },
   },
   async ({ model, ollamaEndpoint }) => {
@@ -737,60 +715,78 @@ server.registerTool(
 );
 
 /**
- * What this repo has actually measured for each model on grounded code research.
- *
- * Added after an eval exposed a real flaw in the first version of `assessDelegatedAnswer`: it
- * quoted qwen-27B's 98.9% base rate no matter which model had answered, and returned `accept` for
- * a 3B model that was right 38% of the time. A trust signal that ignores the model is worse than
- * none, because it launders a weak answer through a confident-looking verdict.
- *
- * Measured 2026-08-30, 8 grounded single-file lookups against this repo, `bash` adapter:
- *   qwen3.8:27b-mlx 8/8 | gemma4:12b-mlx 6/8 | llama3.2:3b 3/8 | qwen2.5:7b 2/8 | qwen2.5:0.5b 0/8
+ * Verdicts in `assessDelegatedAnswer` are per-model, from on-disk evidence — never a global
+ * base rate. Grades live in benchmark/evidence/model-evidence.json.
  */
-
 server.registerTool(
   "delegate_research",
   {
     description:
-      "One narrow, self-contained question answered by a local model reading files under " +
-      "`workspacePath`. Returns the answer, an evidence trail, and a `verification` verdict " +
-      "(accept/verify/escalate) computed from what the run did AND which model ran — not the " +
-      "model's self-report. `escalate` = it read no files at all (recall, not research) OR the " +
-      "model is measured too weak to trust here. Best shape: " +
-      "1-5 files, lookup not judgment. ~98% token reduction. Read `structuredContent` rather than " +
-      "the prose: `verification` gives recommendation + why, and `citations` gives the full " +
-      "unclipped commands and paths behind the answer. Can fail outright; check isError and " +
-      "retry once before concluding it's unanswerable",
+      "Narrow file-backed question under workspacePath. Returns answer, citations, and a " +
+      "verification verdict (accept/verify/escalate) from what the run did and which model ran. " +
+      "escalate = no files read, or the model is measured too weak. Best: 1–5 files, lookup not " +
+      "judgment. Retry one transient/model-format error once; do not retry permission or config errors unchanged.",
     inputSchema: {
-      question: z
-        .string()
-.describe("narrow and self-contained, answerable by reading files"),
+      question: z.string().min(1).describe("narrow and self-contained, answerable by reading files"),
       workspacePath: z
         .string()
-.describe("absolute path; must be inside FREELLAMA_MCP_ALLOWED_ROOTS"),
+        .min(1)
+        .describe("directory inside FREELLAMA_MCP_ALLOWED_ROOTS (absolute preferred; relative is resolved)"),
       adapter: z
         .enum(["bash", "octocode"])
         .optional()
-.describe('"bash" (default) beat "octocode" on every model measured, and is faster'),
+        .describe('"bash" (default) beat "octocode" on every model measured, and is faster'),
       model: z
         .string()
+        .min(1)
         .optional()
-.describe("default qwen3.8:27b-mlx. Below ~12B accuracy collapses — never go smaller"),
-      ollamaEndpoint: z
-        .string()
+        .describe("omit to use FREELLAMA_MCP_DEFAULT_MODEL; research accuracy collapses below ~12B"),
+      endpoint: endpointParam,
+      executionPreference: executionPreferenceParam,
+      minPlacementEvidence: minPlacementEvidenceParam,
+      agent: z
+        .object({
+          maxTurns: z.number().int().positive().optional(),
+          contextTokens: z.number().int().positive().optional(),
+          outputTokens: z.number().int().positive().optional(),
+          temperature: z.number().nonnegative().optional(),
+          seed: z.number().int().nonnegative().optional(),
+          think: z.boolean().optional(),
+          keepAlive: z.string().min(1).optional().describe('Ollama duration such as "5m", "0", or "-1"'),
+          requestTimeoutSeconds: z.number().positive().optional(),
+          toolTimeoutSeconds: z.number().positive().optional(),
+          retryAttempts: z.number().int().positive().optional(),
+          retryBackoffSeconds: z.number().nonnegative().optional(),
+          maxParseRepairs: z.number().int().nonnegative().optional(),
+          parseRepairEchoChars: z.number().int().positive().optional(),
+          context: z
+            .object({
+              charsPerToken: z.number().positive().optional(),
+              safetyMarginTokens: z.number().int().nonnegative().optional(),
+              imageTokenEstimate: z.number().int().nonnegative().optional(),
+              keepRecent: z.number().int().nonnegative().optional(),
+              compactPreviewChars: z.number().int().positive().optional(),
+              compactRetainRatio: z.number().positive().lt(1).optional(),
+              clipHeadRatio: z.number().positive().lt(1).optional(),
+              observationPageChars: z.number().int().positive().optional(),
+              pinnedOverflow: z.enum(["error", "clip"]).optional(),
+            })
+            .optional(),
+        })
         .optional()
-.describe("default :11435, the proxy (has retry/backoff)"),
+        .describe("Per-call adapter, decoding, retry, and compaction overrides."),
     },
-    // Spawns a subprocess, reads files under `workspacePath`, and loads a model into VRAM — real
-    // effects, so not read-only. Additive only (it never writes to the workspace) and
-    // non-idempotent (a local model generates the answer).
-    // Only deviations from the spec defaults are declared; restating a default says nothing.
-    // reads files, writes nothing
     annotations: { destructiveHint: false },
   },
-  async ({ question, workspacePath, adapter, model, ollamaEndpoint }) => {
+  async ({ question, workspacePath, adapter, model, endpoint, executionPreference, minPlacementEvidence, agent }) => {
     const chosenAdapter: ResearchAdapter = adapter ?? DEFAULT_RESEARCH_ADAPTER;
     const chosenModel = model ?? DEFAULT_DELEGATE_MODEL;
+    let resolvedWorkspace: string;
+    try {
+      resolvedWorkspace = await assertAllowedWorkspace(workspacePath);
+    } catch (error) {
+      return errorResult(error);
+    }
     // Pre-flight, not post-hoc: a model this repo measured at 0-38% will not become right by
     // running it, so refuse before spending a model load and 10-40s of wall time on it.
     const known = MODEL_EVIDENCE[chosenModel];
@@ -804,14 +800,8 @@ server.registerTool(
         evidence: [],
         summary:
           `Refused before running: ${chosenModel} is measured unusable for research here ` +
-          `(${known.note}). Re-run with qwen3.8:27b-mlx, or answer it yourself.`,
+          `(${known.note}). Re-run with a ~27B model (see README), or answer it yourself.`,
       });
-    }
-    let resolvedWorkspace: string;
-    try {
-      resolvedWorkspace = await assertAllowedWorkspace(workspacePath);
-    } catch (error) {
-      return errorResult(error);
     }
     const dir = await mkdtemp(path.join(tmpdir(), "freellama-delegate-"));
     const promptFile = path.join(dir, "prompt.md");
@@ -832,11 +822,35 @@ server.registerTool(
         env: {
           ...process.env,
           FREELLAMA_TARGET_MODEL: chosenModel,
-          FREELLAMA_OLLAMA_ENDPOINT: ollamaEndpoint ?? DEFAULT_SERVE_ENDPOINT,
+          FREELLAMA_AGENT_MANAGED_ENDPOINT: endpoint ?? DEFAULT_SERVE_ENDPOINT,
+          FREELLAMA_AGENT_EXECUTION_PREFERENCE: executionPreference ?? "auto",
+          FREELLAMA_AGENT_MIN_PLACEMENT_EVIDENCE: minPlacementEvidence ?? "configured",
+          FREELLAMA_AGENT_TOKEN_CALIBRATION_DIR: DEFAULT_TOKEN_CALIBRATION_DIR,
           FREELLAMA_BENCH_WORKSPACE: resolvedWorkspace,
           FREELLAMA_BENCH_PROMPT: promptFile,
           FREELLAMA_AGENT_RESULT: resultFile,
-          FREELLAMA_AGENT_MAX_TURNS: String(DEFAULT_DELEGATE_MAX_TURNS),
+          FREELLAMA_AGENT_MAX_TURNS: String(agent?.maxTurns ?? DEFAULT_DELEGATE_MAX_TURNS),
+          ...(agent?.contextTokens !== undefined ? { FREELLAMA_AGENT_NUM_CTX: String(agent.contextTokens) } : {}),
+          ...(agent?.outputTokens !== undefined ? { FREELLAMA_AGENT_NUM_PREDICT: String(agent.outputTokens) } : {}),
+          ...(agent?.temperature !== undefined ? { FREELLAMA_AGENT_TEMPERATURE: String(agent.temperature) } : {}),
+          ...(agent?.seed !== undefined ? { FREELLAMA_AGENT_SEED: String(agent.seed) } : {}),
+          ...(agent?.think !== undefined ? { FREELLAMA_AGENT_THINK: String(agent.think) } : {}),
+          ...(agent?.keepAlive !== undefined ? { FREELLAMA_AGENT_KEEP_ALIVE: agent.keepAlive } : {}),
+          ...(agent?.requestTimeoutSeconds !== undefined ? { FREELLAMA_AGENT_REQUEST_TIMEOUT_SECONDS: String(agent.requestTimeoutSeconds) } : {}),
+          ...(agent?.toolTimeoutSeconds !== undefined ? { FREELLAMA_AGENT_TOOL_TIMEOUT_SECONDS: String(agent.toolTimeoutSeconds) } : {}),
+          ...(agent?.retryAttempts !== undefined ? { FREELLAMA_AGENT_RETRY_ATTEMPTS: String(agent.retryAttempts) } : {}),
+          ...(agent?.retryBackoffSeconds !== undefined ? { FREELLAMA_AGENT_RETRY_BACKOFF_SECONDS: String(agent.retryBackoffSeconds) } : {}),
+          ...(agent?.maxParseRepairs !== undefined ? { FREELLAMA_AGENT_MAX_PARSE_REPAIRS: String(agent.maxParseRepairs) } : {}),
+          ...(agent?.parseRepairEchoChars !== undefined ? { FREELLAMA_AGENT_PARSE_REPAIR_ECHO_CHARS: String(agent.parseRepairEchoChars) } : {}),
+          ...(agent?.context?.charsPerToken !== undefined ? { FREELLAMA_AGENT_CHARS_PER_TOKEN: String(agent.context.charsPerToken) } : {}),
+          ...(agent?.context?.safetyMarginTokens !== undefined ? { FREELLAMA_AGENT_SAFETY_MARGIN_TOKENS: String(agent.context.safetyMarginTokens) } : {}),
+          ...(agent?.context?.imageTokenEstimate !== undefined ? { FREELLAMA_AGENT_IMAGE_TOKEN_ESTIMATE: String(agent.context.imageTokenEstimate) } : {}),
+          ...(agent?.context?.keepRecent !== undefined ? { FREELLAMA_AGENT_KEEP_RECENT: String(agent.context.keepRecent) } : {}),
+          ...(agent?.context?.compactPreviewChars !== undefined ? { FREELLAMA_AGENT_COMPACT_PREVIEW_CHARS: String(agent.context.compactPreviewChars) } : {}),
+          ...(agent?.context?.compactRetainRatio !== undefined ? { FREELLAMA_AGENT_COMPACT_RETAIN_RATIO: String(agent.context.compactRetainRatio) } : {}),
+          ...(agent?.context?.clipHeadRatio !== undefined ? { FREELLAMA_AGENT_CLIP_HEAD_RATIO: String(agent.context.clipHeadRatio) } : {}),
+          ...(agent?.context?.observationPageChars !== undefined ? { FREELLAMA_AGENT_OBSERVATION_PAGE_CHARS: String(agent.context.observationPageChars) } : {}),
+          ...(agent?.context?.pinnedOverflow !== undefined ? { FREELLAMA_AGENT_PINNED_OVERFLOW: agent.context.pinnedOverflow } : {}),
         },
         timeout: DEFAULT_DELEGATE_TIMEOUT_SECONDS * 1000,
         // The answer is read from `resultFile`, never from stdout — but execFile's default 1 MB
@@ -863,22 +877,14 @@ server.registerTool(
       } finally {
         liveDelegates.delete(running.child);
       }
-      type AdapterResult = {
-        final_answer: string;
-        tool_calls: Array<{
-          raw_name?: string;
-          status?: string;
-          arguments?: { tool?: string; command?: string; queries?: { path?: string } };
-        }>;
-        usage: { input_tokens: number | null; output_tokens: number | null };
-      };
-      let result: AdapterResult;
+      let result: ReturnType<typeof parseAdapterResult>;
       try {
         // Read AND parse under one guard. A SIGKILL at the timeout can land mid-write, leaving a
         // truncated result.json — reading it succeeds and only the parse fails, so guarding the
         // read alone reported "Unexpected end of JSON input" and threw away the timeout diagnosis
-        // that actually explains the run.
-        result = JSON.parse(await readFile(resultFile, "utf8")) as AdapterResult;
+        // that actually explains the run. A valid object missing `final_answer` is the same class
+        // of failure: unusable, not "empty trail".
+        result = parseAdapterResult(await readFile(resultFile, "utf8"));
       } catch {
         // No usable result file: a hard kill (the SIGKILL timeout above) or a crash before the
         // adapter could finish writing. Here the exec error genuinely is the best account.
@@ -901,6 +907,7 @@ server.registerTool(
       // whichever adapter ran.
       const evidence = result.tool_calls.map((call, index) => {
         const target = call.arguments?.queries?.path;
+        const detail = call.arguments?.command ?? null;
         return {
           step: index + 1,
           tool: call.arguments?.tool ?? call.raw_name ?? "?",
@@ -908,8 +915,12 @@ server.registerTool(
           // lets a reader tell a run that read three files from one that failed three commands —
           // indistinguishable in the trail before, and graded identically.
           status: call.status ?? "ok",
-          path: target ? path.relative(resolvedWorkspace, target) : null,
-          detail: call.arguments?.command ?? null,
+          path: target
+            ? path.relative(resolvedWorkspace, target)
+            : detail
+              ? extractExistingWorkspacePath(detail, resolvedWorkspace)
+              : null,
+          detail,
         };
       });
       const succeeded = evidence.filter((step) => step.status === "ok");
@@ -974,6 +985,12 @@ server.registerTool(
           usage: {
             inputTokens: result.usage.input_tokens,
             outputTokens: result.usage.output_tokens,
+          },
+          contextManagement: result.model_metadata?.context_management ?? null,
+          execution: {
+            preference: executionPreference ?? "auto",
+            minPlacementEvidence: minPlacementEvidence ?? "configured",
+            receipts: result.model_metadata?.execution_receipts ?? [],
           },
           evidence,
           summary,
