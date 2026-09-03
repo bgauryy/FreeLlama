@@ -261,10 +261,27 @@ Building FreeLlama from source also requires Rust 1.85 or later and Node.js 20 o
 
 ## Install from npm on a supported platform
 
-After the matching release is published, install the CLI with `npx @octocodeai/freellama doctor`, or add
-`@octocodeai/freellama-mcp-server` to an MCP client's stdio configuration. The portable JavaScript package
-installs exactly one matching `@octocodeai/freellama-native-*` optional dependency containing the Rust CLI
-and N-API addon. Do not install with `--omit=optional`.
+After the matching release is published, run the CLI directly:
+
+```bash
+npx @octocodeai/freellama doctor
+```
+
+Add the MCP server to your AI client:
+
+```json
+{
+  "mcpServers": {
+    "freellama": {
+      "command": "npx",
+      "args": ["@octocodeai/freellama-mcp-server"]
+    }
+  }
+}
+```
+
+The portable JavaScript package installs exactly one matching `@octocodeai/freellama-native-*` optional
+dependency containing the Rust CLI and N-API addon. Do not install with `--omit=optional`.
 
 Prebuilt targets are macOS arm64/x64, Linux arm64/x64 for glibc and musl, and Windows arm64/x64.
 The release gate publishes no Cargo crates: `freellama-core` and `freellama-cli` are internal Rust
@@ -296,12 +313,11 @@ In another terminal, inspect the models. Then preview and execute one route:
   "Reply with exactly OK."
 ```
 
-The control plane listens on `127.0.0.1:11435` by default. The build writes the MCP server to
-`packages/mcp/dist/index.js`, and an MCP client launches it over stdio. Before publishing, run the
-local release checks in the [production runbook](docs/PRODUCTION.md), assemble checksummed artifacts
-for every claimed target, and publish the CLI and MCP packages explicitly. Until the first registry
-release succeeds, use the checked-out build and follow the
-[MCP build and client guidance](packages/mcp/README.md).
+The control plane listens on `127.0.0.1:11435` by default. Point your MCP client at
+`npx @octocodeai/freellama-mcp-server` or, from a source checkout, `node packages/mcp/dist/index.js`.
+Before publishing, run the local release checks in the [production runbook](docs/PRODUCTION.md),
+assemble checksummed artifacts for every claimed target, and publish the CLI and MCP packages
+explicitly. See the [MCP build and client guidance](packages/mcp/README.md).
 
 ## Control FreeLlama through MCP
 

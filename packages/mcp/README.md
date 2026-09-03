@@ -200,12 +200,34 @@ artifact); `native/index.js` and `native/index.d.ts` are hand-written and checke
 
 ## Run
 
+**From npm (recommended):**
+
+```bash
+npx @octocodeai/freellama-mcp-server
+```
+
+**From a source checkout:**
+
 ```bash
 node dist/index.js
 ```
 
-The server speaks MCP over stdio — launch it from an MCP client (for example, Claude Desktop's
-`claude_desktop_config.json`), not interactively.
+The server speaks MCP over stdio — configure it in your MCP client, do not run it interactively.
+
+**Claude Desktop (`claude_desktop_config.json`):**
+
+```json
+{
+  "mcpServers": {
+    "freellama": {
+      "command": "npx",
+      "args": ["@octocodeai/freellama-mcp-server"]
+    }
+  }
+}
+```
+
+**Cursor / other clients** — use the same `command`/`args` shape in their MCP server config.
 
 ## Test
 
@@ -400,7 +422,7 @@ See `skills/freellama/references/proxy-vs-serve.md` for the `proxy` vs `serve` d
 
 `packages/mcp/` is the portable JavaScript package. Its `package.json` lists the platform packages
 as exact-version optional dependencies; it intentionally does not embed a `.node` binary. Publish
-the eight `packages/native/*` packages first, then publish `@octocodeai/freellama` and `@octocodeai/freellama-mcp-server`
+the eight `packages/native/*` packages first, then publish `@octocodeai/freellama` (`npx @octocodeai/freellama`) and `@octocodeai/freellama-mcp-server` (`npx @octocodeai/freellama-mcp-server`)
 at the same version. `yarn release:verify:publish` refuses a release if any platform package has a
 missing, empty, or unpacked executable/addon pair.
 

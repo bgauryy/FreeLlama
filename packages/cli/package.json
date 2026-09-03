@@ -1,6 +1,6 @@
 {
   "name": "@octocodeai/freellama",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Local Ollama model gateway, router, and benchmarker — CLI. Wraps the compiled Rust binary from packages/rust-core.",
   "repository": {
     "type": "git",
@@ -16,7 +16,7 @@
     "coding-agent"
   ],
   "type": "module",
-  "bin": "bin/freellama.mjs",
+  "bin": "bin/freellama.js",
   "files": [
     "bin",
     "README.md"
@@ -43,8 +43,7 @@
   },
   "publishConfig": {
     "access": "public",
-    "registry": "https://registry.npmjs.org/",
-    "provenance": true
+    "registry": "https://registry.npmjs.org/"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

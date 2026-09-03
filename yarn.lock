@@ -1251,7 +1251,7 @@ __metadata:
     "@octocodeai/freellama-native-win32-x64-msvc":
       optional: true
   bin:
-    freellama: bin/freellama.mjs
+    freellama: bin/freellama.js
   languageName: unknown
   linkType: soft
 

@@ -29,5 +29,11 @@ packages/native/*/freellama
 packages/native/*/freellama.exe
 packages/native/*/*.node
 
+# Cross-platform build staging (populated by build-all-platforms workflow).
+release-artifacts/
+
+# Final assembled release directory (output of scripts/assemble-release.mjs).
+release/
+
 # Cloned upstream repos used as held-out eval corpora — never part of this repo
 .clones/

@@ -58,8 +58,7 @@
   "license": "Apache-2.0 OR MIT",
   "publishConfig": {
     "access": "public",
-    "registry": "https://registry.npmjs.org/",
-    "provenance": true
+    "registry": "https://registry.npmjs.org/"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
