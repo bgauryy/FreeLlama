@@ -24,8 +24,10 @@ packages/mcp/dist/
 .yarn/unplugged
 .yarn/build-state.yml
 
-# Prebuilt CLI binary staged at prepack; the source of truth is target/release.
-packages/cli/vendor/
+# Per-platform release artifacts staged by `yarn release:assemble`.
+packages/native/*/freellama
+packages/native/*/freellama.exe
+packages/native/*/*.node
 
 # Cloned upstream repos used as held-out eval corpora — never part of this repo
 .clones/

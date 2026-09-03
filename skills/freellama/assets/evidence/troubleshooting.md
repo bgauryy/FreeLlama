@@ -35,7 +35,7 @@ more than one large model listed is almost certainly it. → `references/ollama-
 
 **Cause B — Ollama's own transient flakiness under sustained tool-calling load**, independent of
 memory: measured ~8% per-request even with one resident model and headroom to spare. **Fix:** send
-requests through `npx freellama proxy`/`serve`, not raw Ollama — the proxy retries these
+requests through `npx @octocodeai/freellama proxy`/`serve`, not raw Ollama — the proxy retries these
 automatically. `scripts/check.sh` reports whether the request uses it.
 
 ## A request that used to fail fast now times out instead

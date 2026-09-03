@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
   belowConfidence,
+  canonicalTaskKind,
   clipText,
+  configuredExternalCost,
+  costTelemetry,
   errorResult,
   parseAdapterResult,
   parsedResult,
@@ -10,6 +13,7 @@ import {
   summarizeEmbeddings,
   summarizeOllamaPullStream,
   extractExistingWorkspacePath,
+  withRequiredCapability,
 } from "../../src/helpers.js";
 import { REPO_ROOT } from "../../src/config.js";
 
@@ -23,6 +27,59 @@ describe("extractExistingWorkspacePath", () => {
   it("does not turn an outside path or a find pattern into a citation", () => {
     expect(extractExistingWorkspacePath("grep root /etc/passwd", REPO_ROOT)).toBeNull();
     expect(extractExistingWorkspacePath("find . -name package.json", REPO_ROOT)).toBeNull();
+  });
+});
+
+describe("managed task aliases", () => {
+  it("normalizes the natural code-review alias at the MCP boundary", () => {
+    expect(canonicalTaskKind("code_review")).toBe("coding");
+    expect(canonicalTaskKind("code_repair")).toBe("code_repair");
+  });
+});
+
+describe("withRequiredCapability", () => {
+  it("adds a tool requirement without dropping or duplicating existing capabilities", () => {
+    expect(withRequiredCapability(["vision", "tools"], "tools")).toEqual(["vision", "tools"]);
+    expect(withRequiredCapability(undefined, "tools")).toEqual(["tools"]);
+  });
+});
+
+describe("costTelemetry", () => {
+  it("reports observed local usage without inventing an external bill", () => {
+    expect(costTelemetry({ inputTokens: 100, outputTokens: 20 })).toMatchObject({
+      local: { inputTokens: 100, outputTokens: 20, totalTokens: 120 },
+      externalEquivalent: null,
+    });
+  });
+
+  it("calculates only the configured same-token external equivalent", () => {
+    expect(costTelemetry(
+      { inputTokens: 1_000_000, outputTokens: 500_000 },
+      { model: "external-large", input: 1.25, output: 10 },
+    )).toMatchObject({
+      externalEquivalent: { model: "external-large", inputUsd: 1.25, outputUsd: 5, totalUsd: 6.25 },
+    });
+  });
+
+  it("refuses to estimate an external equivalent when Ollama omits token counts", () => {
+    expect(costTelemetry(
+      { inputTokens: null, outputTokens: 2 },
+      { model: "external-large", input: 1.25, output: 10 },
+    ).externalEquivalent).toBeNull();
+  });
+});
+
+describe("configuredExternalCost", () => {
+  it("requires a complete operator-owned rate card", () => {
+    expect(() => configuredExternalCost({ FREELLAMA_EXTERNAL_COST_MODEL: "external" })).toThrow(/requires/);
+  });
+
+  it("reads a complete USD-per-million rate card", () => {
+    expect(configuredExternalCost({
+      FREELLAMA_EXTERNAL_COST_MODEL: "external",
+      FREELLAMA_EXTERNAL_COST_INPUT_USD_PER_M: "1.25",
+      FREELLAMA_EXTERNAL_COST_OUTPUT_USD_PER_M: "10",
+    })).toEqual({ model: "external", input: 1.25, output: 10 });
   });
 });
 
@@ -151,10 +208,10 @@ describe("serialize", () => {
 });
 
 describe("result shapes", () => {
-  it("structuredResult carries the same object in both halves", () => {
+  it("structuredResult keeps the object canonical and emits a compact text cue", () => {
     const result = structuredResult({ hello: "world" });
     expect(result.structuredContent).toEqual({ hello: "world" });
-    expect(JSON.parse(result.content[0].text)).toEqual(result.structuredContent);
+    expect(result.content[0].text).toBe("Structured result available (hello).");
   });
 
   it("parsedResult parses upstream JSON once", () => {
@@ -176,6 +233,17 @@ describe("result shapes", () => {
   it("errorResult stringifies non-Error values", () => {
     expect(errorResult("boom").content[0].text).toBe("boom");
     expect(errorResult(new Error("bang")).content[0].text).toBe("bang");
+  });
+
+  it("makes an unavailable managed serve actionable without rewriting other errors", () => {
+    const unavailable = errorResult(
+      new Error("error sending request for url (http://127.0.0.1:11435/_freellama/v1/models): connection refused"),
+    );
+    expect(unavailable.content[0].text).toContain("Start it with `freellama serve`");
+    expect(unavailable.content[0].text).toContain("FREELLAMA_SERVE_ENDPOINT");
+    expect(errorResult(new Error("connection refused at http://127.0.0.1:11434/api/tags")).content[0].text).not.toContain(
+      "FreeLlama managed serve",
+    );
   });
 });
 

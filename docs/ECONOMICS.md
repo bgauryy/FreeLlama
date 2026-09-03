@@ -11,7 +11,39 @@ session projection are estimates derived from those calls.
 | 6 grounded code questions | 59,208 | 1,742 | **97.1%** |
 | 4 text embeddings (307 ms) | 17,600 | ~200 | **98.9%** |
 | 1 image, OCR, byte-exact | 1,970 | 37 | **98.1%** |
-| Tool schemas, per turn | ~3k (measured on the former eight-tool surface; six tools today) | 0 | **100%** |
+| Historical tool-schema surface, per turn | <3.2k | 0 | **100%** |
+
+## Current MCP-envelope audit (2026-09-03)
+
+The earlier table describes a historical workload on an M4 Pro. This audit measures the current
+eight-tool MCP build on the current host. JSON tokenization varies by client and model, so it records
+bytes first and gives `characters / 4` only as a deliberately rough token estimate.
+
+| Current result | Canonical structured chars | Compact text chars | Duplicate chars avoided | Rough duplicate-token estimate |
+|---|---:|---:|---:|---:|
+| `doctor {view:"summary"}` | 3,099 | 35 | 3,064 | ~766 |
+| `doctor {view:"scheduler"}` | 3,933 | 35 | 3,898 | ~975 |
+| `doctor {view:"config"}` | 7,373 | 86 | 7,287 | ~1,822 |
+| `doctor {view:"full"}` | 10,836 | 185 | 10,651 | ~2,663 |
+| `models {view:"raw", limit:1}` | 447 | 43 | 404 | ~101 |
+
+These are **not automatically billed-token savings**. They are the second serialized text copy
+that FreeLlama does not emit. An MCP host that feeds both `structuredContent` and text into a model
+can avoid roughly the listed amount; a host that already keeps only one representation does not.
+The canonical structured payload still exists for deterministic clients that need it.
+
+The current eight-tool schema plus initialization instructions measured 17,935 characters, or
+~4,484 tokens using the same rough conversion. The integration suite enforces a ceiling below 4,500
+estimated tokens. This is tool-schema **rent**, not a saving: clients pay it whenever they expose
+the entire tool list to a model. Read the bundled documentation resource on demand and do not expose
+unneeded tools in a client that supports tool filtering.
+
+Delegated research has a different economics boundary. It keeps source files and full tool
+observations out of the calling agent's active prompt, but it spends local Ollama input/output
+tokens in the delegated agent. The historical research rows below remain useful workload evidence;
+they are not a claim that the current installed model or host can reproduce those savings. Measure
+the same question, source size, model, context policy, and client transcript before using a number
+as a production budget.
 
 ## Scaled to a session
 

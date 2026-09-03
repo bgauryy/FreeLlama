@@ -1,0 +1,34 @@
+{
+  "name": "@octocodeai/freellama-native-linux-x64-gnu",
+  "version": "0.1.0",
+  "description": "FreeLlama native Rust artifacts for Linux x64 (glibc)",
+  "license": "Apache-2.0 OR MIT",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "libc": [
+    "glibc"
+  ],
+  "main": "freellama.linux-x64-gnu.node",
+  "files": [
+    "freellama",
+    "freellama.linux-x64-gnu.node"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/",
+    "provenance": true
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bgauryy/FreeLlama.git",
+    "directory": "packages/native/linux-x64-gnu"
+  },
+  "scripts": {
+    "build": "node -e \"\"",
+    "typecheck": "node -e \"\""
+  }
+}

@@ -6,7 +6,7 @@ Load when choosing a model for a task, finding one you do not have yet, or confi
 
 ## Zero-config `fastest` is a capability filter, not a quality judgment
 
-**Verified live:** `npx freellama route --task code-repair --objective fastest` with no policy
+**Verified live:** `npx @octocodeai/freellama route --task code-repair --objective fastest` with no policy
 configured returned `"selected_model": "qwen2.5:0.5b"`, `"confidence": "low"`,
 `"evidence": "capability_metadata_only"` — a 0.5B model for code repair. Not a bug: with zero
 evidence, `fastest` can only filter on advertised capability (`completion` + `tools`) and pick by
@@ -23,7 +23,7 @@ two inputs below exist. `objective: "balanced"` and `"quality"` need a configure
 | Input | Supplies | Without it |
 |---|---|---|
 | `--policy-file` | a *quality* contract: which models are vouched for on this task | `low`, and `objective: balanced/quality` errors outright |
-| `--benchmark-report` | local *functional* measurement from `npx freellama bench-all` | `low`, evidence `configured_task_policy` |
+| `--benchmark-report` | local *functional* measurement from `npx @octocodeai/freellama bench-all` | `low`, evidence `configured_task_policy` |
 
 Neither alone is enough, deliberately: a policy without measurement is an unverified claim, and
 measurement without a policy is throughput with nobody vouching for correctness.
@@ -31,9 +31,9 @@ measurement without a policy is throughput with nobody vouching for correctness.
 Generate the policy from **quality** data, never from `bench-all`:
 
 ```bash
-npx freellama policy-from-eval \
+npx @octocodeai/freellama policy-from-eval \
   --aggregate <harness aggregate.json> --task coding --min-pass 0.8 --out platform.toml
-npx freellama serve --policy-file platform.toml --benchmark-report <bench-all output>.json
+npx @octocodeai/freellama serve --policy-file platform.toml --benchmark-report <bench-all output>.json
 ```
 
 `bench-all` measures `decode_tokens_per_second`. Generating a policy from it would relabel speed as
@@ -59,7 +59,7 @@ no tag is recommended and you get `recommendationUnavailable`. An earlier fail-o
 with serve down, recommended the 143GB `qwen3-vl:235b`. Start `serve` and ask again; never fall back
 to picking the biggest tag yourself.
 
-`npx freellama recommend --task <task>` separately proposes an *install plan* from a reviewed
+`npx @octocodeai/freellama recommend --task <task>` separately proposes an *install plan* from a reviewed
 catalog — side-effect-free, it never runs `ollama pull`. Not on the MCP surface.
 
 ## Quality of the models installed here — measured, not inferred

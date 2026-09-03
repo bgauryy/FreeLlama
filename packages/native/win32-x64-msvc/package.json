@@ -1,0 +1,31 @@
+{
+  "name": "@octocodeai/freellama-native-win32-x64-msvc",
+  "version": "0.1.0",
+  "description": "FreeLlama native Rust artifacts for Windows x64",
+  "license": "Apache-2.0 OR MIT",
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "main": "freellama.win32-x64-msvc.node",
+  "files": [
+    "freellama.exe",
+    "freellama.win32-x64-msvc.node"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/",
+    "provenance": true
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bgauryy/FreeLlama.git",
+    "directory": "packages/native/win32-x64-msvc"
+  },
+  "scripts": {
+    "build": "node -e \"\"",
+    "typecheck": "node -e \"\""
+  }
+}

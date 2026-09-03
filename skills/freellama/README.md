@@ -1,7 +1,7 @@
 # freellama skill
 
 The orchestration playbook for any agent driving the
-[FreeLlama](https://github.com/bgauryy/FreeLlama) MCP server or its `npx freellama` CLI.
+[FreeLlama](https://github.com/bgauryy/FreeLlama) MCP server or its `npx @octocodeai/freellama` CLI.
 
 **Use it when you want to offload computation to free local models** — vision/OCR, grounded code
 research over real files, embeddings, bulk transforms — instead of spending frontier-model context.

@@ -1,7 +1,12 @@
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { assertAllowedWorkspace, REPO_ROOT, RESEARCH_ADAPTERS } from "../../src/config.js";
+import {
+  assertAllowedWorkspace,
+  parseAllowedResearchRoots,
+  REPO_ROOT,
+  RESEARCH_ADAPTERS,
+} from "../../src/config.js";
 
 describe("REPO_ROOT", () => {
   it("anchors on the directory containing Cargo.toml", () => {
@@ -13,6 +18,15 @@ describe("research adapters", () => {
   it("resolves both adapters to files that exist", () => {
     expect(existsSync(RESEARCH_ADAPTERS.bash)).toBe(true);
     expect(existsSync(RESEARCH_ADAPTERS.octocode)).toBe(true);
+  });
+});
+
+describe("research root parsing", () => {
+  it("preserves Windows drive letters when using the Windows path-list separator", () => {
+    expect(parseAllowedResearchRoots("C:\\code;D:\\work", ";")).toEqual([
+      path.resolve("C:\\code"),
+      path.resolve("D:\\work"),
+    ]);
   });
 });
 

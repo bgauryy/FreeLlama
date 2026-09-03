@@ -33,6 +33,7 @@ fn candidate(name: &str, size: u64, capabilities: &[Capability], resident: bool)
         size,
         capabilities: capabilities.iter().copied().collect(),
         advertised_context: Some(32_768),
+        kv_cache_bytes_per_token_f16: None,
         resident,
         resident_vram: resident.then_some(size),
         benchmark: BTreeMap::new(),
@@ -50,6 +51,54 @@ fn candidate(name: &str, size: u64, capabilities: &[Capability], resident: bool)
         .map(|task| (task, 0))
         .collect(),
     }
+}
+
+/// Session handles are deliberately bounded and releasable: they are affinity metadata, not an
+/// unbounded proxy for conversation history or runner KV.
+#[tokio::test]
+async fn session_affinity_is_bounded_and_releasable() {
+    let platform = app(&PlatformConfig::new(
+        "127.0.0.1:11435",
+        "http://127.0.0.1:11434",
+        None,
+        None,
+        "intent-model",
+    )
+    .with_max_sessions(1))
+    .unwrap();
+    let create = || {
+        Request::post("/_freellama/v1/sessions")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap()
+    };
+    let first = platform.clone().oneshot(create()).await.unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let first: Value =
+        serde_json::from_slice(&to_bytes(first.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(first["stores_prompt_or_kv"], false);
+    let id = first["session_id"].as_str().unwrap();
+    assert_eq!(
+        platform.clone().oneshot(create()).await.unwrap().status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(
+        platform
+            .clone()
+            .oneshot(
+                Request::delete(format!("/_freellama/v1/sessions/{id}"))
+                    .body(Body::empty())
+                    .unwrap()
+            )
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        platform.oneshot(create()).await.unwrap().status(),
+        StatusCode::OK
+    );
 }
 
 #[tokio::test]
@@ -122,7 +171,11 @@ async fn embedding_task_forwards_route_options_and_returns_prompt_free_metrics()
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     let upstream_body = captured.lock().await.clone().unwrap();
     assert_eq!(upstream_body["options"]["num_ctx"], 2048);
-    assert_eq!(response["route"]["hardware_fit"], "strong");
+    assert_eq!(
+        response["route"]["context_window_fit"],
+        "fits_advertised_window"
+    );
+    assert_eq!(response["route"]["hardware_fit"], "context_window_only");
     assert_eq!(response["metrics"]["prompt_tokens_per_second"], 10.0);
     assert_eq!(response["metrics"]["load_duration_ns"], 500_000_000_u64);
     assert!(response["metrics"].get("response").is_none());
@@ -131,6 +184,70 @@ async fn embedding_task_forwards_route_options_and_returns_prompt_free_metrics()
         "nonresident_transition_exclusive"
     );
     assert_eq!(upstream_body["keep_alive"], "5m");
+    mock_task.abort();
+}
+
+#[tokio::test]
+async fn tool_definitions_require_a_tool_capable_model() {
+    let chat_calls = Arc::new(AtomicUsize::new(0));
+    let calls = Arc::clone(&chat_calls);
+    let mock = Router::new()
+        .route(
+            "/api/tags",
+            get(|| async {
+                Json(json!({"models": [{"name": "text-only", "size": 1_000_000_000}]}))
+            }),
+        )
+        .route("/api/ps", get(|| async { Json(json!({"models": []})) }))
+        .route(
+            "/api/show",
+            post(|| async {
+                Json(json!({
+                    "capabilities": ["completion"],
+                    "model_info": {"test.context_length": 8192}
+                }))
+            }),
+        )
+        .route(
+            "/api/chat",
+            post(move || async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Json(json!({"message": {"role": "assistant", "content": "wrong model"}}))
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("http://{}", listener.local_addr().unwrap());
+    let mock_task = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    let platform = app(&PlatformConfig::new(
+        "127.0.0.1:11435",
+        upstream,
+        None,
+        None,
+        "text-only",
+    ))
+    .unwrap();
+
+    let response = platform
+        .oneshot(
+            Request::post("/_freellama/v1/tasks")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"task":"completion","objective":"fastest","prompt":"use the function","tools":[{"type":"function","function":{"name":"lookup"}}]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "unexpected response: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(chat_calls.load(Ordering::SeqCst), 0);
     mock_task.abort();
 }
 
@@ -568,7 +685,8 @@ async fn preview_honors_cpu_preference_and_exposes_the_execution_receipt() {
     let platform =
         app(
             &PlatformConfig::new("127.0.0.1:11435", gpu_upstream, None, None, "intent-model")
-                .with_cpu_backend(cpu_upstream.clone(), ["cpu-model"]),
+                .with_cpu_backend(cpu_upstream.clone(), ["cpu-model"])
+                .with_cpu_max_concurrent_tasks(2),
         )
         .unwrap();
 
@@ -593,6 +711,51 @@ async fn preview_honors_cpu_preference_and_exposes_the_execution_receipt() {
     assert_eq!(body["execution"]["preference"], "prefer_cpu");
     assert_eq!(body["execution"]["preference_satisfied"], true);
     assert_eq!(body["execution"]["reason"], "preferred_backend_eligible");
+    assert_eq!(
+        body["execution"]["agent_plan"]["dispatch_readiness"],
+        "runnable_now"
+    );
+    assert_eq!(body["execution"]["agent_plan"]["task_cost_units"], 2);
+    assert_eq!(
+        body["execution"]["agent_plan"]["independent_tasks_admissible_now"],
+        1
+    );
+    assert_eq!(
+        body["execution"]["agent_plan"]["additional_independent_tasks_same_backend"],
+        0
+    );
+    assert_eq!(
+        body["execution"]["agent_plan"]["parallelism_rule"],
+        "the proposed task is included in admissible_now; launch only caller-declared independent siblings; execution admission remains authoritative"
+    );
+
+    // Two slots can admit one two-unit coding task, not that coding task plus one sibling. This
+    // guards the agent-facing distinction between capacity including the proposed task and
+    // capacity that remains after it.
+    let coding = platform
+        .clone()
+        .oneshot(
+            Request::post("/_freellama/v1/routes")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"task":"coding","objective":"fastest","execution_preference":"prefer_cpu"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(coding.status(), StatusCode::OK);
+    let coding: Value =
+        serde_json::from_slice(&to_bytes(coding.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(coding["execution"]["agent_plan"]["task_cost_units"], 2);
+    assert_eq!(
+        coding["execution"]["agent_plan"]["independent_tasks_admissible_now"],
+        1
+    );
+    assert_eq!(
+        coding["execution"]["agent_plan"]["additional_independent_tasks_same_backend"],
+        0
+    );
 
     let observed_only = platform
         .clone()
@@ -941,7 +1104,10 @@ async fn gpu_and_cpu_backends_have_independent_admission_pools() {
                     async move {
                         let now = active.fetch_add(1, Ordering::SeqCst) + 1;
                         maximum.fetch_max(now, Ordering::SeqCst);
-                        tokio::time::sleep(Duration::from_millis(40)).await;
+                        // Catalog discovery can be delayed by unrelated parallel contracts on a
+                        // busy CI worker. A 40ms overlap window made this assertion test scheduler
+                        // timing instead of independent backend admission.
+                        tokio::time::sleep(Duration::from_millis(200)).await;
                         active.fetch_sub(1, Ordering::SeqCst);
                         Json(json!({
                             "message": {"role": "assistant", "content": "OK"},
@@ -1143,6 +1309,83 @@ async fn assigned_intent_model_uses_the_cpu_ollama_backend() {
 }
 
 #[tokio::test]
+async fn natural_route_respects_backend_admission() {
+    let mock = Router::new()
+        .route(
+            "/api/tags",
+            get(|| async {
+                Json(json!({"models": [{"name": "intent-model", "size": 1_000_000_000}]}))
+            }),
+        )
+        .route("/api/ps", get(|| async { Json(json!({"models": []})) }))
+        .route(
+            "/api/show",
+            post(|| async {
+                Json(json!({
+                    "capabilities": ["completion"],
+                    "model_info": {"test.context_length": 8192}
+                }))
+            }),
+        )
+        .route(
+            "/api/chat",
+            post(|Json(body): Json<Value>| async move {
+                let is_intent = body["messages"]
+                    .as_array()
+                    .is_some_and(|messages| messages.len() > 1);
+                if is_intent {
+                    Json(json!({"message": {"role": "assistant", "content": r#"{"task":"completion","objective":"fastest","context_tokens":null,"requires_tools":false,"requires_vision":false}"#}}))
+                } else {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    Json(json!({"message": {"role": "assistant", "content": "held"}}))
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("http://{}", listener.local_addr().unwrap());
+    let mock_task = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    let platform =
+        app(
+            &PlatformConfig::new("127.0.0.1:11435", upstream, None, None, "intent-model")
+                .with_max_concurrent_tasks(1)
+                .with_max_queue_wait(Duration::from_millis(40)),
+        )
+        .unwrap();
+
+    let holder = {
+        let platform = platform.clone();
+        tokio::spawn(async move {
+            platform
+                .oneshot(
+                    Request::post("/_freellama/v1/tasks")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            r#"{"task":"completion","objective":"fastest","model":"intent-model","prompt":"hold"}"#,
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    let route = platform
+        .oneshot(
+            Request::post("/_freellama/v1/natural-routes")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"text":"Answer this question."}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(route.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(holder.await.unwrap(), StatusCode::OK);
+    mock_task.abort();
+}
+
+#[tokio::test]
 async fn prompt_task_forwards_images_onto_the_built_message() {
     let captured = Arc::new(Mutex::new(None));
     let mock = Router::new()
@@ -1298,7 +1541,7 @@ async fn nonresident_managed_tasks_serialize_upstream_execution() {
                 |State(probe): State<ConcurrencyProbe>, Json(_): Json<Value>| async move {
                     let active = probe.active.fetch_add(1, Ordering::SeqCst) + 1;
                     probe.maximum.fetch_max(active, Ordering::SeqCst);
-                    tokio::time::sleep(Duration::from_millis(40)).await;
+                    tokio::time::sleep(Duration::from_millis(200)).await;
                     probe.active.fetch_sub(1, Ordering::SeqCst);
                     Json(json!({"embeddings": [[0.1]]}))
                 },
@@ -1369,7 +1612,9 @@ async fn resident_managed_tasks_keep_same_model_concurrency() {
                 |State(probe): State<ConcurrencyProbe>, Json(_): Json<Value>| async move {
                     let active = probe.active.fetch_add(1, Ordering::SeqCst) + 1;
                     probe.maximum.fetch_max(active, Ordering::SeqCst);
-                    tokio::time::sleep(Duration::from_millis(40)).await;
+                    // See the CPU/GPU pool contract above: preserve a meaningful overlap window
+                    // so this observes resident shared admission rather than host scheduling.
+                    tokio::time::sleep(Duration::from_millis(200)).await;
                     probe.active.fetch_sub(1, Ordering::SeqCst);
                     Json(json!({"embeddings": [[0.1]]}))
                 },
@@ -1404,6 +1649,79 @@ async fn resident_managed_tasks_keep_same_model_concurrency() {
     assert_eq!(first.unwrap().status(), StatusCode::OK);
     assert_eq!(second.unwrap().status(), StatusCode::OK);
     assert_eq!(probe.maximum.load(Ordering::SeqCst), 2);
+    mock_task.abort();
+}
+
+/// A resident bit from discovery is only a snapshot. If the runner disappears before execution,
+/// the task must not proceed under the shared lock and risk loading a model alongside other
+/// readers. The second `/api/ps` response simulates that intervening transition.
+#[tokio::test]
+async fn stale_residency_is_rechecked_before_using_the_shared_transition_lock() {
+    let ps_calls = Arc::new(AtomicUsize::new(0));
+    let mock = Router::new()
+        .route(
+            "/api/tags",
+            get(|| async {
+                Json(json!({"models": [{"name": "embed-model", "size": 274_000_000}]}))
+            }),
+        )
+        .route(
+            "/api/ps",
+            get(|State(calls): State<Arc<AtomicUsize>>| async move {
+                let call = calls.fetch_add(1, Ordering::SeqCst);
+                if call == 1 {
+                    Json(json!({"models": []}))
+                } else {
+                    Json(json!({
+                        "models": [{
+                            "name": "embed-model",
+                            "size": 274_000_000,
+                            "size_vram": 274_000_000
+                        }]
+                    }))
+                }
+            }),
+        )
+        .route(
+            "/api/show",
+            post(|| async {
+                Json(json!({
+                    "capabilities": ["embedding"],
+                    "model_info": {"test.context_length": 2048}
+                }))
+            }),
+        )
+        .route(
+            "/api/embed",
+            post(|| async { Json(json!({"embeddings": [[0.1]]})) }),
+        )
+        .with_state(ps_calls.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("http://{}", listener.local_addr().unwrap());
+    let mock_task = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    let platform = app(&PlatformConfig::new(
+        "127.0.0.1:11435",
+        upstream,
+        None,
+        None,
+        "qwen2.5:0.5b",
+    ))
+    .unwrap();
+
+    let response = platform.oneshot(embedding_task_request()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+
+    assert_eq!(
+        response["admission"]["mode"],
+        "nonresident_transition_exclusive"
+    );
+    assert_eq!(
+        ps_calls.load(Ordering::SeqCst),
+        3,
+        "expected discovery, the under-lock residency recheck, and post-run observation"
+    );
     mock_task.abort();
 }
 
@@ -1573,7 +1891,7 @@ fn balanced_routing_refuses_an_unqualified_functional_winner() {
 }
 
 #[test]
-fn hardware_fit_grades_the_window_that_will_be_sent() {
+fn context_window_fit_grades_the_window_that_will_be_sent() {
     let mut embed = candidate(
         "nomic-embed-text:latest",
         370_000_000,
@@ -1593,7 +1911,8 @@ fn hardware_fit_grades_the_window_that_will_be_sent() {
     )
     .unwrap();
     assert_eq!(decision.options["num_ctx"], 2_048);
-    assert_eq!(decision.hardware_fit, "strong");
+    assert_eq!(decision.context_window_fit, "fits_advertised_window");
+    assert_eq!(decision.hardware_fit, "context_window_only");
     assert!(
         !decision
             .reasons
@@ -1619,7 +1938,8 @@ fn a_smaller_advertised_window_clamps_and_still_fits() {
     )
     .unwrap();
     assert_eq!(decision.options["num_ctx"], 4_096);
-    assert_eq!(decision.hardware_fit, "strong");
+    assert_eq!(decision.context_window_fit, "fits_advertised_window");
+    assert_eq!(decision.hardware_fit, "context_window_only");
     assert!(
         decision
             .reasons
@@ -1991,6 +2311,25 @@ fn unsupported_natural_language_requirements_are_cleared() {
 }
 
 #[test]
+fn negated_tool_instructions_do_not_become_requirements() {
+    let weak = RouteIntent {
+        task: TaskKind::Completion,
+        objective: Objective::Balanced,
+        context_tokens: None,
+        requires_tools: true,
+        requires_vision: false,
+    };
+    for text in [
+        "Do not use tools; answer from the supplied context.",
+        "Answer without tools.",
+        "Never use tools for this request.",
+    ] {
+        let (intent, _) = normalize_route_intent(weak.clone(), text);
+        assert!(!intent.requires_tools, "negation was ignored for {text:?}");
+    }
+}
+
+#[test]
 fn explicit_small_context_is_clamped_and_task_requirements_are_preserved() {
     let weak = RouteIntent {
         task: TaskKind::Tools,
@@ -2098,6 +2437,75 @@ fn embedding_task_request() -> Request<Body> {
             r#"{"task":"embedding","objective":"fastest","model":"embed-model","input":"hello"}"#,
         ))
         .unwrap()
+}
+
+/// A batch is an explicit independence contract, not an implicit fan-out hidden in a normal task.
+/// It must preserve caller order, expose bounded scheduling, and charge an embedding array for its
+/// real cardinality rather than treating a 5-item batch as a one-unit request.
+#[tokio::test]
+async fn independent_batch_dispatches_and_accounts_for_embedding_cardinality() {
+    let mock = discovery_routes::<()>()
+        .route(
+            "/api/embed",
+            post(|| async { Json(json!({"embeddings": [[0.1]]})) }),
+        )
+        .with_state(());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("http://{}", listener.local_addr().unwrap());
+    let mock_task = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    let platform =
+        app(
+            &PlatformConfig::new("127.0.0.1:11435", upstream, None, None, "qwen2.5:0.5b")
+                .with_max_concurrent_tasks(2),
+        )
+        .unwrap();
+    let response = platform
+        .oneshot(
+            Request::post("/_freellama/v1/task-batches")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"max_parallelism":2,"tasks":[
+                      {"id":"interactive","independent":true,"task":{"task":"embedding","objective":"fastest","model":"embed-model","priority":"interactive","input":"one"}},
+                      {"id":"batched","independent":true,"task":{"task":"embedding","objective":"fastest","model":"embed-model","priority":"background","input":["a","b","c","d","e"]}}
+                    ]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["independent_only"], true);
+    assert_eq!(body["scheduler"]["policy"], "weighted_fair_round_robin");
+    assert_eq!(body["results"][0]["id"], "interactive");
+    assert_eq!(body["results"][1]["id"], "batched");
+    assert_eq!(body["results"][1]["response"]["admission"]["cost"], 2);
+    mock_task.abort();
+}
+
+#[tokio::test]
+async fn batch_refuses_dependent_items_before_any_upstream_call() {
+    let platform = app(&PlatformConfig::new(
+        "127.0.0.1:11435",
+        "http://127.0.0.1:9",
+        None,
+        None,
+        "qwen2.5:0.5b",
+    ))
+    .unwrap();
+    let response = platform
+        .oneshot(
+            Request::post("/_freellama/v1/task-batches")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"tasks":[{"id":"dependent","independent":false,"task":{"task":"embedding","input":"x"}}]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }
 
 /// Ollama returns 500 under load-model contention — the exact condition managed routing creates
@@ -2673,6 +3081,179 @@ async fn a_refused_task_does_not_bind_session_affinity() {
     mock_task.abort();
 }
 
+/// Session affinity records successful execution, not merely an attempted route. A failed
+/// explicit request for `large` must leave the next unpinned route free to choose `small`.
+#[tokio::test]
+async fn a_failed_upstream_task_does_not_bind_session_affinity() {
+    let mock = Router::new()
+        .route(
+            "/api/tags",
+            get(|| async {
+                Json(json!({
+                    "models": [
+                        {"name": "large", "size": 2_000_000_000_u64},
+                        {"name": "small", "size": 1_000_000_000_u64}
+                    ]
+                }))
+            }),
+        )
+        .route("/api/ps", get(|| async { Json(json!({"models": []})) }))
+        .route(
+            "/api/show",
+            post(|| async {
+                Json(json!({
+                    "capabilities": ["completion"],
+                    "model_info": {"test.context_length": 8192}
+                }))
+            }),
+        )
+        .route(
+            "/api/chat",
+            post(|| async {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": "request rejected"})),
+                )
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("http://{}", listener.local_addr().unwrap());
+    let mock_task = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    let platform = app(&PlatformConfig::new(
+        "127.0.0.1:11435",
+        upstream,
+        None,
+        None,
+        "small",
+    ))
+    .unwrap();
+
+    let created = platform
+        .clone()
+        .oneshot(
+            Request::post("/_freellama/v1/sessions")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let created: Value =
+        serde_json::from_slice(&to_bytes(created.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let session = created["session_id"].as_str().unwrap();
+
+    let failed = platform
+        .clone()
+        .oneshot(
+            Request::post("/_freellama/v1/tasks")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"task":"completion","objective":"fastest","model":"large","prompt":"hello","session_id":"{session}"}}"#
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(failed.status(), StatusCode::BAD_REQUEST);
+
+    let next = platform
+        .oneshot(
+            Request::post("/_freellama/v1/routes")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"task":"completion","objective":"fastest","session_id":"{session}"}}"#
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let next: Value =
+        serde_json::from_slice(&to_bytes(next.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(next["selected_model"], "small");
+    mock_task.abort();
+}
+
+#[tokio::test]
+async fn route_preview_does_not_bind_session_affinity() {
+    let mock = Router::new()
+        .route(
+            "/api/tags",
+            get(|| async {
+                Json(json!({
+                    "models": [
+                        {"name": "large", "size": 2_000_000_000_u64},
+                        {"name": "small", "size": 1_000_000_000_u64}
+                    ]
+                }))
+            }),
+        )
+        .route("/api/ps", get(|| async { Json(json!({"models": []})) }))
+        .route(
+            "/api/show",
+            post(|| async {
+                Json(json!({
+                    "capabilities": ["completion"],
+                    "model_info": {"test.context_length": 8192}
+                }))
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("http://{}", listener.local_addr().unwrap());
+    let mock_task = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    let platform = app(&PlatformConfig::new(
+        "127.0.0.1:11435",
+        upstream,
+        None,
+        None,
+        "small",
+    ))
+    .unwrap();
+
+    let created = platform
+        .clone()
+        .oneshot(
+            Request::post("/_freellama/v1/sessions")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let created: Value =
+        serde_json::from_slice(&to_bytes(created.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let session = created["session_id"].as_str().unwrap();
+
+    let preview = platform
+        .clone()
+        .oneshot(
+            Request::post("/_freellama/v1/routes")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"task":"completion","objective":"fastest","model":"large","session_id":"{session}"}}"#
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(preview.status(), StatusCode::OK);
+
+    let next = platform
+        .oneshot(
+            Request::post("/_freellama/v1/routes")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"task":"completion","objective":"fastest","session_id":"{session}"}}"#
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let next: Value =
+        serde_json::from_slice(&to_bytes(next.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(next["selected_model"], "small");
+    mock_task.abort();
+}
+
 /// `confidence` must be derivable from the dimensions, not a standalone opaque grade.
 ///
 /// A single word invites being read as a calibrated probability. It is not one: `medium` means "a
@@ -2802,6 +3383,22 @@ async fn health_reports_admission_capacity() {
             .is_some()
     );
     assert_eq!(body["admission"]["costs"]["vision"], 4);
+    assert_eq!(
+        body["admission"]["costs"]["embedding"],
+        "ceil(input_items/4)"
+    );
+    assert_eq!(
+        body["admission"]["priority_fairness"]["policy"],
+        "weighted_fair_round_robin"
+    );
+    assert_eq!(
+        body["contracts"]["task_batches"],
+        "independent_only_bounded_priority_fair"
+    );
+    assert_eq!(
+        body["contracts"]["memory_kv_preflight"],
+        "metadata_lower_bound_ollama_final_authority"
+    );
     assert_eq!(
         body["contracts"]["hardware_fit"], "sent_num_ctx",
         "health must advertise the sent-window fit contract so a stale serve binary fails this test"

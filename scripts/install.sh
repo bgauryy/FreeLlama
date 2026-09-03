@@ -27,7 +27,18 @@ case "$(uname -m)" in
   *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
 esac
 
-asset="freellama-${platform}-${architecture}"
+if [ "$platform" = "linux" ]; then
+  if ldd --version 2>&1 | grep -qi musl; then
+    libc="musl"
+  else
+    libc="gnu"
+  fi
+  platform="${platform}-${architecture}-${libc}"
+else
+  platform="${platform}-${architecture}"
+fi
+
+asset="freellama-${platform}"
 base="https://github.com/bgauryy/FreeLlama/releases/download/${release_version}"
 temporary_dir="$(mktemp -d)"
 trap 'rm -rf "$temporary_dir"' EXIT HUP INT TERM

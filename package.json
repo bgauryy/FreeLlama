@@ -1,12 +1,13 @@
 {
   "name": "freellama-workspace",
-  "version": "0.2.0",
+  "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Workspace root: shared toolchain (vitest, esbuild, tsc) plus the build-only napi manifest for the native addon compiled from packages/rust-core/src/napi.rs. Not published — the compiled binary is written into packages/mcp/native, which is the publishable unit.",
+  "description": "Workspace root for FreeLlama's internal Rust core, portable JavaScript entry points, and per-platform native artifact packages.",
   "workspaces": [
     "packages/mcp",
-    "packages/cli"
+    "packages/cli",
+    "packages/native/*"
   ],
   "napi": {
     "binaryName": "freellama",
@@ -31,8 +32,12 @@
     "test:integration": "vitest run -c packages/mcp/vitest.integration.config.ts",
     "test:e2e": "vitest run -c packages/mcp/vitest.e2e.config.ts",
     "test:rust": "cargo test --workspace",
-    "test:all": "yarn typecheck && yarn test && yarn test:rust && yarn test:integration && yarn test:e2e",
-    "release:verify": "node scripts/verify-release-packages.mjs"
+    "test:agents": "python3 benchmark/local/scripts/test_agent_context.py && python3 benchmark/local/scripts/test_agent_actions.py",
+    "test:all": "yarn typecheck && yarn test && yarn test:rust && yarn test:agents && yarn test:integration && yarn test:e2e",
+    "verify:production": "yarn build && cargo fmt --all --check && cargo clippy --workspace --all-targets --all-features -- -D warnings && yarn test:all && yarn release:verify:publish",
+    "release:assemble": "node scripts/assemble-release.mjs",
+    "release:verify": "node scripts/verify-release-packages.mjs",
+    "release:verify:publish": "FREELLAMA_REQUIRE_ALL_PLATFORMS=1 node scripts/verify-release-packages.mjs"
   },
   "devDependencies": {
     "@napi-rs/cli": "^3.8.6",

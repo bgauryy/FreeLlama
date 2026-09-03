@@ -151,6 +151,17 @@ async fn post_json(endpoint: &str, path: &str, body: &Value, timeout: Duration) 
     })
 }
 
+async fn delete_json(endpoint: &str, path: &str, timeout: Duration) -> Result<()> {
+    authenticated(client().delete(format!("{}{path}", endpoint.trim_end_matches('/'))))?
+        .timeout(timeout)
+        .send()
+        .await
+        .map_err(to_napi_err)?
+        .error_for_status()
+        .map_err(to_napi_err)?;
+    Ok(())
+}
+
 fn pretty(value: &Value) -> Result<String> {
     serde_json::to_string_pretty(value).map_err(to_napi_err)
 }
@@ -179,6 +190,52 @@ pub async fn machine(endpoint: Option<String>) -> Result<String> {
     let endpoint = endpoint_or_default(endpoint);
     let value = get_json(&endpoint, "/_freellama/v1/machine", control_timeout()).await?;
     pretty(&value)
+}
+
+/// Current managed-platform health, including admission and session bounds.
+///
+/// # Errors
+///
+/// Returns an error if `freellama serve` is unreachable or returns a non-2xx response.
+#[napi]
+pub async fn health(endpoint: Option<String>) -> Result<String> {
+    let endpoint = endpoint_or_default(endpoint);
+    let value = get_json(&endpoint, "/_freellama/v1/health", control_timeout()).await?;
+    pretty(&value)
+}
+
+/// Create a bounded, expiring model-affinity handle. It stores no prompt history or Ollama KV.
+///
+/// # Errors
+///
+/// Returns an error if `freellama serve` is unreachable or its session limit is full.
+#[napi]
+pub async fn create_session(endpoint: Option<String>) -> Result<String> {
+    let endpoint = endpoint_or_default(endpoint);
+    let value = post_json(
+        &endpoint,
+        "/_freellama/v1/sessions",
+        &json!({}),
+        control_timeout(),
+    )
+    .await?;
+    pretty(&value)
+}
+
+/// Release a model-affinity handle when an agent has finished related work.
+///
+/// # Errors
+///
+/// Returns an error if `freellama serve` is unreachable or the handle has expired or was deleted.
+#[napi]
+pub async fn delete_session(endpoint: Option<String>, session_id: String) -> Result<()> {
+    let endpoint = endpoint_or_default(endpoint);
+    delete_json(
+        &endpoint,
+        &format!("/_freellama/v1/sessions/{session_id}"),
+        control_timeout(),
+    )
+    .await
 }
 
 /// Installed-model inventory with capabilities, residency, and advertised context, as discovered
@@ -244,6 +301,10 @@ pub async fn route(
 ///
 /// Returns an error if `freellama serve` isn't reachable at `endpoint`, or rejects the request.
 #[napi]
+// This is a stable JavaScript FFI boundary: keeping the optional routing controls as separate
+// arguments preserves the generated TypeScript API and matches `route`/`run_task`. Internal Rust
+// callers use typed request structs, so the usual maintainability concern does not apply here.
+#[allow(clippy::too_many_arguments)]
 pub async fn recommend(
     endpoint: Option<String>,
     task: String,
@@ -347,6 +408,26 @@ pub async fn run_task(
 pub async fn run_task_request(endpoint: Option<String>, request: Value) -> Result<String> {
     let endpoint = endpoint_or_default(endpoint);
     let value = post_json(&endpoint, "/_freellama/v1/tasks", &request, task_timeout()).await?;
+    pretty(&value)
+}
+
+/// Executes caller-declared independent managed tasks with bounded, priority-fair dispatch.
+///
+/// # Errors
+///
+/// Returns an error if `freellama serve` is unreachable or rejects the batch envelope. Individual
+/// task failures remain explicit entries in the successful batch response so sibling work is not
+/// discarded.
+#[napi]
+pub async fn run_task_batch_request(endpoint: Option<String>, request: Value) -> Result<String> {
+    let endpoint = endpoint_or_default(endpoint);
+    let value = post_json(
+        &endpoint,
+        "/_freellama/v1/task-batches",
+        &request,
+        task_timeout(),
+    )
+    .await?;
     pretty(&value)
 }
 

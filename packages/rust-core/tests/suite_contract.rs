@@ -1,6 +1,7 @@
 use freellama::{
-    Comparison, GuardrailStatus, RunReport, Suite, Verdict, compare, max_loaded_models_advisory,
-    parse_ollama_cli_version,
+    Comparison, GuardrailStatus, RunReport, Suite, Verdict, compare,
+    local_conservative_config_posture, max_loaded_models_advisory, ollama_config_diagnostics,
+    parse_macos_thermal_status, parse_ollama_cli_version, parse_ollama_process_environment,
 };
 
 #[test]
@@ -14,6 +15,78 @@ fn doctor_identifies_a_cli_server_version_mismatch() {
     assert_eq!(diagnostic.client_version.as_deref(), Some("0.13.5"));
     assert_eq!(diagnostic.server_version, "0.32.15");
     assert!(!diagnostic.matches_server);
+}
+
+#[test]
+fn local_conservative_posture_prefers_observed_service_settings_over_hints() {
+    let config = ollama_config_diagnostics("0.33.2", |_| None);
+    let observed = serde_json::json!({
+        "status": "observed",
+        "settings": {
+            "OLLAMA_NO_CLOUD": "1",
+            "OLLAMA_MAX_LOADED_MODELS": "1",
+            "OLLAMA_NUM_PARALLEL": "1",
+            "OLLAMA_MAX_QUEUE": "16"
+        }
+    });
+    let posture = local_conservative_config_posture(&config, &observed);
+    assert_eq!(posture["profile"], "local-conservative-v1");
+    assert_eq!(posture["overall"], "ready");
+    assert_eq!(
+        posture["settings"]["OLLAMA_NO_CLOUD"]["source"],
+        "observed_process"
+    );
+    assert_eq!(posture["settings"]["OLLAMA_MAX_QUEUE"]["status"], "ready");
+    assert!(
+        posture["apply"].is_object(),
+        "must provide non-mutating operator guidance"
+    );
+}
+
+#[test]
+fn local_conservative_posture_warns_when_cloud_and_unbounded_queue_are_visible() {
+    let config = ollama_config_diagnostics("0.33.2", |_| None);
+    let observed = serde_json::json!({
+        "status": "observed",
+        "settings": { "OLLAMA_NO_CLOUD": "0" }
+    });
+    let posture = local_conservative_config_posture(&config, &observed);
+    assert_eq!(posture["overall"], "action_required");
+    assert_eq!(
+        posture["settings"]["OLLAMA_NO_CLOUD"]["status"],
+        "action_required"
+    );
+    assert_eq!(
+        posture["settings"]["OLLAMA_MAX_QUEUE"]["status"],
+        "recommended"
+    );
+}
+
+#[test]
+fn mac_thermal_parser_returns_a_small_status_not_raw_system_output() {
+    assert_eq!(
+        parse_macos_thermal_status("Note: No thermal warning level has been recorded\n"),
+        serde_json::json!({ "status": "normal" })
+    );
+    assert_eq!(
+        parse_macos_thermal_status("Note: Thermal warning level: 2\n"),
+        serde_json::json!({ "status": "warning", "level": "2" })
+    );
+}
+
+#[test]
+fn process_environment_parser_is_allow_listed_and_never_leaks_unrelated_values() {
+    let values = parse_ollama_process_environment(
+        "/Applications/Ollama.app/Contents/Resources/ollama serve API_TOKEN=never OLLAMA_NO_CLOUD=1 OLLAMA_NUM_PARALLEL=2 SECRET=never LLAMA_ARG_FIT=0",
+    );
+    assert_eq!(values.get("OLLAMA_NO_CLOUD").map(String::as_str), Some("1"));
+    assert_eq!(
+        values.get("OLLAMA_NUM_PARALLEL").map(String::as_str),
+        Some("2")
+    );
+    assert_eq!(values.get("LLAMA_ARG_FIT").map(String::as_str), Some("0"));
+    assert!(!values.contains_key("API_TOKEN"));
+    assert!(!values.contains_key("SECRET"));
 }
 
 #[test]
@@ -150,6 +223,79 @@ fn ollama_env_advisories_report_the_configured_value() {
     assert_eq!(
         table["OLLAMA_NUM_PARALLEL"]["value"],
         serde_json::Value::Null
+    );
+}
+
+/// `ollama_env_config` remains the stable flat memory view, while the categorized view covers the
+/// rest of the production settings exposed by the detected Ollama generation.
+#[test]
+fn categorized_ollama_config_covers_installed_production_settings() {
+    let report = ollama_config_diagnostics("0.33.2", |_| None);
+    assert_eq!(report["server_version"], "0.33.2");
+    assert_eq!(report["coverage"]["known_settings"], 21);
+
+    let categories = report["categories"].as_object().expect("categories object");
+    for category in [
+        "memory_scheduler",
+        "network_security",
+        "privacy",
+        "storage_lifecycle",
+        "backend_device",
+        "operations",
+    ] {
+        assert!(categories.contains_key(category), "missing {category}");
+    }
+
+    let expected = [
+        ("network_security", "OLLAMA_HOST"),
+        ("network_security", "OLLAMA_ORIGINS"),
+        ("privacy", "OLLAMA_NO_CLOUD"),
+        ("storage_lifecycle", "OLLAMA_MODELS"),
+        ("storage_lifecycle", "OLLAMA_NOPRUNE"),
+        ("backend_device", "OLLAMA_LLM_LIBRARY"),
+        ("backend_device", "OLLAMA_SCHED_SPREAD"),
+        ("backend_device", "OLLAMA_IGPU_ENABLE"),
+        ("operations", "OLLAMA_MAX_TRANSFER_STREAMS"),
+        ("operations", "OLLAMA_DEBUG"),
+    ];
+    for (category, setting) in expected {
+        let entry = &report["categories"][category][setting];
+        assert!(entry.is_object(), "missing {category}.{setting}");
+        assert!(
+            entry["effective_default"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty()),
+            "{category}.{setting} needs an honest effective default"
+        );
+    }
+}
+
+#[test]
+fn categorized_ollama_config_reports_values_without_claiming_process_visibility() {
+    let report = ollama_config_diagnostics("0.33.2", |key| Some(format!("configured:{key}")));
+    for (category, setting) in [
+        ("network_security", "OLLAMA_HOST"),
+        ("network_security", "OLLAMA_ORIGINS"),
+        ("privacy", "OLLAMA_NO_CLOUD"),
+        ("storage_lifecycle", "OLLAMA_MODELS"),
+        ("storage_lifecycle", "OLLAMA_NOPRUNE"),
+        ("backend_device", "OLLAMA_LLM_LIBRARY"),
+        ("backend_device", "OLLAMA_SCHED_SPREAD"),
+        ("backend_device", "OLLAMA_IGPU_ENABLE"),
+        ("operations", "OLLAMA_MAX_TRANSFER_STREAMS"),
+        ("operations", "OLLAMA_DEBUG"),
+    ] {
+        assert_eq!(
+            report["categories"][category][setting]["value"],
+            format!("configured:{setting}"),
+            "configured value missing for {category}.{setting}"
+        );
+    }
+    assert!(
+        report["visibility_note"]
+            .as_str()
+            .expect("visibility note")
+            .contains("cannot prove")
     );
 }
 

@@ -9,10 +9,10 @@ import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { connectClient, serveAuthHeaders, serveIsUp, SERVE_ENDPOINT } from "../setup/client.js";
 
-type Tool = { name: string; description?: string; annotations?: any; outputSchema?: unknown; inputSchema?: any; title?: string };
+type Tool = { name: string; description?: string; annotations?: any; outputSchema?: any; inputSchema?: any; title?: string };
 type ToolResult = { isError?: boolean; content: { text: string }[]; structuredContent?: any };
 
-const EXPECTED_TOOLS = ["doctor", "models", "run_task", "ollama_manage", "ollama_delete", "delegate_research"];
+const EXPECTED_TOOLS = ["doctor", "models", "run_task", "run_task_batch", "session", "ollama_manage", "ollama_delete", "delegate_research"];
 
 // Whether `freellama serve` is up decides which half of the contract is checkable.
 const serveUp = await serveIsUp();
@@ -39,6 +39,14 @@ describe("tool contract", () => {
     expect([...byName.keys()].sort()).toEqual([...EXPECTED_TOOLS].sort());
   });
 
+  it("gives agents explicit selection, exclusion, and result guidance for every tool", () => {
+    for (const tool of tools) {
+      expect(tool.description, `${tool.name}: missing Use when`).toMatch(/Use when:/);
+      expect(tool.description, `${tool.name}: missing Do not use when`).toMatch(/Do not use when:/);
+      expect(tool.description, `${tool.name}: missing Returns`).toMatch(/Returns:/);
+    }
+  });
+
   it("teaches clients execution ownership and the model-installation approval gate", () => {
     const instructions = client.getInstructions() ?? "";
     expect(instructions).toMatch(/caller owns task decomposition/);
@@ -47,6 +55,9 @@ describe("tool contract", () => {
     expect(instructions).toMatch(/models\{view:"installed"\}.*models\{view:"resident"\}/s);
     expect(instructions).toMatch(/ask approval.*for one exact tag and reported size before ollama_manage/s);
     expect(instructions).toMatch(/search or recommendation\s+is never download permission/i);
+    expect(instructions).toMatch(/run_task preview never executes; code_review aliases coding/);
+    expect(instructions).toMatch(/requiredCapabilities:\["tools"\].*omit preview and supply the payload/s);
+    expect(instructions).toContain("Docs: freellama://docs/index");
   });
 
   it("exposes a bounded placement preference instead of an unsafe backend override", () => {
@@ -60,6 +71,7 @@ describe("tool contract", () => {
       "vision",
       "embedding",
       "long_context",
+      "code_review",
     ]);
     expect(schema.properties.requiredCapabilities.items.enum).toEqual([
       "completion",
@@ -73,6 +85,31 @@ describe("tool contract", () => {
     expect(schema.properties.minPlacementEvidence.enum).toEqual(["configured", "observed"]);
     expect(schema.properties).not.toHaveProperty("upstream");
     expect(schema.properties).not.toHaveProperty("numGpu");
+  });
+
+  it("makes batch independence and the dispatch cap machine-readable", () => {
+    const schema = byName.get("run_task_batch")!.inputSchema;
+    expect(schema.properties.tasks.maxItems).toBe(64);
+    expect(schema.properties.maxParallelism.maximum).toBe(64);
+    expect(schema.properties.maxParallelism.exclusiveMinimum).toBe(0);
+    expect(byName.get("run_task_batch")!.description).toMatch(/independent:true/);
+    expect(byName.get("run_task_batch")!.description).toMatch(/maxParallelism caps dispatch/);
+  });
+
+  it("types owned output fields and exposes bounded model-list pagination", async () => {
+    expect(byName.get("doctor")!.outputSchema?.properties).toMatchObject({ summary: { type: "string" } });
+    expect(byName.get("run_task")!.outputSchema?.properties).toMatchObject({
+      selected_model: { type: "string" }, context_window_fit: { type: "string" },
+    });
+    expect(byName.get("delegate_research")!.outputSchema?.properties).toMatchObject({
+      answer: { type: "string" }, summary: { type: "string" },
+    });
+    expect(byName.get("ollama_delete")!.outputSchema?.properties).toMatchObject({ deleted: { type: "string" } });
+    expect(byName.get("ollama_manage")!.outputSchema?.properties).toMatchObject({ status: { type: "string" } });
+    const raw = await call("models", { view: "raw", limit: 1 });
+    expect(raw.isError ?? false, raw.content[0].text).toBe(false);
+    expect(raw.structuredContent.page).toMatchObject({ returned: expect.any(Number), total: expect.any(Number) });
+    expect((raw.structuredContent.models ?? []).length).toBeLessThanOrEqual(1);
   });
 
   it("rejects view- and action-specific fields before silently ignoring them", async () => {
@@ -95,6 +132,14 @@ describe("tool contract", () => {
     });
     expect(stopTimeout.isError).toBe(true);
     expect(stopTimeout.content[0].text).toMatch(/valid only for action "pull"/);
+
+    const createWithId = await call("session", { action: "create", sessionId: "00000000-0000-4000-8000-000000000000" });
+    expect(createWithId.isError).toBe(true);
+    expect(createWithId.content[0].text).toMatch(/only valid for action: delete/);
+
+    const deleteWithoutId = await call("session", { action: "delete" });
+    expect(deleteWithoutId.isError).toBe(true);
+    expect(deleteWithoutId.content[0].text).toMatch(/requires sessionId/);
   });
 
   it("rejects incompatible run_task payloads before calling serve", async () => {
@@ -112,7 +157,6 @@ describe("tool contract", () => {
 
     const invalidLogprobs = await call("run_task", {
       task: "completion",
-      preview: true,
       topLogprobs: 2,
     });
     expect(invalidLogprobs.isError).toBe(true);
@@ -125,6 +169,34 @@ describe("tool contract", () => {
     });
     expect(implicitVisionModel.isError).toBe(true);
     expect(implicitVisionModel.content[0].text).toMatch(/explicit tested vision-capable `model`/);
+  });
+
+  it("rejects execution-only fields in preview mode instead of silently ignoring them", async () => {
+    const executionFields: Record<string, unknown>[] = [
+      { prompt: "do not execute" },
+      { messages: [{ role: "user", content: "do not execute" }] },
+      { input: "do not embed" },
+      { images: ["aW1hZ2U="] },
+      { tools: [{ type: "function", function: { name: "noop" } }] },
+      { keepAlive: "0" },
+      { format: "json" },
+      { think: false },
+      { options: { temperature: 0 } },
+      { logprobs: true },
+      { topLogprobs: 2, logprobs: true },
+      { returnEmbeddings: true },
+    ];
+
+    for (const fields of executionFields) {
+      const result = await call("run_task", {
+        task: "completion",
+        objective: "fastest",
+        preview: true,
+        ...fields,
+      });
+      expect(result.isError, JSON.stringify(fields)).toBe(true);
+      expect(result.content[0].text).toMatch(/preview:true.*routing fields only/i);
+    }
   });
 
   it("exposes lossless agent history and advanced non-routing Ollama controls", () => {
@@ -160,13 +232,16 @@ describe("tool contract", () => {
     expect(byName.get("ollama_delete")!.description).toMatch(/DESTRUCTIVE AND IRREVERSIBLE/);
   });
 
-  it("advertises no output schemas (removed on purpose — they cost every request)", () => {
+  it("advertises a permissive object output boundary for every tool", () => {
     for (const tool of tools) {
-      expect(tool.outputSchema, `${tool.name}: outputSchema is back`).toBeUndefined();
+      expect(tool.outputSchema, `${tool.name}: missing outputSchema`).toMatchObject({
+        type: "object",
+        additionalProperties: true,
+      });
     }
   });
 
-  it("returns structuredContent whose text half is the same object (doctor)", async () => {
+  it("returns canonical structuredContent with a compact doctor text cue", async () => {
     const result = await call("doctor");
     expect(result.isError ?? false).toBe(false);
     expect(result.structuredContent).toBeTruthy();
@@ -175,11 +250,12 @@ describe("tool contract", () => {
       // doctor absorbed `machine`; with serve up it must carry a real profile, not the null branch.
       expect(result.structuredContent.machine?.memory_bytes).toBeTruthy();
     }
-    expect(JSON.parse(result.content[0].text)).toEqual(result.structuredContent);
+    expect(result.content[0].text).toMatch(/Ollama .*resident model/);
+    expect(result.content[0].text.length).toBeLessThan(500);
   });
 
   it.runIf(!serveUp)("serve down: doctor keeps local host evidence, run_task errors cleanly", async () => {
-    const doctor = await call("doctor");
+    const doctor = await call("doctor", { view: "full" });
     expect(doctor.isError ?? false).toBe(false);
     expect(doctor.structuredContent.machine?.memory_bytes).toBeGreaterThan(0);
     expect(doctor.structuredContent.machine_unavailable).toBeUndefined();
@@ -190,7 +266,7 @@ describe("tool contract", () => {
     expect(route.structuredContent).toBeUndefined();
   });
 
-  it.runIf(serveUp)("serve up: every serve-backed result keeps both halves in agreement", async () => {
+  it.runIf(serveUp)("serve up: every serve-backed result keeps canonical structured content", async () => {
     const health = await fetch(`${SERVE_ENDPOINT}/_freellama/v1/health`, {
       headers: serveAuthHeaders(),
     }).then((r) => r.json());
@@ -214,7 +290,8 @@ describe("tool contract", () => {
       const result = await call(name, args);
       expect(result.isError ?? false, `${name} ${JSON.stringify(args)}: ${result.content?.[0]?.text}`).toBe(false);
       expect(result.structuredContent).toBeTruthy();
-      expect(JSON.parse(result.content[0].text)).toEqual(result.structuredContent);
+      expect(result.content[0].text).toMatch(/Structured result available|Ollama/);
+      expect(result.content[0].text.length).toBeLessThan(500);
       if (name === "run_task") {
         expect(result.structuredContent.execution?.placement).toMatch(/^(cpu|gpu)$/);
         expect(result.structuredContent.execution?.preference).toBe("auto");
@@ -241,7 +318,8 @@ describe("tool contract", () => {
     expect(embed.structuredContent.response.embeddings).toBeUndefined();
     expect(withheld.count).toBe(1);
     expect(typeof withheld.dimensions).toBe("number");
-    expect(embed.structuredContent.route?.hardware_fit).toBe("strong");
+    expect(embed.structuredContent.route?.context_window_fit).toBe("fits_advertised_window");
+    expect(embed.structuredContent.route?.hardware_fit).toBe("context_window_only");
 
     const full = await call("run_task", {
       task: "embedding",
@@ -253,7 +331,7 @@ describe("tool contract", () => {
     });
     expect(full.isError ?? false).toBe(false);
     expect(full.structuredContent.response.embeddings).toHaveLength(1);
-    expect(full.content[0].text.length).toBeGreaterThan(embed.content[0].text.length);
+    expect(JSON.stringify(full.structuredContent).length).toBeGreaterThan(JSON.stringify(embed.structuredContent).length);
   });
 
   it("models{view:detail} withholds license/modelfile blobs unless includeVerbose", async () => {
@@ -269,10 +347,10 @@ describe("tool contract", () => {
 
     const verbose = await call("models", { view: "detail", model: someModel, includeVerbose: true });
     expect(verbose.isError ?? false).toBe(false);
-    expect(verbose.content[0].text.length).toBeGreaterThan(lean.content[0].text.length);
+    expect(JSON.stringify(verbose.structuredContent).length).toBeGreaterThan(JSON.stringify(lean.structuredContent).length);
   });
 
-  it("models{view:resident} derives placement; detail without model errors with guidance", async () => {
+  it.runIf(serveUp)("models{view:resident} derives placement; detail without model errors with guidance", async () => {
     const resident = await call("models", { view: "resident" });
     expect(resident.isError ?? false).toBe(false);
     for (const model of resident.structuredContent.models ?? []) {
@@ -291,9 +369,21 @@ describe("tool contract", () => {
     expect(noModel.content[0].text).toMatch(/needs `model`/);
   });
 
-  it("doctor reports the memory-governing env vars with effective defaults", async () => {
-    const doctor = await call("doctor");
-    const envConfig = doctor.structuredContent.ollama_env_config;
+  it("doctor reports core Ollama controls with effective defaults", async () => {
+    const doctor = await call("doctor", { view: "full" });
+    const envConfig = doctor.structuredContent.ollama_config.categories.memory_scheduler;
+    const categorized = doctor.structuredContent.ollama_config;
+    expect(categorized.visibility_note).toMatch(/separately launched Ollama service|remote endpoint/);
+    expect(Object.keys(categorized.categories).sort()).toEqual([
+      "backend_device",
+      "memory_scheduler",
+      "network_security",
+      "operations",
+      "privacy",
+      "storage_lifecycle",
+    ]);
+    expect(doctor.structuredContent.ollama_env_config).toBeUndefined();
+    expect(categorized.categories.memory_scheduler).toEqual(envConfig);
     for (const key of [
       "OLLAMA_MAX_LOADED_MODELS",
       "OLLAMA_CONTEXT_LENGTH",
@@ -365,7 +455,7 @@ describe("tool contract", () => {
     const surfaceTokens = Math.round(
       (JSON.stringify(tools).length + (client.getInstructions() ?? "").length) / 4,
     );
-    expect(surfaceTokens, `schema surface grew to ~${surfaceTokens} tokens`).toBeLessThan(3200);
+    expect(surfaceTokens, `schema surface grew to ~${surfaceTokens} tokens`).toBeLessThan(4500);
   });
 
   it("models{view:library} defaults to popular, flags cloud, cross-references installed", async () => {

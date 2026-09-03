@@ -3,10 +3,13 @@ param(
   [string]$BinDir = "$env:LOCALAPPDATA\FreeLlama\bin"
 )
 $ErrorActionPreference = "Stop"
-if ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture -ne "X64") {
-  throw "The published Windows package currently supports x64 only."
+$architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
+switch ($architecture.ToString()) {
+  "X64" { $target = "win32-x64-msvc" }
+  "Arm64" { $target = "win32-arm64-msvc" }
+  default { throw "Unsupported Windows architecture: $architecture" }
 }
-$asset = "freellama-win32-x64.exe"
+$asset = "freellama-$target.exe"
 $base = "https://github.com/bgauryy/FreeLlama/releases/download/$Version"
 $temporary = Join-Path ([System.IO.Path]::GetTempPath()) ("freellama-" + [guid]::NewGuid())
 New-Item -ItemType Directory -Path $temporary | Out-Null

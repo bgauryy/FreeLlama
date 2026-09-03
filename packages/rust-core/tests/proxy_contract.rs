@@ -127,6 +127,46 @@ async fn proxy_does_not_retry_upstream_503() {
     );
 }
 
+/// Only the documented transient status allowlist is retryable. A generic server error such as
+/// 501 is usually permanent for this request and must not be multiplied three times.
+#[tokio::test]
+async fn proxy_does_not_retry_an_unlisted_5xx_status() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = calls.clone();
+    let router = Router::new().fallback(any(move |State(()): State<()>| {
+        let counter = counter.clone();
+        async move {
+            counter.fetch_add(1, Ordering::SeqCst);
+            (StatusCode::NOT_IMPLEMENTED, "unsupported").into_response()
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let proxy = app(ProxyConfig::new(
+        "127.0.0.1:0",
+        format!("http://{addr}"),
+        false,
+    ))
+    .unwrap();
+
+    let response = proxy
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/chat")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
 /// Spawns an upstream that accepts the connection but never responds (holds it open past
 /// `hang_for`), to exercise the proxy's per-request timeout independent of retry logic.
 async fn spawn_hanging_upstream(hang_for: std::time::Duration) -> String {

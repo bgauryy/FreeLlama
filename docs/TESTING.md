@@ -5,7 +5,8 @@ tier during development, then run the full matrix before release.
 
 ```mermaid
 flowchart LR
-    U["Unit and Rust contracts"] --> T["Type check, format, and Clippy"]
+    U["Unit and Rust contracts"] --> A["Local-agent context<br/>and action contracts"]
+    A --> T["Type check, format, and Clippy"]
     T --> I["MCP integration against live Ollama"]
     I --> E["End-to-end tools against serve and Ollama"]
     E --> L["Optional live CPU/GPU workload evaluation"]
@@ -18,9 +19,10 @@ yarn install
 yarn build
 ```
 
-The root build compiles the Rust release binary, NAPI addon, single-file MCP JavaScript bundle, and
-vendored CLI binary. The native `.node` addon remains external to the JavaScript bundle because it
-must be loaded by platform triple at runtime.
+The root build compiles the host Rust release binary, NAPI addon, and single-file MCP JavaScript
+bundle. The native `.node` addon remains external to the JavaScript bundle because it is selected
+by platform triple at runtime. Published packages resolve it from an OS/CPU/libc-specific optional
+dependency rather than compiling Rust during installation.
 
 ## Run the test tiers
 
@@ -29,10 +31,12 @@ must be loaded by platform triple at runtime.
 | JavaScript unit | `yarn test` | None |
 | JavaScript watch | `yarn test:watch` | None |
 | Rust contracts | `yarn test:rust` | Rust toolchain |
+| Local-agent contracts | `yarn test:agents` | Python 3 standard library |
 | TypeScript | `yarn typecheck` | None after install |
 | MCP integration | `yarn test:integration` | Ollama on `127.0.0.1:11434` |
 | MCP end to end | `yarn test:e2e` | Ollama, `freellama serve`, and required models |
 | All configured tiers | `yarn test:all` | Requirements of every included tier |
+| Production verification | `yarn verify:production` | Build, formatting, strict Clippy, all test tiers, and package verification |
 
 The end-to-end suite checks behavior rather than schema shape: confidence refusal happens before
 generation, embedding vectors are withheld by default, impossible models are excluded by memory,
@@ -42,21 +46,24 @@ specific unavailable model report a skip reason.
 ## Run static Rust checks
 
 ```bash
-cargo fmt --all -- --check
+cargo fmt --all --check
 cargo clippy --all-targets -- -D warnings
 ```
 
-The Rust edge-case suite includes ignored regression pins for previously confirmed routing bugs.
-Run ignored tests explicitly when repairing one of those contracts:
+Routing regressions run in the default Rust suite; none are hidden behind `#[ignore]`. Add a
+focused contract test for each repaired behavior and keep it enabled in ordinary release checks.
+The local-agent tier runs all context fitting, compaction, pagination, repeat-suppression, and
+strict action-shape contracts. It is included in `yarn test:all`, so adapter regressions cannot be
+missed by the root release matrix.
 
-```bash
-cargo test -- --ignored
-```
+`yarn test:all` does not run formatting, Clippy, a release build, or package inspection. Use
+`yarn verify:production` for the complete local promotion gate.
 
-GitHub Actions runs the Rust and JavaScript/native lanes on macOS, Linux, and Windows. The machine
-profile contract test requires a positive CPU count, host-memory value, and free-disk value on each
-runner; it reports unified memory only on Apple-silicon macOS. This catches an OS branch that
-compiles but returns no usable capacity to recommendations.
+Before claiming platform support, run the deterministic Rust and JavaScript/native lanes from a
+clean checkout on macOS, Linux, and Windows. The machine profile contract test requires a positive
+CPU count, host-memory value, and free-disk value on each machine; it reports unified memory only
+on Apple-silicon macOS. This catches an OS branch that compiles but returns no usable capacity to
+recommendations. Record the commands, toolchain versions, commit, and results with the release.
 
 `platform_contract` also pins the resource-control loop: a CPU preference is honored only for an
 operator-assigned eligible model, an explicit model overrides that hint and reports the fallback,
@@ -87,27 +94,31 @@ Qwen, one embedding from Nomic, positive Qwen VRAM, zero Nomic VRAM, and primary
 through raw passthrough.
 
 For promotion, use the portable [hardware acceptance runner](../benchmark/hardware/README.md) and
-upload its JSON receipt through the manual hardware workflow. Compile-only CI does not validate a
-driver, physical placement, shared-memory contention, or OCR quality.
+archive its JSON receipt with the release evidence. Compilation alone does not validate a driver,
+physical placement, shared-memory contention, or OCR quality.
 
 ## Verify release packages
 
 ```bash
-node scripts/verify-release-packages.mjs
+# Collect each target's `freellama` executable and `freellama.<target>.node`
+# under release-artifacts/<target>/, then stage all eight platform packages.
+yarn release:assemble release-artifacts release
+yarn release:verify:publish
 ```
 
-Tag releases build five CLI/native targets, assemble checksums and universal npm packages, run the
-full deterministic suite, and publish only when npm credentials are configured. A successful local
-pack dry run proves package contents; it does not prove registry publication or another hardware
-class.
+Build every claimed CLI/native target in a clean environment, assemble `SHA256SUMS`, run the full
+deterministic suite, and inspect every platform package dry run before publishing explicitly.
+Publish the eight `@octocodeai/freellama-native-*` packages before `@octocodeai/freellama` and `@octocodeai/freellama-mcp-server`, all
+at the exact same version. A successful local pack dry run proves package contents; it does not
+prove registry publication or another hardware class.
 
 ## Test one layer while iterating
 
 ```bash
 yarn build:native
-yarn workspace freellama-mcp-server build
-yarn workspace freellama-mcp-server test
-yarn workspace freellama test
+yarn workspace @octocodeai/freellama-mcp-server build
+yarn workspace @octocodeai/freellama-mcp-server test
+yarn workspace @octocodeai/freellama test
 ```
 
 The MCP integration and end-to-end setup rebuilds its bundle. The CLI package tests its launcher and

@@ -19,6 +19,7 @@ use axum::{
 };
 use reqwest::{Client, Url};
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::Semaphore;
 
 /// Total attempts (first try + retries) for a request that hits a transient upstream failure.
 /// Matches the general-purpose default cited across retry-policy guidance for slow (LLM-scale,
@@ -113,6 +114,9 @@ pub struct ProxyConfig {
     /// connection-refused error (the process is gone, not just slow or erroring). Off by
     /// default — never restart a system process a caller didn't explicitly ask for.
     pub auto_restart_ollama: bool,
+    /// Optional byte-preserving proxy inflight cap. Unlike managed admission this cannot infer
+    /// task cost or CPU/GPU placement, so it is intentionally an immediate generic refusal.
+    pub max_concurrent_requests: Option<usize>,
     restart_action: RestartAction,
 }
 
@@ -125,6 +129,7 @@ impl ProxyConfig {
             allow_remote,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             auto_restart_ollama: false,
+            max_concurrent_requests: None,
             restart_action: Arc::new(default_restart_ollama),
         }
     }
@@ -141,6 +146,14 @@ impl ProxyConfig {
     #[must_use]
     pub fn with_auto_restart_ollama(mut self, enabled: bool) -> Self {
         self.auto_restart_ollama = enabled;
+        self
+    }
+
+    /// Bound simultaneous raw compatibility requests. Off by default to preserve existing proxy
+    /// semantics; managed `/tasks` should be preferred for weighted CPU/GPU admission.
+    #[must_use]
+    pub fn with_max_concurrent_requests(mut self, max: usize) -> Self {
+        self.max_concurrent_requests = Some(max.max(1));
         self
     }
 
@@ -198,6 +211,7 @@ struct ProxyState {
     auto_restart_ollama: bool,
     restart_action: RestartAction,
     last_restart_attempt: Arc<AsyncMutex<Option<Instant>>>,
+    admission: Option<Arc<Semaphore>>,
 }
 
 /// Resolve an incoming Ollama path against the configured upstream.
@@ -247,6 +261,9 @@ pub fn app(config: ProxyConfig) -> Result<Router> {
         auto_restart_ollama: config.auto_restart_ollama,
         restart_action: config.restart_action,
         last_restart_attempt: Arc::new(AsyncMutex::new(None)),
+        admission: config
+            .max_concurrent_requests
+            .map(|max| Arc::new(Semaphore::new(max))),
     };
     Ok(Router::new().fallback(any(forward)).with_state(state))
 }
@@ -256,9 +273,26 @@ async fn shutdown() {
 }
 
 async fn forward(State(state): State<ProxyState>, request: Request) -> impl IntoResponse {
+    let permit = match state.admission.as_ref().map(Arc::clone) {
+        Some(admission) => match admission.try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                return Response::builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"error":"proxy busy: raw request limit reached; use managed /_freellama/v1/tasks for weighted admission"}"#))
+                    .expect("static response is valid");
+            }
+        },
+        None => None,
+    };
     match forward_inner(&state, request).await {
-        Ok(response) => response,
+        Ok(response) => {
+            drop(permit);
+            response
+        }
         Err(error) => {
+            drop(permit);
             eprintln!("proxy error: {error:#}");
             Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
@@ -272,7 +306,10 @@ async fn forward(State(state): State<ProxyState>, request: Request) -> impl Into
 /// Retry 500/502/504 (load-model blips) but not 503 busy. Shared with managed `/tasks` so a
 /// request through the proxy cannot amplify saturation the admission semaphore is shedding.
 pub(crate) fn retryable_upstream_status(status: StatusCode) -> bool {
-    status.is_server_error() && status != StatusCode::SERVICE_UNAVAILABLE
+    matches!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR | StatusCode::BAD_GATEWAY | StatusCode::GATEWAY_TIMEOUT
+    )
 }
 
 /// Send the request, retrying transient failures (500/502/504 and connection errors) with exponential

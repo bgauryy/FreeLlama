@@ -5,7 +5,7 @@ whether that route exists at all.
 
 Both bind `127.0.0.1:11435` by default — pick one, not both; the second fails to bind.
 
-| | `npx freellama proxy` | `npx freellama serve` |
+| | `npx @octocodeai/freellama proxy` | `npx @octocodeai/freellama serve` |
 |---|---|---|
 | Ollama passthrough (`/api/*`) | Yes, with retry/backoff/timeout | Yes, same code path — it composes `proxy::app()` as its fallback |
 | `/_freellama/v1/{health,machine,models,recommendations,routes,natural-routes,sessions,tasks}` | No — 404 | Yes |
@@ -31,8 +31,8 @@ agents receive the same routing, admission, placement observation, and feedback 
 ## Start either one
 
 ```bash
-npx freellama proxy                                   # passthrough + retry only
-npx freellama serve --policy-file platform.toml \
+npx @octocodeai/freellama proxy                                   # passthrough + retry only
+npx @octocodeai/freellama serve --policy-file platform.toml \
                     --benchmark-report bench-all.json # add these to make minConfidence "medium" reachable
 ```
 
@@ -42,7 +42,7 @@ catalog discovery, residency, and tasks for that exact tag use the CPU backend. 
 passthrough still uses the primary `--upstream`; `proxy` has no model-aware routing layer.
 
 In a checkout the npm launcher runs `target/release/freellama` if it is there, so
-`cargo build --release` then `npx freellama …` works unpacked.
+`cargo build --release` then `npx @octocodeai/freellama …` works unpacked.
 
 ## Retry coverage — both paths, one schedule
 

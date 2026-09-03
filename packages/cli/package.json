@@ -1,6 +1,6 @@
 {
-  "name": "freellama",
-  "version": "0.2.0",
+  "name": "@octocodeai/freellama",
+  "version": "0.1.0",
   "description": "Local Ollama model gateway, router, and benchmarker — CLI. Wraps the compiled Rust binary from packages/rust-core.",
   "repository": {
     "type": "git",
@@ -9,25 +9,38 @@
   },
   "homepage": "https://github.com/bgauryy/FreeLlama#readme",
   "bugs": "https://github.com/bgauryy/FreeLlama/issues",
-  "keywords": ["ollama", "local-llm", "gateway", "coding-agent"],
+  "keywords": [
+    "ollama",
+    "local-llm",
+    "gateway",
+    "coding-agent"
+  ],
   "type": "module",
   "bin": "bin/freellama.mjs",
   "files": [
     "bin",
-    "vendor",
     "README.md"
   ],
   "engines": {
     "node": ">=20.0.0"
   },
   "scripts": {
-    "build": "node scripts/vendor-binary.mjs",
-    "prepack": "node scripts/vendor-binary.mjs",
+    "build": "node -e \"process.stdout.write('freellama CLI launcher ready\\n')\"",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest"
   },
   "license": "Apache-2.0 OR MIT",
+  "optionalDependencies": {
+    "@octocodeai/freellama-native-darwin-arm64": "0.1.0",
+    "@octocodeai/freellama-native-darwin-x64": "0.1.0",
+    "@octocodeai/freellama-native-linux-arm64-gnu": "0.1.0",
+    "@octocodeai/freellama-native-linux-arm64-musl": "0.1.0",
+    "@octocodeai/freellama-native-linux-x64-gnu": "0.1.0",
+    "@octocodeai/freellama-native-linux-x64-musl": "0.1.0",
+    "@octocodeai/freellama-native-win32-arm64-msvc": "0.1.0",
+    "@octocodeai/freellama-native-win32-x64-msvc": "0.1.0"
+  },
   "publishConfig": {
     "access": "public",
     "registry": "https://registry.npmjs.org/",

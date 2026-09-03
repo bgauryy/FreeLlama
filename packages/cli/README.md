@@ -1,6 +1,6 @@
 # `freellama` CLI package
 
-This package is prepared to publish the `freellama` command through npm. Version 0.2.0 is not
+This package is prepared to publish the `freellama` command through npm. Version 0.1.0 is not
 published to a registry. In a checkout after `yarn install`, `npx` resolves the workspace package;
 otherwise, use the release binary built at `target/release/freellama`. The JavaScript launcher
 locates the compiled Rust binary and hands the current process to it. Routing and execution logic
@@ -8,8 +8,8 @@ remain in [`freellama-core`](../rust-core/README.md).
 
 ```mermaid
 flowchart LR
-    N["npx freellama …"] --> J["Node launcher"]
-    J -->|"published package"| V["vendor/platform/freellama"]
+    N["npx @octocodeai/freellama …"] --> J["Node launcher"]
+    J -->|"optional platform package"| V["@octocodeai/freellama-native-<target>/freellama"]
     J -->|"repository checkout"| T["target/release/freellama"]
     V --> R["Rust CLI"]
     T --> R
@@ -19,23 +19,24 @@ flowchart LR
 ## Run it
 
 ```bash
-npx freellama doctor
-npx freellama auth-token --out ~/.local/share/freellama/auth.token
-npx freellama serve \
+npx @octocodeai/freellama doctor
+npx @octocodeai/freellama auth-token --out ~/.local/share/freellama/auth.token
+npx @octocodeai/freellama serve \
   --recommendation-catalog recommendations.example.toml \
   --auth-token-file ~/.local/share/freellama/auth.token \
   --feedback-file ~/.local/share/freellama/feedback.json
 ```
 
 `doctor` works without the control plane. It reports Ollama reachability, CLI/server version drift,
-portable host hardware and disk discovery, and effective memory-related settings. `memory_bytes`
+portable host hardware and disk discovery, effective settings, a non-mutating
+`local_conservative_config_posture`, and source/permission-aware runtime signals. `memory_bytes`
 is total host RAM; `unified_memory_bytes` is present only when the memory is known to be shared with
 the accelerator. In another terminal, inspect or execute:
 
 ```bash
-npx freellama models
-npx freellama route --task coding --objective fastest
-npx freellama task --task completion --objective fastest "Reply with exactly OK."
+npx @octocodeai/freellama models
+npx @octocodeai/freellama route --task coding --objective fastest
+npx @octocodeai/freellama task --task completion --objective fastest "Reply with exactly OK."
 ```
 
 Read the repository [CLI reference](../../docs/CLI.md) for the complete command map, task kinds, routing
@@ -46,7 +47,7 @@ confidence, policy generation, and admission controls.
 `serve` can assign exact models to a second loopback Ollama process:
 
 ```bash
-npx freellama serve \
+npx @octocodeai/freellama serve \
   --upstream http://127.0.0.1:11434 \
   --cpu-upstream http://127.0.0.1:11436 \
   --cpu-model nomic-embed-text:latest
@@ -75,7 +76,7 @@ runs. See the [production runbook](../../docs/PRODUCTION.md).
 
 ## Build the launcher and binary
 
-Run `npx freellama init` for a side-effect-free first-run receipt: it checks Ollama, inventories
+Run `npx @octocodeai/freellama init` for a side-effect-free first-run receipt: it checks Ollama, inventories
 installed tags, inspects serve health, and prints the next steps without downloading anything.
 
 From the repository root:
@@ -85,17 +86,19 @@ yarn install
 yarn build
 ```
 
-`yarn build` compiles the Rust release binary and copies it to
-`packages/cli/vendor/<platform>/freellama`. In a checkout, the launcher also recognizes
-`target/release/freellama`, which supports development without packing the npm package.
+`yarn build` compiles the host Rust release binary. In a checkout, the launcher uses
+`target/release/freellama`. Published installs resolve a matching optional platform package, such
+as `@octocodeai/freellama-native-linux-x64-gnu`; no Rust toolchain is needed by the consumer.
 
-On an unsupported platform, the launcher reports every path it checked and tells the operator to
-run `cargo build --release`. Node.js 20 or newer is required.
+Supported prebuilt targets are macOS arm64/x64, Linux arm64/x64 on glibc or musl, and Windows
+arm64/x64. On an unsupported platform or an install made with `--omit=optional`, the launcher
+reports the attempted packages and tells the operator to run `cargo build --release`. Node.js 20
+or newer is required.
 
 ## Test packaging behavior
 
 ```bash
-yarn workspace freellama test
+yarn workspace @octocodeai/freellama test
 ```
 
 The launcher tests cover binary selection, argument and signal forwarding, unsupported-platform
@@ -105,9 +108,14 @@ errors, and the files included in the package. Core CLI contracts live in
 ## Understand CLI and MCP differences
 
 ```bash
-npx freellama tools
+npx @octocodeai/freellama tools
 ```
 
 The output is contract-tested against the MCP server source. `delegate_research` and the online
 model-library view are MCP-only. Control-plane startup, proxy startup, sessions, recommendation,
 benchmarks, policy generation, and frozen-suite comparison are CLI-only.
+
+Use the surfaces together: the CLI starts and verifies the local services; MCP lets an agent inspect
+that state and submit bounded work. An installed MCP client can read `freellama://docs/index` and
+fetch one packaged guide on demand. The CLI package links the checkout documentation; the MCP
+package bundles the root `docs/` set for installed agent clients.

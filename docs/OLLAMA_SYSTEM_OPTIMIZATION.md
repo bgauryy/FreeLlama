@@ -66,8 +66,28 @@ Across supported backends, Ollama provides the following behavior without FreeLl
 Ollama's documented concurrency controls are global server settings. Increasing
 `OLLAMA_NUM_PARALLEL` multiplies context memory by the parallel-request count.
 Increasing `OLLAMA_MAX_LOADED_MODELS` does not create memory; models still need
-to fit. Leave both at their defaults until a concurrent workload benchmark
-shows that a change improves completed tasks per hour without memory pressure.
+to fit. Use `1` for both values on an unmeasured deployment, then increase one variable at a time
+only when a representative concurrent benchmark improves completed tasks per hour without memory
+pressure.
+
+Keep three signals distinct when operating FreeLlama: `context_window_fit` only compares requested
+context with advertised model context; FreeLlama's K/V preflight is a conservative metadata lower
+bound; and a completed runner is the only placement observation. None is live free-memory or
+throughput proof. `doctor {view:"scheduler"}` reports configuration and a point-in-time admission
+snapshot, not a fairness or parallel-decoding benchmark.
+
+FreeLlama's admission queue and Ollama's internal queue solve different problems. FreeLlama limits
+weighted managed work per backend and applies `--max-queue-wait-seconds`; `OLLAMA_MAX_QUEUE` bounds
+requests that an Ollama process has accepted but cannot schedule. Raw compatibility traffic skips
+FreeLlama admission and reaches the primary Ollama queue directly.
+
+Ollama request context and research-adapter context are also separate budgets. Managed tasks set
+request-specific `num_ctx` from the selected task profile. The coding adapters fit their tool
+conversation inside `FREELLAMA_AGENT_NUM_CTX`: by default, they preserve the system prompt and
+original question, compact the oldest observations first, retain recent evidence, and fail before
+the Ollama call if pinned content cannot fit. Raising the Ollama server's global context does not
+disable adapter compaction or increase its configured budget. See [Agent adapters](../AGENTS.md)
+for the complete pagination and compaction contract.
 
 ## Current Mac audit
 
@@ -86,7 +106,7 @@ evidence, not a portable default.
 | Keep-alive | 5 minutes | Ollama default |
 | Loaded-model limit | `OLLAMA_MAX_LOADED_MODELS=2` | Explicit service configuration for the measured topology |
 | K/V-cache type | `OLLAMA_KV_CACHE_TYPE=q8_0` | Explicit memory-saving configuration; requalify quality per important model |
-| Flash Attention | `OLLAMA_FLASH_ATTENTION=1` | Explicitly enabled; required for quantized K/V cache |
+| Flash Attention | `auto` | Ollama enables it automatically on supported backends; force `1` only after a measured compatibility check. Required for quantized K/V cache. |
 | GGUF CPU threads | 10 worker threads | Ollama selected the 10 performance cores rather than all 14 cores |
 | MLX | GPU runner observed | MLX models use their own runner path, not the GGUF tuning path |
 | Power mode | Automatic on battery and AC power | High Power Mode remains an unmeasured experiment |
@@ -124,7 +144,8 @@ The active Rust implementation adds:
   managed requests;
 - guarded agent placement preferences plus a normalized, three-warm-sample, 10%-advantage feedback
   loop for `fastest` and `balanced` work;
-- independent weighted GPU and CPU admission pools, so a GPU burst cannot starve a CPU helper;
+- independent 3:2:1 priority-fair weighted GPU and CPU admission pools, so a GPU burst cannot
+  starve a CPU helper or indefinitely starve background managed work;
 - prompt-free load, prompt-processing, and output-generation metrics derived
   from Ollama's response fields;
 - a local natural-language intent interpreter that cannot choose a model;
@@ -143,7 +164,9 @@ than an inference-speed claim.
 
 FreeLlama does not provide:
 
-- memory-pressure admission or a minimum-free-memory guard;
+- a live minimum-free-VRAM guard. FreeLlama does calculate a metadata-backed F16 K/V lower bound
+  and refuses a known impossible CPU/unified-memory floor, but Ollama remains the authority for
+  current free memory, runner graph allocation, and final loading;
 - transition coordination for native passthrough requests or processes that
   bypass the managed `tasks` endpoint;
 - live thermal, power-mode, or swap-aware routing;
@@ -165,12 +188,16 @@ Use this table before changing Ollama or FreeLlama:
 
 | Candidate change | Default decision | Reason |
 |---|---|---|
+| Expose Ollama beyond loopback | Do not add | Keep `OLLAMA_HOST` on loopback and put authenticated TLS ingress in front of FreeLlama instead |
+| Permit Ollama cloud features in a local-only deployment | Do not add | Set `OLLAMA_NO_CLOUD=1` when the deployment promises local-only operation |
 | Force layers of one model between CPU and GPU | Do not add | Ollama already fits and offloads the model; partial CPU fallback usually reduces decode throughput |
 | Assign different models to isolated CPU and GPU-capable processes | Supported, benchmark per workload | Process isolation is reliable, but CPU speed and shared-memory pressure still determine whether overlap helps |
 | Add macOS kernel or `sysctl` tuning | Do not add | Ollama does not document a supported, product-specific kernel setting. Unified-memory behavior belongs to macOS and Metal |
 | Run Ollama in Docker on macOS | Do not use for performance | Docker Desktop does not provide Ollama GPU acceleration on macOS |
 | Increase context globally | Do not add | Context memory grows with length; set the smallest sufficient `num_ctx` per request |
 | Set parallel requests above 1 | Benchmark first | It can improve concurrent throughput but multiplies context memory and can hurt interactive latency |
+| Keep more than one model loaded per process | Benchmark first | Model weights, runtime buffers, and every active context must fit together; start with `OLLAMA_MAX_LOADED_MODELS=1` |
+| Leave Ollama's queue without a deployment limit | Do not add | Set a measured `OLLAMA_MAX_QUEUE`; it remains separate from FreeLlama's admission deadline |
 | Pin multiple 18–21 GB models | Do not add by default | The observed 36 GiB Metal budget cannot safely establish that two heavy models plus contexts fit |
 | Force Flash Attention | Benchmark per engine and model | The inspected GGUF path already enabled it automatically; MLX has a different runner |
 | Use `q8_0` K/V cache | **8/10; qualify, then prefer for parallel/long-context work** | Ollama documents roughly half the KV memory of `f16` with very small precision loss; it is the practical companion to higher `OLLAMA_NUM_PARALLEL`, but it remains a process-wide quality tradeoff |
@@ -206,12 +233,13 @@ verification procedure.
    path, both versions, and effective memory-related settings.
 2. Back up the versioned prompt-free feedback snapshot with the policy and deployed binary.
    Verified warm work-unit latency and queue wait survive restart; raw prompts are never stored.
-3. Implement memory admission only after a frozen alternating-model workload
-   reproduces pressure losses. Keep Ollama as the final loading authority.
+3. Validate the metadata-backed K/V lower bound against a frozen alternating-model workload before
+   widening it beyond CPU/unified-memory impossible-floor refusal. Keep Ollama as final authority.
 4. Extend transition coordination only if managed streaming or another parsed
    execution path needs it. Native passthrough remains Ollama-owned.
-5. Evaluate request-specific context and residency profiles before testing
-   global Flash Attention, K/V cache, or concurrency changes.
+5. Evaluate request-specific context and residency profiles before testing global K/V-cache or
+   concurrency changes. Keep Flash Attention automatic on supported backends or set it explicitly
+   to `1` before selecting a quantized K/V cache.
 6. Promote a hardware-and-engine profile only after `benchmark/hardware/run_validation.py` and its
    held-out quality workload pass on a real self-hosted runner.
 

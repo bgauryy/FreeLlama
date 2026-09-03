@@ -17,6 +17,18 @@ export function doctor(endpoint?: string | undefined | null): Promise<string>;
  */
 export function machine(endpoint?: string | undefined | null): Promise<string>;
 
+/** Current managed-platform health, including admission and session bounds. */
+export function health(endpoint?: string | undefined | null): Promise<string>;
+
+/** Create a bounded, idle-expiring model-affinity handle; it stores no prompt history or KV. */
+export function createSession(endpoint?: string | undefined | null): Promise<string>;
+
+/** Release a model-affinity handle after related work has completed. */
+export function deleteSession(
+  endpoint: string | undefined | null,
+  sessionId: string,
+): Promise<void>;
+
 /**
  * Installed-model inventory with capabilities, residency, and advertised context.
  * @param endpoint FreeLlama serve endpoint, defaults to http://127.0.0.1:11435
@@ -118,6 +130,17 @@ export function runTask(
  * @param request Complete `/_freellama/v1/tasks` request object
  */
 export function runTaskRequest(
+  endpoint: string | undefined | null,
+  request: unknown,
+): Promise<string>;
+
+/**
+ * Executes explicitly independent tasks with a bounded, priority-fair dispatcher. Individual
+ * task failures are returned as result entries so unaffected sibling work is preserved.
+ * @param endpoint FreeLlama serve endpoint, defaults to http://127.0.0.1:11435
+ * @param request Complete `/_freellama/v1/task-batches` request object
+ */
+export function runTaskBatchRequest(
   endpoint: string | undefined | null,
   request: unknown,
 ): Promise<string>;
