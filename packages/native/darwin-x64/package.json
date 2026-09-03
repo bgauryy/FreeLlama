@@ -1,0 +1,30 @@
+{
+  "name": "@octocodeai/freellama-native-darwin-x64",
+  "version": "0.1.0",
+  "description": "FreeLlama native Rust artifacts for macOS Intel",
+  "license": "Apache-2.0 OR MIT",
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "main": "freellama.darwin-x64.node",
+  "files": [
+    "freellama",
+    "freellama.darwin-x64.node"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bgauryy/FreeLlama.git",
+    "directory": "packages/native/darwin-x64"
+  },
+  "scripts": {
+    "build": "node -e \"\"",
+    "typecheck": "node -e \"\""
+  }
+}

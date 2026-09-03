@@ -28,3 +28,4 @@ const js = readFileSync(outfile, "utf8").replace(/^(?:#!.*\n)+/, "");
 writeFileSync(outfile, `#!/usr/bin/env node\n${js}`);
 chmodSync(outfile, 0o755);
 await import("./bundle-adapters.mjs");
+await import("./bundle-docs.mjs");

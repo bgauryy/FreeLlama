@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 const PKG = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const LAUNCHER = path.join(PKG, "bin", "freellama.mjs");
+const LAUNCHER = path.join(PKG, "bin", "freellama.js");
 const RELEASE_BINARY = path.join(PKG, "..", "..", "target", "release", "freellama");
 
 describe("freellama launcher", () => {
@@ -17,7 +17,7 @@ describe("freellama launcher", () => {
     // Copy the launcher somewhere with no vendor/ and no ../../target/release next to it.
     const scratch = mkdtempSync(path.join(os.tmpdir(), "freellama-launcher-"));
     mkdirSync(path.join(scratch, "bin"));
-    const orphan = path.join(scratch, "bin", "freellama.mjs");
+    const orphan = path.join(scratch, "bin", "freellama.js");
     copyFileSync(LAUNCHER, orphan);
 
     const result = spawnSync("node", [orphan, "--help"], { encoding: "utf8" });

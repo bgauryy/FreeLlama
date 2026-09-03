@@ -30,18 +30,34 @@ describe.runIf(releaseServeAvailable)("behavior: every tool against the live sys
   const call = (name: string, args: Record<string, unknown> = {}, timeout = 180_000) =>
     client.callTool({ name, arguments: args }, undefined, { timeout }) as Promise<ToolResult>;
 
-  it("doctor: 11 memory settings each with an effective default, absorbed machine profile", async () => {
-    const doctor = (await call("doctor")).structuredContent;
-    // Eleven, not nine: LLAMA_ARG_FIT and LLAMA_ARG_FIT_TARGET govern memory too, and were missed
-    // because they lack the OLLAMA_ prefix an auditor greps for.
-    const envConfig = Object.entries(doctor.ollama_env_config) as [string, any][];
-    expect(envConfig).toHaveLength(11);
-    for (const [key, value] of envConfig) {
+  it("doctor: Ollama settings have effective defaults and include memory controls", async () => {
+    const doctor = (await call("doctor", { view: "full" })).structuredContent;
+    const categorized = doctor.ollama_config;
+    const envConfig = categorized.categories.memory_scheduler;
+    expect(doctor.ollama_env_config).toBeUndefined();
+    expect(categorized.categories.network_security.OLLAMA_HOST).toBeTruthy();
+    expect(categorized.categories.privacy.OLLAMA_NO_CLOUD).toBeTruthy();
+    expect(categorized.categories.backend_device.OLLAMA_LLM_LIBRARY).toBeTruthy();
+    expect(categorized.categories.storage_lifecycle.OLLAMA_MODELS).toBeTruthy();
+    const allSettings = Object.values(categorized.categories).flatMap((category) =>
+      Object.entries(category as Record<string, any>),
+    ) as [string, any][];
+    for (const key of [
+      "OLLAMA_MAX_LOADED_MODELS",
+      "OLLAMA_NUM_PARALLEL",
+      "OLLAMA_CONTEXT_LENGTH",
+      "OLLAMA_KV_CACHE_TYPE",
+      "LLAMA_ARG_FIT",
+      "LLAMA_ARG_FIT_TARGET",
+    ]) {
+      expect(envConfig[key], `doctor does not report ${key}`).toBeTruthy();
+    }
+    for (const [key, value] of allSettings) {
       expect(typeof value.effective_default, `${key} lacks an effective_default`).toBe("string");
       expect(value.effective_default).toBeTruthy();
     }
     expect(doctor.machine?.memory_bytes).toBeTruthy();
-    const loadedModelCap = doctor.ollama_env_config.OLLAMA_MAX_LOADED_MODELS;
+    const loadedModelCap = envConfig.OLLAMA_MAX_LOADED_MODELS;
     if (loadedModelCap.value === null) {
       expect(doctor.ollama_env_config_warning ?? "").toMatch(/3 x GPU count/);
     } else {
@@ -51,12 +67,18 @@ describe.runIf(releaseServeAvailable)("behavior: every tool against the live sys
   });
 
   it("models: installed/resident/raw views succeed; detail withholds blobs and needs a model", async () => {
+    let raw: ToolResult | undefined;
     for (const view of ["installed", "resident", "raw"]) {
       const result = await call("models", { view });
       expect(result.isError ?? false, `models[${view}]: ${result.content?.[0]?.text}`).toBe(false);
       expect(result.structuredContent).toBeTruthy();
+      if (view === "raw") raw = result;
     }
-    const detail = (await call("models", { view: "detail", model: "qwen3.8:27b-mlx" })).structuredContent;
+    const installedModel = raw?.structuredContent?.models?.[0]?.name;
+    expect(installedModel, "the live E2E tier requires at least one installed model").toBeTruthy();
+    const detailResult = await call("models", { view: "detail", model: installedModel });
+    expect(detailResult.isError ?? false, detailResult.content?.[0]?.text).toBe(false);
+    const detail = detailResult.structuredContent;
     expect(detail.license).toBeUndefined();
     expect(detail.modelfile).toBeUndefined();
     expect(typeof detail.max_context_length).toBe("number");
@@ -81,16 +103,26 @@ describe.runIf(releaseServeAvailable)("behavior: every tool against the live sys
     expect(Date.now() - started).toBeLessThan(5000);
   });
 
-  it("run_task: withholds embedding vectors by default, returns them on opt-in", async () => {
-    const lean = (await call("run_task", {
+  it("run_task: withholds embedding vectors by default, returns them on opt-in", async ({ skip }) => {
+    const raw = await call("models", { view: "raw" });
+    const hasEmbeddingModel = raw.structuredContent?.models?.some(
+      (model: { name?: string }) => model.name === "nomic-embed-text:latest",
+    );
+    if (!hasEmbeddingModel) skip("nomic-embed-text:latest is not installed");
+
+    const leanResult = await call("run_task", {
       task: "embedding", model: "nomic-embed-text:latest", input: "x", keepAlive: "0",
-    })).structuredContent;
+    });
+    expect(leanResult.isError ?? false, leanResult.content?.[0]?.text).toBe(false);
+    const lean = leanResult.structuredContent;
     expect(lean.response.embeddings_omitted).toBeTruthy();
     expect(lean.response.embeddings).toBeUndefined();
 
-    const full = (await call("run_task", {
+    const fullResult = await call("run_task", {
       task: "embedding", model: "nomic-embed-text:latest", input: "x", keepAlive: "0", returnEmbeddings: true,
-    })).structuredContent;
+    });
+    expect(fullResult.isError ?? false, fullResult.content?.[0]?.text).toBe(false);
+    const full = fullResult.structuredContent;
     expect(Array.isArray(full.response.embeddings)).toBe(true);
   });
 
@@ -119,15 +151,23 @@ describe.runIf(releaseServeAvailable)("behavior: every tool against the live sys
     expect(escalated.verification.measuredBaseRate).not.toContain("undefined");
   });
 
-  it("delegate_research: grounds a real lookup and accepts it (bash adapter default)", async () => {
-    const grounded = (await call("delegate_research", {
+  it("delegate_research: grounds a real lookup and accepts it (bash adapter default)", async ({ skip }) => {
+    const raw = await call("models", { view: "raw" });
+    const hasDefaultModel = raw.structuredContent?.models?.some(
+      (model: { name?: string }) => model.name === "qwen3.8:27b-mlx",
+    );
+    if (!hasDefaultModel) skip("qwen3.8:27b-mlx is not installed");
+
+    const groundedResult = await call("delegate_research", {
       question: "In packages/rust-core/Cargo.toml, what optional feature enables the Node addon?",
       workspacePath: REPO_ROOT,
       agent: {
         contextTokens: 8192,
         context: { charsPerToken: 3.5, observationPageChars: 2048, pinnedOverflow: "error" },
       },
-    }, 300_000)).structuredContent;
+    }, 300_000);
+    expect(groundedResult.isError ?? false, groundedResult.content?.[0]?.text).toBe(false);
+    const grounded = groundedResult.structuredContent;
     expect(grounded.answer).toMatch(/napi/i);
     expect(grounded.verification.recommendation).toBe("accept");
     expect(grounded.adapter).toBe("bash");

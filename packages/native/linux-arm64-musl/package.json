@@ -1,0 +1,33 @@
+{
+  "name": "@octocodeai/freellama-native-linux-arm64-musl",
+  "version": "0.1.0",
+  "description": "FreeLlama native Rust artifacts for Linux ARM64 (musl)",
+  "license": "Apache-2.0 OR MIT",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "libc": [
+    "musl"
+  ],
+  "main": "freellama.linux-arm64-musl.node",
+  "files": [
+    "freellama",
+    "freellama.linux-arm64-musl.node"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bgauryy/FreeLlama.git",
+    "directory": "packages/native/linux-arm64-musl"
+  },
+  "scripts": {
+    "build": "node -e \"\"",
+    "typecheck": "node -e \"\""
+  }
+}

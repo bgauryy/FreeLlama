@@ -54,16 +54,19 @@ needs model-aware CPU placement must use the managed task endpoint instead.
 
 ## Start the backends
 
-Start the primary Ollama process on its default endpoint:
+Start the primary Ollama process with a conservative local-only baseline:
 
 ```bash
-ollama serve
+OLLAMA_HOST=127.0.0.1:11434 OLLAMA_NO_CLOUD=1 \
+    OLLAMA_MAX_LOADED_MODELS=1 OLLAMA_NUM_PARALLEL=1 ollama serve
 ```
 
 Start a second process on another loopback port:
 
 ```bash
-OLLAMA_HOST=127.0.0.1:11436 OLLAMA_LLM_LIBRARY=cpu ollama serve
+OLLAMA_HOST=127.0.0.1:11436 OLLAMA_NO_CLOUD=1 \
+    OLLAMA_MAX_LOADED_MODELS=1 OLLAMA_NUM_PARALLEL=1 \
+    OLLAMA_LLM_LIBRARY=cpu ollama serve
 ```
 
 The library override is experimental and varies by Ollama build. On the measured Apple Metal 0.33.2
@@ -137,10 +140,12 @@ MCP `run_task` and the managed HTTP route accept `executionPreference`: `auto`, 
   "objective": "fastest",
   "executionPreference": "prefer_cpu",
   "minPlacementEvidence": "observed",
-  "preview": true,
-  "input": ["one", "two"]
+  "preview": true
 }
 ```
+
+A preview accepts routing constraints only. Add the embedding input when submitting the execution
+request after accepting the route.
 
 The agent does not gain authority to assign models. FreeLlama first applies model installation,
 capability, policy, context, explicit-model, and session-affinity constraints. It only honors the
@@ -222,7 +227,9 @@ flowchart TD
 
 FreeLlama can overlap requests across the two servers even when each Ollama process uses
 `OLLAMA_NUM_PARALLEL=1`. Raising `OLLAMA_NUM_PARALLEL` affects parallel requests within one server
-and multiplies K/V-cache memory; it is a separate tuning decision.
+and multiplies K/V-cache memory; it is a separate tuning decision. `OLLAMA_MAX_QUEUE` likewise
+bounds each Ollama process after FreeLlama admission. It does not replace either backend's weighted
+FreeLlama budget or queue-wait deadline.
 
 ## Understand automatic feedback
 

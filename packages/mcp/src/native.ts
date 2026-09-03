@@ -7,9 +7,12 @@ import { createRequire } from "node:module";
 // is not reliably detectable by Node's CJS/ESM interop. Destructuring after a default import
 // sidesteps that entirely.
 import native from "../native/index.js";
-export const { doctor, machine, listModels, route, runTask, runTaskRequest } = native as {
+export const { doctor, machine, health, createSession, deleteSession, listModels, route, runTask, runTaskRequest, runTaskBatchRequest } = native as {
   doctor: (endpoint?: string | null) => Promise<string>;
   machine: (endpoint?: string | null) => Promise<string>;
+  health: (endpoint?: string | null) => Promise<string>;
+  createSession: (endpoint?: string | null) => Promise<string>;
+  deleteSession: (endpoint: string | null | undefined, sessionId: string) => Promise<void>;
   listModels: (endpoint?: string | null) => Promise<string>;
   route: (
     endpoint: string | null | undefined,
@@ -42,10 +45,11 @@ export const { doctor, machine, listModels, route, runTask, runTaskRequest } = n
     minPlacementEvidence?: string | null,
   ) => Promise<string>;
   runTaskRequest: (endpoint: string | null | undefined, request: unknown) => Promise<string>;
+  runTaskBatchRequest: (endpoint: string | null | undefined, request: unknown) => Promise<string>;
 };
 
 // Single source of truth for the version — a hardcoded literal here silently drifts from the
-// package it ships in (it already had: this file said 0.1.0 while the crate it wraps was 0.2.0).
+// package it ships in (it already had: this file said 0.1.0 while the crate it wraps was 0.1.0).
 // package.json is always present in an npm tarball regardless of the `files` allowlist, and
 // `../package.json` resolves to the package root from `dist/index.js`.
 export const { version: SERVER_VERSION } = createRequire(import.meta.url)("../package.json") as {

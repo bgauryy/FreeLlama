@@ -11,15 +11,20 @@ FREELLAMA_REPO="${FREELLAMA_REPO:-}"
 OLLAMA_ENDPOINT="${OLLAMA_ENDPOINT:-http://127.0.0.1:11434}"
 FREELLAMA_ENDPOINT="${FREELLAMA_ENDPOINT:-http://127.0.0.1:11435}"
 FREELLAMA_AUTH_TOKEN_FILE="${FREELLAMA_AUTH_TOKEN_FILE:-}"
-FREELLAMA_CURL_AUTH=()
 if [ -n "$FREELLAMA_AUTH_TOKEN_FILE" ]; then
   if [ ! -r "$FREELLAMA_AUTH_TOKEN_FILE" ]; then
     echo "  FAIL  FREELLAMA_AUTH_TOKEN_FILE is not readable: $FREELLAMA_AUTH_TOKEN_FILE"
     exit 1
   fi
   FREELLAMA_AUTH_TOKEN="$(tr -d '\r\n' < "$FREELLAMA_AUTH_TOKEN_FILE")"
-  FREELLAMA_CURL_AUTH=(-H "Authorization: Bearer $FREELLAMA_AUTH_TOKEN")
 fi
+freellama_curl() {
+  if [ -n "$FREELLAMA_AUTH_TOKEN_FILE" ]; then
+    curl -sf -H "Authorization: Bearer $FREELLAMA_AUTH_TOKEN" "$@"
+  else
+    curl -sf "$@"
+  fi
+}
 FAILED=0
 WARNED=0
 warn() { echo "  WARN  $1"; WARNED=1; }
@@ -69,7 +74,7 @@ else
 fi
 
 echo
-echo "== Ollama KV cache & concurrency =="
+echo "== Ollama configuration =="
 read_ollama_env() {
   local name="$1"
   local value="${!name-}"
@@ -81,12 +86,38 @@ read_ollama_env() {
 kv_type=$(read_ollama_env OLLAMA_KV_CACHE_TYPE)
 num_parallel=$(read_ollama_env OLLAMA_NUM_PARALLEL)
 max_loaded=$(read_ollama_env OLLAMA_MAX_LOADED_MODELS)
+max_queue=$(read_ollama_env OLLAMA_MAX_QUEUE)
+ollama_host=$(read_ollama_env OLLAMA_HOST)
+no_cloud=$(read_ollama_env OLLAMA_NO_CLOUD)
+flash_attention=$(read_ollama_env OLLAMA_FLASH_ATTENTION)
+
+case "$ollama_host" in
+  ""|127.0.0.1:*|localhost:*|\[::1\]:*)
+    ok "OLLAMA_HOST=${ollama_host:-127.0.0.1:11434 (effective loopback default if unset in Ollama)}"
+    ;;
+  *)
+    warn "OLLAMA_HOST=$ollama_host is not an obvious loopback binding — require an authenticated, TLS-protected ingress before exposing Ollama"
+    ;;
+esac
+case "$no_cloud" in
+  1|true|TRUE|True)
+    ok "OLLAMA_NO_CLOUD=$no_cloud (cloud inference and web search disabled)"
+    ;;
+  0|false|FALSE|False)
+    warn "OLLAMA_NO_CLOUD=$no_cloud — cloud features remain available; use 1 when the deployment contract is local-only"
+    ;;
+  *)
+    warn "OLLAMA_NO_CLOUD not visible here — local-only operation is not proven; set 1 in the Ollama service environment when required"
+    ;;
+esac
 if [ -z "$kv_type" ]; then
   warn "OLLAMA_KV_CACHE_TYPE not visible here — effective f16 if it is also unset in the Ollama process; q8_0 uses about half the KV memory, but benchmark model quality before changing it"
 else
   ok "OLLAMA_KV_CACHE_TYPE=$kv_type"
 fi
 echo "  INFO  OLLAMA_NUM_PARALLEL=${num_parallel:-1 (effective default if unset in Ollama)}"
+echo "  INFO  OLLAMA_FLASH_ATTENTION=${flash_attention:-auto (backend/device dependent if unset in Ollama)}"
+echo "  INFO  OLLAMA_MAX_QUEUE=${max_queue:-512 (effective default if unset in Ollama)} — this is separate from FreeLlama admission waiting"
 if [ -z "$max_loaded" ]; then
   warn "OLLAMA_MAX_LOADED_MODELS not visible here — effective cap is 3 x GPU count (or 3 for CPU-only) if unset in Ollama; choose an explicit per-process cap from measured model and memory fit"
 else
@@ -156,9 +187,9 @@ fi
 
 echo
 echo "== FreeLlama proxy/serve =="
-if curl -sf "${FREELLAMA_CURL_AUTH[@]}" "$FREELLAMA_ENDPOINT/api/version" >/dev/null 2>&1; then
+if freellama_curl "$FREELLAMA_ENDPOINT/api/version" >/dev/null 2>&1; then
   ok "reachable at $FREELLAMA_ENDPOINT (passthrough works)"
-  if health_json=$(curl -sf "${FREELLAMA_CURL_AUTH[@]}" "$FREELLAMA_ENDPOINT/_freellama/v1/health" 2>/dev/null); then
+  if health_json=$(freellama_curl "$FREELLAMA_ENDPOINT/_freellama/v1/health" 2>/dev/null); then
     ok "control-plane routes present — this is 'freellama serve' (full platform)"
     if python3 - "$health_json" <<'PYEOF'
 import json, sys

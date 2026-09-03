@@ -76,17 +76,28 @@ pub fn normalize_route_intent(mut intent: RouteIntent, text: &str) -> (RouteInte
     let text = text.to_ascii_lowercase();
     let mut adjustments = Vec::new();
     let has_vision_evidence = contains_any(&text, &["screenshot", "image", "photo", "vision"]);
-    let has_tool_evidence = contains_any(
+    let denies_tools = contains_any(
         &text,
         &[
-            "click",
-            "tool call",
-            "function call",
-            "use tools",
-            "search the repository",
-            "edit files",
+            "do not use tools",
+            "don't use tools",
+            "never use tools",
+            "without tools",
+            "no tools",
         ],
     );
+    let has_tool_evidence = !denies_tools
+        && contains_any(
+            &text,
+            &[
+                "click",
+                "tool call",
+                "function call",
+                "use tools",
+                "search the repository",
+                "edit files",
+            ],
+        );
     let has_context_evidence = contains_any(
         &text,
         &[

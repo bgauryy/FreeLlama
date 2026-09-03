@@ -23,6 +23,7 @@ fn model(name: &str, size: u64, capabilities: &[Capability]) -> CatalogModel {
         size,
         capabilities: capabilities.iter().copied().collect(),
         advertised_context: Some(32_768),
+        kv_cache_bytes_per_token_f16: None,
         resident: false,
         resident_vram: None,
         benchmark: BTreeMap::new(),

@@ -41,14 +41,23 @@ describe.runIf(releaseServeAvailable)("run_task against a live serve", () => {
     expect(route.structuredContent.selected_model).toBeTruthy();
   });
 
-  it('fails closed on requiredCapabilities: ["audio"] (no audio model installed)', async () => {
+  it('enforces requiredCapabilities: ["audio"] against the installed catalog', async () => {
     const route = await call("run_task", {
       task: "completion",
       objective: "fastest",
       requiredCapabilities: ["audio"],
       preview: true,
     });
-    expect(route.isError).toBe(true);
+    if (route.isError) {
+      expect(route.content[0].text).toMatch(/audio|eligible|capabilit/i);
+    } else {
+      expect(route.structuredContent.required_capabilities).toContain("audio");
+      const selectedModel = route.structuredContent.selected_model;
+      expect(selectedModel).toBeTruthy();
+      const detail = await call("models", { view: "detail", model: selectedModel });
+      expect(detail.isError ?? false, detail.content[0].text).toBe(false);
+      expect(detail.structuredContent.capabilities).toContain("audio");
+    }
   });
 
   it("actually routes and executes a prompt", async () => {

@@ -13,7 +13,7 @@ The following table defines the ownership boundary:
 | Model files, runners, Metal, MLX, llama.cpp, and token generation | Ollama |
 | Native `/api/*` and OpenAI-compatible `/v1/*` semantics | Ollama |
 | Installed-model discovery and capability normalization | FreeLlama |
-| Task routing, evidence policy, hardware fit, and model rejection reasons | FreeLlama |
+| Task routing, advertised-context compatibility, K/V lower-bound preflight, evidence policy, and model rejection reasons | FreeLlama |
 | Managed admission, session affinity, and model-transition coordination | FreeLlama |
 | Explicit per-model CPU/GPU backend assignment | FreeLlama and separate Ollama processes |
 | Grounded research adapters, citations, and verification verdicts | FreeLlama MCP server |
@@ -90,6 +90,7 @@ The control API exposes these endpoints:
 | `POST /_freellama/v1/routes` | Deterministic route decision | No |
 | `POST /_freellama/v1/natural-routes` | Schema-bound intent interpretation followed by deterministic routing | Intent model only |
 | `POST /_freellama/v1/sessions` | New model-affinity session | No |
+| `DELETE /_freellama/v1/sessions/:session_id` | Release model-affinity session | No |
 | `POST /_freellama/v1/tasks` | Managed chat, vision, tools, or embedding task | Yes |
 
 The machine profile is host-derived rather than model-name-derived. It reports total physical
@@ -139,7 +140,7 @@ flowchart TD
     O -->|"fastest"| S["Rank local performance,<br/>residency, and deterministic ties"]
     O -->|"balanced"| B["Require policy-qualified candidates,<br/>then balance score and residency"]
     O -->|"quality"| Q["Require policy-qualified candidates,<br/>then prefer policy order"]
-    E --> H["Grade hardware fit and evidence"]
+    E --> H["Grade advertised-context compatibility and evidence"]
     S --> H
     B --> H
     Q --> H
@@ -150,6 +151,11 @@ flowchart TD
 
 Explicit model selection never substitutes another model. Every rejected candidate includes a
 reason so callers can distinguish capability, context, policy, and installation failures.
+
+`context_window_fit` means only that requested `num_ctx` fits the model's advertised context
+window. It is not a live-memory, free-VRAM, K/V-cache, thermal, or runner-admission verdict.
+Execution separately reports a conservative model-metadata K/V lower-bound preflight and post-run
+placement evidence; Ollama remains authoritative for actual runner allocation and admission.
 
 ### Confidence evidence
 
@@ -196,41 +202,60 @@ Managed tasks combine routing with admission and backend-aware transition coordi
 
 ```mermaid
 flowchart TD
-    T["POST /tasks"] --> R["Select eligible model + backend"]
-    R --> A{"Acquire selected backend's<br/>weighted budget"}
+    T["POST /tasks or /task-batches"] --> R["Select eligible model + backend"]
+    R --> K["Calculate metadata-backed K/V lower bound<br/>(or report unknown)"]
+    K --> A{"Acquire selected backend's<br/>3:2:1 fair weighted budget"}
     A -->|"No"| E503["503 server busy"]
     A -->|"Yes"| B{"Execution backend"}
-    B -->|"Primary"| GL{"GPU model resident?"}
+    B -->|"Primary"| GL{"GPU model resident<br/>under transition lock?"}
     B -->|"CPU assignment"| CO["Add num_gpu: 0"]
-    CO --> CL{"CPU model resident?"}
+    CO --> CL{"CPU model resident<br/>under transition lock?"}
     GL -->|"Yes"| GR["GPU shared lock"]
     GL -->|"No"| GX["GPU exclusive transition lock"]
     CL -->|"Yes"| CR["CPU shared lock"]
     CL -->|"No"| CX["CPU exclusive transition lock"]
-    GR --> SEND["Send bounded Ollama request"]
-    GX --> SEND
-    CR --> SEND
-    CX --> SEND
+    GR --> OQ["Send to selected Ollama queue"]
+    GX --> OQ
+    CR --> OQ
+    CX --> OQ
+    OQ --> SEND["Ollama schedules bounded request"]
     SEND --> RETRY{"500, 502, 504,<br/>or connection failure?"}
-    RETRY -->|"Retryable"| SEND
+    RETRY -->|"Retryable"| OQ
     RETRY -->|"Success"| OBS["Query selected Ollama /api/ps"]
     OBS --> OUT["Route, assignment, physical observation,<br/>admission, metrics, and response"]
     RETRY -->|"503, timeout, or final failure"| ERR["Return upstream error"]
 ```
 
-Admission is independent per backend. The primary/GPU pool defaults to two weighted units and the
+Admission is independent per backend and uses weighted fair round robin: interactive gets three
+turns, normal two, and background one, preserving FIFO inside each class and preventing starvation.
+The primary/GPU pool defaults to two weighted units and the
 optional CPU pool defaults to one. A saturated GPU burst therefore cannot consume the permit held
 for a small CPU helper. Those values represent one ordinary chat and one embedding, not detected
 hardware capacity; operators can tune both budgets from queue-wait and resident-memory evidence.
+After FreeLlama admission, each Ollama process applies its own `OLLAMA_MAX_QUEUE`, scheduler,
+`OLLAMA_NUM_PARALLEL`, and loaded-model limit. Raw proxy requests bypass FreeLlama admission and
+enter the primary Ollama queue directly.
 
 | Task | Cost |
 |---|---:|
-| Embedding | 1 |
+| Embedding | `ceil(input_items / 4)` |
 | Chat, coding, tools, browser, or long context | 2 |
 | Vision | 4 |
 
-FreeLlama acquires the admission slot before a transition lock to avoid deadlock. It binds session
-affinity only after admission succeeds so a refused task cannot change later routing.
+FreeLlama acquires the admission slot before a transition lock to avoid deadlock. A model marked
+resident during discovery is checked again while the shared transition lock is held; stale or
+unavailable residency falls back to the exclusive transition path. Session affinity is bound only
+after successful upstream execution, so refused and failed tasks cannot change later routing.
+
+`POST /_freellama/v1/task-batches` is for caller-declared independent work only: every item has a
+stable ID and `independent:true`; dependent workflow execution is rejected before any upstream call.
+It bounds local dispatch and returns ordered per-item success/error receipts. Every child still
+passes the same global admission and transition path above.
+
+The K/V preflight derives F16 K+V bytes-per-token only when `/api/show` exposes the required model
+shape. It blocks only a known weights-plus-cache lower bound above 80% of total CPU/unified memory.
+It deliberately reports unknown rather than guessing for other architectures or discrete GPU free
+VRAM; Ollama remains the live loader and final memory authority.
 
 Resident tasks share a backend lock. Nonresident tasks take that backend's exclusive lock so a cold
 load cannot race another managed task on the same server. CPU and GPU backends have separate locks
@@ -268,11 +293,12 @@ flowchart TD
 
 The hint never changes the operator's CPU assignment. If the preferred backend has no eligible
 model, routing falls back and returns `preference_satisfied: false`. Feedback is task-specific,
-in-memory, restart-reset, and records normalized latency only for already-resident, physically
-verified tasks so prompt
-size and cold-load cost do not poison the comparison. It requires more than a 10% advantage;
-capacity can break a tie before the sample threshold. Quality routing,
-explicit model selection, and session affinity do not follow the latency loop.
+bounded, versioned, and prompt-free. The CLI persists it with atomic file replacement by default;
+restart-reset behavior is available only through the explicit `--ephemeral-feedback` mode. It
+records normalized latency only for already-resident, physically verified tasks so prompt size and
+cold-load cost do not poison the comparison. It requires more than a 10% advantage; capacity can
+break a tie before the sample threshold. Quality routing, explicit model selection, and session
+affinity do not follow the latency loop.
 
 The same selection function supplies preview/recommendation receipts, intent-model execution, and
 managed task execution. This keeps advertised placement and actual request routing aligned.
@@ -364,12 +390,13 @@ FreeLlama keeps these values in memory:
 - Catalog metadata cache
 - Current residency snapshots
 - Session-to-model affinity
-- Independent GPU and CPU admission semaphores
+- Independent GPU and CPU priority-fair weighted admission pools
 - Per-task normalized warm latency and queue feedback for each backend, restored from an optional
   versioned atomic snapshot
 - Separate CPU and GPU transition locks
 
-Restarting `freellama serve` clears sessions and the catalog cache. Persisted placement feedback is
+Sessions are bounded (default 1024) and expire after idle time (default one hour); they store only
+model affinity, never prompts or Ollama KV. Restarting `freellama serve` clears sessions and the catalog cache. Persisted placement feedback is
 reloaded; `--ephemeral-feedback` intentionally resets it. Ollama owns model residency, so loaded
 models survive a FreeLlama restart.
 

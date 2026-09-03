@@ -45,6 +45,16 @@ struct AdmissionArgs {
     /// contract; waiting forever would hide load as unattributable latency.
     #[arg(long)]
     max_queue_wait_seconds: Option<u64>,
+    /// Bound raw Ollama-compatible proxy requests with immediate 503. This is a generic primary
+    /// backend cap only; use managed tasks for weighted CPU/GPU admission.
+    #[arg(long)]
+    raw_proxy_max_concurrent_requests: Option<usize>,
+    /// Maximum live session-affinity handles (default 1024). Sessions contain no prompt/KV data.
+    #[arg(long)]
+    max_sessions: Option<usize>,
+    /// Expire idle affinity handles after this many seconds (default 3600).
+    #[arg(long)]
+    session_ttl_seconds: Option<u64>,
 }
 
 /// Ollama backend placement, grouped so device-specific routing stays an explicit serve concern.
@@ -251,6 +261,10 @@ enum Command {
         /// request. Off by default — this never happens unless explicitly enabled.
         #[arg(long)]
         auto_restart_ollama: bool,
+        /// Optional immediate cap for raw compatibility requests. Prefer managed tasks for
+        /// weighted admission and backend-aware routing.
+        #[arg(long)]
+        max_concurrent_requests: Option<usize>,
     },
     /// Benchmark every installed model in separate capability groups.
     BenchAll {
@@ -478,10 +492,14 @@ async fn main() -> Result<()> {
             allow_remote,
             request_timeout_seconds,
             auto_restart_ollama,
+            max_concurrent_requests,
         } => {
-            let config = ProxyConfig::new(listen, upstream, allow_remote)
+            let mut config = ProxyConfig::new(listen, upstream, allow_remote)
                 .with_request_timeout(std::time::Duration::from_secs(request_timeout_seconds))
                 .with_auto_restart_ollama(auto_restart_ollama);
+            if let Some(max) = max_concurrent_requests {
+                config = config.with_max_concurrent_requests(max);
+            }
             serve(config).await?;
         }
         Command::BenchAll {
@@ -606,6 +624,15 @@ async fn start_platform(args: PlatformStartArgs) -> Result<()> {
     }
     if let Some(seconds) = args.admission.max_queue_wait_seconds {
         config = config.with_max_queue_wait(Duration::from_secs(seconds));
+    }
+    if let Some(max) = args.admission.raw_proxy_max_concurrent_requests {
+        config = config.with_raw_proxy_max_concurrent_requests(max);
+    }
+    if let Some(max) = args.admission.max_sessions {
+        config = config.with_max_sessions(max);
+    }
+    if let Some(seconds) = args.admission.session_ttl_seconds {
+        config = config.with_session_ttl(Duration::from_secs(seconds));
     }
     if !args.production.ephemeral_feedback {
         let path = args
@@ -1178,7 +1205,7 @@ fn authenticate_request(request: reqwest::RequestBuilder) -> Result<reqwest::Req
 /// Hand-maintained rather than generated from the MCP server, so the CLI keeps no Node dependency.
 /// The trade-off is that adding or removing a tool means updating this table.
 fn print_tool_map() {
-    println!("FreeLlama exposes 6 MCP tools. Equivalents for a CLI-only agent:\n");
+    println!("FreeLlama exposes 8 MCP tools. Equivalents for a CLI-only agent:\n");
     let rows = [
         (
             "doctor",
@@ -1194,6 +1221,16 @@ fn print_tool_map() {
             "run_task",
             "freellama task --task <t> <prompt>",
             "route AND execute; preview:true is decision-only",
+        ),
+        (
+            "run_task_batch",
+            "HTTP/MCP only",
+            "bounded, independent-only fair local dispatch",
+        ),
+        (
+            "session",
+            "freellama session",
+            "create/release bounded model-affinity metadata; no prompt/KV",
         ),
         (
             "ollama_manage",

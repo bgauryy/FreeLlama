@@ -3,6 +3,8 @@
 // See packages/mcp/README.md.
 const { existsSync } = require("node:fs");
 const path = require("node:path");
+const { createRequire } = require("node:module");
+const requireFromHere = createRequire(__filename);
 
 // napi-rs filenames: `freellama.<platform>-<arch>[-<abi>].node`. ABI suffix is present on
 // Linux/Windows, absent on macOS. On Linux try both gnu and musl — Node's glibc probe does not
@@ -12,27 +14,32 @@ const ABI_SUFFIXES = {
   win32: ["-msvc"],
 };
 
-function candidateNames() {
+function candidateIds() {
   const { platform, arch } = process;
   const suffixes = ABI_SUFFIXES[platform] ?? [];
-  // Bare name last: on a triple with no ABI component (macOS) it is the only form napi-rs emits.
-  return [...new Set(suffixes.concat("").map((s) => `freellama.${platform}-${arch}${s}.node`))];
+  return [...new Set(suffixes.concat("").map((suffix) => `${platform}-${arch}${suffix}`))];
 }
 
-const candidates = candidateNames();
-const found = candidates.find((name) => existsSync(path.join(__dirname, name)));
+const candidates = candidateIds();
+const found = candidates.find((id) => existsSync(path.join(__dirname, `freellama.${id}.node`)));
 
 if (!found) {
+  const failures = [];
+  for (const id of candidates) {
+    const packageName = `@octocodeai/freellama-native-${id}`;
+    try {
+      module.exports = requireFromHere(packageName);
+      return;
+    } catch (error) {
+      failures.push(`${packageName}: ${error?.message ?? error}`);
+    }
+  }
   throw new Error(
-    `freellama: no native addon for ${process.platform}-${process.arch}.\n` +
-      `Looked for: ${candidates.join(", ")} in ${__dirname}\n` +
-      "The addon is a compiled artifact and is not checked into git. Build it from the repo " +
-      "root with:\n" +
-      "  npm install && npm run build\n" +
-      "(which runs `napi build --platform --release --features napi -o packages/mcp/native`). " +
-      "This requires a Rust toolchain. A package release can contain " +
-      "fewer prebuilt targets than the source supports — see packages/mcp/README.md.",
+    `freellama: no usable native addon for ${process.platform}-${process.arch}.\n` +
+      `Tried local development artifacts and optional packages: ${candidates.map((id) => `@octocodeai/freellama-native-${id}`).join(", ")}.\n` +
+      "Reinstall without --omit=optional. From a source checkout, run `yarn build:native`.\n" +
+      `Load failures:\n  ${failures.join("\n  ")}`,
   );
 }
 
-module.exports = require(`./${found}`);
+module.exports = require(`./freellama.${found}.node`);

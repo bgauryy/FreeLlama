@@ -6,6 +6,7 @@
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -30,6 +31,23 @@ pub enum TaskKind {
     Vision,
     Embedding,
     LongContext,
+}
+
+/// Relative service class for managed work.
+///
+/// This is deliberately an execution concern, rather than a routing preference: it never changes
+/// which model is eligible. Admission uses weighted fair scheduling (interactive 3, normal 2,
+/// background 1), so low-priority work makes bounded progress instead of starving behind a
+/// continuous interactive stream.
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Default, ValueEnum,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskPriority {
+    Interactive,
+    #[default]
+    Normal,
+    Background,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, ValueEnum)]
@@ -108,6 +126,11 @@ pub struct CatalogModel {
     pub size: u64,
     pub capabilities: BTreeSet<Capability>,
     pub advertised_context: Option<u64>,
+    /// F16-equivalent bytes needed for K and V cache per token, derived from Ollama's model
+    /// metadata when its architecture fields are available. It is intentionally optional: not all
+    /// model families expose a shape `FreeLlama` can calculate without guessing.
+    #[serde(default)]
+    pub kv_cache_bytes_per_token_f16: Option<u64>,
     pub resident: bool,
     pub resident_vram: Option<u64>,
     pub benchmark: BTreeMap<Capability, f64>,
@@ -133,6 +156,10 @@ pub struct RouteDecision {
     /// rather than a single word a caller may mistake for a calibrated probability.
     pub quality_evidence: String,
     pub task_evidence: String,
+    /// Whether the sent context fits the model's advertised context window. This is not a RAM,
+    /// KV-cache, or live runner-admission claim.
+    pub context_window_fit: String,
+    /// Deprecated alias; retained for older callers.
     pub hardware_fit: String,
     /// Every other eligible candidate and why it lost.
     pub rejected: Vec<Value>,
@@ -141,7 +168,13 @@ pub struct RouteDecision {
 
 #[derive(Debug, Clone, Default)]
 pub struct SessionAffinity {
-    sessions: BTreeMap<String, Option<String>>,
+    sessions: BTreeMap<String, SessionRecord>,
+}
+
+#[derive(Debug, Clone)]
+struct SessionRecord {
+    model: Option<String>,
+    last_used: Instant,
 }
 
 impl SessionAffinity {
@@ -150,29 +183,66 @@ impl SessionAffinity {
         Self {
             sessions: pairs
                 .into_iter()
-                .map(|(session, model)| (session, Some(model)))
+                .map(|(session, model)| {
+                    (
+                        session,
+                        SessionRecord {
+                            model: Some(model),
+                            last_used: Instant::now(),
+                        },
+                    )
+                })
                 .collect(),
         }
     }
 
     pub(super) fn create(&mut self) -> String {
         let id = Uuid::new_v4().to_string();
-        self.sessions.insert(id.clone(), None);
+        self.sessions.insert(
+            id.clone(),
+            SessionRecord {
+                model: None,
+                last_used: Instant::now(),
+            },
+        );
         id
     }
 
-    pub(super) fn contains(&self, id: &str) -> bool {
-        self.sessions.contains_key(id)
-    }
-
     pub(super) fn assigned(&self, id: &str) -> Option<&str> {
-        self.sessions.get(id).and_then(Option::as_deref)
+        self.sessions
+            .get(id)
+            .and_then(|record| record.model.as_deref())
     }
 
     pub(super) fn bind(&mut self, id: &str, model: &str) {
-        if let Some(slot) = self.sessions.get_mut(id) {
-            *slot = Some(model.to_owned());
+        if let Some(record) = self.sessions.get_mut(id) {
+            record.model = Some(model.to_owned());
+            record.last_used = Instant::now();
         }
+    }
+
+    pub(super) fn touch(&mut self, id: &str, ttl: Duration) -> bool {
+        self.prune_expired(ttl);
+        if let Some(record) = self.sessions.get_mut(id) {
+            record.last_used = Instant::now();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(super) fn prune_expired(&mut self, ttl: Duration) {
+        let now = Instant::now();
+        self.sessions
+            .retain(|_, record| now.duration_since(record.last_used) < ttl);
+    }
+
+    pub(super) fn remove(&mut self, id: &str) -> bool {
+        self.sessions.remove(id).is_some()
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.sessions.len()
     }
 }
 
@@ -285,6 +355,7 @@ pub fn select_route(
         evidence: graded.evidence.to_owned(),
         quality_evidence: graded.quality_evidence.to_owned(),
         task_evidence: graded.task_evidence.to_owned(),
+        context_window_fit: graded.context_window_fit.to_owned(),
         hardware_fit: graded.hardware_fit.to_owned(),
         rejected,
         reasons,
@@ -406,8 +477,11 @@ pub struct RouteEvidence {
     pub quality_evidence: &'static str,
     /// A functional benchmark measured this model on the ranking capability.
     pub task_evidence: &'static str,
-    /// Sent `num_ctx` vs the model's advertised window (`strong` / `insufficient_context` /
-    /// `unknown`). Not RAM or KV-cache headroom — that lives on `recommend` / `machine`.
+    /// Sent `num_ctx` vs the model's advertised window. This is intentionally not named
+    /// hardware fit: it proves neither live RAM/KV headroom nor successful runner admission.
+    pub context_window_fit: &'static str,
+    /// Deprecated compatibility alias for `context_window_fit`. Never interpret this as a live
+    /// hardware-memory result; use `memory_kv_preflight` and post-run observation instead.
     pub hardware_fit: &'static str,
     /// Legacy single-word summary, derived from the three above. Kept so existing callers and the
     /// `min_confidence` gate keep working.
@@ -430,8 +504,13 @@ fn route_evidence(
     RouteEvidence {
         quality_evidence: if policy_qualified { "strong" } else { "none" },
         task_evidence: if has_benchmark { "strong" } else { "none" },
+        context_window_fit: match fits {
+            Some(true) => "fits_advertised_window",
+            Some(false) => "insufficient_context",
+            None => "unknown",
+        },
         hardware_fit: match fits {
-            Some(true) => "strong",
+            Some(true) => "context_window_only",
             Some(false) => "insufficient_context",
             None => "unknown",
         },

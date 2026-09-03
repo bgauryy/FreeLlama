@@ -1,6 +1,6 @@
 {
-  "name": "freellama-mcp-server",
-  "version": "0.2.0",
+  "name": "@octocodeai/freellama-mcp-server",
+  "version": "0.1.0",
   "description": "MCP server exposing FreeLlama core as tools, via native NAPI bindings into packages/rust-core.",
   "repository": {
     "type": "git",
@@ -9,7 +9,12 @@
   },
   "homepage": "https://github.com/bgauryy/FreeLlama#readme",
   "bugs": "https://github.com/bgauryy/FreeLlama/issues",
-  "keywords": ["mcp", "ollama", "local-llm", "coding-agent"],
+  "keywords": [
+    "mcp",
+    "ollama",
+    "local-llm",
+    "coding-agent"
+  ],
   "engines": {
     "node": ">=20.0.0"
   },
@@ -18,8 +23,11 @@
   "bin": "dist/index.js",
   "files": [
     "dist",
-    "native",
-    "adapters",
+    "native/index.js",
+    "native/index.d.ts",
+    "native/package.json",
+    "adapters/*.py",
+    "docs",
     "README.md"
   ],
   "scripts": {
@@ -30,18 +38,27 @@
     "test:watch": "vitest",
     "test:integration": "vitest run -c vitest.integration.config.ts",
     "test:e2e": "vitest run -c vitest.e2e.config.ts",
-    "prepublishOnly": "yarn typecheck && yarn --cwd ../.. build:native && yarn build && yarn test",
+    "prepublishOnly": "yarn typecheck && yarn build && yarn test",
     "build:native": "yarn --cwd ../.. build:native"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
     "zod": "^3.24.1"
   },
+  "optionalDependencies": {
+    "@octocodeai/freellama-native-darwin-arm64": "0.1.0",
+    "@octocodeai/freellama-native-darwin-x64": "0.1.0",
+    "@octocodeai/freellama-native-linux-arm64-gnu": "0.1.0",
+    "@octocodeai/freellama-native-linux-arm64-musl": "0.1.0",
+    "@octocodeai/freellama-native-linux-x64-gnu": "0.1.0",
+    "@octocodeai/freellama-native-linux-x64-musl": "0.1.0",
+    "@octocodeai/freellama-native-win32-arm64-msvc": "0.1.0",
+    "@octocodeai/freellama-native-win32-x64-msvc": "0.1.0"
+  },
   "license": "Apache-2.0 OR MIT",
   "publishConfig": {
     "access": "public",
-    "registry": "https://registry.npmjs.org/",
-    "provenance": true
+    "registry": "https://registry.npmjs.org/"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

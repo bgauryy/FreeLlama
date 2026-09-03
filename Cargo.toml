@@ -4,10 +4,13 @@ members = ["packages/rust-core", "packages/cli"]
 
 # Shared across both crates so versions cannot drift between the library and the CLI that wraps it.
 [workspace.package]
-version = "0.2.0"
+version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0 OR MIT"
 rust-version = "1.85"
+repository = "https://github.com/bgauryy/FreeLlama"
+homepage = "https://github.com/bgauryy/FreeLlama"
+readme = "README.md"
 
 [workspace.lints.rust]
 # `napi.rs` is the sole FFI boundary and opts out explicitly with its own `#![allow(unsafe_code)]`.

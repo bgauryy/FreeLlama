@@ -31,8 +31,9 @@ flowchart LR
 
 ## Understand admission
 
-The platform combines an independent weighted semaphore and transition lock for each configured
-backend. Embedding costs 1, chat costs 2, and vision costs 4 (capped to the pool size).
+The platform combines an independent 3:2:1 priority-fair weighted admission pool and transition
+lock for each configured backend. Embedding costs `ceil(input_items / 4)`, chat costs 2, and vision
+costs 4 (capped to the pool size).
 
 - A resident model takes a shared lock on its assigned backend.
 - A cold model takes an exclusive lock on its assigned backend.
@@ -40,7 +41,8 @@ backend. Embedding costs 1, chat costs 2, and vision costs 4 (capped to the pool
 - A task that cannot acquire its weighted permit before the queue deadline receives HTTP 503.
 
 The primary/GPU pool defaults to two weighted units; the optional CPU pool defaults to one. An
-embedding costs 1, ordinary chat costs 2, and vision costs 4 capped to the pool size. Runtime
+embedding batch costs `ceil(input_items / 4)`, ordinary chat costs 2, and vision costs 4 capped to
+the pool size. Runtime
 feedback records successful resident-task work-unit latency by task and backend: decode
 nanoseconds/output token for generation and total nanoseconds/input token for embeddings. Only
 after three samples exist on each backend and one is more than 10% faster may `auto` steer; it never

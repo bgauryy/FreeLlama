@@ -20,7 +20,7 @@ describe("doctor", () => {
   it("lists the expected tools", async () => {
     const { tools } = await client.listTools();
     const names = tools.map((tool) => tool.name);
-    for (const expected of ["doctor", "models", "run_task", "ollama_manage", "ollama_delete", "delegate_research"]) {
+    for (const expected of ["doctor", "models", "run_task", "session", "ollama_manage", "ollama_delete", "delegate_research"]) {
       expect(names).toContain(expected);
     }
   });
@@ -29,6 +29,9 @@ describe("doctor", () => {
     const result = (await client.callTool({ name: "doctor", arguments: {} })) as ToolResult;
     expect(result.isError ?? false).toBe(false);
     expect(typeof result.structuredContent?.endpoint).toBe("string");
+    expect(result.structuredContent?.local_conservative_config_posture?.profile).toBe("local-conservative-v1");
+    expect(result.structuredContent?.local_conservative_config_posture?.apply?.mutates_nothing).toBe(true);
+    expect(result.structuredContent?.host_runtime_signals).toBeTruthy();
   });
 });
 

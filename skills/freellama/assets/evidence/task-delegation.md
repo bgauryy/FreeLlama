@@ -110,7 +110,7 @@ subject"*, not *"one can be deleted"*. Read the candidates before acting on a sc
 
 ### Local RAG, if you actually need it
 
-`examples/local-rag.sh` is a working ~40-line pattern: `npx freellama task --task embedding
+`examples/local-rag.sh` is a working ~40-line pattern: `npx @octocodeai/freellama task --task embedding
 --input-file` produces the vectors, `jq` does cosine and top-k. **FreeLlama owns no vector store**,
 deliberately — persistence is a standing non-goal, and a stale index fails *silently*, returning
 confidently wrong files as the corpus drifts. You own storage and staleness; swap the flat file for

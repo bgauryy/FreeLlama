@@ -164,7 +164,18 @@ export const TASK_KINDS = [
   "embedding",
   "long_context",
 ] as const;
-export const taskParam = z.enum(TASK_KINDS).describe("Exact managed task profile.");
+export const MCP_TASK_KINDS = [...TASK_KINDS, "code_review"] as const;
+export type McpTaskKind = (typeof MCP_TASK_KINDS)[number];
+export const taskParam = z.enum(MCP_TASK_KINDS).describe("code_review=coding.");
+
+/**
+ * MCP accepts the name humans and agents naturally use for a review, while the Rust routing
+ * contract deliberately keeps one coding profile. Normalize at the boundary so every downstream
+ * policy, receipt, and benchmark continues to use the canonical task kind.
+ */
+export function canonicalTaskKind(task: McpTaskKind): (typeof TASK_KINDS)[number] {
+  return task === "code_review" ? "coding" : task;
+}
 export const objectiveParam = z
   .enum(["fastest", "balanced", "quality"])
   .optional()
@@ -227,6 +238,134 @@ export const requiredCapabilitiesParam = z
   .optional()
   .describe('Additional hard requirements, e.g. ["vision"] or ["tools"]. Fails closed if unmet.');
 
+// The stable parts are typed so an MCP client can construct a batch without guessing. The
+// forwarded Ollama controls remain deliberately open because Ollama evolves them independently.
+export const batchTaskParam = z.object({
+  task: taskParam,
+  objective: objectiveParam,
+  model: z.string().min(1).optional(),
+  sessionId: z.string().uuid().optional(),
+  contextTokens: z.number().int().positive().optional(),
+  executionPreference: executionPreferenceParam,
+  minPlacementEvidence: minPlacementEvidenceParam,
+  requiredCapabilities: requiredCapabilitiesParam,
+  priority: z.enum(["interactive", "normal", "background"]).optional(),
+  prompt: z.string().min(1).optional(),
+  messages: z.array(z.object({ role: z.enum(["system", "user", "assistant", "tool"]), content: z.string() }).passthrough()).min(1).optional(),
+  images: z.array(z.string().min(1)).min(1).optional(),
+  input: z.union([z.string().min(1), z.array(z.string().min(1)).min(1)]).optional(),
+  tools: z.array(z.record(z.unknown())).min(1).optional(),
+  keepAlive: z.string().min(1).optional(),
+  format: z.union([z.literal("json"), z.record(z.unknown())]).optional(),
+  think: z.union([z.boolean(), z.enum(["low", "medium", "high"])]).optional(),
+  options: z.record(z.unknown()).optional(),
+  logprobs: z.boolean().optional(),
+  topLogprobs: z.number().int().nonnegative().optional(),
+  minConfidence: minConfidenceParam,
+}).strict();
+
+export const batchItemParam = z.object({
+  id: z.string().min(1),
+  independent: z.literal(true),
+  task: batchTaskParam,
+}).strict();
+
+// Output schemas describe FreeLlama-owned decision envelopes while leaving Ollama-owned payloads
+// open. This gives a client useful validation without making a newly-added upstream response field
+// into a protocol failure.
+export const objectResultSchema = z.object({}).passthrough();
+export const doctorResultSchema = z.object({
+  summary: z.string().optional(), endpoint: z.string().optional(), scheduler: z.unknown().optional(),
+}).passthrough();
+export const sessionResultSchema = z.object({
+  session_id: z.string().optional(), deleted: z.boolean().optional(),
+}).passthrough();
+export const manageResultSchema = z.object({
+  status: z.string().optional(), progress: z.unknown().optional(),
+}).passthrough();
+export const deleteResultSchema = z.object({
+  deleted: z.string(),
+}).passthrough();
+export const modelsResultSchema = z.object({
+  models: z.array(z.record(z.unknown())).optional(), tags: z.array(z.record(z.unknown())).optional(), page: z.unknown().optional(),
+}).passthrough();
+export const taskResultSchema = z.object({
+  selected_model: z.string().optional(), context_window_fit: z.string().optional(), execution: z.unknown().optional(), response: z.unknown().optional(), telemetry: z.unknown().optional(),
+}).passthrough();
+export const batchResultSchema = z.object({
+  results: z.unknown().optional(), telemetry: z.unknown().optional(),
+}).passthrough();
+export const researchResultSchema = z.object({
+  answer: z.string(), summary: z.string(), citations: z.unknown().optional(), verification: z.unknown(), usage: z.unknown().optional(), telemetry: z.unknown().optional(),
+}).passthrough();
+
+export type ExternalCost = { model: string; input: number; output: number };
+
+/** Optional operator-owned rate card; partial or invalid configuration fails at server startup. */
+export function configuredExternalCost(env: NodeJS.ProcessEnv = process.env): ExternalCost | undefined {
+  const model = env.FREELLAMA_EXTERNAL_COST_MODEL;
+  const inputRaw = env.FREELLAMA_EXTERNAL_COST_INPUT_USD_PER_M;
+  const outputRaw = env.FREELLAMA_EXTERNAL_COST_OUTPUT_USD_PER_M;
+  if (model === undefined && inputRaw === undefined && outputRaw === undefined) return undefined;
+  const input = Number(inputRaw);
+  const output = Number(outputRaw);
+  if (!model?.trim() || !Number.isFinite(input) || input < 0 || !Number.isFinite(output) || output < 0) {
+    throw new Error(
+      "External cost telemetry requires FREELLAMA_EXTERNAL_COST_MODEL plus non-negative " +
+      "FREELLAMA_EXTERNAL_COST_INPUT_USD_PER_M and FREELLAMA_EXTERNAL_COST_OUTPUT_USD_PER_M.",
+    );
+  }
+  return { model, input, output };
+}
+
+type TokenUsage = { inputTokens: number | null; outputTokens: number | null; totalDurationNs?: number | null };
+
+/**
+ * Observed local token counts plus an opt-in, caller-configured external equivalent. Tokenizers,
+ * cached-input discounts, retries, electricity, and hardware amortization are deliberately not
+ * invented here, so this receipt is a reproducible comparison input rather than a false bill.
+ */
+export function costTelemetry(usage: TokenUsage, externalCost?: ExternalCost) {
+  const local = {
+    inputTokens: usage.inputTokens,
+    outputTokens: usage.outputTokens,
+    totalTokens: usage.inputTokens === null || usage.outputTokens === null ? null : usage.inputTokens + usage.outputTokens,
+    totalDurationNs: usage.totalDurationNs ?? null,
+  };
+  if (!externalCost || usage.inputTokens === null || usage.outputTokens === null) {
+    return {
+      local,
+      externalEquivalent: null,
+      note: externalCost
+        ? "External equivalent unavailable because Ollama did not report both input and output token counts."
+        : "No external rate card supplied; local usage is observed, but avoided external cost is not estimated.",
+    };
+  }
+  const inputUsd = (usage.inputTokens * externalCost.input) / 1_000_000;
+  const outputUsd = (usage.outputTokens * externalCost.output) / 1_000_000;
+  return {
+    local,
+    externalEquivalent: {
+      model: externalCost.model,
+      currency: "USD",
+      inputUsdPerMillion: externalCost.input,
+      outputUsdPerMillion: externalCost.output,
+      inputUsd,
+      outputUsd,
+      totalUsd: inputUsd + outputUsd,
+      assumption: "Same input/output token counts at the configured external rate; excludes cached-input pricing, external reasoning tokens, retries, local energy, and hardware cost.",
+    },
+    note: "External equivalent is a configured comparison estimate, not an observed provider bill or net local cost.",
+  };
+}
+
+export function withRequiredCapability<T extends string>(
+  required: readonly T[] | undefined,
+  capability: T,
+): T[] {
+  return [...new Set([...(required ?? []), capability])];
+}
+
 // Pretty-printing is easier for a model to read but is pure overhead once a payload is large:
 // a single 768-dim embedding measured 10,293 bytes compact vs 17,471 pretty — ~1,800 wasted
 // tokens of indentation for zero information. Stay pretty while it's cheap, go compact when it
@@ -259,11 +398,20 @@ export function serialize(value: unknown): string {
   return compact.length > PRETTY_PRINT_MAX_BYTES ? compact : JSON.stringify(value, null, 2);
 }
 
-// Results carry both `structuredContent` (the parsed object) and the serialized JSON as a text
-// block, per the spec's backwards-compatibility SHOULD. No `outputSchema` is declared — see below.
-export function structuredResult(value: Record<string, unknown>) {
+/** A short human/backward-client cue; canonical result data stays in structuredContent. */
+function resultSummary(value: Record<string, unknown>): string {
+  const explicit = value.summary;
+  if (typeof explicit === "string" && explicit.trim()) return clipText(explicit.trim(), 500);
+  const keys = Object.keys(value);
+  return `Structured result available (${keys.slice(0, 8).join(", ") || "empty object"}).`;
+}
+
+// MCP clients that understand structuredContent receive the canonical object. Repeating a large
+// JSON serialization in TextContent wastes agent context (especially doctor and raw model views),
+// so the text block is a compact compatibility cue rather than a second transport encoding.
+export function structuredResult(value: Record<string, unknown>, options: { legacyJson?: boolean } = {}) {
   return {
-    content: [{ type: "text" as const, text: serialize(value) }],
+    content: [{ type: "text" as const, text: options.legacyJson ? serialize(value) : resultSummary(value) }],
     structuredContent: value,
   };
 }
@@ -294,7 +442,17 @@ export function parsedResult(raw: string) {
 
 export function errorResult(error: unknown) {
   const message = error instanceof Error ? error.message : String(error);
-  return { content: [{ type: "text" as const, text: message }], isError: true };
+  // Native managed calls reach the local `freellama serve` process. A bare reqwest connection
+  // error makes an agent retry a tool that cannot work yet; keep the original diagnostic, but
+  // add the one safe recovery action. Do not do this for Ollama's direct endpoint errors: this
+  // MCP package does not own that process or its configuration.
+  const managedServeUnavailable =
+    /(?:connection refused|connect error|failed to connect|error sending request)/i.test(message) &&
+    /(?:_freellama|127\.0\.0\.1:11435|localhost:11435)/i.test(message);
+  const actionableMessage = managedServeUnavailable
+    ? `${message}\n\nFreeLlama managed serve is unreachable. Start it with \`freellama serve\`, or set \`FREELLAMA_SERVE_ENDPOINT\` to a running managed endpoint; then retry. Run \`doctor\` to inspect the configured endpoint.`
+    : message;
+  return { content: [{ type: "text" as const, text: actionableMessage }], isError: true };
 }
 
 const adapterCallSchema = z
@@ -348,12 +506,11 @@ export function parseAdapterResult(raw: string): AdapterResult {
   return adapterResultSchema.parse(JSON.parse(raw));
 }
 
-// Output schemas were removed deliberately. They cost ~1,086 tokens on EVERY request to buy
-// client-side JSON-Schema validation — and that validation was itself a hazard: a strict schema
-// turned any undeclared upstream field into a hard `McpError` (caught live when /api/show returned
-// an undocumented `requires` field). Verified against the SDK: `structuredContent` still reaches
-// the client with no `outputSchema` declared, so callers keep the parsed object and lose only the
-// validation. Reinstate per-tool if a consumer needs machine-checked output.
+// Every MCP tool declares a permissive object output boundary. That makes structuredContent
+// machine-declared without falsely freezing upstream Ollama fields: a strict schema previously
+// turned an undocumented /api/show `requires` field into a hard McpError. Compact, owned results
+// (for example doctor summary) can gain strict field schemas incrementally; proxy-shaped results
+// must remain forward-compatible.
 
 /**
  * Strip the raw embedding matrix out of a `run_task` result, leaving enough to verify the call

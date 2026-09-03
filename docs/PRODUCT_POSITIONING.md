@@ -46,7 +46,7 @@ flowchart LR
 [Ollama](https://docs.ollama.com/api/introduction) owns model execution and its API. FreeLlama
 owns the policy around managed use of that runtime. The [Model Context Protocol
 (MCP)](https://modelcontextprotocol.io/specification/2025-06-18/architecture) makes those controls
-available to compatible agent hosts as six bounded tools. Native Ollama requests can still pass
+available to compatible agent hosts as seven bounded tools. Native Ollama requests can still pass
 through unchanged to the primary upstream.
 
 See [FreeLlama architecture](ARCHITECTURE.md) for the complete responsibility and request-flow

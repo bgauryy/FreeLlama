@@ -2,7 +2,7 @@
 
 Choose models from local evidence, not model-card popularity. The measurements below come from one
 Apple M4 Pro machine with 48 GB unified memory and are not compiled into routing. Re-run
-`npx freellama doctor`, `models`, `bench-all`, and your quality suite on the target hardware.
+`npx @octocodeai/freellama doctor`, `models`, `bench-all`, and your quality suite on the target hardware.
 `doctor.machine.memory_bytes` is host RAM; a discrete GPU's usable VRAM must be observed separately.
 
 ```mermaid

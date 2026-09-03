@@ -8,10 +8,12 @@
  * need serve (:11435). delegate_research: adapter subprocess + Ollama (or the serve proxy).
  */
 import { type ChildProcess, execFile } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -30,7 +32,9 @@ import {
   DEFAULT_OLLAMA_FETCH_TIMEOUT_SECONDS,
   assertAllowedWorkspace,
 } from "./config.js";
-import { doctor, machine, listModels, route, runTaskRequest, SERVER_VERSION } from "./native.js";
+import {
+  doctor, machine, health, createSession, deleteSession, listModels, route, runTaskRequest, runTaskBatchRequest, SERVER_VERSION,
+} from "./native.js";
 import {
   ollamaFetch,
   ollamaPull,
@@ -38,6 +42,8 @@ import {
   endpointParam,
   ollamaEndpointParam,
   taskParam,
+  batchItemParam,
+  canonicalTaskKind,
   objectiveParam,
   executionPreferenceParam,
   minPlacementEvidenceParam,
@@ -50,11 +56,100 @@ import {
   errorResult,
   summarizeEmbeddings,
   extractExistingWorkspacePath,
+  withRequiredCapability,
+  objectResultSchema,
+  doctorResultSchema,
+  sessionResultSchema,
+  manageResultSchema,
+  deleteResultSchema,
+  modelsResultSchema,
+  taskResultSchema,
+  batchResultSchema,
+  researchResultSchema,
+  configuredExternalCost,
+  costTelemetry,
 } from "./helpers.js";
 import { parseModelSearch, parseModelTags } from "./model-search.js";
 import { MODEL_EVIDENCE, assessDelegatedAnswer } from "./delegate.js";
 
 const execFileAsync = promisify(execFile);
+
+type Page<T> = { items: T[]; returned: number; total: number; next_cursor: string | null };
+const EXTERNAL_COST = configuredExternalCost();
+
+/** Attach accounting after a successful managed response; the Rust layer remains provider-neutral. */
+function withTaskTelemetry(result: ReturnType<typeof parsedResult>) {
+  if (!("structuredContent" in result)) return result;
+  const payload = result.structuredContent as Record<string, unknown>;
+  const metrics = payload.metrics as Record<string, unknown> | undefined;
+  return structuredResult({
+    ...payload,
+    telemetry: costTelemetry({
+      inputTokens: typeof metrics?.prompt_tokens === "number" ? metrics.prompt_tokens : null,
+      outputTokens: typeof metrics?.output_tokens === "number" ? metrics.output_tokens : null,
+      totalDurationNs: typeof metrics?.total_duration_ns === "number" ? metrics.total_duration_ns : null,
+    }, EXTERNAL_COST),
+  });
+}
+
+function withBatchTelemetry(result: ReturnType<typeof parsedResult>) {
+  if (!("structuredContent" in result)) return result;
+  const payload = result.structuredContent as Record<string, unknown>;
+  const rows = Array.isArray(payload.results) ? payload.results : [];
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let complete = 0;
+  const results = rows.map((row) => {
+    if (!row || typeof row !== "object") return row;
+    const item = row as Record<string, unknown>;
+    if (item.ok !== true || !item.response || typeof item.response !== "object") return item;
+    const response = item.response as Record<string, unknown>;
+    const metrics = response.metrics as Record<string, unknown> | undefined;
+    const input = typeof metrics?.prompt_tokens === "number" ? metrics.prompt_tokens : null;
+    const output = typeof metrics?.output_tokens === "number" ? metrics.output_tokens : null;
+    if (input !== null && output !== null) {
+      inputTokens += input;
+      outputTokens += output;
+      complete += 1;
+    }
+    return { ...item, response: { ...response, telemetry: costTelemetry({ inputTokens: input, outputTokens: output }, EXTERNAL_COST) } };
+  });
+  return structuredResult({
+    ...payload,
+    results,
+    telemetry: complete === rows.filter((row) => (row as Record<string, unknown>)?.ok === true).length
+      ? costTelemetry({ inputTokens, outputTokens }, EXTERNAL_COST)
+      : { local: null, externalEquivalent: null, note: "Batch aggregate unavailable because one or more successful items omitted token counts." },
+  });
+}
+
+/** Page a live list with an opaque cursor that refuses to continue after list drift. */
+function pageLiveList<T>(items: T[], limit: number | undefined, cursor: string | undefined, identity: (item: T) => string): Page<T> {
+  const pageSize = limit ?? 20;
+  const fingerprint = createHash("sha256").update(items.map(identity).join("\n")).digest("base64url").slice(0, 16);
+  let offset = 0;
+  if (cursor) {
+    try {
+      const parsed = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8")) as { offset?: unknown; fingerprint?: unknown };
+      if (!Number.isInteger(parsed.offset) || (parsed.offset as number) < 0 || parsed.fingerprint !== fingerprint) {
+        throw new Error("invalid or stale cursor");
+      }
+      offset = parsed.offset as number;
+    } catch {
+      throw new Error("`cursor` is invalid or the model list changed; restart without cursor.");
+    }
+  }
+  const page = items.slice(offset, offset + pageSize);
+  const nextOffset = offset + page.length;
+  return {
+    items: page,
+    returned: page.length,
+    total: items.length,
+    next_cursor: nextOffset < items.length
+      ? Buffer.from(JSON.stringify({ offset: nextOffset, fingerprint }), "utf8").toString("base64url")
+      : null,
+  };
+}
 
 // `delegate_research` spawns a python subprocess that can run for minutes. If this server goes
 // away first — client disconnect, Ctrl-C, a supervisor restart — an untracked child keeps a local
@@ -94,45 +189,63 @@ for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
 }
 
 
-const INSTRUCTIONS = `Use FreeLlama for governed local Ollama delegation. Playbook:
-skills/freellama/SKILL.md.
-
-Ownership: the caller owns task decomposition and concurrent independent calls. The operator owns
-endpoints, exact --cpu-model assignments, settings, and lifecycle approval. FreeLlama qualifies,
-routes only to eligible assigned backends, admits work, and returns receipts. Ollama plus the
-OS/driver load and execute runners on physical CPU/GPU; FreeLlama is not a hardware scheduler.
-
-Workflow: (1) doctor; if Ollama is unavailable, ask the user to install/start it, then stop.
-(2) Delegate embeddings, OCR/vision, bulk transforms, or grounded lookup past ~1k source tokens;
-keep tiny lookups, architecture/review judgment, and ambiguous synthesis with the caller.
-(3) Inspect models{view:"installed"} and models{view:"resident"}; never guess inventory or fit.
-(4) Prefer a qualified installed model; preview consequential work. (5) If none fits, ask for
-modality, quality, context, latency, privacy, disk/download, and memory constraints. Search
-models{view:"library"}, inspect exact tags and host-memory fit, present at most two, and ask approval
-for one exact tag and reported size before ollama_manage{action:"pull"}. Search or recommendation
-is never download permission. (6) Execute; assignment is not physical proof. Read
-execution.observation; warm with configured evidence, then use minPlacementEvidence:"observed"
-when processor placement is required. Only verified samples train feedback. Read verification and
-citations; discard an escalate result. delegate_research model turns are managed coding tasks.
-
-Known identifier: search directly. Files: delegate_research. run_task has no file access.
-minConfidence:"medium" refuses weak evidence; balanced/quality need policy evidence.`;
+const INSTRUCTIONS = `caller owns task decomposition; operator owns endpoints, exact --cpu-model assignments, lifecycle.
+Ollama plus the OS/driver run physical CPU/GPU.
+Efficient loop: models{view:"installed"}, then models{view:"resident"}; doctor only for runtime diagnosis. Preview consequential work before executing.
+delegate_research is only for narrow allowed-workspace research. Keep full diagnostics, raw embeddings, and long evidence out of active context; read freellama://docs/index on demand.
+ask approval for one exact tag and reported size before ollama_manage; search or recommendation is never download permission.
+run_task preview never executes; code_review aliases coding.
+Use requiredCapabilities:["tools"] to preview tool eligibility; omit preview and supply the payload to execute.
+Docs: freellama://docs/index.`;
 
 const server = new McpServer(
   { name: "freellama", version: SERVER_VERSION },
   { instructions: INSTRUCTIONS },
 );
 
+// Documentation is bundled at build time from the repository docs/ directory. Resources keep it
+// out of the always-present tool instruction budget while giving MCP clients an on-demand,
+// package-local operating manual after npm installation.
+const PACKAGED_DOCS_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "docs");
+if (!existsSync(PACKAGED_DOCS_DIR)) {
+  throw new Error(`FreeLlama MCP documentation is missing at ${PACKAGED_DOCS_DIR}; run the package build.`);
+}
+const packagedDocs = readdirSync(PACKAGED_DOCS_DIR)
+  .filter((name) => name.endsWith(".md"))
+  .sort();
+if (!packagedDocs.includes("INDEX.md")) {
+  throw new Error(`FreeLlama MCP documentation index is missing at ${PACKAGED_DOCS_DIR}/INDEX.md; run the package build.`);
+}
+for (const name of packagedDocs) {
+  const uri = `freellama://docs/${name === "INDEX.md" ? "index" : name.replace(/\.md$/, "")}`;
+  server.registerResource(
+    `freellama-docs-${name.toLowerCase().replace(/\.md$/, "")}`,
+    uri,
+    {
+      mimeType: "text/markdown",
+      description: name === "INDEX.md"
+        ? "Index of packaged FreeLlama operator and agent documentation. Read this first, then fetch one relevant document."
+        : `Packaged FreeLlama documentation: ${name}.`,
+    },
+    async () => ({
+      contents: [{ uri, mimeType: "text/markdown", text: await readFile(path.join(PACKAGED_DOCS_DIR, name), "utf8") }],
+    }),
+  );
+}
+
 server.registerTool(
   "doctor",
   {
-    description:
-      "Ollama health, 11 memory settings with effective defaults (unset ≠ off), chip/RAM. " +
-      "Warns if MAX_LOADED_MODELS is unset (cap is 3× GPU count). Run first on errors.",
-    inputSchema: { endpoint: ollamaEndpointParam, serveEndpoint: endpointParam },
+    description: "Use when: runtime/config diagnosis. Do not use when: model selection. Returns: compact summary by default; config/full are opt-in.",
+    inputSchema: {
+      endpoint: ollamaEndpointParam,
+      serveEndpoint: endpointParam,
+      view: z.enum(["summary", "scheduler", "config", "full"]).optional().describe("summary default; scheduler/config/full are verbose"),
+    },
+    outputSchema: doctorResultSchema,
     annotations: { readOnlyHint: true },
   },
-  async ({ endpoint, serveEndpoint }) => {
+  async ({ endpoint, serveEndpoint, view }) => {
     try {
       const report = parsedResult(await doctor(endpoint));
       if (!("structuredContent" in report)) return report;
@@ -151,7 +264,81 @@ server.registerTool(
             `freellama serve unreachable, so no machine profile: ${error instanceof Error ? error.message : String(error)}`;
         }
       }
-      return structuredResult(report.structuredContent);
+      try {
+        report.structuredContent.platform_health = JSON.parse(await health(serveEndpoint));
+      } catch (error) {
+        report.structuredContent.platform_health_unavailable =
+          `freellama serve unreachable: ${error instanceof Error ? error.message : String(error)}`;
+      }
+      const full = { ...report.structuredContent };
+      // `ollama_config.categories.memory_scheduler` is the canonical categorized form. The former
+      // flat `ollama_env_config` duplicated it (~25% of a live full doctor result), so keep it
+      // only in the internal derivation below and do not send it in verbose results.
+      const flatConfig = full.ollama_env_config as Record<string, unknown> | undefined;
+      delete full.ollama_env_config;
+      if (view === "config") {
+        return structuredResult({
+          status: "ok",
+          summary: "Categorized Ollama configuration; values are source-qualified, not endpoint/PID proof.",
+          endpoint: full.endpoint,
+          ollama_config: full.ollama_config,
+          ollama_env_config_source: full.ollama_env_config_source,
+          ollama_env_config_warning: full.ollama_env_config_warning,
+          host_runtime_signals: full.host_runtime_signals,
+        });
+      }
+      if ((view ?? "summary") === "full") return structuredResult(full);
+      const running = (full.running as { models?: unknown[] } | undefined)?.models ?? [];
+      const platformHealth = full.platform_health as Record<string, unknown> | undefined;
+      const compact = {
+        status: "ok",
+        summary: `Ollama ${String((full.version as Record<string, unknown> | undefined)?.version ?? "unknown")}; ${running.length} resident model(s).`,
+        endpoint: full.endpoint,
+        ollama: { endpoint: full.endpoint, version: full.version, resident_model_count: running.length },
+        machine: full.machine,
+        local_conservative_config_posture: full.local_conservative_config_posture,
+        host_runtime_signals: full.host_runtime_signals,
+        ...(view === "scheduler" ? {
+          scheduler: {
+            admission: platformHealth?.admission ?? null,
+            ollama_num_parallel: flatConfig?.OLLAMA_NUM_PARALLEL,
+            ollama_max_queue: flatConfig?.OLLAMA_MAX_QUEUE,
+            proof_level: "configured_and_snapshot_only; measure concurrent execution before claiming throughput",
+          },
+        } : {}),
+        evidence: { runtime: "ollama_api_version_and_ps", configuration: full.ollama_env_config_source },
+        next: view === "scheduler" ? "Use run_task preview for a per-task advisory receipt." : "Use models{view:\"installed\"} to select a local model.",
+      };
+      return structuredResult(compact);
+    } catch (error) {
+      return errorResult(error);
+    }
+  },
+);
+
+server.registerTool(
+  "session",
+  {
+    description:
+      "Use when: retaining model affinity. Do not use when: storing history or KV. " +
+      "Inputs: action, sessionId for delete. Returns: affinity handle or confirmation.",
+    inputSchema: {
+      action: z.enum(["create", "delete"]).describe("create | release"),
+      sessionId: z.string().uuid().optional().describe("delete only"),
+      endpoint: endpointParam,
+    },
+    outputSchema: sessionResultSchema,
+    annotations: { destructiveHint: false },
+  },
+  async ({ action, sessionId, endpoint }) => {
+    try {
+      if (action === "create") {
+        if (sessionId !== undefined) return errorResult(new Error("sessionId is only valid for action: delete."));
+        return structuredResult(JSON.parse(await createSession(endpoint)));
+      }
+      if (sessionId === undefined) return errorResult(new Error("action: delete requires sessionId."));
+      await deleteSession(endpoint, sessionId);
+      return structuredResult({ session_id: sessionId, deleted: true });
     } catch (error) {
       return errorResult(error);
     }
@@ -162,10 +349,9 @@ server.registerTool(
   "models",
   {
     description:
-      "Installed models, managed resident GPU/CPU split across both backends, one-model detail, " +
-      "raw /api/tags, or ollama.com " +
-      "library. Library is two steps: families, then model:\"<family>\" for tags and memory fit. " +
-      "Inspect installed/resident before searching. Downloads nothing and grants no pull permission.",
+      "Use when: inspecting models. Do not use when: executing or changing state; search never " +
+      "permits a pull. Inputs: one view and its fields. Returns: inventory/detail, placement, or candidates. " +
+      "Next: library family, then model:\"<family>\" for tags/fit.",
     inputSchema: {
       view: z
         .enum(["installed", "resident", "detail", "raw", "library"])
@@ -187,20 +373,22 @@ server.registerTool(
         .enum(["popular", "newest"])
         .optional()
         .describe('"library" step 1. default "popular" — prefer it'),
-      limit: z.number().int().positive().max(50).optional().describe('"library" step 1. default 10'),
+      limit: z.number().int().positive().max(50).optional().describe('"library" search or raw/tag page size; raw default 20'),
+      cursor: z.string().min(1).optional().describe('opaque continuation cursor for raw models or library tags'),
       endpoint: endpointParam,
       ollamaEndpoint: ollamaEndpointParam,
     },
+    outputSchema: modelsResultSchema,
     annotations: { readOnlyHint: true },
   },
-  async ({ view, model, includeVerbose, query, capabilities, order, limit, endpoint, ollamaEndpoint }) => {
+  async ({ view, model, includeVerbose, query, capabilities, order, limit, cursor, endpoint, ollamaEndpoint }) => {
     try {
       const selectedView = view ?? "installed";
-      if (
-        selectedView !== "library" &&
-        [query, capabilities, order, limit].some((value) => value !== undefined)
-      ) {
+      if (selectedView !== "library" && [query, capabilities, order].some((value) => value !== undefined)) {
         return errorResult(new Error(`view "${selectedView}" does not accept library search fields.`));
+      }
+      if (selectedView !== "library" && selectedView !== "raw" && [limit, cursor].some((value) => value !== undefined)) {
+        return errorResult(new Error(`view "${selectedView}" accepts neither pagination nor library search fields.`));
       }
       if (selectedView !== "detail" && includeVerbose !== undefined) {
         return errorResult(new Error('`includeVerbose` is valid only for view "detail".'));
@@ -211,7 +399,7 @@ server.registerTool(
       if (
         selectedView === "library" &&
         model &&
-        [query, capabilities, order, limit].some((value) => value !== undefined)
+        [query, capabilities, order].some((value) => value !== undefined)
       ) {
         return errorResult(
           new Error('Library step 2 accepts only `model` plus endpoint overrides; omit step-1 search fields.'),
@@ -219,8 +407,12 @@ server.registerTool(
       }
 
       switch (selectedView) {
-        case "raw":
-          return structuredResult((await ollamaFetch(ollamaEndpoint, "/api/tags")) as Record<string, unknown>);
+        case "raw": {
+          const raw = (await ollamaFetch(ollamaEndpoint, "/api/tags")) as Record<string, unknown>;
+          const models = Array.isArray(raw.models) ? raw.models : [];
+          const page = pageLiveList(models, limit, cursor, (model) => String((model as Record<string, unknown>).name ?? JSON.stringify(model)));
+          return structuredResult({ ...raw, models: page.items, page: { returned: page.returned, total: page.total, next_cursor: page.next_cursor } });
+        }
 
         case "resident": {
           const managed = parsedResult(await listModels(endpoint));
@@ -303,7 +495,7 @@ server.registerTool(
         }
 
         case "library":
-          return await libraryLookup({ model, query, capabilities, order, limit, endpoint, ollamaEndpoint });
+          return await libraryLookup({ model, query, capabilities, order, limit, cursor, endpoint, ollamaEndpoint });
 
         default:
           return parsedResult(await listModels(endpoint));
@@ -322,6 +514,7 @@ async function libraryLookup({
   capabilities,
   order,
   limit,
+  cursor,
   endpoint,
   ollamaEndpoint,
 }: {
@@ -330,6 +523,7 @@ async function libraryLookup({
   capabilities?: Array<"vision" | "tools" | "thinking" | "embedding" | "cloud">;
   order?: "popular" | "newest";
   limit?: number;
+  cursor?: string;
   endpoint?: string;
   ollamaEndpoint?: string;
 }) {
@@ -384,9 +578,10 @@ async function libraryLookup({
             ? sized.sort((a, b) => (a.sizeBytes ?? 0) - (b.sizeBytes ?? 0))[0]
             : sized.sort((a, b) => (b.sizeBytes ?? 0) - (a.sizeBytes ?? 0))[0]
           : undefined;
+        const tagPage = pageLiveList(annotated, limit, cursor, (tag) => tag.tag);
         return structuredResult({
           family,
-          page: `https://ollama.com/library/${encodeURIComponent(family)}`,
+          sourcePage: `https://ollama.com/library/${encodeURIComponent(family)}`,
           ...(tags.length === 0
             ? {
                 tagsUnavailable:
@@ -397,7 +592,8 @@ async function libraryLookup({
             : {}),
           machineMemoryBytes: memoryBytes,
           fitBudgetBytes: budget,
-          tags: annotated,
+          tags: tagPage.items,
+          page: { returned: tagPage.returned, total: tagPage.total, next_cursor: tagPage.next_cursor },
           recommendationUnavailable: budget
             ? undefined
             : "No machine profile (freellama serve unreachable), so memory fit could not be checked and no tag is recommended. Start serve, or read the sizes yourself.",
@@ -429,7 +625,7 @@ async function libraryLookup({
                     "This proves neither accelerator fit nor task quality; preview and benchmark before pulling.",
                   configure:
                     "Send an explicit num_ctx rather than inheriting Ollama's default, which is " +
-                    'VRAM-tiered and reaches 256K when Ollama reports at least 48 GiB of device memory. Use keepAlive:"0" for one-off ' +
+                    '4096 tokens by default unless the Ollama service or request sets num_ctx. Use keepAlive:"0" for one-off ' +
                     "calls so it does not hold memory after.",
                   caution:
                     "Do not co-resident large models until their combined runner sizes, contexts, " +
@@ -465,16 +661,15 @@ server.registerTool(
   "run_task",
   {
     description:
-      "Route and run chat, tools, embeddings, or vision on content you pass. preview:true = decide only. " +
-      "No file access — use delegate_research for that. balanced/quality need a policy; fastest " +
-      "does not. Images require an explicit tested vision model. Needs serve.",
+      "Use when: routing or executing supplied content. Do not use when: workspace files must be read; use delegate_research. " +
+      "Preview consequential work first; it never generates. Returns: decision or response with receipts. Next: inspect structured observation and verification.",
     inputSchema: {
       endpoint: endpointParam,
       task: taskParam,
       objective: objectiveParam,
       model: z.string().min(1).optional().describe("Force this exact installed model name."),
       sessionId: z.string().min(1).optional().describe("Session id for model affinity across calls."),
-      contextTokens: z.number().int().positive().optional().describe("Minimum context window required."),
+      contextTokens: z.number().int().positive().optional().describe("Total Ollama context window (num_ctx), including input and output."),
       executionPreference: executionPreferenceParam,
       minPlacementEvidence: minPlacementEvidenceParam,
       requiredCapabilities: requiredCapabilitiesParam,
@@ -512,13 +707,20 @@ server.registerTool(
       options: z
         .record(z.unknown())
         .optional()
-        .describe("Advanced Ollama runtime options; num_ctx and num_gpu are routing-owned"),
+        .describe("Advanced Ollama options; num_ctx/contextTokens and num_gpu/placement are routing-owned. num_predict caps output."),
       logprobs: z.boolean().optional(),
       topLogprobs: z.number().int().nonnegative().optional().describe("Requires logprobs:true"),
       minConfidence: minConfidenceParam,
+      priority: z.enum(["interactive", "normal", "background"]).optional().describe("Admission class only; normal default. Fair scheduling prevents background starvation."),
       returnEmbeddings: z.boolean().optional().describe("false (default) withholds the raw vectors; they are large and unreadable to a model"),
-      preview: z.boolean().optional().describe("true = route decision only, no generation"),
+      preview: z
+        .boolean()
+        .optional()
+        .describe(
+          "true = routing fields only; rejects payloads and runtime controls; never executes",
+        ),
     },
+    outputSchema: taskResultSchema,
     annotations: { destructiveHint: false },
   },
   async ({
@@ -543,10 +745,43 @@ server.registerTool(
     logprobs,
     topLogprobs,
     minConfidence,
+    priority,
     returnEmbeddings,
     preview,
   }) => {
     try {
+      const canonicalTask = canonicalTaskKind(task);
+      if (preview) {
+        const executionOnlyFields = ([
+          ["prompt", prompt],
+          ["images", images],
+          ["messages", messages],
+          ["input", input],
+          ["tools", tools],
+          ["keepAlive", keepAlive],
+          ["format", format],
+          ["think", think],
+          ["options", options],
+          ["logprobs", logprobs],
+          ["topLogprobs", topLogprobs],
+          ["returnEmbeddings", returnEmbeddings],
+        ] satisfies Array<[string, unknown]>)
+          .filter(([, value]) => value !== undefined)
+          .map(([name]) => `\`${name}\``);
+        if (executionOnlyFields.length > 0) {
+          return errorResult(
+            new Error(
+              "`preview:true` accepts routing fields only; remove execution-only fields " +
+                `${executionOnlyFields.join(", ")}. Use \`requiredCapabilities:[\"tools\"]\` ` +
+                "to preview tool capability, then make a separate execution call with the payload.",
+            ),
+          );
+        }
+      }
+      const effectiveRequiredCapabilities =
+        tools === undefined
+          ? requiredCapabilities
+          : withRequiredCapability(requiredCapabilities, "tools");
       if (topLogprobs !== undefined && logprobs !== true) {
         return errorResult(new Error("`topLogprobs` requires `logprobs:true`."));
       }
@@ -580,7 +815,7 @@ server.registerTool(
       }
       if (preview) {
         const result = parsedResult(
-          await route(endpoint, task, objective, model, sessionId, contextTokens, requiredCapabilities, minConfidence, executionPreference, minPlacementEvidence),
+          await route(endpoint, canonicalTask, objective, model, sessionId, contextTokens, effectiveRequiredCapabilities, minConfidence, executionPreference, minPlacementEvidence),
         );
         if ("structuredContent" in result) {
           const refusal = belowConfidence(result.structuredContent, minConfidence);
@@ -596,8 +831,8 @@ server.registerTool(
         const decision = parsedResult(
           // minConfidence is forwarded so the CORE gate refuses, with its actionable message naming
         // the two commands that raise the grade. The belowConfidence() check below stays only as a
-        // fallback for servers older than the core gate.
-        await route(endpoint, task, objective, model, sessionId, contextTokens, requiredCapabilities, minConfidence, executionPreference, minPlacementEvidence),
+          // fallback for servers older than the core gate.
+        await route(endpoint, canonicalTask, objective, model, sessionId, contextTokens, effectiveRequiredCapabilities, minConfidence, executionPreference, minPlacementEvidence),
         );
         if ("structuredContent" in decision) {
           const refusal = belowConfidence(decision.structuredContent, minConfidence);
@@ -606,12 +841,12 @@ server.registerTool(
       }
       const result = parsedResult(
         await runTaskRequest(endpoint ?? DEFAULT_SERVE_ENDPOINT, {
-          task,
+          task: canonicalTask,
           objective: objective ?? "balanced",
           model,
           session_id: sessionId,
           context_tokens: contextTokens,
-          required_capabilities: requiredCapabilities ?? [],
+          required_capabilities: effectiveRequiredCapabilities ?? [],
           prompt,
           images,
           messages: messages ?? [],
@@ -619,6 +854,7 @@ server.registerTool(
           tools,
           keep_alive: keepAlive,
           min_confidence: minConfidence,
+          priority: priority ?? "normal",
           execution_preference: executionPreference ?? "auto",
           min_placement_evidence: minPlacementEvidence ?? "configured",
           request_options: {
@@ -632,9 +868,79 @@ server.registerTool(
       );
       if (!returnEmbeddings && "structuredContent" in result) {
         const trimmed = summarizeEmbeddings(result.structuredContent);
-        if (trimmed) return structuredResult(trimmed);
+        if (trimmed) return withTaskTelemetry(structuredResult(trimmed));
       }
-      return result;
+      return withTaskTelemetry(result);
+    } catch (error) {
+      return errorResult(error);
+    }
+  },
+);
+
+server.registerTool(
+  "run_task_batch",
+  {
+    description:
+      "Use when: independent work. Do not use when: dependencies. " +
+      "Inputs: [{id, independent:true, task}]; maxParallelism caps dispatch. Returns: ordered receipts.",
+    inputSchema: {
+      tasks: z.array(batchItemParam).min(1).max(64),
+      maxParallelism: z.number().int().positive().max(64).optional(),
+      endpoint: endpointParam,
+    },
+    outputSchema: batchResultSchema,
+    annotations: { destructiveHint: false },
+  },
+  async ({ tasks, maxParallelism, endpoint }) => {
+    try {
+      for (const item of tasks) {
+        const task = item.task as Record<string, unknown>;
+        if (task.task === "embedding") {
+          if (task.input === undefined || task.prompt !== undefined || task.messages !== undefined || task.tools !== undefined) {
+            return errorResult(new Error(`batch item ${item.id}: embedding requires input and accepts no chat payload.`));
+          }
+        } else if (task.input !== undefined || (task.prompt === undefined && task.messages === undefined)) {
+          return errorResult(new Error(`batch item ${item.id}: chat work requires prompt or messages and accepts no input.`));
+        }
+        if (task.images !== undefined && task.model === undefined) {
+          return errorResult(new Error(`batch item ${item.id}: images require an explicit tested vision model.`));
+        }
+      }
+      return withBatchTelemetry(parsedResult(await runTaskBatchRequest(endpoint ?? DEFAULT_SERVE_ENDPOINT, {
+        tasks: tasks.map((item) => {
+          const task = item.task as Record<string, unknown>;
+          return ({
+          id: item.id,
+          independent: item.independent,
+          task: {
+            task: task.task === "code_review" ? "coding" : task.task,
+            objective: (task as Record<string, unknown>).objective ?? "balanced",
+            model: task.model,
+            session_id: (task as Record<string, unknown>).sessionId,
+            context_tokens: (task as Record<string, unknown>).contextTokens,
+            execution_preference: (task as Record<string, unknown>).executionPreference ?? "auto",
+            min_placement_evidence: (task as Record<string, unknown>).minPlacementEvidence ?? "configured",
+            required_capabilities: (task as Record<string, unknown>).requiredCapabilities ?? [],
+            priority: task.priority ?? "normal",
+            prompt: task.prompt,
+            images: task.images,
+            messages: task.messages ?? [],
+            input: task.input,
+            tools: (task as Record<string, unknown>).tools,
+            keep_alive: (task as Record<string, unknown>).keepAlive,
+            min_confidence: (task as Record<string, unknown>).minConfidence,
+            request_options: {
+              format: task.format,
+              think: task.think,
+              options: task.options,
+              logprobs: task.logprobs,
+              top_logprobs: task.topLogprobs,
+            },
+          },
+        });
+        }),
+        max_parallelism: maxParallelism,
+      })));
     } catch (error) {
       return errorResult(error);
     }
@@ -648,8 +954,8 @@ server.registerTool(
   "ollama_manage",
   {
     description:
-      "pull: download after a human names the tag; streams percent. stop: free VRAM now. " +
-      "Not delete.",
+      "Use when: pulling an approved tag or stopping a loaded model. Do not use when: deleting/recommending. " +
+      "Inputs: action/model; timeoutSeconds is pull-only. Returns: lifecycle result. Next: inspect models.",
     inputSchema: {
       action: z.enum(["pull", "stop"]).describe('"pull" = disk, "stop" = memory'),
       model: z.string().min(1),
@@ -661,7 +967,8 @@ server.registerTool(
         .optional()
         .describe(`"pull" only. Defaults to ${DEFAULT_PULL_TIMEOUT_SECONDS}s.`),
     },
-    annotations: { destructiveHint: false, idempotentHint: true },
+    outputSchema: manageResultSchema,
+    annotations: { destructiveHint: false },
   },
   async ({ action, model, ollamaEndpoint, timeoutSeconds }) => {
     try {
@@ -693,13 +1000,14 @@ server.registerTool(
   "ollama_delete",
   {
     description:
-      "DESTRUCTIVE AND IRREVERSIBLE. Removes an installed model. Only after a human names this " +
-      "exact tag in the current conversation — never on an idle/staleness heuristic.",
+      "DESTRUCTIVE AND IRREVERSIBLE. Use when: a human requests one exact tag. Do not use when: freeing memory, " +
+      "cleaning by age, or inferring a tag. Inputs: exact tag. Returns: deleted tag. Next: refresh models.",
     inputSchema: {
       model: z.string().min(1),
       ollamaEndpoint: ollamaEndpointParam,
     },
-    annotations: { destructiveHint: true, idempotentHint: true },
+    outputSchema: deleteResultSchema,
+    annotations: { destructiveHint: true },
   },
   async ({ model, ollamaEndpoint }) => {
     try {
@@ -722,10 +1030,8 @@ server.registerTool(
   "delegate_research",
   {
     description:
-      "Narrow file-backed question under workspacePath. Returns answer, citations, and a " +
-      "verification verdict (accept/verify/escalate) from what the run did and which model ran. " +
-      "escalate = no files read, or the model is measured too weak. Best: 1–5 files, lookup not " +
-      "judgment. Retry one transient/model-format error once; do not retry permission or config errors unchanged.",
+      "Use when: a narrow lookup needs an allowed workspace. Do not use when: mutation, broad judgment, or outside-workspace facts are needed. " +
+      "Pages tool evidence instead of flooding caller context. Returns: answer, citations, evidence, verdict. Next: verify or escalate yourself.",
     inputSchema: {
       question: z.string().min(1).describe("narrow and self-contained, answerable by reading files"),
       workspacePath: z
@@ -744,11 +1050,12 @@ server.registerTool(
       endpoint: endpointParam,
       executionPreference: executionPreferenceParam,
       minPlacementEvidence: minPlacementEvidenceParam,
+      legacyText: z.boolean().optional().describe("false default: compact text cue; true: legacy serialized JSON text"),
       agent: z
         .object({
           maxTurns: z.number().int().positive().optional(),
-          contextTokens: z.number().int().positive().optional(),
-          outputTokens: z.number().int().positive().optional(),
+          contextTokens: z.number().int().positive().optional().describe("Total agent context; input reserves outputTokens and safety margin."),
+          outputTokens: z.number().int().positive().optional().describe("Maximum generated tokens per model call; reserved from context."),
           temperature: z.number().nonnegative().optional(),
           seed: z.number().int().nonnegative().optional(),
           think: z.boolean().optional(),
@@ -774,11 +1081,12 @@ server.registerTool(
             .optional(),
         })
         .optional()
-        .describe("Per-call adapter, decoding, retry, and compaction overrides."),
+        .describe("Per-call agent budget, recovery, and compaction controls."),
     },
+    outputSchema: researchResultSchema,
     annotations: { destructiveHint: false },
   },
-  async ({ question, workspacePath, adapter, model, endpoint, executionPreference, minPlacementEvidence, agent }) => {
+  async ({ question, workspacePath, adapter, model, endpoint, executionPreference, minPlacementEvidence, legacyText, agent }) => {
     const chosenAdapter: ResearchAdapter = adapter ?? DEFAULT_RESEARCH_ADAPTER;
     const chosenModel = model ?? DEFAULT_DELEGATE_MODEL;
     let resolvedWorkspace: string;
@@ -797,6 +1105,7 @@ server.registerTool(
         answer: "",
         toolCallCount: 0,
         usage: { inputTokens: null, outputTokens: null },
+        telemetry: costTelemetry({ inputTokens: null, outputTokens: null }, EXTERNAL_COST),
         evidence: [],
         summary:
           `Refused before running: ${chosenModel} is measured unusable for research here ` +
@@ -907,7 +1216,8 @@ server.registerTool(
       // whichever adapter ran.
       const evidence = result.tool_calls.map((call, index) => {
         const target = call.arguments?.queries?.path;
-        const detail = call.arguments?.command ?? null;
+        const rawDetail = call.arguments?.command ?? null;
+        const detail = rawDetail ? clipText(rawDetail, 400) : null;
         return {
           step: index + 1,
           tool: call.arguments?.tool ?? call.raw_name ?? "?",
@@ -921,13 +1231,13 @@ server.registerTool(
               ? extractExistingWorkspacePath(detail, resolvedWorkspace)
               : null,
           detail,
+          detail_truncated: rawDetail !== detail,
         };
       });
       const succeeded = evidence.filter((step) => step.status === "ok");
       const failed = evidence.length - succeeded.length;
-      // `evidence[].detail` above is the FULL command, deliberately unclipped: the structured half
-      // exists to be audited, and a command cut mid-flag cannot be. Only the prose line below is
-      // clipped, and it says how much it dropped.
+      // Commands can be arbitrarily long and are not reasoning-relevant by themselves. Keep a
+      // marked excerpt in both halves; the cited path and tool remain enough to spot-check source.
       const evidenceText = evidence
         .map(
           (step) =>
@@ -944,6 +1254,7 @@ server.registerTool(
         tool: step.tool,
         path: step.path,
         command: step.detail,
+        command_truncated: step.detail_truncated,
       }));
       if (adapterError) {
         return errorResult(
@@ -957,23 +1268,11 @@ server.registerTool(
       // how many of them there were.
       const verification = assessDelegatedAnswer(question, succeeded.length, chosenModel);
       const summary =
-        `${result.final_answer}\n\n` +
-        `[delegated: ${result.tool_calls.length} tool call(s)` +
+        `Delegated answer ready: ${result.tool_calls.length} tool call(s)` +
         (failed > 0 ? `, ${failed} of which did not succeed` : "") +
-        `, ` +
-        `${result.usage.input_tokens ?? "?"} input / ${result.usage.output_tokens ?? "?"} ` +
-        "output tokens spent on the local model]\n" +
-        (evidenceText
-          ? `Evidence trail:\n${evidenceText}`
-          : "No tool calls were made — treat this answer as unverified.") +
-        `\n\nVerification: ${verification.recommendation.toUpperCase()} — ${verification.why}`;
-      // Deliberate deviation from the spec's "SHOULD also return the serialized JSON in a text
-      // block": the text block keeps the composed prose summary, because that is what a reading
-      // model actually consumes, and the same summary is carried in `structuredContent.summary`
-      // so nothing is lost to a client that only reads the structured half.
-      return {
-        content: [{ type: "text" as const, text: summary }],
-        structuredContent: {
+        `; ${result.usage.input_tokens ?? "?"} input / ${result.usage.output_tokens ?? "?"} output local tokens; ` +
+        `verification=${verification.recommendation}. Read structuredContent.answer and citations.`;
+      const payload = {
           adapter: chosenAdapter,
           verification,
           answer: result.final_answer,
@@ -986,6 +1285,10 @@ server.registerTool(
             inputTokens: result.usage.input_tokens,
             outputTokens: result.usage.output_tokens,
           },
+          telemetry: costTelemetry({
+            inputTokens: result.usage.input_tokens ?? null,
+            outputTokens: result.usage.output_tokens ?? null,
+          }, EXTERNAL_COST),
           contextManagement: result.model_metadata?.context_management ?? null,
           execution: {
             preference: executionPreference ?? "auto",
@@ -994,8 +1297,8 @@ server.registerTool(
           },
           evidence,
           summary,
-        },
-      };
+        };
+      return structuredResult(payload, { legacyJson: legacyText === true });
     } catch (error) {
       return errorResult(error);
     } finally {

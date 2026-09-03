@@ -14,6 +14,31 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+const OLLAMA_CONFIG_SETTING_NAMES: [&str; 21] = [
+    "OLLAMA_DEBUG",
+    "OLLAMA_HOST",
+    "OLLAMA_CONTEXT_LENGTH",
+    "OLLAMA_KEEP_ALIVE",
+    "OLLAMA_MAX_LOADED_MODELS",
+    "OLLAMA_MAX_TRANSFER_STREAMS",
+    "OLLAMA_MAX_QUEUE",
+    "OLLAMA_MODELS",
+    "OLLAMA_NO_CLOUD",
+    "OLLAMA_NOPRUNE",
+    "OLLAMA_ORIGINS",
+    "OLLAMA_SCHED_SPREAD",
+    "OLLAMA_FLASH_ATTENTION",
+    "OLLAMA_KV_CACHE_TYPE",
+    "OLLAMA_LLM_LIBRARY",
+    "OLLAMA_GPU_OVERHEAD",
+    "OLLAMA_IGPU_ENABLE",
+    "OLLAMA_LOAD_TIMEOUT",
+    "LLAMA_ARG_FIT",
+    "LLAMA_ARG_FIT_TARGET",
+    // `OLLAMA_NUM_PARALLEL` is deliberately last only to keep the list grouped by the help text.
+    "OLLAMA_NUM_PARALLEL",
+];
+
 pub mod model_bench;
 #[cfg(feature = "napi")]
 #[allow(unsafe_code)]
@@ -584,6 +609,111 @@ fn ollama_environment_source() -> &'static str {
     }
 }
 
+/// Extract only documented Ollama configuration variables from a `ps eww` command string.
+///
+/// The command string may contain every environment variable of an application.  Keeping a
+/// strict allow-list here is intentional: `doctor` must never turn process inspection into a
+/// generic environment dumper.  Values with whitespace are not valid for these settings in the
+/// documented service configuration, so whitespace tokenization also prevents a malformed value
+/// from swallowing adjacent process data.
+#[must_use]
+pub fn parse_ollama_process_environment(command: &str) -> BTreeMap<String, String> {
+    command
+        .split_whitespace()
+        .filter_map(|token| token.split_once('='))
+        .filter(|(name, value)| {
+            OLLAMA_CONFIG_SETTING_NAMES.contains(name) && !value.trim().is_empty()
+        })
+        .map(|(name, value)| (name.to_owned(), value.to_owned()))
+        .collect()
+}
+
+fn endpoint_is_loopback(endpoint: &str) -> bool {
+    reqwest::Url::parse(endpoint)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .is_some_and(|host| host == "localhost" || host == "::1" || host.starts_with("127."))
+}
+
+/// Inspect the environment of one locally-running Ollama serve process when macOS permits it.
+///
+/// This is deliberately a *separate* diagnostic from `ollama_environment_getenv`: the latter is
+/// a configuration hint, whereas this records what the current user can observe in a process.
+/// It is never attempted for a non-loopback endpoint and it reports ambiguity rather than picking
+/// a process when more than one candidate is running.  Other platforms return an explicit
+/// unsupported status instead of implying their process model is equivalent to macOS.
+fn local_ollama_process_environment(endpoint: &str) -> Value {
+    if !endpoint_is_loopback(endpoint) {
+        return json!({
+            "status": "not_attempted",
+            "reason": "endpoint is not loopback; local process inspection cannot establish the configuration of a remote service",
+        });
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        return json!({
+            "status": "unsupported_platform",
+            "reason": "same-user Ollama process inspection is currently implemented only for macOS",
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let Ok(listing) = Command::new("ps").args(["-axo", "pid=,command="]).output() else {
+            return json!({ "status": "unavailable", "reason": "could not list same-user processes" });
+        };
+        if !listing.status.success() {
+            return json!({ "status": "unavailable", "reason": "same-user process listing failed" });
+        }
+
+        let listing = String::from_utf8_lossy(&listing.stdout);
+        let candidates: Vec<&str> = listing
+            .lines()
+            .filter(|line| {
+                line.contains("/ollama") && line.split_whitespace().any(|token| token == "serve")
+            })
+            .collect();
+        if candidates.is_empty() {
+            return json!({ "status": "unavailable", "reason": "no same-user Ollama serve process found" });
+        }
+        if candidates.len() != 1 {
+            return json!({
+                "status": "ambiguous",
+                "reason": "multiple same-user Ollama serve processes found; refusing to attribute one process environment to this endpoint",
+                "candidate_count": candidates.len(),
+            });
+        }
+
+        let Some(pid) = candidates[0].split_whitespace().next() else {
+            return json!({ "status": "unavailable", "reason": "could not parse Ollama process id" });
+        };
+        let Ok(details) = Command::new("ps")
+            .args(["eww", "-p", pid, "-o", "command="])
+            .output()
+        else {
+            return json!({ "status": "unavailable", "reason": "could not inspect the observed Ollama process" });
+        };
+        if !details.status.success() {
+            return json!({ "status": "unavailable", "reason": "same-user Ollama process inspection failed" });
+        }
+        let settings = parse_ollama_process_environment(&String::from_utf8_lossy(&details.stdout));
+        let not_observed: Vec<&str> = OLLAMA_CONFIG_SETTING_NAMES
+            .iter()
+            .copied()
+            .filter(|name| !settings.contains_key(*name))
+            .collect();
+        json!({
+            "status": "observed",
+            "scope": "one same-user macOS process whose command is ollama serve; endpoint-to-PID association is not provable from ps",
+            "pid": pid,
+            "settings": settings,
+            "not_observed_setting_names": not_observed,
+            "note": "Only the 21 documented configuration names are read. A name not observed was not passed in this process environment; it can still have an Ollama default or be configured through another mechanism.",
+        })
+    }
+}
+
 /// Advise when `OLLAMA_MAX_LOADED_MODELS` is unset.
 ///
 /// The `0` that `envconfig/config.go` declares as this variable's default is a *sentinel*, not an
@@ -690,7 +820,7 @@ where
         "OLLAMA_NUM_PARALLEL": {
             "value": getenv("OLLAMA_NUM_PARALLEL"),
             "effective_default": "1",
-            "note": "Memory scales by OLLAMA_NUM_PARALLEL x context length — raising it multiplies KV-cache memory, it does not just add scheduling slots. At the default of 1, FreeLlama's SHARED resident permits cannot create parallel decoding within the same Ollama backend: measured here, Ollama serializes two concurrent requests against one resident model, producing only 1.12x. Separate CPU and GPU Ollama processes can still overlap through FreeLlama's independent backend admission pools. Raise this only for same-backend overlap, and pair it with OLLAMA_KV_CACHE_TYPE=q8_0 so the extra KV cache roughly pays for itself.",
+            "note": "Memory scales by OLLAMA_NUM_PARALLEL x context length — raising it multiplies KV-cache memory, it does not just add scheduling slots. Repository benchmark evidence (not a current-host observation) found that a same-backend OLLAMA_NUM_PARALLEL=1 serializes work: SHARED resident admission permits cannot defeat it. Verify actual overlap with your model and host. Separate CPU and GPU Ollama processes can still overlap through FreeLlama's independent backend admission pools. Raise this only for measured same-backend overlap, and qualify any KV-cache change before rollout.",
         },
         "OLLAMA_KEEP_ALIVE": {
             "value": getenv("OLLAMA_KEEP_ALIVE"),
@@ -698,13 +828,13 @@ where
         },
         "OLLAMA_CONTEXT_LENGTH": {
             "value": getenv("OLLAMA_CONTEXT_LENGTH"),
-            "effective_default": "VRAM-tiered: 4k under 24GiB, 32k for 24-48GiB, 256k at 48GiB+",
+            "effective_default": "4096 tokens (Ollama 0.33.x FAQ; override with OLLAMA_CONTEXT_LENGTH)",
             "note": "The single largest memory lever. FreeLlama's own routing always sends an explicit num_ctx, so tasks routed through `serve` are unaffected — but anything talking to Ollama directly inherits this default.",
         },
         "OLLAMA_KV_CACHE_TYPE": {
             "value": getenv("OLLAMA_KV_CACHE_TYPE"),
             "effective_default": "f16",
-            "note": "q8_0 roughly halves KV-cache memory for a given context length; Ollama describes the precision loss as very small and recommends q8_0 when memory pressure matters. It still changes a process-wide numerical setting, so qualify model quality before rollout. It needs flash attention, which is auto-enabled on supported backends (Metal included). Prefix KV-cache reuse is real and measured here (a warm 2,462-token prefix re-served in 281ms vs 18,631ms cold), so halving KV memory can double cacheable context and reduce cache-invalidating compaction.",
+            "note": "q8_0 roughly halves KV-cache memory for a given context length; Ollama describes the precision loss as very small, but the quality effect is model and task dependent. It is process-wide, so qualify model quality before rollout. It needs Flash Attention, which is automatic on supported backends. Repository benchmark evidence (not a current-host observation) found prefix reuse can materially reduce warm-prefix latency; validate it on the deployed model before sizing context or cache policy.",
         },
         "OLLAMA_FLASH_ATTENTION": {
             "value": getenv("OLLAMA_FLASH_ATTENTION"),
@@ -738,6 +868,264 @@ where
             "note": "Target free VRAM margin per device, in MiB, that the automatic fit above aims to leave. On unified memory this is headroom taken from the same pool the OS and everything else uses, which is why Ollama's own loader also refuses a model predicted past 80% of free memory (server/sched.go).",
         },
     })
+}
+
+/// Build the version-labelled, categorized Ollama configuration diagnostic.
+///
+/// `ollama_env_advisories` intentionally remains the backwards-compatible flat view of the eleven
+/// memory controls. This report adds the other production-relevant variables advertised by the
+/// detected Ollama 0.33 generation, grouped by operational purpose. The detected server version is
+/// included because Ollama's environment surface changes over time; this is a known-setting audit,
+/// not a claim that every listed variable exists in every past or future release.
+///
+/// Values come only from the injected best-effort environment reader. No process memory, command
+/// line, log, credential store, or unrelated environment variable is inspected.
+pub fn ollama_config_diagnostics<F>(server_version: &str, getenv: F) -> Value
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let memory_scheduler = ollama_env_advisories(&getenv);
+    json!({
+        "server_version": server_version,
+        "coverage": {
+            "known_settings": 21,
+            "basis": "production-relevant environment variables advertised by Ollama 0.33.x `ollama serve --help`",
+            "version_note": "Ollama adds and removes settings across releases; compare this known-setting audit with the detected version's `ollama serve --help` after an upgrade.",
+        },
+        "visibility_note": "Best-effort values cannot prove the environment of a separately launched Ollama service or remote endpoint; null means not visible, not necessarily unset.",
+        "categories": {
+            "memory_scheduler": memory_scheduler,
+            "network_security": {
+                "OLLAMA_HOST": {
+                    "value": getenv("OLLAMA_HOST"),
+                    "effective_default": "127.0.0.1:11434 (loopback only)",
+                    "note": "Binding to a non-loopback address expands the trust boundary. Put authentication and transport security in front of Ollama before exposing it beyond the host.",
+                },
+                "OLLAMA_ORIGINS": {
+                    "value": getenv("OLLAMA_ORIGINS"),
+                    "effective_default": "Ollama's built-in local application origins",
+                    "note": "Additional browser origins expand which web pages may call Ollama. Keep this list explicit and narrow; the value is configuration, not an authentication mechanism.",
+                },
+            },
+            "privacy": {
+                "OLLAMA_NO_CLOUD": {
+                    "value": getenv("OLLAMA_NO_CLOUD"),
+                    "effective_default": "false — Ollama cloud features are available",
+                    "note": "Set to 1 when the deployment contract requires local-only inference and no Ollama web-search or remote-inference features.",
+                },
+            },
+            "storage_lifecycle": {
+                "OLLAMA_MODELS": {
+                    "value": getenv("OLLAMA_MODELS"),
+                    "effective_default": "$HOME/.ollama/models on macOS/Linux; %USERPROFILE%\\.ollama\\models on Windows",
+                    "note": "Controls model-blob placement. Ensure the service account has sufficient disk capacity and permissions; this path may differ from the interactive user's model store.",
+                },
+                "OLLAMA_NOPRUNE": {
+                    "value": getenv("OLLAMA_NOPRUNE"),
+                    "effective_default": "false — unused model blobs may be pruned on startup",
+                    "note": "Set only when retaining otherwise-unused blobs is intentional and disk growth is monitored.",
+                },
+            },
+            "backend_device": {
+                "OLLAMA_LLM_LIBRARY": {
+                    "value": getenv("OLLAMA_LLM_LIBRARY"),
+                    "effective_default": "auto — detect the best available backend library",
+                    "note": "Override only for a diagnosed backend problem or deliberate CPU isolation; request-level num_gpu=0 remains the stronger per-request CPU-routing control.",
+                },
+                "OLLAMA_SCHED_SPREAD": {
+                    "value": getenv("OLLAMA_SCHED_SPREAD"),
+                    "effective_default": "false — Ollama chooses model placement",
+                    "note": "When enabled, Ollama spreads a model across all GPUs. Leave disabled on single-GPU hosts and measure memory and latency before enabling on multi-GPU hosts.",
+                },
+                "OLLAMA_IGPU_ENABLE": {
+                    "value": getenv("OLLAMA_IGPU_ENABLE"),
+                    "effective_default": "false",
+                    "note": "Enables integrated-GPU discovery on releases that support this setting. Availability and benefit are hardware- and Ollama-version-dependent.",
+                },
+            },
+            "operations": {
+                "OLLAMA_MAX_TRANSFER_STREAMS": {
+                    "value": getenv("OLLAMA_MAX_TRANSFER_STREAMS"),
+                    "effective_default": "4",
+                    "note": "Limits parallel safetensors pull/push transfer streams; it does not control inference concurrency.",
+                },
+                "OLLAMA_DEBUG": {
+                    "value": getenv("OLLAMA_DEBUG"),
+                    "effective_default": "false",
+                    "note": "Enable temporarily for diagnosis. Debug output can be verbose and should be reviewed under the deployment's log-retention and privacy policy.",
+                },
+            },
+        },
+    })
+}
+
+fn config_hint(config: &Value, name: &str) -> Option<Value> {
+    config["categories"]
+        .as_object()?
+        .values()
+        .find_map(|category| {
+            category
+                .get(name)
+                .and_then(|entry| entry.get("value"))
+                .cloned()
+        })
+}
+
+fn posture_value(
+    config: &Value,
+    observed_process: &Value,
+    name: &str,
+) -> (Option<String>, &'static str) {
+    if observed_process["status"] == "observed"
+        && let Some(value) = observed_process["settings"][name].as_str()
+    {
+        return (Some(value.to_owned()), "observed_process");
+    }
+    (
+        config_hint(config, name).and_then(|value| value.as_str().map(str::to_owned)),
+        "configuration_hint",
+    )
+}
+
+/// Assess a portable, conservative starting profile without changing an Ollama process.
+///
+/// This is deliberately not an auto-tuner. The profile contains only settings whose safe starting
+/// value does not depend on a particular model, GPU vendor, or benchmark result. A caller still
+/// qualifies K/V quantization, expanded context, and same-model parallelism on its own workload.
+#[must_use]
+pub fn local_conservative_config_posture(config: &Value, observed_process: &Value) -> Value {
+    let rule = |name: &str, target: &str, status: &str, note: &str| {
+        let (value, source) = posture_value(config, observed_process, name);
+        json!({
+            "observed_or_hint": value,
+            "source": source,
+            "target": target,
+            "status": status,
+            "note": note,
+        })
+    };
+    let (no_cloud, _) = posture_value(config, observed_process, "OLLAMA_NO_CLOUD");
+    let (max_loaded, _) = posture_value(config, observed_process, "OLLAMA_MAX_LOADED_MODELS");
+    let (parallel, _) = posture_value(config, observed_process, "OLLAMA_NUM_PARALLEL");
+    let (queue, _) = posture_value(config, observed_process, "OLLAMA_MAX_QUEUE");
+    let (context, _) = posture_value(config, observed_process, "OLLAMA_CONTEXT_LENGTH");
+    let (flash, _) = posture_value(config, observed_process, "OLLAMA_FLASH_ATTENTION");
+    let (kv_cache, _) = posture_value(config, observed_process, "OLLAMA_KV_CACHE_TYPE");
+
+    let no_cloud_status = if matches!(no_cloud.as_deref(), Some("1" | "true" | "TRUE")) {
+        "ready"
+    } else {
+        "action_required"
+    };
+    let max_loaded_status = match max_loaded.as_deref() {
+        Some("1") => "ready",
+        Some(_) => "review",
+        None => "recommended",
+    };
+    let parallel_status = match parallel.as_deref() {
+        None | Some("1") => "ready",
+        Some(_) => "review",
+    };
+    let queue_status = match queue.as_deref().and_then(|value| value.parse::<u64>().ok()) {
+        Some(value) if (1..=16).contains(&value) => "ready",
+        Some(_) => "review",
+        None => "recommended",
+    };
+    let context_status = if context.is_none() { "ready" } else { "review" };
+    let flash_status = match flash.as_deref() {
+        Some("0") => "review",
+        _ => "ready",
+    };
+    let kv_status = match kv_cache.as_deref() {
+        None | Some("f16") => "ready",
+        Some("q8_0" | "q4_0") => "qualified_only",
+        Some(_) => "review",
+    };
+    let overall = if no_cloud_status == "action_required" {
+        "action_required"
+    } else if [
+        max_loaded_status,
+        parallel_status,
+        queue_status,
+        context_status,
+        flash_status,
+        kv_status,
+    ]
+    .iter()
+    .any(|status| *status != "ready")
+    {
+        "review_required"
+    } else {
+        "ready"
+    };
+
+    json!({
+        "profile": "local-conservative-v1",
+        "overall": overall,
+        "scope": "portable local-only starter profile, not a hardware or quality benchmark result",
+        "settings": {
+            "OLLAMA_NO_CLOUD": rule("OLLAMA_NO_CLOUD", "1", no_cloud_status, "FreeLlama local-only deployments must disable Ollama cloud features."),
+            "OLLAMA_MAX_LOADED_MODELS": rule("OLLAMA_MAX_LOADED_MODELS", "1", max_loaded_status, "Start with one resident model per process; raise only after measured concurrent-fit validation."),
+            "OLLAMA_NUM_PARALLEL": rule("OLLAMA_NUM_PARALLEL", "1", parallel_status, "Raise only after validating the multiplied context/KV memory and tail latency."),
+            "OLLAMA_MAX_QUEUE": rule("OLLAMA_MAX_QUEUE", "1-16", queue_status, "Keep Ollama's internal backlog finite; FreeLlama admission is a separate queue."),
+            "OLLAMA_CONTEXT_LENGTH": rule("OLLAMA_CONTEXT_LENGTH", "unset (Ollama default 4096)", context_status, "Use per-request num_ctx for managed work; qualify any global override."),
+            "OLLAMA_FLASH_ATTENTION": rule("OLLAMA_FLASH_ATTENTION", "auto", flash_status, "Ollama enables it automatically on supported backends; forcing it is not a performance claim."),
+            "OLLAMA_KV_CACHE_TYPE": rule("OLLAMA_KV_CACHE_TYPE", "f16", kv_status, "q8_0/q4_0 are process-wide quality-versus-memory choices and require workload qualification."),
+        },
+        "apply": {
+            "mutates_nothing": true,
+            "macos": "Set approved variables with launchctl setenv, restart Ollama.app, then rerun doctor.",
+            "linux": "Set approved variables in the Ollama systemd service environment, restart it, then rerun doctor.",
+            "windows": "Set approved variables for the Ollama user service, restart it, then rerun doctor.",
+        },
+    })
+}
+
+/// Reduce macOS `pmset -g therm` output to a narrow, non-sensitive thermal status.
+#[must_use]
+pub fn parse_macos_thermal_status(output: &str) -> Value {
+    if output.contains("No thermal warning level has been recorded") {
+        return json!({ "status": "normal" });
+    }
+    if let Some(level) = output
+        .lines()
+        .find(|line| line.to_ascii_lowercase().contains("thermal warning level"))
+        .and_then(|line| line.rsplit_once(':').map(|(_, value)| value.trim()))
+        .filter(|level| !level.is_empty())
+    {
+        return json!({ "status": "warning", "level": level });
+    }
+    json!({ "status": "unknown" })
+}
+
+fn host_runtime_signals() -> Value {
+    #[cfg(target_os = "macos")]
+    {
+        let thermal = Command::new("pmset")
+            .args(["-g", "therm"])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map_or_else(
+                || json!({ "status": "unavailable" }),
+                |output| parse_macos_thermal_status(&String::from_utf8_lossy(&output.stdout)),
+            );
+        json!({
+            "snapshot": "collected during doctor",
+            "thermal": { "source": "pmset -g therm", "data": thermal, "permission": "unprivileged" },
+            "gpu_memory": { "status": "unavailable", "reason": "macOS does not expose a stable per-process free-VRAM contract for Apple unified memory" },
+            "power": { "status": "unavailable", "reason": "powermetrics may provide richer data but requires explicit elevated operator access" },
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        json!({
+            "snapshot": "not_collected",
+            "thermal": { "status": "unsupported", "reason": "no cross-platform thermal provider is enabled" },
+            "gpu_memory": { "status": "unsupported", "reason": "install a vendor-specific telemetry provider; never infer free VRAM from host RAM" },
+            "power": { "status": "unsupported", "reason": "no cross-platform power provider is enabled" },
+        })
+    }
 }
 
 /// Query the diagnostic endpoints required by the harness.
@@ -785,14 +1173,18 @@ pub async fn doctor(endpoint: &str) -> Result<Value> {
         diagnostic.resolved_path = resolved_path.map(|path| path.display().to_string());
         Some(diagnostic)
     });
-    let env_config = ollama_env_advisories(ollama_environment_getenv);
+    let categorized_config = ollama_config_diagnostics(server_version, ollama_environment_getenv);
+    let observed_process_environment = local_ollama_process_environment(endpoint);
+    let local_conservative_posture =
+        local_conservative_config_posture(&categorized_config, &observed_process_environment);
+    let env_config = categorized_config["categories"]["memory_scheduler"].clone();
     // Read the value back out of the table rather than probing the selected environment source a
     // second time, so the advisory and reported value cannot disagree.
     let ollama_env_config_warning =
         max_loaded_models_advisory(env_config["OLLAMA_MAX_LOADED_MODELS"]["value"].as_str());
-    // Previously only 3 of Ollama's 16 `OLLAMA_*` variables were reported, and the three that
-    // dominate memory were not among them. Each entry below carries its effective default, because
-    // A missing best-effort value can mean "Ollama picks" or that a separately launched service
+    // Previously only 3 Ollama variables were reported, and the settings that dominate memory
+    // were not among them. Each entry below carries its effective default, because a missing
+    // best-effort value can mean "Ollama picks" or that a separately launched service
     // has an environment this process cannot see. Either interpretation differs from "off".
     Ok(json!({
         "endpoint": endpoint,
@@ -800,6 +1192,18 @@ pub async fn doctor(endpoint: &str) -> Result<Value> {
         "ollama_cli": cli,
         "running": running,
         "ollama_env_config": env_config,
+        // Categorized superset of `ollama_env_config`. Keep the flat field above for clients that
+        // already consume it, and use this field for production/security audits.
+        "ollama_config": categorized_config,
+        // Unlike `ollama_config`, this is not inherited from FreeLlama or launchd. On supported
+        // local hosts it is a deliberately allow-listed snapshot of one same-user `ollama serve`
+        // process. Keep its scope and endpoint-association limit visible to callers.
+        "ollama_process_environment": observed_process_environment,
+        // Non-mutating portable posture: operators approve and apply service settings themselves.
+        // It is separate from the raw audit so an agent can distinguish "observed" from "safe
+        // local-only starter profile" without treating a recommendation as a command.
+        "local_conservative_config_posture": local_conservative_posture,
+        "host_runtime_signals": host_runtime_signals(),
         // Ollama exposes no endpoint for the server's resolved environment. Report the exact
         // visibility boundary so a null is never mistaken for proof that a separate service (or
         // a remote endpoint) left the setting unset.

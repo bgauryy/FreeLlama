@@ -40,13 +40,13 @@ flowchart TD
 | `run` | Run a frozen suite against one Ollama build | No |
 | `eval` | Compare the same frozen suite against stock and candidate builds | No |
 
-Run `npx freellama <command> --help` for every accepted flag and enum value. The executable's help
+Run `npx @octocodeai/freellama <command> --help` for every accepted flag and enum value. The executable's help
 is authoritative; this page explains how the commands fit together.
 
 ## Start the control plane
 
 ```bash
-npx freellama serve --recommendation-catalog recommendations.example.toml
+npx @octocodeai/freellama serve --recommendation-catalog recommendations.example.toml
 ```
 
 The default listener is `http://127.0.0.1:11435`, and the default Ollama upstream is
@@ -68,7 +68,7 @@ Use `--cpu-upstream` with one or more `--cpu-model` values to send named models 
 process. Other managed models and all raw passthrough traffic remain on the primary process.
 
 ```bash
-npx freellama serve \
+npx @octocodeai/freellama serve \
   --upstream http://127.0.0.1:11434 \
   --cpu-upstream http://127.0.0.1:11436 \
   --cpu-model nomic-embed-text:latest
@@ -99,7 +99,10 @@ available, FreeLlama refuses the task with HTTP 503 instead of waiting forever.
 
 These are conservative workload-unit defaults, not detected core or RAM counts. Tune them from
 queue-wait receipts and resident-memory observations on the target host. Ollama still controls
-decoding concurrency with `OLLAMA_NUM_PARALLEL`.
+decoding concurrency with `OLLAMA_NUM_PARALLEL`. It also owns a separate internal queue through
+`OLLAMA_MAX_QUEUE`: managed tasks enter that queue only after FreeLlama admission, while raw proxy
+traffic enters it directly. Start an unmeasured deployment with one loaded model and one parallel
+stream per Ollama process.
 
 `route`, `recommend`, and `task` accept
 `--execution-preference auto|prefer-cpu|prefer-gpu`. This is a fallback-capable hint over models
@@ -114,17 +117,17 @@ Start with the read-only guided receipt, then inspect available models. `init` n
 it stops at exact-tag approval and prints the next prerequisite, serve, managed-task, and MCP steps.
 
 ```bash
-npx freellama init
-npx freellama doctor
-npx freellama models
-npx freellama machine
+npx @octocodeai/freellama init
+npx @octocodeai/freellama doctor
+npx @octocodeai/freellama models
+npx @octocodeai/freellama machine
 ```
 
 Preview a deterministic decision without spending generation tokens:
 
 ```bash
-npx freellama route --task coding --objective fastest
-npx freellama route \
+npx @octocodeai/freellama route --task coding --objective fastest
+npx @octocodeai/freellama route \
   --task vision \
   --objective fastest \
   --required-capability vision
@@ -146,8 +149,8 @@ choose the final model directly.
 The prompt for `task` is positional:
 
 ```bash
-npx freellama task --task completion --objective fastest "Reply with exactly OK."
-npx freellama task --task coding --min-confidence medium "Explain this patch."
+npx @octocodeai/freellama task --task completion --objective fastest "Reply with exactly OK."
+npx @octocodeai/freellama task --task coding --min-confidence medium "Explain this patch."
 ```
 
 Useful task options include:
@@ -160,9 +163,10 @@ Useful task options include:
 - `--input-file` for batched embedding input, one item per line.
 - `--min-confidence low|medium` to refuse insufficiently evidenced routes before generation.
 
-Create a session with `session`, then pass its identifier to related `route` or `task` calls. The
-router reuses the selected model when it remains eligible; it does not bypass capability, policy,
-or memory checks.
+Create a session with `session`, then pass its identifier to related `route` or `task` calls. A
+route preview honors an existing affinity but does not create or change one. Only a successfully
+admitted task execution binds the session to its selected model. Reuse never bypasses capability,
+policy, or memory checks.
 
 The CLI has no keep-alive flag. MCP `run_task` accepts `keepAlive`: `"0"` unloads after the request,
 `"-1"` pins the runner, and omission leaves Ollama's default in place.
@@ -185,14 +189,14 @@ flowchart LR
 Generate the policy from correctness data and the benchmark report from local runtime data:
 
 ```bash
-npx freellama policy-from-eval \
+npx @octocodeai/freellama policy-from-eval \
   --aggregate benchmark/local/results/<model>/aggregate.json \
   --task coding \
   --min-pass 0.8 \
   --out platform.toml
 
-npx freellama bench-all --output benchmark-report.json
-npx freellama serve --recommendation-catalog recommendations.example.toml
+npx @octocodeai/freellama bench-all --output benchmark-report.json
+npx @octocodeai/freellama serve --recommendation-catalog recommendations.example.toml
 ```
 
 `serve` discovers `platform.toml` and `benchmark-report.json` in its working directory. Explicit
@@ -205,7 +209,7 @@ are not installed. This prevents speed data from being mislabeled as quality evi
 ## Compare the CLI and MCP surfaces
 
 ```bash
-npx freellama tools
+npx @octocodeai/freellama tools
 ```
 
 The command prints the maintained parity map. MCP-only operations are `delegate_research` and the

@@ -5,7 +5,7 @@ description: "Use when delegating token-heavy work to local Ollama models throug
 
 # FreeLlama
 
-Operate FreeLlama as governed local-model delegation, not as a frontier-model replacement. MCP tools: `doctor`, `models`, `run_task`, `ollama_manage`, `ollama_delete`, `delegate_research`; `npx freellama tools` maps them to CLI equivalents.
+Operate FreeLlama as governed local-model delegation, not as a frontier-model replacement. MCP tools: `doctor`, `models`, `run_task`, `ollama_manage`, `ollama_delete`, `delegate_research`; `npx @octocodeai/freellama tools` maps them to CLI equivalents.
 
 Flow: `PREREQUISITE → DIAGNOSE → DECIDE → EXECUTE → VERIFY`
 

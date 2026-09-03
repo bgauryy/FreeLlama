@@ -84,11 +84,18 @@ export const DEFAULT_TOKEN_CALIBRATION_DIR =
 // Without a boundary, an orchestrator (or a bug, or a compromised orchestrator) could point it at
 // $HOME or / and have a local model read arbitrary files on the machine — verified live: an
 // unconstrained version of this tool happily listed a real $HOME (Desktop, Documents, Library...).
-// Default to just this repo; extend via a colon-separated allowlist, never accept "anything".
-const ALLOWED_RESEARCH_ROOTS = (process.env.FREELLAMA_MCP_ALLOWED_ROOTS ?? findRepoRoot() ?? "")
-  .split(":")
-  .filter(Boolean)
-  .map((root) => path.resolve(root));
+// Default to just this repo; extend via the platform path-list separator, never accept "anything".
+// `path.delimiter` is `:` on POSIX and `;` on Windows, where splitting on `:` corrupts drive paths.
+export function parseAllowedResearchRoots(raw: string, delimiter = path.delimiter): string[] {
+  return raw
+    .split(delimiter)
+    .filter(Boolean)
+    .map((root) => path.resolve(root));
+}
+
+const ALLOWED_RESEARCH_ROOTS = parseAllowedResearchRoots(
+  process.env.FREELLAMA_MCP_ALLOWED_ROOTS ?? findRepoRoot() ?? "",
+);
 
 // Resolved once, lazily, and through symlinks — see `assertAllowedWorkspace`. A root that can't
 // be resolved (typo'd env var, deleted directory) falls back to its lexical form rather than
@@ -126,7 +133,7 @@ export async function assertAllowedWorkspace(workspacePath: string): Promise<str
   if (roots.length === 0) {
     throw new Error(
       `workspacePath "${workspacePath}" is rejected because no research roots are configured. ` +
-        "Set FREELLAMA_MCP_ALLOWED_ROOTS (colon-separated absolute paths) to the directories " +
+        "Set FREELLAMA_MCP_ALLOWED_ROOTS (a platform-separated list of absolute paths) to the directories " +
         "`delegate_research` may read. In a FreeLlama checkout this defaults to the repo root.",
     );
   }
@@ -137,7 +144,7 @@ export async function assertAllowedWorkspace(workspacePath: string): Promise<str
     throw new Error(
       `workspacePath "${workspacePath}" resolves to "${resolved}", which is outside the allowed ` +
         `research roots (${roots.join(", ")}). Set FREELLAMA_MCP_ALLOWED_ROOTS ` +
-        "(colon-separated) to extend this if you genuinely need to research another directory.",
+        "(using the platform path-list separator) to extend this if you genuinely need to research another directory.",
     );
   }
   return resolved;

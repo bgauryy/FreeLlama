@@ -5,9 +5,36 @@ under [`benchmark/local/`](benchmark/local/README.md) — the one canonical home
 the generic scoring infrastructure in [`benchmark/harness/`](benchmark/harness/README.md) (see
 [`benchmark/harness/README.md`](benchmark/harness/README.md) for the workflow map).
 
-## Available Agents
+## Repository operating index
 
-### Octocode CLI Agent (v1)
+Use this file for adapter behavior and measured caveats. Use the narrower owner for everything
+else:
+
+| Need | Source of truth |
+|---|---|
+| Install, run, architecture, and production workflow | [`README.md`](README.md) and [`docs/`](docs/) |
+| MCP tool choice, request shapes, and agent workflow | [`packages/mcp/README.md`](packages/mcp/README.md) |
+| Ollama/model operation procedure | [`skills/freellama/SKILL.md`](skills/freellama/SKILL.md) |
+| Generic benchmark execution and scoring | [`benchmark/harness/README.md`](benchmark/harness/README.md) |
+| Local adapter comparison and evidence | [`benchmark/local/README.md`](benchmark/local/README.md) |
+
+Agent-facing invariants:
+
+- Inspect current state; do not infer installed models, residency, CPU/GPU placement, or memory fit
+  from a model name.
+- Treat `run_task {preview:true}` as a decision-only request containing routing fields only. It
+  rejects prompts, messages, embedding input, tool definitions, images, and runtime controls.
+  Make a separate execution call with the payload after reviewing the decision.
+- Model search and recommendation never authorize a pull. Require explicit approval for one exact
+  tag and its reported size. Delete only when you explicitly name the exact installed tag.
+- Treat configured CPU/GPU assignment as intent, not physical proof. Read the returned placement
+  observation and require observed evidence when processor placement is consequential.
+- `delegate_research` is a bounded read-only lookup helper. The caller retains decomposition,
+  judgment, mutation authority, and final verification; discard an `escalate` result.
+
+## Available agents
+
+### Octocode CLI agent (v1)
 
 **ID:** `octocode-cli-agent-v1`
 
@@ -23,7 +50,7 @@ files by pattern, code search, semantic content retrieval, and LSP-based queries
 - `localSearchCode` — Full-text code search with context. AST/structural mode is **not** driven by
   `keywords`: it requires `pattern` or `rule` and hard-errors otherwise. The adapter prompt used to
   advertise `mode: "structural"` next to `keywords`, so a model that followed it spent a turn on a
-  guaranteed error; the prompt now says so explicitly.
+  request that the tool contract rejects; the prompt now says so explicitly.
 - `localGetFileContent` — Read file with syntax and line numbers
 - `lspGetSemantics` — Language server protocol queries (definitions, references, hover). **An empty
   result is ambiguous, and the tool does not disambiguate it.** It reports `serverAvailable: true`
@@ -57,7 +84,7 @@ reducing hallucination and supporting deterministic grading.
   `skills/freellama/references/task-delegation.md`.
 - Results include exact file paths and line numbers
 
-### Bash Shell Agent (v1)
+### Bash shell agent (v1)
 
 **ID:** `bash-shell-agent-v1`
 
@@ -84,7 +111,7 @@ evaluate whether better performance comes from the tool or the model.
 - On the one 30-question suite measured, needed *fewer* tool calls and tokens than the octocode
   agent for equal accuracy — don't assume more structure always wins; verify per task/model.
 
-## Running Agents
+## Run agents
 
 Agents are invoked through `benchmark/local/scripts/run_all.sh`, which runs both agents on the
 same suite for a given model:
@@ -187,12 +214,12 @@ gathered from a long run before this was fixed understates the model.
 `fit_to_context` runs before the first call and after every turn. It:
 
 - **byte-preserves** the system prompt and original question by default — the two messages Ollama
-  would delete first; if they cannot fit, the adapter errors before calling Ollama;
+  deletes first during truncation; if they cannot fit, the adapter errors before calling Ollama;
 - **compacts** older observations to a one-line breadcrumb, oldest first, so every step the agent
   took stays visible even when its full text is gone;
-- **keeps the two most recent observations verbatim**, since those are what the model is reasoning
-  over right now;
-- **clips the recent ones too**, looping until the estimate actually fits, if even they overflow.
+- **keeps the two most recent observations verbatim**, since the model uses them for its current
+  reasoning;
+- **clips the recent ones too**, looping until the estimate fits, if even they overflow.
 
 The first call uses the configured 4-characters-per-token estimate. Ollama has no stable preflight
 tokenizer endpoint; after each successful call, the budgeter calibrates upward from Ollama's own
@@ -221,7 +248,7 @@ the same fields in camelCase. Defaults and validation live once in `AgentRuntime
 Contracts: `benchmark/local/scripts/test_agent_context.py` (63 context/pagination contracts) and
 `test_agent_actions.py` (strict Bash and Octocode action shapes).
 
-## Extending with a new agent
+## Add a new agent
 
 1. **Create an adapter** — a Python script that:
    - Reads `FREELLAMA_TARGET_MODEL`, `FREELLAMA_OLLAMA_ENDPOINT`, `FREELLAMA_BENCH_WORKSPACE`,

@@ -1,0 +1,12 @@
+# Source files not needed in the published package.
+scripts/
+test/
+vitest.config.ts
+vitest.integration.config.ts
+vitest.e2e.config.ts
+tsconfig.json
+*.tgz
+eval-small-results.json
+
+# dist/, native/, adapters/, and docs/ are build outputs listed in files[]
+# and must be included — do NOT ignore them here.
