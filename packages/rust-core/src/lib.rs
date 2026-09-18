@@ -828,8 +828,8 @@ where
         },
         "OLLAMA_CONTEXT_LENGTH": {
             "value": getenv("OLLAMA_CONTEXT_LENGTH"),
-            "effective_default": "4096 tokens (Ollama 0.33.x FAQ; override with OLLAMA_CONTEXT_LENGTH)",
-            "note": "The single largest memory lever. FreeLlama's own routing always sends an explicit num_ctx, so tasks routed through `serve` are unaffected — but anything talking to Ollama directly inherits this default.",
+            "effective_default": "documentation drift: current context docs use VRAM-tiered 4k/32k/256k; FAQ still says 4096",
+            "note": "The single largest memory lever. FreeLlama's managed routing sends an explicit num_ctx. For direct Ollama work, do not infer a tier from host RAM: inspect the loaded runner's context_length through /api/ps.",
         },
         "OLLAMA_KV_CACHE_TYPE": {
             "value": getenv("OLLAMA_KV_CACHE_TYPE"),
@@ -1068,7 +1068,7 @@ pub fn local_conservative_config_posture(config: &Value, observed_process: &Valu
             "OLLAMA_MAX_LOADED_MODELS": rule("OLLAMA_MAX_LOADED_MODELS", "1", max_loaded_status, "Start with one resident model per process; raise only after measured concurrent-fit validation."),
             "OLLAMA_NUM_PARALLEL": rule("OLLAMA_NUM_PARALLEL", "1", parallel_status, "Raise only after validating the multiplied context/KV memory and tail latency."),
             "OLLAMA_MAX_QUEUE": rule("OLLAMA_MAX_QUEUE", "1-16", queue_status, "Keep Ollama's internal backlog finite; FreeLlama admission is a separate queue."),
-            "OLLAMA_CONTEXT_LENGTH": rule("OLLAMA_CONTEXT_LENGTH", "unset (Ollama default 4096)", context_status, "Use per-request num_ctx for managed work; qualify any global override."),
+            "OLLAMA_CONTEXT_LENGTH": rule("OLLAMA_CONTEXT_LENGTH", "unset; observe the VRAM-tiered runtime default with /api/ps", context_status, "Use per-request num_ctx for managed work; current upstream pages disagree on a fixed default, so qualify any global override and inspect the loaded runner."),
             "OLLAMA_FLASH_ATTENTION": rule("OLLAMA_FLASH_ATTENTION", "auto", flash_status, "Ollama enables it automatically on supported backends; forcing it is not a performance claim."),
             "OLLAMA_KV_CACHE_TYPE": rule("OLLAMA_KV_CACHE_TYPE", "f16", kv_status, "q8_0/q4_0 are process-wide quality-versus-memory choices and require workload qualification."),
         },

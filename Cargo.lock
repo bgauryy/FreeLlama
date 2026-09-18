@@ -430,6 +430,7 @@ dependencies = [
  "axum",
  "base64",
  "clap",
+ "http-body",
  "napi",
  "napi-build",
  "napi-derive",

@@ -120,13 +120,18 @@ Set independent admission budgets when the defaults do not fit the workload:
     --cpu-upstream http://127.0.0.1:11436 \
     --cpu-model nomic-embed-text:latest \
     --max-concurrent-tasks 2 \
-    --cpu-max-concurrent-tasks 1
+    --cpu-max-concurrent-tasks 1 \
+    --max-queued-tasks 16 \
+    --cpu-max-queued-tasks 8
 ```
 
 The defaults above admit one ordinary primary-backend chat (cost 2) and one CPU embedding (cost 1)
 at the same time. They are conservative workload units for the common `OLLAMA_NUM_PARALLEL=1`
 layout, not a profile of the development Mac. Increase them only after measuring queue wait,
 resident memory, and Ollama's own parallel setting on the target host.
+Queue cardinality and wait time are separate bounds: excess waiters are refused immediately, while
+an admitted waiter may remain until `--max-queue-wait-seconds`. Automatic backend selection checks
+that the actual task cost fits the current slot snapshot before following historical speed.
 
 ## Let an agent express placement intent
 
@@ -208,6 +213,12 @@ Each backend has its own weighted admission pool and its own resident/shared and
 transition/exclusive lock. CPU and GPU model transitions therefore do not block each other, and a
 GPU burst cannot spend the CPU helper's permit:
 
+Both pools also share local host-pressure sampling and forecast-memory reservations. Independent
+queues do not imply independent RAM on a unified-memory machine. A request can wait for available
+headroom even when its backend has a free weighted permit. Inspect `admission.resources` in health
+and `execution.resource_admission` in task receipts. Unknown thermal or GPU measurements are not
+reported as healthy readings. See [the execution architecture](ARCHITECTURE.md) for the complete gate.
+
 ```mermaid
 flowchart TD
     T["Managed task"] --> B{"Selected backend"}
@@ -229,7 +240,11 @@ FreeLlama can overlap requests across the two servers even when each Ollama proc
 `OLLAMA_NUM_PARALLEL=1`. Raising `OLLAMA_NUM_PARALLEL` affects parallel requests within one server
 and multiplies K/V-cache memory; it is a separate tuning decision. `OLLAMA_MAX_QUEUE` likewise
 bounds each Ollama process after FreeLlama admission. It does not replace either backend's weighted
-FreeLlama budget or queue-wait deadline.
+FreeLlama budget, bounded waiter count, or queue-wait deadline. Raw passthrough uses a separate
+one-stream default cap in `serve`; its permit is held until the streamed response ends or is dropped.
+Mutating raw requests also require exclusive access to the primary backend's managed transition
+lock and receive 503 while it is busy. Metadata GET/HEAD calls remain available. This prevents raw
+inference or model lifecycle calls from overlapping a managed generation on that backend.
 
 ## Understand automatic feedback
 

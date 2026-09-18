@@ -710,7 +710,12 @@ async fn resident(client: &Client, endpoint: &str, model: &str) -> (Option<u64>,
 }
 
 fn rate(value: &Value, count: &str, duration: &str) -> Option<f64> {
-    let tokens = f64::from(u32::try_from(value.get(count)?.as_u64()?).ok()?);
+    let mut count_value = value.get(count)?.as_u64()?;
+    if count == "prompt_eval_count" {
+        // Prompt time covers only uncached prefill. Older backends do not expose the split.
+        count_value = count_value.checked_sub(value.get("prompt_eval_cached_count")?.as_u64()?)?;
+    }
+    let tokens = f64::from(u32::try_from(count_value).ok()?);
     let seconds = Duration::from_nanos(value.get(duration)?.as_u64()?).as_secs_f64();
     (seconds > 0.0).then_some(tokens / seconds)
 }
@@ -733,4 +738,28 @@ fn needle_prompt() -> String {
 
 fn f64_count(value: usize) -> f64 {
     f64::from(u32::try_from(value).unwrap_or(u32::MAX))
+}
+
+#[cfg(test)]
+mod cache_metric_tests {
+    use super::*;
+
+    #[test]
+    fn benchmark_prefill_rate_uses_uncached_tokens() {
+        let mut value = json!({"prompt_eval_count":10,"prompt_eval_duration":1_000_000_000});
+        assert_eq!(
+            rate(&value, "prompt_eval_count", "prompt_eval_duration"),
+            None
+        );
+        value["prompt_eval_cached_count"] = json!(4);
+        assert_eq!(
+            rate(&value, "prompt_eval_count", "prompt_eval_duration"),
+            Some(6.0)
+        );
+        value["prompt_eval_cached_count"] = json!(11);
+        assert_eq!(
+            rate(&value, "prompt_eval_count", "prompt_eval_duration"),
+            None
+        );
+    }
 }

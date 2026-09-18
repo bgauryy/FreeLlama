@@ -123,6 +123,9 @@ impl Default for RouteInput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CatalogModel {
     pub name: String,
+    /// Content identity from Ollama's manifest; absent metadata must not be treated as a tag hash.
+    #[serde(default)]
+    pub digest: Option<String>,
     pub size: u64,
     pub capabilities: BTreeSet<Capability>,
     pub advertised_context: Option<u64>,
@@ -175,6 +178,7 @@ pub struct SessionAffinity {
 struct SessionRecord {
     model: Option<String>,
     last_used: Instant,
+    killed: tokio::sync::watch::Sender<bool>,
 }
 
 impl SessionAffinity {
@@ -189,6 +193,7 @@ impl SessionAffinity {
                         SessionRecord {
                             model: Some(model),
                             last_used: Instant::now(),
+                            killed: tokio::sync::watch::channel(false).0,
                         },
                     )
                 })
@@ -203,6 +208,7 @@ impl SessionAffinity {
             SessionRecord {
                 model: None,
                 last_used: Instant::now(),
+                killed: tokio::sync::watch::channel(false).0,
             },
         );
         id
@@ -241,6 +247,20 @@ impl SessionAffinity {
         self.sessions.remove(id).is_some()
     }
 
+    pub(super) fn cancellation(&self, id: &str) -> Option<tokio::sync::watch::Receiver<bool>> {
+        self.sessions
+            .get(id)
+            .map(|record| record.killed.subscribe())
+    }
+
+    pub(super) fn kill(&mut self, id: &str) -> bool {
+        let Some(record) = self.sessions.remove(id) else {
+            return false;
+        };
+        record.killed.send_replace(true);
+        true
+    }
+
     pub(super) fn len(&self) -> usize {
         self.sessions.len()
     }
@@ -269,20 +289,7 @@ pub fn select_route(
         })
         .collect::<Vec<_>>();
 
-    let eligible = if input.model.is_some() || matches!(input.objective, Objective::Fastest) {
-        capability_eligible
-    } else {
-        let qualified = capability_eligible
-            .iter()
-            .copied()
-            .filter(|model| model.policy_rank.contains_key(&input.task))
-            .collect::<Vec<_>>();
-        ensure!(
-            !qualified.is_empty(),
-            "no quality-qualified model exists for this task; configure a task policy (`freellama policy-from-eval`), choose objective \"fastest\" (CLI: --objective fastest; MCP: objective:\"fastest\"), or name an explicit model. Run `freellama doctor` — unset OLLAMA_MAX_LOADED_MODELS / OLLAMA_KV_CACHE_TYPE is a machine-config gap, not a missing model"
-        );
-        qualified
-    };
+    let eligible = eligible_for_objective(input, capability_eligible)?;
 
     let chosen = if let Some(exact) = input.model.as_deref() {
         let installed = models.iter().find(|model| model.name == exact);
@@ -312,6 +319,10 @@ pub fn select_route(
     let has_benchmark = chosen.benchmark.contains_key(&capability);
     let policy_qualified = chosen.policy_rank.contains_key(&input.task);
     let mut reasons = vec!["installed".to_owned(), "capabilities_satisfied".to_owned()];
+    if input.model.is_none() && matches!(input.objective, Objective::Balanced) && !policy_qualified
+    {
+        reasons.push("balanced_without_quality_policy".to_owned());
+    }
     if input.model.is_some() {
         reasons.push("explicit_model".to_owned());
     } else if input
@@ -568,6 +579,30 @@ fn compare_candidates(left: &CatalogModel, right: &CatalogModel, input: &RouteIn
             policy_preference(left, right, input.task).then_with(|| right.name.cmp(&left.name))
         }
     }
+}
+
+fn eligible_for_objective<'a>(
+    input: &RouteInput,
+    capability_eligible: Vec<&'a CatalogModel>,
+) -> Result<Vec<&'a CatalogModel>> {
+    if input.model.is_some() || matches!(input.objective, Objective::Fastest) {
+        return Ok(capability_eligible);
+    }
+    let qualified = capability_eligible
+        .iter()
+        .copied()
+        .filter(|model| model.policy_rank.contains_key(&input.task))
+        .collect::<Vec<_>>();
+    if qualified.is_empty() && matches!(input.objective, Objective::Balanced) {
+        // Ordinary requests need no quality-policy setup. Retain capability/context filters
+        // and report missing quality evidence; an explicit confidence floor still applies.
+        return Ok(capability_eligible);
+    }
+    ensure!(
+        !qualified.is_empty(),
+        "no quality-qualified model exists for this task; configure a task policy (`freellama policy-from-eval`), choose objective \"fastest\" (CLI: --objective fastest; MCP: objective:\"fastest\"), or name an explicit model. Run `freellama doctor` — unset OLLAMA_MAX_LOADED_MODELS / OLLAMA_KV_CACHE_TYPE is a machine-config gap, not a missing model"
+    );
+    Ok(qualified)
 }
 
 fn policy_preference(left: &CatalogModel, right: &CatalogModel, task: TaskKind) -> Ordering {

@@ -32,6 +32,15 @@ struct Cli {
 /// Admission tuning, grouped so `start_platform` stays within a readable argument count.
 #[derive(Debug, Clone, Copy, clap::Args)]
 struct AdmissionArgs {
+    /// Required local telemetry: RAM by default; best-effort explicitly permits unknown RAM.
+    #[arg(long, value_enum)]
+    resource_telemetry_policy: Option<TelemetryPolicyArg>,
+    /// Available host-memory percentage held back before admitting model work (default 15).
+    #[arg(long)]
+    resource_hold_available_percent: Option<u32>,
+    /// Available-memory percentage required for recovery (default 20; greater than hold).
+    #[arg(long)]
+    resource_resume_available_percent: Option<u32>,
     /// Primary/GPU admission budget in weighted units — embedding 1, chat 2, vision 4 (default 2,
     /// or `FREELLAMA_MAX_CONCURRENT_TASKS`). This is not a literal task count.
     #[arg(long, alias = "gpu-admission-slots")]
@@ -45,8 +54,16 @@ struct AdmissionArgs {
     /// contract; waiting forever would hide load as unattributable latency.
     #[arg(long)]
     max_queue_wait_seconds: Option<u64>,
-    /// Bound raw Ollama-compatible proxy requests with immediate 503. This is a generic primary
-    /// backend cap only; use managed tasks for weighted CPU/GPU admission.
+    /// Maximum managed requests retained while the primary/GPU pool is saturated (default 16,
+    /// or `FREELLAMA_MAX_QUEUED_TASKS`). Excess work receives 503 immediately.
+    #[arg(long)]
+    max_queued_tasks: Option<usize>,
+    /// Maximum managed requests retained while the CPU pool is saturated (default 8, or
+    /// `FREELLAMA_CPU_MAX_QUEUED_TASKS`).
+    #[arg(long)]
+    cpu_max_queued_tasks: Option<usize>,
+    /// Bound raw Ollama-compatible proxy streams with immediate 503 (default 1 in `serve`). This is
+    /// a generic primary-backend cap; use managed tasks for weighted CPU/GPU admission.
     #[arg(long)]
     raw_proxy_max_concurrent_requests: Option<usize>,
     /// Maximum live session-affinity handles (default 1024). Sessions contain no prompt/KV data.
@@ -55,6 +72,93 @@ struct AdmissionArgs {
     /// Expire idle affinity handles after this many seconds (default 3600).
     #[arg(long)]
     session_ttl_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum TelemetryPolicyArg {
+    BestEffort,
+    RequireMemory,
+    RequireAll,
+}
+
+impl From<TelemetryPolicyArg> for freellama::platform::resources::TelemetryPolicy {
+    fn from(value: TelemetryPolicyArg) -> Self {
+        match value {
+            TelemetryPolicyArg::BestEffort => Self::BestEffort,
+            TelemetryPolicyArg::RequireMemory => Self::RequireMemory,
+            TelemetryPolicyArg::RequireAll => Self::RequireAll,
+        }
+    }
+}
+
+#[cfg(test)]
+mod telemetry_cli_tests {
+    use super::*;
+
+    #[test]
+    fn telemetry_policy_parses_on_serve_and_proxy_and_rejects_typos() {
+        for command in ["serve", "proxy"] {
+            for policy in ["best-effort", "require-memory", "require-all"] {
+                Cli::try_parse_from(["freellama", command, "--resource-telemetry-policy", policy])
+                    .expect("supported telemetry policy");
+            }
+            assert!(
+                Cli::try_parse_from([
+                    "freellama",
+                    command,
+                    "--resource-telemetry-policy",
+                    "allow-all"
+                ])
+                .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_policy_reaches_the_governor_and_default_requires_memory() {
+        for (value, expected) in [
+            ("best-effort", "best_effort"),
+            ("require-memory", "require_memory"),
+            ("require-all", "require_all"),
+        ] {
+            let parsed =
+                Cli::try_parse_from(["freellama", "serve", "--resource-telemetry-policy", value])
+                    .unwrap();
+            let Command::Serve {
+                admission: args, ..
+            } = parsed.command
+            else {
+                panic!("expected serve")
+            };
+            let mut config = PlatformConfig::new(
+                "127.0.0.1:11435",
+                "http://127.0.0.1:11434",
+                None,
+                None,
+                "test",
+            );
+            configure_resource_policy(&mut config, &args).unwrap();
+            assert_eq!(
+                serde_json::to_value(
+                    config
+                        .resource_governor
+                        .snapshot()
+                        .await
+                        .policy
+                        .telemetry_policy
+                )
+                .unwrap(),
+                expected
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(
+                freellama::platform::resources::ResourcePolicy::default().telemetry_policy
+            )
+            .unwrap(),
+            "require_memory"
+        );
+    }
 }
 
 /// Ollama backend placement, grouped so device-specific routing stays an explicit serve concern.
@@ -148,8 +252,8 @@ enum Command {
         endpoint: String,
         #[arg(long, value_enum, default_value_t = TaskKind::Completion)]
         task: TaskKind,
-        /// `balanced`/`quality` need a task policy; without one the router refuses. Use `fastest`
-        /// until `freellama policy-from-eval` has produced one.
+        /// `balanced` prefers task-policy candidates, falling back with low confidence.
+        /// `quality` needs a policy unless an explicit model is supplied.
         #[arg(long, value_enum, default_value_t = Objective::Balanced)]
         objective: Objective,
         #[arg(long)]
@@ -179,8 +283,8 @@ enum Command {
         endpoint: String,
         #[arg(long, value_enum, default_value_t = TaskKind::Completion)]
         task: TaskKind,
-        /// `balanced`/`quality` need a task policy; without one the router refuses. Use `fastest`
-        /// until `freellama policy-from-eval` has produced one.
+        /// `balanced` prefers task-policy candidates, falling back with low confidence.
+        /// `quality` needs a policy unless an explicit model is supplied.
         #[arg(long, value_enum, default_value_t = Objective::Balanced)]
         objective: Objective,
         /// Restrict installation planning to this exact model tag.
@@ -213,8 +317,8 @@ enum Command {
         endpoint: String,
         #[arg(long, value_enum, default_value_t = TaskKind::Completion)]
         task: TaskKind,
-        /// `balanced`/`quality` need a task policy; without one the router refuses. Use `fastest`
-        /// until `freellama policy-from-eval` has produced one.
+        /// `balanced` prefers task-policy candidates, falling back with low confidence.
+        /// `quality` needs a policy unless an explicit model is supplied.
         #[arg(long, value_enum, default_value_t = Objective::Balanced)]
         objective: Objective,
         #[arg(long)]
@@ -249,6 +353,9 @@ enum Command {
         listen: String,
         #[arg(long, default_value = "http://127.0.0.1:11434")]
         upstream: String,
+        /// Required local telemetry; defaults to require-memory like managed execution.
+        #[arg(long, value_enum)]
+        resource_telemetry_policy: Option<TelemetryPolicyArg>,
         /// Explicitly permit binding beyond localhost. Add authentication before using this.
         #[arg(long)]
         allow_remote: bool,
@@ -489,6 +596,7 @@ async fn main() -> Result<()> {
         Command::Proxy {
             listen,
             upstream,
+            resource_telemetry_policy,
             allow_remote,
             request_timeout_seconds,
             auto_restart_ollama,
@@ -499,6 +607,16 @@ async fn main() -> Result<()> {
                 .with_auto_restart_ollama(auto_restart_ollama);
             if let Some(max) = max_concurrent_requests {
                 config = config.with_max_concurrent_requests(max);
+            }
+            if let Some(value) = resource_telemetry_policy {
+                let policy = freellama::platform::resources::ResourcePolicy {
+                    telemetry_policy: value.into(),
+                    ..freellama::platform::resources::ResourcePolicy::default()
+                };
+                config = config.with_resource_governor(
+                    freellama::platform::resources::ResourceGovernor::new(policy)
+                        .map_err(anyhow::Error::msg)?,
+                );
             }
             serve(config).await?;
         }
@@ -606,6 +724,7 @@ async fn start_platform(args: PlatformStartArgs) -> Result<()> {
         policy_file,
         args.intent_model,
     );
+    configure_resource_policy(&mut config, &args.admission)?;
     if let Some(cpu_upstream) = args.backends.cpu_upstream {
         eprintln!(
             "freellama: assigning {} model(s) to CPU Ollama at {cpu_upstream}",
@@ -624,6 +743,12 @@ async fn start_platform(args: PlatformStartArgs) -> Result<()> {
     }
     if let Some(seconds) = args.admission.max_queue_wait_seconds {
         config = config.with_max_queue_wait(Duration::from_secs(seconds));
+    }
+    if let Some(max) = args.admission.max_queued_tasks {
+        config = config.with_max_queued_tasks(max);
+    }
+    if let Some(max) = args.admission.cpu_max_queued_tasks {
+        config = config.with_cpu_max_queued_tasks(max);
     }
     if let Some(max) = args.admission.raw_proxy_max_concurrent_requests {
         config = config.with_raw_proxy_max_concurrent_requests(max);
@@ -664,14 +789,45 @@ async fn start_platform(args: PlatformStartArgs) -> Result<()> {
     if args.production.allow_remote {
         config = config.with_remote_access(true);
     }
+    report_admission_config(&config);
+    serve_platform(config).await
+}
+
+fn configure_resource_policy(config: &mut PlatformConfig, args: &AdmissionArgs) -> Result<()> {
+    if args.resource_hold_available_percent.is_some()
+        || args.resource_resume_available_percent.is_some()
+        || args.resource_telemetry_policy.is_some()
+    {
+        let mut policy = freellama::platform::resources::ResourcePolicy::default();
+        if let Some(value) = args.resource_hold_available_percent {
+            policy.hold_available_percent = value;
+        }
+        if let Some(value) = args.resource_resume_available_percent {
+            policy.resume_available_percent = value;
+        }
+        if let Some(value) = args.resource_telemetry_policy {
+            policy.telemetry_policy = value.into();
+        }
+        config.resource_governor = freellama::platform::resources::ResourceGovernor::new(policy)
+            .map_err(anyhow::Error::msg)?;
+    }
+    Ok(())
+}
+
+fn report_admission_config(config: &PlatformConfig) {
     eprintln!(
-        "freellama: per-backend admission budgets: GPU {} units, CPU {} units (embedding 1, chat \
-         2, vision 4). These are weighted units, not literal task counts; pair same-model GPU \
+        "freellama: per-backend admission budgets: GPU {} units / {} queued, CPU {} units / {} \
+         queued (embedding 1, chat 2, vision 4). Units are not literal task counts; pair same-model GPU \
          concurrency changes with OLLAMA_NUM_PARALLEL and KV-cache validation.",
         config.resolved_max_concurrent_tasks(),
-        config.resolved_cpu_max_concurrent_tasks()
+        config.resolved_max_queued_tasks(),
+        config.resolved_cpu_max_concurrent_tasks(),
+        config.resolved_cpu_max_queued_tasks()
     );
-    serve_platform(config).await
+    eprintln!(
+        "freellama: raw passthrough cap: {} streaming request(s); managed routes remain preferred",
+        config.resolved_raw_proxy_max_concurrent_requests()
+    );
 }
 
 fn default_feedback_file() -> Option<PathBuf> {

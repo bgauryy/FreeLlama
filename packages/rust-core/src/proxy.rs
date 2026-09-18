@@ -5,21 +5,24 @@ use std::{
     net::SocketAddr,
     pin::Pin,
     sync::Arc,
+    task::{Context as TaskContext, Poll},
     time::{Duration, Instant},
 };
 
+use crate::platform::resources::{ResourceGovernor, ResourcePermit};
 use anyhow::{Context, Result, ensure};
 use axum::{
     Router,
-    body::{Body, to_bytes},
+    body::{Body, Bytes, to_bytes},
     extract::{Request, State},
     http::{HeaderMap, Response, StatusCode, Uri},
     response::IntoResponse,
     routing::any,
 };
+use http_body::{Body as HttpBody, Frame, SizeHint};
 use reqwest::{Client, Url};
 use tokio::sync::Mutex as AsyncMutex;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedRwLockWriteGuard, OwnedSemaphorePermit, RwLock, Semaphore};
 
 /// Total attempts (first try + retries) for a request that hits a transient upstream failure.
 /// Matches the general-purpose default cited across retry-policy guidance for slow (LLM-scale,
@@ -106,6 +109,7 @@ const HOP_BY_HOP: &[&str] = &[
 
 #[derive(Clone)]
 pub struct ProxyConfig {
+    resource_governor: ResourceGovernor,
     pub listen: String,
     pub upstream: String,
     pub allow_remote: bool,
@@ -117,6 +121,7 @@ pub struct ProxyConfig {
     /// Optional byte-preserving proxy inflight cap. Unlike managed admission this cannot infer
     /// task cost or CPU/GPU placement, so it is intentionally an immediate generic refusal.
     pub max_concurrent_requests: Option<usize>,
+    execution_lock: Option<Arc<RwLock<()>>>,
     restart_action: RestartAction,
 }
 
@@ -124,12 +129,14 @@ impl ProxyConfig {
     #[must_use]
     pub fn new(listen: impl Into<String>, upstream: impl Into<String>, allow_remote: bool) -> Self {
         Self {
+            resource_governor: ResourceGovernor::default(),
             listen: listen.into(),
             upstream: upstream.into(),
             allow_remote,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             auto_restart_ollama: false,
             max_concurrent_requests: None,
+            execution_lock: None,
             restart_action: Arc::new(default_restart_ollama),
         }
     }
@@ -154,6 +161,22 @@ impl ProxyConfig {
     #[must_use]
     pub fn with_max_concurrent_requests(mut self, max: usize) -> Self {
         self.max_concurrent_requests = Some(max.max(1));
+        self
+    }
+
+    /// Share host pressure and memory reservations with managed execution.
+    #[must_use]
+    pub fn with_resource_governor(mut self, governor: ResourceGovernor) -> Self {
+        self.resource_governor = governor;
+        self
+    }
+
+    /// Share a backend's managed execution boundary. Raw mutations may load or unload any model,
+    /// so they require exclusive access until their response stream ends. Metadata GET/HEAD
+    /// requests remain available while managed execution is active.
+    #[must_use]
+    pub fn with_execution_lock(mut self, execution_lock: Arc<RwLock<()>>) -> Self {
+        self.execution_lock = Some(execution_lock);
         self
     }
 
@@ -206,12 +229,51 @@ impl ProxyConfig {
 
 #[derive(Clone)]
 struct ProxyState {
+    resource_governor: ResourceGovernor,
     client: Client,
+    request_body_timeout: Duration,
     upstream: String,
     auto_restart_ollama: bool,
     restart_action: RestartAction,
     last_restart_attempt: Arc<AsyncMutex<Option<Instant>>>,
     admission: Option<Arc<Semaphore>>,
+    execution_lock: Option<Arc<RwLock<()>>>,
+}
+
+/// Response body that owns the raw-admission permit for the complete upstream stream lifetime.
+/// Receiving headers is not completion for Ollama: generation usually continues while bytes are
+/// streamed, so releasing earlier turns a concurrency cap into a headers-only cap.
+struct AdmittedBody {
+    inner: Body,
+    permit: Option<OwnedSemaphorePermit>,
+    execution: Option<OwnedRwLockWriteGuard<()>>,
+    resource: Option<ResourcePermit>,
+}
+
+impl HttpBody for AdmittedBody {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let result = Pin::new(&mut self.inner).poll_frame(context);
+        if matches!(&result, Poll::Ready(None)) {
+            self.permit.take();
+            self.execution.take();
+            self.resource.take();
+        }
+        result
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
 }
 
 /// Resolve an incoming Ollama path against the configured upstream.
@@ -253,10 +315,12 @@ pub async fn serve(config: ProxyConfig) -> Result<()> {
 pub fn app(config: ProxyConfig) -> Result<Router> {
     config.validate()?;
     let state = ProxyState {
+        resource_governor: config.resource_governor,
         client: Client::builder()
             .timeout(config.request_timeout)
             .build()
             .context("build upstream HTTP client")?,
+        request_body_timeout: config.request_timeout,
         upstream: config.upstream,
         auto_restart_ollama: config.auto_restart_ollama,
         restart_action: config.restart_action,
@@ -264,6 +328,7 @@ pub fn app(config: ProxyConfig) -> Result<Router> {
         admission: config
             .max_concurrent_requests
             .map(|max| Arc::new(Semaphore::new(max))),
+        execution_lock: config.execution_lock,
     };
     Ok(Router::new().fallback(any(forward)).with_state(state))
 }
@@ -273,7 +338,30 @@ async fn shutdown() {
 }
 
 async fn forward(State(state): State<ProxyState>, request: Request) -> impl IntoResponse {
-    let permit = match state.admission.as_ref().map(Arc::clone) {
+    let metadata =
+        matches!(request.method().as_str(), "GET" | "HEAD") || request.uri().path() == "/api/show";
+    let execution = if metadata {
+        None
+    } else if let Some(lock) = state.execution_lock.as_ref() {
+        match Arc::clone(lock).try_write_owned() {
+            Ok(guard) => Some(guard),
+            Err(_) => {
+                return Response::builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"error":"proxy busy: backend execution active; use managed /_freellama/v1/tasks to queue"}"#))
+                    .expect("static response is valid");
+            }
+        }
+    } else {
+        None
+    };
+    let permit = match state
+        .admission
+        .as_ref()
+        .filter(|_| !metadata)
+        .map(Arc::clone)
+    {
         Some(admission) => match admission.try_acquire_owned() {
             Ok(permit) => Some(permit),
             Err(_) => {
@@ -288,33 +376,56 @@ async fn forward(State(state): State<ProxyState>, request: Request) -> impl Into
     };
     match forward_inner(&state, request).await {
         Ok(response) => {
-            drop(permit);
-            response
+            let (parts, body) = response.into_parts();
+            Response::from_parts(
+                parts,
+                Body::new(AdmittedBody {
+                    inner: body,
+                    permit,
+                    execution,
+                    resource: None,
+                }),
+            )
         }
         Err(error) => {
             drop(permit);
             eprintln!("proxy error: {error:#}");
+            let (status, body) = if error.is::<tokio::time::error::Elapsed>() {
+                (
+                    StatusCode::REQUEST_TIMEOUT,
+                    r#"{"error":"request body read deadline exceeded"}"#,
+                )
+            } else {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    r#"{"error":"upstream unavailable"}"#,
+                )
+            };
             Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
+                .status(status)
                 .header("content-type", "application/json")
-                .body(Body::from(r#"{"error":"upstream unavailable"}"#))
+                .body(Body::from(body))
                 .expect("static response is valid")
         }
     }
 }
 
-/// Retry 500/502/504 (load-model blips) but not 503 busy. Shared with managed `/tasks` so a
+/// Retry 500/502 (load-model blips) and connection-establishment failures, but not 503 busy,
+/// 504/client timeouts, or ambiguous failures after the upstream accepted a request.
+/// A timed-out generation may still be consuming the upstream runner, so replaying it can multiply
+/// load precisely when the host is under pressure. Shared with managed `/tasks` so a
 /// request through the proxy cannot amplify saturation the admission semaphore is shedding.
 pub(crate) fn retryable_upstream_status(status: StatusCode) -> bool {
     matches!(
         status,
-        StatusCode::INTERNAL_SERVER_ERROR | StatusCode::BAD_GATEWAY | StatusCode::GATEWAY_TIMEOUT
+        StatusCode::INTERNAL_SERVER_ERROR | StatusCode::BAD_GATEWAY
     )
 }
 
-/// Send the request, retrying transient failures (500/502/504 and connection errors) with exponential
-/// backoff. Ollama occasionally returns a 500 under load-model contention; a same-request retry
-/// is enough to ride that out without surfacing an error to the caller. HTTP 503 is returned as-is.
+/// Send the request, retrying transient 500/502 responses and connection-establishment errors
+/// with exponential backoff. Ollama occasionally returns a 500 under load-model contention; a
+/// same-request retry is enough to ride that out without surfacing an error to the caller. HTTP
+/// 503, 504, client timeouts, and post-send transport failures are returned as-is.
 async fn send_with_retries(
     state: &ProxyState,
     method: &reqwest::Method,
@@ -345,7 +456,10 @@ async fn send_with_retries(
                 tokio::time::sleep(retry_delay(attempt)).await;
             }
             Ok(response) => return Ok(response),
-            Err(error) if retryable_more_attempts => {
+            // Once the upstream accepts a request, a timeout or disconnected response may leave
+            // generation running. Only failures while establishing the connection are safe to
+            // replay; other transport failures would risk duplicating the accepted work.
+            Err(error) if retryable_more_attempts && error.is_connect() && !error.is_timeout() => {
                 eprintln!(
                     "proxy retry attempt={attempt} error={error:#} path={}",
                     target.path()
@@ -396,10 +510,42 @@ async fn forward_inner(state: &ProxyState, request: Request) -> Result<Response<
     let (parts, body) = request.into_parts();
     // Buffer the body up front: a retried attempt must resend the exact same bytes, and a
     // streamed body can only be consumed once.
-    let body_bytes = to_bytes(body, MAX_BUFFERED_REQUEST_BODY_BYTES)
-        .await
-        .context("buffer request body for retry-safe forwarding")?;
+    // The upstream client timeout starts only after this read. Bound incoming uploads too:
+    // otherwise an incomplete body can retain the shared execution lock indefinitely.
+    let body_bytes = tokio::time::timeout(
+        state.request_body_timeout,
+        to_bytes(body, MAX_BUFFERED_REQUEST_BODY_BYTES),
+    )
+    .await
+    .context("read incoming request body before deadline")?
+    .context("buffer request body for retry-safe forwarding")?;
     let headers = filtered_headers(&parts.headers);
+
+    // Metadata and unload requests must remain available to diagnose/recover pressure.
+    // Raw requests remain byte-preserving; only admission interprets their envelope.
+    let parsed = serde_json::from_slice::<serde_json::Value>(&body_bytes).ok();
+    let unload = parts.uri.path() == "/api/generate" && parsed.as_ref().is_some_and(|body| {
+        matches!(body.get("keep_alive"), Some(value) if value == 0 || value == "0" || value == "0s")
+            && body
+                .get("prompt")
+                .is_none_or(|value| value.as_str() == Some(""))
+            && body.get("messages").is_none()
+            && body.get("images").is_none()
+    });
+    let metadata = matches!(parts.method, reqwest::Method::GET | reqwest::Method::HEAD)
+        || parts.uri.path() == "/api/show";
+    let resource = if metadata || unload {
+        None
+    } else {
+        match state.resource_governor.wait_for_capacity(&state.upstream, 0, Duration::from_millis(500)).await {
+            Ok(permit) => Some(permit),
+            Err(error) => return Response::builder().status(StatusCode::SERVICE_UNAVAILABLE)
+                .header("content-type", "application/json")
+                .header("retry-after", "2")
+                .body(Body::from(serde_json::json!({"error":error.to_string(),"resource_admission":error.receipt}).to_string()))
+                .context("build resource refusal"),
+        }
+    };
 
     let outcome = send_with_retries(state, &parts.method, &target, &headers, &body_bytes).await;
     let response = match outcome {
@@ -423,7 +569,12 @@ async fn forward_inner(state: &ProxyState, request: Request) -> Result<Response<
     }
     outgoing = outgoing.header("x-freellama-proxy", "1");
     let result = outgoing
-        .body(Body::from_stream(response.bytes_stream()))
+        .body(Body::new(AdmittedBody {
+            inner: Body::from_stream(response.bytes_stream()),
+            permit: None,
+            execution: None,
+            resource,
+        }))
         .context("build proxied response")?;
     eprintln!(
         "proxy method={} path={} upstream_status={} upstream_headers_ms={}",

@@ -33,7 +33,7 @@ import {
   assertAllowedWorkspace,
 } from "./config.js";
 import {
-  doctor, machine, health, createSession, deleteSession, listModels, route, runTaskRequest, runTaskBatchRequest, SERVER_VERSION,
+  doctor, machine, health, createSession, deleteSession, killSession, listModels, route, runTaskRequest, runTaskBatchRequest, SERVER_VERSION,
 } from "./native.js";
 import {
   ollamaFetch,
@@ -42,6 +42,10 @@ import {
   endpointParam,
   ollamaEndpointParam,
   taskParam,
+  systemPromptParam,
+  messagesParam,
+  localToolsParam,
+  taskMessages,
   batchItemParam,
   canonicalTaskKind,
   objectiveParam,
@@ -189,12 +193,11 @@ for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
 }
 
 
-const INSTRUCTIONS = `caller owns task decomposition; operator owns endpoints, exact --cpu-model assignments, lifecycle.
-Ollama plus the OS/driver run physical CPU/GPU.
-Efficient loop: models{view:"installed"}, then models{view:"resident"}; doctor only for runtime diagnosis. Preview consequential work before executing.
-delegate_research is only for narrow allowed-workspace research. Keep full diagnostics, raw embeddings, and long evidence out of active context; read freellama://docs/index on demand.
+const INSTRUCTIONS = `caller owns task decomposition; operator owns endpoints, exact --cpu-model assignments, lifecycle. Ollama plus the OS/driver run physical CPU/GPU.
+models{view:"installed"}, then models{view:"resident"}; doctor only diagnoses. Preview consequential work.
+delegate_research is narrow read-only workspace research.
 ask approval for one exact tag and reported size before ollama_manage; search or recommendation is never download permission.
-run_task preview never executes; code_review aliases coding.
+run_task preview never executes; code_review aliases coding. Caller owns prompts and format; findings are candidates, not accepted defects.
 Use requiredCapabilities:["tools"] to preview tool eligibility; omit preview and supply the payload to execute.
 Docs: freellama://docs/index.`;
 
@@ -320,23 +323,23 @@ server.registerTool(
   "session",
   {
     description:
-      "Use when: retaining model affinity. Do not use when: storing history or KV. " +
-      "Inputs: action, sessionId for delete. Returns: affinity handle or confirmation.",
+      "Use when: create/delete affinity; kill also cancels requests. Do not use when: history/KV storage or shared-model unload. Returns: handle or receipt.",
     inputSchema: {
-      action: z.enum(["create", "delete"]).describe("create | release"),
-      sessionId: z.string().uuid().optional().describe("delete only"),
+      action: z.enum(["create", "delete", "kill"]),
+      sessionId: z.string().uuid().optional().describe("required for delete/kill"),
       endpoint: endpointParam,
     },
     outputSchema: sessionResultSchema,
-    annotations: { destructiveHint: false },
+    annotations: { destructiveHint: true },
   },
   async ({ action, sessionId, endpoint }) => {
     try {
       if (action === "create") {
-        if (sessionId !== undefined) return errorResult(new Error("sessionId is only valid for action: delete."));
+        if (sessionId !== undefined) return errorResult(new Error("sessionId is only valid for action: delete or kill."));
         return structuredResult(JSON.parse(await createSession(endpoint)));
       }
-      if (sessionId === undefined) return errorResult(new Error("action: delete requires sessionId."));
+      if (sessionId === undefined) return errorResult(new Error(`action: ${action} requires sessionId.`));
+      if (action === "kill") return parsedResult(await killSession(endpoint, sessionId));
       await deleteSession(endpoint, sessionId);
       return structuredResult({ session_id: sessionId, deleted: true });
     } catch (error) {
@@ -349,9 +352,9 @@ server.registerTool(
   "models",
   {
     description:
-      "Use when: inspecting models. Do not use when: executing or changing state; search never " +
-      "permits a pull. Inputs: one view and its fields. Returns: inventory/detail, placement, or candidates. " +
-      "Next: library family, then model:\"<family>\" for tags/fit.",
+      "Use when: inspecting models. Do not use when: executing or changing state — search never permits a pull. " +
+      "Inputs: one view and its fields. Returns: inventory/detail, placement, or candidates. " +
+      "Next for library lookup: view='library', then model='<family>' for tags and fit.",
     inputSchema: {
       view: z
         .enum(["installed", "resident", "detail", "raw", "library"])
@@ -361,7 +364,7 @@ server.registerTool(
       includeVerbose: z
         .boolean()
         .optional()
-        .describe('"detail" only. Adds license/modelfile — the bulk of that payload, never routing-relevant'),
+        .describe('detail only: include license/modelfile'),
       query: z.string().min(1).optional().describe('"library" step 1: free text, e.g. "qwen", "embed"'),
       capabilities: z
         .array(z.enum(["vision", "tools", "thinking", "embedding", "cloud"]))
@@ -372,7 +375,7 @@ server.registerTool(
       order: z
         .enum(["popular", "newest"])
         .optional()
-        .describe('"library" step 1. default "popular" — prefer it'),
+        .describe('library search; default popular'),
       limit: z.number().int().positive().max(50).optional().describe('"library" search or raw/tag page size; raw default 20'),
       cursor: z.string().min(1).optional().describe('opaque continuation cursor for raw models or library tags'),
       endpoint: endpointParam,
@@ -661,49 +664,42 @@ server.registerTool(
   "run_task",
   {
     description:
-      "Use when: routing or executing supplied content. Do not use when: workspace files must be read; use delegate_research. " +
-      "Preview consequential work first; it never generates. Returns: decision or response with receipts. Next: inspect structured observation and verification.",
+      "Use when: running your prompts, conversations, tools, or embeddings. " +
+      "Do not use when: looking up workspace files; use delegate_research. " +
+      "Task defaults to completion. preview:true only decides. Returns: response plus receipts.",
     inputSchema: {
       endpoint: endpointParam,
       task: taskParam,
       objective: objectiveParam,
-      model: z.string().min(1).optional().describe("Force this exact installed model name."),
-      sessionId: z.string().min(1).optional().describe("Session id for model affinity across calls."),
-      contextTokens: z.number().int().positive().optional().describe("Total Ollama context window (num_ctx), including input and output."),
+      model: z.string().min(1).optional().describe("Exact installed model."),
+      sessionId: z.string().min(1).optional().describe("Model affinity, not history."),
+      contextTokens: z.number().int().positive().optional().describe("Total input + output window (num_ctx)."),
       executionPreference: executionPreferenceParam,
       minPlacementEvidence: minPlacementEvidenceParam,
       requiredCapabilities: requiredCapabilitiesParam,
       prompt: z.string().min(1).optional().describe("Chat input when messages is omitted."),
+      systemPrompt: systemPromptParam,
       images: z
         .array(z.string().min(1))
         .min(1)
         .optional()
         .describe("base64, no data-URI prefix; prompt mode only; requires an explicit tested vision model"),
-      messages: z
-        .array(
-          z
-            .object({ role: z.enum(["system", "user", "assistant", "tool"]), content: z.string() })
-            .passthrough(),
-        )
-        .min(1)
-        .optional()
-        .describe(
-          "wins over prompt; preserves Ollama images, thinking, tool_calls, tool_name, and other message fields",
+      messages: messagesParam.describe(
+          "Caller-owned system prompts; no injected task instructions. Overrides prompt; extra fields preserved.",
         ),
       input: z
         .union([z.string().min(1), z.array(z.string().min(1)).min(1)])
         .optional()
-        .describe('embedding only; batch strings because one call is far cheaper than one call per item'),
-      tools: z.array(z.record(z.unknown())).min(1).optional().describe("Ollama function definitions for chat tasks."),
+        .describe('embedding only; accepts batches'),
+      tools: localToolsParam,
       keepAlive: z.string().min(1).optional().describe('"0" unloads now, "-1" pins, default 5m'),
       format: z
         .union([z.literal("json"), z.record(z.unknown())])
         .optional()
-        .describe('Ollama structured output: "json" or a JSON schema object'),
+        .describe('Structured output: json or JSON Schema'),
       think: z
         .union([z.boolean(), z.enum(["low", "medium", "high"])])
-        .optional()
-        .describe("Override the task profile for thinking-capable models"),
+        .optional(),
       options: z
         .record(z.unknown())
         .optional()
@@ -711,8 +707,8 @@ server.registerTool(
       logprobs: z.boolean().optional(),
       topLogprobs: z.number().int().nonnegative().optional().describe("Requires logprobs:true"),
       minConfidence: minConfidenceParam,
-      priority: z.enum(["interactive", "normal", "background"]).optional().describe("Admission class only; normal default. Fair scheduling prevents background starvation."),
-      returnEmbeddings: z.boolean().optional().describe("false (default) withholds the raw vectors; they are large and unreadable to a model"),
+      priority: z.enum(["interactive", "normal", "background"]).optional().describe("Fair admission class; default normal."),
+      returnEmbeddings: z.boolean().optional().describe("Include raw vectors; default false."),
       preview: z
         .boolean()
         .optional()
@@ -734,6 +730,7 @@ server.registerTool(
     minPlacementEvidence,
     requiredCapabilities,
     prompt,
+    systemPrompt,
     images,
     messages,
     input,
@@ -754,6 +751,7 @@ server.registerTool(
       if (preview) {
         const executionOnlyFields = ([
           ["prompt", prompt],
+          ["systemPrompt", systemPrompt],
           ["images", images],
           ["messages", messages],
           ["input", input],
@@ -788,7 +786,7 @@ server.registerTool(
       if (!preview && task === "embedding") {
         if (input === undefined) return errorResult(new Error('task "embedding" requires `input`.'));
         if (
-          [prompt, images, messages, tools, format, think, logprobs, topLogprobs].some(
+          [prompt, systemPrompt, images, messages, tools, format, think, logprobs, topLogprobs].some(
             (value) => value !== undefined,
           )
         ) {
@@ -801,10 +799,10 @@ server.registerTool(
         if (input !== undefined || returnEmbeddings !== undefined) {
           return errorResult(new Error('`input` and `returnEmbeddings` are valid only for task "embedding".'));
         }
-        if (prompt === undefined && (messages === undefined || messages.length === 0)) {
-          return errorResult(new Error(`task "${task}" requires \`prompt\` or \`messages\`.`));
+        if (prompt === undefined && systemPrompt === undefined && (messages === undefined || messages.length === 0)) {
+          return errorResult(new Error(`task "${task}" requires \`prompt\`, \`systemPrompt\`, or \`messages\`.`));
         }
-        if (images !== undefined && messages !== undefined) {
+        if (images !== undefined && (messages !== undefined || prompt === undefined)) {
           return errorResult(
             new Error("Top-level `images` is valid only with `prompt`; put images inside messages instead."),
           );
@@ -849,7 +847,7 @@ server.registerTool(
           required_capabilities: effectiveRequiredCapabilities ?? [],
           prompt,
           images,
-          messages: messages ?? [],
+          messages: taskMessages({ systemPrompt, messages, prompt, images }),
           input,
           tools,
           keep_alive: keepAlive,
@@ -896,11 +894,14 @@ server.registerTool(
       for (const item of tasks) {
         const task = item.task as Record<string, unknown>;
         if (task.task === "embedding") {
-          if (task.input === undefined || task.prompt !== undefined || task.messages !== undefined || task.tools !== undefined) {
+          if (task.input === undefined || task.prompt !== undefined || task.systemPrompt !== undefined || task.messages !== undefined || task.tools !== undefined) {
             return errorResult(new Error(`batch item ${item.id}: embedding requires input and accepts no chat payload.`));
           }
-        } else if (task.input !== undefined || (task.prompt === undefined && task.messages === undefined)) {
-          return errorResult(new Error(`batch item ${item.id}: chat work requires prompt or messages and accepts no input.`));
+        } else if (task.input !== undefined || (task.prompt === undefined && task.systemPrompt === undefined && task.messages === undefined)) {
+          return errorResult(new Error(`batch item ${item.id}: chat work requires prompt, systemPrompt, or messages and accepts no input.`));
+        }
+        if (task.images !== undefined && (task.messages !== undefined || task.prompt === undefined)) {
+          return errorResult(new Error(`batch item ${item.id}: top-level images requires prompt without messages; put images inside messages instead.`));
         }
         if (task.images !== undefined && task.model === undefined) {
           return errorResult(new Error(`batch item ${item.id}: images require an explicit tested vision model.`));
@@ -908,7 +909,7 @@ server.registerTool(
       }
       return withBatchTelemetry(parsedResult(await runTaskBatchRequest(endpoint ?? DEFAULT_SERVE_ENDPOINT, {
         tasks: tasks.map((item) => {
-          const task = item.task as Record<string, unknown>;
+          const task = item.task;
           return ({
           id: item.id,
           independent: item.independent,
@@ -924,7 +925,7 @@ server.registerTool(
             priority: task.priority ?? "normal",
             prompt: task.prompt,
             images: task.images,
-            messages: task.messages ?? [],
+            messages: taskMessages(task),
             input: task.input,
             tools: (task as Record<string, unknown>).tools,
             keep_alive: (task as Record<string, unknown>).keepAlive,
@@ -1037,29 +1038,29 @@ server.registerTool(
       workspacePath: z
         .string()
         .min(1)
-        .describe("directory inside FREELLAMA_MCP_ALLOWED_ROOTS (absolute preferred; relative is resolved)"),
+        .describe("Directory inside FREELLAMA_MCP_ALLOWED_ROOTS"),
       adapter: z
         .enum(["bash", "octocode"])
         .optional()
-        .describe('"bash" (default) beat "octocode" on every model measured, and is faster'),
+        .describe('default bash'),
       model: z
         .string()
         .min(1)
         .optional()
-        .describe("omit to use FREELLAMA_MCP_DEFAULT_MODEL; research accuracy collapses below ~12B"),
+        .describe("default FREELLAMA_MCP_DEFAULT_MODEL"),
       endpoint: endpointParam,
       executionPreference: executionPreferenceParam,
       minPlacementEvidence: minPlacementEvidenceParam,
-      legacyText: z.boolean().optional().describe("false default: compact text cue; true: legacy serialized JSON text"),
+      legacyText: z.boolean().optional().describe("Include duplicate JSON text; default false"),
       agent: z
         .object({
           maxTurns: z.number().int().positive().optional(),
-          contextTokens: z.number().int().positive().optional().describe("Total agent context; input reserves outputTokens and safety margin."),
-          outputTokens: z.number().int().positive().optional().describe("Maximum generated tokens per model call; reserved from context."),
+          contextTokens: z.number().int().positive().optional().describe("Total window, including output and margin."),
+          outputTokens: z.number().int().positive().optional().describe("Per-call output cap, reserved from context."),
           temperature: z.number().nonnegative().optional(),
           seed: z.number().int().nonnegative().optional(),
           think: z.boolean().optional(),
-          keepAlive: z.string().min(1).optional().describe('Ollama duration such as "5m", "0", or "-1"'),
+          keepAlive: z.string().min(1).optional(),
           requestTimeoutSeconds: z.number().positive().optional(),
           toolTimeoutSeconds: z.number().positive().optional(),
           retryAttempts: z.number().int().positive().optional(),

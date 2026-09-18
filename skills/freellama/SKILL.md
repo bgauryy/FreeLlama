@@ -37,8 +37,9 @@ One managed call contains one task; only the calling agent knows which tasks are
 
 Prefer deterministic search when an identifier is known; embeddings are for no-keyword similarity. Treat every measured number as one-machine evidence, not a default. Models at or below 12B were unreliable for broad research in the recorded trials.
 
-Before offloading, map the work to `completion`, `coding`, `code_repair`, `tools`, `browser`,
-`vision`, `embedding`, or `long_context`, plus required capabilities and context. Prefer a
+Ordinary chat can omit `task` and use the `completion` default. Choose `coding`, `code_repair`,
+`tools`, `browser`, `vision`, `embedding`, or `long_context` when that routing profile fits; callers
+own prompts and system messages. Add capability/context constraints when needed. Prefer a
 qualified installed model; never infer inventory from a model family name or this skill's examples.
 
 ## Execute one flow

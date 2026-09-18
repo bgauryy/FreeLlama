@@ -13,8 +13,9 @@ evidence, `fastest` can only filter on advertised capability (`completion` + `to
 that. A name/param-count table is not evidence either, just a different guess.
 
 So: pass `minConfidence:"medium"` for anything quality-sensitive, and expect a refusal until the
-two inputs below exist. `objective: "balanced"` and `"quality"` need a configured policy at all;
-`"fastest"` does not.
+two inputs below exist. Default `objective:"balanced"` prefers policy-qualified candidates but
+falls back to eligible models with low confidence when none qualify. `"quality"` requires a
+configured policy unless the caller pins an explicit model; `"fastest"` needs no policy.
 
 ## Making `minConfidence:"medium"` reachable — the step nobody does
 
@@ -22,7 +23,7 @@ two inputs below exist. `objective: "balanced"` and `"quality"` need a configure
 
 | Input | Supplies | Without it |
 |---|---|---|
-| `--policy-file` | a *quality* contract: which models are vouched for on this task | `low`, and `objective: balanced/quality` errors outright |
+| `--policy-file` | a *quality* contract: which models are vouched for on this task | `low`; balanced can fall back, while quality without an explicit model refuses |
 | `--benchmark-report` | local *functional* measurement from `npx @octocodeai/freellama bench-all` | `low`, evidence `configured_task_policy` |
 
 Neither alone is enough, deliberately: a policy without measurement is an unverified claim, and

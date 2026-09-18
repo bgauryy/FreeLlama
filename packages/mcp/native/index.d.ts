@@ -23,6 +23,8 @@ export function health(endpoint?: string | undefined | null): Promise<string>;
 /** Create a bounded, idle-expiring model-affinity handle; it stores no prompt history or KV. */
 export function createSession(endpoint?: string | undefined | null): Promise<string>;
 
+export function killSession(endpoint: string | undefined | null, sessionId: string): Promise<string>;
+
 /** Release a model-affinity handle after related work has completed. */
 export function deleteSession(
   endpoint: string | undefined | null,

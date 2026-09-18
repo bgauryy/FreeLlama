@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import sys
+import json
+import tracemalloc
 import tempfile
 from pathlib import Path
 
@@ -24,6 +26,7 @@ from agent_context import (  # noqa: E402
     context_budget,
     fit_to_context,
     messages_tokens,
+    _compact,
 )
 
 FAILURES: list[str] = []
@@ -102,6 +105,22 @@ check(
 small = build_conversation(turns=1, observation_chars=100)
 fitted_small, compacted_small = fit_to_context(small, num_ctx=8192, num_predict=512)
 check("a small conversation is not compacted", not compacted_small and fitted_small == small)
+check("fitting within budget preserves the original prefix object", fitted_small is small)
+
+recoverable = "Observation (step 7):\nFIRST_EVIDENCE\n" + "middle " * 2000 + "\nLAST_EVIDENCE"
+recoverable += page_footer(7, 2, 4, 20_000)
+breadcrumb = _compact(recoverable, ContextPolicy())
+check("compaction retains an exact stored-page recovery action", '{"action":"page","step":7,"page":2}' in breadcrumb)
+check("compaction retains completeness state", "page 2 of 4" in breadcrumb)
+check("compaction retains evidence at both ends", "FIRST_EVIDENCE" in breadcrumb and "LAST_EVIDENCE" in breadcrumb)
+check("compacting a breadcrumb again is byte-stable", _compact(breadcrumb, ContextPolicy()) == breadcrumb)
+single_page_observation = "Observation (step 8):\nFIRST_EVIDENCE\n" + "middle " * 500 + "\nLAST_EVIDENCE"
+single_page_observation += "\n\nCommands remaining: 2. Finish now if the task is answerable; do not repeat prior commands."
+check("breadcrumb tail is evidence rather than an obsolete turn reminder", "LAST_EVIDENCE" in _compact(single_page_observation, ContextPolicy()))
+check("overflow compaction reclaims modest headroom when old observations suffice", messages_tokens(fitted) <= int(budget * 0.9))
+extended = fitted + [{"role": "assistant", "content": '{"action":"finish","answer":"done"}'}]
+extended_fit, extended_compacted = fit_to_context(extended, num_ctx=8192, num_predict=512)
+check("next fitting append leaves the compacted prefix unchanged", not extended_compacted and extended_fit is extended)
 
 # --- pathological case: recent turns alone exceed the window ---------------------------------
 huge = build_conversation(turns=2, observation_chars=60_000)
@@ -217,6 +236,26 @@ with tempfile.TemporaryDirectory() as calibration_root:
         other_model.metadata()["calibration_source"] == "current_process"
         and other_model.budgeter.scale == 1.0,
     )
+    changed_policy_runtime = AgentRuntimeConfig.from_env(
+        default_tool_timeout_seconds=30,
+        env={**runtime_env, "FREELLAMA_AGENT_CHARS_PER_TOKEN": "8"},
+    )
+    changed_policy = AgentContextManager(changed_policy_runtime, model="model-a", calibration_dir=calibration_dir)
+    check("calibration is isolated when the estimator policy changes", changed_policy.budgeter.scale == 1.0)
+    identified = AgentContextManager(runtime, model="model-a", calibration_dir=calibration_dir, calibration_identity="digest-a/template-a")
+    identified.observe(small, baseline_estimate * 3)
+    same_identity = AgentContextManager(runtime, model="model-a", calibration_dir=calibration_dir, calibration_identity="digest-a/template-a")
+    changed_identity = AgentContextManager(runtime, model="model-a", calibration_dir=calibration_dir, calibration_identity="digest-b/template-a")
+    check("matching immutable calibration identity reloads", same_identity.budgeter.scale >= 3.0)
+    check("changed calibration identity starts fresh", changed_identity.budgeter.scale == 1.0)
+    check("tag-only calibration reports its limited scope", restarted_manager.metadata()["calibration_scope"] == "model_tag_and_estimator")
+    invalid_cache_path = calibration_dir / f"{first_manager._model_key()}-invalid.json"
+    invalid_cache_path.write_text("[]", encoding="utf-8")
+    invalid_record_manager = AgentContextManager(runtime, model="model-a", calibration_dir=calibration_dir)
+    check("malformed calibration records do not prevent loading valid samples", invalid_record_manager.budgeter.scale >= 2.0)
+    invalid_cache_path.write_text(json.dumps({**first_manager._calibration_contract(), "scale": 2, "samples": float("inf")}), encoding="utf-8")
+    invalid_sample_manager = AgentContextManager(runtime, model="model-a", calibration_dir=calibration_dir)
+    check("non-finite cached sample counts do not break startup", invalid_sample_manager.budgeter.scale >= 2.0)
 
 try:
     ContextPolicy.from_env({"FREELLAMA_AGENT_COMPACT_RETAIN_RATIO": "1.0"})
@@ -289,7 +328,7 @@ check(
     rejoined == big,
     f"{len(rejoined)} chars vs {len(big)} original",
 )
-check("no page exceeds the page budget by more than one line", all(len(c) <= 3000 + 120 for c in pages))
+check("no page exceeds the page budget", all(len(c) <= 3000 for c in pages))
 check(
     "pages split on line boundaries, never mid-line",
     all(c.endswith("\n") for c in pages[:-1]),
@@ -297,6 +336,18 @@ check(
 check("a short observation is a single page", paginate("one line")[2] == 1)
 check("empty input is one empty page", paginate("") == ("", 1, 1))
 check("page numbers clamp instead of erroring", paginate(big, 9999)[1] == total)
+long_line = "prefix\n" + "界" * 10_000 + "\r\ntail"
+long_line_total = paginate(long_line, page_size=128)[2]
+long_line_pages = [paginate(long_line, p, 128)[0] for p in range(1, long_line_total + 1)]
+check("oversized Unicode lines obey the hard page limit", all(len(c) <= 128 for c in long_line_pages))
+check("oversized-line pagination remains lossless", "".join(long_line_pages) == long_line)
+try:
+    paginate("", page_size=0)
+except ValueError:
+    invalid_page_size_rejected = True
+else:
+    invalid_page_size_rejected = False
+check("pagination rejects a non-positive page size even for empty input", invalid_page_size_rejected)
 
 # --- the footer must tell the model how to get the rest --------------------------------------
 foot = page_footer(step=3, page=1, total=4, total_chars=len(big))
@@ -305,6 +356,9 @@ check("footer gives an exact next-page action", '"action":"page","step":3,"page"
 check("footer states nothing was discarded", "nothing discarded" in foot)
 check("footer says paging does not re-run the command", "does NOT re-run" in foot)
 check("a single page gets no footer at all", page_footer(1, 1, 1, 10) == "")
+final_foot = page_footer(3, 4, 4, len(big))
+check("final page explicitly ends pagination", "End of stored output" in final_foot)
+check("final page never instructs a wraparound", '"action":"page"' not in final_foot and "next page" not in final_foot)
 
 # --- the store keeps everything retrievable -------------------------------------------------
 store = ObservationStore()
@@ -327,6 +381,52 @@ small_pages = ObservationStore(page_size=128)
 small_pages.put(1, big)
 _, small_page_footer = small_pages.view(1)
 check("observation page size is configurable", "page 1 of" in small_page_footer and "page 1 of 1" not in small_page_footer)
+store.close()
+small_pages.close()
+
+# The hot loop must retain page descriptors, not every full observation or page offset.
+disk_payload = "開始\n" + "🦙\"\\\r\n" * 100_000 + "END"
+with ObservationStore(page_size=128) as disk_store:
+    spool_directory = disk_store.directory
+    tracemalloc.start()
+    disk_store.put(1, disk_payload, metadata={"action": "shell", "status": "ok", "source": "src/router.py"})
+    _, peak_bytes = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    check("spooling uses bounded additional memory", peak_bytes < 1_000_000, str(peak_bytes))
+    check("disk store keeps full Unicode output exact", disk_store.get(1) == disk_payload)
+    recovered = []
+    total_pages = disk_store.page_count(1)
+    for page in range(total_pages, 0, -1):
+        recovered.append(disk_store.view(1, page)[0])
+    check("disk store supports arbitrary page seeks losslessly", "".join(reversed(recovered)) == disk_payload)
+    ledger_message = disk_store.message(1, 2)
+    ledger_compact = _compact(ledger_message, ContextPolicy())
+    check("structured compaction preserves action status source and page", all(part in ledger_compact for part in ['"action":"shell"', '"status":"ok"', '"source":"src/router.py"', '"page":2']))
+    with tempfile.TemporaryDirectory() as result_root:
+        result_path = Path(result_root) / "result.json"
+        result = {"final_answer": "ok", "tool_calls": [{"name": "shell", "status": "ok"}], "usage": {"input_tokens": 1}}
+        tracemalloc.start()
+        disk_store.write_result(result_path, result)
+        _, write_peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        check("final audit JSON streams with bounded memory", write_peak < 2_000_000, str(write_peak))
+        decoded = json.loads(result_path.read_text(encoding="utf-8"))
+        check("streamed final result preserves the public JSON shape", decoded == {**result, "tool_calls": [{"name": "shell", "status": "ok", "result": disk_payload}]})
+        previous_result = result_path.read_bytes()
+        try:
+            disk_store.write_result(result_path, {"tool_calls": [{"name": "shell"}, {"name": "missing"}]})
+        except KeyError:
+            pass
+        check("failed finalization leaves the previous result intact", result_path.read_bytes() == previous_result)
+        check("failed finalization removes its partial output", not list(Path(result_root).glob("*.tmp")))
+check("closing the store removes its temporary spool", not spool_directory.exists())
+try:
+    with ObservationStore() as failing_store:
+        failed_directory = failing_store.directory
+        raise RuntimeError("test cleanup")
+except RuntimeError:
+    pass
+check("exceptional exit cleans the observation spool", not failed_directory.exists())
 
 print()
 if FAILURES:

@@ -238,6 +238,25 @@ pub async fn delete_session(endpoint: Option<String>, session_id: String) -> Res
     .await
 }
 
+/// Cancel managed requests for one session and invalidate its affinity handle.
+///
+/// # Errors
+/// Returns an error if the server is unreachable or the session does not exist.
+#[napi]
+pub async fn kill_session(endpoint: Option<String>, session_id: String) -> Result<String> {
+    uuid::Uuid::parse_str(&session_id)
+        .map_err(|error| Error::from_reason(format!("invalid session UUID: {error}")))?;
+    let endpoint = endpoint_or_default(endpoint);
+    let value = post_json(
+        &endpoint,
+        &format!("/_freellama/v1/sessions/{session_id}/kill"),
+        &json!({}),
+        control_timeout(),
+    )
+    .await?;
+    pretty(&value)
+}
+
 /// Installed-model inventory with capabilities, residency, and advertised context, as discovered
 /// by a running `freellama serve`.
 ///

@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "suite_id": "mixed-workload-v1",
+  "evidence_scope": "public_synthetic_development",
+  "reviewed_at": "2026-09-06",
+  "review_due_at": "2026-10-06",
+  "cases": [
+    {"id": "long-extraction", "kind": "long", "prompt": "Find the CURRENT record and return only its ticket value. Ignore archived records.", "record": "CURRENT record: ticket=FL-7319; owner=Mira; status=ready", "expected": "FL-7319", "grader": "exact", "archive_rows": 180},
+    {"id": "short-extraction", "kind": "short", "prompt": "Return only the ticket value from this record: ticket=FL-2086; owner=Noam; status=queued", "expected": "FL-2086", "grader": "exact"},
+    {"id": "structured-fields", "kind": "json", "prompt": "Return a JSON object with exactly the fields owner and count from this record. count must be a number. Record: owner=Rina; count=7; ignored=blue", "expected": {"owner": "Rina", "count": 7}, "grader": "json"},
+    {"id": "independent-extraction", "kind": "independent", "prompt": "Return only the status value from this independent record: ticket=FL-9902; owner=Tal; status=review", "expected": "review", "grader": "exact"}
+  ]
+}

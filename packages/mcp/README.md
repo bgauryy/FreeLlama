@@ -267,6 +267,18 @@ refuses continuation if the live model list changed. Library tag responses use t
 shape. Do not request `doctor {view:"full"}` in an agent loop: use `summary`, `scheduler`, or
 `config` for the smallest diagnostic that answers the question.
 
+### Preview and execution
+
+For ordinary chat, `run_task {prompt:"Hello"}` is enough once the server and an eligible model
+are available. `task` defaults to `completion`, including inside batch items. Task profiles are
+optional routing presets, not restrictions on what you can ask the model.
+
+Default `balanced` routing prefers policy-qualified candidates when available. Without an eligible
+policy candidate, it falls back to capability/context-compatible models and reports low confidence,
+`quality_evidence:"none"`, and `balanced_without_quality_policy`. Set `minConfidence:"medium"`
+to require evidence, or `objective:"quality"` to require policy-based selection unless you pin a model.
+Memory admission, authentication, and capability requirements apply in every mode.
+
 `run_task` has two deliberately exclusive request shapes:
 
 - Preview: set `preview: true`; pass routing fields such as `task`, `objective`, `model`,
@@ -284,6 +296,16 @@ thinking, tool calls, and tool names. Managed requests also accept `format`, `th
 `logprobs`, and `topLogprobs`. Use `contextTokens` for `num_ctx`; placement owns `num_gpu`, so both
 keys are rejected inside `options`. The raw proxy remains available when a caller needs an Ollama
 endpoint or feature that the managed MCP tool does not expose, including streaming.
+
+You own the task instructions. Pass system prompts as `messages` entries with `role:"system"`;
+FreeLlama preserves their content and order without prepending its own task prompt. A plain `prompt`
+becomes one user message, and a supplied `messages` array takes precedence. This also applies to
+`task:"code_review"` (an alias for `coding`) and `run_task_batch`: no review wrapper, mandatory
+JSON review format, or review-specific output-token minimum is added.
+
+The separate `delegate_research` adapter and natural-language routing interpreter retain internal
+protocol prompts for their own bounded jobs. Those prompts are not injected into `run_task`
+conversations. Ollama can still apply the selected model's own template or Modelfile defaults.
 
 `model_type` is a display-oriented value derived from Ollama's additive capabilities:
 `generative`, `multimodal`, `embedding_only`, or `unknown`. Routing continues to use the original
@@ -306,6 +328,13 @@ steers the `quality` objective. `minPlacementEvidence:"observed"` fails closed u
 `keepAlive:"0"` uses an observe-then-unload transaction: FreeLlama retains the runner long enough
 to inspect `/api/ps`, accepts feedback only for verified placement, requests an explicit unload,
 then reports the unload verification in `execution.lifecycle`.
+
+Preview `execution.agent_plan` separates `queue_readiness`, `resource_readiness`, and combined
+`dispatch_readiness`. Inspect `execution.resource_assessment` for required bytes and missing telemetry;
+the preview shares execution's footprint estimate but never reserves memory. Local inference requires
+RAM telemetry by default; configure an explicit alternative on `serve`, not in a model prompt.
+Resource errors retain a human-readable `error` plus machine-readable `code` and `resource_admission`
+fields in the HTTP response. The MCP error text preserves that response for inspection.
 
 `models {view: "resident"}` uses the managed catalog, so it includes resident models from both
 Ollama processes and labels explicitly assigned CPU models instead of querying only the primary

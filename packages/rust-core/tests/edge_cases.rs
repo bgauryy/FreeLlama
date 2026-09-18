@@ -6,7 +6,7 @@ use std::io::Write;
 
 use freellama::model_bench::{Capability, ModelMetadata, ModelType, benchmark_plan};
 use freellama::platform::{
-    CatalogModel, Objective, PlatformConfig, RouteInput, RouteIntent, SessionAffinity, TaskKind,
+    CatalogModel, Objective, RouteInput, RouteIntent, SessionAffinity, TaskKind,
     normalize_route_intent, runtime_metrics, select_route,
 };
 use freellama::policy::qualify_from_aggregate;
@@ -20,6 +20,7 @@ use serde_json::json;
 fn model(name: &str, size: u64, capabilities: &[Capability]) -> CatalogModel {
     CatalogModel {
         name: name.to_owned(),
+        digest: None,
         size,
         capabilities: capabilities.iter().copied().collect(),
         advertised_context: Some(32_768),
@@ -684,7 +685,7 @@ fn recursive_upstream_detection_covers_ipv6_loopback() {
 
 #[test]
 fn cpu_backend_configuration_fails_closed_on_ambiguous_or_empty_assignments() {
-    let same_endpoint = PlatformConfig::new(
+    let same_endpoint = common::platform_config(
         "127.0.0.1:11435",
         "http://localhost:11434",
         None,
@@ -694,7 +695,7 @@ fn cpu_backend_configuration_fails_closed_on_ambiguous_or_empty_assignments() {
     .with_cpu_backend("http://127.0.0.1:11434/", ["embed-model"]);
     assert!(same_endpoint.validate().is_err());
 
-    let no_models = PlatformConfig::new(
+    let no_models = common::platform_config(
         "127.0.0.1:11435",
         "http://127.0.0.1:11434",
         None,
@@ -821,3 +822,4 @@ fn incidental_substrings_do_not_create_a_vision_requirement() {
         "'photosynthesis' contains 'photo' but is not an image request"
     );
 }
+mod common;

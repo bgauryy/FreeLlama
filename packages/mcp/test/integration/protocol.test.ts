@@ -56,6 +56,7 @@ describe("tool contract", () => {
     expect(instructions).toMatch(/ask approval.*for one exact tag and reported size before ollama_manage/s);
     expect(instructions).toMatch(/search or recommendation\s+is never download permission/i);
     expect(instructions).toMatch(/run_task preview never executes; code_review aliases coding/);
+    expect(instructions).toMatch(/findings are candidates, not accepted defects/);
     expect(instructions).toMatch(/requiredCapabilities:\["tools"\].*omit preview and supply the payload/s);
     expect(instructions).toContain("Docs: freellama://docs/index");
   });
@@ -85,6 +86,8 @@ describe("tool contract", () => {
     expect(schema.properties.minPlacementEvidence.enum).toEqual(["configured", "observed"]);
     expect(schema.properties).not.toHaveProperty("upstream");
     expect(schema.properties).not.toHaveProperty("numGpu");
+    expect(schema.properties.task.description).toMatch(/caller owns prompts and output format/);
+    expect(schema.properties.messages.description).toMatch(/system prompts; no injected task instructions/);
   });
 
   it("makes batch independence and the dispatch cap machine-readable", () => {
@@ -223,9 +226,10 @@ describe("tool contract", () => {
     }
   });
 
-  it("marks ollama_delete — and only ollama_delete — machine-readably destructive", () => {
+  it("marks model deletion and session termination machine-readably destructive", () => {
     expect(byName.get("ollama_delete")!.annotations.destructiveHint).toBe(true);
     expect(tools.filter((tool) => tool.annotations?.destructiveHint === true).map((tool) => tool.name)).toEqual([
+      "session",
       "ollama_delete",
     ]);
     // Belt and braces: the prose warning must survive too.

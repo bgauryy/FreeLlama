@@ -9,6 +9,7 @@ mirrors verbatim.
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 import json
 import os
 import subprocess
@@ -25,12 +26,10 @@ from agent_context import (
     REPEAT_NOTICE,
     ObservationStore,
     call_signature,
-    paginate,
-    page_footer,
     parse_json_action,
     write_failure_result,
 )
-from agent_transport import chat_request, request_headers, unwrap_chat_response
+from agent_transport import chat_request, request_headers, unwrap_chat_response, PromptCacheUsage, retryable_chat_error, resolve_model_identity
 
 OCTOCODE_TOOLS = {"localViewStructure", "localFindFiles", "localSearchCode", "localGetFileContent", "lspGetSemantics"}
 PATH_KEYS = ("path", "uri")
@@ -111,36 +110,31 @@ def system_prompt(workspace: str) -> str:
 Tools (call as {{"action":"octocode","tool":"<name>","queries":{{...}}}}):
 
 localViewStructure - browse a directory tree, no content loaded; cheapest first orientation step.
-  queries: path (string, required, absolute), maxDepth (int), recursive (bool), filesOnly (bool),
+  path (string, required, absolute), maxDepth (int), recursive (bool), filesOnly (bool),
   directoriesOnly (bool), pattern (glob/substring filter).
 
 localFindFiles - find files/dirs by name, glob, regex, or type; returns paths only, not content.
-  queries: path (string, required, absolute), names (array of globs), pathPattern (glob over full
-  path), regex (basename regex), entryType ("f"|"d"), excludeDir (array, e.g. ["node_modules",".git"]).
+  path (string, required, absolute), names (array of globs), pathPattern (glob over full path),
+  regex (basename regex), entryType ("f"|"d"), excludeDir (array, e.g. ["node_modules",".git"]).
 
 localSearchCode - search file contents for text/regex; returns file+line matches. Your main tool.
-  queries: path (string, required, absolute), keywords (string; literal or regex search term),
+  path (string, required, absolute), keywords (string; literal or regex search term),
   mode ("paginated"|"discovery"|"detailed"), include/exclude (glob arrays),
   caseInsensitive (bool), maxFiles (int).
   Do NOT pass mode "structural" with keywords — structural (AST) search takes `pattern`/`rule`
   instead and hard-errors on keywords, costing you a turn for nothing.
 
 localGetFileContent - read one file or a line range/matched slice of it.
-  queries: path (string, required, absolute), fullContent (bool; small files only), startLine +
+  path (string, required, absolute), fullContent (bool; small files only), startLine +
   endLine (ints, both required together), matchString (anchor text/regex), minify
   ("none"|"standard"|"symbols" — "symbols" gives a cheap outline first).
 
 lspGetSemantics - LSP semantic queries: definitions, references, callers/callees, symbol outline.
-  queries: uri (string, required, absolute path), type ("definition"|"references"|"callers"|
-  "callees"|"documentSymbols"|"hover"|...), symbolName (exact identifier), lineHint (int; get this
-  from a prior search/documentSymbols call, never guess it).
-  An EMPTY result is ambiguous, and it will not tell you which case you hit: it reports
-  serverAvailable=true whether the language server is still indexing the project or genuinely
-  cannot analyse the file. Measured here on the same files: a cold server returned
-  totalSymbols=0 for Rust, and once warm the identical call returned 35. Python returned 139-430,
-  TypeScript 45. So totalSymbols=0 means "ask again or search instead", NOT "no such symbol" and
-  NOT "unsupported". Do not spend more than one retry on it — prefer localSearchCode, which needs
-  no index and cannot be cold.
+  uri (string, required, absolute path), type ("definition"|"references"|"callers"|
+  "callees"|"documentSymbols"|"hover"), symbolName (exact name), lineHint (int from a prior
+  search result — never guess it).
+  Empty result means the server is still indexing, not "not found". Retry once or prefer
+  localSearchCode instead (needs no index, never cold).
 
 Read another page of an earlier step: {{"action":"page","step":2,"page":2}}
 Long output is PAGINATED, never truncated — you see page 1 and the total, and nothing is discarded.
@@ -159,20 +153,17 @@ vendored and generated files will bury the answer. Matches under fixtures/, mock
 scaffolding, NOT the real implementation. Prefer src/, packages/*/src/ and lib/, and name the file
 you took the answer from. Absence of a match is weak evidence: widen the pattern before concluding
 something does not exist.
-ASKED FOR A DEFAULT? Find where it is DECLARED, not where it appears. A value like a port or a
-timeout is scattered across tests, docs and examples that merely pass it; those are occurrences, not
-the default. The declaration is an attribute or initializer — `default_value = `, `unwrap_or(`,
-`const `, `static `, a settings schema, a clap/argparse arg. Grep for the declaration form, and if
-you can only find occurrences, say which file you took it from and that you did not find a
-declaration. Test files (`tests/`, `*_test.*`, `*_contract.*`) define nothing — they consume it.
+ASKED FOR A DEFAULT? Find the DECLARATION, not test occurrences. Declarations look like
+`default=`, `unwrap_or(`, `const `, `static `, or a settings schema initializer.
+Test files define nothing — they only consume values declared elsewhere.
 
 All paths you pass must resolve inside the workspace; relative paths are resolved against the
-workspace root automatically. Orient cheap (localViewStructure/documentSymbols) before reading in
+workspace root automatically. Orient cheap (localViewStructure) before reading in
 full. Be decisive: most tasks need 2-6 tool calls. Never edit or write files — you only have
 read-only tools. Call finish as soon as the requested facts are established."""
 
 
-def main() -> int:
+def _main(resources: ExitStack) -> int:
     model = os.environ.get("FREELLAMA_TARGET_MODEL") or os.environ["FREELLAMA_BENCH_MODEL"]
     workspace = Path(os.environ["FREELLAMA_BENCH_WORKSPACE"]).resolve()
     prompt = Path(os.environ["FREELLAMA_BENCH_PROMPT"]).read_text(encoding="utf-8")
@@ -194,15 +185,21 @@ def main() -> int:
     ]
     calls: list[dict[str, Any]] = []
     usage = {"input_tokens": 0, "output_tokens": 0, "cache_read_tokens": None, "cache_write_tokens": None}
+    cache_usage = PromptCacheUsage()
     metrics = {"load_ms": 0.0, "prompt_eval_ms": 0.0, "eval_ms": 0.0}
     execution_receipts: list[dict[str, Any]] = []
     answer = ""
     failure: str | None = None
     calibration_dir = os.environ.get("FREELLAMA_AGENT_TOKEN_CALIBRATION_DIR", "").strip()
+    calibration_model_identity = (
+        resolve_model_identity(managed_endpoint or endpoint, model, messages[0]["content"])
+        if calibration_dir else {"verified": False, "scope": "persistence_disabled", "identity": ""}
+    )
     context_manager = AgentContextManager(
         runtime,
         model=model,
-        calibration_dir=Path(calibration_dir) if calibration_dir else None,
+        calibration_identity=calibration_model_identity["identity"],
+        calibration_dir=Path(calibration_dir) if calibration_dir and calibration_model_identity["verified"] else None,
     )
     try:
         messages = context_manager.fit(messages)
@@ -219,9 +216,8 @@ def main() -> int:
     }
 
     def call_model() -> dict[str, Any]:
-        # The proxy already retries 500/502/504 (packages/rust-core/src/proxy.rs); this loop is a
-        # second, slower layer for outages that outlast the proxy's own retry budget — losing a
-        # whole multi-turn conversation to one bad turn would be wasteful.
+        # Retry explicit overload/connection refusals only. Replaying a timeout or an uncertain
+        # transport failure can overlap a generation that is still consuming the runner.
         last_error: Exception | None = None
         for attempt in range(runtime.retry_attempts):
             try:
@@ -243,12 +239,16 @@ def main() -> int:
                 )
                 break
             except (HTTPError, URLError, TimeoutError) as error:
+                if not retryable_chat_error(error):
+                    raise
                 last_error = error
                 if attempt + 1 < runtime.retry_attempts:
                     time.sleep(runtime.retry_backoff_seconds)
         else:
             raise last_error  # type: ignore[misc]
         usage["input_tokens"] += int(response.get("prompt_eval_count", 0))
+        cache_usage.observe(response)
+        usage["cache_read_tokens"] = cache_usage.tokens
         usage["output_tokens"] += int(response.get("eval_count", 0))
         metrics["load_ms"] += float(response.get("load_duration", 0)) / 1_000_000
         metrics["prompt_eval_ms"] += float(response.get("prompt_eval_duration", 0)) / 1_000_000
@@ -266,7 +266,7 @@ def main() -> int:
             return False
 
     seen_calls: dict[str, int] = {}
-    observations = ObservationStore(runtime.context.observation_page_chars)
+    observations = resources.enter_context(ObservationStore(runtime.context.observation_page_chars))
     parse_failures = 0
     for _ in range(runtime.max_turns):
         # Transport failures are terminal (call_model already retried them). A *parse* failure is
@@ -300,9 +300,8 @@ def main() -> int:
                 want_page = int(action.get("page", 1))
             except (TypeError, ValueError):
                 want_step, want_page = 0, 1
-            body, footer = observations.view(want_step, want_page)
             messages.append({"role": "assistant", "content": json.dumps(action, ensure_ascii=False)})
-            messages.append({"role": "user", "content": f"Observation (step {want_step}):\n{body}{footer}"})
+            messages.append({"role": "user", "content": observations.message(want_step, want_page)})
             if not refit():
                 break
             continue
@@ -335,17 +334,13 @@ def main() -> int:
             "arguments": {"tool": tool_name, "queries": queries},
             "status": status,
             "duration_ms": round((time.perf_counter() - started) * 1000, 3),
-            "result": observation,
         })
         messages.append({"role": "assistant", "content": json.dumps(action, ensure_ascii=False)})
         remaining = runtime.max_turns - len(calls)
         step = len(calls)
-        observations.put(step, observation)
-        body, shown_page, total_pages = paginate(
-            observation, page_size=runtime.context.observation_page_chars
-        )
-        footer = page_footer(step, shown_page, total_pages, len(observation))
-        messages.append({"role": "user", "content": f"Observation (step {step}):\n{body}{footer}\n\nTool calls remaining: {remaining}. Finish now if the task is answerable; do not repeat prior calls."})
+        observations.put(step, observation, metadata={"action": tool_name, "status": status, "source": json.dumps(queries, ensure_ascii=False)})
+        del observation
+        messages.append({"role": "user", "content": observations.message(step) + f"\n\nTool calls remaining: {remaining}. Finish now if the task is answerable; do not repeat prior calls."})
         if not refit():
             break
     else:
@@ -381,13 +376,18 @@ def main() -> int:
             "execution_preference": execution_preference,
             "min_placement_evidence": min_placement_evidence,
             "execution_receipts": execution_receipts,
-            "cache_token_metrics": "not_reported_by_ollama",
+            "cache_token_metrics": cache_usage.metadata(),
+            "calibration_model_identity": calibration_model_identity,
         },
     }
-    result_path.parent.mkdir(parents=True, exist_ok=True)
-    result_path.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    observations.write_result(result_path, result)
     print(answer)
     return 1 if failure else 0
+
+
+def main() -> int:
+    with ExitStack() as resources:
+        return _main(resources)
 
 
 if __name__ == "__main__":

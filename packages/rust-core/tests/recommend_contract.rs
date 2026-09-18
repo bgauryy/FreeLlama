@@ -8,7 +8,7 @@ use axum::{
 };
 use freellama::{
     model_bench::Capability,
-    platform::{PlatformConfig, TaskKind, app},
+    platform::{TaskKind, app},
     recommend::{FitStatus, InstallationPlanRequest, RecommendationCatalog, installation_plans},
 };
 use serde_json::{Value, json};
@@ -89,7 +89,7 @@ async fn recommendation_endpoint_returns_a_plan_without_side_effects() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream = format!("http://{}", listener.local_addr().unwrap());
     let mock_task = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
-    let config = PlatformConfig::new("127.0.0.1:11435", upstream, None, None, "qwen2.5:0.5b")
+    let config = common::platform_config("127.0.0.1:11435", upstream, None, None, "qwen2.5:0.5b")
         .with_recommendation_catalog(path);
     let response = app(&config)
         .unwrap()
@@ -112,3 +112,4 @@ async fn recommendation_endpoint_returns_a_plan_without_side_effects() {
     assert_eq!(body["install_plans"][0]["requires_confirmation"], true);
     mock_task.abort();
 }
+mod common;

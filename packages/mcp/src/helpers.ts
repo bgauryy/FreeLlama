@@ -166,7 +166,10 @@ export const TASK_KINDS = [
 ] as const;
 export const MCP_TASK_KINDS = [...TASK_KINDS, "code_review"] as const;
 export type McpTaskKind = (typeof MCP_TASK_KINDS)[number];
-export const taskParam = z.enum(MCP_TASK_KINDS).describe("code_review=coding.");
+export const taskParam = z
+  .enum(MCP_TASK_KINDS)
+  .default("completion")
+  .describe("code_review=coding; caller owns prompts and output format.");
 
 /**
  * MCP accepts the name humans and agents naturally use for a review, while the Rust routing
@@ -179,17 +182,17 @@ export function canonicalTaskKind(task: McpTaskKind): (typeof TASK_KINDS)[number
 export const objectiveParam = z
   .enum(["fastest", "balanced", "quality"])
   .optional()
-  .describe('"balanced"/"quality" need a policy; "fastest" does not');
+  .describe('balanced works without policy; quality needs policy or explicit model');
 export const executionPreferenceParam = z
   .enum(["auto", "prefer_cpu", "prefer_gpu"])
   .optional()
   .describe(
-    'Backend hint. "auto" uses guarded runtime feedback; prefer_* falls back when no eligible operator-assigned model exists.',
+    'Backend hint; auto uses runtime feedback. Preferences allow fallback.',
   );
 export const minPlacementEvidenceParam = z
   .enum(["configured", "observed"])
   .optional()
-  .describe('"observed" fails closed unless Ollama /api/ps confirms the selected processor');
+  .describe('observed requires Ollama /api/ps placement proof');
 // Router grades only "low" | "medium". A low/capability-only pick once selected a far-too-small
 // model for a demanding task — the answer still looked confident.
 const CONFIDENCE_RANK: Record<string, number> = { low: 1, medium: 2 };
@@ -197,7 +200,7 @@ const CONFIDENCE_RANK: Record<string, number> = { low: 1, medium: 2 };
 export const minConfidenceParam = z
   .enum(["low", "medium"])
   .optional()
-  .describe('Fail closed below this. "medium" needs policy AND benchmark; "low" accepts capability metadata.');
+  .describe('Minimum evidence: medium needs policy + benchmark; low accepts capabilities.');
 
 /**
  * Fail closed when a route decision isn't backed well enough for what the caller asked.
@@ -236,7 +239,37 @@ export const requiredCapabilitiesParam = z
   .array(z.enum(REQUIRED_CAPABILITIES))
   .max(REQUIRED_CAPABILITIES.length)
   .optional()
-  .describe('Additional hard requirements, e.g. ["vision"] or ["tools"]. Fails closed if unmet.');
+  .describe('Hard capability requirements; fails closed.');
+
+export const systemPromptParam = z.string().optional()
+  .describe("Local model instructions, prepended verbatim. No default.");
+export const messagesParam = z.array(z.object({
+  role: z.enum(["system", "user", "assistant", "tool"]),
+  content: z.string().optional(),
+}).passthrough()).min(1).optional();
+export const localToolsParam = z.array(z.object({
+  type: z.literal("function"),
+  function: z.object({
+    name: z.string().min(1),
+    description: z.string().optional(),
+    parameters: z.record(z.unknown()).optional(),
+  }).passthrough(),
+}).passthrough()).min(1).optional()
+  .describe("Local model functions; parameters is JSON Schema. Caller executes calls.");
+
+/** Only explicitly supplied instructions become a system message; existing messages stay intact. */
+export function taskMessages({ systemPrompt, messages, prompt, images }: {
+  systemPrompt?: string;
+  messages?: Record<string, unknown>[];
+  prompt?: string;
+  images?: string[];
+}): Record<string, unknown>[] {
+  if (systemPrompt === undefined) return messages ?? [];
+  const conversation = messages ?? (prompt === undefined ? [] : [{
+    role: "user", content: prompt, ...(images === undefined ? {} : { images }),
+  }]);
+  return [{ role: "system", content: systemPrompt }, ...conversation];
+}
 
 // The stable parts are typed so an MCP client can construct a batch without guessing. The
 // forwarded Ollama controls remain deliberately open because Ollama evolves them independently.
@@ -251,10 +284,11 @@ export const batchTaskParam = z.object({
   requiredCapabilities: requiredCapabilitiesParam,
   priority: z.enum(["interactive", "normal", "background"]).optional(),
   prompt: z.string().min(1).optional(),
-  messages: z.array(z.object({ role: z.enum(["system", "user", "assistant", "tool"]), content: z.string() }).passthrough()).min(1).optional(),
+  systemPrompt: systemPromptParam,
+  messages: messagesParam,
   images: z.array(z.string().min(1)).min(1).optional(),
   input: z.union([z.string().min(1), z.array(z.string().min(1)).min(1)]).optional(),
-  tools: z.array(z.record(z.unknown())).min(1).optional(),
+  tools: localToolsParam,
   keepAlive: z.string().min(1).optional(),
   format: z.union([z.literal("json"), z.record(z.unknown())]).optional(),
   think: z.union([z.boolean(), z.enum(["low", "medium", "high"])]).optional(),
@@ -279,6 +313,7 @@ export const doctorResultSchema = z.object({
 }).passthrough();
 export const sessionResultSchema = z.object({
   session_id: z.string().optional(), deleted: z.boolean().optional(),
+  killed: z.boolean().optional(), runner_stop_confirmed: z.boolean().optional(),
 }).passthrough();
 export const manageResultSchema = z.object({
   status: z.string().optional(), progress: z.unknown().optional(),

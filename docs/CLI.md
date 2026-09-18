@@ -96,13 +96,42 @@ placement.
 chat costs 2, and vision costs 4 (capped to the selected backend's pool). A saturated GPU pool does
 not consume CPU permits. `--max-queue-wait-seconds` defaults to 120; when no permit becomes
 available, FreeLlama refuses the task with HTTP 503 instead of waiting forever.
+That deadline covers weighted admission, host-resource waiting, and model-transition locking together.
+`--max-queued-tasks` (default 16) and `--cpu-max-queued-tasks` (default 8) also bound how many
+parsed requests can be retained per backend; a full queue receives 503 immediately, and cancelled
+clients release their waiter. Health exposes the queue depth, oldest wait, in-flight work, and
+refusal/timeout/cancellation counters.
 
 These are conservative workload-unit defaults, not detected core or RAM counts. Tune them from
 queue-wait receipts and resident-memory observations on the target host. Ollama still controls
 decoding concurrency with `OLLAMA_NUM_PARALLEL`. It also owns a separate internal queue through
 `OLLAMA_MAX_QUEUE`: managed tasks enter that queue only after FreeLlama admission, while raw proxy
 traffic enters it directly. Start an unmeasured deployment with one loaded model and one parallel
-stream per Ollama process.
+stream per Ollama process. In `serve`, raw passthrough defaults to one full-lifetime streaming
+request; override with `--raw-proxy-max-concurrent-requests` only after measurement. The standalone
+`proxy` command keeps its cap opt-in for compatibility.
+
+The local host-pressure gate defaults to holding below 15% available RAM and resuming above 20%
+after two healthy samples; minimum reserves are 1 GiB and 2 GiB, respectively. Tune the percentages
+with `--resource-hold-available-percent` and `--resource-resume-available-percent`; the hold value
+must be lower than the resume value, and neither can exceed 100. Health reports the policy, sampled
+signals, unknown measurements, and reserved memory. These flags do not change Ollama or OS settings.
+Both `serve` and `proxy` accept `--resource-telemetry-policy`:
+
+- `require-memory` (default): wait or refuse local inference when available RAM is unknown, including
+  raw requests with zero forecast bytes. Missing thermal data alone does not block this policy.
+- `require-all`: require all signals applicable to the collector. The built-in Linux collector does
+  not provide OS pressure or thermal signals and marks those as unsupported; custom collectors must
+  provide them. Unsupported signals are not evidence of healthy hardware.
+- `best-effort`: explicitly permit unknown telemetry unless an observed pressure hold is active.
+
+Remote upstreams bypass local host policy. Raw metadata and empty unload requests remain available
+during a hold. Route receipts separate `queue_readiness` from `resource_readiness`, and include
+`resource_assessment` without acquiring a permit. Resource refusals return a human-readable `error`,
+a stable `code`, and an object-valued `resource_admission`; timeout during metadata inspection reports
+its phase and omits estimates that were not obtained.
+
+See [resource admission](ARCHITECTURE.md#managed-task-execution) for scope and limitations.
 
 `route`, `recommend`, and `task` accept
 `--execution-preference auto|prefer-cpu|prefer-gpu`. This is a fallback-capable hint over models
@@ -135,7 +164,10 @@ npx @octocodeai/freellama route \
 
 Task kinds are `completion`, `coding`, `code-repair`, `tools`, `browser`, `vision`, `embedding`, and
 `long-context`. Objectives are `fastest`, `balanced`, and `quality`. `fastest` can use capability
-and local benchmark evidence alone; `balanced` and `quality` require a policy for that task.
+and local benchmark evidence alone. Default `balanced` prefers eligible task-policy candidates;
+without them it falls back to capability/context-compatible models and reports low confidence
+and missing quality evidence. `quality` requires a policy unless you supply an explicit model.
+An explicit minimum-confidence gate still refuses insufficient evidence in every objective.
 
 `recommend` is side-effect-free. If no installed model qualifies, it can return an installation
 plan from the reviewed recommendation catalog, but it never pulls a model.

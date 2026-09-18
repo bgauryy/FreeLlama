@@ -54,7 +54,8 @@ swap, eviction churn, or unacceptable queueing.
 Do not set a global `OLLAMA_CONTEXT_LENGTH` merely to maximize the advertised window. Managed
 FreeLlama tasks send the smallest sufficient request-specific `num_ctx`; a larger context and a
 larger `OLLAMA_NUM_PARALLEL` multiply K/V-cache memory. Direct Ollama clients still follow the
-server's context configuration, which defaults to 4096 tokens in current Ollama.
+server's context configuration. Current context documentation describes VRAM-tiered 4k/32k/256k
+defaults while the FAQ still says 4096, so treat `/api/ps` `context_length` after load as authority.
 
 `freellama doctor` returns `local_conservative_config_posture` as a **non-mutating** portable
 starting profile. It names the source of each value (`observed_process` or `configuration_hint`),
@@ -63,11 +64,13 @@ parallel stream, and a finite internal queue before benchmarking. It also report
 `host_runtime_signals` with source and permission scope. Treat unavailable GPU-memory, thermal, or
 power signals as unavailable; do not substitute host RAM or a guessed value.
 
-FreeLlama and Ollama have separate queues. FreeLlama acquires a weighted backend permit and waits
-for at most `--max-queue-wait-seconds`. An admitted request can then enter Ollama's internal queue,
-which is bounded by `OLLAMA_MAX_QUEUE`. Raw compatibility traffic bypasses FreeLlama admission and
-enters the primary Ollama queue directly. Set both limits from observed latency and overload
-behavior; changing one does not configure the other.
+FreeLlama and Ollama have separate queues. FreeLlama caps retained managed waiters per backend with
+`--max-queued-tasks`/`--cpu-max-queued-tasks`, then waits for at most
+`--max-queue-wait-seconds`. An admitted request can then enter Ollama's internal queue,
+which is bounded by `OLLAMA_MAX_QUEUE`. Raw compatibility traffic bypasses weighted managed
+admission and enters the primary Ollama queue through a separate one-stream default cap in `serve`.
+Set all limits from observed latency and overload behavior; changing one does not configure the
+others.
 
 The following flow shows where each production setting applies:
 
@@ -76,7 +79,9 @@ flowchart LR
     C["Client"] --> FQ["FreeLlama admission<br/>weighted budget + wait deadline"]
     FQ -->|"refused"| E503["503 server busy"]
     FQ -->|"admitted"| OQ["Ollama queue<br/>OLLAMA_MAX_QUEUE"]
-    RAW["Raw /api/* or /v1/*"] --> OQ
+    RAW["Raw /api/* or /v1/*"] --> RC["Raw stream cap<br/>default 1 in serve"]
+    RC -->|"refused"| E503
+    RC -->|"admitted until EOF/drop"| OQ
     OQ --> S["Ollama scheduler<br/>loaded models + parallel streams"]
     S --> M["Runner memory<br/>num_ctx x K/V cache"]
 ```

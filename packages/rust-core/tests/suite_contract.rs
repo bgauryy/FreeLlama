@@ -1,7 +1,8 @@
 use freellama::{
     Comparison, GuardrailStatus, RunReport, Suite, Verdict, compare,
     local_conservative_config_posture, max_loaded_models_advisory, ollama_config_diagnostics,
-    parse_macos_thermal_status, parse_ollama_cli_version, parse_ollama_process_environment,
+    ollama_env_advisories, parse_macos_thermal_status, parse_ollama_cli_version,
+    parse_ollama_process_environment,
 };
 
 #[test]
@@ -15,6 +16,21 @@ fn doctor_identifies_a_cli_server_version_mismatch() {
     assert_eq!(diagnostic.client_version.as_deref(), Some("0.13.5"));
     assert_eq!(diagnostic.server_version, "0.32.15");
     assert!(!diagnostic.matches_server);
+}
+
+#[test]
+fn context_default_advisory_reports_upstream_documentation_drift() {
+    let values = ollama_env_advisories(|_| None);
+    let advisory = &values["OLLAMA_CONTEXT_LENGTH"];
+    let effective = advisory["effective_default"].as_str().unwrap_or_default();
+    assert!(effective.contains("VRAM-tiered"), "got {effective:?}");
+    assert!(
+        advisory["note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("/api/ps"),
+        "the actionable authority must be named"
+    );
 }
 
 #[test]
