@@ -589,16 +589,17 @@ fn ollama_environment_getenv(name: &str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
-        .or_else(|| {
-            #[cfg(target_os = "macos")]
-            {
-                launchctl_getenv(name)
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                None
-            }
-        })
+        .or_else(|| service_manager_getenv(name))
+}
+
+#[cfg(target_os = "macos")]
+fn service_manager_getenv(name: &str) -> Option<String> {
+    launchctl_getenv(name)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn service_manager_getenv(_name: &str) -> Option<String> {
+    None
 }
 
 fn ollama_environment_source() -> &'static str {
@@ -652,10 +653,10 @@ fn local_ollama_process_environment(endpoint: &str) -> Value {
 
     #[cfg(not(target_os = "macos"))]
     {
-        return json!({
+        json!({
             "status": "unsupported_platform",
             "reason": "same-user Ollama process inspection is currently implemented only for macOS",
-        });
+        })
     }
 
     #[cfg(target_os = "macos")]
