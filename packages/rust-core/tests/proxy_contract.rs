@@ -1,8 +1,9 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use axum::Router;
-use axum::body::Body;
+use axum::body::{Body, to_bytes};
 use axum::extract::State;
 use axum::http::{Request, StatusCode};
 use axum::response::IntoResponse;
@@ -383,7 +384,9 @@ async fn raw_proxy_cap_is_held_for_the_stream_lifetime() {
         "raw stream must exclude managed execution"
     );
     let second = proxy.clone().oneshot(request()).await.unwrap();
-    assert_eq!(second.status(), StatusCode::SERVICE_UNAVAILABLE);
+    // The configured raw cap is FreeLlama's own limit: 429 with a Retry-After hint.
+    assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(second.headers().contains_key("retry-after"));
     assert_eq!(
         calls.load(Ordering::SeqCst),
         1,
@@ -653,4 +656,50 @@ async fn request_timeout_bounds_silence_not_a_stream_that_keeps_producing() {
         .await
         .expect("a live stream is not cut off by the idle timeout");
     assert_eq!(body.len(), 18);
+}
+
+/// With a raw queue wait, a request that finds the cap full waits for the live stream to end
+/// instead of being refused at once, and still never overlaps it upstream.
+#[tokio::test]
+async fn raw_queue_wait_admits_a_waiter_when_the_stream_ends() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let server_calls = calls.clone();
+    tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            server_calls.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let mut request = [0_u8; 4096];
+                let _ = socket.read(&mut request).await;
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}")
+                    .await
+                    .unwrap();
+            });
+        }
+    });
+    let proxy = app(
+        common::proxy_config("127.0.0.1:0", format!("http://{addr}"), false)
+            .with_max_concurrent_requests(1)
+            .with_raw_queue_wait(Duration::from_secs(2)),
+    )
+    .unwrap();
+    let request = || Request::post("/api/chat").body(Body::from("{}")).unwrap();
+    let first = proxy.clone().oneshot(request()).await.unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let waiter = tokio::spawn({
+        let proxy = proxy.clone();
+        async move { proxy.oneshot(request()).await.unwrap().status() }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the waiter must not overlap the stream"
+    );
+    to_bytes(first.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(waiter.await.unwrap(), StatusCode::OK);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
 }

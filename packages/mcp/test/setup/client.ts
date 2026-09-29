@@ -86,6 +86,7 @@ export async function startIsolatedServe(): Promise<IsolatedServe> {
       "--recommendation-catalog",
       "recommendations.example.toml",
       "--ephemeral-feedback",
+      "--ephemeral-usage",
     ],
     { cwd: REPO_ROOT, stdio: ["ignore", "ignore", "pipe"] },
   );

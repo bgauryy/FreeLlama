@@ -20,6 +20,15 @@ export function machine(endpoint?: string | undefined | null): Promise<string>;
 /** Current managed-platform health, including admission and session bounds. */
 export function health(endpoint?: string | undefined | null): Promise<string>;
 
+/**
+ * Live platform view: admission, queues, adaptive limits and circuit breakers per backend,
+ * loaded models, host memory, Ollama's effective settings, and today's usage.
+ */
+export function status(endpoint?: string | undefined | null): Promise<string>;
+
+/** Usage totals per day and per model over the last `days` days (default 7). */
+export function usage(endpoint?: string | undefined | null, days?: number | undefined | null): Promise<string>;
+
 /** Create a bounded, idle-expiring model-affinity handle; it stores no prompt history or KV. */
 export function createSession(endpoint?: string | undefined | null): Promise<string>;
 

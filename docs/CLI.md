@@ -27,6 +27,9 @@ flowchart TD
 | `auth-token` | Create a new mode-0600 bearer-token file without printing the secret | No |
 | `models` | List installed models, capabilities, residency, and evidence | Yes |
 | `machine` | Print portable host RAM, CPU, OS, architecture, disk, and the local Ollama endpoint | Yes |
+| `status` | Live queues (also as a page at `http://127.0.0.1:11435/_freellama/ui`), current and adaptive limits, circuit breakers, loaded models, host memory, Ollama's effective settings, today's usage | Yes |
+| `usage` | Task and token totals per day and per model (`--days`, default 7) | Yes |
+| `config` | Effective runtime settings and the source of each; `--reload` re-reads the runtime file | Yes |
 | `session` | Create an affinity scope for related tasks | Yes |
 | `route` | Choose a model and request profile without executing it | Yes |
 | `recommend` | Return an installed route or a reviewed installation plan | Yes |
@@ -91,15 +94,21 @@ placement.
 
 ### Bound admission
 
-`--max-concurrent-tasks` is the primary/GPU cost budget, not a request count; it defaults to 2.
+`--max-concurrent-tasks` is the primary/GPU cost budget, not a request count. Without a flag,
+environment variable, or runtime-file value it defaults to 2 units per `OLLAMA_NUM_PARALLEL` slot of
+the Ollama server (read from its process environment where visible; Ollama's own default is 1, so 2).
+`freellama config` shows the effective value and where it came from.
 `--cpu-max-concurrent-tasks` controls the independent CPU pool and defaults to 1. Embedding costs 1,
 chat costs 2, and vision costs 4 (capped to the selected backend's pool). A saturated GPU pool does
 not consume CPU permits. `--max-queue-wait-seconds` defaults to 120; when no permit becomes
-available, FreeLlama refuses the task with HTTP 503 instead of waiting forever.
+available, FreeLlama refuses the task with HTTP 503 (`admission_timeout`) instead of waiting forever.
+A task may ask for a shorter wait with `max_wait_seconds`; it can never exceed the configured one.
 That deadline covers weighted admission, host-resource waiting, and model-transition locking together.
 `--max-queued-tasks` (default 16) and `--cpu-max-queued-tasks` (default 8) also bound how many
-parsed requests can be retained per backend; a full queue receives 503 immediately, and cancelled
-clients release their waiter. Health exposes the queue depth, oldest wait, in-flight work, and
+parsed requests can be retained per backend; a full queue receives 429 (`admission_queue_full`)
+immediately, and cancelled clients release their waiter. Every capacity refusal carries a
+`Retry-After` header and `retry_after_seconds`, estimated from queue depth and the backend's recent
+task duration, so clients back off instead of retrying hot. Health exposes the queue depth, oldest wait, in-flight work, and
 refusal/timeout/cancellation counters.
 
 These are conservative workload-unit defaults, not detected core or RAM counts. Tune them from
@@ -108,7 +117,13 @@ decoding concurrency with `OLLAMA_NUM_PARALLEL`. It also owns a separate interna
 `OLLAMA_MAX_QUEUE`: managed tasks enter that queue only after FreeLlama admission, while raw proxy
 traffic enters it directly. Start an unmeasured deployment with one loaded model and one parallel
 stream per Ollama process. In `serve`, raw passthrough defaults to one full-lifetime streaming
-request; override with `--raw-proxy-max-concurrent-requests` only after measurement. The standalone
+request; override with `--raw-proxy-max-concurrent-requests` only after measurement. A raw request
+over the cap waits up to `--raw-queue-wait-seconds` (default 10) and is then refused with 429 and
+`Retry-After`; `0` restores immediate refusal.
+
+All of these, plus pinned models, idle eviction, adaptive concurrency, the circuit breaker, and
+context sizing, can also live in a runtime file (`--runtime-config`) that `serve` re-reads when it
+changes. See [Monitoring and live tuning](MONITORING.md). The standalone
 `proxy` command keeps its cap opt-in for compatibility.
 
 The local host-pressure gate defaults to holding below 15% available RAM and resuming above 20%

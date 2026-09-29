@@ -57,7 +57,8 @@ async fn raw_inference_cannot_overlap_managed_work_but_metadata_remains_availabl
         None,
         None,
         "test:latest",
-    ))
+    )
+    .with_raw_queue_wait(std::time::Duration::ZERO))
     .unwrap();
     let managed_platform = platform.clone();
     let managed = tokio::spawn(async move {

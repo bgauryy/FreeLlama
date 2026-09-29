@@ -25,6 +25,9 @@ pub(super) struct ErrorBody {
     upstream_response: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     lifecycle: Option<Value>,
+    /// Seconds a caller should wait before retrying; also sent as the `Retry-After` header.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retry_after_seconds: Option<u64>,
 }
 
 /// A deadline can expire before footprint discovery establishes a byte requirement. Keep that
@@ -50,6 +53,7 @@ impl ApiError {
                 resource_admission: None,
                 upstream_response: None,
                 lifecycle: None,
+                retry_after_seconds: None,
             }),
         }
     }
@@ -57,6 +61,22 @@ impl ApiError {
     /// A host-memory admission wait that ran out of time (as opposed to a queue or input error).
     pub(super) fn is_resource_wait(&self) -> bool {
         self.body.code == Some("resource_admission_unavailable")
+    }
+
+    /// Attach a machine-readable code.
+    pub(super) fn with_code(mut self, code: &'static str) -> Self {
+        self.body.code = Some(code);
+        self
+    }
+
+    /// Tell the caller when capacity is expected back (`Retry-After`).
+    pub(super) fn with_retry_after(mut self, seconds: u64) -> Self {
+        self.body.retry_after_seconds = Some(seconds.max(1));
+        self
+    }
+
+    pub(super) fn status(&self) -> StatusCode {
+        self.status
     }
 
     pub(super) fn bad_request(error: impl std::fmt::Display) -> Self {
@@ -109,7 +129,16 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.status, Json(self.body)).into_response()
+        let retry_after = self.body.retry_after_seconds;
+        let mut response = (self.status, Json(self.body)).into_response();
+        if let Some(seconds) = retry_after
+            && let Ok(value) = axum::http::HeaderValue::from_str(&seconds.to_string())
+        {
+            response
+                .headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, value);
+        }
+        response
     }
 }
 
@@ -124,6 +153,8 @@ pub(super) fn resource_error(error: resources::ResourceWaitError) -> ApiError {
             resource_admission: Some(ResourceFailureReceipt::Assessed(Box::new(receipt))),
             upstream_response: None,
             lifecycle: None,
+            // Host memory rarely recovers in under a few seconds.
+            retry_after_seconds: Some(5),
         }),
     }
 }

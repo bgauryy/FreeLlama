@@ -7,10 +7,12 @@ import { createRequire } from "node:module";
 // is not reliably detectable by Node's CJS/ESM interop. Destructuring after a default import
 // sidesteps that entirely.
 import native from "../native/index.js";
-export const { doctor, machine, health, createSession, deleteSession, killSession, listModels, route, runTask, runTaskRequest, runTaskBatchRequest } = native as {
+export const { doctor, machine, health, status, usage, createSession, deleteSession, killSession, listModels, route, runTask, runTaskRequest, runTaskBatchRequest } = native as {
   doctor: (endpoint?: string | null) => Promise<string>;
   machine: (endpoint?: string | null) => Promise<string>;
   health: (endpoint?: string | null) => Promise<string>;
+  status: (endpoint?: string | null) => Promise<string>;
+  usage: (endpoint?: string | null, days?: number | null) => Promise<string>;
   createSession: (endpoint?: string | null) => Promise<string>;
   killSession: (endpoint: string | null | undefined, sessionId: string) => Promise<string>;
   deleteSession: (endpoint: string | null | undefined, sessionId: string) => Promise<void>;

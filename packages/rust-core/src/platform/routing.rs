@@ -134,6 +134,10 @@ pub struct CatalogModel {
     /// model families expose a shape `FreeLlama` can calculate without guessing.
     #[serde(default)]
     pub kv_cache_bytes_per_token_f16: Option<u64>,
+    /// `PARAMETER num_ctx` from the model's Modelfile. When set, Ollama uses it instead of its
+    /// automatic context for requests that leave `num_ctx` unset.
+    #[serde(default)]
+    pub modelfile_num_ctx: Option<u64>,
     pub resident: bool,
     pub resident_vram: Option<u64>,
     pub benchmark: BTreeMap<Capability, f64>,

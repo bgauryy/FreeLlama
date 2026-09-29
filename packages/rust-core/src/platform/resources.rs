@@ -1211,7 +1211,11 @@ fn bounded_command(program: &str, args: &[&str]) -> Option<String> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
-fn bounded_command_with(program: &str, args: &[&str], timeout: Duration) -> Option<String> {
+pub(crate) fn bounded_command_with(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> Option<String> {
     let mut child = Command::new(program)
         .args(args)
         .stdin(Stdio::null())
