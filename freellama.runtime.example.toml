@@ -21,8 +21,12 @@
 # --- Model residency ---
 # Never unload these, even when another model needs the memory.
 # pinned_models = ["qwen3:8b"]
-# Unload idle models (keep_alive: 0) when a different model needs room.
+# When a load needs room, unload the cheapest idle models first (keep_alive: 0). Models with
+# tasks queued or running are never unloaded; among the rest, the cost of unloading one is its
+# measured reload time x (1 + recent uses) x its weight below.
 # evict_idle_models = true
+# Per-model weight on that cost (default 1): higher keeps a model loaded longer.
+# eviction_costs = { "qwen3:8b" = 3.0, "nomic-embed-text" = 0.2 }
 
 # --- Throttling ---
 # Adaptive concurrency halves a pool's limit on errors, memory pressure, or a throughput drop and

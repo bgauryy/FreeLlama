@@ -6,7 +6,7 @@ use super::{
     PlacementEvidence, PlacementSignals, PlatformState, RouteDecision, RouteInput, SessionAffinity,
     TaskInput, TaskKind, TaskPriority, context, desired_placement, discover_models, get_json,
     host_has_unified_memory, host_total_memory_bytes, persist_feedback, require_active_session,
-    resources, select_route,
+    residency, resources, select_route,
 };
 use crate::{model_bench::Capability, proxy};
 use anyhow::{Context, Result};
@@ -529,16 +529,13 @@ pub(super) async fn run_task(
         Box::pin(run_session_task(State(state.clone()), Json(input))),
     )
     .await;
-    state
-        .telemetry
-        .record_task(task_record(
-            &result,
-            started,
-            task,
-            priority,
-            requested_model.as_deref(),
-        ))
-        .await;
+    let record = task_record(&result, started, task, priority, requested_model.as_deref());
+    if record.outcome == "ok" {
+        state
+            .activity
+            .completed(&record.backend, &record.model, record.load_ms);
+    }
+    state.telemetry.record_task(record).await;
     result
 }
 
@@ -656,6 +653,11 @@ async fn run_session_task(
     let resource_model = managed.model;
     let decision = managed.route;
     let execution = managed.execution;
+    // From here until the task ends this model counts as busy: eviction planning leaves it
+    // alone, and its recent demand makes it more expensive to unload later.
+    let _active = state
+        .activity
+        .begin(execution.placement, &decision.selected_model);
     // Fail fast while this backend's circuit is open instead of queueing for a dead upstream.
     // The guard lets exactly one probe through after the cooldown.
     let breaker_probe = match state.breakers.check(execution.placement) {
@@ -830,12 +832,12 @@ async fn run_session_task(
     })??;
     resource_wait_ms = resource_wait_ms.saturating_add(recheck_started.elapsed().as_millis());
     execution_receipt["resource_revalidation"] = json!(resource_recheck.receipt);
-    let evicted = execution_receipt["memory_reservation"]
-        .get("evicted_idle_models")
-        .cloned();
+    let previous = execution_receipt["memory_reservation"].clone();
     execution_receipt["memory_reservation"] = footprint;
-    if let Some(evicted) = evicted {
-        execution_receipt["memory_reservation"]["evicted_idle_models"] = evicted;
+    for key in ["evicted_idle_models", "eviction"] {
+        if let Some(value) = previous.get(key) {
+            execution_receipt["memory_reservation"][key] = value.clone();
+        }
     }
     let admission_mode = transition.admission_mode();
     let selected_model = decision.selected_model.clone();
@@ -1084,6 +1086,94 @@ pub(super) async fn model_memory_requirement(
     footprint
 }
 
+/// Unload idle runners when the load behind `footprint` would not fit, and return the footprint
+/// and byte requirement re-measured afterwards.
+async fn make_room(
+    state: &PlatformState,
+    execution: &ExecutionTarget,
+    model: &CatalogModel,
+    decision: &RouteDecision,
+    mut footprint: Value,
+    mut bytes: u64,
+) -> (Value, u64) {
+    let mut evictions = Vec::new();
+    // Discrete GPU: make room in VRAM before Ollama must. Ollama would either evict by its
+    // own least-recently-used order (possibly a model with work queued here) or spill layers
+    // to the CPU; FreeLlama knows which runners are idle and cheap to reload.
+    let vram_shortfall = footprint["full_estimate_bytes"]
+        .as_u64()
+        .zip(footprint["gpu_memory_free_bytes"].as_u64())
+        .map_or(0, |(full, free)| full.saturating_sub(free));
+    if vram_shortfall > 0
+        && let Some(receipt) = evict_idle_models(
+            state,
+            execution,
+            &decision.selected_model,
+            residency::Freed::Vram,
+            vram_shortfall,
+        )
+        .await
+    {
+        evictions.push(receipt);
+        state.resources.invalidate().await;
+        footprint = model_memory_requirement(state, execution, model, decision).await;
+        bytes = footprint["required_available_bytes"].as_u64().unwrap_or(0);
+    }
+    if bytes > 0 {
+        let snapshot = state.resources.snapshot().await;
+        // A host already holding for low memory recovers only above the resume reserve, and
+        // idle runners are often exactly what holds that memory, so both cases evict.
+        let assessment = snapshot.assess_capacity(bytes, snapshot.holding);
+        let memory_hold = snapshot.reasons.iter().any(|reason| {
+            matches!(
+                reason,
+                resources::PressureReason::LowAvailableMemory
+                    | resources::PressureReason::OsMemoryPressure
+                    | resources::PressureReason::ActiveSwapping
+            )
+        });
+        let evict = match assessment.denial_reason {
+            Some(resources::CapacityDenialReason::InsufficientCapacity) => true,
+            Some(resources::CapacityDenialReason::HostPressure) => memory_hold,
+            _ => false,
+        };
+        if evict {
+            let shortfall = assessment
+                .required_with_reserve_bytes
+                .unwrap_or(u64::MAX)
+                .saturating_sub(assessment.effective_available_bytes.unwrap_or(0));
+            let freed = if footprint["source"] == "discrete_gpu_spill_estimate" {
+                residency::Freed::HostSpill
+            } else {
+                residency::Freed::Total
+            };
+            if let Some(receipt) =
+                evict_idle_models(state, execution, &decision.selected_model, freed, shortfall)
+                    .await
+            {
+                evictions.push(receipt);
+                // The cached sample predates the unload; judge the new footprint fresh.
+                state.resources.invalidate().await;
+                footprint = model_memory_requirement(state, execution, model, decision).await;
+                bytes = footprint["required_available_bytes"].as_u64().unwrap_or(0);
+            }
+        }
+    }
+    if !evictions.is_empty() {
+        footprint["evicted_idle_models"] = json!(
+            evictions
+                .iter()
+                .flat_map(|receipt| receipt["unloaded_ok"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default())
+                .collect::<Vec<_>>()
+        );
+        footprint["eviction"] = json!(evictions);
+    }
+    (footprint, bytes)
+}
+
 async fn reserve_task_resources(
     state: &PlatformState,
     execution: &ExecutionTarget,
@@ -1097,27 +1187,8 @@ async fn reserve_task_resources(
         .as_u64()
         .unwrap_or(0)
         .saturating_sub(already_reserved.unwrap_or(0));
-    if already_reserved.is_none() && bytes > 0 && state.tunables().evict_idle_models {
-        let snapshot = state.resources.snapshot().await;
-        let assessment = snapshot.assess_capacity(bytes, false);
-        if assessment.denial_reason == Some(resources::CapacityDenialReason::InsufficientCapacity) {
-            let shortfall = assessment
-                .required_with_reserve_bytes
-                .unwrap_or(u64::MAX)
-                .saturating_sub(assessment.effective_available_bytes.unwrap_or(0));
-            let evicted =
-                evict_idle_models(state, execution, &decision.selected_model, shortfall).await;
-            state
-                .telemetry
-                .record_evictions(execution.placement, evicted.len());
-            if !evicted.is_empty() {
-                // The cached sample predates the unload; judge the new footprint on a fresh one.
-                state.resources.invalidate().await;
-                footprint = model_memory_requirement(state, execution, model, decision).await;
-                bytes = footprint["required_available_bytes"].as_u64().unwrap_or(0);
-                footprint["evicted_idle_models"] = json!(evicted);
-            }
-        }
+    if already_reserved.is_none() && state.tunables().evict_idle_models {
+        (footprint, bytes) = make_room(state, execution, model, decision, footprint, bytes).await;
     }
     let resident = footprint["source"] == "matching_resident_context";
     if already_reserved.is_some() {
@@ -1146,36 +1217,50 @@ async fn reserve_task_resources(
     Ok((permit, footprint))
 }
 
-/// Unload least-recently-used idle runners on `execution` until about `shortfall` bytes are freed.
+/// Unload the cheapest set of idle runners on `execution` that frees about `shortfall` bytes.
 ///
 /// A cold load used to wait for memory that only idle resident models were holding; `FreeLlama`
-/// never unloaded them, so the request held its slot and then failed with 503. `keep_alive: 0`
-/// is safe for a runner that is still serving: Ollama unloads it once its requests finish.
-/// Models pinned with `keep_alive: -1` (an expiry far in the future) or listed in the
-/// `pinned_models` setting are never evicted.
+/// never unloaded them, so the request held its slot and then failed with 503. The victims come
+/// from `residency::plan`: never the target, a pinned or `keep_alive: -1` model, or one with
+/// tasks queued or running here; among the rest, the set whose loss costs least (measured reload
+/// time, recent demand, operator weight). `keep_alive: 0` is safe for a runner that is still
+/// serving a raw client: Ollama unloads it once those requests finish.
 async fn evict_idle_models(
     state: &PlatformState,
     execution: &ExecutionTarget,
     keep: &str,
+    freed: residency::Freed,
     shortfall: u64,
-) -> Vec<String> {
-    let Ok(ps) = get_json(&state.client, &execution.upstream, "/api/ps").await else {
-        return Vec::new();
-    };
-    let candidates = eviction_candidates(&ps, keep, &state.tunables().pinned_models);
-    let mut freed = 0_u64;
+) -> Option<Value> {
+    let ps = get_json(&state.client, &execution.upstream, "/api/ps")
+        .await
+        .ok()?;
+    state
+        .footprints
+        .lock()
+        .await
+        .observe_resident(&execution.upstream, &ps);
+    let tunables = state.tunables();
+    let plan = residency::plan(
+        &ps,
+        &state.activity,
+        &residency::PlanInputs {
+            backend: execution.placement,
+            keep,
+            pinned: &tunables.pinned_models,
+            weights: &tunables.eviction_costs,
+            freed,
+            shortfall,
+        },
+    );
     let mut evicted = Vec::new();
-    for (name, size) in candidates {
-        if freed >= shortfall {
-            break;
-        }
-        let body = json!({"model": name, "keep_alive": 0, "stream": false});
+    for victim in &plan.victims {
+        let body = json!({"model": victim.name, "keep_alive": 0, "stream": false});
         if post_json_with_retries(state, &execution.upstream, "/api/generate", &body)
             .await
             .is_ok()
         {
-            freed = freed.saturating_add(size);
-            evicted.push(name);
+            evicted.push(victim.name.clone());
         }
     }
     // Give Ollama a moment to release the runners before capacity is re-read.
@@ -1193,52 +1278,24 @@ async fn evict_idle_models(
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    evicted
-}
-
-/// Idle runners that may be unloaded, least recently used first: everything resident except the
-/// model being loaded, models in the `pinned_models` setting, and `keep_alive: -1` runners.
-fn eviction_candidates(
-    ps: &Value,
-    keep: &str,
-    pinned: &std::collections::BTreeSet<String>,
-) -> Vec<(String, u64)> {
-    let mut candidates: Vec<(String, String, u64)> = ps["models"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|entry| {
-            let name = entry.get("name").or_else(|| entry.get("model"))?.as_str()?;
-            let expires = entry
-                .get("expires_at")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let size = entry.get("size").and_then(Value::as_u64).unwrap_or(0);
-            (name != keep && !pinned.contains(name) && !pinned_expiry(expires))
-                .then(|| (expires.to_owned(), name.to_owned(), size))
-        })
-        .collect();
-    // Same keep_alive => the earliest expiry is the least recently used.
-    candidates.sort();
-    candidates
-        .into_iter()
-        .map(|(_, name, size)| (name, size))
-        .collect()
-}
-
-/// `keep_alive: -1` shows up in `/api/ps` as an expiry centuries away; treat anything more than
-/// a year out as pinned by its owner.
-fn pinned_expiry(expires_at: &str) -> bool {
-    let Some(year) = expires_at
-        .get(..4)
-        .and_then(|year| year.parse::<u64>().ok())
-    else {
-        return false;
-    };
-    let now_year = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(1970, |elapsed| 1970 + elapsed.as_secs() / 31_556_952);
-    year > now_year + 1
+    state
+        .telemetry
+        .record_evictions(execution.placement, evicted.len());
+    let mut receipt = plan.receipt();
+    receipt["backend"] = json!(execution.placement);
+    receipt["for_model"] = json!(keep);
+    receipt["memory"] = json!(match freed {
+        residency::Freed::Total => "host",
+        residency::Freed::Vram => "vram",
+        residency::Freed::HostSpill => "host_spill",
+    });
+    receipt["unloaded_ok"] = json!(evicted);
+    receipt["at"] = json!(super::telemetry::now_seconds());
+    *state
+        .last_eviction
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(receipt.clone());
+    (!plan.victims.is_empty()).then_some(receipt)
 }
 
 /// POST JSON upstream, retrying transient failures on the same backoff schedule the passthrough
@@ -1803,30 +1860,4 @@ pub(super) fn memory_kv_preflight_with_memory(
         "live_available_memory_bytes": null,
         "authority": "Ollama owns live free-memory, runner graph, cache-type, and final load admission",
     })
-}
-
-#[cfg(test)]
-mod eviction_tests {
-    use super::eviction_candidates;
-    use serde_json::json;
-    use std::collections::BTreeSet;
-
-    #[test]
-    fn candidates_skip_the_target_pinned_names_and_infinite_keep_alive_oldest_first() {
-        let ps = json!({"models": [
-            {"name": "newer:latest", "size": 3, "expires_at": "2026-09-29T10:10:00Z"},
-            {"name": "pinned:latest", "size": 5, "expires_at": "2026-09-29T10:00:00Z"},
-            {"name": "target:latest", "size": 7, "expires_at": "2026-09-29T09:00:00Z"},
-            {"name": "forever:latest", "size": 9, "expires_at": "2318-01-01T00:00:00Z"},
-            {"name": "older:latest", "size": 1, "expires_at": "2026-09-29T10:05:00Z"},
-        ]});
-        let pinned = BTreeSet::from(["pinned:latest".to_owned()]);
-        assert_eq!(
-            eviction_candidates(&ps, "target:latest", &pinned),
-            vec![
-                ("older:latest".to_owned(), 1),
-                ("newer:latest".to_owned(), 3)
-            ]
-        );
-    }
 }

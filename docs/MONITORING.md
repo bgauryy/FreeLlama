@@ -4,6 +4,12 @@
 restart. Everything on this page is served under `/_freellama/v1/` and needs the same bearer token
 as the rest of the control API when auth is enabled.
 
+Open **`http://127.0.0.1:11435/_freellama/ui`** (the address `serve` prints at startup) for a live
+page of the same data, refreshed every two seconds: backends and queues, raw traffic, host RAM and
+VRAM, Ollama's settings, loaded models with their current tasks and load times, and the last
+eviction. The page itself is static and needs no token; when auth is on it asks for the bearer
+token and keeps it only for the browser tab.
+
 | Endpoint | CLI | MCP | What it returns |
 |---|---|---|---|
 | `GET /status` | `freellama status` | `doctor {view:"status"}` | Live view of every backend, the raw proxy, loaded models, host, Ollama settings, and today's usage |
@@ -87,11 +93,49 @@ its configured ceiling:
 The CPU backend is adaptive by default because oversubscribing it shows up as a throughput collapse
 rather than an error. Every change is counted in metrics and shown in `status`.
 
-## Model residency
+## Model residency and eviction
 
-Before loading a model that needs memory, FreeLlama unloads idle resident models (`keep_alive: 0`)
-that no admitted task is using. Models in `pinned_models` are never unloaded this way; set
-`evict_idle_models = false` to leave residency entirely to Ollama.
+When a model about to load needs room, FreeLlama unloads idle runners itself (`keep_alive: 0`)
+instead of letting the load wait, fail, or spill to CPU. It does this in three cases: host RAM
+would fall below the reserve, the host is already holding for low memory, or (discrete GPU) the
+model would not fit in free VRAM, where Ollama would otherwise choose its own victim.
+
+Which runners go is a small optimisation, in the spirit of llama-swap's `evict_costs` and LocalAI's
+busy-aware LRU:
+
+- **Never unloaded:** the model being loaded, `pinned_models`, `keep_alive: -1` runners, and any
+  model with a FreeLlama task queued or running (unloading it would force an immediate reload).
+- **Cost of unloading a runner** = its reload time (Ollama's measured `load_duration` from earlier
+  loads, or size ÷ 1.5 GB/s before the first one) × (1 + recent uses, decaying with a 30-minute
+  half-life) × its `eviction_costs` weight (default 1).
+- **Choice:** the set of runners with the lowest total cost that frees enough memory; ties go to
+  fewer runners, then less memory freed beyond what is needed. Only the memory that matters is
+  counted: VRAM for a GPU fit, the host-RAM part for a spill, the whole runner on CPU or unified
+  memory.
+
+Every managed receipt that caused an eviction carries the plan under
+`memory_reservation.eviction`: what was unloaded, its cost and reload estimate, and what was kept
+and why. `status` and the page show the latest one. Set `evict_idle_models = false` to leave
+residency entirely to Ollama.
+
+## Who decides what: FreeLlama and Ollama
+
+Two schedulers that both guess at memory will disagree. The split is:
+
+| Decision | Owner | How |
+|---|---|---|
+| Exact memory of a loaded runner | Ollama | Measured; FreeLlama reads it from `/api/ps` |
+| Whether a new load fits | Both, Ollama final | FreeLlama estimates from Ollama's past measurements, then Ollama loads or refuses |
+| Decoding slots per model | Ollama | `OLLAMA_NUM_PARALLEL`; FreeLlama's GPU budget defaults to match it |
+| Admission, priority, queue limits, back-pressure | FreeLlama | Weighted pools, 429/503 with `Retry-After` |
+| Which idle runner to unload, and when | FreeLlama | The cost planner above, before Ollama has to choose |
+| Context size | Ollama by default | `num_ctx` is left to Ollama when its default covers the request |
+
+To keep the estimates honest, FreeLlama learns from every runner Ollama reports as resident,
+including ones loaded by raw clients, and saves those measurements to `footprints.json` next to the
+usage ledger. After a restart a model it has seen before is sized from Ollama's measurement, not a
+formula. A larger context than any measured one is sized as the measurement plus exactly the extra
+KV cache, when the model's KV shape is known.
 
 ## Context sizing and Ollama's defaults
 

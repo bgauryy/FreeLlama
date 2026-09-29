@@ -693,7 +693,7 @@ observable, and bounded local research can keep intermediate context out of the 
 |---|---|
 | [Product positioning](docs/PRODUCT_POSITIONING.md) | Definition, audiences, messaging, and claim guardrails |
 | [Architecture](docs/ARCHITECTURE.md) | Ownership, request classification, routing, admission, research, and backend flows |
-| [Monitoring and live tuning](docs/MONITORING.md) | Status, usage ledger, Prometheus metrics, runtime config reload, 429 back-pressure, circuit breaker, adaptive limits |
+| [Monitoring and live tuning](docs/MONITORING.md) | Status page, usage ledger, Prometheus metrics, runtime config reload, 429 back-pressure, circuit breaker, adaptive limits, cost-aware eviction |
 | [Production runbook](docs/PRODUCTION.md) | Auth, persisted feedback, explicit Ollama settings, releases, hardware gates, and promotion |
 | [MCP server](packages/mcp/README.md) | Seven tools, schemas, configuration, allowed roots, build, and security |
 | [CLI reference](docs/CLI.md) | Commands, flags, objectives, managed execution, and policy workflow |

@@ -76,7 +76,18 @@ async fn loaded_models(state: &PlatformState) -> Vec<Value> {
     for (backend, upstream, _) in backend_views(state) {
         match get_json(&state.client, &upstream, "/api/ps").await {
             Ok(ps) => {
+                state
+                    .footprints
+                    .lock()
+                    .await
+                    .observe_resident(&upstream, &ps);
                 for entry in ps["models"].as_array().into_iter().flatten() {
+                    let name = entry
+                        .get("name")
+                        .or_else(|| entry.get("model"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let usage = state.activity.usage(backend, name);
                     let size = entry["size"].as_u64().unwrap_or(0);
                     let vram = entry["size_vram"].as_u64().unwrap_or(0);
                     loaded.push(json!({
@@ -87,10 +98,11 @@ async fn loaded_models(state: &PlatformState) -> Vec<Value> {
                         "gpu_percent": vram.saturating_mul(100).checked_div(size).unwrap_or(0),
                         "context_length": entry.get("context_length"),
                         "expires_at": entry.get("expires_at"),
-                        "pinned": state.tunables().pinned_models.contains(
-                            entry.get("name").or_else(|| entry.get("model"))
-                                .and_then(Value::as_str).unwrap_or_default()
-                        ),
+                        "pinned": state.tunables().pinned_models.contains(name),
+                        "active_tasks": usage.active,
+                        "recent_uses": (usage.recent_uses * 100.0).round() / 100.0,
+                        "idle_seconds": usage.idle_seconds.map(f64::round),
+                        "measured_load_seconds": usage.load_ms.map(|ms| (ms / 10.0).round() / 100.0),
                     }));
                 }
             }
@@ -153,6 +165,19 @@ pub(super) async fn status(State(state): State<PlatformState>) -> Json<Value> {
             "config": state.ollama.receipt(),
             "default_context": default_context.map(|(tokens, source)| json!({"tokens": tokens, "source": source})),
             "context_mode": tunables.context_mode,
+        },
+        "scheduling": {
+            "last_eviction": state
+                .last_eviction
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+            "measured_footprints": state.footprints.lock().await.len(),
+            "evict_idle_models": tunables.evict_idle_models,
+            "division_of_work": {
+                "freellama": "admission, priorities, queue limits, which idle runner to unload, and when",
+                "ollama": "exact memory measurement, final fit, runner loading, and decoding slots",
+            },
         },
         "usage_today": state.telemetry.usage(1)["totals"].clone(),
         "usage_ledger": state.telemetry.ledger_receipt(),
@@ -434,4 +459,21 @@ pub(super) async fn metrics(State(state): State<PlatformState>) -> Response {
         body,
     )
         .into_response()
+}
+
+/// Localhost status page: polls `/status` every two seconds.
+pub(super) async fn ui() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+            (header::X_FRAME_OPTIONS, "DENY"),
+            (
+                header::CONTENT_SECURITY_POLICY,
+                "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; \
+                 connect-src 'self'; form-action 'none'; frame-ancestors 'none'",
+            ),
+        ],
+        include_str!("ui.html"),
+    )
 }

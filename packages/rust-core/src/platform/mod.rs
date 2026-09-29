@@ -44,6 +44,7 @@ mod intent;
 mod monitor;
 mod ollama_env;
 mod readiness;
+mod residency;
 pub mod resources;
 mod routing;
 mod runtime;
@@ -428,6 +429,10 @@ fn is_loopback_host(host: &str) -> bool {
 struct PlatformState {
     resources: resources::ResourceGovernor,
     footprints: Arc<Mutex<footprint::FootprintHistory>>,
+    /// Per-model demand and load history for eviction planning.
+    activity: residency::ModelActivity,
+    /// The most recent eviction plan, for `status` and the UI.
+    last_eviction: Arc<std::sync::Mutex<Option<Value>>>,
     client: Client,
     upstream: String,
     cpu_upstream: Option<String>,
@@ -773,7 +778,7 @@ fn build(config: &PlatformConfig) -> Result<(Router, PlatformState)> {
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
     });
-    let telemetry = Telemetry::new(usage_file);
+    let telemetry = Telemetry::new(usage_file.clone());
     let raw_admission = proxy::RawAdmission::new(
         tunables.raw_max_concurrent_requests,
         tunables.raw_queue_wait(),
@@ -786,9 +791,18 @@ fn build(config: &PlatformConfig) -> Result<(Router, PlatformState)> {
         .unwrap_or_default();
     let state = PlatformState {
         resources: config.resource_governor.clone(),
-        footprints: Arc::new(Mutex::new(footprint::FootprintHistory::with_hints(
-            footprint::RuntimeHints::from_lookup(|name| ollama.lookup(name)),
-        ))),
+        footprints: Arc::new(Mutex::new({
+            let history = footprint::FootprintHistory::with_hints(
+                footprint::RuntimeHints::from_lookup(|name| ollama.lookup(name)),
+            );
+            // Measured runner sizes live next to the usage ledger, so a restart keeps them.
+            match &usage_file {
+                Some(ledger) => history.with_file(ledger.with_file_name("footprints.json")),
+                None => history,
+            }
+        })),
+        activity: residency::ModelActivity::default(),
+        last_eviction: Arc::default(),
         // A client-level backstop, not a nicety. `forward_managed_task` holds the
         // `managed_execution` write lock across its upstream call, so an untimed request against
         // a wedged Ollama would hold that exclusive lock forever and block every subsequent
@@ -878,6 +892,9 @@ fn build(config: &PlatformConfig) -> Result<(Router, PlatformState)> {
     } else {
         app
     };
+    // The status page is a static shell with no data in it, so it is served outside the bearer
+    // check; its requests to `/status` carry the token the viewer enters.
+    let router = router.route("/_freellama/ui", get(monitor::ui));
     Ok((router, state))
 }
 
@@ -911,6 +928,7 @@ pub async fn serve(config: PlatformConfig) -> Result<()> {
         });
     }
     println!("FreeLlama platform listening on http://{}", config.listen);
+    println!("Status page: http://{}/_freellama/ui", config.listen);
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;

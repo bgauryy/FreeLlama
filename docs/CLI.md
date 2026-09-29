@@ -27,7 +27,7 @@ flowchart TD
 | `auth-token` | Create a new mode-0600 bearer-token file without printing the secret | No |
 | `models` | List installed models, capabilities, residency, and evidence | Yes |
 | `machine` | Print portable host RAM, CPU, OS, architecture, disk, and the local Ollama endpoint | Yes |
-| `status` | Live queues, current and adaptive limits, circuit breakers, loaded models, host memory, Ollama's effective settings, today's usage | Yes |
+| `status` | Live queues (also as a page at `http://127.0.0.1:11435/_freellama/ui`), current and adaptive limits, circuit breakers, loaded models, host memory, Ollama's effective settings, today's usage | Yes |
 | `usage` | Task and token totals per day and per model (`--days`, default 7) | Yes |
 | `config` | Effective runtime settings and the source of each; `--reload` re-reads the runtime file | Yes |
 | `session` | Create an affinity scope for related tasks | Yes |

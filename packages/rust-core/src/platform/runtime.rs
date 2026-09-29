@@ -55,6 +55,9 @@ pub struct RuntimeFile {
     pub raw_max_concurrent_requests: Option<usize>,
     pub pinned_models: Option<Vec<String>>,
     pub evict_idle_models: Option<bool>,
+    /// Per-model multiplier on the cost of unloading it (default 1): raise it for a model that is
+    /// expensive to lose, lower it for one that is cheap to reload.
+    pub eviction_costs: Option<BTreeMap<String, f64>>,
     pub adaptive_concurrency: Option<AdaptiveMode>,
     pub context_mode: Option<ContextMode>,
     pub ollama_default_context: Option<u64>,
@@ -98,6 +101,7 @@ pub struct Tunables {
     pub raw_max_concurrent_requests: usize,
     pub pinned_models: BTreeSet<String>,
     pub evict_idle_models: bool,
+    pub eviction_costs: BTreeMap<String, f64>,
     pub adaptive_concurrency: AdaptiveMode,
     pub context_mode: ContextMode,
     pub ollama_default_context: Option<u64>,
@@ -268,6 +272,17 @@ pub(super) fn resolve(
         true,
         "default"
     );
+    let eviction_costs = pick!(
+        "eviction_costs",
+        None::<BTreeMap<String, f64>>,
+        None::<BTreeMap<String, f64>>,
+        file.eviction_costs.clone().map(|costs| costs
+            .into_iter()
+            .filter(|(_, weight)| weight.is_finite() && *weight >= 0.0)
+            .collect()),
+        BTreeMap::new(),
+        "default"
+    );
     let adaptive_concurrency = pick!(
         "adaptive_concurrency",
         None::<AdaptiveMode>,
@@ -329,6 +344,7 @@ pub(super) fn resolve(
         raw_max_concurrent_requests,
         pinned_models,
         evict_idle_models,
+        eviction_costs,
         adaptive_concurrency,
         context_mode,
         ollama_default_context,
