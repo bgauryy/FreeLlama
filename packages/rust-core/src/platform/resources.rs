@@ -322,7 +322,7 @@ pub struct ResourceReceipt {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ResourceWaitError {
-    pub receipt: ResourceReceipt,
+    pub receipt: Box<ResourceReceipt>,
 }
 
 impl std::fmt::Display for ResourceWaitError {
@@ -634,14 +634,14 @@ impl ResourceGovernor {
             }
         }
         Err(ResourceWaitError {
-            receipt: ResourceReceipt {
+            receipt: Box::new(ResourceReceipt {
                 status: "deadline_exceeded",
                 waited_ms: started.elapsed().as_millis(),
                 required_available_bytes,
                 reserved_bytes: 0,
                 snapshot: last,
                 assessment: last_assessment,
-            },
+            }),
         })
     }
 

@@ -32,7 +32,7 @@ fn cli_tool_map_lists_every_registered_mcp_tool() {
         .find("fn print_tool_map()")
         .expect("print_tool_map() not found in the CLI source");
     let map_body = &cli[map_start..];
-    let map_body = &map_body[..map_body.find("\n}\n").map_or(map_body.len(), |end| end)];
+    let map_body = &map_body[..map_body.find("\n}\n").unwrap_or(map_body.len())];
 
     for tool in &registered {
         assert!(

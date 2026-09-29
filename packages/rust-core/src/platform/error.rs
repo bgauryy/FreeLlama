@@ -115,7 +115,7 @@ impl IntoResponse for ApiError {
 
 pub(super) fn resource_error(error: resources::ResourceWaitError) -> ApiError {
     let message = error.to_string();
-    let receipt = error.receipt;
+    let receipt = *error.receipt;
     ApiError {
         status: StatusCode::SERVICE_UNAVAILABLE,
         body: Box::new(ErrorBody {
@@ -167,14 +167,14 @@ mod structured_error_tests {
     #[test]
     fn assessed_batch_result_preserves_machine_readable_resource_fields() {
         let result = resource_error(resources::ResourceWaitError {
-            receipt: resources::ResourceReceipt {
+            receipt: Box::new(resources::ResourceReceipt {
                 status: "held",
                 waited_ms: 12,
                 required_available_bytes: 4096,
                 reserved_bytes: 128,
                 snapshot: None,
                 assessment: None,
-            },
+            }),
         })
         .into_batch_result("task-b".into());
         assert_eq!(result["status"], 503);
@@ -190,14 +190,14 @@ mod structured_error_tests {
     #[tokio::test]
     async fn resource_refusal_has_a_human_message_and_structured_receipt() {
         let response = resource_error(resources::ResourceWaitError {
-            receipt: resources::ResourceReceipt {
+            receipt: Box::new(resources::ResourceReceipt {
                 status: "held",
                 waited_ms: 12,
                 required_available_bytes: 4096,
                 reserved_bytes: 0,
                 snapshot: None,
                 assessment: None,
-            },
+            }),
         })
         .into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
