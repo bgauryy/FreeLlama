@@ -917,7 +917,7 @@ fn parse_memory_psi(text: &str) -> Option<(f64, MemoryPressure)> {
 }
 
 /// `nvidia-smi --query-gpu=memory.total,memory.used --format=csv,noheader,nounits` (MiB per GPU).
-#[cfg(any(target_os = "linux", target_os = "windows", test))]
+#[cfg(any(target_os = "linux", test))]
 fn parse_nvidia_smi(text: &str) -> Option<(u64, u64)> {
     const MIB: u64 = 1024 * 1024;
     let mut total = 0_u64;

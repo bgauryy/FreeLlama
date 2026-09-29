@@ -194,6 +194,9 @@ struct ProductionArgs {
     allow_remote: bool,
 }
 
+// Parsed once per process, so the size gap between `Serve` and the small commands costs nothing.
+// Windows' larger `PathBuf` pushes the gap past clippy's threshold there.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Inspect prerequisites and print a side-effect-free first-run plan. Never pulls a model.

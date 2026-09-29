@@ -231,7 +231,7 @@ fn total_memory_bytes() -> Option<u64> {
 fn available_disk_bytes() -> Option<u64> {
     #[cfg(target_os = "windows")]
     {
-        return command_output(
+        command_output(
             "powershell.exe",
             &[
                 "-NoProfile",
@@ -239,7 +239,7 @@ fn available_disk_bytes() -> Option<u64> {
                 "(Get-PSDrive -Name (Get-Item .).PSDrive.Name).Free",
             ],
         )
-        .and_then(|value| value.parse().ok());
+        .and_then(|value| value.parse().ok())
     }
     #[cfg(not(target_os = "windows"))]
     {
