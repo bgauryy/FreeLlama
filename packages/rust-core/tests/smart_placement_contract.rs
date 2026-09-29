@@ -64,7 +64,8 @@ async fn backend(mock: Mock) -> (String, tokio::task::JoinHandle<()>) {
             get(|| async {
                 Json(json!({"models": [
                     {"name": "big:latest", "digest": "d-big", "size": 8000},
-                    {"name": "idle:latest", "digest": "d-idle", "size": 3000}
+                    {"name": "idle:latest", "digest": "d-idle", "size": 3000},
+                    {"name": "huge:latest", "digest": "d-huge", "size": 20000}
                 ]}))
             }),
         )
@@ -241,5 +242,26 @@ async fn pinned_models_are_never_evicted() {
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert!(!mock.unloaded.load(Ordering::SeqCst));
     assert_eq!(mock.loaded.lock().await.len(), 1);
+    server.abort();
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+#[tokio::test]
+async fn a_model_larger_than_the_gpu_does_not_empty_vram() {
+    let mock = Mock::default();
+    mock.loaded.lock().await.push(json!({
+        "name": "idle:latest", "digest": "d-idle", "size": 3000, "size_vram": 3000,
+        "context_length": 2048, "expires_at": "2026-01-01T00:05:00Z"
+    }));
+    let (upstream, server) = backend(mock.clone()).await;
+    // 20000-byte model on a 12000-byte GPU: it spills whatever is unloaded.
+    let governor = ResourceGovernor::with_sampler(policy(), || sample(9000, Some(9000))).unwrap();
+    let _ = run(
+        app(&config(upstream, governor)).unwrap(),
+        "huge:latest",
+        "hi",
+    )
+    .await;
+    assert!(!mock.unloaded.load(Ordering::SeqCst));
     server.abort();
 }

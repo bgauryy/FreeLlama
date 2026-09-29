@@ -103,11 +103,14 @@ model would not fit in free VRAM, where Ollama would otherwise choose its own vi
 Which runners go is a small optimisation, in the spirit of llama-swap's `evict_costs` and LocalAI's
 busy-aware LRU:
 
-- **Never unloaded:** the model being loaded, `pinned_models`, `keep_alive: -1` runners, and any
-  model with a FreeLlama task queued or running (unloading it would force an immediate reload).
+- **Never unloaded:** the model being loaded, `pinned_models`, `keep_alive: -1` runners, runners
+  Ollama is still loading, and any model with a FreeLlama task queued or running (unloading it would
+  force an immediate reload). Busy status is checked again right before each unload.
+- **Not for a model bigger than the GPU:** it spills to the CPU whatever is unloaded, so VRAM is
+  left alone.
 - **Cost of unloading a runner** = its reload time (Ollama's measured `load_duration` from earlier
   loads, or size ÷ 1.5 GB/s before the first one) × (1 + recent uses, decaying with a 30-minute
-  half-life) × its `eviction_costs` weight (default 1).
+  half-life; only tasks actually served count) × its `eviction_costs` weight (default 1).
 - **Choice:** the set of runners with the lowest total cost that frees enough memory; ties go to
   fewer runners, then less memory freed beyond what is needed. Only the memory that matters is
   counted: VRAM for a GPU fit, the host-RAM part for a spill, the whole runner on CPU or unified
@@ -115,8 +118,9 @@ busy-aware LRU:
 
 Every managed receipt that caused an eviction carries the plan under
 `memory_reservation.eviction`: what was unloaded, its cost and reload estimate, and what was kept
-and why. `status` and the page show the latest one. Set `evict_idle_models = false` to leave
-residency entirely to Ollama.
+and why. `status` and the page show the latest one that unloaded something. Eviction runs once per
+task, after admission and before the memory wait, and is never cancelled halfway by a deadline.
+Set `evict_idle_models = false` to leave residency entirely to Ollama.
 
 ## Who decides what: FreeLlama and Ollama
 
@@ -134,7 +138,9 @@ Two schedulers that both guess at memory will disagree. The split is:
 To keep the estimates honest, FreeLlama learns from every runner Ollama reports as resident,
 including ones loaded by raw clients, and saves those measurements to `footprints.json` next to the
 usage ledger. After a restart a model it has seen before is sized from Ollama's measurement, not a
-formula. A larger context than any measured one is sized as the measurement plus exactly the extra
+formula. Each measurement records the `OLLAMA_NUM_PARALLEL` and KV-cache type it was taken under and
+is used only while those match, so changing either setting falls back to the formula until Ollama
+measures again. A larger context than any measured one is sized as the measurement plus exactly the extra
 KV cache, when the model's KV shape is known.
 
 ## Context sizing and Ollama's defaults

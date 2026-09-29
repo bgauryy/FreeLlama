@@ -947,9 +947,11 @@ fn with_runtime_and_usage(
 
 fn report_admission_config(config: &PlatformConfig) {
     eprintln!(
-        "freellama: per-backend admission budgets: GPU {} units / {} queued, CPU {} units / {} \
-         queued (embedding 1, chat 2, vision 4). Units are not literal task counts; pair same-model GPU \
-         concurrency changes with OLLAMA_NUM_PARALLEL and KV-cache validation.",
+        "freellama: per-backend admission budgets from flags/env: GPU {} units / {} queued, CPU {} \
+         units / {} queued (embedding 1, chat 2, vision 4); a --runtime-config file sets \
+         any value no flag or env var set, and `freellama config` shows the effective values. Units are not literal task \
+         counts; pair same-model GPU concurrency changes with OLLAMA_NUM_PARALLEL and KV-cache \
+         validation.",
         config.resolved_max_concurrent_tasks(),
         config.resolved_max_queued_tasks(),
         config.resolved_cpu_max_concurrent_tasks(),

@@ -182,8 +182,8 @@ function render(data) {
   for (const name of ["OLLAMA_NUM_PARALLEL", "OLLAMA_MAX_LOADED_MODELS", "OLLAMA_CONTEXT_LENGTH", "OLLAMA_KV_CACHE_TYPE", "OLLAMA_FLASH_ATTENTION"]) {
     const setting = settings[name];
     if (!setting) continue;
-    const line = row(name.replace("OLLAMA_", ""), setting.value ?? "default");
-    line.lastChild.append(" ", el("span", setting.source.replaceAll("_", " "), "source"));
+    const line = row(name.replace("OLLAMA_", ""), setting.value ?? "Ollama default");
+    if (setting.value != null) line.lastChild.append(" ", el("span", setting.source.replaceAll("_", " "), "source"));
     ollamaNodes.push(line);
   }
   if (o.default_context) ollamaNodes.push(row("Default context", `${o.default_context.tokens} (${o.default_context.source})`));

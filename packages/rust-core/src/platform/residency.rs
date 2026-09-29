@@ -86,7 +86,6 @@ impl ModelActivity {
         let entry = inner.entry(key.clone()).or_default();
         entry.decay(now);
         entry.active += 1;
-        entry.uses += 1.0;
         entry.last_used = Some(now);
         drop(inner);
         ActiveModel {
@@ -95,13 +94,17 @@ impl ModelActivity {
         }
     }
 
-    /// Record a finished task: when it last ran, and how long a cold load took.
+    /// Record a served task: one more recent use, when it ran, and how long a cold load took.
+    /// Only served work counts as demand; a task refused at admission never used the model.
     pub(super) fn completed(&self, backend: &str, model: &str, load_ms: u64) {
+        let now = Instant::now();
         let mut inner = self.lock();
         let entry = inner
             .entry((backend.to_owned(), model.to_owned()))
             .or_default();
-        entry.last_used = Some(Instant::now());
+        entry.decay(now);
+        entry.uses += 1.0;
+        entry.last_used = Some(now);
         if load_ms >= MIN_LEARNED_LOAD_MS {
             #[allow(clippy::cast_precision_loss)] // Milliseconds, far below 2^52.
             let sample = load_ms as f64;
@@ -217,7 +220,8 @@ pub(super) struct PlanInputs<'a> {
 /// the rest it minimises total cost, then the number of runners, then the bytes freed beyond
 /// the shortfall; with too many runners for an exact search it falls back to cheapest-per-byte.
 /// When even every eligible runner is not enough, all of them are returned and the plan says so:
-/// the estimate is conservative, and the freed memory may still let the load fit.
+/// the estimate is conservative, and the freed memory may still let the load fit (or, in VRAM,
+/// spill fewer layers to the CPU).
 pub(super) fn plan(ps: &Value, activity: &ModelActivity, inputs: &PlanInputs<'_>) -> Plan {
     let mut candidates = Vec::new();
     let mut skipped = Vec::new();
@@ -240,6 +244,9 @@ pub(super) fn plan(ps: &Value, activity: &ModelActivity, inputs: &PlanInputs<'_>
             Some("pinned")
         } else if pinned_expiry(expires_at) {
             Some("keep_alive_forever")
+        } else if expires_at.starts_with("0001-") {
+            // Ollama reports the zero time while a runner is still loading for someone.
+            Some("loading")
         } else if usage.active > 0 {
             Some("busy")
         } else {
@@ -413,7 +420,7 @@ mod tests {
         let activity = ModelActivity::default();
         // "hot" was used many times recently; "big-cold" is idle and big enough on its own.
         for _ in 0..6 {
-            drop(activity.begin("gpu", "hot"));
+            activity.completed("gpu", "hot", 0);
         }
         let loaded = ps(&[
             ("hot", 8 * GIB, 8 * GIB, "2026-09-29T12:05:00Z"),
@@ -516,6 +523,23 @@ mod tests {
     }
 
     #[test]
+    fn runners_still_loading_are_never_unloaded() {
+        let activity = ModelActivity::default();
+        let loaded = ps(&[
+            ("idle", 4 * GIB, 4 * GIB, "2026-09-29T12:00:00Z"),
+            ("loading", 4 * GIB, 4 * GIB, "0001-01-01T00:00:00Z"),
+        ]);
+        let (pinned, weights) = (BTreeSet::new(), BTreeMap::new());
+        let host = plan(
+            &loaded,
+            &activity,
+            &inputs(&pinned, &weights, Freed::Total, 40 * GIB),
+        );
+        assert_eq!(names(&host), ["idle"]);
+        assert_eq!(host.skipped, [("loading".to_owned(), "loading")]);
+    }
+
+    #[test]
     fn many_runners_fall_back_to_cheapest_per_byte() {
         let activity = ModelActivity::default();
         let entries: Vec<(String, u64)> =
@@ -540,7 +564,10 @@ mod tests {
         drop(guard);
         let usage = activity.usage("cpu", "m");
         assert_eq!(usage.active, 0);
-        assert!(usage.recent_uses > 0.99);
+        // Admitted but never served (refused, failed): no demand recorded.
+        assert!(usage.recent_uses < 0.01);
+        activity.completed("cpu", "m", 0);
+        assert!(activity.usage("cpu", "m").recent_uses > 0.99);
         assert!(usage.idle_seconds.is_some());
         assert_eq!(activity.usage("gpu", "m"), Usage::default());
     }
