@@ -54,6 +54,11 @@ impl ApiError {
         }
     }
 
+    /// A host-memory admission wait that ran out of time (as opposed to a queue or input error).
+    pub(super) fn is_resource_wait(&self) -> bool {
+        self.body.code == Some("resource_admission_unavailable")
+    }
+
     pub(super) fn bad_request(error: impl std::fmt::Display) -> Self {
         Self::new(StatusCode::UNPROCESSABLE_ENTITY, error)
     }

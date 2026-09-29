@@ -45,7 +45,9 @@ mod readiness;
 pub mod resources;
 mod routing;
 
-pub use discovery::{MachineProfile, machine_profile};
+pub use discovery::{
+    MachineProfile, host_has_unified_memory, host_total_memory_bytes, machine_profile,
+};
 pub use intent::{RouteIntent, intent_schema, normalize_route_intent, parse_route_intent};
 pub use routing::{
     CatalogModel, ExecutionPreference, Objective, PlacementEvidence, RouteDecision, RouteEvidence,
@@ -411,6 +413,8 @@ struct PlatformState {
     max_sessions: usize,
     session_ttl: Duration,
     raw_proxy_max_concurrent_requests: usize,
+    /// Unload idle resident runners when a cold load is short of memory.
+    evict_idle_models: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -672,7 +676,9 @@ pub fn app(config: &PlatformConfig) -> Result<Router> {
         .unwrap_or_default();
     let state = PlatformState {
         resources: config.resource_governor.clone(),
-        footprints: Arc::new(Mutex::new(footprint::FootprintHistory::default())),
+        footprints: Arc::new(Mutex::new(footprint::FootprintHistory::with_hints(
+            footprint::RuntimeHints::from_lookup(|name| std::env::var(name).ok()),
+        ))),
         // A client-level backstop, not a nicety. `forward_managed_task` holds the
         // `managed_execution` write lock across its upstream call, so an untimed request against
         // a wedged Ollama would hold that exclusive lock forever and block every subsequent
@@ -706,6 +712,9 @@ pub fn app(config: &PlatformConfig) -> Result<Router> {
         max_sessions: config.max_sessions.unwrap_or(1024),
         session_ttl: config.session_ttl.unwrap_or(Duration::from_secs(3600)),
         raw_proxy_max_concurrent_requests: config.resolved_raw_proxy_max_concurrent_requests(),
+        evict_idle_models: std::env::var("FREELLAMA_EVICT_IDLE_MODELS").map_or(true, |value| {
+            !matches!(value.trim(), "0" | "false" | "no" | "off")
+        }),
     };
     let fallback_config = ProxyConfig::new(&config.listen, &config.upstream, config.allow_remote)
         .with_max_concurrent_requests(config.resolved_raw_proxy_max_concurrent_requests())
@@ -1378,7 +1387,7 @@ async fn run_task_batch(
             let index = next_batch_task(&mut pending, &input.tasks, &mut credits);
             let task = input.tasks[index].task.clone();
             let task_state = state.clone();
-            let handle = running.spawn(async move { run_task(State(task_state), Json(task)).await });
+            let handle = running.spawn(Box::pin(run_task(State(task_state), Json(task))));
             in_flight.insert(handle.id(), index);
         }
         if let Some(joined) = running.join_next_with_id().await {

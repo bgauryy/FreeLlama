@@ -5,7 +5,8 @@ use super::{
     CatalogModel, ExecutionPreference, FEEDBACK_SCHEMA_VERSION, OllamaRequestOptions,
     PlacementEvidence, PlacementSignals, PlatformState, RouteDecision, RouteInput, SessionAffinity,
     TaskInput, TaskKind, TaskPriority, context, desired_placement, discover_models, get_json,
-    machine_profile, persist_feedback, require_active_session, resources, select_route,
+    host_has_unified_memory, host_total_memory_bytes, persist_feedback, require_active_session,
+    resources, select_route,
 };
 use crate::{model_bench::Capability, proxy};
 use anyhow::{Context, Result};
@@ -17,6 +18,9 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
+
+/// How long a request may wait for host memory while holding its admission slot.
+const SLOT_HELD_RESOURCE_WAIT: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
 pub(super) struct ExecutionTarget {
@@ -266,15 +270,41 @@ fn requests_immediate_unload(value: Option<&str>) -> bool {
     matches!(value.map(str::trim), Some("0" | "0s" | "0m" | "0h"))
 }
 
-pub(super) fn apply_execution_options(body: &mut Value, target: &ExecutionTarget) {
-    if let Some(options) = body.get_mut("options").and_then(Value::as_object_mut) {
-        let threads =
-            std::thread::available_parallelism().map_or(1, |cores| (cores.get() / 2).max(1));
-        options
-            .entry("num_thread")
-            .or_insert_with(|| json!(threads));
+/// Thread count for CPU-placed runners, or `None` to let Ollama choose.
+///
+/// Ollama compares `num_thread` when deciding whether a loaded runner can serve a request, so a
+/// value that differs from what other clients send forces a reload. It is therefore set only on
+/// the dedicated CPU backend, where `FreeLlama` is the only client. The GPU backend is left alone:
+/// injecting `logical/2` there made every raw request without `num_thread` reload the runner
+/// managed traffic had just loaded, and on Apple Silicon (no SMT) it halved CPU throughput.
+fn cpu_num_thread() -> Option<u64> {
+    if let Some(value) = std::env::var("FREELLAMA_CPU_NUM_THREAD")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+    {
+        return Some(value);
     }
+    if cfg!(target_os = "macos") {
+        // Ollama already sizes to performance cores; efficiency cores slow llama.cpp's barriers.
+        return None;
+    }
+    // x86 SMT: half the logical CPUs approximates physical cores and leaves the siblings free.
+    std::thread::available_parallelism()
+        .ok()
+        .map(|cores| (cores.get() as u64 / 2).max(1))
+}
+
+pub(super) fn apply_execution_options(body: &mut Value, target: &ExecutionTarget) {
     if target.placement == "cpu" {
+        if let (Some(options), Some(threads)) = (
+            body.get_mut("options").and_then(Value::as_object_mut),
+            cpu_num_thread(),
+        ) {
+            options
+                .entry("num_thread")
+                .or_insert_with(|| json!(threads));
+        }
         // The process-level CPU library override is ignored by some Metal builds. Ollama's
         // request contract treats num_gpu as a runner load option; pinning zero here makes the
         // explicit CPU assignment real while the second process prevents GPU-runner churn on the
@@ -475,7 +505,7 @@ pub(super) async fn run_task(
     super::with_session_cancellation(
         &state,
         session_id.as_deref(),
-        run_session_task(State(state.clone()), Json(input)),
+        Box::pin(run_session_task(State(state.clone()), Json(input))),
     )
     .await
 }
@@ -506,7 +536,20 @@ async fn run_session_task(
     drop(sessions);
 
     apply_request_options(input.route.task, &mut managed.route, &input.request_options)?;
-    let context_sizing = context::size_context(&input, &mut managed.route, &managed.model)?;
+    let mut context_sizing = context::size_context(&input, &mut managed.route, &managed.model)?;
+    if managed.route.resident && context_sizing["mode"] == "prompt_estimate" {
+        let loaded = resident_entry(
+            &state.client,
+            &managed.execution.upstream,
+            &managed.route.selected_model,
+        )
+        .await;
+        if let Some(reused) =
+            context::reuse_resident_context(&mut managed.route, &managed.model, loaded.as_ref())
+        {
+            context_sizing["reused_resident_context"] = json!(reused);
+        }
+    }
     let preflight = memory_kv_preflight(
         &managed.model,
         &managed.route,
@@ -543,7 +586,7 @@ async fn run_session_task(
     // non-resident path took the write lock before its slot while resident tasks held slots and
     // waited on the read lock, the two would deadlock. One consistent order removes that entirely.
     let queue_deadline = tokio::time::Instant::now() + state.queue_wait;
-    let (slot, cost, queue_wait_ms) = admit(
+    let (mut slot, mut cost, mut queue_wait_ms) = admit(
         &state,
         &execution,
         decision.task,
@@ -553,29 +596,77 @@ async fn run_session_task(
     )
     .await?;
 
+    // Wait for host memory while holding the admission slot only briefly. A cold load that must
+    // wait for memory used to keep its slot for the whole queue deadline, blocking resident
+    // requests that need no new memory at all (head-of-line blocking). After the short bound it
+    // gives the slot back, waits for memory, then queues for a slot again with memory reserved.
     let resource_started = Instant::now();
-    let (resource_permit, footprint) = tokio::time::timeout_at(
-        queue_deadline,
+    let quick_deadline =
+        (tokio::time::Instant::now() + SLOT_HELD_RESOURCE_WAIT).min(queue_deadline);
+    let reserved = tokio::time::timeout_at(
+        quick_deadline,
         reserve_task_resources(
             &state,
             &execution,
             &resource_model,
             &decision,
-            queue_deadline,
+            quick_deadline,
             None,
         ),
     )
-    .await
-    .map_err(|_| {
-        ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "resource admission deadline exceeded",
-        )
-        .with_resource_deadline(
-            "initial_reservation",
-            resource_started.elapsed().as_millis(),
-        )
-    })??;
+    .await;
+    let (resource_permit, footprint) = match reserved {
+        Ok(Ok(reserved)) => reserved,
+        Ok(Err(error)) if !error.is_resource_wait() => return Err(error),
+        _ if tokio::time::Instant::now() >= queue_deadline => {
+            return Err(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "resource admission deadline exceeded",
+            )
+            .with_resource_deadline(
+                "initial_reservation",
+                resource_started.elapsed().as_millis(),
+            ));
+        }
+        _ => {
+            drop(slot);
+            let reserved = tokio::time::timeout_at(
+                queue_deadline,
+                reserve_task_resources(
+                    &state,
+                    &execution,
+                    &resource_model,
+                    &decision,
+                    queue_deadline,
+                    None,
+                ),
+            )
+            .await
+            .map_err(|_| {
+                ApiError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "resource admission deadline exceeded",
+                )
+                .with_resource_deadline(
+                    "initial_reservation",
+                    resource_started.elapsed().as_millis(),
+                )
+            })??;
+            let (readmitted, readmitted_cost, requeued_ms) = admit(
+                &state,
+                &execution,
+                decision.task,
+                input.priority,
+                batch_items,
+                queue_deadline,
+            )
+            .await?;
+            slot = readmitted;
+            cost = readmitted_cost;
+            queue_wait_ms = queue_wait_ms.saturating_add(requeued_ms);
+            reserved
+        }
+    };
     let mut resource_wait_ms = resource_started.elapsed().as_millis();
     execution_receipt["resource_admission"] = json!(resource_permit.receipt);
     execution_receipt["memory_reservation"] = footprint;
@@ -623,11 +714,18 @@ async fn run_session_task(
     })??;
     resource_wait_ms = resource_wait_ms.saturating_add(recheck_started.elapsed().as_millis());
     execution_receipt["resource_revalidation"] = json!(resource_recheck.receipt);
+    let evicted = execution_receipt["memory_reservation"]
+        .get("evicted_idle_models")
+        .cloned();
     execution_receipt["memory_reservation"] = footprint;
+    if let Some(evicted) = evicted {
+        execution_receipt["memory_reservation"]["evicted_idle_models"] = evicted;
+    }
     let admission_mode = transition.admission_mode();
     let selected_model = decision.selected_model.clone();
     let session_id = input.route.session_id.clone();
-    let result = forward_managed_task(
+    let mut permits = [resource_permit, resource_recheck];
+    let forward = forward_managed_task(
         &state,
         decision,
         &execution,
@@ -641,11 +739,36 @@ async fn run_session_task(
         resource_wait_ms,
         cost,
         immediate_unload,
-    )
-    .await;
+    );
+    // On unified memory a loaded runner's weights are wired and visible in OS telemetry, so the
+    // reservation that covered the load is returned as soon as the runner is resident instead of
+    // being counted a second time until the response ends. (With mmap'd weights on Linux the
+    // page cache still reads as available, so there the reservation is held to the end.)
+    let result =
+        if host_has_unified_memory() && permits.iter().any(|permit| permit.reserved_bytes() > 0) {
+            let client = state.client.clone();
+            let upstream = execution.upstream.clone();
+            let watch = async {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    if model_is_resident(&client, &upstream, &selected_model).await {
+                        permits
+                            .iter_mut()
+                            .for_each(resources::ResourcePermit::release);
+                        break;
+                    }
+                }
+                std::future::pending::<()>().await;
+            };
+            tokio::select! {
+                result = forward => result,
+                () = watch => unreachable!("the residency watch never completes"),
+            }
+        } else {
+            forward.await
+        };
     drop(transition);
-    drop(resource_permit);
-    drop(resource_recheck);
+    drop(permits);
 
     // Affinity means the last model that successfully executed for the session. An upstream error
     // must not pin a model the caller never received a successful result from.
@@ -669,7 +792,7 @@ pub(super) async fn intent_memory_requirement(
     target: &ExecutionTarget,
 ) -> u64 {
     if !upstream_is_loopback(&target.upstream)
-        || !(target.placement == "cpu" || machine_profile("").memory_kind == "unified")
+        || !(target.placement == "cpu" || host_has_unified_memory())
     {
         return 0;
     }
@@ -694,29 +817,42 @@ pub(super) async fn model_memory_requirement(
     model: &CatalogModel,
     decision: &RouteDecision,
 ) -> Value {
-    let host_relevant = upstream_is_loopback(&execution.upstream)
-        && (execution.placement == "cpu" || machine_profile("").memory_kind == "unified");
-    let current = if host_relevant && model.digest.is_some() {
-        get_json(&state.client, &execution.upstream, "/api/ps")
-            .await
-            .ok()
-            .and_then(|ps| ps["models"].as_array().cloned())
-            .and_then(|models| {
-                models
-                    .into_iter()
-                    .find(|entry| entry["name"] == model.name || entry["model"] == model.name)
-            })
+    let loopback = upstream_is_loopback(&execution.upstream);
+    let host_relevant = loopback && (execution.placement == "cpu" || host_has_unified_memory());
+    // A discrete GPU holds the model in VRAM, but whatever does not fit spills into system RAM
+    // ("mixed" placement), which used to be reserved as zero. Estimate the full footprint, then
+    // charge host memory only for the part the GPU's current free VRAM cannot hold.
+    let discrete_gpu = loopback && !host_relevant;
+    let current = if (host_relevant || discrete_gpu) && model.digest.is_some() {
+        resident_entry(&state.client, &execution.upstream, &model.name).await
     } else {
         None
     };
     let context = decision.options["num_ctx"].as_u64().unwrap_or(0);
-    state.footprints.lock().await.requirement(
+    let mut footprint = state.footprints.lock().await.requirement(
         &execution.upstream,
         model,
         context,
         current.as_ref(),
-        host_relevant,
-    )
+        host_relevant || discrete_gpu,
+    );
+    if discrete_gpu {
+        let full = footprint["required_available_bytes"].as_u64().unwrap_or(0);
+        if full > 0 {
+            let observation = state.resources.snapshot().await.observation;
+            footprint["full_estimate_bytes"] = json!(full);
+            if let Some(vram_free) = observation.gpu_memory_free_bytes {
+                footprint["gpu_memory_free_bytes"] = json!(vram_free);
+                footprint["gpu_telemetry_source"] = json!(observation.gpu_telemetry_source);
+                footprint["required_available_bytes"] = json!(full.saturating_sub(vram_free));
+                footprint["source"] = json!("discrete_gpu_spill_estimate");
+            } else {
+                footprint["required_available_bytes"] = json!(0);
+                footprint["source"] = json!("discrete_gpu_without_vram_telemetry");
+            }
+        }
+    }
+    footprint
 }
 
 async fn reserve_task_resources(
@@ -727,21 +863,46 @@ async fn reserve_task_resources(
     deadline: tokio::time::Instant,
     already_reserved: Option<u64>,
 ) -> Result<(resources::ResourcePermit, Value), ApiError> {
-    let footprint = model_memory_requirement(state, execution, model, decision).await;
-    let bytes = footprint["required_available_bytes"]
+    let mut footprint = model_memory_requirement(state, execution, model, decision).await;
+    let mut bytes = footprint["required_available_bytes"]
         .as_u64()
         .unwrap_or(0)
         .saturating_sub(already_reserved.unwrap_or(0));
+    if already_reserved.is_none() && bytes > 0 && state.evict_idle_models {
+        let snapshot = state.resources.snapshot().await;
+        let assessment = snapshot.assess_capacity(bytes, false);
+        if assessment.denial_reason == Some(resources::CapacityDenialReason::InsufficientCapacity) {
+            let shortfall = assessment
+                .required_with_reserve_bytes
+                .unwrap_or(u64::MAX)
+                .saturating_sub(assessment.effective_available_bytes.unwrap_or(0));
+            let evicted =
+                evict_idle_models(state, execution, &decision.selected_model, shortfall).await;
+            if !evicted.is_empty() {
+                // The cached sample predates the unload; judge the new footprint on a fresh one.
+                state.resources.invalidate().await;
+                footprint = model_memory_requirement(state, execution, model, decision).await;
+                bytes = footprint["required_available_bytes"].as_u64().unwrap_or(0);
+                footprint["evicted_idle_models"] = json!(evicted);
+            }
+        }
+    }
+    let resident = footprint["source"] == "matching_resident_context";
     if already_reserved.is_some() {
         // Refresh under the transition guard, but never wait for pressure recovery while holding
         // that guard: an unload request may be what makes recovery possible.
         state.resources.snapshot().await;
     }
+    let demand = if resident && bytes == 0 {
+        resources::ResourceDemand::resident()
+    } else {
+        resources::ResourceDemand::load(bytes)
+    };
     let permit = state
         .resources
-        .wait_for_capacity(
+        .wait_for_demand(
             &execution.upstream,
-            bytes,
+            demand,
             if already_reserved.is_some() {
                 Duration::ZERO
             } else {
@@ -751,6 +912,86 @@ async fn reserve_task_resources(
         .await
         .map_err(resource_error)?;
     Ok((permit, footprint))
+}
+
+/// Unload least-recently-used idle runners on `execution` until about `shortfall` bytes are freed.
+///
+/// A cold load used to wait for memory that only idle resident models were holding; `FreeLlama`
+/// never unloaded them, so the request held its slot and then failed with 503. `keep_alive: 0`
+/// is safe for a runner that is still serving: Ollama unloads it once its requests finish.
+/// Models pinned with `keep_alive: -1` (an expiry far in the future) are never evicted.
+async fn evict_idle_models(
+    state: &PlatformState,
+    execution: &ExecutionTarget,
+    keep: &str,
+    shortfall: u64,
+) -> Vec<String> {
+    let Ok(ps) = get_json(&state.client, &execution.upstream, "/api/ps").await else {
+        return Vec::new();
+    };
+    let mut candidates: Vec<(String, String, u64)> = ps["models"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.get("name").or_else(|| entry.get("model"))?.as_str()?;
+            let expires = entry
+                .get("expires_at")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let size = entry.get("size").and_then(Value::as_u64).unwrap_or(0);
+            (name != keep && !pinned_expiry(expires))
+                .then(|| (expires.to_owned(), name.to_owned(), size))
+        })
+        .collect();
+    // Same keep_alive => the earliest expiry is the least recently used.
+    candidates.sort();
+    let mut freed = 0_u64;
+    let mut evicted = Vec::new();
+    for (_, name, size) in candidates {
+        if freed >= shortfall {
+            break;
+        }
+        let body = json!({"model": name, "keep_alive": 0, "stream": false});
+        if post_json_with_retries(state, &execution.upstream, "/api/generate", &body)
+            .await
+            .is_ok()
+        {
+            freed = freed.saturating_add(size);
+            evicted.push(name);
+        }
+    }
+    // Give Ollama a moment to release the runners before capacity is re-read.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !evicted.is_empty() && Instant::now() < deadline {
+        let mut still_loaded = false;
+        for name in &evicted {
+            if model_is_resident(&state.client, &execution.upstream, name).await {
+                still_loaded = true;
+                break;
+            }
+        }
+        if !still_loaded {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    evicted
+}
+
+/// `keep_alive: -1` shows up in `/api/ps` as an expiry centuries away; treat anything more than
+/// a year out as pinned by its owner.
+fn pinned_expiry(expires_at: &str) -> bool {
+    let Some(year) = expires_at
+        .get(..4)
+        .and_then(|year| year.parse::<u64>().ok())
+    else {
+        return false;
+    };
+    let now_year = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(1970, |elapsed| 1970 + elapsed.as_secs() / 31_556_952);
+    year > now_year + 1
 }
 
 /// POST JSON upstream, retrying transient failures on the same backoff schedule the passthrough
@@ -1044,6 +1285,24 @@ async fn observe_physical_placement(
     observation
 }
 
+/// The `/api/ps` entry for `model` on `upstream`, if it is loaded.
+async fn resident_entry(client: &Client, upstream: &str, model: &str) -> Option<Value> {
+    get_json(client, upstream, "/api/ps")
+        .await
+        .ok()?
+        .get("models")?
+        .as_array()?
+        .iter()
+        .find(|entry| {
+            entry
+                .get("name")
+                .or_else(|| entry.get("model"))
+                .and_then(Value::as_str)
+                == Some(model)
+        })
+        .cloned()
+}
+
 async fn model_is_resident(client: &Client, upstream: &str, model: &str) -> bool {
     get_json(client, upstream, "/api/ps")
         .await
@@ -1206,14 +1465,13 @@ fn memory_kv_preflight(
         .get("num_ctx")
         .and_then(Value::as_u64)
         .or(model.advertised_context);
-    let machine = machine_profile("");
     let host_relevant =
-        upstream_is_loopback(upstream) && (placement == "cpu" || machine.memory_kind == "unified");
+        upstream_is_loopback(upstream) && (placement == "cpu" || host_has_unified_memory());
     memory_kv_preflight_with_memory(
         model,
         requested_context,
         host_relevant,
-        machine.memory_bytes,
+        host_total_memory_bytes(),
     )
 }
 
