@@ -46,7 +46,13 @@ curl -fL --proto '=https' --tlsv1.2 "${base}/${asset}" -o "${temporary_dir}/${as
 curl -fL --proto '=https' --tlsv1.2 "${base}/SHA256SUMS" -o "${temporary_dir}/SHA256SUMS"
 expected="$(awk -v file="$asset" '$2 == file {print $1}' "${temporary_dir}/SHA256SUMS")"
 [ -n "$expected" ] || { echo "No checksum published for ${asset}" >&2; exit 1; }
-actual="$(shasum -a 256 "${temporary_dir}/${asset}" | awk '{print $1}')"
+if command -v sha256sum >/dev/null 2>&1; then
+  actual="$(sha256sum "${temporary_dir}/${asset}" | awk '{print $1}')"
+elif command -v shasum >/dev/null 2>&1; then
+  actual="$(shasum -a 256 "${temporary_dir}/${asset}" | awk '{print $1}')"
+else
+  echo "Need sha256sum or shasum to verify ${asset}" >&2; exit 1
+fi
 [ "$actual" = "$expected" ] || { echo "Checksum mismatch for ${asset}" >&2; exit 1; }
 mkdir -p "$install_dir"
 install -m 0755 "${temporary_dir}/${asset}" "${install_dir}/freellama"

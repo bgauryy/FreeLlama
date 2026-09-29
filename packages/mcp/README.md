@@ -375,6 +375,19 @@ server-launch config (for example `.mcp.json`'s `env` block) or the launching sh
 | `FREELLAMA_TASK_TIMEOUT_SECONDS` | `900` | Generation calls; read by `../rust-core/src/napi.rs` |
 | `FREELLAMA_AUTH_TOKEN_FILE` | unset | Bearer-token file used by the native client and research adapters for all serve routes |
 | `FREELLAMA_AGENT_TOKEN_CALIBRATION_DIR` | platform data directory | Prompt-free, model-specific token-estimator calibration shared across adapter processes |
+| `FREELLAMA_MCP_AUTOSTART_SERVE` | `1` | When the default loopback serve endpoint does not answer, start `freellama serve` as a child of the MCP server (stopped with it). `0` disables |
+| `FREELLAMA_SERVE_BINARY` | checkout `target/release`/`debug`, then the platform package | Binary used for serve autostart |
+| `FREELLAMA_AGENT_OS_SANDBOX` | `auto` | Bash adapter OS confinement: `bwrap` on Linux, `sandbox-exec` on macOS, when present. `off` keeps only the restricted shell |
+| `FREELLAMA_AGENT_OCTOCODE_PACKAGE` | `octocode@19.1.0` | Pinned npm spec the Octocode adapter runs through `npx` |
+
+Serve-side placement settings (read by `freellama serve`, not the MCP process):
+
+| Variable | Default | Affects |
+|---|---|---|
+| `FREELLAMA_EVICT_IDLE_MODELS` | on | Unload idle, unpinned resident models (least recently used first) when a cold load would not fit. `0` disables |
+| `FREELLAMA_CPU_NUM_THREAD` | half the logical cores (not set on macOS) | `num_thread` for CPU-placed tasks only; GPU tasks leave it to Ollama |
+| `FREELLAMA_MAX_QUEUE_WAIT_SECONDS` | `120` | How long a managed task queues for a slot or memory |
+| `OLLAMA_NUM_PARALLEL`, `OLLAMA_KV_CACHE_TYPE`, `OLLAMA_FLASH_ATTENTION` | Ollama's | Read as hints for the memory estimate: parallel slots multiply the KV cache, and `q8_0`/`q4_0` shrink it only with flash attention. Set them for serve the same way as for Ollama |
 
 Research-adapter settings are deployment defaults. The optional `delegate_research.agent` object
 overrides the per-call budget (`maxTurns`, `contextTokens`, `outputTokens`, `temperature`, `seed`,
@@ -414,8 +427,9 @@ between model templates.
 **Security:** `delegate_research` grants a local model read access to `workspacePath`. The path is
 confined to `FREELLAMA_MCP_ALLOWED_ROOTS` (default: this repository in a checkout; unset in a published
 install until you set it), resolved through symlinks so a link inside an allowed root can't escape
-it. The default `bash` adapter also rejects home-directory paths, `..`, and absolute paths outside
-that workspace. Production deployments should generate a permission-restricted token with
+it. The default `bash` adapter runs an allowlist of read-only tools in a restricted shell with a
+scrubbed environment and, where available, an OS sandbox; it also rejects command substitution,
+home-directory paths, `..`, and absolute paths outside that workspace. Production deployments should generate a permission-restricted token with
 `freellama auth-token`, start `serve` with `--auth-token-file`, and set
 `FREELLAMA_AUTH_TOKEN_FILE` for MCP. Authentication covers managed and raw passthrough routes; use
 an external TLS and authorization layer for untrusted or multi-tenant networks.
