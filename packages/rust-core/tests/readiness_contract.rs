@@ -6,7 +6,7 @@ use axum::{
 };
 use freellama::platform::{
     PlatformConfig, app,
-    resources::{HostResources, ResourceGovernor, ResourcePolicy},
+    resources::{HostResources, ResourceGovernor, ResourcePolicy, TelemetryPolicy},
 };
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -27,6 +27,8 @@ async fn fixture(
             resume_available_min_bytes: 200,
             hold_available_percent: 10,
             resume_available_percent: 20,
+            // Windows defaults to best-effort; these contracts are about required memory.
+            telemetry_policy: TelemetryPolicy::RequireMemory,
             ..ResourcePolicy::default()
         },
         move || HostResources {

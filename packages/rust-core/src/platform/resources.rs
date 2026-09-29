@@ -1264,9 +1264,12 @@ mod tests {
             ..HostResources::default()
         }
     }
+    /// Pins the Linux/macOS default so these contracts hold on Windows too, whose default is
+    /// best-effort.
     fn quick_policy() -> ResourcePolicy {
         ResourcePolicy {
             sample_interval: Duration::from_millis(5),
+            telemetry_policy: TelemetryPolicy::RequireMemory,
             ..ResourcePolicy::default()
         }
     }

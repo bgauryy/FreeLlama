@@ -151,12 +151,19 @@ mod telemetry_cli_tests {
                 expected
             );
         }
+        // Memory telemetry is required where a collector exists; Windows has none, so its
+        // default is best-effort rather than refusing every local request.
+        let default_policy = if cfg!(any(target_os = "linux", target_os = "macos")) {
+            "require_memory"
+        } else {
+            "best_effort"
+        };
         assert_eq!(
             serde_json::to_value(
                 freellama::platform::resources::ResourcePolicy::default().telemetry_policy
             )
             .unwrap(),
-            "require_memory"
+            default_policy
         );
     }
 }
