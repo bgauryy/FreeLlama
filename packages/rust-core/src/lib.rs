@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-const OLLAMA_CONFIG_SETTING_NAMES: [&str; 21] = [
+pub(crate) const OLLAMA_CONFIG_SETTING_NAMES: [&str; 21] = [
     "OLLAMA_DEBUG",
     "OLLAMA_HOST",
     "OLLAMA_CONTEXT_LENGTH",

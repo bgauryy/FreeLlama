@@ -41,9 +41,13 @@ mod error;
 mod execution;
 mod footprint;
 mod intent;
+mod monitor;
+mod ollama_env;
 mod readiness;
 pub mod resources;
 mod routing;
+mod runtime;
+mod telemetry;
 
 pub use discovery::{
     MachineProfile, host_has_unified_memory, host_total_memory_bytes, machine_profile,
@@ -53,6 +57,8 @@ pub use routing::{
     CatalogModel, ExecutionPreference, Objective, PlacementEvidence, RouteDecision, RouteEvidence,
     RouteInput, SessionAffinity, TaskKind, TaskPriority, select_route,
 };
+pub use runtime::{AdaptiveMode, ContextMode, RuntimeFile};
+pub use telemetry::Telemetry;
 
 use admission::{AdmissionPool, MAX_CAPACITY_BYPASSES, PRIORITY_WEIGHTS, priority_index};
 use error::{ApiError, resource_error};
@@ -110,12 +116,21 @@ pub struct PlatformConfig {
     /// Generic cap for byte-preserving raw proxy traffic. `None` resolves to one streaming request
     /// in `serve`; the standalone `proxy` command remains opt-in for compatibility.
     pub raw_proxy_max_concurrent_requests: Option<usize>,
+    /// How long a raw generation may wait for a slot or for managed execution before 429/503.
+    /// `None` falls back to `FREELLAMA_RAW_QUEUE_WAIT_SECONDS`, the runtime file, then 10s.
+    pub raw_queue_wait: Option<Duration>,
     /// Optional versioned, atomically replaced adaptive-feedback snapshot.
     pub feedback_file: Option<PathBuf>,
     /// Optional bearer token protecting both control and Ollama-compatible routes.
     pub auth_token: Option<String>,
     /// Explicit opt-in for a non-loopback listener. Requires `auth_token`.
     pub allow_remote: bool,
+    /// Optional runtime config file (TOML), re-read when it changes. `None` falls back to
+    /// `FREELLAMA_RUNTIME_CONFIG`.
+    pub runtime_config: Option<PathBuf>,
+    /// Optional JSON-lines usage ledger. `None` falls back to `FREELLAMA_USAGE_FILE`; without
+    /// either, usage totals are kept in memory only.
+    pub usage_file: Option<PathBuf>,
 }
 
 impl PlatformConfig {
@@ -145,10 +160,27 @@ impl PlatformConfig {
             max_sessions: None,
             session_ttl: None,
             raw_proxy_max_concurrent_requests: None,
+            raw_queue_wait: None,
             feedback_file: None,
             auth_token: None,
             allow_remote: false,
+            runtime_config: None,
+            usage_file: None,
         }
+    }
+
+    /// Read live-tunable settings from `path`; edits are applied without a restart.
+    #[must_use]
+    pub fn with_runtime_config(mut self, path: impl Into<PathBuf>) -> Self {
+        self.runtime_config = Some(path.into());
+        self
+    }
+
+    /// Append one JSON line per finished managed task to `path` and replay it at startup.
+    #[must_use]
+    pub fn with_usage_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.usage_file = Some(path.into());
+        self
     }
 
     /// Cap how long a task may queue for admission before being refused.
@@ -192,6 +224,13 @@ impl PlatformConfig {
     #[must_use]
     pub fn with_raw_proxy_max_concurrent_requests(mut self, max: usize) -> Self {
         self.raw_proxy_max_concurrent_requests = Some(max.max(1));
+        self
+    }
+
+    /// Bound how long raw passthrough generations wait before being refused (0 = refuse at once).
+    #[must_use]
+    pub fn with_raw_queue_wait(mut self, wait: Duration) -> Self {
+        self.raw_queue_wait = Some(wait);
         self
     }
 
@@ -409,12 +448,52 @@ struct PlatformState {
     feedback_persistence_error: Arc<RwLock<Option<String>>>,
     auth_required: bool,
     remote_access: bool,
-    queue_wait: Duration,
     max_sessions: usize,
     session_ttl: Duration,
-    raw_proxy_max_concurrent_requests: usize,
-    /// Unload idle resident runners when a cold load is short of memory.
-    evict_idle_models: bool,
+    /// Live-tunable limits, waits, eviction, context and breaker settings.
+    runtime: runtime::RuntimeSettings,
+    telemetry: Telemetry,
+    breakers: runtime::Breakers,
+    adaptive_gpu: runtime::AdaptiveLimiter,
+    adaptive_cpu: runtime::AdaptiveLimiter,
+    /// The primary Ollama server's effective configuration, probed at startup.
+    ollama: Arc<ollama_env::OllamaSettings>,
+    raw_admission: proxy::RawAdmission,
+}
+
+impl PlatformState {
+    fn tunables(&self) -> runtime::Tunables {
+        self.runtime.get()
+    }
+
+    fn average_task_ms(&self, placement: &str) -> Option<u64> {
+        self.telemetry.average_task_ms(placement)
+    }
+
+    fn adaptive_for(&self, placement: &str) -> &runtime::AdaptiveLimiter {
+        if placement == "cpu" {
+            &self.adaptive_cpu
+        } else {
+            &self.adaptive_gpu
+        }
+    }
+
+    /// Push the current tunables into the admission pools and raw admission.
+    fn apply_tunables(&self) {
+        let tunables = self.tunables();
+        self.gpu_admission
+            .set_ceiling(tunables.max_concurrent_tasks);
+        self.gpu_admission
+            .set_max_waiters(tunables.max_queued_tasks);
+        self.cpu_admission
+            .set_ceiling(tunables.cpu_max_concurrent_tasks);
+        self.cpu_admission
+            .set_max_waiters(tunables.cpu_max_queued_tasks);
+        self.raw_admission.set(
+            tunables.raw_max_concurrent_requests,
+            tunables.raw_queue_wait(),
+        );
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -660,14 +739,45 @@ const fn task_key(task: TaskKind) -> &'static str {
 ///
 /// Returns an error for unsafe configuration, unreadable benchmark evidence, or HTTP setup.
 pub fn app(config: &PlatformConfig) -> Result<Router> {
+    build(config).map(|(router, _)| router)
+}
+
+#[allow(clippy::too_many_lines)] // One linear assembly of state, proxy and routes.
+fn build(config: &PlatformConfig) -> Result<(Router, PlatformState)> {
     config.validate()?;
     let benchmark = load_benchmark(config.benchmark_report.as_ref())?;
     let policies = load_policies(config.policy_file.as_ref())?;
     let recommendation_catalog = load_catalog(config.recommendation_catalog.as_ref())?;
-    let gpu_slots_total = config.resolved_max_concurrent_tasks();
-    let cpu_slots_total = config.resolved_cpu_max_concurrent_tasks();
-    let gpu_queue_limit = config.resolved_max_queued_tasks();
-    let cpu_queue_limit = config.resolved_cpu_max_queued_tasks();
+    let ollama = ollama_env::probe(&config.upstream);
+    let runtime_file = config.runtime_config.clone().or_else(|| {
+        std::env::var_os("FREELLAMA_RUNTIME_CONFIG")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    });
+    let runtime = runtime::RuntimeSettings::new(
+        runtime::PinnedTunables {
+            max_concurrent_tasks: config.max_concurrent_tasks,
+            cpu_max_concurrent_tasks: config.cpu_max_concurrent_tasks,
+            max_queued_tasks: config.max_queued_tasks,
+            cpu_max_queued_tasks: config.cpu_max_queued_tasks,
+            max_queue_wait: config.max_queue_wait,
+            raw_max_concurrent_requests: config.raw_proxy_max_concurrent_requests,
+            raw_queue_wait: config.raw_queue_wait,
+        },
+        runtime_file,
+        ollama.num_parallel(),
+    )?;
+    let tunables = runtime.get();
+    let usage_file = config.usage_file.clone().or_else(|| {
+        std::env::var_os("FREELLAMA_USAGE_FILE")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    });
+    let telemetry = Telemetry::new(usage_file);
+    let raw_admission = proxy::RawAdmission::new(
+        tunables.raw_max_concurrent_requests,
+        tunables.raw_queue_wait(),
+    );
     let feedback = config
         .feedback_file
         .as_deref()
@@ -677,7 +787,7 @@ pub fn app(config: &PlatformConfig) -> Result<Router> {
     let state = PlatformState {
         resources: config.resource_governor.clone(),
         footprints: Arc::new(Mutex::new(footprint::FootprintHistory::with_hints(
-            footprint::RuntimeHints::from_lookup(|name| std::env::var(name).ok()),
+            footprint::RuntimeHints::from_lookup(|name| ollama.lookup(name)),
         ))),
         // A client-level backstop, not a nicety. `forward_managed_task` holds the
         // `managed_execution` write lock across its upstream call, so an untimed request against
@@ -701,23 +811,29 @@ pub fn app(config: &PlatformConfig) -> Result<Router> {
         intent_model: config.intent_model.clone(),
         managed_execution: Arc::new(RwLock::new(())),
         cpu_managed_execution: Arc::new(RwLock::new(())),
-        gpu_admission: AdmissionPool::new(gpu_slots_total, gpu_queue_limit),
-        cpu_admission: AdmissionPool::new(cpu_slots_total, cpu_queue_limit),
+        gpu_admission: AdmissionPool::new(tunables.max_concurrent_tasks, tunables.max_queued_tasks),
+        cpu_admission: AdmissionPool::new(
+            tunables.cpu_max_concurrent_tasks,
+            tunables.cpu_max_queued_tasks,
+        ),
         feedback: Arc::new(RwLock::new(feedback)),
         feedback_file: config.feedback_file.clone().map(Arc::new),
         feedback_persistence_error: Arc::new(RwLock::new(None)),
         auth_required: config.auth_token.is_some(),
         remote_access: config.allow_remote,
-        queue_wait: config.max_queue_wait.unwrap_or_else(max_queue_wait),
         max_sessions: config.max_sessions.unwrap_or(1024),
         session_ttl: config.session_ttl.unwrap_or(Duration::from_secs(3600)),
-        raw_proxy_max_concurrent_requests: config.resolved_raw_proxy_max_concurrent_requests(),
-        evict_idle_models: std::env::var("FREELLAMA_EVICT_IDLE_MODELS").map_or(true, |value| {
-            !matches!(value.trim(), "0" | "false" | "no" | "off")
-        }),
+        runtime,
+        telemetry: telemetry.clone(),
+        breakers: runtime::Breakers::default(),
+        adaptive_gpu: runtime::AdaptiveLimiter::default(),
+        adaptive_cpu: runtime::AdaptiveLimiter::default(),
+        ollama: Arc::new(ollama),
+        raw_admission: raw_admission.clone(),
     };
     let fallback_config = ProxyConfig::new(&config.listen, &config.upstream, config.allow_remote)
-        .with_max_concurrent_requests(config.resolved_raw_proxy_max_concurrent_requests())
+        .with_raw_admission(raw_admission)
+        .with_telemetry(telemetry)
         .with_execution_lock(Arc::clone(&state.managed_execution))
         .with_resource_governor(state.resources.clone());
     let platform = Router::new()
@@ -741,10 +857,18 @@ pub fn app(config: &PlatformConfig) -> Result<Router> {
         )
         .route(&format!("{API_ROOT}/tasks"), post(run_task))
         .route(&format!("{API_ROOT}/task-batches"), post(run_task_batch))
-        .with_state(state);
+        .route(&format!("{API_ROOT}/metrics"), get(monitor::metrics))
+        .route(&format!("{API_ROOT}/status"), get(monitor::status))
+        .route(&format!("{API_ROOT}/usage"), get(monitor::usage))
+        .route(&format!("{API_ROOT}/config"), get(monitor::config))
+        .route(
+            &format!("{API_ROOT}/config/reload"),
+            post(monitor::reload_config),
+        )
+        .with_state(state.clone());
     let fallback = proxy::app(fallback_config)?;
     let app = platform.merge(fallback);
-    Ok(if let Some(token) = config.auth_token.as_deref() {
+    let router = if let Some(token) = config.auth_token.as_deref() {
         app.layer(middleware::from_fn_with_state(
             AuthState {
                 token: Arc::from(token),
@@ -753,7 +877,8 @@ pub fn app(config: &PlatformConfig) -> Result<Router> {
         ))
     } else {
         app
-    })
+    };
+    Ok((router, state))
 }
 
 /// Serve the localhost model platform until Ctrl-C.
@@ -765,7 +890,26 @@ pub async fn serve(config: PlatformConfig) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&config.listen)
         .await
         .with_context(|| format!("bind platform at {}", config.listen))?;
-    let app = app(&config)?;
+    let (app, state) = build(&config)?;
+    if state.runtime.file().is_some() {
+        // Poll the runtime config's modification time; a changed file is re-resolved and pushed
+        // into admission without a restart. A bad edit keeps the last good values.
+        let watched = state.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(2));
+            loop {
+                ticker.tick().await;
+                match watched.runtime.reload(false) {
+                    Ok(Some(_)) => {
+                        watched.apply_tunables();
+                        eprintln!("runtime config reloaded");
+                    }
+                    Ok(None) => {}
+                    Err(error) => eprintln!("runtime config not applied: {error}"),
+                }
+            }
+        });
+    }
     println!("FreeLlama platform listening on http://{}", config.listen);
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
@@ -847,8 +991,9 @@ async fn health(State(state): State<PlatformState>) -> Json<Value> {
             "slots_total": state.gpu_admission.total() + state.cpu_upstream.as_ref().map_or(0, |_| state.cpu_admission.total()),
             "slots_available": state.gpu_admission.available()
                 + state.cpu_upstream.as_ref().map_or(0, |_| state.cpu_admission.available()),
-            "max_queue_wait_seconds": state.queue_wait.as_secs(),
-            "raw_proxy_max_concurrent_requests": state.raw_proxy_max_concurrent_requests,
+            "max_queue_wait_seconds": state.tunables().max_queue_wait().as_secs(),
+            "raw_proxy_max_concurrent_requests": state.tunables().raw_max_concurrent_requests,
+            "raw_proxy": state.raw_admission.receipt(),
             "costs": {"embedding": "ceil(input_items/4)", "chat": 2, "vision": 4},
             "priority_fairness": {"policy": "weighted_fair_round_robin", "weights": {"interactive": 3, "normal": 2, "background": 1}, "starvation_prevention": "oldest_capacity_reservation", "max_capacity_bypasses": MAX_CAPACITY_BYPASSES},
             "queue_deadline_scope": "admission_resources_and_transition",
@@ -1128,7 +1273,7 @@ async fn interpret_natural_route(
         // the transition lock so it cannot bypass the same capacity/model-load boundary enforced
         // for managed tasks. Use the write side conservatively because residency has not yet been
         // discovered and a cold interpreter call may replace the active runner.
-        let queue_deadline = tokio::time::Instant::now() + state.queue_wait;
+        let queue_deadline = tokio::time::Instant::now() + state.tunables().max_queue_wait();
         let (intent_slot, _, _) = admit(
             &state,
             &intent_target,
@@ -1294,6 +1439,9 @@ struct TaskInput {
     /// what is sent upstream.
     #[serde(default)]
     request_options: OllamaRequestOptions,
+    /// Per-request admission wait in seconds, capped by the server's `max_queue_wait_seconds`.
+    #[serde(default)]
+    max_wait_seconds: Option<u64>,
 }
 
 /// Explicitly independent managed work. Dependencies are intentionally not accepted: a batch is
@@ -1518,6 +1666,7 @@ async fn fetch_catalog_from(
             .collect();
         let advertised_context = advertised_context_from_show(&show);
         let kv_cache_bytes_per_token_f16 = estimate_kv_cache_bytes_per_token_f16(&show);
+        let modelfile_num_ctx = ollama_env::modelfile_num_ctx(&show);
         let running = resident.iter().find(|running| {
             running
                 .get("name")
@@ -1535,6 +1684,7 @@ async fn fetch_catalog_from(
             capabilities,
             advertised_context,
             kv_cache_bytes_per_token_f16,
+            modelfile_num_ctx,
             resident: running.is_some(),
             resident_vram: running
                 .and_then(|value| value.get("size_vram"))
@@ -1734,25 +1884,6 @@ async fn refresh_residency(
     Ok(())
 }
 
-/// Upper bound on a managed generation forwarded to Ollama. Overridable via
-/// `FREELLAMA_TASK_TIMEOUT_SECONDS` — the same name the CLI and the NAPI layer read, so one
-/// setting covers every path that can make a model generate.
-/// Longest a task may wait for an admission slot before being refused.
-///
-/// Ollama does not block when saturated: `getRunner` does a non-blocking send onto its pending
-/// channel and returns `ErrMaxQueue` ("server busy, please try again") the instant it is full.
-/// An unbounded wait here would convert that honest, actionable signal into an invisible pile-up,
-/// where the only symptom is latency the caller cannot attribute. Match the upstream contract.
-fn max_queue_wait() -> Duration {
-    Duration::from_secs(
-        std::env::var("FREELLAMA_MAX_QUEUE_WAIT_SECONDS")
-            .ok()
-            .and_then(|raw| raw.parse::<u64>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(120),
-    )
-}
-
 /// Primary-backend admission budget in weighted units. Default 2 — one ordinary chat generation
 /// or two embeddings at `FreeLlama`'s admission layer. CPU has an independent one-unit default.
 ///
@@ -1792,6 +1923,9 @@ fn cpu_max_queued_tasks() -> usize {
         .unwrap_or(8)
 }
 
+/// Upper bound on a managed generation forwarded to Ollama. Overridable via
+/// `FREELLAMA_TASK_TIMEOUT_SECONDS` — the same name the CLI and the NAPI layer read, so one
+/// setting covers every path that can make a model generate.
 fn platform_task_timeout() -> Duration {
     crate::timeout_from_env(
         "FREELLAMA_TASK_TIMEOUT_SECONDS",
@@ -1889,6 +2023,7 @@ mod kv_estimate_tests {
             capabilities: BTreeSet::new(),
             advertised_context: None,
             kv_cache_bytes_per_token_f16: Some(10),
+            modelfile_num_ctx: None,
             resident: false,
             resident_vram: None,
             benchmark: BTreeMap::new(),

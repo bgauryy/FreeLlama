@@ -11,13 +11,19 @@ use tokio::sync::Notify;
 pub(super) struct AdmissionPool {
     state: Arc<StdMutex<AdmissionState>>,
     changed: Arc<Notify>,
-    total: usize,
-    max_waiters: usize,
 }
 
 #[derive(Debug)]
 struct AdmissionState {
-    available: usize,
+    /// Units currently charged to admitted tasks.
+    active: usize,
+    /// Current capacity in units. It moves between 1 and `ceiling` when the adaptive controller
+    /// or a configuration reload changes it; lowering it never revokes an admitted task, it only
+    /// stops new admissions until enough units are released.
+    limit: usize,
+    /// Configured maximum for `limit`.
+    ceiling: usize,
+    max_waiters: usize,
     next_ticket: u64,
     waiting: Vec<AdmissionWaiter>,
     /// Weighted round-robin credits, ordered interactive, normal, background.
@@ -32,6 +38,18 @@ struct AdmissionState {
     queue_timeouts: u64,
     queue_cancellations: u64,
     transition_timeouts: u64,
+}
+
+impl AdmissionState {
+    fn free(&self) -> usize {
+        self.limit.saturating_sub(self.active)
+    }
+
+    /// A task never costs more than the whole current limit, so lowering the limit cannot leave
+    /// an already-queued expensive task unable to fit forever.
+    fn charge(&self, cost: usize) -> usize {
+        cost.min(self.limit).max(1)
+    }
 }
 
 #[derive(Debug)]
@@ -53,10 +71,7 @@ pub(super) struct AdmissionPermit {
 impl Drop for AdmissionPermit {
     fn drop(&mut self) {
         let mut state = self.pool.state.lock().expect("admission state poisoned");
-        state.available = state
-            .available
-            .saturating_add(self.cost)
-            .min(self.pool.total);
+        state.active = state.active.saturating_sub(self.cost);
         state.in_flight = state.in_flight.saturating_sub(1);
         state.released = state.released.saturating_add(1);
         drop(state);
@@ -105,8 +120,53 @@ pub(super) const fn priority_index(priority: TaskPriority) -> usize {
 }
 
 impl AdmissionPool {
+    /// Current capacity in units (the adaptive limit, at most the configured ceiling).
     pub(super) fn total(&self) -> usize {
-        self.total
+        self.state.lock().expect("admission state poisoned").limit
+    }
+
+    /// Configured maximum capacity.
+    pub(super) fn ceiling(&self) -> usize {
+        self.state.lock().expect("admission state poisoned").ceiling
+    }
+
+    /// Change the configured maximum. The current limit follows it down, and follows it up only
+    /// when it was already at the old ceiling (an adaptive reduction stays in force).
+    pub(super) fn set_ceiling(&self, ceiling: usize) {
+        let ceiling = ceiling.max(1);
+        let mut state = self.state.lock().expect("admission state poisoned");
+        if state.limit >= state.ceiling || state.limit > ceiling {
+            state.limit = ceiling;
+        }
+        state.ceiling = ceiling;
+        drop(state);
+        self.changed.notify_waiters();
+    }
+
+    /// Set the current limit within `1..=ceiling`; returns the value applied.
+    pub(super) fn set_limit(&self, limit: usize) -> usize {
+        let mut state = self.state.lock().expect("admission state poisoned");
+        state.limit = limit.clamp(1, state.ceiling);
+        let applied = state.limit;
+        drop(state);
+        self.changed.notify_waiters();
+        applied
+    }
+
+    pub(super) fn set_max_waiters(&self, max_waiters: usize) {
+        self.state
+            .lock()
+            .expect("admission state poisoned")
+            .max_waiters = max_waiters.max(1);
+    }
+
+    /// Waiting requests and the oldest wait, for `Retry-After` estimates and gauges.
+    pub(super) fn queue_depth(&self) -> usize {
+        self.state
+            .lock()
+            .expect("admission state poisoned")
+            .waiting
+            .len()
     }
 
     pub(super) fn record_transition_timeout(&self) {
@@ -117,7 +177,10 @@ impl AdmissionPool {
     pub(super) fn new(total: usize, max_waiters: usize) -> Self {
         Self {
             state: Arc::new(StdMutex::new(AdmissionState {
-                available: total,
+                active: 0,
+                limit: total.max(1),
+                ceiling: total.max(1),
+                max_waiters: max_waiters.max(1),
                 next_ticket: 0,
                 waiting: Vec::new(),
                 credits: PRIORITY_WEIGHTS,
@@ -131,27 +194,23 @@ impl AdmissionPool {
                 transition_timeouts: 0,
             })),
             changed: Arc::new(Notify::new()),
-            total,
-            max_waiters,
         }
     }
 
     pub(super) fn available(&self) -> usize {
-        self.state
-            .lock()
-            .expect("admission state poisoned")
-            .available
+        self.state.lock().expect("admission state poisoned").free()
     }
 
     pub(super) fn receipt(&self) -> Value {
         let state = self.state.lock().expect("admission state poisoned");
         json!({
-            "slots_total": self.total,
-            "slots_available": state.available,
-            "active_units": self.total.saturating_sub(state.available),
+            "slots_total": state.limit,
+            "slots_ceiling": state.ceiling,
+            "slots_available": state.free(),
+            "active_units": state.active,
             "in_flight": state.in_flight,
             "queue_depth": state.waiting.len(),
-            "queue_limit": self.max_waiters,
+            "queue_limit": state.max_waiters,
             "oldest_wait_ms": state.waiting.iter()
                 .map(|waiter| waiter.enqueued_at.elapsed().as_millis())
                 .max(),
@@ -177,7 +236,7 @@ impl AdmissionPool {
             .iter()
             .position(|waiter| waiter.bypasses >= MAX_CAPACITY_BYPASSES)
         {
-            if state.waiting[index].cost > state.available {
+            if state.charge(state.waiting[index].cost) > state.free() {
                 return None;
             }
             let class = priority_index(state.waiting[index].priority);
@@ -191,7 +250,8 @@ impl AdmissionPool {
                     continue;
                 }
                 if let Some((index, _)) = state.waiting.iter().enumerate().find(|(_, waiter)| {
-                    priority_index(waiter.priority) == class && waiter.cost <= state.available
+                    priority_index(waiter.priority) == class
+                        && state.charge(waiter.cost) <= state.free()
                 }) {
                     state.credits[class] -= 1;
                     Self::record_capacity_bypasses(state);
@@ -206,8 +266,10 @@ impl AdmissionPool {
     }
 
     fn record_capacity_bypasses(state: &mut AdmissionState) {
+        let free = state.free();
+        let limit = state.limit;
         for waiter in &mut state.waiting {
-            if waiter.cost > state.available {
+            if waiter.cost.min(limit) > free {
                 waiter.bypasses = waiter.bypasses.saturating_add(1);
             }
         }
@@ -222,7 +284,7 @@ impl AdmissionPool {
         let queued = Instant::now();
         let ticket = {
             let mut state = self.state.lock().expect("admission state poisoned");
-            if state.waiting.len() >= self.max_waiters {
+            if state.waiting.len() >= state.max_waiters {
                 state.queue_full_rejections = state.queue_full_rejections.saturating_add(1);
                 return Err(AdmissionFailure::QueueFull);
             }
@@ -245,7 +307,7 @@ impl AdmissionPool {
         self.changed.notify_waiters();
         loop {
             let changed = self.changed.notified();
-            let (acquired, selected) = {
+            let (acquired, selected, units) = {
                 let mut state = self.state.lock().expect("admission state poisoned");
                 let mut selected = false;
                 if state.granted.is_none() {
@@ -261,13 +323,14 @@ impl AdmissionPool {
                         .position(|waiter| waiter.ticket == ticket)
                         .expect("granted admission waiter must remain queued");
                     let waiter = state.waiting.remove(index);
-                    state.available -= waiter.cost;
+                    let units = state.charge(waiter.cost);
+                    state.active = state.active.saturating_add(units);
                     state.in_flight = state.in_flight.saturating_add(1);
                     state.admitted = state.admitted.saturating_add(1);
                     state.granted = None;
-                    (true, selected)
+                    (true, selected, units)
                 } else {
-                    (false, selected)
+                    (false, selected, 0)
                 }
             };
             if acquired {
@@ -275,7 +338,7 @@ impl AdmissionPool {
                 return Ok((
                     AdmissionPermit {
                         pool: self.clone(),
-                        cost,
+                        cost: units,
                     },
                     queued.elapsed().as_millis(),
                 ));

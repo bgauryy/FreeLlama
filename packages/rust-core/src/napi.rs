@@ -204,6 +204,32 @@ pub async fn health(endpoint: Option<String>) -> Result<String> {
     pretty(&value)
 }
 
+/// Live platform view: per-backend admission, queues, adaptive limits and circuit breakers,
+/// loaded models, host memory, Ollama's effective settings, and today's usage.
+///
+/// # Errors
+///
+/// Returns an error if `freellama serve` is unreachable.
+#[napi]
+pub async fn status(endpoint: Option<String>) -> Result<String> {
+    let endpoint = endpoint_or_default(endpoint);
+    let value = get_json(&endpoint, "/_freellama/v1/status", control_timeout()).await?;
+    pretty(&value)
+}
+
+/// Usage totals for the last `days` days (default 7), per day and per model.
+///
+/// # Errors
+///
+/// Returns an error if `freellama serve` is unreachable.
+#[napi]
+pub async fn usage(endpoint: Option<String>, days: Option<u32>) -> Result<String> {
+    let endpoint = endpoint_or_default(endpoint);
+    let path = format!("/_freellama/v1/usage?days={}", days.unwrap_or(7));
+    let value = get_json(&endpoint, &path, control_timeout()).await?;
+    pretty(&value)
+}
+
 /// Create a bounded, expiring model-affinity handle. It stores no prompt history or Ollama KV.
 ///
 /// # Errors

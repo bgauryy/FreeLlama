@@ -34,6 +34,7 @@ fn candidate(name: &str, size: u64, capabilities: &[Capability], resident: bool)
         capabilities: capabilities.iter().copied().collect(),
         advertised_context: Some(32_768),
         kv_cache_bytes_per_token_f16: None,
+        modelfile_num_ctx: None,
         resident,
         resident_vram: resident.then_some(size),
         benchmark: BTreeMap::new(),
@@ -3046,8 +3047,15 @@ async fn a_full_managed_wait_queue_sheds_excess_work_immediately() {
     let started = std::time::Instant::now();
     let refused = platform.oneshot(embedding_task_request()).await.unwrap();
 
-    assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+    // A full queue is FreeLlama's own cap, so it is 429 with a Retry-After hint, not 503.
+    assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
     assert!(started.elapsed() < Duration::from_millis(150));
+    let retry_after: u64 = refused.headers()["retry-after"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((1..=120).contains(&retry_after));
     let body: Value =
         serde_json::from_slice(&to_bytes(refused.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert!(
@@ -3056,6 +3064,8 @@ async fn a_full_managed_wait_queue_sheds_excess_work_immediately() {
             .unwrap_or_default()
             .contains("queue full")
     );
+    assert_eq!(body["code"], "admission_queue_full");
+    assert_eq!(body["retry_after_seconds"], retry_after);
     assert_eq!(holder.await.unwrap(), StatusCode::OK);
     assert_eq!(queued.await.unwrap(), StatusCode::OK);
     mock_task.abort();

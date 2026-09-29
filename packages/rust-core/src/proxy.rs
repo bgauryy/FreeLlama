@@ -9,6 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::platform::Telemetry;
 use crate::platform::resources::{ResourceGovernor, ResourcePermit};
 use anyhow::{Context, Result, ensure};
 use axum::{
@@ -22,7 +23,7 @@ use axum::{
 use http_body::{Body as HttpBody, Frame, SizeHint};
 use reqwest::{Client, Url};
 use tokio::sync::Mutex as AsyncMutex;
-use tokio::sync::{OwnedRwLockWriteGuard, OwnedSemaphorePermit, RwLock, Semaphore};
+use tokio::sync::{Notify, OwnedRwLockWriteGuard, RwLock};
 
 /// Total attempts (first try + retries) for a request that hits a transient upstream failure.
 /// Matches the general-purpose default cited across retry-policy guidance for slow (LLM-scale,
@@ -135,8 +136,13 @@ pub struct ProxyConfig {
     /// Optional byte-preserving proxy inflight cap. Unlike managed admission this cannot infer
     /// task cost or CPU/GPU placement, so it is intentionally an immediate generic refusal.
     pub max_concurrent_requests: Option<usize>,
+    /// How long a raw generation may wait for a free slot and for managed execution to finish
+    /// before being refused. Zero (the standalone default) refuses immediately.
+    pub raw_queue_wait: Duration,
     execution_lock: Option<Arc<RwLock<()>>>,
     restart_action: RestartAction,
+    raw_admission: Option<RawAdmission>,
+    telemetry: Option<Telemetry>,
 }
 
 impl ProxyConfig {
@@ -150,8 +156,11 @@ impl ProxyConfig {
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             auto_restart_ollama: false,
             max_concurrent_requests: None,
+            raw_queue_wait: Duration::ZERO,
             execution_lock: None,
             restart_action: Arc::new(default_restart_ollama),
+            raw_admission: None,
+            telemetry: None,
         }
     }
 
@@ -176,6 +185,28 @@ impl ProxyConfig {
     #[must_use]
     pub fn with_max_concurrent_requests(mut self, max: usize) -> Self {
         self.max_concurrent_requests = Some(max.max(1));
+        self
+    }
+
+    /// Wait up to `wait` for a raw slot (and for managed execution) before refusing.
+    #[must_use]
+    pub fn with_raw_queue_wait(mut self, wait: Duration) -> Self {
+        self.raw_queue_wait = wait;
+        self
+    }
+
+    /// Use a shared, live-adjustable raw admission instead of a fixed cap. The platform passes
+    /// one so a runtime-config reload can change the limit and wait without a restart.
+    #[must_use]
+    pub fn with_raw_admission(mut self, admission: RawAdmission) -> Self {
+        self.raw_admission = Some(admission);
+        self
+    }
+
+    /// Count raw requests and refusals in the platform's metrics.
+    #[must_use]
+    pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
+        self.telemetry = Some(telemetry);
         self
     }
 
@@ -251,8 +282,171 @@ struct ProxyState {
     auto_restart_ollama: bool,
     restart_action: RestartAction,
     last_restart_attempt: Arc<AsyncMutex<Option<Instant>>>,
-    admission: Option<Arc<Semaphore>>,
+    admission: Option<RawAdmission>,
+    raw_queue_wait: Duration,
     execution_lock: Option<Arc<RwLock<()>>>,
+    telemetry: Option<Telemetry>,
+}
+
+/// Raw passthrough admission: a concurrency limit with a bounded wait, adjustable at runtime.
+///
+/// Raw callers cannot declare a task cost, so this is a plain count, not weighted admission.
+/// Waiters are woken together and race for a freed slot: bounded, not strictly FIFO.
+#[derive(Clone)]
+pub struct RawAdmission {
+    inner: Arc<RawAdmissionInner>,
+}
+
+struct RawAdmissionInner {
+    state: std::sync::Mutex<RawAdmissionState>,
+    changed: Notify,
+}
+
+#[derive(Debug)]
+struct RawAdmissionState {
+    active: usize,
+    limit: usize,
+    wait: Duration,
+    waiting: usize,
+    admitted: u64,
+    rejected: u64,
+    /// Exponentially weighted service time of finished raw requests, for `Retry-After`.
+    average_ms: Option<u64>,
+}
+
+/// Why a raw request was refused, with a `Retry-After` estimate in seconds.
+pub struct RawRejection {
+    pub reason: &'static str,
+    pub retry_after_seconds: u64,
+}
+
+impl RawAdmission {
+    #[must_use]
+    pub fn new(limit: usize, wait: Duration) -> Self {
+        Self {
+            inner: Arc::new(RawAdmissionInner {
+                state: std::sync::Mutex::new(RawAdmissionState {
+                    active: 0,
+                    limit: limit.max(1),
+                    wait,
+                    waiting: 0,
+                    admitted: 0,
+                    rejected: 0,
+                    average_ms: None,
+                }),
+                changed: Notify::new(),
+            }),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, RawAdmissionState> {
+        self.inner.state.lock().expect("raw admission poisoned")
+    }
+
+    /// Change the limit and wait; takes effect for the next request.
+    pub fn set(&self, limit: usize, wait: Duration) {
+        let mut state = self.lock();
+        state.limit = limit.max(1);
+        state.wait = wait;
+        drop(state);
+        self.inner.changed.notify_waiters();
+    }
+
+    #[must_use]
+    pub fn wait(&self) -> Duration {
+        self.lock().wait
+    }
+
+    #[must_use]
+    pub fn receipt(&self) -> serde_json::Value {
+        let state = self.lock();
+        serde_json::json!({
+            "limit": state.limit,
+            "active": state.active,
+            "waiting": state.waiting,
+            "queue_wait_seconds": state.wait.as_secs(),
+            "admitted": state.admitted,
+            "rejected": state.rejected,
+        })
+    }
+
+    fn retry_after(state: &RawAdmissionState) -> u64 {
+        let per_request = state.average_ms.unwrap_or(5_000).max(250);
+        let ahead = u64::try_from(state.waiting.saturating_add(1)).unwrap_or(u64::MAX);
+        let lanes = u64::try_from(state.limit.max(1)).unwrap_or(1);
+        (ahead.saturating_mul(per_request) / lanes)
+            .div_ceil(1000)
+            .clamp(1, 120)
+    }
+
+    /// Queue for a slot until `deadline`. The waiting count is bounded at eight per slot.
+    async fn acquire(&self, deadline: tokio::time::Instant) -> Result<RawPermit, RawRejection> {
+        {
+            let mut state = self.lock();
+            if state.active < state.limit {
+                state.active += 1;
+                state.admitted += 1;
+                return Ok(RawPermit::new(self.clone()));
+            }
+            if tokio::time::Instant::now() >= deadline || state.waiting >= state.limit * 8 {
+                state.rejected += 1;
+                return Err(RawRejection {
+                    reason: "raw request limit reached",
+                    retry_after_seconds: Self::retry_after(&state),
+                });
+            }
+            state.waiting += 1;
+        }
+        let result = loop {
+            let changed = self.inner.changed.notified();
+            {
+                let mut state = self.lock();
+                if state.active < state.limit {
+                    state.active += 1;
+                    state.admitted += 1;
+                    break Ok(RawPermit::new(self.clone()));
+                }
+            }
+            if tokio::time::timeout_at(deadline, changed).await.is_err() {
+                let mut state = self.lock();
+                state.rejected += 1;
+                break Err(RawRejection {
+                    reason: "raw request limit reached",
+                    retry_after_seconds: Self::retry_after(&state),
+                });
+            }
+        };
+        self.lock().waiting -= 1;
+        result
+    }
+}
+
+/// Held raw slot; released (and the service-time average updated) when the stream ends.
+pub(crate) struct RawPermit {
+    admission: RawAdmission,
+    started: Instant,
+}
+
+impl RawPermit {
+    fn new(admission: RawAdmission) -> Self {
+        Self {
+            admission,
+            started: Instant::now(),
+        }
+    }
+}
+
+impl Drop for RawPermit {
+    fn drop(&mut self) {
+        let elapsed = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let mut state = self.admission.lock();
+        state.active = state.active.saturating_sub(1);
+        state.average_ms = Some(state.average_ms.map_or(elapsed, |average| {
+            average.saturating_mul(4).saturating_add(elapsed) / 5
+        }));
+        drop(state);
+        self.admission.inner.changed.notify_waiters();
+    }
 }
 
 /// Response body that owns the raw-admission permit for the complete upstream stream lifetime.
@@ -260,7 +454,7 @@ struct ProxyState {
 /// streamed, so releasing earlier turns a concurrency cap into a headers-only cap.
 struct AdmittedBody {
     inner: Body,
-    permit: Option<OwnedSemaphorePermit>,
+    permit: Option<RawPermit>,
     execution: Option<OwnedRwLockWriteGuard<()>>,
     resource: Option<ResourcePermit>,
 }
@@ -341,10 +535,14 @@ pub fn app(config: ProxyConfig) -> Result<Router> {
         auto_restart_ollama: config.auto_restart_ollama,
         restart_action: config.restart_action,
         last_restart_attempt: Arc::new(AsyncMutex::new(None)),
-        admission: config
-            .max_concurrent_requests
-            .map(|max| Arc::new(Semaphore::new(max))),
+        admission: config.raw_admission.or_else(|| {
+            config
+                .max_concurrent_requests
+                .map(|max| RawAdmission::new(max, config.raw_queue_wait))
+        }),
+        raw_queue_wait: config.raw_queue_wait,
         execution_lock: config.execution_lock,
+        telemetry: config.telemetry,
     };
     Ok(Router::new().fallback(any(forward)).with_state(state))
 }
@@ -408,6 +606,19 @@ fn json_response(status: StatusCode, body: String) -> Response<Body> {
         .expect("static response is valid")
 }
 
+fn refusal(status: StatusCode, message: &str, retry_after_seconds: u64) -> Response<Body> {
+    let mut response = json_response(
+        status,
+        serde_json::json!({"error": message, "retry_after_seconds": retry_after_seconds})
+            .to_string(),
+    );
+    if let Ok(value) = axum::http::HeaderValue::from_str(&retry_after_seconds.to_string()) {
+        response.headers_mut().insert("retry-after", value);
+    }
+    response
+}
+
+#[allow(clippy::too_many_lines)] // Admission steps must stay in this order; see comments.
 async fn forward(State(state): State<ProxyState>, request: Request) -> impl IntoResponse {
     let (parts, body) = request.into_parts();
     // Buffer the body before taking any lock: a retried attempt must resend the exact same bytes,
@@ -434,36 +645,55 @@ async fn forward(State(state): State<ProxyState>, request: Request) -> impl Into
         }
     };
     let kind = classify(&parts.method, parts.uri.path(), &body_bytes);
+    let kind_label = match kind {
+        RawRequestKind::Metadata => "metadata",
+        RawRequestKind::ModelStore => "model_store",
+        RawRequestKind::Unload => "unload",
+        RawRequestKind::Generation => "generation",
+    };
+    let count = |outcome: &str| {
+        if let Some(telemetry) = &state.telemetry {
+            telemetry.record_raw(kind_label, outcome);
+        }
+    };
     let generation = kind == RawRequestKind::Generation;
+    let wait = state
+        .admission
+        .as_ref()
+        .map_or(state.raw_queue_wait, RawAdmission::wait);
+    let deadline = tokio::time::Instant::now() + wait;
+    // Slot first, then the execution lock, so a queued raw request never holds the lock while
+    // waiting for a slot.
+    let permit = match state.admission.as_ref().filter(|_| generation) {
+        Some(admission) => match admission.acquire(deadline).await {
+            Ok(permit) => Some(permit),
+            Err(rejection) => {
+                count("rejected_limit");
+                return refusal(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    &format!(
+                        "proxy busy: {}; use managed /_freellama/v1/tasks for weighted admission",
+                        rejection.reason
+                    ),
+                    rejection.retry_after_seconds,
+                );
+            }
+        },
+        None => None,
+    };
     let execution = if generation && let Some(lock) = state.execution_lock.as_ref() {
-        if let Ok(guard) = Arc::clone(lock).try_write_owned() {
+        if let Ok(guard) = tokio::time::timeout_at(deadline, Arc::clone(lock).write_owned()).await {
             Some(guard)
         } else {
-            return json_response(
+            count("rejected_busy");
+            return refusal(
                 StatusCode::SERVICE_UNAVAILABLE,
-                r#"{"error":"proxy busy: backend execution active; use managed /_freellama/v1/tasks to queue"}"#.into(),
+                "proxy busy: backend execution active; use managed /_freellama/v1/tasks to queue",
+                2,
             );
         }
     } else {
         None
-    };
-    let permit = match state
-        .admission
-        .as_ref()
-        .filter(|_| generation)
-        .map(Arc::clone)
-    {
-        Some(admission) => {
-            if let Ok(permit) = admission.try_acquire_owned() {
-                Some(permit)
-            } else {
-                return json_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    r#"{"error":"proxy busy: raw request limit reached; use managed /_freellama/v1/tasks for weighted admission"}"#.into(),
-                );
-            }
-        }
-        None => None,
     };
     let resource = if generation {
         match state
@@ -473,6 +703,7 @@ async fn forward(State(state): State<ProxyState>, request: Request) -> impl Into
         {
             Ok(permit) => Some(permit),
             Err(error) => {
+                count("rejected_pressure");
                 let mut refusal = json_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     serde_json::json!({"error": error.to_string(), "resource_admission": error.receipt})
@@ -489,6 +720,7 @@ async fn forward(State(state): State<ProxyState>, request: Request) -> impl Into
     };
     match forward_inner(&state, &parts, &body_bytes).await {
         Ok(response) => {
+            count("forwarded");
             let (parts, body) = response.into_parts();
             Response::from_parts(
                 parts,
@@ -501,6 +733,7 @@ async fn forward(State(state): State<ProxyState>, request: Request) -> impl Into
             )
         }
         Err(error) => {
+            count("upstream_error");
             drop((permit, execution, resource));
             eprintln!("proxy error: {error:#}");
             json_response(

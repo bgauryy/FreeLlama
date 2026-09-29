@@ -448,7 +448,7 @@ pub(super) async fn admit(
         .unwrap_or(u32::MAX)
         .max(1);
     let cost = task_cost_for(task, batch_items).min(budget).max(1);
-    let wait = state.queue_wait;
+    let wait = state.tunables().max_queue_wait();
     match execution
         .admission
         .acquire(cost as usize, priority, deadline)
@@ -456,6 +456,20 @@ pub(super) async fn admit(
     {
         Ok((permit, queued)) => Ok((permit, cost, queued)),
         Err(failure) => {
+            let retry_after = super::runtime::retry_after_seconds(
+                execution.admission.queue_depth(),
+                execution.admission.total(),
+                state.average_task_ms(execution.placement),
+            );
+            let (status, code) = match failure {
+                // A full queue is FreeLlama's own configured cap, not an upstream fault.
+                AdmissionFailure::QueueFull => {
+                    (StatusCode::TOO_MANY_REQUESTS, "admission_queue_full")
+                }
+                AdmissionFailure::TimedOut => {
+                    (StatusCode::SERVICE_UNAVAILABLE, "admission_timeout")
+                }
+            };
             let (reason, setting) = match failure {
                 AdmissionFailure::QueueFull => (
                     "admission queue full".to_owned(),
@@ -475,13 +489,15 @@ pub(super) async fn admit(
                 ),
             };
             Err(ApiError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
+                status,
                 format!(
                     "server busy: {reason} (task cost {cost} of {budget} units; priority \
-                     {priority:?} on the {} backend). Retry, or raise {setting}.",
+                     {priority:?} on the {} backend). Retry after {retry_after}s, or raise {setting}.",
                     execution.placement,
                 ),
-            ))
+            )
+            .with_code(code)
+            .with_retry_after(retry_after))
         }
     }
 }
@@ -495,19 +511,87 @@ pub(super) fn transition_timeout(execution: &ExecutionTarget) -> ApiError {
             execution.placement
         ),
     )
+    .with_retry_after(5)
 }
 
 pub(super) async fn run_task(
     State(state): State<PlatformState>,
     Json(input): Json<TaskInput>,
 ) -> Result<Json<Value>, ApiError> {
+    let started = Instant::now();
     let session_id = input.route.session_id.clone();
-    super::with_session_cancellation(
+    let task = super::task_key(input.route.task);
+    let priority = input.priority;
+    let requested_model = input.route.model.clone();
+    let result = super::with_session_cancellation(
         &state,
         session_id.as_deref(),
         Box::pin(run_session_task(State(state.clone()), Json(input))),
     )
-    .await
+    .await;
+    state
+        .telemetry
+        .record_task(task_record(
+            &result,
+            started,
+            task,
+            priority,
+            requested_model.as_deref(),
+        ))
+        .await;
+    result
+}
+
+/// Usage-ledger row for a finished managed call, successful or not.
+fn task_record(
+    result: &Result<Json<Value>, ApiError>,
+    started: Instant,
+    task: &str,
+    priority: TaskPriority,
+    requested_model: Option<&str>,
+) -> super::telemetry::TaskRecord {
+    let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let priority = match priority {
+        TaskPriority::Interactive => "interactive",
+        TaskPriority::Normal => "normal",
+        TaskPriority::Background => "background",
+    };
+    let mut record = super::telemetry::TaskRecord {
+        ts: super::telemetry::now_seconds(),
+        model: requested_model.unwrap_or("unrouted").to_owned(),
+        backend: "none".into(),
+        task: task.to_owned(),
+        priority: priority.to_owned(),
+        outcome: "ok".into(),
+        status: 200,
+        prompt_tokens: 0,
+        output_tokens: 0,
+        duration_ms,
+        queue_wait_ms: 0,
+        load_ms: 0,
+        output_tokens_per_second: None,
+    };
+    match result {
+        Ok(Json(value)) => {
+            if let Some(model) = value["route"]["selected_model"].as_str() {
+                model.clone_into(&mut record.model);
+            }
+            if let Some(backend) = value["execution"]["placement"].as_str() {
+                backend.clone_into(&mut record.backend);
+            }
+            let metrics = &value["metrics"];
+            record.prompt_tokens = metrics["prompt_tokens"].as_u64().unwrap_or(0);
+            record.output_tokens = metrics["output_tokens"].as_u64().unwrap_or(0);
+            record.load_ms = metrics["load_duration_ns"].as_u64().unwrap_or(0) / 1_000_000;
+            record.output_tokens_per_second = metrics["output_tokens_per_second"].as_f64();
+            record.queue_wait_ms = value["admission"]["total_wait_ms"].as_u64().unwrap_or(0);
+        }
+        Err(error) => {
+            record.outcome = "error".into();
+            record.status = error.status().as_u16();
+        }
+    }
+    record
 }
 
 #[allow(clippy::too_many_lines)] // Explicit RAII lifetime across admission, revalidation and forwarding.
@@ -550,6 +634,8 @@ async fn run_session_task(
             context_sizing["reused_resident_context"] = json!(reused);
         }
     }
+    let leave_context_to_ollama =
+        context_left_to_ollama(&state, &mut managed, &context_sizing).await;
     let preflight = memory_kv_preflight(
         &managed.model,
         &managed.route,
@@ -570,6 +656,23 @@ async fn run_session_task(
     let resource_model = managed.model;
     let decision = managed.route;
     let execution = managed.execution;
+    // Fail fast while this backend's circuit is open instead of queueing for a dead upstream.
+    // The guard lets exactly one probe through after the cooldown.
+    let breaker_probe = match state.breakers.check(execution.placement) {
+        Ok(probe) => probe,
+        Err(remaining) => {
+            return Err(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "{} backend circuit open after repeated upstream failures; retry in {}s",
+                    execution.placement,
+                    remaining.as_secs().max(1)
+                ),
+            )
+            .with_code("upstream_circuit_open")
+            .with_retry_after(remaining.as_secs().max(1)));
+        }
+    };
     let immediate_unload = requests_immediate_unload(input.keep_alive.as_deref());
     // `keep_alive:0` makes Ollama unload before its response reaches FreeLlama, so `/api/ps`
     // cannot prove where the work ran. Hold the runner briefly, observe it, then issue and verify
@@ -581,11 +684,24 @@ async fn run_session_task(
     };
     let (path, mut body) = build_managed_request(&mut input, &decision, &keep_alive)?;
     apply_execution_options(&mut body, &execution);
+    if let Some(default_context) = leave_context_to_ollama {
+        // Ollama's own default covers this request: leave `num_ctx` unset so the runner stays
+        // in Ollama's automatic mode (shared with raw clients, OOM shrink-and-retry intact).
+        if let Some(options) = body["options"].as_object_mut() {
+            options.remove("num_ctx");
+        }
+        execution_receipt["context_sizing"]["num_ctx_sent"] = json!(false);
+        execution_receipt["context_sizing"]["ollama_default_context"] = default_context;
+    }
     execution_receipt["runtime_options"] = body["options"].clone();
     // Slot first, THEN the transition lock — in both branches. The order matters: if the
     // non-resident path took the write lock before its slot while resident tasks held slots and
     // waited on the read lock, the two would deadlock. One consistent order removes that entirely.
-    let queue_deadline = tokio::time::Instant::now() + state.queue_wait;
+    let queue_wait = input.max_wait_seconds.map_or_else(
+        || state.tunables().max_queue_wait(),
+        |seconds| Duration::from_secs(seconds.max(1)).min(state.tunables().max_queue_wait()),
+    );
+    let queue_deadline = tokio::time::Instant::now() + queue_wait;
     let (mut slot, mut cost, mut queue_wait_ms) = admit(
         &state,
         &execution,
@@ -739,6 +855,7 @@ async fn run_session_task(
         resource_wait_ms,
         cost,
         immediate_unload,
+        breaker_probe,
     );
     // On unified memory a loaded runner's weights are wired and visible in OS telemetry, so the
     // reservation that covered the load is returned as soon as the runner is resident instead of
@@ -779,6 +896,118 @@ async fn run_session_task(
     }
     result
 }
+
+/// Decide whether to leave `num_ctx` to Ollama for this request.
+///
+/// Only for prompt-sized contexts (an explicit `context_tokens` is always sent), and only when
+/// Ollama's default for this model is known, covers the sized context, and does not exceed
+/// `auto_context_max` (a 256k tier default would allocate a huge KV cache). A resident runner
+/// whose context was reused keeps being addressed explicitly. On success the decision's
+/// `num_ctx` is set to the default so memory estimates match what Ollama will allocate.
+async fn context_left_to_ollama(
+    state: &PlatformState,
+    managed: &mut ManagedDecision,
+    context_sizing: &Value,
+) -> Option<Value> {
+    let tunables = state.tunables();
+    if tunables.context_mode != super::ContextMode::OllamaDefault
+        || context_sizing["mode"] != "prompt_estimate"
+        || context_sizing.get("reused_resident_context").is_some()
+    {
+        return None;
+    }
+    let sized = managed.route.options["num_ctx"].as_u64()?;
+    let (default, source) = super::monitor::ollama_default_context(
+        state,
+        Some(&managed.model),
+        managed.execution.placement,
+    )
+    .await?;
+    let window = managed.model.advertised_context.unwrap_or(u64::MAX);
+    if default < sized || default > tunables.auto_context_max || default > window {
+        return None;
+    }
+    // A runner already loaded with some other explicit context would be reloaded by an
+    // automatic request; keep addressing it explicitly (reuse handles the larger-window case).
+    if managed.route.resident {
+        let loaded = resident_entry(
+            &state.client,
+            &managed.execution.upstream,
+            &managed.route.selected_model,
+        )
+        .await;
+        if loaded
+            .as_ref()
+            .and_then(|entry| entry["context_length"].as_u64())
+            .is_some_and(|loaded| loaded != default)
+        {
+            return None;
+        }
+    }
+    managed.route.options["num_ctx"] = json!(default);
+    managed
+        .route
+        .reasons
+        .push("context_left_to_ollama_default".to_owned());
+    Some(json!({"tokens": default, "source": source}))
+}
+
+/// Feed the circuit breaker with one upstream call's outcome.
+fn record_upstream_outcome(
+    state: &PlatformState,
+    execution: &ExecutionTarget,
+    probe: Option<super::runtime::BreakerProbe>,
+    failed: bool,
+) {
+    let tunables = state.tunables();
+    drop(probe);
+    if state.breakers.record(
+        execution.placement,
+        !failed,
+        tunables.breaker_failures,
+        tunables.breaker_cooldown(),
+    ) {
+        state.telemetry.record_breaker_open(execution.placement);
+        eprintln!(
+            "circuit breaker: {} backend open for {}s after repeated upstream failures",
+            execution.placement, tunables.breaker_cooldown_seconds
+        );
+    }
+}
+
+/// Feed adaptive concurrency and the service-time average with one finished upstream call.
+async fn observe_completion(
+    state: &PlatformState,
+    execution: &ExecutionTarget,
+    model: &str,
+    failed: bool,
+    output_tokens_per_second: Option<f64>,
+) {
+    if !super::monitor::adaptive_applies(state, execution.placement) {
+        return;
+    }
+    let observation = state.resources.snapshot().await.observation;
+    let memory_pressure = matches!(
+        observation.memory_pressure,
+        Some(resources::MemoryPressure::Warning | resources::MemoryPressure::Critical)
+    ) || observation
+        .memory_psi_some_avg10
+        .is_some_and(|stall| stall >= ADAPTIVE_PSI_THRESHOLD);
+    let change = state.adaptive_for(execution.placement).observe(
+        &execution.admission,
+        &super::runtime::Completion {
+            model,
+            failed,
+            memory_pressure,
+            output_tokens_per_second,
+        },
+    );
+    super::runtime::note_limit_change(&state.telemetry, execution.placement, change);
+}
+
+/// PSI memory `some avg10` (percent of the last 10s with a task stalled on memory) at which a
+/// completion counts as "under pressure" for adaptive concurrency.
+const ADAPTIVE_PSI_THRESHOLD: f64 = 10.0;
 
 /// Retry 500/502 (load-model blips), but not 503 busy or 504 timeout. Same as passthrough.
 /// Retrying 503 while holding an admission slot — and on a cold load, the exclusive write lock —
@@ -868,7 +1097,7 @@ async fn reserve_task_resources(
         .as_u64()
         .unwrap_or(0)
         .saturating_sub(already_reserved.unwrap_or(0));
-    if already_reserved.is_none() && bytes > 0 && state.evict_idle_models {
+    if already_reserved.is_none() && bytes > 0 && state.tunables().evict_idle_models {
         let snapshot = state.resources.snapshot().await;
         let assessment = snapshot.assess_capacity(bytes, false);
         if assessment.denial_reason == Some(resources::CapacityDenialReason::InsufficientCapacity) {
@@ -878,6 +1107,9 @@ async fn reserve_task_resources(
                 .saturating_sub(assessment.effective_available_bytes.unwrap_or(0));
             let evicted =
                 evict_idle_models(state, execution, &decision.selected_model, shortfall).await;
+            state
+                .telemetry
+                .record_evictions(execution.placement, evicted.len());
             if !evicted.is_empty() {
                 // The cached sample predates the unload; judge the new footprint on a fresh one.
                 state.resources.invalidate().await;
@@ -919,7 +1151,8 @@ async fn reserve_task_resources(
 /// A cold load used to wait for memory that only idle resident models were holding; `FreeLlama`
 /// never unloaded them, so the request held its slot and then failed with 503. `keep_alive: 0`
 /// is safe for a runner that is still serving: Ollama unloads it once its requests finish.
-/// Models pinned with `keep_alive: -1` (an expiry far in the future) are never evicted.
+/// Models pinned with `keep_alive: -1` (an expiry far in the future) or listed in the
+/// `pinned_models` setting are never evicted.
 async fn evict_idle_models(
     state: &PlatformState,
     execution: &ExecutionTarget,
@@ -929,26 +1162,10 @@ async fn evict_idle_models(
     let Ok(ps) = get_json(&state.client, &execution.upstream, "/api/ps").await else {
         return Vec::new();
     };
-    let mut candidates: Vec<(String, String, u64)> = ps["models"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|entry| {
-            let name = entry.get("name").or_else(|| entry.get("model"))?.as_str()?;
-            let expires = entry
-                .get("expires_at")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let size = entry.get("size").and_then(Value::as_u64).unwrap_or(0);
-            (name != keep && !pinned_expiry(expires))
-                .then(|| (expires.to_owned(), name.to_owned(), size))
-        })
-        .collect();
-    // Same keep_alive => the earliest expiry is the least recently used.
-    candidates.sort();
+    let candidates = eviction_candidates(&ps, keep, &state.tunables().pinned_models);
     let mut freed = 0_u64;
     let mut evicted = Vec::new();
-    for (_, name, size) in candidates {
+    for (name, size) in candidates {
         if freed >= shortfall {
             break;
         }
@@ -977,6 +1194,36 @@ async fn evict_idle_models(
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     evicted
+}
+
+/// Idle runners that may be unloaded, least recently used first: everything resident except the
+/// model being loaded, models in the `pinned_models` setting, and `keep_alive: -1` runners.
+fn eviction_candidates(
+    ps: &Value,
+    keep: &str,
+    pinned: &std::collections::BTreeSet<String>,
+) -> Vec<(String, u64)> {
+    let mut candidates: Vec<(String, String, u64)> = ps["models"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.get("name").or_else(|| entry.get("model"))?.as_str()?;
+            let expires = entry
+                .get("expires_at")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let size = entry.get("size").and_then(Value::as_u64).unwrap_or(0);
+            (name != keep && !pinned.contains(name) && !pinned_expiry(expires))
+                .then(|| (expires.to_owned(), name.to_owned(), size))
+        })
+        .collect();
+    // Same keep_alive => the earliest expiry is the least recently used.
+    candidates.sort();
+    candidates
+        .into_iter()
+        .map(|(_, name, size)| (name, size))
+        .collect()
 }
 
 /// `keep_alive: -1` shows up in `/api/ps` as an expiry centuries away; treat anything more than
@@ -1095,7 +1342,7 @@ async fn validate_upstream_completion(
     Ok(value)
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn forward_managed_task(
     state: &PlatformState,
     decision: RouteDecision,
@@ -1111,8 +1358,18 @@ async fn forward_managed_task(
     resource_wait_ms: u128,
     cost: u32,
     immediate_unload: bool,
+    breaker_probe: Option<super::runtime::BreakerProbe>,
 ) -> Result<Json<Value>, ApiError> {
-    let (status, value) = post_json_with_retries(state, &execution.upstream, path, &body).await?;
+    let posted = post_json_with_retries(state, &execution.upstream, path, &body).await;
+    let upstream_failed = match &posted {
+        Err(_) => true,
+        Ok((status, _)) => matches!(status.as_u16(), 500 | 502 | 504),
+    };
+    record_upstream_outcome(state, execution, breaker_probe, upstream_failed);
+    if upstream_failed {
+        observe_completion(state, execution, &decision.selected_model, true, None).await;
+    }
+    let (status, value) = posted?;
     let value = validate_upstream_completion(
         state,
         execution,
@@ -1124,6 +1381,14 @@ async fn forward_managed_task(
     )
     .await?;
     let metrics = runtime_metrics(&value);
+    observe_completion(
+        state,
+        execution,
+        &decision.selected_model,
+        false,
+        metrics["output_tokens_per_second"].as_f64(),
+    )
+    .await;
     let placement = observe_physical_placement(state, execution, &decision.selected_model).await;
     state.footprints.lock().await.observe(
         &execution.upstream,
@@ -1538,4 +1803,30 @@ pub(super) fn memory_kv_preflight_with_memory(
         "live_available_memory_bytes": null,
         "authority": "Ollama owns live free-memory, runner graph, cache-type, and final load admission",
     })
+}
+
+#[cfg(test)]
+mod eviction_tests {
+    use super::eviction_candidates;
+    use serde_json::json;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn candidates_skip_the_target_pinned_names_and_infinite_keep_alive_oldest_first() {
+        let ps = json!({"models": [
+            {"name": "newer:latest", "size": 3, "expires_at": "2026-09-29T10:10:00Z"},
+            {"name": "pinned:latest", "size": 5, "expires_at": "2026-09-29T10:00:00Z"},
+            {"name": "target:latest", "size": 7, "expires_at": "2026-09-29T09:00:00Z"},
+            {"name": "forever:latest", "size": 9, "expires_at": "2318-01-01T00:00:00Z"},
+            {"name": "older:latest", "size": 1, "expires_at": "2026-09-29T10:05:00Z"},
+        ]});
+        let pinned = BTreeSet::from(["pinned:latest".to_owned()]);
+        assert_eq!(
+            eviction_candidates(&ps, "target:latest", &pinned),
+            vec![
+                ("older:latest".to_owned(), 1),
+                ("newer:latest".to_owned(), 3)
+            ]
+        );
+    }
 }
