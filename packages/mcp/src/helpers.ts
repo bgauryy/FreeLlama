@@ -579,9 +579,16 @@ export function errorResult(error: unknown) {
   const managedServeUnavailable =
     /(?:connection refused|connect error|failed to connect|error sending request)/i.test(message) &&
     /(?:_freellama|127\.0\.0\.1:11435|localhost:11435)/i.test(message);
+  // serve reached Ollama and Ollama was down: retrying the tool cannot help until a human starts it.
+  const ollamaUnavailable =
+    !managedServeUnavailable &&
+    /(?:connection refused|connect error|failed to connect|error sending request)/i.test(message) &&
+    /\/api\/(?:tags|ps|chat|generate|embed|show)/.test(message);
   const actionableMessage = managedServeUnavailable
     ? `${message}\n\nFreeLlama managed serve is unreachable. Start it with \`freellama serve\`, or set \`FREELLAMA_SERVE_ENDPOINT\` to a running managed endpoint; then retry. Run \`doctor\` to inspect the configured endpoint.`
-    : message;
+    : ollamaUnavailable
+      ? `${message}\n\nOllama is not running at that address. Ask the user to start Ollama (the app, or \`ollama serve\`); retrying before that cannot succeed.`
+      : message;
   return { content: [{ type: "text" as const, text: actionableMessage }], isError: true };
 }
 

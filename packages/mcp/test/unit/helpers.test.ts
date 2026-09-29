@@ -335,3 +335,10 @@ describe("task answer text", () => {
     expect(text).toContain("queue full");
   });
 });
+
+describe("errorResult recovery hints", () => {
+  it("tells the caller Ollama itself is down when serve could not reach it", () => {
+    const result = errorResult(new Error("error sending request for url (http://127.0.0.1:11434/api/tags)"));
+    expect(result.content[0].text).toMatch(/Ollama is not running/);
+  });
+});

@@ -33,9 +33,9 @@ import {
   assertAllowedWorkspace,
   delegateEnvironment,
 } from "./config.js";
-import {
-  doctor, machine, health, createSession, deleteSession, killSession, listModels, route, runTaskRequest, runTaskBatchRequest, SERVER_VERSION,
-} from "./native.js";
+import * as native from "./native.js";
+import { doctor, machine, health, SERVER_VERSION } from "./native.js";
+import { ensureServe, stopAutostartedServe } from "./serve.js";
 import {
   ollamaFetch,
   ollamaPull,
@@ -81,6 +81,23 @@ import { parseModelSearch, parseModelTags } from "./model-search.js";
 import { MODEL_EVIDENCE, assessDelegatedAnswer } from "./delegate.js";
 
 const execFileAsync = promisify(execFile);
+
+/** Serve-backed native calls start the bundled `freellama serve` first when nothing answers. */
+function withServe<Args extends unknown[], R>(
+  call: (endpoint: string | null | undefined, ...args: Args) => Promise<R>,
+): (endpoint: string | null | undefined, ...args: Args) => Promise<R> {
+  return async (endpoint, ...args) => {
+    await ensureServe(endpoint ?? undefined);
+    return call(endpoint, ...args);
+  };
+}
+const createSession = withServe(native.createSession);
+const deleteSession = withServe(native.deleteSession);
+const killSession = withServe(native.killSession);
+const listModels = withServe(native.listModels);
+const route = withServe(native.route);
+const runTaskRequest = withServe(native.runTaskRequest);
+const runTaskBatchRequest = withServe(native.runTaskBatchRequest);
 
 type Page<T> = { items: T[]; returned: number; total: number; next_cursor: string | null };
 const EXTERNAL_COST = configuredExternalCost();
@@ -188,11 +205,15 @@ for (const stream of [process.stdout, process.stderr] as const) {
   });
 }
 
-process.on("exit", killLiveDelegates);
+process.on("exit", () => {
+  killLiveDelegates();
+  stopAutostartedServe();
+});
 // A client that closes stdin without a signal (most MCP hosts on shutdown) left this process
 // alive until every running delegate finished, holding a model loaded for nobody.
 process.stdin.on("close", () => {
   killLiveDelegates();
+  stopAutostartedServe();
   process.exit(0);
 });
 
@@ -243,7 +264,7 @@ const INSTRUCTIONS = `Offload work to local Ollama models.
 3. delegate_research is narrow read-only workspace research; verify its citations.
 The caller owns task decomposition, prompts and format; findings are candidates, not accepted defects. The operator owns endpoints, exact --cpu-model assignments, lifecycle. Ollama plus the OS/driver run physical CPU/GPU.
 ask approval for one exact tag and reported size before ollama_manage; search or recommendation is never download permission.
-run_task and delegate_research need \`freellama serve\` (default :11435). Docs: freellama://docs/index.`;
+run_task and delegate_research use \`freellama serve\` (default :11435; started automatically when absent). Docs: freellama://docs/index.`;
 
 const server = new McpServer(
   { name: "freellama", version: SERVER_VERSION },
