@@ -98,8 +98,9 @@ possible hop.
 FreeLlama's managed API is non-streaming. Its machine profile exposes portable host RAM,
 CPU, disk, and diagnostic thermal-pressure signals, while physical placement is observed from
 Ollama after execution. Local admission uses available-RAM estimates, load, and reported pressure
-or thermal throttling. It does not consume vendor GPU utilization, power limits,
-or live free VRAM before load; FreeLlama also does not provide multi-tenant RBAC,
+or thermal throttling. On a discrete GPU it reads free VRAM before load (`nvidia-smi` or amdgpu
+sysfs) and charges host RAM only for the part expected to spill. It does not consume vendor GPU
+utilization or power limits; FreeLlama also does not provide multi-tenant RBAC,
 durable conversation state, or cluster scheduling. Those are product gaps, not hidden features.
 
 Route preview returns an advisory `execution.agent_plan` with separate queue and resource readiness.
@@ -692,6 +693,7 @@ observable, and bounded local research can keep intermediate context out of the 
 |---|---|
 | [Product positioning](docs/PRODUCT_POSITIONING.md) | Definition, audiences, messaging, and claim guardrails |
 | [Architecture](docs/ARCHITECTURE.md) | Ownership, request classification, routing, admission, research, and backend flows |
+| [Monitoring and live tuning](docs/MONITORING.md) | Status, usage ledger, Prometheus metrics, runtime config reload, 429 back-pressure, circuit breaker, adaptive limits |
 | [Production runbook](docs/PRODUCTION.md) | Auth, persisted feedback, explicit Ollama settings, releases, hardware gates, and promotion |
 | [MCP server](packages/mcp/README.md) | Seven tools, schemas, configuration, allowed roots, build, and security |
 | [CLI reference](docs/CLI.md) | Commands, flags, objectives, managed execution, and policy workflow |

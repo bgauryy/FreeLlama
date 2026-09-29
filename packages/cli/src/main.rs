@@ -62,10 +62,15 @@ struct AdmissionArgs {
     /// `FREELLAMA_CPU_MAX_QUEUED_TASKS`).
     #[arg(long)]
     cpu_max_queued_tasks: Option<usize>,
-    /// Bound raw Ollama-compatible proxy streams with immediate 503 (default 1 in `serve`). This is
-    /// a generic primary-backend cap; use managed tasks for weighted CPU/GPU admission.
+    /// Bound raw Ollama-compatible proxy streams (default 1 in `serve`). Over the cap a request
+    /// waits up to --raw-queue-wait-seconds, then gets 429 with Retry-After. This is a generic
+    /// primary-backend cap; use managed tasks for weighted CPU/GPU admission.
     #[arg(long)]
     raw_proxy_max_concurrent_requests: Option<usize>,
+    /// How long a raw generation may wait for a slot or for managed execution (default 10, or
+    /// `FREELLAMA_RAW_QUEUE_WAIT_SECONDS`; 0 refuses at once).
+    #[arg(long)]
+    raw_queue_wait_seconds: Option<u64>,
     /// Maximum live session-affinity handles (default 1024). Sessions contain no prompt/KV data.
     #[arg(long)]
     max_sessions: Option<usize>,
@@ -199,6 +204,17 @@ struct ProductionArgs {
     /// `FREELLAMA_AUTH_TOKEN_FILE`).
     #[arg(long)]
     allow_remote: bool,
+    /// Live-tunable settings (TOML), re-read when the file changes. Defaults to
+    /// `FREELLAMA_RUNTIME_CONFIG`; see `freellama.runtime.example.toml`.
+    #[arg(long)]
+    runtime_config: Option<PathBuf>,
+    /// JSON-lines usage ledger, replayed at startup for daily totals. Defaults to the platform
+    /// data directory (or `FREELLAMA_USAGE_FILE`).
+    #[arg(long)]
+    usage_file: Option<PathBuf>,
+    /// Keep usage totals in memory only.
+    #[arg(long, conflicts_with = "usage_file")]
+    ephemeral_usage: bool,
 }
 
 // Parsed once per process, so the size gap between `Serve` and the small commands costs nothing.
@@ -262,6 +278,38 @@ enum Command {
             default_value = "http://127.0.0.1:11435"
         )]
         endpoint: String,
+    },
+    /// Live view: admission and queues per backend, loaded models, host memory and GPU, circuit
+    /// breakers, adaptive limits, Ollama's effective settings, and today's usage.
+    Status {
+        #[arg(
+            long,
+            env = "FREELLAMA_SERVE_ENDPOINT",
+            default_value = "http://127.0.0.1:11435"
+        )]
+        endpoint: String,
+    },
+    /// Usage totals per day and per model (tasks, errors, tokens, busy and queue time).
+    Usage {
+        #[arg(
+            long,
+            env = "FREELLAMA_SERVE_ENDPOINT",
+            default_value = "http://127.0.0.1:11435"
+        )]
+        endpoint: String,
+        #[arg(long, default_value_t = 7)]
+        days: u32,
+    },
+    /// Effective runtime settings and where each came from; --reload re-reads the config file.
+    Config {
+        #[arg(
+            long,
+            env = "FREELLAMA_SERVE_ENDPOINT",
+            default_value = "http://127.0.0.1:11435"
+        )]
+        endpoint: String,
+        #[arg(long)]
+        reload: bool,
     },
     /// Create an isolated session for model affinity across related tasks.
     Session {
@@ -550,6 +598,19 @@ async fn main() -> Result<()> {
         Command::Session { endpoint } => {
             print_post(&endpoint, "/_freellama/v1/sessions", &json!({})).await?;
         }
+        Command::Status { endpoint } => {
+            print_get(&endpoint, "/_freellama/v1/status").await?;
+        }
+        Command::Usage { endpoint, days } => {
+            print_get(&endpoint, &format!("/_freellama/v1/usage?days={days}")).await?;
+        }
+        Command::Config { endpoint, reload } => {
+            if reload {
+                print_post(&endpoint, "/_freellama/v1/config/reload", &json!({})).await?;
+            } else {
+                print_get(&endpoint, "/_freellama/v1/config").await?;
+            }
+        }
         Command::Route {
             endpoint,
             task,
@@ -796,6 +857,10 @@ async fn start_platform(args: PlatformStartArgs) -> Result<()> {
     if let Some(max) = args.admission.raw_proxy_max_concurrent_requests {
         config = config.with_raw_proxy_max_concurrent_requests(max);
     }
+    if let Some(seconds) = args.admission.raw_queue_wait_seconds {
+        config = config.with_raw_queue_wait(Duration::from_secs(seconds));
+    }
+    config = with_runtime_and_usage(config, &args.production);
     if let Some(max) = args.admission.max_sessions {
         config = config.with_max_sessions(max);
     }
@@ -857,6 +922,29 @@ fn configure_resource_policy(config: &mut PlatformConfig, args: &AdmissionArgs) 
     Ok(())
 }
 
+/// The live-tunable runtime file and the usage ledger (on by default, next to the feedback file).
+fn with_runtime_and_usage(
+    mut config: PlatformConfig,
+    production: &ProductionArgs,
+) -> PlatformConfig {
+    if let Some(path) = &production.runtime_config {
+        eprintln!("freellama: watching runtime config {}", path.display());
+        config = config.with_runtime_config(path);
+    }
+    if !production.ephemeral_usage {
+        let path = production
+            .usage_file
+            .clone()
+            .or_else(|| std::env::var_os("FREELLAMA_USAGE_FILE").map(PathBuf::from))
+            .or_else(|| default_feedback_file().map(|path| path.with_file_name("usage.jsonl")));
+        if let Some(path) = path {
+            eprintln!("freellama: recording task usage at {}", path.display());
+            config = config.with_usage_file(path);
+        }
+    }
+    config
+}
+
 fn report_admission_config(config: &PlatformConfig) {
     eprintln!(
         "freellama: per-backend admission budgets: GPU {} units / {} queued, CPU {} units / {} \
@@ -870,6 +958,11 @@ fn report_admission_config(config: &PlatformConfig) {
     eprintln!(
         "freellama: raw passthrough cap: {} streaming request(s); managed routes remain preferred",
         config.resolved_raw_proxy_max_concurrent_requests()
+    );
+    eprintln!(
+        "freellama: without an explicit GPU budget the default follows the Ollama server's \
+         OLLAMA_NUM_PARALLEL (2 units per parallel slot); `freellama config` shows the effective \
+         value and its source"
     );
 }
 

@@ -34,7 +34,7 @@ import {
   delegateEnvironment,
 } from "./config.js";
 import * as native from "./native.js";
-import { doctor, machine, health, SERVER_VERSION } from "./native.js";
+import { doctor, machine, health, status, usage, SERVER_VERSION } from "./native.js";
 import { ensureServe, stopAutostartedServe } from "./serve.js";
 import {
   ollamaFetch,
@@ -304,17 +304,22 @@ for (const name of packagedDocs) {
 server.registerTool(
   "doctor",
   {
-    description: "Use when: runtime/config diagnosis. Do not use when: model selection. Returns: compact summary by default; config/full are opt-in.",
+    description: "Use when: runtime/config diagnosis, or live load and usage (view:status/usage). Do not use when: model selection. Returns: compact summary by default; config/full are opt-in.",
     inputSchema: {
       endpoint: ollamaEndpointParam,
       serveEndpoint: endpointParam,
-      view: z.enum(["summary", "scheduler", "config", "full"]).optional().describe("summary default; scheduler/config/full are verbose"),
+      view: z.enum(["summary", "scheduler", "config", "full", "status", "usage"]).optional().describe("summary default; scheduler/config/full are verbose; status = live queues, limits, circuits, loaded models; usage = token/task totals (needs serve)"),
+      days: z.number().int().min(1).max(366).optional().describe("usage view only; default 7"),
     },
     outputSchema: doctorResultSchema,
     annotations: { readOnlyHint: true },
   },
-  async ({ endpoint, serveEndpoint, view }) => {
+  async ({ endpoint, serveEndpoint, view, days }) => {
     try {
+      if (days !== undefined && view !== "usage") return errorResult(new Error("days is only valid with view: usage."));
+      // Live views come from serve alone; they do not need the Ollama half of the diagnostic.
+      if (view === "status") return parsedResult(await status(serveEndpoint));
+      if (view === "usage") return parsedResult(await usage(serveEndpoint, days));
       const report = parsedResult(await doctor(endpoint));
       if (!("structuredContent" in report)) return report;
       // Absorbed the former `machine` tool. Attempted, not required: `doctor` must keep working
