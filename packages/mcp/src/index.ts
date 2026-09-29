@@ -56,6 +56,8 @@ import {
   requiredCapabilitiesParam,
   clipText,
   structuredResult,
+  taskAnswerText,
+  batchAnswerText,
   parsedResult,
   errorResult,
   summarizeEmbeddings,
@@ -93,7 +95,7 @@ function withTaskTelemetry(result: ReturnType<typeof parsedResult>) {
       outputTokens: typeof metrics?.output_tokens === "number" ? metrics.output_tokens : null,
       totalDurationNs: typeof metrics?.total_duration_ns === "number" ? metrics.total_duration_ns : null,
     }, EXTERNAL_COST),
-  });
+  }, { text: taskAnswerText(payload) });
 }
 
 function withBatchTelemetry(result: ReturnType<typeof parsedResult>) {
@@ -124,7 +126,7 @@ function withBatchTelemetry(result: ReturnType<typeof parsedResult>) {
     telemetry: complete === rows.filter((row) => (row as Record<string, unknown>)?.ok === true).length
       ? costTelemetry({ inputTokens, outputTokens }, EXTERNAL_COST)
       : { local: null, externalEquivalent: null, note: "Batch aggregate unavailable because one or more successful items omitted token counts." },
-  });
+  }, { text: batchAnswerText(payload) });
 }
 
 /** Page a live list with an opaque cursor that refuses to continue after list drift. */

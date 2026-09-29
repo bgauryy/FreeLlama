@@ -1369,28 +1369,35 @@ async fn run_task_batch(
         .take(input.tasks.len())
         .collect::<Vec<Option<Value>>>();
     let mut running = JoinSet::new();
+    // A panicking worker must fail only its own item: keep completed answers instead of
+    // discarding the whole batch, which is what `?` on the JoinError used to do.
+    let mut in_flight = BTreeMap::new();
 
     while !pending.is_empty() || !running.is_empty() {
         while running.len() < max_parallelism && !pending.is_empty() {
             let index = next_batch_task(&mut pending, &input.tasks, &mut credits);
-            let id = input.tasks[index].id.clone();
             let task = input.tasks[index].task.clone();
             let task_state = state.clone();
-            running.spawn(async move {
-                let result = run_task(State(task_state), Json(task)).await;
-                (index, id, result)
-            });
+            let handle = running.spawn(async move { run_task(State(task_state), Json(task)).await });
+            in_flight.insert(handle.id(), index);
         }
-        if let Some(joined) = running.join_next().await {
-            let (index, id, result) = joined.map_err(|error| {
-                ApiError::new(
+        if let Some(joined) = running.join_next_with_id().await {
+            let (task_id, outcome) = match joined {
+                Ok((task_id, result)) => (task_id, Ok(result)),
+                Err(error) => (error.id(), Err(error)),
+            };
+            let Some(index) = in_flight.remove(&task_id) else {
+                continue;
+            };
+            let id = input.tasks[index].id.clone();
+            results[index] = Some(match outcome {
+                Ok(Ok(Json(response))) => json!({ "id": id, "ok": true, "response": response }),
+                Ok(Err(error)) => error.into_batch_result(id),
+                Err(error) => ApiError::new(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("batch worker failed: {error}"),
                 )
-            })?;
-            results[index] = Some(match result {
-                Ok(Json(response)) => json!({ "id": id, "ok": true, "response": response }),
-                Err(error) => error.into_batch_result(id),
+                .into_batch_result(id),
             });
         }
     }

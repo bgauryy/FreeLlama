@@ -10,6 +10,9 @@ import {
   parsedResult,
   serialize,
   structuredResult,
+  taskAnswerText,
+  batchAnswerText,
+  ANSWER_TEXT_MAX_CHARS,
   summarizeEmbeddings,
   summarizeOllamaPullStream,
   extractExistingWorkspacePath,
@@ -293,5 +296,42 @@ describe("summarizeEmbeddings", () => {
     expect(summarizeEmbeddings({ response: { message: "hi" } })).toBeNull();
     expect(summarizeEmbeddings({ response: { embeddings: [] } })).toBeNull();
     expect(summarizeEmbeddings({})).toBeNull();
+  });
+});
+
+describe("task answer text", () => {
+  it("puts the chat answer and selected model into TextContent", () => {
+    const payload = {
+      route: { selected_model: "qwen3:8b" },
+      response: { model: "qwen3:8b", message: { role: "assistant", content: "  42  " } },
+    };
+    const result = structuredResult(payload, { text: taskAnswerText(payload) });
+    expect(result.content[0].text).toBe("[qwen3:8b] 42");
+    expect(result.structuredContent).toBe(payload);
+  });
+
+  it("includes tool calls and clips very long answers", () => {
+    const calls = taskAnswerText({ response: { message: { content: "", tool_calls: [{ function: { name: "f" } }] } } });
+    expect(calls).toContain('tool_calls: [{"function":{"name":"f"}}]');
+    const long = taskAnswerText({ response: { message: { content: "x".repeat(ANSWER_TEXT_MAX_CHARS * 2) } } });
+    expect(long!.length).toBeLessThanOrEqual(ANSWER_TEXT_MAX_CHARS);
+  });
+
+  it("describes withheld embeddings instead of dumping vectors", () => {
+    const text = taskAnswerText({ response: { embeddings_omitted: { count: 3 } } });
+    expect(text).toContain("3 vectors");
+    expect(text).toContain("returnEmbeddings:true");
+  });
+
+  it("labels each batch item, including failures", () => {
+    const text = batchAnswerText({
+      results: [
+        { id: "a", ok: true, response: { response: { message: { content: "one" } } } },
+        { id: "b", ok: false, error: { message: "queue full" } },
+      ],
+    });
+    expect(text).toContain("## a\none");
+    expect(text).toContain("## b (failed)");
+    expect(text).toContain("queue full");
   });
 });

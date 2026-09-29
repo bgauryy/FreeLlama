@@ -441,12 +441,67 @@ function resultSummary(value: Record<string, unknown>): string {
   return `Structured result available (${keys.slice(0, 8).join(", ") || "empty object"}).`;
 }
 
+/** Text budget for a model answer in TextContent; the full answer stays in structuredContent. */
+export const ANSWER_TEXT_MAX_CHARS = 8 * 1024;
+
+function record(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+}
+
+/**
+ * The answer of one managed execution, as text. Many MCP clients forward only TextContent to the
+ * model, so a key list here meant the delegated answer never reached the caller at all.
+ */
+export function taskAnswerText(payload: Record<string, unknown>): string | undefined {
+  const response = record(payload.response);
+  if (!response) return undefined;
+  const model = record(payload.route)?.selected_model ?? payload.selected_model ?? response.model;
+  const header = typeof model === "string" && model ? `[${model}] ` : "";
+  const message = record(response.message);
+  if (message) {
+    const parts: string[] = [];
+    if (typeof message.content === "string" && message.content.trim()) parts.push(message.content.trim());
+    if (Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
+      parts.push(`tool_calls: ${JSON.stringify(message.tool_calls)}`);
+    }
+    if (parts.length === 0) parts.push("(empty response)");
+    return clipText(header + parts.join("\n"), ANSWER_TEXT_MAX_CHARS);
+  }
+  if (typeof response.response === "string") return clipText(header + response.response.trim(), ANSWER_TEXT_MAX_CHARS);
+  const omitted = record(response.embeddings_omitted);
+  if (Array.isArray(response.embeddings) || omitted) {
+    const count = Array.isArray(response.embeddings) ? response.embeddings.length : omitted?.count;
+    const where = omitted ? "vectors withheld; pass returnEmbeddings:true" : "vectors are in structuredContent";
+    return `${header}embedding complete (${String(count ?? "?")} vectors); ${where}.`;
+  }
+  return undefined;
+}
+
+/** Batch counterpart of taskAnswerText: one labelled answer per item, in request order. */
+export function batchAnswerText(payload: Record<string, unknown>): string | undefined {
+  if (!Array.isArray(payload.results)) return undefined;
+  const perItem = Math.max(512, Math.floor(ANSWER_TEXT_MAX_CHARS / Math.max(payload.results.length, 1)));
+  const lines = payload.results.map((row) => {
+    const item = record(row) ?? {};
+    const id = String(item.id ?? "?");
+    if (item.ok !== true) return `## ${id} (failed)\n${clipText(JSON.stringify(item.error ?? item), perItem)}`;
+    const answer = taskAnswerText(record(item.response) ?? {}) ?? "(no answer)";
+    return `## ${id}\n${clipText(answer, perItem)}`;
+  });
+  return lines.join("\n\n");
+}
+
 // MCP clients that understand structuredContent receive the canonical object. Repeating a large
 // JSON serialization in TextContent wastes agent context (especially doctor and raw model views),
 // so the text block is a compact compatibility cue rather than a second transport encoding.
-export function structuredResult(value: Record<string, unknown>, options: { legacyJson?: boolean } = {}) {
+// Task results are the exception: their text is the model's answer, since that is the payload.
+export function structuredResult(
+  value: Record<string, unknown>,
+  options: { legacyJson?: boolean; text?: string } = {},
+) {
+  const text = options.text ?? (options.legacyJson ? serialize(value) : resultSummary(value));
   return {
-    content: [{ type: "text" as const, text: options.legacyJson ? serialize(value) : resultSummary(value) }],
+    content: [{ type: "text" as const, text }],
     structuredContent: value,
   };
 }
