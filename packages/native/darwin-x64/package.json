@@ -1,6 +1,6 @@
 {
   "name": "@octocodeai/freellama-native-darwin-x64",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "FreeLlama native Rust artifacts for macOS Intel",
   "license": "Apache-2.0 OR MIT",
   "os": [

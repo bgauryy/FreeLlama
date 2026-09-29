@@ -1,6 +1,6 @@
 {
   "name": "@octocodeai/freellama-native-linux-arm64-gnu",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "FreeLlama native Rust artifacts for Linux ARM64 (glibc)",
   "license": "Apache-2.0 OR MIT",
   "os": [

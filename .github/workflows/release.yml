@@ -1,0 +1,120 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build ${{ matrix.id }}
+    strategy:
+      fail-fast: false
+      # Must match scripts/release-platforms.mjs exactly; assemble-release.mjs refuses a
+      # missing id. The previous workflow staged 5 ids (linux-x64, win32-x64, ...) that the
+      # 8-id matrix never accepted.
+      matrix:
+        include:
+          - { id: darwin-arm64, runner: macos-15, target: aarch64-apple-darwin }
+          - { id: darwin-x64, runner: macos-15-intel, target: x86_64-apple-darwin }
+          - { id: linux-x64-gnu, runner: ubuntu-24.04, target: x86_64-unknown-linux-gnu }
+          - { id: linux-arm64-gnu, runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+          - { id: linux-x64-musl, runner: ubuntu-24.04, target: x86_64-unknown-linux-musl, zig: true }
+          - { id: linux-arm64-musl, runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, zig: true }
+          - { id: win32-x64-msvc, runner: windows-2025, target: x86_64-pc-windows-msvc }
+          - { id: win32-arm64-msvc, runner: windows-11-arm, target: aarch64-pc-windows-msvc }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - run: corepack enable
+      - run: yarn install --immutable
+      - name: Install zig (musl cross-linking)
+        if: matrix.zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.13.0
+      - name: Install cargo-zigbuild
+        if: matrix.zig
+        run: cargo install --locked cargo-zigbuild
+      - name: Build CLI
+        shell: bash
+        run: |
+          if [[ "${{ matrix.zig }}" == "true" ]]; then
+            cargo zigbuild --release -p freellama-cli --target ${{ matrix.target }}
+          else
+            cargo build --release -p freellama-cli --target ${{ matrix.target }}
+          fi
+      - name: Build N-API addon
+        shell: bash
+        run: |
+          cross=""
+          [[ "${{ matrix.zig }}" == "true" ]] && cross="--cross-compile"
+          yarn napi build --platform --release --target ${{ matrix.target }} $cross \
+            --manifest-path packages/rust-core/Cargo.toml --features napi --no-js \
+            -o release-target
+      - name: Stage target
+        shell: bash
+        run: |
+          mkdir -p release-target
+          exe=freellama; [[ "${{ matrix.id }}" == win32-* ]] && exe=freellama.exe
+          cp "target/${{ matrix.target }}/release/$exe" release-target/
+          ls release-target
+          test -f "release-target/freellama.${{ matrix.id }}.node"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.id }}
+          path: release-target
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - run: corepack enable
+      - run: yarn install --immutable
+      - uses: actions/download-artifact@v5
+        with:
+          path: release-artifacts
+      - run: node scripts/assemble-release.mjs release-artifacts release
+      - run: yarn build:native && yarn workspace @octocodeai/freellama-mcp-server build
+      - run: yarn typecheck && yarn test
+      - run: yarn release:verify:publish
+      - name: Publish npm packages
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          test -n "$NODE_AUTH_TOKEN" || { echo "NPM_TOKEN secret is required"; exit 1; }
+          for dir in packages/native/*/; do
+            npm publish "$dir" --ignore-scripts --provenance --access public
+          done
+          npm publish ./packages/cli --ignore-scripts --provenance --access public
+          npm publish ./packages/mcp --ignore-scripts --provenance --access public
+      - name: Publish GitHub release assets
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
