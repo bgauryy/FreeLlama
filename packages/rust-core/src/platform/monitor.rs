@@ -84,7 +84,7 @@ async fn loaded_models(state: &PlatformState) -> Vec<Value> {
                         "name": entry.get("name").or_else(|| entry.get("model")),
                         "size_bytes": size,
                         "size_vram_bytes": vram,
-                        "gpu_percent": if size > 0 { vram.saturating_mul(100) / size } else { 0 },
+                        "gpu_percent": vram.saturating_mul(100).checked_div(size).unwrap_or(0),
                         "context_length": entry.get("context_length"),
                         "expires_at": entry.get("expires_at"),
                         "pinned": state.tunables().pinned_models.contains(
