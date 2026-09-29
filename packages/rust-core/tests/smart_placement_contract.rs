@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
@@ -195,7 +195,7 @@ async fn discrete_gpu_spill_is_reserved_and_idle_models_are_evicted_to_fit() {
     }));
     let (upstream, server) = backend(mock.clone()).await;
     let unloaded = Arc::clone(&mock.unloaded);
-    let host_available = Arc::new(AtomicU64::new(2000));
+    let host_available = Arc::new(std::sync::atomic::AtomicU64::new(2000));
     let governor = ResourceGovernor::with_sampler(policy(), move || {
         // 8000-byte model estimates 10800 with assumed KV and graph margin. With the idle model
         // loaded only 1000 bytes of VRAM are free, so 9800 would spill into 2000 bytes of RAM.
