@@ -360,7 +360,7 @@ server-launch config (for example `.mcp.json`'s `env` block) or the launching sh
 |---|---|---|
 | `FREELLAMA_OLLAMA_ENDPOINT` | `http://127.0.0.1:11434` | `doctor` and all `ollama_*` tools' default Ollama endpoint |
 | `FREELLAMA_SERVE_ENDPOINT` | `http://127.0.0.1:11435` | Default `endpoint` for serve-backed tools and `delegate_research` |
-| `FREELLAMA_MCP_DEFAULT_MODEL` | `qwen3.8:27b-mlx` | `delegate_research`'s default `model` |
+| `FREELLAMA_MCP_DEFAULT_MODEL` | unset (routes to an installed coding model) | `delegate_research`'s default `model` |
 | `FREELLAMA_MCP_DEFAULT_ADAPTER` | `bash` | `delegate_research`'s adapter (`octocode` to switch) |
 | `FREELLAMA_MCP_MAX_TURNS` | `8` | Max agent turns for `delegate_research` |
 | `FREELLAMA_MCP_DELEGATE_TIMEOUT_SECONDS` | `180` | Whole-subprocess timeout for `delegate_research` |
@@ -377,7 +377,10 @@ server-launch config (for example `.mcp.json`'s `env` block) or the launching sh
 | `FREELLAMA_AGENT_TOKEN_CALIBRATION_DIR` | platform data directory | Prompt-free, model-specific token-estimator calibration shared across adapter processes |
 
 Research-adapter settings are deployment defaults. The optional `delegate_research.agent` object
-exposes the same values per call using camelCase; explicit per-call fields win.
+overrides the per-call budget (`maxTurns`, `contextTokens`, `outputTokens`, `temperature`, `seed`,
+`think`, `keepAlive`, `requestTimeoutSeconds`, `toolTimeoutSeconds`); explicit per-call fields win.
+The research subprocess receives only `FREELLAMA_*`, locale, temp, and proxy/CA variables from the
+server environment.
 
 | Variable | Default | Affects |
 |---|---:|---|

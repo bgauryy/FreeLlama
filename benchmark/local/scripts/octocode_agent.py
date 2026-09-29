@@ -77,6 +77,12 @@ def parse_action(content: str) -> dict[str, Any]:
     return value
 
 
+# Pinned: an unpinned `npx octocode` downloads whatever is latest at call time (a supply-chain
+# risk for a tool that reads the user's workspace) and the first download can exceed the tool
+# timeout. Override deliberately with FREELLAMA_AGENT_OCTOCODE_PACKAGE.
+OCTOCODE_PACKAGE = os.environ.get("FREELLAMA_AGENT_OCTOCODE_PACKAGE", "octocode@19.1.0")
+
+
 def run_octocode(
     root: Path,
     tool_name: str,
@@ -89,7 +95,7 @@ def run_octocode(
     for key in PATH_KEYS:
         if key in resolved and isinstance(resolved[key], str):
             resolved[key] = str(safe_resolve(root, resolved[key]))
-    command = ["npx", "octocode", "tools", tool_name, "--queries", json.dumps(resolved), "--compact"]
+    command = ["npx", "--yes", OCTOCODE_PACKAGE, "tools", tool_name, "--queries", json.dumps(resolved), "--compact"]
     result = subprocess.run(
         command,
         cwd=root,

@@ -11,7 +11,6 @@ from __future__ import annotations
 from contextlib import ExitStack
 import json
 import os
-import re
 import subprocess
 import time
 from pathlib import Path
@@ -29,6 +28,8 @@ from agent_context import (
     parse_json_action,
     write_failure_result,
 )
+import shell_sandbox
+from shell_sandbox import ReadOnlyShell
 from agent_transport import chat_request, request_headers, unwrap_chat_response, PromptCacheUsage, retryable_chat_error, resolve_model_identity
 
 # Nothing is clipped any more. `calls[].result` is written to result.json on disk and read by the
@@ -36,38 +37,9 @@ from agent_transport import chat_request, request_headers, unwrap_chat_response,
 # the MODEL sees is paginated instead: one page plus an exact instruction for fetching the next.
 # See the pagination section of agent_context.py for why clipping was data loss, not economy.
 
-DENYLIST = re.compile(
-    r"\bsudo\b|\brm\s+-rf\s+/(?!\S)|:\(\)\s*\{.*:\|:.*\}|\bcurl\b|\bwget\b|\bnc\b|\bssh\b|>\s*/dev/(sd|nvme|disk)",
-    re.IGNORECASE,
-)
-
-# Home and well-known absolute prefixes. A relative `grep /pattern/` is not a filesystem path;
-# `/etc/passwd` is. `..` as a path component walks out of cwd=workspace.
-_HOME_ESCAPE = re.compile(r"(?:^|[\s=\"'])(?:~(?:/|$)|\$HOME\b|\$\{HOME\})")
-_ABS_PATH = re.compile(r"(?:^|[\s=\"'])(/(?:[^\s\"']+))")
-_DOTDOT_PATH = re.compile(r"(?:^|[\s=\"'/])\.\.(?:/|[\s\"']|$)")
-_FS_ABS_PREFIX = re.compile(
-    r"^/(?:etc|usr|home|Users|var|tmp|private|opt|root|System|Library|bin|sbin|dev|Applications|Volumes)(?:/|$)"
-)
-
-
-def assert_command_confined(root: Path, command_text: str) -> None:
-    """Reject commands that read outside the workspace. The MCP allowlist only constrains
-    the workspace *root*; without this, `cat /etc/hosts` from cwd=root succeeds."""
-    if _HOME_ESCAPE.search(command_text):
-        raise ValueError("command blocked: home-directory path is outside the workspace")
-    if _DOTDOT_PATH.search(command_text):
-        raise ValueError("command blocked: '..' walks outside the workspace")
-    root = root.resolve()
-    for match in _ABS_PATH.finditer(command_text):
-        raw = match.group(1)
-        candidate = Path(raw)
-        looks_like_fs = _FS_ABS_PREFIX.match(raw) is not None or candidate.exists()
-        if not looks_like_fs:
-            continue
-        resolved = candidate.resolve()
-        if resolved != root and root not in resolved.parents:
-            raise ValueError(f"command blocked: path escapes workspace: {raw}")
+# Validation, restricted bash, a scrubbed environment and (where the host allows) an OS sandbox
+# live in shell_sandbox; see its module docstring for why the old regex denylist was not enough.
+assert_command_confined = shell_sandbox.assert_command_confined
 
 
 def request_json(url: str, payload: dict[str, Any], timeout_seconds: float) -> dict[str, Any]:
@@ -95,24 +67,11 @@ def parse_action(content: str) -> dict[str, Any]:
     return value
 
 
-def run_shell(root: Path, command_text: str, timeout_seconds: float) -> str:
-    if not command_text.strip():
-        raise ValueError("empty shell command")
-    if DENYLIST.search(command_text):
-        raise ValueError("command blocked by safety denylist")
-    assert_command_confined(root, command_text)
-    result = subprocess.run(
-        ["/bin/bash", "-c", command_text],
-        cwd=root,
-        text=True,
-        capture_output=True,
-        timeout=timeout_seconds,
-        check=False,
-    )
-    output = (result.stdout or "") + (result.stderr or "")
-    if not output.strip():
-        output = f"(no output, exit code {result.returncode})"
-    return output
+def run_shell(root: Path, command_text: str, timeout_seconds: float, shell: ReadOnlyShell | None = None) -> str:
+    if shell is not None:
+        return shell.run(command_text, timeout_seconds)
+    with ReadOnlyShell(root) as scoped:
+        return scoped.run(command_text, timeout_seconds)
 
 
 def system_prompt() -> str:
@@ -130,9 +89,13 @@ discarded, so "not found" is only a real answer once you have seen every page yo
 page action to read another page of a previous step — it re-reads stored output and does not re-run
 the command, so it is cheaper than repeating the search.
 
-Use standard Unix utilities: ls, find, cat, grep, sed, awk, head, tail, wc, tree (if present). Chain
-with pipes if needed, but keep each turn to a single shell invocation. Never edit files. Be decisive:
-most tasks need 2-6 commands. Call finish as soon as the requested facts are established.
+The shell is READ-ONLY and restricted. Available tools: ls, find, grep, rg, cat, head, tail, wc,
+sort, uniq, cut, tr, nl, sed (no -i), jq, diff, xargs, tree, file, stat, and read-only git
+(log, show, grep, ls-files, diff, blame, status). There is no awk, python, network, output
+redirection, $(...) substitution, $VARIABLES, or loops: write paths and patterns literally and
+chain tools with pipes, one pipeline per turn. A refused command costs a turn, so follow these
+rules. Be decisive: most tasks need 2-6 commands. Call finish as soon as the requested facts are
+established.
 
 SCOPE YOUR SEARCHES. A real workspace holds far more than its source, and an unscoped grep drowns
 the answer in vendored and generated files. Always exclude them:
@@ -252,6 +215,7 @@ def _main(resources: ExitStack) -> int:
 
     seen_calls: dict[str, int] = {}
     observations = resources.enter_context(ObservationStore(runtime.context.observation_page_chars))
+    shell = resources.enter_context(ReadOnlyShell(workspace))
     parse_failures = 0
     for _ in range(runtime.max_turns):
         # Transport failures are terminal (call_model already retried them). A *parse* failure is
@@ -303,7 +267,7 @@ def _main(resources: ExitStack) -> int:
             status = "repeat"
         else:
             try:
-                observation = run_shell(workspace, command_text, runtime.tool_timeout_seconds)
+                observation = run_shell(workspace, command_text, runtime.tool_timeout_seconds, shell)
                 status = "ok"
             except (OSError, ValueError, subprocess.TimeoutExpired) as error:
                 observation = f"tool error: {type(error).__name__}: {error}"
@@ -345,6 +309,7 @@ def _main(resources: ExitStack) -> int:
         "provider_metrics": metrics,
         "model_metadata": {
             "adapter": "bash_shell_agent_v1",
+            "sandbox": shell.kind,
             "temperature": chat_options["temperature"],
             "seed": chat_options["seed"],
             "num_ctx": chat_options["num_ctx"],

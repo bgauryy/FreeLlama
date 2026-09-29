@@ -52,3 +52,17 @@ describe("assertAllowedWorkspace", () => {
     );
   });
 });
+
+describe("delegateEnvironment", () => {
+  it("keeps adapter settings and drops unrelated secrets", async () => {
+    const { delegateEnvironment } = await import("../../src/config.js");
+    const env = delegateEnvironment({
+      PATH: "/usr/bin",
+      FREELLAMA_AGENT_NUM_CTX: "8192",
+      GITHUB_TOKEN: "ghp_secret",
+      AWS_SECRET_ACCESS_KEY: "secret",
+      OPENAI_API_KEY: "sk-secret",
+    });
+    expect(env).toEqual({ PATH: "/usr/bin", FREELLAMA_AGENT_NUM_CTX: "8192" });
+  });
+});

@@ -45,7 +45,16 @@ export function extractExistingWorkspacePath(command: string, workspace: string)
 export async function ollamaFetch(
   endpoint: string | undefined,
   path: string,
-  init: { method?: string; body?: unknown; timeoutMs?: number; parse?: "json" | "ndjson" } = {},
+  init: {
+    method?: string;
+    body?: unknown;
+    timeoutMs?: number;
+    parse?: "json" | "ndjson";
+    /** MCP request cancellation; aborts the HTTP call so Ollama stops the work too. */
+    signal?: AbortSignal;
+    /** ndjson only: called per parsed line as it arrives (pull progress). */
+    onLine?: (line: Record<string, unknown>) => void;
+  } = {},
 ): Promise<unknown> {
   const base = (endpoint ?? DEFAULT_OLLAMA_ENDPOINT).replace(/\/$/, "");
   const controller = new AbortController();
@@ -53,14 +62,17 @@ export async function ollamaFetch(
     () => controller.abort(),
     init.timeoutMs ?? DEFAULT_OLLAMA_FETCH_TIMEOUT_SECONDS * 1000,
   );
+  const signal = init.signal ? AbortSignal.any([controller.signal, init.signal]) : controller.signal;
   try {
     const response = await fetch(`${base}${path}`, {
       method: init.method ?? "GET",
       headers: init.body ? { "content-type": "application/json" } : undefined,
       body: init.body ? JSON.stringify(init.body) : undefined,
-      signal: controller.signal,
+      signal,
     });
-    const text = await response.text();
+    const text = init.onLine && response.ok && response.body
+      ? await readNdjson(response.body, init.onLine)
+      : await response.text();
     if (!response.ok) {
       throw new Error(`Ollama ${init.method ?? "GET"} ${path} -> HTTP ${response.status}: ${text}`);
     }
@@ -70,6 +82,31 @@ export async function ollamaFetch(
   } finally {
     clearTimeout(timeout);
   }
+}
+
+async function readNdjson(
+  body: ReadableStream<Uint8Array>,
+  onLine: (line: Record<string, unknown>) => void,
+): Promise<string> {
+  const decoder = new TextDecoder();
+  let text = "";
+  let pending = "";
+  for await (const chunk of body as unknown as AsyncIterable<Uint8Array>) {
+    const piece = decoder.decode(chunk, { stream: true });
+    text += piece;
+    pending += piece;
+    const lines = pending.split("\n");
+    pending = lines.pop() ?? "";
+    for (const line of lines) {
+      try {
+        const parsed = JSON.parse(line) as unknown;
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) onLine(parsed as Record<string, unknown>);
+      } catch {
+        // A partial or non-JSON line is summarized from the full text afterwards.
+      }
+    }
+  }
+  return text + decoder.decode();
 }
 
 /**
@@ -137,12 +174,15 @@ export async function ollamaPull(
   endpoint: string | undefined,
   model: string,
   timeoutSeconds?: number,
+  options: { signal?: AbortSignal; onProgress?: (event: Record<string, unknown>) => void } = {},
 ): Promise<Record<string, unknown>> {
   const raw = await ollamaFetch(endpoint, "/api/pull", {
     method: "POST",
-    body: { name: model, stream: true },
+    body: { model, stream: true },
     timeoutMs: (timeoutSeconds ?? DEFAULT_PULL_TIMEOUT_SECONDS) * 1000,
     parse: "ndjson",
+    signal: options.signal,
+    onLine: options.onProgress,
   });
   if (typeof raw === "string") return summarizeOllamaPullStream(raw);
   if (raw && typeof raw === "object" && !Array.isArray(raw)) return raw as Record<string, unknown>;

@@ -31,6 +31,7 @@ import {
   DEFAULT_TOKEN_CALIBRATION_DIR,
   DEFAULT_OLLAMA_FETCH_TIMEOUT_SECONDS,
   assertAllowedWorkspace,
+  delegateEnvironment,
 } from "./config.js";
 import {
   doctor, machine, health, createSession, deleteSession, killSession, listModels, route, runTaskRequest, runTaskBatchRequest, SERVER_VERSION,
@@ -58,6 +59,7 @@ import {
   structuredResult,
   taskAnswerText,
   batchAnswerText,
+  ANSWER_TEXT_MAX_CHARS,
   parsedResult,
   errorResult,
   summarizeEmbeddings,
@@ -187,6 +189,46 @@ for (const stream of [process.stdout, process.stderr] as const) {
 }
 
 process.on("exit", killLiveDelegates);
+// A client that closes stdin without a signal (most MCP hosts on shutdown) left this process
+// alive until every running delegate finished, holding a model loaded for nobody.
+process.stdin.on("close", () => {
+  killLiveDelegates();
+  process.exit(0);
+});
+
+type ToolExtra = {
+  signal: AbortSignal;
+  _meta?: { progressToken?: string | number };
+  sendNotification: (notification: {
+    method: "notifications/progress";
+    params: { progressToken: string | number; progress: number; total?: number; message?: string };
+  }) => Promise<void>;
+};
+
+/** MCP progress for a pull: clients that sent a progressToken see bytes instead of a silent wait. */
+function pullProgressReporter(extra: ToolExtra): ((event: Record<string, unknown>) => void) | undefined {
+  const token = extra._meta?.progressToken;
+  if (token === undefined) return undefined;
+  let lastSent = 0;
+  let step = 0;
+  return (event) => {
+    const now = Date.now();
+    if (now - lastSent < 500 && event.status !== "success") return;
+    lastSent = now;
+    step += 1;
+    const completed = typeof event.completed === "number" ? event.completed : undefined;
+    const total = typeof event.total === "number" ? event.total : undefined;
+    void extra.sendNotification({
+      method: "notifications/progress",
+      params: {
+        progressToken: token,
+        progress: completed ?? step,
+        ...(completed !== undefined && total !== undefined ? { total } : {}),
+        message: String(event.status ?? "pulling"),
+      },
+    }).catch(() => undefined);
+  };
+}
 for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
   process.on(signal, () => {
     killLiveDelegates();
@@ -195,13 +237,13 @@ for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
 }
 
 
-const INSTRUCTIONS = `caller owns task decomposition; operator owns endpoints, exact --cpu-model assignments, lifecycle. Ollama plus the OS/driver run physical CPU/GPU.
-models{view:"installed"}, then models{view:"resident"}; doctor only diagnoses. Preview consequential work.
-delegate_research is narrow read-only workspace research.
+const INSTRUCTIONS = `Offload work to local Ollama models.
+1. models{view:"installed"}, then models{view:"resident"}: see what exists and what is loaded; never assume a tag. doctor only diagnoses.
+2. run_task{prompt} executes on a routed model and returns the answer as text; add model to pin one. run_task preview never executes; code_review aliases coding. Use requiredCapabilities:["tools"] to preview tool eligibility; omit preview and supply the payload to execute.
+3. delegate_research is narrow read-only workspace research; verify its citations.
+The caller owns task decomposition, prompts and format; findings are candidates, not accepted defects. The operator owns endpoints, exact --cpu-model assignments, lifecycle. Ollama plus the OS/driver run physical CPU/GPU.
 ask approval for one exact tag and reported size before ollama_manage; search or recommendation is never download permission.
-run_task preview never executes; code_review aliases coding. Caller owns prompts and format; findings are candidates, not accepted defects.
-Use requiredCapabilities:["tools"] to preview tool eligibility; omit preview and supply the payload to execute.
-Docs: freellama://docs/index.`;
+run_task and delegate_research need \`freellama serve\` (default :11435). Docs: freellama://docs/index.`;
 
 const server = new McpServer(
   { name: "freellama", version: SERVER_VERSION },
@@ -674,7 +716,7 @@ server.registerTool(
       task: taskParam,
       objective: objectiveParam,
       model: z.string().min(1).optional().describe("Exact installed model."),
-      sessionId: z.string().min(1).optional().describe("Model affinity, not history."),
+      sessionId: z.string().uuid().optional().describe("Model affinity from session{create}, not history."),
       contextTokens: z.number().int().positive().optional().describe("Total input + output window (num_ctx)."),
       executionPreference: executionPreferenceParam,
       minPlacementEvidence: minPlacementEvidenceParam,
@@ -971,19 +1013,23 @@ server.registerTool(
         .describe(`"pull" only. Defaults to ${DEFAULT_PULL_TIMEOUT_SECONDS}s.`),
     },
     outputSchema: manageResultSchema,
-    annotations: { destructiveHint: false },
+    annotations: { destructiveHint: false, openWorldHint: true },
   },
-  async ({ action, model, ollamaEndpoint, timeoutSeconds }) => {
+  async ({ action, model, ollamaEndpoint, timeoutSeconds }, extra) => {
     try {
       if (action === "stop" && timeoutSeconds !== undefined) {
         return errorResult(new Error('`timeoutSeconds` is valid only for action "pull".'));
       }
       const data =
         action === "pull"
-          ? await ollamaPull(ollamaEndpoint, model, timeoutSeconds)
+          ? await ollamaPull(ollamaEndpoint, model, timeoutSeconds, {
+              signal: extra.signal,
+              onProgress: pullProgressReporter(extra),
+            })
           : await ollamaFetch(ollamaEndpoint, "/api/generate", {
               method: "POST",
               body: { model, keep_alive: 0 },
+              signal: extra.signal,
             });
       const payload = data as Record<string, unknown>;
       // Pull failures arrive as an {"error": ...} event on an HTTP 200 stream, so the fetch
@@ -1016,7 +1062,7 @@ server.registerTool(
     try {
       await ollamaFetch(ollamaEndpoint, "/api/delete", {
         method: "DELETE",
-        body: { name: model },
+        body: { model },
       });
       return structuredResult({ deleted: model });
     } catch (error) {
@@ -1029,6 +1075,24 @@ server.registerTool(
  * Verdicts in `assessDelegatedAnswer` are per-model, from on-disk evidence — never a global
  * base rate. Grades live in benchmark/evidence/model-evidence.json.
  */
+/** With no explicit or configured model, ask the router for an installed coding model. */
+async function routedResearchModel(
+  endpoint: string | undefined,
+  executionPreference: string | undefined,
+  minPlacementEvidence: string | undefined,
+): Promise<string> {
+  const decision = JSON.parse(
+    await route(endpoint, "coding", "balanced", undefined, undefined, undefined, [], undefined, executionPreference, minPlacementEvidence),
+  ) as { selected_model?: unknown };
+  if (typeof decision.selected_model !== "string" || !decision.selected_model) {
+    throw new Error(
+      "No research model: pass `model`, set FREELLAMA_MCP_DEFAULT_MODEL, or install a coding model " +
+        "(models{view:'installed'} shows what routing can use).",
+    );
+  }
+  return decision.selected_model;
+}
+
 server.registerTool(
   "delegate_research",
   {
@@ -1049,7 +1113,7 @@ server.registerTool(
         .string()
         .min(1)
         .optional()
-        .describe("default FREELLAMA_MCP_DEFAULT_MODEL"),
+        .describe("default FREELLAMA_MCP_DEFAULT_MODEL, else the routed coding model"),
       endpoint: endpointParam,
       executionPreference: executionPreferenceParam,
       minPlacementEvidence: minPlacementEvidenceParam,
@@ -1065,36 +1129,20 @@ server.registerTool(
           keepAlive: z.string().min(1).optional(),
           requestTimeoutSeconds: z.number().positive().optional(),
           toolTimeoutSeconds: z.number().positive().optional(),
-          retryAttempts: z.number().int().positive().optional(),
-          retryBackoffSeconds: z.number().nonnegative().optional(),
-          maxParseRepairs: z.number().int().nonnegative().optional(),
-          parseRepairEchoChars: z.number().int().positive().optional(),
-          context: z
-            .object({
-              charsPerToken: z.number().positive().optional(),
-              safetyMarginTokens: z.number().int().nonnegative().optional(),
-              imageTokenEstimate: z.number().int().nonnegative().optional(),
-              keepRecent: z.number().int().nonnegative().optional(),
-              compactPreviewChars: z.number().int().positive().optional(),
-              compactRetainRatio: z.number().positive().lt(1).optional(),
-              clipHeadRatio: z.number().positive().lt(1).optional(),
-              observationPageChars: z.number().int().positive().optional(),
-              pinnedOverflow: z.enum(["error", "clip"]).optional(),
-            })
-            .optional(),
         })
         .optional()
-        .describe("Per-call agent budget, recovery, and compaction controls."),
+        .describe("Per-call budget. Retry, repair and compaction tuning: FREELLAMA_AGENT_* env vars."),
     },
     outputSchema: researchResultSchema,
     annotations: { destructiveHint: false },
   },
-  async ({ question, workspacePath, adapter, model, endpoint, executionPreference, minPlacementEvidence, legacyText, agent }) => {
+  async ({ question, workspacePath, adapter, model, endpoint, executionPreference, minPlacementEvidence, legacyText, agent }, extra) => {
     const chosenAdapter: ResearchAdapter = adapter ?? DEFAULT_RESEARCH_ADAPTER;
-    const chosenModel = model ?? DEFAULT_DELEGATE_MODEL;
     let resolvedWorkspace: string;
+    let chosenModel: string;
     try {
       resolvedWorkspace = await assertAllowedWorkspace(workspacePath);
+      chosenModel = model ?? DEFAULT_DELEGATE_MODEL ?? await routedResearchModel(endpoint, executionPreference, minPlacementEvidence);
     } catch (error) {
       return errorResult(error);
     }
@@ -1131,8 +1179,9 @@ server.registerTool(
         );
       }
       const running = execFileAsync("python3", [adapter], {
+        signal: extra.signal,
         env: {
-          ...process.env,
+          ...delegateEnvironment(),
           FREELLAMA_TARGET_MODEL: chosenModel,
           FREELLAMA_AGENT_MANAGED_ENDPOINT: endpoint ?? DEFAULT_SERVE_ENDPOINT,
           FREELLAMA_AGENT_EXECUTION_PREFERENCE: executionPreference ?? "auto",
@@ -1150,19 +1199,6 @@ server.registerTool(
           ...(agent?.keepAlive !== undefined ? { FREELLAMA_AGENT_KEEP_ALIVE: agent.keepAlive } : {}),
           ...(agent?.requestTimeoutSeconds !== undefined ? { FREELLAMA_AGENT_REQUEST_TIMEOUT_SECONDS: String(agent.requestTimeoutSeconds) } : {}),
           ...(agent?.toolTimeoutSeconds !== undefined ? { FREELLAMA_AGENT_TOOL_TIMEOUT_SECONDS: String(agent.toolTimeoutSeconds) } : {}),
-          ...(agent?.retryAttempts !== undefined ? { FREELLAMA_AGENT_RETRY_ATTEMPTS: String(agent.retryAttempts) } : {}),
-          ...(agent?.retryBackoffSeconds !== undefined ? { FREELLAMA_AGENT_RETRY_BACKOFF_SECONDS: String(agent.retryBackoffSeconds) } : {}),
-          ...(agent?.maxParseRepairs !== undefined ? { FREELLAMA_AGENT_MAX_PARSE_REPAIRS: String(agent.maxParseRepairs) } : {}),
-          ...(agent?.parseRepairEchoChars !== undefined ? { FREELLAMA_AGENT_PARSE_REPAIR_ECHO_CHARS: String(agent.parseRepairEchoChars) } : {}),
-          ...(agent?.context?.charsPerToken !== undefined ? { FREELLAMA_AGENT_CHARS_PER_TOKEN: String(agent.context.charsPerToken) } : {}),
-          ...(agent?.context?.safetyMarginTokens !== undefined ? { FREELLAMA_AGENT_SAFETY_MARGIN_TOKENS: String(agent.context.safetyMarginTokens) } : {}),
-          ...(agent?.context?.imageTokenEstimate !== undefined ? { FREELLAMA_AGENT_IMAGE_TOKEN_ESTIMATE: String(agent.context.imageTokenEstimate) } : {}),
-          ...(agent?.context?.keepRecent !== undefined ? { FREELLAMA_AGENT_KEEP_RECENT: String(agent.context.keepRecent) } : {}),
-          ...(agent?.context?.compactPreviewChars !== undefined ? { FREELLAMA_AGENT_COMPACT_PREVIEW_CHARS: String(agent.context.compactPreviewChars) } : {}),
-          ...(agent?.context?.compactRetainRatio !== undefined ? { FREELLAMA_AGENT_COMPACT_RETAIN_RATIO: String(agent.context.compactRetainRatio) } : {}),
-          ...(agent?.context?.clipHeadRatio !== undefined ? { FREELLAMA_AGENT_CLIP_HEAD_RATIO: String(agent.context.clipHeadRatio) } : {}),
-          ...(agent?.context?.observationPageChars !== undefined ? { FREELLAMA_AGENT_OBSERVATION_PAGE_CHARS: String(agent.context.observationPageChars) } : {}),
-          ...(agent?.context?.pinnedOverflow !== undefined ? { FREELLAMA_AGENT_PINNED_OVERFLOW: agent.context.pinnedOverflow } : {}),
         },
         timeout: DEFAULT_DELEGATE_TIMEOUT_SECONDS * 1000,
         // The answer is read from `resultFile`, never from stdout — but execFile's default 1 MB
@@ -1252,13 +1288,8 @@ server.registerTool(
       // The compact machine-readable half. Two independent small-model callers asked for exactly
       // this shape — recommendation, why, citations — rather than parsing it back out of the prose.
       // Successful steps only: a failed command is not a citation for anything.
-      const citations = succeeded.map((step) => ({
-        step: step.step,
-        tool: step.tool,
-        path: step.path,
-        command: step.detail,
-        command_truncated: step.detail_truncated,
-      }));
+      // Citations point into `evidence` by step instead of repeating each command a second time.
+      const citations = succeeded.map((step) => ({ step: step.step, tool: step.tool, path: step.path }));
       if (adapterError) {
         return errorResult(
           new Error(
@@ -1301,7 +1332,15 @@ server.registerTool(
           evidence,
           summary,
         };
-      return structuredResult(payload, { legacyJson: legacyText === true });
+      // The answer itself goes in TextContent: clients that forward only text to the model
+      // otherwise received a pointer to structuredContent and never the answer.
+      const cited = [...new Set(citations.map((citation) => citation.path).filter(Boolean))];
+      const answerText =
+        `${clipText(result.final_answer, ANSWER_TEXT_MAX_CHARS)}\n\n` +
+        `verification: ${verification.recommendation}` +
+        (cited.length ? `\ncited: ${cited.slice(0, 20).join(", ")}` : "") +
+        `\n(${chosenModel}, ${result.tool_calls.length} tool call(s))`;
+      return structuredResult(payload, legacyText === true ? { legacyJson: true } : { text: answerText });
     } catch (error) {
       return errorResult(error);
     } finally {
