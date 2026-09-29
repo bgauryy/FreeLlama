@@ -86,6 +86,37 @@ pub(super) fn size_context(
     }))
 }
 
+/// Reuse a loaded runner's context window when it already covers this request.
+///
+/// Ollama reloads a runner whose `num_ctx` differs from the request's, so bucketing each request
+/// independently (2k/4k/8k/...) turned a warm model into a reload whenever consecutive prompts
+/// landed in different buckets, and back again. Returns the reused size, or `None` when the
+/// loaded runner is a different revision or smaller than the request needs.
+pub(super) fn reuse_resident_context(
+    decision: &mut RouteDecision,
+    model: &CatalogModel,
+    loaded: Option<&Value>,
+) -> Option<u64> {
+    let loaded = loaded?;
+    let requested = decision.options.get("num_ctx").and_then(Value::as_u64)?;
+    let loaded_context = loaded.get("context_length").and_then(Value::as_u64)?;
+    let same_revision = match (
+        model.digest.as_deref(),
+        loaded.get("digest").and_then(Value::as_str),
+    ) {
+        (Some(expected), Some(actual)) => expected == actual,
+        _ => false,
+    };
+    if !same_revision || loaded_context < requested || loaded_context == requested {
+        return None;
+    }
+    decision.options["num_ctx"] = json!(loaded_context);
+    decision
+        .reasons
+        .push("context_reused_from_resident_runner".to_owned());
+    Some(loaded_context)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -56,7 +56,8 @@ Managed work follows a decision contract. Raw Ollama traffic follows a compatibi
 - **Route previews** return a snapshot-only `agent_plan`; previews never reserve capacity or infer
   dependencies. For actual independent work, `run_task_batch` supplies bounded fair dispatch.
 - **Raw `/api/*` and `/v1/*` requests** pass through unchanged to the primary Ollama server.
-- **Grounded research** runs in a confined adapter whose model turns re-enter managed `coding`
+- **Grounded research** runs in a read-only sandboxed adapter (allowlisted tools, restricted shell,
+  scrubbed environment, OS sandbox where available) whose model turns re-enter managed `coding`
   tasks, so file confinement does not bypass routing, admission, or placement evidence.
 
 Read [Product positioning](docs/PRODUCT_POSITIONING.md) for the audience and category decision, or

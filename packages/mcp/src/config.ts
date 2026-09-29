@@ -15,9 +15,13 @@ import { homedir } from "node:os";
  * Unmarked installs must set `FREELLAMA_MCP_ALLOWED_ROOTS`.
  */
 function findRepoRoot(): string | undefined {
+  const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
   let dir = path.dirname(fileURLToPath(import.meta.url));
   for (let depth = 0; depth < 10; depth += 1) {
-    if (existsSync(path.join(dir, "Cargo.toml"))) return dir;
+    // Only a FreeLlama checkout counts: this package must sit at <root>/packages/mcp. Any
+    // Cargo.toml used to match, so an npm install inside some other Rust project silently made
+    // that project the default research allowlist.
+    if (existsSync(path.join(dir, "Cargo.toml")) && path.join(dir, "packages", "mcp") === packageRoot) return dir;
     const parent = path.dirname(dir);
     if (parent === dir) break;
     dir = parent;
@@ -63,8 +67,10 @@ export const DEFAULT_OLLAMA_ENDPOINT = process.env.FREELLAMA_OLLAMA_ENDPOINT ?? 
 // Same env var name the Rust side (packages/rust-core/src/napi.rs) uses for its own serve-endpoint default — one
 // name, one meaning, across both languages.
 export const DEFAULT_SERVE_ENDPOINT = process.env.FREELLAMA_SERVE_ENDPOINT ?? "http://127.0.0.1:11435";
-// docs/MODEL_SELECTION.md owns the measured default; override per machine.
-export const DEFAULT_DELEGATE_MODEL = process.env.FREELLAMA_MCP_DEFAULT_MODEL ?? "qwen3.8:27b-mlx";
+// No hardcoded tag: the old default (`qwen3.8:27b-mlx`) exists only on Apple Silicon, so every
+// Linux/Windows call without `model` failed. Unset means "route to an installed coding model".
+// docs/MODEL_SELECTION.md owns the measured recommendation.
+export const DEFAULT_DELEGATE_MODEL: string | undefined = process.env.FREELLAMA_MCP_DEFAULT_MODEL?.trim() || undefined;
 export const DEFAULT_DELEGATE_MAX_TURNS = envInt("FREELLAMA_MCP_MAX_TURNS", 8);
 export const DEFAULT_DELEGATE_TIMEOUT_SECONDS = envInt("FREELLAMA_MCP_DELEGATE_TIMEOUT_SECONDS", 180);
 export const DEFAULT_PULL_TIMEOUT_SECONDS = envInt("FREELLAMA_MCP_PULL_TIMEOUT_SECONDS", 1200);
@@ -148,4 +154,23 @@ export async function assertAllowedWorkspace(workspacePath: string): Promise<str
     );
   }
   return resolved;
+}
+
+// The research adapter runs model-chosen commands, so it gets only what it needs: its own
+// FREELLAMA_* settings, locale, temp and the proxy/CA settings `npx octocode` needs. Tokens and
+// API keys in the MCP host's environment used to be inherited verbatim.
+const DELEGATE_ENV_ALLOWLIST = new Set([
+  "PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR", "TEMP", "TMP",
+  "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "PATHEXT", "APPDATA", "LOCALAPPDATA", "USERPROFILE",
+  "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy",
+  "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE",
+  "XDG_CACHE_HOME", "XDG_DATA_HOME", "npm_config_cache", "PYTHONPATH",
+]);
+
+export function delegateEnvironment(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(source)) {
+    if (value !== undefined && (DELEGATE_ENV_ALLOWLIST.has(key) || key.startsWith("FREELLAMA_"))) env[key] = value;
+  }
+  return env;
 }

@@ -32,14 +32,14 @@
   },
   "license": "Apache-2.0 OR MIT",
   "optionalDependencies": {
-    "@octocodeai/freellama-native-darwin-arm64": "0.1.0",
-    "@octocodeai/freellama-native-darwin-x64": "0.1.0",
-    "@octocodeai/freellama-native-linux-arm64-gnu": "0.1.0",
-    "@octocodeai/freellama-native-linux-arm64-musl": "0.1.0",
-    "@octocodeai/freellama-native-linux-x64-gnu": "0.1.0",
-    "@octocodeai/freellama-native-linux-x64-musl": "0.1.0",
-    "@octocodeai/freellama-native-win32-arm64-msvc": "0.1.0",
-    "@octocodeai/freellama-native-win32-x64-msvc": "0.1.0"
+    "@octocodeai/freellama-native-darwin-arm64": "0.2.0",
+    "@octocodeai/freellama-native-darwin-x64": "0.2.0",
+    "@octocodeai/freellama-native-linux-arm64-gnu": "0.2.0",
+    "@octocodeai/freellama-native-linux-arm64-musl": "0.2.0",
+    "@octocodeai/freellama-native-linux-x64-gnu": "0.2.0",
+    "@octocodeai/freellama-native-linux-x64-musl": "0.2.0",
+    "@octocodeai/freellama-native-win32-arm64-msvc": "0.2.0",
+    "@octocodeai/freellama-native-win32-x64-msvc": "0.2.0"
   },
   "publishConfig": {
     "access": "public",

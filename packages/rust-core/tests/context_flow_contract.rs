@@ -158,12 +158,9 @@ async fn managed_text_sizes_context_and_refuses_oversize_before_inference() {
         assert_eq!(actual, status, "{}", String::from_utf8_lossy(&bytes));
         if actual == StatusCode::OK {
             let body: Value = serde_json::from_slice(&bytes).unwrap();
-            assert!(
-                body["execution"]["runtime_options"]["num_thread"]
-                    .as_u64()
-                    .unwrap()
-                    >= 1
-            );
+            // num_thread is part of Ollama's runner identity; injecting it on the shared GPU
+            // backend made raw clients and managed tasks reload each other's runner.
+            assert!(body["execution"]["runtime_options"]["num_thread"].is_null());
             assert_eq!(
                 body["execution"]["runtime_options"],
                 captured.lock().await.last().unwrap()["options"]

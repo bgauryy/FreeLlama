@@ -45,7 +45,9 @@ mod readiness;
 pub mod resources;
 mod routing;
 
-pub use discovery::{MachineProfile, machine_profile};
+pub use discovery::{
+    MachineProfile, host_has_unified_memory, host_total_memory_bytes, machine_profile,
+};
 pub use intent::{RouteIntent, intent_schema, normalize_route_intent, parse_route_intent};
 pub use routing::{
     CatalogModel, ExecutionPreference, Objective, PlacementEvidence, RouteDecision, RouteEvidence,
@@ -411,6 +413,8 @@ struct PlatformState {
     max_sessions: usize,
     session_ttl: Duration,
     raw_proxy_max_concurrent_requests: usize,
+    /// Unload idle resident runners when a cold load is short of memory.
+    evict_idle_models: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -672,7 +676,9 @@ pub fn app(config: &PlatformConfig) -> Result<Router> {
         .unwrap_or_default();
     let state = PlatformState {
         resources: config.resource_governor.clone(),
-        footprints: Arc::new(Mutex::new(footprint::FootprintHistory::default())),
+        footprints: Arc::new(Mutex::new(footprint::FootprintHistory::with_hints(
+            footprint::RuntimeHints::from_lookup(|name| std::env::var(name).ok()),
+        ))),
         // A client-level backstop, not a nicety. `forward_managed_task` holds the
         // `managed_execution` write lock across its upstream call, so an untimed request against
         // a wedged Ollama would hold that exclusive lock forever and block every subsequent
@@ -706,6 +712,9 @@ pub fn app(config: &PlatformConfig) -> Result<Router> {
         max_sessions: config.max_sessions.unwrap_or(1024),
         session_ttl: config.session_ttl.unwrap_or(Duration::from_secs(3600)),
         raw_proxy_max_concurrent_requests: config.resolved_raw_proxy_max_concurrent_requests(),
+        evict_idle_models: std::env::var("FREELLAMA_EVICT_IDLE_MODELS").map_or(true, |value| {
+            !matches!(value.trim(), "0" | "false" | "no" | "off")
+        }),
     };
     let fallback_config = ProxyConfig::new(&config.listen, &config.upstream, config.allow_remote)
         .with_max_concurrent_requests(config.resolved_raw_proxy_max_concurrent_requests())
@@ -1369,28 +1378,35 @@ async fn run_task_batch(
         .take(input.tasks.len())
         .collect::<Vec<Option<Value>>>();
     let mut running = JoinSet::new();
+    // A panicking worker must fail only its own item: keep completed answers instead of
+    // discarding the whole batch, which is what `?` on the JoinError used to do.
+    let mut in_flight = BTreeMap::new();
 
     while !pending.is_empty() || !running.is_empty() {
         while running.len() < max_parallelism && !pending.is_empty() {
             let index = next_batch_task(&mut pending, &input.tasks, &mut credits);
-            let id = input.tasks[index].id.clone();
             let task = input.tasks[index].task.clone();
             let task_state = state.clone();
-            running.spawn(async move {
-                let result = run_task(State(task_state), Json(task)).await;
-                (index, id, result)
-            });
+            let handle = running.spawn(Box::pin(run_task(State(task_state), Json(task))));
+            in_flight.insert(handle.id(), index);
         }
-        if let Some(joined) = running.join_next().await {
-            let (index, id, result) = joined.map_err(|error| {
-                ApiError::new(
+        if let Some(joined) = running.join_next_with_id().await {
+            let (task_id, outcome) = match joined {
+                Ok((task_id, result)) => (task_id, Ok(result)),
+                Err(error) => (error.id(), Err(error)),
+            };
+            let Some(index) = in_flight.remove(&task_id) else {
+                continue;
+            };
+            let id = input.tasks[index].id.clone();
+            results[index] = Some(match outcome {
+                Ok(Ok(Json(response))) => json!({ "id": id, "ok": true, "response": response }),
+                Ok(Err(error)) => error.into_batch_result(id),
+                Err(error) => ApiError::new(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("batch worker failed: {error}"),
                 )
-            })?;
-            results[index] = Some(match result {
-                Ok(Json(response)) => json!({ "id": id, "ok": true, "response": response }),
-                Err(error) => error.into_batch_result(id),
+                .into_batch_result(id),
             });
         }
     }
@@ -1475,15 +1491,21 @@ async fn fetch_catalog_from(
         .and_then(Value::as_array)
         .context("Ollama tags response has no models")
         .map_err(ApiError::upstream)?;
+    let names = entries
+        .iter()
+        .map(|entry| {
+            entry
+                .get("name")
+                .or_else(|| entry.get("model"))
+                .and_then(Value::as_str)
+                .context("Ollama model has no name")
+                .map_err(ApiError::upstream)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut shows = show_models(state, upstream, &names).await?;
     let mut models = Vec::with_capacity(entries.len());
-    for entry in entries {
-        let name = entry
-            .get("name")
-            .or_else(|| entry.get("model"))
-            .and_then(Value::as_str)
-            .context("Ollama model has no name")
-            .map_err(ApiError::upstream)?;
-        let Some(show) = show_model(state, upstream, name).await? else {
+    for (index, (entry, name)) in entries.iter().zip(names).enumerate() {
+        let Some(show) = shows[index].take() else {
             continue;
         };
         let capabilities = show
@@ -1608,6 +1630,36 @@ fn estimate_kv_cache_bytes_per_token_f16(show: &Value) -> Option<u64> {
         .checked_mul(kv_heads)?
         .checked_mul(key.checked_add(value)?)?
         .checked_mul(2)
+}
+
+/// Concurrent `/api/show` lookups for a whole catalog. Sequential lookups made a cold catalog cost
+/// one control round trip per installed model; a small bound keeps a large library from flooding
+/// Ollama. Results keep the order of `names`.
+const SHOW_CONCURRENCY: usize = 4;
+
+async fn show_models(
+    state: &PlatformState,
+    upstream: &str,
+    names: &[&str],
+) -> Result<Vec<Option<Value>>, ApiError> {
+    let permits = Arc::new(tokio::sync::Semaphore::new(SHOW_CONCURRENCY));
+    let mut lookups = tokio::task::JoinSet::new();
+    for (index, name) in names.iter().enumerate() {
+        let (state, upstream, name) = (state.clone(), upstream.to_owned(), (*name).to_owned());
+        let permits = Arc::clone(&permits);
+        lookups.spawn(async move {
+            let _permit = permits.acquire_owned().await;
+            (index, show_model(&state, &upstream, &name).await)
+        });
+    }
+    let mut shows = vec![None; names.len()];
+    while let Some(joined) = lookups.join_next().await {
+        let (index, show) = joined
+            .context("model metadata lookup panicked")
+            .map_err(ApiError::upstream)?;
+        shows[index] = show?;
+    }
+    Ok(shows)
 }
 
 /// `None` means skip this tag — a single corrupt `/api/show` must not 502 the whole catalog.

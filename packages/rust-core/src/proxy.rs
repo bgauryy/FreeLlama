@@ -90,9 +90,23 @@ pub(crate) fn retry_delay(attempt: u32) -> Duration {
 /// Request bodies are buffered (not streamed) so a failed attempt can be resent byte-for-byte.
 /// Ollama chat/generate payloads are JSON, not large uploads, so this bound is generous.
 const MAX_BUFFERED_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
-/// Default per-attempt upstream timeout. Generous enough for a slow local-model generation turn,
-/// bounded enough that a hung connection fails fast instead of blocking the caller indefinitely.
-const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+/// Default upstream idle timeout: the longest gap allowed between bytes from Ollama (including
+/// the wait for response headers while a model loads). It is not a total deadline, so a streamed
+/// generation that keeps producing tokens is never cut off mid-answer, while a wedged connection
+/// still fails instead of blocking the caller indefinitely.
+/// Matches Ollama's own `OLLAMA_LOAD_TIMEOUT` (5m), so a cold load of a large model is not cut
+/// off by the proxy before Ollama itself would give up.
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+/// Establishing a loopback connection is instant; a long connect wait only delays the
+/// connection-refused handling that restarts or reports a stopped Ollama.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a raw generation waits for a host memory/pressure hold to clear before a 503 with
+/// `retry-after`. Short, because raw callers cannot be queued fairly; managed `/tasks` queue.
+const RAW_PRESSURE_WAIT: Duration = Duration::from_secs(2);
+/// Ollama endpoints that only move model files. They never load a runner, so they neither take
+/// the execution lock nor wait on memory: a multi-minute pull used to hold the exclusive lock and
+/// refuse every managed task until the download finished.
+const MODEL_STORE_PATHS: &[&str] = &["/api/pull", "/api/push", "/api/copy", "/api/delete"];
 
 const HOP_BY_HOP: &[&str] = &[
     "connection",
@@ -141,7 +155,8 @@ impl ProxyConfig {
         }
     }
 
-    /// Overrides the per-attempt upstream timeout (default 120s).
+    /// Overrides the upstream idle timeout (default 300s): the longest silence allowed between
+    /// bytes, not a total deadline. It also bounds reading the incoming request body.
     #[must_use]
     pub fn with_request_timeout(mut self, request_timeout: Duration) -> Self {
         self.request_timeout = request_timeout;
@@ -317,7 +332,8 @@ pub fn app(config: ProxyConfig) -> Result<Router> {
     let state = ProxyState {
         resource_governor: config.resource_governor,
         client: Client::builder()
-            .timeout(config.request_timeout)
+            .connect_timeout(CONNECT_TIMEOUT.min(config.request_timeout))
+            .read_timeout(config.request_timeout)
             .build()
             .context("build upstream HTTP client")?,
         request_body_timeout: config.request_timeout,
@@ -337,21 +353,96 @@ async fn shutdown() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
+/// How a raw request is admitted. Only generations take the execution lock and memory checks.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RawRequestKind {
+    /// Reads (GET/HEAD, `/api/show`): always available, including to diagnose pressure.
+    Metadata,
+    /// Pull/push/copy/delete and blob uploads: file work that never loads a runner.
+    ModelStore,
+    /// A `keep_alive: 0` request with nothing to generate: frees memory, so never held for it.
+    Unload,
+    /// Anything that may load a model or generate.
+    Generation,
+}
+
+fn is_zero_keep_alive(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Number(number) => number.as_f64() == Some(0.0),
+        serde_json::Value::String(text) => {
+            let digits = text.trim().trim_end_matches(['s', 'm', 'h']);
+            !digits.is_empty() && digits.parse::<f64>().is_ok_and(|value| value == 0.0)
+        }
+        _ => false,
+    }
+}
+
+fn classify(method: &reqwest::Method, path: &str, body: &[u8]) -> RawRequestKind {
+    if path.starts_with("/api/blobs/") || MODEL_STORE_PATHS.contains(&path) {
+        return RawRequestKind::ModelStore;
+    }
+    if matches!(*method, reqwest::Method::GET | reqwest::Method::HEAD) || path == "/api/show" {
+        return RawRequestKind::Metadata;
+    }
+    if matches!(path, "/api/generate" | "/api/chat")
+        && let Ok(body) = serde_json::from_slice::<serde_json::Value>(body)
+        && body.get("keep_alive").is_some_and(is_zero_keep_alive)
+        && body
+            .get("prompt")
+            .is_none_or(|value| value.as_str() == Some(""))
+        && body
+            .get("messages")
+            .is_none_or(|value| value.as_array().is_some_and(Vec::is_empty))
+        && body.get("images").is_none()
+    {
+        return RawRequestKind::Unload;
+    }
+    RawRequestKind::Generation
+}
+
+fn json_response(status: StatusCode, body: String) -> Response<Body> {
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .expect("static response is valid")
+}
+
 async fn forward(State(state): State<ProxyState>, request: Request) -> impl IntoResponse {
-    let metadata =
-        matches!(request.method().as_str(), "GET" | "HEAD") || request.uri().path() == "/api/show";
-    let execution = if metadata {
-        None
-    } else if let Some(lock) = state.execution_lock.as_ref() {
-        match Arc::clone(lock).try_write_owned() {
-            Ok(guard) => Some(guard),
-            Err(_) => {
-                return Response::builder()
-                    .status(StatusCode::SERVICE_UNAVAILABLE)
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"error":"proxy busy: backend execution active; use managed /_freellama/v1/tasks to queue"}"#))
-                    .expect("static response is valid");
-            }
+    let (parts, body) = request.into_parts();
+    // Buffer the body before taking any lock: a retried attempt must resend the exact same bytes,
+    // and a slow or incomplete upload must never hold the shared execution lock while it trickles.
+    let body_bytes = match tokio::time::timeout(
+        state.request_body_timeout,
+        to_bytes(body, MAX_BUFFERED_REQUEST_BODY_BYTES),
+    )
+    .await
+    {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(error)) => {
+            eprintln!("proxy error: buffer request body: {error:#}");
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                r#"{"error":"could not read request body"}"#.into(),
+            );
+        }
+        Err(_) => {
+            return json_response(
+                StatusCode::REQUEST_TIMEOUT,
+                r#"{"error":"request body read deadline exceeded"}"#.into(),
+            );
+        }
+    };
+    let kind = classify(&parts.method, parts.uri.path(), &body_bytes);
+    let generation = kind == RawRequestKind::Generation;
+    let execution = if generation && let Some(lock) = state.execution_lock.as_ref() {
+        if let Ok(guard) = Arc::clone(lock).try_write_owned() {
+            Some(guard)
+        } else {
+            return json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                r#"{"error":"proxy busy: backend execution active; use managed /_freellama/v1/tasks to queue"}"#.into(),
+            );
         }
     } else {
         None
@@ -359,22 +450,44 @@ async fn forward(State(state): State<ProxyState>, request: Request) -> impl Into
     let permit = match state
         .admission
         .as_ref()
-        .filter(|_| !metadata)
+        .filter(|_| generation)
         .map(Arc::clone)
     {
-        Some(admission) => match admission.try_acquire_owned() {
-            Ok(permit) => Some(permit),
-            Err(_) => {
-                return Response::builder()
-                    .status(StatusCode::SERVICE_UNAVAILABLE)
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"error":"proxy busy: raw request limit reached; use managed /_freellama/v1/tasks for weighted admission"}"#))
-                    .expect("static response is valid");
+        Some(admission) => {
+            if let Ok(permit) = admission.try_acquire_owned() {
+                Some(permit)
+            } else {
+                return json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    r#"{"error":"proxy busy: raw request limit reached; use managed /_freellama/v1/tasks for weighted admission"}"#.into(),
+                );
             }
-        },
+        }
         None => None,
     };
-    match forward_inner(&state, request).await {
+    let resource = if generation {
+        match state
+            .resource_governor
+            .wait_for_capacity(&state.upstream, 0, RAW_PRESSURE_WAIT)
+            .await
+        {
+            Ok(permit) => Some(permit),
+            Err(error) => {
+                let mut refusal = json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    serde_json::json!({"error": error.to_string(), "resource_admission": error.receipt})
+                        .to_string(),
+                );
+                refusal
+                    .headers_mut()
+                    .insert("retry-after", axum::http::HeaderValue::from_static("2"));
+                return refusal;
+            }
+        }
+    } else {
+        None
+    };
+    match forward_inner(&state, &parts, &body_bytes).await {
         Ok(response) => {
             let (parts, body) = response.into_parts();
             Response::from_parts(
@@ -383,29 +496,17 @@ async fn forward(State(state): State<ProxyState>, request: Request) -> impl Into
                     inner: body,
                     permit,
                     execution,
-                    resource: None,
+                    resource,
                 }),
             )
         }
         Err(error) => {
-            drop(permit);
+            drop((permit, execution, resource));
             eprintln!("proxy error: {error:#}");
-            let (status, body) = if error.is::<tokio::time::error::Elapsed>() {
-                (
-                    StatusCode::REQUEST_TIMEOUT,
-                    r#"{"error":"request body read deadline exceeded"}"#,
-                )
-            } else {
-                (
-                    StatusCode::BAD_GATEWAY,
-                    r#"{"error":"upstream unavailable"}"#,
-                )
-            };
-            Response::builder()
-                .status(status)
-                .header("content-type", "application/json")
-                .body(Body::from(body))
-                .expect("static response is valid")
+            json_response(
+                StatusCode::BAD_GATEWAY,
+                r#"{"error":"upstream unavailable"}"#.into(),
+            )
         }
     }
 }
@@ -504,50 +605,15 @@ async fn try_restart_ollama(state: &ProxyState) -> bool {
     true
 }
 
-async fn forward_inner(state: &ProxyState, request: Request) -> Result<Response<Body>> {
+async fn forward_inner(
+    state: &ProxyState,
+    parts: &axum::http::request::Parts,
+    body_bytes: &Bytes,
+) -> Result<Response<Body>> {
     let started = Instant::now();
-    let target = proxy_target(&state.upstream, request.uri().to_string().as_str())?;
-    let (parts, body) = request.into_parts();
-    // Buffer the body up front: a retried attempt must resend the exact same bytes, and a
-    // streamed body can only be consumed once.
-    // The upstream client timeout starts only after this read. Bound incoming uploads too:
-    // otherwise an incomplete body can retain the shared execution lock indefinitely.
-    let body_bytes = tokio::time::timeout(
-        state.request_body_timeout,
-        to_bytes(body, MAX_BUFFERED_REQUEST_BODY_BYTES),
-    )
-    .await
-    .context("read incoming request body before deadline")?
-    .context("buffer request body for retry-safe forwarding")?;
+    let target = proxy_target(&state.upstream, parts.uri.to_string().as_str())?;
     let headers = filtered_headers(&parts.headers);
-
-    // Metadata and unload requests must remain available to diagnose/recover pressure.
-    // Raw requests remain byte-preserving; only admission interprets their envelope.
-    let parsed = serde_json::from_slice::<serde_json::Value>(&body_bytes).ok();
-    let unload = parts.uri.path() == "/api/generate" && parsed.as_ref().is_some_and(|body| {
-        matches!(body.get("keep_alive"), Some(value) if value == 0 || value == "0" || value == "0s")
-            && body
-                .get("prompt")
-                .is_none_or(|value| value.as_str() == Some(""))
-            && body.get("messages").is_none()
-            && body.get("images").is_none()
-    });
-    let metadata = matches!(parts.method, reqwest::Method::GET | reqwest::Method::HEAD)
-        || parts.uri.path() == "/api/show";
-    let resource = if metadata || unload {
-        None
-    } else {
-        match state.resource_governor.wait_for_capacity(&state.upstream, 0, Duration::from_millis(500)).await {
-            Ok(permit) => Some(permit),
-            Err(error) => return Response::builder().status(StatusCode::SERVICE_UNAVAILABLE)
-                .header("content-type", "application/json")
-                .header("retry-after", "2")
-                .body(Body::from(serde_json::json!({"error":error.to_string(),"resource_admission":error.receipt}).to_string()))
-                .context("build resource refusal"),
-        }
-    };
-
-    let outcome = send_with_retries(state, &parts.method, &target, &headers, &body_bytes).await;
+    let outcome = send_with_retries(state, &parts.method, &target, &headers, body_bytes).await;
     let response = match outcome {
         Ok(response) => response,
         Err(error)
@@ -557,7 +623,7 @@ async fn forward_inner(state: &ProxyState, request: Request) -> Result<Response<
         {
             // One more full attempt (with its own internal MAX_ATTEMPTS retries) after the
             // restart — not an unbounded loop back into this same branch.
-            send_with_retries(state, &parts.method, &target, &headers, &body_bytes).await?
+            send_with_retries(state, &parts.method, &target, &headers, body_bytes).await?
         }
         Err(error) => return Err(error),
     };
@@ -569,12 +635,7 @@ async fn forward_inner(state: &ProxyState, request: Request) -> Result<Response<
     }
     outgoing = outgoing.header("x-freellama-proxy", "1");
     let result = outgoing
-        .body(Body::new(AdmittedBody {
-            inner: Body::from_stream(response.bytes_stream()),
-            permit: None,
-            execution: None,
-            resource,
-        }))
+        .body(Body::from_stream(response.bytes_stream()))
         .context("build proxied response")?;
     eprintln!(
         "proxy method={} path={} upstream_status={} upstream_headers_ms={}",

@@ -2,7 +2,7 @@
 //! introspection, benchmark/policy file loaders, capability parsing) that the server plane in
 //! `mod.rs` calls but that carry no request state of their own.
 
-use std::{collections::BTreeMap, path::PathBuf, process::Command};
+use std::{collections::BTreeMap, path::PathBuf, process::Command, sync::OnceLock};
 
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -123,13 +123,13 @@ pub(super) fn parse_capability(value: &str) -> Option<Capability> {
 }
 
 pub fn machine_profile(upstream: &str) -> MachineProfile {
-    let memory_bytes = total_memory_bytes();
+    let memory_bytes = host_total_memory_bytes();
     let (memory_kind, unified_memory) =
         memory_semantics(std::env::consts::OS, std::env::consts::ARCH);
     MachineProfile {
         os: std::env::consts::OS.to_owned(),
         architecture: std::env::consts::ARCH.to_owned(),
-        chip: chip_name(),
+        chip: cached_chip_name(),
         logical_cpus: std::thread::available_parallelism().map_or(1, usize::from),
         memory_bytes,
         memory_kind,
@@ -137,6 +137,24 @@ pub fn machine_profile(upstream: &str) -> MachineProfile {
         available_disk_bytes: available_disk_bytes(),
         ollama_endpoint: upstream.to_owned(),
     }
+}
+
+/// Physical RAM does not change while serve runs, and reading it spawns `sysctl` (macOS) or
+/// `PowerShell` (Windows); the managed hot path used to do that several times per task.
+pub fn host_total_memory_bytes() -> Option<u64> {
+    static TOTAL: OnceLock<Option<u64>> = OnceLock::new();
+    *TOTAL.get_or_init(total_memory_bytes)
+}
+
+fn cached_chip_name() -> Option<String> {
+    static CHIP: OnceLock<Option<String>> = OnceLock::new();
+    CHIP.get_or_init(chip_name).clone()
+}
+
+/// Whether CPU and GPU share one physical memory pool (Apple Silicon).
+#[must_use]
+pub const fn host_has_unified_memory() -> bool {
+    memory_semantics(std::env::consts::OS, std::env::consts::ARCH).1
 }
 
 const fn memory_semantics(os: &str, architecture: &str) -> (&'static str, bool) {
@@ -213,7 +231,7 @@ fn total_memory_bytes() -> Option<u64> {
 fn available_disk_bytes() -> Option<u64> {
     #[cfg(target_os = "windows")]
     {
-        return command_output(
+        command_output(
             "powershell.exe",
             &[
                 "-NoProfile",
@@ -221,7 +239,7 @@ fn available_disk_bytes() -> Option<u64> {
                 "(Get-PSDrive -Name (Get-Item .).PSDrive.Name).Free",
             ],
         )
-        .and_then(|value| value.parse().ok());
+        .and_then(|value| value.parse().ok())
     }
     #[cfg(not(target_os = "windows"))]
     {

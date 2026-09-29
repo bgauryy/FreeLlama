@@ -151,12 +151,19 @@ mod telemetry_cli_tests {
                 expected
             );
         }
+        // Memory telemetry is required where a collector exists; Windows has none, so its
+        // default is best-effort rather than refusing every local request.
+        let default_policy = if cfg!(any(target_os = "linux", target_os = "macos")) {
+            "require_memory"
+        } else {
+            "best_effort"
+        };
         assert_eq!(
             serde_json::to_value(
                 freellama::platform::resources::ResourcePolicy::default().telemetry_policy
             )
             .unwrap(),
-            "require_memory"
+            default_policy
         );
     }
 }
@@ -194,13 +201,20 @@ struct ProductionArgs {
     allow_remote: bool,
 }
 
+// Parsed once per process, so the size gap between `Serve` and the small commands costs nothing.
+// Windows' larger `PathBuf` pushes the gap past clippy's threshold there.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Inspect prerequisites and print a side-effect-free first-run plan. Never pulls a model.
     Init {
         #[arg(long, default_value = "http://127.0.0.1:11434")]
         ollama_endpoint: String,
-        #[arg(long, default_value = "http://127.0.0.1:11435")]
+        #[arg(
+            long,
+            env = "FREELLAMA_SERVE_ENDPOINT",
+            default_value = "http://127.0.0.1:11435"
+        )]
         serve_endpoint: String,
     },
     /// Generate a strong bearer token into a new mode-0600 file. Refuses to overwrite.
@@ -233,22 +247,38 @@ enum Command {
     },
     /// List installed local models with capabilities, residency, and local evidence.
     Models {
-        #[arg(long, default_value = "http://127.0.0.1:11435")]
+        #[arg(
+            long,
+            env = "FREELLAMA_SERVE_ENDPOINT",
+            default_value = "http://127.0.0.1:11435"
+        )]
         endpoint: String,
     },
-    /// Print the Mac execution profile visible to the platform.
+    /// Print the machine execution profile (CPU, memory, GPU, backends) visible to the platform.
     Machine {
-        #[arg(long, default_value = "http://127.0.0.1:11435")]
+        #[arg(
+            long,
+            env = "FREELLAMA_SERVE_ENDPOINT",
+            default_value = "http://127.0.0.1:11435"
+        )]
         endpoint: String,
     },
     /// Create an isolated session for model affinity across related tasks.
     Session {
-        #[arg(long, default_value = "http://127.0.0.1:11435")]
+        #[arg(
+            long,
+            env = "FREELLAMA_SERVE_ENDPOINT",
+            default_value = "http://127.0.0.1:11435"
+        )]
         endpoint: String,
     },
     /// Resolve a task to a local model and Ollama request profile without running it.
     Route {
-        #[arg(long, default_value = "http://127.0.0.1:11435")]
+        #[arg(
+            long,
+            env = "FREELLAMA_SERVE_ENDPOINT",
+            default_value = "http://127.0.0.1:11435"
+        )]
         endpoint: String,
         #[arg(long, value_enum, default_value_t = TaskKind::Completion)]
         task: TaskKind,
@@ -271,7 +301,7 @@ enum Command {
         /// Refuse rather than return a route graded below this ("low" or "medium"). "medium"
         /// needs both a policy file and a benchmark report; without them every route grades "low"
         /// and this refuses — which is the point.
-        #[arg(long)]
+        #[arg(long, value_parser = ["low", "medium"])]
         min_confidence: Option<String>,
         /// Extra capability the model must advertise (repeatable), e.g. `--required-capability vision`.
         #[arg(long = "required-capability")]
@@ -279,7 +309,11 @@ enum Command {
     },
     /// Recommend an installed route or a reviewed, side-effect-free model installation plan.
     Recommend {
-        #[arg(long, default_value = "http://127.0.0.1:11435")]
+        #[arg(
+            long,
+            env = "FREELLAMA_SERVE_ENDPOINT",
+            default_value = "http://127.0.0.1:11435"
+        )]
         endpoint: String,
         #[arg(long, value_enum, default_value_t = TaskKind::Completion)]
         task: TaskKind,
@@ -304,7 +338,11 @@ enum Command {
     NaturalRoute {
         /// Natural-language task description.
         text: String,
-        #[arg(long, default_value = "http://127.0.0.1:11435")]
+        #[arg(
+            long,
+            env = "FREELLAMA_SERVE_ENDPOINT",
+            default_value = "http://127.0.0.1:11435"
+        )]
         endpoint: String,
         #[arg(long)]
         session: Option<String>,
@@ -313,7 +351,11 @@ enum Command {
     Task {
         /// Prompt to send as a single user message.
         prompt: String,
-        #[arg(long, default_value = "http://127.0.0.1:11435")]
+        #[arg(
+            long,
+            env = "FREELLAMA_SERVE_ENDPOINT",
+            default_value = "http://127.0.0.1:11435"
+        )]
         endpoint: String,
         #[arg(long, value_enum, default_value_t = TaskKind::Completion)]
         task: TaskKind,
@@ -342,7 +384,7 @@ enum Command {
         #[arg(long)]
         input_file: Option<PathBuf>,
         /// Refuse rather than run a route graded below this ("low" or "medium").
-        #[arg(long)]
+        #[arg(long, value_parser = ["low", "medium"])]
         min_confidence: Option<String>,
         #[arg(long = "required-capability")]
         required_capabilities: Vec<String>,
@@ -359,9 +401,10 @@ enum Command {
         /// Explicitly permit binding beyond localhost. Add authentication before using this.
         #[arg(long)]
         allow_remote: bool,
-        /// Per-attempt upstream timeout. Raise this for endpoints that legitimately run long
-        /// (e.g. `/api/pull`); the default suits chat/generate-style requests.
-        #[arg(long, default_value_t = 120)]
+        /// Longest silence allowed from Ollama, including the wait for headers while a model
+        /// loads. Not a total deadline: a stream that keeps producing bytes is never cut off.
+        /// The default matches Ollama's own 5-minute model load timeout.
+        #[arg(long, default_value_t = 300)]
         request_timeout_seconds: u64,
         /// Opt-in: on a true connection-refused failure (Ollama's process is gone, not just
         /// slow or erroring), quit and relaunch the macOS Ollama app once, then retry the

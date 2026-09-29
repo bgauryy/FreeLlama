@@ -4,7 +4,55 @@ use serde_json::{Value, json};
 use std::collections::VecDeque;
 
 #[derive(Default)]
-pub(super) struct FootprintHistory(VecDeque<Sample>);
+pub(super) struct FootprintHistory(VecDeque<Sample>, RuntimeHints);
+
+/// Ollama settings that scale a runner's memory beyond file size + one F16 KV sequence.
+///
+/// Read from `FreeLlama`'s own environment, which usually matches an Ollama started from the same
+/// shell or service definition; `doctor` reports where the Ollama process's values differ.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct RuntimeHints {
+    /// `OLLAMA_NUM_PARALLEL`: Ollama allocates one KV cache per parallel slot.
+    pub(super) num_parallel: u64,
+    /// KV bytes relative to F16: `q8_0` halves and `q4_0` quarters it, only with flash attention.
+    pub(super) kv_cache_percent: u64,
+}
+
+impl Default for RuntimeHints {
+    fn default() -> Self {
+        Self {
+            num_parallel: 1,
+            kv_cache_percent: 100,
+        }
+    }
+}
+
+impl RuntimeHints {
+    pub(super) fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
+        let num_parallel = get("OLLAMA_NUM_PARALLEL")
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(1);
+        let flash_attention = get("OLLAMA_FLASH_ATTENTION")
+            .is_some_and(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "True"));
+        let kv_cache_percent = match get("OLLAMA_KV_CACHE_TYPE").as_deref().map(str::trim) {
+            Some("q8_0") if flash_attention => 50,
+            Some("q4_0") if flash_attention => 25,
+            _ => 100,
+        };
+        Self {
+            num_parallel,
+            kv_cache_percent,
+        }
+    }
+}
+
+/// Compute-graph and runtime buffers on top of weights and KV; Ollama's own estimator adds a
+/// comparable per-model graph allocation. Kept deliberately conservative.
+const GRAPH_MARGIN_PERCENT: u64 = 10;
+/// When an architecture's KV shape is unknown (sliding-window, SSM, hybrid), assume the cache
+/// needs a quarter of the file size rather than zero.
+const UNKNOWN_KV_PERCENT_OF_FILE: u64 = 25;
 
 struct Sample {
     backend: String,
@@ -14,6 +62,10 @@ struct Sample {
 }
 
 impl FootprintHistory {
+    pub(super) fn with_hints(hints: RuntimeHints) -> Self {
+        Self(VecDeque::new(), hints)
+    }
+
     pub(super) fn observe(&mut self, backend: &str, digest: Option<&str>, observation: &Value) {
         let Some(digest) = digest.filter(|digest| !digest.is_empty()) else {
             return;
@@ -85,12 +137,23 @@ impl FootprintHistory {
             })
             .map(|sample| sample.bytes)
             .max();
+        let hints = self.1;
         let kv = model
             .kv_cache_bytes_per_token_f16
-            .and_then(|bytes| bytes.checked_mul(context));
-        let estimate = observed.unwrap_or_else(|| model.size.saturating_add(kv.unwrap_or(0)));
-        json!({"required_available_bytes":estimate,"source":if observed.is_some() {"observed_same_digest_at_equal_or_larger_context"} else {"model_file_plus_known_f16_kv"},
+            .and_then(|bytes| bytes.checked_mul(context))
+            .and_then(|bytes| bytes.checked_mul(hints.num_parallel))
+            .map(|bytes| bytes / 100 * hints.kv_cache_percent);
+        let kv_or_fallback = kv.unwrap_or_else(|| model.size / 100 * UNKNOWN_KV_PERCENT_OF_FILE);
+        let graph = model.size / 100 * GRAPH_MARGIN_PERCENT;
+        let estimate = observed.unwrap_or_else(|| {
+            model
+                .size
+                .saturating_add(kv_or_fallback)
+                .saturating_add(graph)
+        });
+        json!({"required_available_bytes":estimate,"source":if observed.is_some() {"observed_same_digest_at_equal_or_larger_context"} else if kv.is_some() {"model_file_plus_kv_plus_graph"} else {"model_file_plus_assumed_kv_plus_graph"},
             "exact":false,"kv_metadata_available":kv.is_some(),"history_samples":self.0.len(),
+            "ollama_num_parallel":hints.num_parallel,"kv_cache_percent_of_f16":hints.kv_cache_percent,
             "note":"capacity reservation estimate; OS telemetry and Ollama final admission remain authoritative"})
     }
 }
@@ -113,19 +176,20 @@ mod tests {
             history.requirement("cpu", &model(), 4096, None, true)["required_available_bytes"],
             2000
         );
+        // No same-digest sample at this context: file + assumed KV (25%) + graph (10%).
         assert_eq!(
             history.requirement("cpu", &model(), 16384, None, true)["required_available_bytes"],
-            1000
+            1350
         );
         let mut changed = model();
         changed.digest = Some("b".into());
         assert_eq!(
             history.requirement("cpu", &changed, 4096, None, true)["required_available_bytes"],
-            1000
+            1350
         );
         assert_eq!(
             history.requirement("gpu", &model(), 4096, None, true)["required_available_bytes"],
-            1000
+            1350
         );
     }
     #[test]
@@ -141,6 +205,35 @@ mod tests {
             0
         );
     }
+    #[test]
+    fn kv_scales_with_parallel_slots_and_quantized_cache() {
+        let mut shaped = model();
+        shaped.kv_cache_bytes_per_token_f16 = Some(10);
+        let f16 = FootprintHistory::default();
+        // 1000 file + 10 * 100 KV + 100 graph
+        assert_eq!(
+            f16.requirement("cpu", &shaped, 100, None, true)["required_available_bytes"],
+            2100
+        );
+        let hints = RuntimeHints::from_lookup(|name| match name {
+            "OLLAMA_NUM_PARALLEL" => Some("4".into()),
+            "OLLAMA_KV_CACHE_TYPE" => Some("q8_0".into()),
+            "OLLAMA_FLASH_ATTENTION" => Some("1".into()),
+            _ => None,
+        });
+        let parallel_q8 = FootprintHistory::with_hints(hints);
+        // KV: 10 * 100 * 4 slots * 50%
+        assert_eq!(
+            parallel_q8.requirement("cpu", &shaped, 100, None, true)["required_available_bytes"],
+            3100
+        );
+        // Quantized cache without flash attention stays F16 in Ollama.
+        let no_fa = RuntimeHints::from_lookup(|name| {
+            (name == "OLLAMA_KV_CACHE_TYPE").then(|| "q4_0".into())
+        });
+        assert_eq!(no_fa.kv_cache_percent, 100);
+    }
+
     #[test]
     fn history_is_bounded_and_rejects_unverified_samples() {
         let mut history = FootprintHistory::default();

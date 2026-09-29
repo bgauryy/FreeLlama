@@ -6,7 +6,7 @@ use axum::{
 };
 use freellama::platform::{
     PlatformConfig, app,
-    resources::{HostResources, ResourceGovernor, ResourcePolicy},
+    resources::{HostResources, ResourceGovernor, ResourcePolicy, TelemetryPolicy},
 };
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -27,6 +27,8 @@ async fn fixture(
             resume_available_min_bytes: 200,
             hold_available_percent: 10,
             resume_available_percent: 20,
+            // Windows defaults to best-effort; these contracts are about required memory.
+            telemetry_policy: TelemetryPolicy::RequireMemory,
             ..ResourcePolicy::default()
         },
         move || HostResources {
@@ -97,7 +99,8 @@ async fn preview_does_not_call_a_cold_model_runnable_when_its_memory_wont_fit() 
     );
     assert_eq!(
         result["execution"]["resource_assessment"]["required_available_bytes"],
-        4000
+        // 4000-byte file with unknown KV shape: + 25% assumed KV + 10% graph margin.
+        5400
     );
     assert_eq!(
         governor.snapshot().await.reserved_bytes,
@@ -137,7 +140,7 @@ async fn fitting_preview_reports_model_footprint_without_acquiring_it() {
     );
     assert_eq!(
         result["execution"]["memory_reservation"]["required_available_bytes"],
-        4000
+        5400
     );
     assert_eq!(governor.snapshot().await.reserved_bytes, 0);
     server.abort();

@@ -2885,13 +2885,13 @@ async fn vision_tasks_cost_more_admission_than_embeddings() {
         .route(
             "/api/tags",
             get(|| async {
-                Json(json!({"models": [{"name": "seer", "size": 18_000_000_000_u64}]}))
+                Json(json!({"models": [{"name": "seer", "size": 2_000_000_000_u64}]}))
             }),
         )
         .route(
             "/api/ps",
             get(|| async {
-                Json(json!({"models": [{"name": "seer", "size_vram": 18_000_000_000_u64}]}))
+                Json(json!({"models": [{"name": "seer", "size_vram": 2_000_000_000_u64}]}))
             }),
         )
         .route(

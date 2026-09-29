@@ -42,7 +42,7 @@ automatically. `scripts/check.sh` reports whether the request uses it.
 
 **Cause:** retries without a bounded per-attempt timeout compound. One slow failing
 request (15-18s measured) retried 2-3 times blows past the caller's own budget, turning a fast clean
-failure into a slow total loss. **Fix:** the proxy sets `--request-timeout-seconds` (default 120) for
+failure into a slow total loss. **Fix:** the proxy sets `--request-timeout-seconds` (an idle timeout, default 300) for
 exactly this reason; give any retry wrapper of your own the same discipline, and raise the *caller's*
 budget to leave room (this repo raised task timeouts from 180s to 240s). → `references/reliability.md`
 

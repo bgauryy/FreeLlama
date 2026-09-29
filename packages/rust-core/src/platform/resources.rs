@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 use std::process::{Command, Stdio};
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
 use std::{collections::BTreeMap, io::Read};
@@ -48,19 +48,40 @@ pub struct HostResources {
     pub thermal_throttled: Option<bool>,
     pub cpu_speed_limit_percent: Option<u32>,
     pub thermal_warning_level: Option<u32>,
+    /// cgroup v2 `memory.max` of this process when it is below physical RAM (containers).
+    pub cgroup_memory_limit_bytes: Option<u64>,
+    /// Linux PSI `some avg10` for memory: % of the last 10s some task stalled on memory.
+    pub memory_psi_some_avg10: Option<f64>,
+    /// Discrete-GPU memory summed over devices (NVIDIA via nvidia-smi, AMD via sysfs). `None` on
+    /// unified-memory hosts and when no GPU tool is readable.
+    pub gpu_memory_total_bytes: Option<u64>,
+    pub gpu_memory_free_bytes: Option<u64>,
+    pub gpu_telemetry_source: Option<String>,
     pub unavailable: Vec<String>,
 }
 
 /// Missing observations never clear known pressure. This policy controls only whether an
 /// otherwise unheld local request may proceed with incomplete telemetry.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TelemetryPolicy {
     BestEffort,
-    #[default]
     RequireMemory,
     /// Require RAM and CPU load, plus OS pressure and thermal readings where supported.
     RequireAll,
+}
+
+impl Default for TelemetryPolicy {
+    /// Require RAM telemetry where a collector exists. Elsewhere (Windows) a memory requirement
+    /// could never be met and every local request was refused, so admission there is best-effort
+    /// and says so in each receipt (`admitted_telemetry_unknown`).
+    fn default() -> Self {
+        if cfg!(any(target_os = "linux", target_os = "macos")) {
+            Self::RequireMemory
+        } else {
+            Self::BestEffort
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -190,6 +211,28 @@ impl ResourceSnapshot {
         required_available_bytes: u64,
         recovering_capacity: bool,
     ) -> ResourceCapacityAssessment {
+        self.assess_demand(
+            ResourceDemand::load(required_available_bytes),
+            recovering_capacity,
+        )
+    }
+
+    /// Like [`Self::assess_capacity`], but a request to an already-resident runner adds no memory
+    /// and is not held by low available memory alone: on unified memory the resident model is
+    /// usually what lowered it, and holding its own requests locked the model out until
+    /// `keep_alive` unloaded it. OS pressure, swapping, CPU load and thermal holds still apply.
+    #[must_use]
+    pub fn assess_demand(
+        &self,
+        demand: ResourceDemand,
+        recovering_capacity: bool,
+    ) -> ResourceCapacityAssessment {
+        let required_available_bytes = demand.bytes;
+        let resident_only = demand.resident && demand.bytes == 0;
+        let low_memory_only = self
+            .reasons
+            .iter()
+            .all(|reason| *reason == PressureReason::LowAvailableMemory);
         let reserve_bytes = if recovering_capacity {
             self.resume_reserve_bytes
         } else {
@@ -199,7 +242,7 @@ impl ResourceSnapshot {
         let missing_telemetry = self
             .observation
             .missing_required(self.policy.telemetry_policy);
-        let denial_reason = if self.holding {
+        let denial_reason = if self.holding && !(resident_only && low_memory_only) {
             Some(CapacityDenialReason::HostPressure)
         } else if !missing_telemetry.is_empty() {
             Some(CapacityDenialReason::TelemetryUnavailable)
@@ -211,9 +254,11 @@ impl ResourceSnapshot {
                 .is_none()
         {
             Some(CapacityDenialReason::ArithmeticOverflow)
-        } else if self.effective_available_bytes.is_some_and(|available| {
-            required_with_reserve_bytes.is_some_and(|required| available < required)
-        }) {
+        } else if !resident_only
+            && self.effective_available_bytes.is_some_and(|available| {
+                required_with_reserve_bytes.is_some_and(|required| available < required)
+            })
+        {
             Some(CapacityDenialReason::InsufficientCapacity)
         } else {
             None
@@ -239,6 +284,32 @@ impl ResourceSnapshot {
     }
 }
 
+/// What a request adds to host memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ResourceDemand {
+    pub bytes: u64,
+    /// The runner is already loaded with a compatible configuration.
+    pub resident: bool,
+}
+
+impl ResourceDemand {
+    #[must_use]
+    pub const fn load(bytes: u64) -> Self {
+        Self {
+            bytes,
+            resident: false,
+        }
+    }
+
+    #[must_use]
+    pub const fn resident() -> Self {
+        Self {
+            bytes: 0,
+            resident: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ResourceReceipt {
     pub status: &'static str,
@@ -251,7 +322,7 @@ pub struct ResourceReceipt {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ResourceWaitError {
-    pub receipt: ResourceReceipt,
+    pub receipt: Box<ResourceReceipt>,
 }
 
 impl std::fmt::Display for ResourceWaitError {
@@ -273,6 +344,23 @@ pub struct ResourcePermit {
     bytes: u64,
 }
 
+impl ResourcePermit {
+    /// Return the reservation early, once the load it covered is visible in OS telemetry.
+    /// Keeping it until the response ended counted a loaded model twice (in OS available memory
+    /// and in the reservation), so a second cold model needed about twice its real headroom.
+    pub fn release(&mut self) {
+        let bytes = std::mem::take(&mut self.bytes);
+        if bytes > 0 {
+            self.reservations.fetch_sub(bytes, Ordering::AcqRel);
+        }
+    }
+
+    #[must_use]
+    pub const fn reserved_bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
 impl Drop for ResourcePermit {
     fn drop(&mut self) {
         self.reservations.fetch_sub(self.bytes, Ordering::AcqRel);
@@ -286,7 +374,13 @@ struct SampleState {
     sample_count: u64,
     reasons: Vec<PressureReason>,
     healthy_samples: u32,
+    held_since: Option<Instant>,
+    stale: bool,
 }
+
+/// A hold whose signal stops being reported (a sensor that goes quiet after a throttle event)
+/// could otherwise never recover, holding all local work until restart.
+const MAX_UNOBSERVED_HOLD: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 pub struct ResourceGovernor {
@@ -341,15 +435,23 @@ impl ResourceGovernor {
         })
     }
 
+    /// Make the next [`Self::snapshot`] sample afresh, after `FreeLlama` itself changed what the
+    /// host holds (for example by unloading idle models).
+    pub async fn invalidate(&self) {
+        self.state.lock().await.stale = true;
+    }
+
     /// Read the latest cached observation, sampling once when stale.
     /// # Panics
     /// Panics only if the private sampler state violates its initialized-handle/cache invariant.
     pub async fn snapshot(&self) -> ResourceSnapshot {
         let mut state = self.state.lock().await;
-        let needs_sample = state
-            .saved
-            .as_ref()
-            .is_none_or(|(at, _)| at.elapsed() >= self.policy.sample_interval);
+        let needs_sample = state.stale
+            || state
+                .saved
+                .as_ref()
+                .is_none_or(|(at, _)| at.elapsed() >= self.policy.sample_interval);
+        state.stale = false;
         if needs_sample {
             if state.pending.is_none() {
                 let sampler = self.sampler.clone();
@@ -370,11 +472,14 @@ impl ResourceGovernor {
             state.pending = None;
             let previous = state.saved.as_ref().map(|(_, sample)| sample);
             let triggered = pressure_reasons(&observed, previous, &self.policy);
+            let stale_hold = state
+                .held_since
+                .is_some_and(|since| since.elapsed() >= MAX_UNOBSERVED_HOLD);
             let recovered = triggered.is_empty()
-                && state
-                    .reasons
-                    .iter()
-                    .all(|reason| recovered_reason(*reason, &observed, previous, &self.policy));
+                && state.reasons.iter().all(|reason| {
+                    recovered_reason(*reason, &observed, previous, &self.policy)
+                        || (stale_hold && !reason_observed(*reason, &observed))
+                });
             if !triggered.is_empty() {
                 for reason in triggered {
                     if !state.reasons.contains(&reason) {
@@ -382,11 +487,13 @@ impl ResourceGovernor {
                     }
                 }
                 state.healthy_samples = 0;
+                state.held_since.get_or_insert_with(Instant::now);
             } else if !state.reasons.is_empty() && recovered {
                 state.healthy_samples = state.healthy_samples.saturating_add(1);
                 if state.healthy_samples >= self.policy.recovery_samples {
                     state.reasons.clear();
                     state.healthy_samples = 0;
+                    state.held_since = None;
                 }
             } else {
                 state.healthy_samples = 0;
@@ -437,6 +544,24 @@ impl ResourceGovernor {
         required_available_bytes: u64,
         timeout: Duration,
     ) -> Result<ResourcePermit, ResourceWaitError> {
+        self.wait_for_demand(
+            upstream,
+            ResourceDemand::load(required_available_bytes),
+            timeout,
+        )
+        .await
+    }
+
+    /// [`Self::wait_for_capacity`] for a [`ResourceDemand`]; see [`ResourceSnapshot::assess_demand`].
+    /// # Errors
+    /// Returns the last observed pressure snapshot if sampling or recovery exceeds the deadline.
+    pub async fn wait_for_demand(
+        &self,
+        upstream: &str,
+        demand: ResourceDemand,
+        timeout: Duration,
+    ) -> Result<ResourcePermit, ResourceWaitError> {
+        let required_available_bytes = demand.bytes;
         let started = Instant::now();
         if !is_loopback(upstream) {
             return Ok(ResourcePermit {
@@ -460,15 +585,15 @@ impl ResourceGovernor {
             let Ok(snapshot) = tokio::time::timeout_at(deadline, self.snapshot()).await else {
                 break;
             };
-            let mut assessment =
-                snapshot.assess_capacity(required_available_bytes, recovering_capacity);
+            let mut assessment = snapshot.assess_demand(demand, recovering_capacity);
             let available = snapshot.observation.available_memory_bytes;
             if assessment.admissible
-                && self.try_reserve(
-                    required_available_bytes,
-                    available,
-                    assessment.reserve_bytes,
-                )
+                && (demand.resident && demand.bytes == 0
+                    || self.try_reserve(
+                        required_available_bytes,
+                        available,
+                        assessment.reserve_bytes,
+                    ))
             {
                 let receipt = ResourceReceipt {
                     status: if available.is_some() && snapshot.status == "ready" {
@@ -509,14 +634,14 @@ impl ResourceGovernor {
             }
         }
         Err(ResourceWaitError {
-            receipt: ResourceReceipt {
+            receipt: Box::new(ResourceReceipt {
                 status: "deadline_exceeded",
                 waited_ms: started.elapsed().as_millis(),
                 required_available_bytes,
                 reserved_bytes: 0,
                 snapshot: last,
                 assessment: last_assessment,
-            },
+            }),
         })
     }
 
@@ -651,6 +776,18 @@ fn recovered_reason(
     }
 }
 
+/// Whether the current sample carries the signal a pressure reason is judged on.
+fn reason_observed(reason: PressureReason, current: &HostResources) -> bool {
+    match reason {
+        PressureReason::LowAvailableMemory | PressureReason::ActiveSwapping => {
+            current.available_memory_bytes.is_some()
+        }
+        PressureReason::OsMemoryPressure => current.memory_pressure.is_some(),
+        PressureReason::HighCpuLoad => current.load_per_cpu().is_some(),
+        PressureReason::ThermalThrottling => current.thermal_throttled.is_some(),
+    }
+}
+
 fn is_loopback(upstream: &str) -> bool {
     reqwest::Url::parse(upstream)
         .ok()
@@ -721,18 +858,130 @@ fn parse_linux(meminfo: &str, loadavg: &str, vmstat: &str, cpus: Option<u32>) ->
             .and_then(|text| text.parse::<f64>().ok())
             .filter(|load| load.is_finite() && *load >= 0.0),
         logical_cpus: cpus.filter(|cpus| *cpus > 0),
-        unavailable: vec![
-            "thermal_pressure".into(),
-            "os_memory_pressure_level".into(),
-            "cgroup_memory_limit".into(),
-        ],
+        unavailable: vec!["thermal_pressure".into()],
         ..HostResources::default()
+    }
+}
+
+/// Apply the process's cgroup v2 memory limit: inside a container `MemAvailable` describes the
+/// host, so admission could approve a load the container's OOM killer then ends.
+#[cfg(any(target_os = "linux", test))]
+fn apply_cgroup_limit(observed: &mut HostResources, max: &str, current: &str) {
+    let (Ok(limit), Ok(used)) = (max.trim().parse::<u64>(), current.trim().parse::<u64>()) else {
+        return; // "max" = unlimited, or unreadable
+    };
+    if observed
+        .total_memory_bytes
+        .is_some_and(|total| limit >= total)
+    {
+        return;
+    }
+    let headroom = limit.saturating_sub(used);
+    observed.cgroup_memory_limit_bytes = Some(limit);
+    observed.total_memory_bytes = Some(
+        observed
+            .total_memory_bytes
+            .map_or(limit, |total| total.min(limit)),
+    );
+    observed.available_memory_bytes = Some(
+        observed
+            .available_memory_bytes
+            .map_or(headroom, |available| available.min(headroom)),
+    );
+    observed.available_memory_kind = "cgroup_v2_limit_minus_usage".into();
+}
+
+/// Linux pressure-stall information as an OS memory-pressure level. `some` counts time at least
+/// one task stalled on memory; `full` counts time all non-idle tasks stalled (thrashing).
+#[cfg(any(target_os = "linux", test))]
+fn parse_memory_psi(text: &str) -> Option<(f64, MemoryPressure)> {
+    let avg10 = |kind: &str| {
+        text.lines()
+            .find(|line| line.starts_with(kind))?
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("avg10="))?
+            .parse::<f64>()
+            .ok()
+            .filter(|value| value.is_finite() && *value >= 0.0)
+    };
+    let some = avg10("some")?;
+    let full = avg10("full").unwrap_or(0.0);
+    let level = if full >= 10.0 {
+        MemoryPressure::Critical
+    } else if some >= 10.0 || full >= 2.0 {
+        MemoryPressure::Warning
+    } else {
+        MemoryPressure::Normal
+    };
+    Some((some, level))
+}
+
+/// `nvidia-smi --query-gpu=memory.total,memory.used --format=csv,noheader,nounits` (MiB per GPU).
+#[cfg(any(target_os = "linux", test))]
+fn parse_nvidia_smi(text: &str) -> Option<(u64, u64)> {
+    const MIB: u64 = 1024 * 1024;
+    let mut total = 0_u64;
+    let mut used = 0_u64;
+    let mut devices = 0;
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let mut fields = line
+            .split(',')
+            .map(|field| field.trim().parse::<u64>().ok());
+        let (Some(Some(device_total)), Some(Some(device_used))) = (fields.next(), fields.next())
+        else {
+            return None;
+        };
+        total = total.checked_add(device_total.checked_mul(MIB)?)?;
+        used = used.checked_add(device_used.checked_mul(MIB)?)?;
+        devices += 1;
+    }
+    (devices > 0).then_some((total, total.saturating_sub(used)))
+}
+
+#[cfg(target_os = "linux")]
+fn sample_gpu_linux(observed: &mut HostResources, read: impl Fn(&str) -> Option<String>) {
+    if let Some((total, free)) = bounded_command_with(
+        "nvidia-smi",
+        &[
+            "--query-gpu=memory.total,memory.used",
+            "--format=csv,noheader,nounits",
+        ],
+        Duration::from_millis(1500),
+    )
+    .as_deref()
+    .and_then(parse_nvidia_smi)
+    {
+        observed.gpu_memory_total_bytes = Some(total);
+        observed.gpu_memory_free_bytes = Some(free);
+        observed.gpu_telemetry_source = Some("nvidia_smi".into());
+        return;
+    }
+    // amdgpu exposes VRAM counters per DRM card; integrated APUs report a small carve-out.
+    let mut total = 0_u64;
+    let mut used = 0_u64;
+    for card in 0..8 {
+        let base = format!("/sys/class/drm/card{card}/device");
+        let (Some(card_total), Some(card_used)) = (
+            read(&format!("{base}/mem_info_vram_total"))
+                .and_then(|text| text.trim().parse::<u64>().ok()),
+            read(&format!("{base}/mem_info_vram_used"))
+                .and_then(|text| text.trim().parse::<u64>().ok()),
+        ) else {
+            continue;
+        };
+        total = total.saturating_add(card_total);
+        used = used.saturating_add(card_used);
+    }
+    if total > 0 {
+        observed.gpu_memory_total_bytes = Some(total);
+        observed.gpu_memory_free_bytes = Some(total.saturating_sub(used));
+        observed.gpu_telemetry_source = Some("amdgpu_sysfs".into());
     }
 }
 
 #[cfg(target_os = "linux")]
 fn sample_linux() -> HostResources {
-    let read = |path| {
+    let read = |path: &str| {
         std::fs::File::open(path).ok().and_then(|file| {
             let mut text = String::new();
             file.take(64 * 1024).read_to_string(&mut text).ok()?;
@@ -747,6 +996,32 @@ fn sample_linux() -> HostResources {
             .ok()
             .and_then(|cpus| u32::try_from(cpus.get()).ok()),
     );
+    if let Some(path) = read("/proc/self/cgroup").and_then(|text| {
+        text.lines()
+            .find_map(|line| line.strip_prefix("0::").map(|path| path.trim().to_owned()))
+    }) {
+        let base = format!(
+            "/sys/fs/cgroup{}",
+            if path == "/" { "" } else { path.as_str() }
+        );
+        if let (Some(max), Some(current)) = (
+            read(&format!("{base}/memory.max")),
+            read(&format!("{base}/memory.current")),
+        ) {
+            apply_cgroup_limit(&mut observed, &max, &current);
+        }
+    }
+    match read("/proc/pressure/memory")
+        .as_deref()
+        .and_then(parse_memory_psi)
+    {
+        Some((some, level)) => {
+            observed.memory_psi_some_avg10 = Some(some);
+            observed.memory_pressure = Some(level);
+        }
+        None => observed.unavailable.push("os_memory_pressure_level".into()),
+    }
+    sample_gpu_linux(&mut observed, read);
     if observed.available_memory_bytes.is_none() {
         observed.unavailable.push("MemAvailable".into());
     }
@@ -932,6 +1207,11 @@ fn sample_macos() -> HostResources {
 
 #[cfg(any(target_os = "macos", test))]
 fn bounded_command(program: &str, args: &[&str]) -> Option<String> {
+    bounded_command_with(program, args, Duration::from_millis(400))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn bounded_command_with(program: &str, args: &[&str], timeout: Duration) -> Option<String> {
     let mut child = Command::new(program)
         .args(args)
         .stdin(Stdio::null())
@@ -939,7 +1219,16 @@ fn bounded_command(program: &str, args: &[&str]) -> Option<String> {
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
-    let deadline = Instant::now() + Duration::from_millis(400);
+    // Drain stdout while the child runs: reading only after exit let a child with more than a
+    // pipe buffer of output block on write until the deadline killed it.
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = (&mut stdout).take(64 * 1024).read_to_end(&mut bytes);
+        let _ = std::io::copy(&mut stdout, &mut std::io::sink());
+        bytes
+    });
+    let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
             Ok(Some(_)) => break,
@@ -947,17 +1236,12 @@ fn bounded_command(program: &str, args: &[&str]) -> Option<String> {
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
+                let _ = reader.join();
                 return None;
             }
         }
     }
-    let mut text = String::new();
-    child
-        .stdout
-        .take()?
-        .take(64 * 1024)
-        .read_to_string(&mut text)
-        .ok()?;
+    let text = String::from_utf8(reader.join().ok()?).ok()?;
     // A missing optional sysctl may cause nonzero status while the other fields remain valid.
     (!text.trim().is_empty()).then_some(text)
 }
@@ -980,9 +1264,12 @@ mod tests {
             ..HostResources::default()
         }
     }
+    /// Pins the Linux/macOS default so these contracts hold on Windows too, whose default is
+    /// best-effort.
     fn quick_policy() -> ResourcePolicy {
         ResourcePolicy {
             sample_interval: Duration::from_millis(5),
+            telemetry_policy: TelemetryPolicy::RequireMemory,
             ..ResourcePolicy::default()
         }
     }
@@ -1009,6 +1296,111 @@ mod tests {
             vec![TelemetryMetric::AvailableMemory]
         );
         assert_eq!(governor.snapshot().await.reserved_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn low_memory_hold_admits_resident_runners_but_not_new_loads() {
+        // 32 GiB unified host with a 26 GiB model resident: available memory is below the hold
+        // reserve because of the model itself. Its own requests must not be locked out.
+        let governor = ResourceGovernor::with_sampler(quick_policy(), || {
+            let mut sample = healthy();
+            sample.available_memory_bytes = Some(3 * GIB);
+            sample
+        })
+        .unwrap();
+        let permit = governor
+            .wait_for_demand(
+                "http://localhost:11434",
+                ResourceDemand::resident(),
+                Duration::from_millis(20),
+            )
+            .await
+            .expect("resident request admitted under low-memory hold");
+        assert_eq!(permit.reserved_bytes(), 0);
+        let cold = governor
+            .wait_for_capacity("http://localhost:11434", 0, Duration::from_millis(20))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            cold.receipt.assessment.unwrap().denial_reason,
+            Some(CapacityDenialReason::HostPressure)
+        );
+    }
+
+    #[tokio::test]
+    async fn resident_runners_still_wait_for_os_pressure_and_swapping() {
+        let governor = ResourceGovernor::with_sampler(quick_policy(), || {
+            let mut sample = healthy();
+            sample.memory_pressure = Some(MemoryPressure::Critical);
+            sample
+        })
+        .unwrap();
+        assert!(
+            governor
+                .wait_for_demand(
+                    "http://localhost:11434",
+                    ResourceDemand::resident(),
+                    Duration::from_millis(20),
+                )
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn released_permit_returns_capacity_before_drop() {
+        let governor = ResourceGovernor::with_sampler(quick_policy(), healthy).unwrap();
+        let mut permit = governor
+            .wait_for_capacity("http://localhost:11434", 4 * GIB, Duration::from_millis(20))
+            .await
+            .unwrap();
+        assert_eq!(governor.reservations.load(Ordering::Acquire), 4 * GIB);
+        permit.release();
+        assert_eq!(governor.reservations.load(Ordering::Acquire), 0);
+        drop(permit);
+        assert_eq!(governor.reservations.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn cgroup_limit_caps_available_memory_inside_containers() {
+        let mut sample = healthy();
+        apply_cgroup_limit(&mut sample, "8589934592\n", "6442450944\n");
+        assert_eq!(sample.total_memory_bytes, Some(8 * GIB));
+        assert_eq!(sample.available_memory_bytes, Some(2 * GIB));
+        assert_eq!(sample.cgroup_memory_limit_bytes, Some(8 * GIB));
+        let mut unlimited = healthy();
+        apply_cgroup_limit(&mut unlimited, "max\n", "6442450944\n");
+        assert_eq!(unlimited.available_memory_bytes, Some(16 * GIB));
+        let mut above_ram = healthy();
+        apply_cgroup_limit(&mut above_ram, &(64 * GIB).to_string(), "0");
+        assert_eq!(above_ram.cgroup_memory_limit_bytes, None);
+    }
+
+    #[test]
+    fn memory_psi_maps_stalls_to_pressure_levels() {
+        let calm = "some avg10=0.50 avg60=0.10 avg300=0.00 total=1\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0";
+        assert_eq!(parse_memory_psi(calm), Some((0.5, MemoryPressure::Normal)));
+        let stalling = "some avg10=12.00 avg60=3.00 avg300=1.00 total=1\nfull avg10=1.00 avg60=0.00 avg300=0.00 total=0";
+        assert_eq!(
+            parse_memory_psi(stalling).unwrap().1,
+            MemoryPressure::Warning
+        );
+        let thrashing = "some avg10=40.00 avg60=3.00 avg300=1.00 total=1\nfull avg10=15.00 avg60=0.00 avg300=0.00 total=0";
+        assert_eq!(
+            parse_memory_psi(thrashing).unwrap().1,
+            MemoryPressure::Critical
+        );
+        assert_eq!(parse_memory_psi(""), None);
+    }
+
+    #[test]
+    fn nvidia_smi_sums_devices_and_rejects_garbage() {
+        assert_eq!(
+            parse_nvidia_smi("24576, 1024\n24576, 23552\n"),
+            Some((48 * GIB, 24 * GIB))
+        );
+        assert_eq!(parse_nvidia_smi("[N/A], [N/A]\n"), None);
+        assert_eq!(parse_nvidia_smi(""), None);
     }
 
     #[tokio::test]

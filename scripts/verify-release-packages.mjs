@@ -36,6 +36,9 @@ for (const [directory, expectedName] of publicPackages) {
   if (packageManifest.name !== expectedName || packageManifest.publishConfig?.access !== "public") {
     throw new Error(`${directory}: must publish publicly as ${expectedName}`);
   }
+  if (packageManifest.version !== version) {
+    throw new Error(`${directory}: version ${packageManifest.version} must match workspace version ${version}`);
+  }
   if (packageManifest.os || packageManifest.cpu) {
     throw new Error(`${directory}: portable launcher package must not restrict os/cpu`);
   }

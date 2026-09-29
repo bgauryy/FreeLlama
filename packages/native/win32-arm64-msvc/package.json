@@ -1,6 +1,6 @@
 {
   "name": "@octocodeai/freellama-native-win32-arm64-msvc",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "FreeLlama native Rust artifacts for Windows ARM64",
   "license": "Apache-2.0 OR MIT",
   "os": [

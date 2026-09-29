@@ -589,16 +589,17 @@ fn ollama_environment_getenv(name: &str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
-        .or_else(|| {
-            #[cfg(target_os = "macos")]
-            {
-                launchctl_getenv(name)
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                None
-            }
-        })
+        .or_else(|| service_manager_getenv(name))
+}
+
+#[cfg(target_os = "macos")]
+fn service_manager_getenv(name: &str) -> Option<String> {
+    launchctl_getenv(name)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn service_manager_getenv(_name: &str) -> Option<String> {
+    None
 }
 
 fn ollama_environment_source() -> &'static str {
@@ -652,10 +653,10 @@ fn local_ollama_process_environment(endpoint: &str) -> Value {
 
     #[cfg(not(target_os = "macos"))]
     {
-        return json!({
+        json!({
             "status": "unsupported_platform",
             "reason": "same-user Ollama process inspection is currently implemented only for macOS",
-        });
+        })
     }
 
     #[cfg(target_os = "macos")]
@@ -1128,6 +1129,8 @@ fn host_runtime_signals() -> Value {
     }
 }
 
+const DOCTOR_LOCAL_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Query the diagnostic endpoints required by the harness.
 ///
 /// # Errors
@@ -1164,17 +1167,34 @@ pub async fn doctor(endpoint: &str) -> Result<Value> {
     let server_version = version
         .get("version")
         .and_then(Value::as_str)
-        .context("Ollama version response has no version")?;
-    let cli = find_path_command("ollama").and_then(|invoked_path| {
-        let resolved_path = invoked_path.canonicalize().ok();
-        let (stdout, stderr) = ollama_cli_output(&invoked_path).ok()?;
-        let mut diagnostic = parse_ollama_cli_version(server_version, &stdout, &stderr);
-        diagnostic.invoked_path = Some(invoked_path.display().to_string());
-        diagnostic.resolved_path = resolved_path.map(|path| path.display().to_string());
-        Some(diagnostic)
-    });
+        .context("Ollama version response has no version")?
+        .to_owned();
+    // `ollama --version`, `ps` and `launchctl` are synchronous subprocesses. Run them off the
+    // async runtime and bound them: a wedged CLI must not hang the tool meant for diagnosing hangs.
+    let local = {
+        let (server_version, endpoint) = (server_version.clone(), endpoint.to_owned());
+        tokio::task::spawn_blocking(move || {
+            let cli = find_path_command("ollama").and_then(|invoked_path| {
+                let resolved_path = invoked_path.canonicalize().ok();
+                let (stdout, stderr) = ollama_cli_output(&invoked_path).ok()?;
+                let mut diagnostic = parse_ollama_cli_version(&server_version, &stdout, &stderr);
+                diagnostic.invoked_path = Some(invoked_path.display().to_string());
+                diagnostic.resolved_path = resolved_path.map(|path| path.display().to_string());
+                Some(diagnostic)
+            });
+            (cli, local_ollama_process_environment(&endpoint))
+        })
+    };
+    let (cli, observed_process_environment) =
+        match tokio::time::timeout(DOCTOR_LOCAL_PROBE_TIMEOUT, local).await {
+            Ok(Ok(result)) => result,
+            _ => (
+                None,
+                json!({"status": "unavailable", "reason": "local process probes timed out"}),
+            ),
+        };
+    let server_version = server_version.as_str();
     let categorized_config = ollama_config_diagnostics(server_version, ollama_environment_getenv);
-    let observed_process_environment = local_ollama_process_environment(endpoint);
     let local_conservative_posture =
         local_conservative_config_posture(&categorized_config, &observed_process_environment);
     let env_config = categorized_config["categories"]["memory_scheduler"].clone();

@@ -16,7 +16,8 @@ resident model. There is no fix available to us in Ollama itself; the proxy abso
 - **Backoff:** exponential with jitter — `RETRY_BASE_DELAY (200ms) * 2^(attempt-1) + jitter(0-100ms)`.
   Jitter is dependency-free (derived from the system clock's low bits, not cryptographic) — its only
   job is to stop multiple retrying callers from piling back onto a recovering server in lockstep.
-- **Per-attempt timeout:** `--request-timeout-seconds` on `npx @octocodeai/freellama proxy`/`serve` (default 120s).
+- **Idle timeout:** `--request-timeout-seconds` on `npx @octocodeai/freellama proxy` (default 300s, Ollama's own
+  load timeout). It bounds silence between bytes, not the whole response, so a long stream is never cut off.
   This exists specifically because retries without a timeout compound badly: a request that's
   already slow (15-18s observed for a multi-turn chat call near Ollama's failure point) times out
   a whole *task* budget if retried 2-3 times with no per-attempt cap. Verified fix, live:
