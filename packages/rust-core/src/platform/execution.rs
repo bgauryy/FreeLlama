@@ -1162,8 +1162,15 @@ async fn forward_managed_task(
         let snapshot = feedback.clone();
         drop(feedback);
         let persistence = if feedback_accepted {
-            if let Some(path) = state.feedback_file.as_deref() {
-                match persist_feedback(path, &snapshot) {
+            if let Some(path) = state.feedback_file.clone() {
+                // A synchronous fsync-and-rename on a runtime worker stalls every task sharing it.
+                let written =
+                    tokio::task::spawn_blocking(move || persist_feedback(&path, &snapshot))
+                        .await
+                        .unwrap_or_else(|error| {
+                            Err(anyhow::anyhow!("feedback writer panicked: {error}"))
+                        });
+                match written {
                     Ok(()) => {
                         *state.feedback_persistence_error.write().await = None;
                         json!({"enabled": true, "persisted": true, "schema_version": FEEDBACK_SCHEMA_VERSION})

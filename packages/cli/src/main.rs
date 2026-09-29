@@ -359,9 +359,10 @@ enum Command {
         /// Explicitly permit binding beyond localhost. Add authentication before using this.
         #[arg(long)]
         allow_remote: bool,
-        /// Per-attempt upstream timeout. Raise this for endpoints that legitimately run long
-        /// (e.g. `/api/pull`); the default suits chat/generate-style requests.
-        #[arg(long, default_value_t = 120)]
+        /// Longest silence allowed from Ollama, including the wait for headers while a model
+        /// loads. Not a total deadline: a stream that keeps producing bytes is never cut off.
+        /// The default matches Ollama's own 5-minute model load timeout.
+        #[arg(long, default_value_t = 300)]
         request_timeout_seconds: u64,
         /// Opt-in: on a true connection-refused failure (Ollama's process is gone, not just
         /// slow or erroring), quit and relaunch the macOS Ollama app once, then retry the

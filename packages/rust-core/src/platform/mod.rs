@@ -1491,15 +1491,21 @@ async fn fetch_catalog_from(
         .and_then(Value::as_array)
         .context("Ollama tags response has no models")
         .map_err(ApiError::upstream)?;
+    let names = entries
+        .iter()
+        .map(|entry| {
+            entry
+                .get("name")
+                .or_else(|| entry.get("model"))
+                .and_then(Value::as_str)
+                .context("Ollama model has no name")
+                .map_err(ApiError::upstream)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut shows = show_models(state, upstream, &names).await?;
     let mut models = Vec::with_capacity(entries.len());
-    for entry in entries {
-        let name = entry
-            .get("name")
-            .or_else(|| entry.get("model"))
-            .and_then(Value::as_str)
-            .context("Ollama model has no name")
-            .map_err(ApiError::upstream)?;
-        let Some(show) = show_model(state, upstream, name).await? else {
+    for (index, (entry, name)) in entries.iter().zip(names).enumerate() {
+        let Some(show) = shows[index].take() else {
             continue;
         };
         let capabilities = show
@@ -1624,6 +1630,36 @@ fn estimate_kv_cache_bytes_per_token_f16(show: &Value) -> Option<u64> {
         .checked_mul(kv_heads)?
         .checked_mul(key.checked_add(value)?)?
         .checked_mul(2)
+}
+
+/// Concurrent `/api/show` lookups for a whole catalog. Sequential lookups made a cold catalog cost
+/// one control round trip per installed model; a small bound keeps a large library from flooding
+/// Ollama. Results keep the order of `names`.
+const SHOW_CONCURRENCY: usize = 4;
+
+async fn show_models(
+    state: &PlatformState,
+    upstream: &str,
+    names: &[&str],
+) -> Result<Vec<Option<Value>>, ApiError> {
+    let permits = Arc::new(tokio::sync::Semaphore::new(SHOW_CONCURRENCY));
+    let mut lookups = tokio::task::JoinSet::new();
+    for (index, name) in names.iter().enumerate() {
+        let (state, upstream, name) = (state.clone(), upstream.to_owned(), (*name).to_owned());
+        let permits = Arc::clone(&permits);
+        lookups.spawn(async move {
+            let _permit = permits.acquire_owned().await;
+            (index, show_model(&state, &upstream, &name).await)
+        });
+    }
+    let mut shows = vec![None; names.len()];
+    while let Some(joined) = lookups.join_next().await {
+        let (index, show) = joined
+            .context("model metadata lookup panicked")
+            .map_err(ApiError::upstream)?;
+        shows[index] = show?;
+    }
+    Ok(shows)
 }
 
 /// `None` means skip this tag — a single corrupt `/api/show` must not 502 the whole catalog.

@@ -576,3 +576,81 @@ async fn proxy_does_not_restart_ollama_for_an_ordinary_5xx_not_a_dead_process() 
     );
 }
 mod common;
+
+#[tokio::test]
+async fn model_file_work_and_unloads_bypass_the_execution_lock() {
+    let (upstream, calls) = spawn_flaky_upstream(0).await;
+    let execution = Arc::new(RwLock::new(()));
+    let proxy = app(common::proxy_config("127.0.0.1:0", upstream, false)
+        .with_max_concurrent_requests(1)
+        .with_execution_lock(execution.clone()))
+    .unwrap();
+    // A managed task is running; a pull must not be refused, nor hold the lock while it downloads.
+    let managed = execution.read().await;
+    for (path, body) in [
+        ("/api/pull", r#"{"model":"llama3.2:1b"}"#),
+        ("/api/delete", r#"{"model":"llama3.2:1b"}"#),
+        ("/api/copy", r#"{"source":"a","destination":"b"}"#),
+        ("/api/blobs/sha256:abc", "bytes"),
+        (
+            "/api/chat",
+            r#"{"model":"m","messages":[],"keep_alive":"0m"}"#,
+        ),
+        ("/api/generate", r#"{"model":"m","keep_alive":0}"#),
+    ] {
+        let response = proxy
+            .clone()
+            .oneshot(Request::post(path).body(Body::from(body)).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path} {body}");
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 6);
+    // A generation still waits for managed execution to finish.
+    let generation = proxy
+        .clone()
+        .oneshot(
+            Request::post("/api/chat")
+                .body(Body::from(r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"keep_alive":"0m"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(generation.status(), StatusCode::SERVICE_UNAVAILABLE);
+    drop(managed);
+}
+
+#[tokio::test]
+async fn request_timeout_bounds_silence_not_a_stream_that_keeps_producing() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut buffer = [0u8; 4096];
+        let _ = socket.read(&mut buffer).await.unwrap();
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n")
+            .await
+            .unwrap();
+        // Six chunks 60ms apart: 360ms in total, far past the 150ms timeout, never silent for it.
+        for _ in 0..6 {
+            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+            socket.write_all(b"3\r\n{}\n\r\n").await.unwrap();
+        }
+        socket.write_all(b"0\r\n\r\n").await.unwrap();
+    });
+    let proxy = app(
+        common::proxy_config("127.0.0.1:0", format!("http://{addr}"), false)
+            .with_request_timeout(std::time::Duration::from_millis(150)),
+    )
+    .unwrap();
+    let response = proxy
+        .oneshot(Request::post("/api/chat").body(Body::from("{}")).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("a live stream is not cut off by the idle timeout");
+    assert_eq!(body.len(), 18);
+}
