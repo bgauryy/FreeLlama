@@ -182,6 +182,7 @@ fn endpoint_is_loopback(endpoint: &str) -> bool {
 }
 
 /// Keep only tracked names, so inspection never turns into a generic environment dump.
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn tracked_only<'a>(pairs: impl Iterator<Item = (&'a str, &'a str)>) -> BTreeMap<String, String> {
     pairs
         .filter(|(name, value)| TRACKED.contains(name) && !value.trim().is_empty())
@@ -190,6 +191,7 @@ fn tracked_only<'a>(pairs: impl Iterator<Item = (&'a str, &'a str)>) -> BTreeMap
 }
 
 /// Parse a NUL-separated `/proc/<pid>/environ` blob.
+#[cfg(any(target_os = "linux", test))]
 pub(super) fn parse_proc_environ(bytes: &[u8]) -> BTreeMap<String, String> {
     let text = String::from_utf8_lossy(bytes);
     tracked_only(text.split('\0').filter_map(|entry| entry.split_once('=')))
