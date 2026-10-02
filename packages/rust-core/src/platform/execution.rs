@@ -637,6 +637,20 @@ pub(super) async fn execute_task(
             result = Err(error);
         }
     }
+    record_completion(&state, record, started).await;
+    if matches!(operation, super::warming::ManagedOperation::Warm)
+        && let Ok(Json(value)) = &mut result
+    {
+        value["warm"] = super::warming::completion_receipt(&value["execution"]);
+    }
+    result
+}
+
+async fn record_completion(
+    state: &PlatformState,
+    mut record: super::telemetry::TaskRecord,
+    started: Instant,
+) {
     record.duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     if record.outcome == "ok" {
         state
@@ -644,12 +658,6 @@ pub(super) async fn execute_task(
             .completed(&record.backend, &record.model, record.load_ms);
     }
     state.telemetry.record_task(record).await;
-    if matches!(operation, super::warming::ManagedOperation::Warm)
-        && let Ok(Json(value)) = &mut result
-    {
-        value["warm"] = super::warming::completion_receipt(&value["execution"]);
-    }
-    result
 }
 
 async fn commit_scoped_completion(

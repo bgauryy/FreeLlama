@@ -1330,9 +1330,7 @@ async fn request_recommendation(endpoint: String, route: RouteInput) -> Result<(
     .await
 }
 
-/// Nine parameters because `task` mirrors the platform's own request shape one-for-one; grouping
-/// them into a struct here would add a type that exists only to satisfy a lint, and would drift
-/// from the endpoint it mirrors.
+/// Forward caller controls without resolving defaults locally; scopes own omitted routing fields.
 #[allow(clippy::too_many_arguments)]
 async fn request_task(
     prompt: String,

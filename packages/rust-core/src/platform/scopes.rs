@@ -177,9 +177,13 @@ struct History {
     forked_from: Option<Value>,
 }
 impl History {
-    fn receipt(&self, id: &str, include: bool) -> Value {
+    fn receipt(&self, id: &str, include: bool, policy: &ScopePolicy) -> Value {
+        let limits = self.limits.bounded(policy);
+        let expires_at = self
+            .expires_at
+            .saturating_sub(self.limits.ttl_seconds.saturating_sub(limits.ttl_seconds));
         let (bytes, tokens) = history_size(&self.messages);
-        let mut result = json!({"scope_id":id,"revision":self.revision,"route_defaults":self.defaults,"limits":self.limits,"storage":"process_local","privacy":{"opt_in":true,"persistent":false,"contains_caller_history":true},"message_count":self.messages.len(),"bytes":bytes,"estimated_tokens":tokens,"token_estimator":"utf8_bytes_div_3","expires_at":self.expires_at});
+        let mut result = json!({"scope_id":id,"revision":self.revision,"route_defaults":self.defaults,"limits":limits,"storage":"process_local","privacy":{"opt_in":true,"persistent":false,"contains_caller_history":true},"message_count":self.messages.len(),"bytes":bytes,"estimated_tokens":tokens,"token_estimator":"utf8_bytes_div_3","expires_at":expires_at});
         if include {
             result["messages"] = json!(self.messages);
         }
@@ -244,7 +248,7 @@ impl ScopeStore {
             lease: None,
             forked_from: None,
         };
-        let receipt = history.receipt(&id, false);
+        let receipt = history.receipt(&id, false, policy);
         entries.insert(id, history);
         Ok(receipt)
     }
@@ -253,7 +257,7 @@ impl ScopeStore {
         Self::prune(&mut entries, policy);
         entries
             .get(id)
-            .map(|history| history.receipt(id, include))
+            .map(|history| history.receipt(id, include, policy))
             .ok_or_else(not_found)
     }
     fn fork(&self, id: &str, input: ForkInput, policy: &ScopePolicy) -> Result<Value, ApiError> {
@@ -291,7 +295,7 @@ impl ScopeStore {
         };
         Self::capacity(&entries, history_size(&history.messages).0, policy)?;
         let new_id = Uuid::new_v4().to_string();
-        let receipt = history.receipt(&new_id, false);
+        let receipt = history.receipt(&new_id, false, policy);
         entries.insert(new_id, history);
         Ok(receipt)
     }
@@ -431,11 +435,11 @@ impl ScopeLease {
             defaults: history.defaults.clone(),
             limits: history.limits.clone(),
             touched: Instant::now(),
-            expires_at: super::telemetry::now_seconds().saturating_add(limits.ttl_seconds),
+            expires_at: super::telemetry::now_seconds().saturating_add(history.limits.ttl_seconds),
             lease: None,
             forked_from: history.forked_from.clone(),
         };
-        let mut receipt = candidate.receipt(&self.id, false);
+        let mut receipt = candidate.receipt(&self.id, false, policy);
         receipt["previous_revision"] = json!(self.revision);
         receipt["committed"] = json!(true);
         result["scope"] = receipt;
@@ -495,10 +499,12 @@ fn validate_messages(messages: &[Value]) -> Result<(), ApiError> {
         if !matches!(
             message["role"].as_str(),
             Some("system" | "user" | "assistant" | "tool")
-        ) || !message["content"].is_string()
+        ) || message
+            .get("content")
+            .is_some_and(|content| !content.is_string())
         {
             return Err(ApiError::bad_request(
-                "scope messages require a supported role and string content",
+                "scope messages require a supported role and string content when present",
             ));
         }
         if message
@@ -570,4 +576,67 @@ pub(super) async fn fork(
         StatusCode::CREATED,
         Json(state.scopes.fork(&id, input, &state.tunables().scopes)?),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lowered_operator_caps_change_receipts_without_renewing_history() {
+        let store = ScopeStore::default();
+        let original = ScopePolicy::default();
+        let created = store
+            .create(
+                CreateInput {
+                    messages: vec![json!({"role":"system","content":"prefix"})],
+                    ..Default::default()
+                },
+                &original,
+            )
+            .unwrap();
+        let id = created["scope_id"].as_str().unwrap();
+        let touched = store.lock()[id].touched;
+        let lowered = ScopePolicy {
+            max_messages: 2,
+            max_bytes: 200,
+            max_estimated_tokens: 100,
+            ttl_seconds: 60,
+            ..original.clone()
+        };
+        let receipt = store.get(id, true, &lowered).unwrap();
+        assert_eq!(receipt["limits"]["max_messages"], 2);
+        assert_eq!(receipt["limits"]["max_bytes"], 200);
+        assert_eq!(receipt["limits"]["max_estimated_tokens"], 100);
+        assert_eq!(receipt["limits"]["ttl_seconds"], 60);
+        assert_eq!(
+            receipt["expires_at"],
+            created["expires_at"].as_u64().unwrap() - 3540
+        );
+        assert_eq!(receipt["revision"], 0);
+        assert_eq!(receipt["message_count"], 1);
+        {
+            let entries = store.lock();
+            assert_eq!(entries[id].touched, touched);
+            assert_eq!(entries[id].limits.ttl_seconds, 3600);
+        }
+        let restored = store.get(id, false, &original).unwrap();
+        assert_eq!(restored["limits"]["ttl_seconds"], 3600);
+        assert_eq!(restored["expires_at"], created["expires_at"]);
+        let mut input: TaskInput =
+            serde_json::from_value(json!({"scope_id":id,"scope_revision":0,"prompt":"next"}))
+                .unwrap();
+        let lease = store.prepare(&mut input, &original).unwrap().unwrap();
+        let mut response =
+            json!({"response":{"done":true,"message":{"role":"assistant","content":"reply"}}});
+        let generous = ScopePolicy {
+            ttl_seconds: 60,
+            ..original.clone()
+        };
+        lease.commit(&mut response, &generous, None).unwrap();
+        assert_eq!(response["scope"]["limits"]["ttl_seconds"], 60);
+        let effective = store.get(id, false, &generous).unwrap();
+        assert_eq!(effective["expires_at"], response["scope"]["expires_at"]);
+        assert_eq!(store.lock()[id].limits.ttl_seconds, 3600);
+    }
 }

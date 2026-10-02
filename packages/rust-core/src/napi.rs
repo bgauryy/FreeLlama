@@ -21,7 +21,7 @@ use napi_derive::napi;
 use reqwest::Client;
 use serde_json::{Value, json};
 
-/// Default for the 5 functions that need a running `freellama serve` (proxy + control plane).
+/// Default for functions that need a running `freellama serve` (proxy + control plane).
 /// Overridable via `FREELLAMA_SERVE_ENDPOINT` so a non-default port/host doesn't need a recompile.
 const DEFAULT_SERVE_ENDPOINT: &str = "http://127.0.0.1:11435";
 /// Default for `doctor`, which talks to Ollama directly and needs no `freellama serve` at all —
@@ -41,7 +41,7 @@ fn control_timeout() -> Duration {
     )
 }
 
-/// Timeout for the two calls that make a model actually generate. A cold load of a large model can
+/// Timeout for managed inference and model loading. A cold load of a large model can
 /// legitimately take minutes — Ollama's own `OLLAMA_LOAD_TIMEOUT` is 5m before it even gives up on
 /// the load — so this has to be generous or it would abort work that was going to succeed.
 /// Overridable via `FREELLAMA_TASK_TIMEOUT_SECONDS`.

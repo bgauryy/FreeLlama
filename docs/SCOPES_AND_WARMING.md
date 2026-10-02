@@ -43,6 +43,9 @@ Create accepts the following optional fields:
 | `route_defaults` | `routeDefaults` | Task-routing defaults for later scoped execution. |
 | `limits` | `limits` | Per-scope bounds within the server's configured limits. |
 
+Messages require a supported role and can omit content, including for assistant tool calls.
+When present, content must be a string.
+
 Routing defaults accept `task`, `objective`, `model`, `required_capabilities`, `context_tokens`,
 `execution_preference`, `min_placement_evidence`, and `min_confidence`. MCP uses the corresponding
 camelCase field names. Defaults do not grant admission or qualify a model. Explicit task fields
@@ -51,6 +54,9 @@ take precedence, and execution checks current eligibility and resources.
 The metadata receipt contains `scope_id`, `revision`, `route_defaults`, `limits`, `message_count`,
 `bytes`, `estimated_tokens`, `expires_at`, and `storage:"process_local"`. Full history can include images, thinking, and tool calls; request it only when needed. Counts and estimates
 describe the stored transcript; they are not an exact tokenizer result or runner-memory estimate.
+Token estimates derive from the full serialized message bytes and count both media and extra fields.
+This conservative estimate can refuse media-heavy history before inference; it does not measure
+exact image token cost.
 
 Fork requires `revision` and accepts optional replacement routing defaults and limit overrides. It creates a
 separate history snapshot with revision `0`; later writes to either scope do not change the other.
@@ -71,6 +77,10 @@ metadata receipt with the next revision. Failed or cancelled tasks do not append
 deleted or expired during execution cannot receive the result. History limits also apply to the
 completed assistant message: a response that exceeds them returns an append error with the prior
 revision intact even though inference has run. Inspect the failure before retrying.
+
+Deleting a session releases its affinity without deleting scope history or invalidating an
+already-running scope append. Killing a session cancels its associated work; cancelled work does
+not append history.
 
 Limits reject an oversized transcript instead of silently deleting earlier instructions. If a task
 cannot fit, narrow its input, create a compact replacement scope, or fork a suitable snapshot. The
@@ -154,6 +164,10 @@ A cold warm request can therefore wait or refuse. Read the `warm` receipt alongs
 `execution.observation` and `execution.keep_alive`; a successful load response alone does not prove
 physical residency or placement. Use configured placement for an initial load,
 inspect its receipt, and require observed placement for subsequent work when placement matters.
+
+With `keep_alive:"0"`, warming observes placement and then unloads. The `warm` receipt describes
+residency after unload: `loaded:false` on verified unload, with
+`residency_source:"ollama_api_ps_after_unload"`.
 
 Use a context/task profile compatible with the following task. Warming a different profile can
 require another runner transition. Warm residency does not reserve a later execution slot. Cache reuse depends on the compatible

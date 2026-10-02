@@ -603,3 +603,42 @@ async fn scope_history_is_independent_of_deleted_affinity_but_session_kill_cance
     }
     server.abort();
 }
+
+#[tokio::test]
+async fn scope_preserves_contentless_assistant_tool_messages() {
+    let (platform, captured, server) = fixture().await;
+    let initial = json!({"role":"assistant","tool_calls":[{"function":{"name":"initial_lookup","arguments":{"key":"one"}}}]});
+    let (status, created) = request(
+        &platform,
+        "POST",
+        "scopes",
+        json!({"messages":[initial.clone()]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = created["scope_id"].as_str().unwrap();
+    let followup = json!({"role":"assistant","tool_calls":[{"function":{"name":"followup_lookup","arguments":{"key":"two"}}}]});
+    let (status,result)=request(&platform,"POST","tasks",json!({"scope_id":id,"scope_revision":0,"messages":[followup.clone(),{"role":"tool","tool_name":"followup_lookup","content":"result"}]})).await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    let (_, history) = request(
+        &platform,
+        "GET",
+        &format!("scopes/{id}?include_messages=true"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(history["messages"][0], initial);
+    assert_eq!(history["messages"][1], followup);
+    assert!(history["messages"][0].get("content").is_none());
+    assert!(history["messages"][1].get("content").is_none());
+    assert_eq!(captured.lock().await[0]["messages"][1], followup);
+    let (status, result) = request(
+        &platform,
+        "POST",
+        "scopes",
+        json!({"messages":[{"role":"assistant","content":null,"tool_calls":[]}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{result}");
+    server.abort();
+}
