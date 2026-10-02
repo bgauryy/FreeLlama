@@ -176,3 +176,11 @@ export function naturalRoute(
   text: string,
   sessionId?: string | undefined | null,
 ): Promise<string>;
+
+/** Opt-in bounded process-local history. Metadata by default. */
+export function createScope(endpoint: string | undefined | null, request: unknown): Promise<string>;
+export function getScope(endpoint: string | undefined | null, scopeId: string, includeMessages?: boolean | null): Promise<string>;
+export function forkScope(endpoint: string | undefined | null, scopeId: string, request: unknown): Promise<string>;
+export function deleteScope(endpoint: string | undefined | null, scopeId: string): Promise<void>;
+/** Empty-payload preload through managed admission and deadlines. */
+export function warmModelRequest(endpoint: string | undefined | null, request: unknown): Promise<string>;

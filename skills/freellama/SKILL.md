@@ -5,7 +5,7 @@ description: "Use when delegating token-heavy work to local Ollama models throug
 
 # FreeLlama
 
-Operate FreeLlama as governed local-model delegation, not as a frontier-model replacement. MCP tools: `doctor`, `session`, `models`, `run_task`, `task_jobs`, `run_task_batch`, `ollama_manage`, `ollama_delete`, `delegate_research`; `npx @octocodeai/freellama tools` maps them to CLI equivalents.
+Operate FreeLlama as governed local-model delegation, not as a frontier-model replacement. MCP tools: `doctor`, `session`, `scope`, `warm_model`, `models`, `run_task`, `task_jobs`, `run_task_batch`, `ollama_manage`, `ollama_delete`, `delegate_research`; `npx @octocodeai/freellama tools` maps them to CLI equivalents.
 
 Flow: `PREREQUISITE → DIAGNOSE → DECIDE → EXECUTE → VERIFY`
 
@@ -35,7 +35,7 @@ One managed call contains one task; only the calling agent knows which tasks are
 |---|---|
 | Grounded lookup over >~1k source tokens, OCR, embeddings, bulk transforms, privacy/rate-limited work | Tiny lookups already in context, architecture/review judgment, ambiguous synthesis |
 
-Prefer deterministic search when an identifier is known; embeddings are for no-keyword similarity. Treat every measured number as one-machine evidence, not a default. Models at or below 12B were unreliable for broad research in the recorded trials.
+Prefer deterministic search when an identifier is known; embeddings are for no-keyword similarity. Treat every measured number as one-machine evidence, not a default. Use the exact model’s workload evidence; parameter count does not qualify a research result.
 
 Ordinary chat can omit `task` and use the `completion` default. Choose `coding`, `code_repair`,
 `tools`, `browser`, `vision`, `embedding`, or `long_context` when that routing profile fits; callers
@@ -50,7 +50,7 @@ Call `delegate_research{question,workspacePath,model?,adapter?,executionPreferen
 
 ### B — supplied content or vision
 
-Call `run_task{task,prompt|messages,images?,model?,executionPreference?,minPlacementEvidence?,keepAlive?,minConfidence?,preview?}`. It has no file access. `preview:true` is free; `minConfidence` gates quality evidence. `minPlacementEvidence:"observed"` additionally refuses cold, mixed, or mismatched processor placement; warm once with `"configured"`, inspect the receipt, then require `"observed"`. Images are base64 without a data-URI prefix and require an explicitly trialled vision model. GLM-OCR needs a model-specific repetition guard: `options.stop:["```"]` handles fence tails; add `"\n"` only for a one-line transcription contract. Load `references/model-selection.md` before model choice.
+Call `run_task{task,prompt|messages,images?,model?,executionPreference?,minPlacementEvidence?,keepAlive?,minConfidence?,preview?}`. It has no file access. `preview:true` is free; `minConfidence` gates quality evidence. `minPlacementEvidence:"observed"` additionally refuses cold, mixed, or mismatched processor placement; warm once with `"configured"`, inspect the receipt, then require `"observed"`. Images are base64 without a data-URI prefix and require an explicitly trialled vision model. Choose output limits and stop sequences from the tested output contract. Load `references/model-selection.md` before model choice.
 
 ### C — embeddings
 
@@ -58,11 +58,21 @@ Batch `run_task{task:"embedding",input:[...]}` and leave `returnEmbeddings:false
 
 For work that may wait, use `run_task{defer:true,timeoutSeconds,priority,...}` and inspect its ID with `task_jobs{action:"get",jobId}`. `timeoutSeconds` includes discovery, queueing, loading, and inference. `task_jobs{action:"cancel",jobId}` waits for local permit release; it does not prove Ollama stopped decoding. Jobs and bounded results are process-local and expire; they are not resumed after restart. Preview accepts routing fields only: omit payloads, priorities, deadlines, and `defer`, then make a separate execution call.
 
-### D — choose or install a model
+### D — retain history or prepare a runner
+
+Use `scope{action:"create",messages}` for bounded process-local history; `session` stores only
+model affinity. Pass `scopeId` and `scopeRevision` with new input to `run_task`, then use its
+returned revision. Fork at the expected revision before independent parallel branches. Read history
+only with `includeMessages:true`; failures and cancellations do not append. Use
+`warm_model{model,contextTokens,keepAlive?}` to load an exact installed runner profile through the
+same admission and fit checks. Explicit `keepAlive` wins over finite adaptive retention. Load
+`references/context-management.md` for scope limits and cache ownership.
+
+### E — choose or install a model
 
 Ask for missing workload/modality, quality, latency, context, privacy, download, disk, and memory constraints. Diagnose the host, prefer qualified installed models, then search `models{view:"library"}` by family and inspect exact pullable tags with `models{view:"detail",model}`. Present at most two evidence-backed candidates. Ask approval for one exact tag and size before `ollama_manage{action:"pull"}`; discovery never grants installation permission. Load `references/model-selection.md`, then `references/ollama-config.md` for fit.
 
-### E — diagnose a failure
+### F — diagnose a failure
 
 Run `doctor`, resident models, then `scripts/check.sh` (read-only; exit 0 means healthy). Load `references/troubleshooting.md` for symptom routing. Never treat a 503, confidence refusal, CPU spill, or proxy/serve 404 as the same failure.
 

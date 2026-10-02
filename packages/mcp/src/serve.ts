@@ -17,6 +17,16 @@ const STARTUP_TIMEOUT_MS = 15_000;
 let child: ChildProcess | null = null;
 let starting: Promise<void> | null = null;
 
+/** Serve-backed native calls start the bundled `freellama serve` first when nothing answers. */
+export function withServe<Args extends unknown[], R>(
+  call: (endpoint: string | null | undefined, ...args: Args) => Promise<R>,
+): (endpoint: string | null | undefined, ...args: Args) => Promise<R> {
+  return async (endpoint, ...args) => {
+    await ensureServe(endpoint ?? undefined);
+    return call(endpoint, ...args);
+  };
+}
+
 function autostartEnabled(): boolean {
   return process.env.FREELLAMA_MCP_AUTOSTART_SERVE !== "0";
 }
@@ -68,8 +78,8 @@ export function stopAutostartedServe(): void {
 
 /**
  * Make sure serve answers at `endpoint`. A no-op for explicit non-default or remote endpoints,
- * when FREELLAMA_MCP_AUTOSTART_SERVE=0, or when something already answers. Failures are left to
- * the caller's own request, whose error names the endpoint.
+ * when FREELLAMA_MCP_AUTOSTART_SERVE=0, or when something already answers. Startup failures
+ * reject the tool request while leaving the MCP transport available for a retry.
  */
 export async function ensureServe(endpoint: string | undefined): Promise<void> {
   const target = endpoint ?? DEFAULT_SERVE_ENDPOINT;
@@ -83,18 +93,31 @@ export async function ensureServe(endpoint: string | undefined): Promise<void> {
       const binary = serveBinaryCandidates().find((candidate) => existsSync(candidate));
       if (!binary) return;
       // stdout is the MCP transport: the child must never write to it.
-      child = spawn(binary, ["serve", "--listen", listen, "--upstream", DEFAULT_OLLAMA_ENDPOINT], {
+      const spawned = spawn(binary, ["serve", "--listen", listen, "--upstream", DEFAULT_OLLAMA_ENDPOINT], {
         stdio: ["ignore", "ignore", "pipe"],
       });
-      child.stderr?.on("data", (chunk: Buffer) => process.stderr.write(`[freellama serve] ${chunk}`));
-      child.on("exit", () => {
-        child = null;
+      child = spawned;
+      spawned.stderr?.on("data", (chunk: Buffer) => process.stderr.write(`[freellama serve] ${chunk}`));
+      spawned.once("exit", () => {
+        if (child === spawned) child = null;
+      });
+      await new Promise<void>((resolve, reject) => {
+        spawned.once("spawn", resolve);
+        spawned.once("error", (error) => {
+          if (child === spawned) child = null;
+          reject(new Error(`Could not start freellama serve at ${target}: ${error.message}`));
+        });
       });
       const deadline = Date.now() + STARTUP_TIMEOUT_MS;
-      while (Date.now() < deadline && child) {
+      while (Date.now() < deadline && child === spawned) {
         if (await answers(target, 500)) return;
         await new Promise((resolve) => setTimeout(resolve, 200));
       }
+      if (child === spawned) {
+        stopAutostartedServe();
+        throw new Error(`freellama serve did not become ready at ${target} within ${STARTUP_TIMEOUT_MS}ms.`);
+      }
+      throw new Error(`freellama serve exited before becoming ready at ${target} (exit ${spawned.exitCode}, signal ${spawned.signalCode}).`);
     } finally {
       starting = null;
     }

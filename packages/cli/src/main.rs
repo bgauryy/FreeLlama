@@ -1,3 +1,5 @@
+mod context_cli;
+
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -220,6 +222,9 @@ struct BackendArgs {
 /// Per-task execution controls, separate from side-effect-free routing.
 #[derive(Debug, Clone, clap::Args)]
 struct TaskExecutionArgs {
+    /// Override model residency; omitted uses the server adaptive finite TTL.
+    #[arg(long)]
+    keep_alive: Option<String>,
     /// Return a job ID immediately; use `jobs` to inspect or cancel it.
     #[arg(long)]
     defer: bool,
@@ -367,6 +372,20 @@ enum Command {
         )]
         endpoint: String,
     },
+    /// Manage opt-in process-local conversation history.
+    Scope {
+        #[arg(
+            long,
+            global = true,
+            env = "FREELLAMA_SERVE_ENDPOINT",
+            default_value = "http://127.0.0.1:11435"
+        )]
+        endpoint: String,
+        #[command(subcommand)]
+        action: context_cli::ScopeAction,
+    },
+    /// Preload an exact installed chat model through managed resource admission.
+    Warm(context_cli::WarmArgs),
     /// Resolve a task to a local model and Ollama request profile without running it.
     Route {
         #[arg(
@@ -452,24 +471,28 @@ enum Command {
             default_value = "http://127.0.0.1:11435"
         )]
         endpoint: String,
-        #[arg(long, value_enum, default_value_t = TaskKind::Completion)]
-        task: TaskKind,
+        #[arg(long, value_enum)]
+        task: Option<TaskKind>,
         /// `balanced` prefers task-policy candidates, falling back with low confidence.
         /// `quality` needs a policy unless an explicit model is supplied.
-        #[arg(long, value_enum, default_value_t = Objective::Balanced)]
-        objective: Objective,
+        #[arg(long, value_enum)]
+        objective: Option<Objective>,
         #[arg(long)]
         model: Option<String>,
         #[arg(long)]
         session: Option<String>,
         #[arg(long)]
         context_tokens: Option<u64>,
+        #[arg(long, requires = "scope_revision")]
+        scope_id: Option<Uuid>,
+        #[arg(long, requires = "scope_id")]
+        scope_revision: Option<u64>,
         /// Prefer an operator-configured backend. Falls back safely when it has no eligible model.
-        #[arg(long, value_enum, default_value_t = ExecutionPreference::Auto)]
-        execution_preference: ExecutionPreference,
+        #[arg(long, value_enum)]
+        execution_preference: Option<ExecutionPreference>,
         /// `observed` fails closed unless the selected resident model matches physical placement.
-        #[arg(long, value_enum, default_value_t = PlacementEvidence::Configured)]
-        min_placement_evidence: PlacementEvidence,
+        #[arg(long, value_enum)]
+        min_placement_evidence: Option<PlacementEvidence>,
         /// Attach an image (repeatable). Required for `--task vision`: without one the model is
         /// routed correctly but has nothing to look at, and says so.
         #[arg(long = "image")]
@@ -660,6 +683,8 @@ async fn main() -> Result<()> {
         Command::Machine { endpoint } => {
             print_get(&endpoint, "/_freellama/v1/machine").await?;
         }
+        Command::Scope { endpoint, action } => context_cli::run_scope(&endpoint, action).await?,
+        Command::Warm(args) => context_cli::run_warm(args).await?,
         Command::Session { endpoint } => {
             print_post(&endpoint, "/_freellama/v1/sessions", &json!({})).await?;
         }
@@ -738,6 +763,8 @@ async fn main() -> Result<()> {
             model,
             session,
             context_tokens,
+            scope_id,
+            scope_revision,
             execution_preference,
             min_placement_evidence,
             images,
@@ -754,6 +781,8 @@ async fn main() -> Result<()> {
                 model,
                 session,
                 context_tokens,
+                scope_id,
+                scope_revision,
                 execution_preference,
                 min_placement_evidence,
                 images,
@@ -1308,35 +1337,51 @@ async fn request_recommendation(endpoint: String, route: RouteInput) -> Result<(
 async fn request_task(
     prompt: String,
     endpoint: String,
-    task: TaskKind,
-    objective: Objective,
+    task: Option<TaskKind>,
+    objective: Option<Objective>,
     model: Option<String>,
     session: Option<String>,
     context_tokens: Option<u64>,
-    execution_preference: ExecutionPreference,
-    min_placement_evidence: PlacementEvidence,
+    scope_id: Option<Uuid>,
+    scope_revision: Option<u64>,
+    execution_preference: Option<ExecutionPreference>,
+    min_placement_evidence: Option<PlacementEvidence>,
     images: Vec<PathBuf>,
     input_file: Option<PathBuf>,
     min_confidence: Option<String>,
     required_capabilities: Vec<String>,
     execution: TaskExecutionArgs,
 ) -> Result<()> {
-    let route = route_input(
-        task,
-        objective,
-        model,
-        session,
-        context_tokens,
-        execution_preference,
-        min_placement_evidence,
-        &required_capabilities,
-        min_confidence,
-    );
-    let mut body = serde_json::to_value(route)?;
+    let mut body = json!({
+        "model": model, "session_id": session, "context_tokens": context_tokens,
+        "scope_id": scope_id, "scope_revision": scope_revision,
+        "min_confidence": min_confidence,
+    });
+    if let Some(task) = task {
+        body["task"] = json!(task);
+    }
+    if let Some(objective) = objective {
+        body["objective"] = json!(objective);
+    }
+    if let Some(preference) = execution_preference {
+        body["execution_preference"] = json!(preference);
+    }
+    if let Some(evidence) = min_placement_evidence {
+        body["min_placement_evidence"] = json!(evidence);
+    }
+    if !required_capabilities.is_empty() {
+        body["required_capabilities"] = json!(required_capabilities);
+    }
+    body["keep_alive"] = json!(execution.keep_alive);
     body["defer"] = json!(execution.defer);
     body["timeout_seconds"] = json!(execution.timeout_seconds);
     body["priority"] = json!(execution.priority);
     body["max_wait_seconds"] = json!(execution.max_wait_seconds);
+
+    // Omitted flags must remain absent so scoped routing defaults can apply.
+    body.as_object_mut()
+        .expect("task object")
+        .retain(|_, value| !value.is_null());
 
     // Ollama takes images as base64 with no data-URI prefix, attached to the user message.
     // Without this the CLI could select a vision model but never hand it anything to look at —
@@ -1368,7 +1413,7 @@ async fn request_task(
         return print_post(&endpoint, "/_freellama/v1/tasks", &body).await;
     }
 
-    let field = if matches!(task, TaskKind::Embedding) {
+    let field = if matches!(task, Some(TaskKind::Embedding)) {
         "input"
     } else {
         "prompt"
@@ -1583,11 +1628,13 @@ async fn print_get(endpoint: &str, path: &str) -> Result<()> {
 
 async fn print_post(endpoint: &str, path: &str, body: &Value) -> Result<()> {
     // `/tasks` and `/natural-routes` run a model; everything else is a decision.
-    let timeout = if path.ends_with("/tasks") || path.ends_with("/natural-routes") {
-        cli_task_timeout()
-    } else {
-        cli_control_timeout()
-    };
+    let timeout =
+        if path.ends_with("/tasks") || path.ends_with("/natural-routes") || path.ends_with("/warm")
+        {
+            cli_task_timeout()
+        } else {
+            cli_control_timeout()
+        };
     let request = cli_client()
         .post(format!("{}{path}", endpoint.trim_end_matches('/')))
         .timeout(timeout)
@@ -1611,8 +1658,18 @@ fn authenticate_request(request: reqwest::RequestBuilder) -> Result<reqwest::Req
 /// Hand-maintained rather than generated from the MCP server, so the CLI keeps no Node dependency.
 /// The trade-off is that adding or removing a tool means updating this table.
 fn print_tool_map() {
-    println!("FreeLlama exposes 9 MCP tools. Equivalents for a CLI-only agent:\n");
+    println!("FreeLlama exposes 11 MCP tools. Equivalents for a CLI-only agent:\n");
     let rows = [
+        (
+            "scope",
+            "freellama scope <create|get|fork|delete>",
+            "bounded process-local history, revision-safe task continuation",
+        ),
+        (
+            "warm_model",
+            "freellama warm --model <exact-tag>",
+            "managed preload with adaptive finite residency",
+        ),
         (
             "doctor",
             "freellama doctor",
@@ -1663,7 +1720,7 @@ fn print_tool_map() {
         println!("  {tool:<18} {cli:<38} {what}");
     }
     println!(
-        "\nCLI-only: init, serve, proxy, machine, session, bench-all, policy-from-eval, eval, run, \
+        "\nCLI-only: init, serve, proxy, machine, bench-all, policy-from-eval, eval, run, \
          natural-route, recommend."
     );
     println!("Orchestration guidance for either surface: skills/freellama/SKILL.md");

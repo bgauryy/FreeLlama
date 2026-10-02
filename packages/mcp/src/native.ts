@@ -7,7 +7,12 @@ import { createRequire } from "node:module";
 // is not reliably detectable by Node's CJS/ESM interop. Destructuring after a default import
 // sidesteps that entirely.
 import native from "../native/index.js";
-export const { doctor, machine, health, status, usage, createSession, deleteSession, killSession, listModels, route, runTask, runTaskRequest, runTaskBatchRequest, listTaskJobs, getTaskJob, cancelTaskJob, removeTaskJob } = native as {
+export const { createScope, getScope, forkScope, deleteScope, warmModelRequest, doctor, machine, health, status, usage, createSession, deleteSession, killSession, listModels, route, runTask, runTaskRequest, runTaskBatchRequest, listTaskJobs, getTaskJob, cancelTaskJob, removeTaskJob } = native as {
+  createScope: (endpoint: string | null | undefined, request: unknown) => Promise<string>;
+  getScope: (endpoint: string | null | undefined, scopeId: string, includeMessages?: boolean) => Promise<string>;
+  forkScope: (endpoint: string | null | undefined, scopeId: string, request: unknown) => Promise<string>;
+  deleteScope: (endpoint: string | null | undefined, scopeId: string) => Promise<void>;
+  warmModelRequest: (endpoint: string | null | undefined, request: unknown) => Promise<string>;
   doctor: (endpoint?: string | null) => Promise<string>;
   machine: (endpoint?: string | null) => Promise<string>;
   health: (endpoint?: string | null) => Promise<string>;

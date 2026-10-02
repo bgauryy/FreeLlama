@@ -244,7 +244,11 @@ async fn embedding_task_forwards_route_options_and_returns_prompt_free_metrics()
         response["admission"]["mode"],
         "nonresident_transition_exclusive"
     );
-    assert_eq!(upstream_body["keep_alive"], "5m");
+    let residency = &response["execution"]["keep_alive"];
+    assert_eq!(residency["mode"], "adaptive");
+    assert_eq!(residency["finite"], true);
+    assert!(residency["seconds"].as_u64().unwrap() > 0);
+    assert_eq!(upstream_body["keep_alive"], residency["value"]);
     mock_task.abort();
 }
 

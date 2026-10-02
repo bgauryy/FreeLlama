@@ -95,6 +95,7 @@ possible hop.
 | Exact known model and prompt | One request to the runtime | Adds routing, admission, and a receipt | FreeLlama is extra latency and complexity; do not insert it by default. |
 | Agent must choose safely | Application must implement its own rules | Typed capability, context, policy, confidence, and placement-evidence checks can preview or refuse | The rules are only as good as the configured policy and benchmark evidence. |
 | Avoid local overload | Ollama owns its runtime queue | Weighted-fair per-backend admission with bounded queue cardinality and wait time; independent batches get a bounded dispatcher | Raw compatibility traffic bypasses managed routing; `serve` applies a separate one-stream default cap that is generic, not device-aware. |
+| Retain related-task history | Caller replays messages | Opt-in bounded scopes replay history with revision-protected appends | Process-local history survives neither restart nor expiry; KV reuse remains backend-owned. |
 | Keep related tasks on one model | Caller names the model each time | In-memory affinity handle binds only after successful execution | A session is not chat memory or Ollama KV, expires when idle, and disappears on restart. |
 | CPU/GPU separation | Ollama selects runner placement | Exact operator-assigned models can use a second CPU Ollama process | This is manual process topology, not automatic GPU scheduling or live VRAM management. |
 | Ground repository answers | Caller supplies tools, prompts, and verification | Confined research adapters return citations and a verification verdict | The adapter is deliberately narrow and is not a general autonomous coding system. |
@@ -143,7 +144,7 @@ The system therefore is not an autonomous scheduler. It is agentic where interpr
 investigation help, deterministic where trust, safety, hardware ownership, and compatibility
 matter.
 
-In short: the agent owns **what can be offloaded and what can run concurrently**; the operator owns
+The agent owns **what can be offloaded and what can run concurrently**; the operator owns
 **which Ollama processes and exact model tags may use CPU**; FreeLlama owns **qualification,
 admission, and the managed routing decision**; Ollama and the operating system own **the actual
 model runner and physical CPU/GPU execution**.
@@ -159,7 +160,8 @@ Some contracts are intentionally strict:
   proof still requires post-run `size_vram:0` because some MLX runners ignore the request.
 - An explicit model or an existing session affinity wins over adaptive placement.
 - The schema represents managed task types and objectives as enums rather than free-form prompts.
-- The MCP surface has seven focused tools; permanent deletion remains a separate destructive tool.
+- The MCP surface separates model work, history, residency, and lifecycle operations; permanent
+  deletion remains a destructive tool.
 - Quality-sensitive routes fail closed when policy or benchmark evidence is missing.
 
 Workload policy remains configurable: endpoints, CPU model assignments, policies, benchmark
@@ -285,7 +287,7 @@ explicitly. See the [MCP build and client guidance](packages/mcp/README.md).
 
 ## Control FreeLlama through MCP
 
-The MCP server exposes nine tools to compatible AI-agent hosts:
+The MCP server exposes focused tools to compatible AI-agent hosts:
 
 | MCP tool | Control | Important behavior |
 |---|---|---|
@@ -295,9 +297,14 @@ The MCP server exposes nine tools to compatible AI-agent hosts:
 | `task_jobs` | List states, retrieve results, cancel, or remove deferred work by ID | Removal stops active work and discards its retained record after local permits are released |
 | `run_task_batch` | Execute caller-declared independent work | Requires stable IDs and `independent:true`; bounds dispatch and returns each sibling result/error |
 | `session` | Create or release bounded model affinity for related tasks | Stores neither prompt history nor Ollama KV; expires when idle |
+| `scope` | Create, inspect, fork, or delete bounded message history | Revision protects successful appends; history reads are explicit and state is process-local |
+| `warm_model` | Warm an exact installed model through managed admission | Retains routing, memory-fit, placement, deadline, and deferred-job controls |
 | `ollama_manage` | Pull or unload an exact model | Keeps lifecycle work explicit |
 | `ollama_delete` | Permanently delete an exact model | Isolated as a destructive tool |
 | `delegate_research` | Answer a narrow question from allowlisted files | Runs managed coding-agent turns and returns citations, placement receipts, and an independent verdict |
+
+Use [Scope history and model warming](docs/SCOPES_AND_WARMING.md) for opt-in conversation history,
+parallel forks, governed prewarming, and bounded adaptive keep-alive.
 
 For ordinary chat, call `run_task {prompt:"Hello"}`. Task profiles and stricter evidence gates
 are optional; your messages, system prompts, and output format remain yours. See
@@ -429,6 +436,7 @@ flowchart LR
 | `init`, `doctor`, `machine`, `models` | Guide first-run prerequisites, then inspect runtime, host, catalog, residency, and drift |
 | `route`, `recommend` | Make a side-effect-free model decision or installation recommendation |
 | `task`, `session` | Execute managed work or create a session; successful admitted tasks preserve eligible affinity |
+| `scope`, `warm` | Manage bounded message history or warm an installed model through ordinary admission |
 | `natural-route` | Infer typed intent and return a route decision without executing the selected task or changing session affinity |
 | `serve` | Run managed control routes and the Ollama-compatible proxy |
 | `proxy` | Run only passthrough, retry, and telemetry behavior |
@@ -700,7 +708,8 @@ observable, and bounded local research can keep intermediate context out of the 
 | [Architecture](docs/ARCHITECTURE.md) | Ownership, request classification, routing, admission, research, and backend flows |
 | [Monitoring and live tuning](docs/MONITORING.md) | Status page, usage ledger, Prometheus metrics, runtime config reload, 429 back-pressure, circuit breaker, adaptive limits, cost-aware eviction |
 | [Production runbook](docs/PRODUCTION.md) | Auth, persisted feedback, explicit Ollama settings, releases, hardware gates, and promotion |
-| [MCP server](packages/mcp/README.md) | Seven tools, schemas, configuration, allowed roots, build, and security |
+| [MCP server](packages/mcp/README.md) | Tools, schemas, configuration, allowed roots, build, and security |
+| [Scope history and model warming](docs/SCOPES_AND_WARMING.md) | Revision-safe history, parallel forks, managed warming, and residency policy |
 | [CLI reference](docs/CLI.md) | Commands, flags, objectives, managed execution, and policy workflow |
 | [CLI package](packages/cli/README.md) | npm launcher, binary selection, packaging, and CLI/MCP differences |
 | [Rust core](packages/rust-core/README.md) | Embeddable routing, admission, recommendation, evaluation, and NAPI boundary |

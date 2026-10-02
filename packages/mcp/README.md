@@ -4,7 +4,7 @@ Exposes FreeLlama's local-LLM control plane, and Ollama's lifecycle, as
 [MCP](https://modelcontextprotocol.io) tools, built on the official
 [TypeScript SDK](https://github.com/modelcontextprotocol/typescript-sdk).
 
-## Understand the nine tools
+## Understand the tools
 
 - `doctor`, `models`, `run_task`, `task_jobs`, `run_task_batch` — thin wrappers over the native NAPI bindings into the
   Rust core (`../rust-core/src/napi.rs`); no CLI subprocess, no reimplemented routing logic.
@@ -12,6 +12,8 @@ Exposes FreeLlama's local-LLM control plane, and Ollama's lifecycle, as
   Preview and execution are separate calls: preview accepts routing fields only and rejects task
   payloads or runtime controls instead of silently ignoring them.
   `models { view: "library" }` queries the public `ollama.com` library (the former `search_models` tool).
+- `scope` — creates, inspects, forks, or deletes bounded process-local message history.
+- `warm_model` — warms an exact installed model through ordinary managed admission and placement.
 - `session` — creates and releases a bounded, idle-expiring model-affinity handle for related
   route/task calls. It does not store messages, prompt history, or Ollama's runner KV cache.
 - `ollama_manage`, `ollama_delete` — Ollama's HTTP API for lifecycle operations the routing layer
@@ -30,6 +32,8 @@ flowchart TD
     Q -->|"Inspect or cancel deferred work"| J["task_jobs"]
     Q -->|"Fan out independent tasks"| B["run_task_batch"]
     Q -->|"Keep/release related-task model affinity"| S["session"]
+    Q -->|"Retain or fork message history"| H["scope"]
+    Q -->|"Prepare runner residency"| W["warm_model"]
     Q -->|"Pull or stop a model"| O["ollama_manage"]
     Q -->|"Permanently remove a named model"| X["ollama_delete"]
     Q -->|"Ground an answer in workspace files"| G["delegate_research"]
@@ -43,6 +47,8 @@ flowchart TD
 | `task_jobs` | Lists, retrieves, cancels, or removes a bounded process-local task submitted with `defer:true`. Removal stops active work first. |
 | `run_task_batch` | Executes only caller-declared independent tasks. Stable IDs, a bounded dispatcher, 3:2:1 fair priority classes, and per-item errors make fan-out inspectable rather than implicit. |
 | `session` | Lets an agent explicitly own the lifetime of a bounded affinity handle without misrepresenting it as conversation or KV storage. |
+| `scope` | Retains bounded message history with expected revisions and explicit history reads. |
+| `warm_model` | Loads an installed runner profile using the same memory, admission, placement, and job controls as task execution. |
 | `ollama_manage` | Exposes additive lifecycle operations that FreeLlama routing intentionally does not perform. |
 | `ollama_delete` | Keeps irreversible deletion separate and explicit so a client can guard it. |
 | `delegate_research` | Gives a local model bounded read-only tools and returns citations plus an independently computed verification verdict. |
@@ -156,7 +162,7 @@ placement and admission. Ollama and the OS/driver own runner loading and physica
 
 ```mermaid
 flowchart TD
-    C["MCP client"] -->|"stdio JSON-RPC"| B["dist/index.js: nine tool registrations"]
+    C["MCP client"] -->|"stdio JSON-RPC"| B["dist/index.js: tool registrations"]
     B --> N["native/index.js and platform addon"]
     N -->|"doctor"| L["Rust diagnostics"]
     N -->|"models installed/resident; run_task"| S["freellama serve"]
@@ -262,6 +268,10 @@ The same commands work from the repository root (`yarn test` there also runs the
 The integration/e2e tiers fail fast with a readable message when Ollama is down, and the lifecycle
 test refuses to delete a model already installed on the test system.
 
+For default-endpoint autostart, a spawn failure, early exit, or readiness timeout rejects the
+request while leaving the MCP transport available for diagnosis or retry. Autostart does not apply
+to an explicit non-default endpoint; see `FREELLAMA_MCP_AUTOSTART_SERVE` below.
+
 ## Tools
 
 | Tool | Needs `freellama serve`? | What it does |
@@ -269,6 +279,10 @@ test refuses to delete a model already installed on the test system.
 | `doctor` | No | Runtime/configuration diagnostic. `summary` (default) returns endpoint, version, resident count, host/profile signals, and next step; `scheduler` adds configured/snapshot admission data; `config` returns categorized settings; `full` adds all non-duplicated diagnostics; `status` returns serve's live view (per-backend queues, current and adaptive limits, circuit breakers, loaded models, host memory, Ollama's effective settings, today's usage); `usage` returns task and token totals per day and model (`days`, default 7). The report distinguishes an observed same-user macOS process from configuration hints and never claims remote process visibility. |
 | `models` | `installed` (default) and `resident` do; `detail`/`raw`/`library` don't | Views: `installed` (capabilities, use explanations, derived `model_type`, VRAM, context, policy_rank), `resident` (loaded now + managed GPU/CPU split), `detail` (one model, maximum context), paged `raw` (`GET /api/tags`), `library` (two-step ollama.com search: omit `model` for families, pass `model:"<family>"` for all tags/`fitsInMemory`). `includeLibrary:true` enriches installed/detail views with sourced public guidance; `includeReadme:true` returns bounded README text in library step 2 or enriched detail. |
 | `run_task` | Yes | **Routes or executes** a chat/generate/embed call. `preview: true` accepts routing fields only and returns a decision without generation. Execution omits preview and supplies the payload. Embedding results withhold raw vectors by default (`returnEmbeddings: true` to get them) |
+| `scope` | Yes | Creates, inspects, forks, or deletes process-local message history; history inclusion requires `includeMessages:true`. |
+| `warm_model` | Yes | Warms an exact installed model through managed admission; accepts residency/profile controls and optional `defer:true`. |
+| `session` | Yes | Creates or releases model affinity without storing messages or KV. |
+| `task_jobs` | Yes | Inspects, cancels, or removes a deferred task or warming operation. |
 | `run_task_batch` | Yes | Executes only typed `{id, independent:true, task}` items. The nested `task` exposes the same task, routing, payload, and runtime controls as `run_task`; `maxParallelism` bounds fan-out. It is not a dependency graph scheduler. |
 | `ollama_manage` | No (direct to Ollama) | `action: "pull"` downloads a model; `action: "stop"` force-unloads it. Both additive and idempotent |
 | `ollama_delete` | No (direct to Ollama) | **Destructive**: permanently removes a model. Call only on an explicit human instruction naming the exact model |
@@ -287,7 +301,7 @@ custom models, and variant limitations.
 
 ### Preserve Ollama request controls
 
-All nine tools declare an MCP object `outputSchema`. Schemas type the stable fields FreeLlama owns
+The tools declare an MCP object `outputSchema`. Schemas type the stable fields FreeLlama owns
 (such as route decision, page, answer, and session identifiers) while leaving Ollama-owned nested
 payloads forward-compatible. `structuredContent` is canonical; normal text is a concise cue. For
 the narrow `delegate_research` legacy case, set `legacyText:true` to receive serialized JSON text.
@@ -319,7 +333,7 @@ Memory admission, authentication, and capability requirements apply in every mod
 
 Preview rejects `prompt`, `messages`, `input`, `images`, `tools`, `keepAlive`, `format`, `think`,
 `options`, `logprobs`, `topLogprobs`, `returnEmbeddings`, `priority`, `maxWaitSeconds`, `timeoutSeconds`, and
-`defer`. This prevents a client from attaching
+`defer`, `scopeId`, and `scopeRevision`. This prevents a client from attaching
 work to a decision-only call and mistakenly assuming it ran.
 
 `run_task.messages` preserves Ollama message fields beyond `role` and `content`, including images,
@@ -361,6 +375,19 @@ conversations. Ollama can still apply the selected model's own template or Model
 `generative`, `multimodal`, `embedding_only`, or `unknown`. Routing continues to use the original
 capability set, not this summary label. Unknown future Ollama capabilities are omitted from the
 typed routing set instead of being treated as a known capability.
+
+### Retain history and warm models
+
+Use `scope {action:"create",messages}` to retain a caller-owned prefix. Pass its returned ID and
+revision as `scopeId` and `scopeRevision` with only the new input to `run_task`; successful execution
+returns the next scope revision. Fork a snapshot before parallel branches. `sessionId` continues to
+mean model affinity only.
+
+Use `warm_model {model,contextTokens,keepAlive?}` for a matching runner profile. It accepts no task
+payload and does not pull a model. Add `defer:true` to inspect its progress through `task_jobs`.
+Explicit `keepAlive` wins over finite adaptive retention. See the canonical
+[Scope history and model warming reference](../../docs/SCOPES_AND_WARMING.md) for schemas, limits,
+concurrency, privacy, and cache boundaries.
 
 ### Use CPU assignments through MCP
 

@@ -106,6 +106,21 @@ of waiting and active requests, removal of active and completed jobs without aff
 total deadlines during inference, and input-size/batch boundaries.
 Registry unit tests cover active-job limits, terminal eviction, expiry, and result-size limits.
 Cancellation must retain its receipt even when another operation evicts the completed record.
+`scope_warming_contract` covers opt-in history replay, message-field preservation, isolated forks,
+failed/stale append refusal, and payload-free managed warming. The warming unit contract
+exercises bounded reuse, load, and pressure adjustments. For request fields and failure codes, see
+[Scope history and model warming](SCOPES_AND_WARMING.md).
+
+Usage-ledger unit contracts cover ordered writes, bounded queue overflow, failed writes, regular-file
+validation, replay, and flush behavior. `monitoring_contract` also checks that a blocked ledger path
+does not hold task completion. Persistence remains best effort, not a zero-loss promise.
+
+MCP `serve.test.ts` checks startup permission failure, retry, and child-lifecycle isolation. The
+protocol integration contracts verify that spawn failure leaves the MCP connection usable and that
+fixture-backed library requests fail on unexpected product errors. External catalog availability
+is separate from these deterministic checks. Runtime-view `app-windows.test.ts` checks legitimate
+Windows static paths alongside traversal refusal.
+
 Request-validation contracts preserve structured JSON errors for invalid task and batch bodies.
 MCP `task-jobs.test.ts` exercises submission, inspection, result retrieval, cancellation, and removal through
 the native binding, plus preview rejection and embedding-vector summaries. Separate footprint and

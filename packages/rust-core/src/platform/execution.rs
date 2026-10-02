@@ -256,16 +256,6 @@ pub(super) async fn select_managed_route(
     })
 }
 
-fn normalize_keep_alive(value: Option<String>) -> Value {
-    match value {
-        // Ollama's API accepts a numeric negative value for infinite residency. Its duration-string
-        // parser rejects the superficially equivalent `"-1"` because that string has no unit.
-        Some(value) if value == "-1" => json!(-1),
-        Some(value) => json!(value),
-        None => json!("5m"),
-    }
-}
-
 fn requests_immediate_unload(value: Option<&str>) -> bool {
     matches!(value.map(str::trim), Some("0" | "0s" | "0m" | "0h"))
 }
@@ -376,6 +366,12 @@ fn build_managed_request(
     decision: &RouteDecision,
     keep_alive: &Value,
 ) -> Result<(&'static str, Value), ApiError> {
+    if matches!(input.operation, super::warming::ManagedOperation::Warm) {
+        return Ok((
+            "/api/chat",
+            json!({"model":decision.selected_model,"messages":[],"stream":false,"keep_alive":keep_alive,"options":decision.options}),
+        ));
+    }
     if matches!(input.route.task, TaskKind::Embedding) {
         let value = input
             .input
@@ -550,12 +546,17 @@ pub(super) fn task_deadline(seconds: Option<u64>) -> Result<Duration, ApiError> 
 
 pub(super) async fn execute_task(
     State(state): State<PlatformState>,
-    Json(input): Json<TaskInput>,
+    Json(mut input): Json<TaskInput>,
 ) -> Result<Json<Value>, ApiError> {
     let timeout = input
         .timeout_seconds
         .map(|seconds| task_deadline(Some(seconds)))
-        .transpose()?;
+        .transpose()?
+        .or_else(|| {
+            (input.scope_id.is_some()
+                || matches!(input.operation, super::warming::ManagedOperation::Warm))
+            .then(super::platform_task_timeout)
+        });
     let cancellation = input
         .job_progress
         .as_ref()
@@ -567,15 +568,31 @@ pub(super) async fn execute_task(
         )
     });
     let started = Instant::now();
+    let mut scope_lease = None;
+    let preparation = state
+        .scopes
+        .prepare(&mut input, &state.tunables().scopes)
+        .map(|lease| scope_lease = lease);
+    let operation = input.operation;
+    let job_progress = input.job_progress.clone();
     let session_id = input.route.session_id.clone();
     let task = super::task_key(input.route.task);
     let priority = input.priority;
     let requested_model = input.route.model.clone();
-    let work = super::with_session_cancellation(
-        &state,
-        session_id.as_deref(),
-        Box::pin(run_session_task(State(state.clone()), Json(input))),
-    );
+    let scoped = scope_lease.is_some();
+    let mut scope_session_cancellation = None;
+    let work = async {
+        preparation?;
+        if scoped && let Some(id) = session_id.as_deref() {
+            scope_session_cancellation = state.sessions.read().await.cancellation(id);
+        }
+        super::with_session_cancellation(
+            &state,
+            session_id.as_deref(),
+            Box::pin(run_session_task(State(state.clone()), Json(input))),
+        )
+        .await
+    };
     let bounded = async {
         if let Some(deadline) = deadline {
             tokio::time::timeout_at(deadline, work)
@@ -590,7 +607,7 @@ pub(super) async fn execute_task(
             work.await
         }
     };
-    let result = if let Some(mut cancellation) = cancellation {
+    let mut result = if let Some(mut cancellation) = cancellation.clone() {
         tokio::select! {
             biased;
             _ = cancellation.wait_for(|cancelled| *cancelled) => Err(ApiError::task_cancelled()),
@@ -599,14 +616,81 @@ pub(super) async fn execute_task(
     } else {
         bounded.await
     };
-    let record = task_record(&result, started, task, priority, requested_model.as_deref());
+    // Retain measured inference costs even when the final history transaction fails.
+    let mut record = task_record(&result, started, task, priority, requested_model.as_deref());
+    if let Some(lease) = scope_lease
+        && let Ok(Json(value)) = &mut result
+    {
+        if let Err(error) = commit_scoped_completion(
+            &state,
+            lease,
+            value,
+            session_id.as_deref(),
+            job_progress.as_ref(),
+            deadline,
+            scope_session_cancellation.as_ref(),
+        )
+        .await
+        {
+            record.outcome = "error".into();
+            record.status = error.status().as_u16();
+            result = Err(error);
+        }
+    }
+    record.duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     if record.outcome == "ok" {
         state
             .activity
             .completed(&record.backend, &record.model, record.load_ms);
     }
     state.telemetry.record_task(record).await;
+    if matches!(operation, super::warming::ManagedOperation::Warm)
+        && let Ok(Json(value)) = &mut result
+    {
+        value["warm"] = super::warming::completion_receipt(&value["execution"]);
+    }
     result
+}
+
+async fn commit_scoped_completion(
+    state: &PlatformState,
+    lease: super::scopes::ScopeLease,
+    value: &mut Value,
+    session_id: Option<&str>,
+    progress: Option<&super::jobs::JobProgress>,
+    deadline: Option<tokio::time::Instant>,
+    session_cancellation: Option<&tokio::sync::watch::Receiver<bool>>,
+) -> Result<(), ApiError> {
+    let mut sessions = if let Some(deadline) = deadline {
+        tokio::time::timeout_at(deadline, state.sessions.write())
+            .await
+            .map_err(|_| scope_commit_deadline())?
+    } else {
+        state.sessions.write().await
+    };
+    if session_cancellation.is_some_and(|signal| *signal.borrow()) {
+        return Err(ApiError::session_killed());
+    }
+    let commit = || lease.commit(value, &state.tunables().scopes, deadline);
+    if let Some(progress) = progress {
+        progress.commit_result(commit)?;
+    } else {
+        commit()?;
+    }
+    if let Some(id) = session_id
+        && let Some(model) = value["route"]["selected_model"].as_str()
+    {
+        sessions.bind(id, model);
+    }
+    Ok(())
+}
+
+pub(super) fn scope_commit_deadline() -> ApiError {
+    ApiError::new(
+        StatusCode::GATEWAY_TIMEOUT,
+        "task total deadline exceeded before history commit",
+    )
+    .with_code("task_deadline_exceeded")
 }
 
 /// Usage-ledger row for a finished managed call, successful or not.
@@ -756,8 +840,19 @@ async fn run_session_task(
     let keep_alive = if immediate_unload {
         json!("30s")
     } else {
-        normalize_keep_alive(input.keep_alive.take())
+        let (value, receipt) = super::warming::keep_alive(
+            &state,
+            input.keep_alive.take(),
+            execution.placement,
+            &decision.selected_model,
+        )
+        .await;
+        execution_receipt["keep_alive"] = receipt;
+        value
     };
+    if immediate_unload {
+        execution_receipt["keep_alive"] = json!({"mode":"explicit","value":0,"reason":"caller_immediate_unload_with_placement_observation","finite":true});
+    }
     let (path, mut body) = build_managed_request(&mut input, &decision, &keep_alive)?;
     apply_execution_options(&mut body, &execution);
     if let Some(default_context) = leave_context_to_ollama {
@@ -1069,6 +1164,7 @@ async fn run_session_task(
     // Affinity means the last model that successfully executed for the session. An upstream error
     // must not pin a model the caller never received a successful result from.
     if result.is_ok()
+        && input.scope_id.is_none()
         && let Some(id) = session_id.as_deref()
     {
         state.sessions.write().await.bind(id, &selected_model);

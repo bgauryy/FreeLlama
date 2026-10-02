@@ -461,6 +461,96 @@ pub async fn run_task_request(endpoint: Option<String>, request: Value) -> Resul
     pretty(&value)
 }
 
+/// Creates opt-in, bounded process-local conversation history.
+/// # Errors
+/// Returns an error if the server is unavailable or rejects the scope limits or messages.
+#[napi]
+pub async fn create_scope(endpoint: Option<String>, request: Value) -> Result<String> {
+    pretty(
+        &post_json(
+            &endpoint_or_default(endpoint),
+            "/_freellama/v1/scopes",
+            &request,
+            control_timeout(),
+        )
+        .await?,
+    )
+}
+
+/// Reads scope metadata; history is returned only when explicitly requested.
+/// # Errors
+/// Returns an error for an invalid ID or missing/expired scope.
+#[napi]
+pub async fn get_scope(
+    endpoint: Option<String>,
+    scope_id: String,
+    include_messages: Option<bool>,
+) -> Result<String> {
+    let id = uuid::Uuid::parse_str(&scope_id).map_err(to_napi_err)?;
+    pretty(
+        &get_json(
+            &endpoint_or_default(endpoint),
+            &format!(
+                "/_freellama/v1/scopes/{id}?include_messages={}",
+                include_messages.unwrap_or(false)
+            ),
+            control_timeout(),
+        )
+        .await?,
+    )
+}
+
+/// Copies a specified revision into an independent scope.
+/// # Errors
+/// Returns an error for an invalid ID, stale revision, or rejected limits.
+#[napi]
+pub async fn fork_scope(
+    endpoint: Option<String>,
+    scope_id: String,
+    request: Value,
+) -> Result<String> {
+    let id = uuid::Uuid::parse_str(&scope_id).map_err(to_napi_err)?;
+    pretty(
+        &post_json(
+            &endpoint_or_default(endpoint),
+            &format!("/_freellama/v1/scopes/{id}/fork"),
+            &request,
+            control_timeout(),
+        )
+        .await?,
+    )
+}
+
+/// Deletes history and invalidates in-flight commits for this scope.
+/// # Errors
+/// Returns an error for an invalid ID or unavailable server.
+#[napi]
+pub async fn delete_scope(endpoint: Option<String>, scope_id: String) -> Result<()> {
+    let id = uuid::Uuid::parse_str(&scope_id).map_err(to_napi_err)?;
+    delete_json(
+        &endpoint_or_default(endpoint),
+        &format!("/_freellama/v1/scopes/{id}"),
+        control_timeout(),
+    )
+    .await
+}
+
+/// Preloads an exact installed model through managed admission and deadlines.
+/// # Errors
+/// Returns an error if the server refuses placement, capacity, or the request.
+#[napi]
+pub async fn warm_model_request(endpoint: Option<String>, request: Value) -> Result<String> {
+    pretty(
+        &post_json(
+            &endpoint_or_default(endpoint),
+            "/_freellama/v1/warm",
+            &request,
+            task_timeout(),
+        )
+        .await?,
+    )
+}
+
 /// Executes caller-declared independent managed tasks with bounded, priority-fair dispatch.
 ///
 /// # Errors

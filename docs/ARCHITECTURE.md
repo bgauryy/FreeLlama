@@ -14,7 +14,7 @@ The following table defines the ownership boundary:
 | Native `/api/*` and OpenAI-compatible `/v1/*` semantics | Ollama |
 | Installed-model discovery and capability normalization | FreeLlama |
 | Task routing, advertised-context compatibility, advisory K/V estimates, evidence policy, and model rejection reasons | FreeLlama |
-| Managed admission, session affinity, and model-transition coordination | FreeLlama |
+| Managed admission, session affinity, bounded scope history, and model-transition coordination | FreeLlama |
 | Explicit per-model CPU/GPU backend assignment | FreeLlama and separate Ollama processes |
 | Grounded research adapters, citations, and verification verdicts | FreeLlama MCP server |
 
@@ -77,6 +77,8 @@ flowchart TD
     C -->|"natural-routes"| INTENT["Run intent model, then route"]
     C -->|"tasks"| RUN["Route, admit, and execute"]
     C -->|"sessions"| SESSION["Create in-memory affinity id"]
+    C -->|"scopes"| SCOPES["Retain revision-protected messages"]
+    C -->|"warm"| RUN
 ```
 
 The control API exposes these endpoints:
@@ -91,6 +93,11 @@ The control API exposes these endpoints:
 | `POST /_freellama/v1/natural-routes` | Schema-bound intent interpretation followed by deterministic routing | Intent model only |
 | `POST /_freellama/v1/sessions` | New model-affinity session | No |
 | `DELETE /_freellama/v1/sessions/:session_id` | Release model-affinity session | No |
+| `POST /_freellama/v1/scopes` | Create bounded message history | No |
+| `GET /_freellama/v1/scopes/:id` | Scope metadata; optional explicit history inclusion | No |
+| `POST /_freellama/v1/scopes/:id/fork` | Fork history at an expected revision | No |
+| `DELETE /_freellama/v1/scopes/:id` | Delete retained history | No |
+| `POST /_freellama/v1/warm` | Admitted load of an exact installed runner profile | Load only |
 | `POST /_freellama/v1/tasks` | Managed chat, vision, tools, or embedding task | Yes |
 | `GET /_freellama/v1/jobs` | Deferred job metadata without prompts or results | No |
 | `GET /_freellama/v1/jobs/:id` | One deferred receipt and retained result | No |
@@ -510,6 +517,7 @@ FreeLlama keeps these values in memory:
 - Catalog metadata cache
 - Current residency snapshots
 - Session-to-model affinity
+- Revision-protected scope message history and bounded adaptive residency measurements
 - Independent GPU and CPU priority-fair weighted admission pools
 - Per-task normalized warm latency and queue feedback for each backend, restored from an optional
   versioned atomic snapshot
@@ -518,7 +526,11 @@ FreeLlama keeps these values in memory:
 Sessions are bounded (default 1024) and expire after idle time (default one hour); they store only
 model affinity, never prompts or Ollama KV. Restarting `freellama serve` clears sessions and the catalog cache. Persisted placement feedback is
 reloaded; `--ephemeral-feedback` intentionally resets it. Ollama owns model residency, so loaded
-models survive a FreeLlama restart.
+models survive a FreeLlama restart. Scope histories and their revisions do not survive restart.
+They store messages independently from affinity and append only a successful generation at the
+expected revision. Warming uses ordinary admission and fit checks; omitted residency controls use
+a finite measured policy. See [Scope history and model warming](SCOPES_AND_WARMING.md) for the
+public contract and configured limits.
 
 The design fails closed when it cannot establish a required contract. Examples include an
 unreachable configured backend, an unknown confidence grade, a policy without qualified models, an

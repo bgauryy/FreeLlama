@@ -164,15 +164,15 @@ than an inference-speed claim.
 
 FreeLlama does not provide:
 
-- a live minimum-free-VRAM guard. FreeLlama does calculate a metadata-backed F16 K/V lower bound
-  and refuses a known impossible CPU/unified-memory floor, but Ollama remains the authority for
-  current free memory, runner graph allocation, and final loading;
-- transition coordination for native passthrough requests or processes that
-  bypass the managed `tasks` endpoint;
-- live thermal, power-mode, or swap-aware routing;
-- online token-rate, error-rate, or cold-load-duration scoring;
+- exact runner-allocation prediction. Managed admission uses observed available RAM, free VRAM
+  when available, and a metadata-backed F16 K/V estimate; unknown layouts remain unknown. Ollama
+  remains authoritative for runner allocation and final loading;
+- coordination for processes that bypass FreeLlama. Mutating passthrough requests in `serve`
+  share the primary transition lock;
+- direct control over thermal state, power mode, or swapping. Observed pressure can hold admission;
+- model-quality scoring inferred from operational latency or errors;
 - per-engine tuning for GGUF compared with MLX;
-- dynamic `keep_alive` or concurrency limits by workload;
+- unbounded automatic residency or concurrency. Runtime limits remain operator-owned;
 - an atomic natural-language route-and-run operation;
 - held-out quality policies for completion, coding, tools, browser, vision, or
   long-context tasks in the example policy;
@@ -200,7 +200,7 @@ Use this table before changing Ollama or FreeLlama:
 | Leave Ollama's queue without a deployment limit | Do not add | Set a measured `OLLAMA_MAX_QUEUE`; it remains separate from FreeLlama's admission deadline |
 | Pin multiple 18–21 GB models | Do not add by default | The observed 36 GiB Metal budget cannot safely establish that two heavy models plus contexts fit |
 | Force Flash Attention | Benchmark per engine and model | The inspected GGUF path already enabled it automatically; MLX has a different runner |
-| Use `q8_0` K/V cache | **8/10; qualify, then prefer for parallel/long-context work** | Ollama documents roughly half the KV memory of `f16` with very small precision loss; it is the practical companion to higher `OLLAMA_NUM_PARALLEL`, but it remains a process-wide quality tradeoff |
+| Use `q8_0` K/V cache | Qualify quality and memory effects per workload | KV quantization changes memory use and precision for the whole process; compare representative task quality and resident memory before deployment |
 | Use `q4_0` K/V cache | Reject as a default | It saves more memory with a larger possible quality loss |
 | Enable High Power Mode | Sustained-load experiment only | Apple documents higher sustained performance. Local token-rate and energy effects are not measured |
 | Keep the small intent model resident | Keep bounded | It reduces routing latency but consumes memory and can affect a large-model transition |

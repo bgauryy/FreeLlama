@@ -62,6 +62,9 @@ pub struct RuntimeFile {
     pub context_mode: Option<ContextMode>,
     pub ollama_default_context: Option<u64>,
     pub auto_context_max: Option<u64>,
+    pub usage_queue_capacity: Option<std::num::NonZeroUsize>,
+    pub scopes: Option<super::ScopePolicy>,
+    pub warming: Option<super::WarmingPolicy>,
     pub breaker_failures: Option<u32>,
     pub breaker_cooldown_seconds: Option<u64>,
 }
@@ -72,7 +75,14 @@ impl RuntimeFile {
     /// Returns an error when the file cannot be read or is not valid TOML for this schema.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path)?;
-        Ok(toml::from_str(&text)?)
+        let file: Self = toml::from_str(&text)?;
+        if let Some(policy) = &file.scopes {
+            policy.validate()?;
+        }
+        if let Some(policy) = &file.warming {
+            policy.validate()?;
+        }
+        Ok(file)
     }
 }
 
@@ -106,6 +116,10 @@ pub struct Tunables {
     pub context_mode: ContextMode,
     pub ollama_default_context: Option<u64>,
     pub auto_context_max: u64,
+    /// Fixed at startup; changing it during reload is rejected.
+    pub usage_queue_capacity: std::num::NonZeroUsize,
+    pub scopes: super::ScopePolicy,
+    pub warming: super::WarmingPolicy,
     pub breaker_failures: u32,
     pub breaker_cooldown_seconds: u64,
     /// Setting name -> `cli`, `env`, `file`, `default`, or `ollama_num_parallel`.
@@ -334,6 +348,123 @@ pub(super) fn resolve(
         15,
         "default"
     );
+    let usage_queue_capacity = pick!(
+        "usage_queue_capacity",
+        None::<std::num::NonZeroUsize>,
+        usize_positive("FREELLAMA_USAGE_QUEUE_CAPACITY").and_then(std::num::NonZeroUsize::new),
+        file.usage_queue_capacity,
+        std::num::NonZeroUsize::new(128).expect("default is positive"),
+        "default"
+    );
+    let mut scopes = pick!(
+        "scopes",
+        None::<super::ScopePolicy>,
+        None::<super::ScopePolicy>,
+        file.scopes.clone(),
+        super::ScopePolicy::default(),
+        "default"
+    );
+    let mut warming = pick!(
+        "warming",
+        None::<super::WarmingPolicy>,
+        None::<super::WarmingPolicy>,
+        file.warming.clone(),
+        super::WarmingPolicy::default(),
+        "default"
+    );
+    macro_rules! env_override {
+        ($policy:ident, $field:ident, $name:literal, $parser:expr, $source:literal) => {
+            if let Some(value) = $parser($name) {
+                $policy.$field = value;
+                sources.insert($source, "env");
+            }
+        };
+    }
+    env_override!(
+        scopes,
+        max_count,
+        "FREELLAMA_SCOPE_MAX_COUNT",
+        usize_positive,
+        "scopes"
+    );
+    env_override!(
+        scopes,
+        max_messages,
+        "FREELLAMA_SCOPE_MAX_MESSAGES",
+        usize_positive,
+        "scopes"
+    );
+    env_override!(
+        scopes,
+        max_bytes,
+        "FREELLAMA_SCOPE_MAX_BYTES",
+        usize_positive,
+        "scopes"
+    );
+    env_override!(
+        scopes,
+        max_estimated_tokens,
+        "FREELLAMA_SCOPE_MAX_ESTIMATED_TOKENS",
+        positive,
+        "scopes"
+    );
+    env_override!(
+        scopes,
+        total_max_bytes,
+        "FREELLAMA_SCOPE_TOTAL_MAX_BYTES",
+        usize_positive,
+        "scopes"
+    );
+    env_override!(
+        scopes,
+        ttl_seconds,
+        "FREELLAMA_SCOPE_TTL_SECONDS",
+        positive,
+        "scopes"
+    );
+    env_override!(
+        warming,
+        min_seconds,
+        "FREELLAMA_KEEP_ALIVE_MIN_SECONDS",
+        positive,
+        "warming"
+    );
+    env_override!(
+        warming,
+        max_seconds,
+        "FREELLAMA_KEEP_ALIVE_MAX_SECONDS",
+        positive,
+        "warming"
+    );
+    env_override!(
+        warming,
+        base_seconds,
+        "FREELLAMA_KEEP_ALIVE_BASE_SECONDS",
+        positive,
+        "warming"
+    );
+    env_override!(
+        warming,
+        reuse_gain_seconds,
+        "FREELLAMA_KEEP_ALIVE_REUSE_GAIN_SECONDS",
+        number,
+        "warming"
+    );
+    let finite = |name: &str| parse(name).and_then(|value| value.parse::<f64>().ok());
+    env_override!(
+        warming,
+        load_multiplier,
+        "FREELLAMA_KEEP_ALIVE_LOAD_MULTIPLIER",
+        finite,
+        "warming"
+    );
+    env_override!(
+        warming,
+        pressure_factor,
+        "FREELLAMA_KEEP_ALIVE_PRESSURE_FACTOR",
+        finite,
+        "warming"
+    );
     Tunables {
         max_concurrent_tasks,
         cpu_max_concurrent_tasks,
@@ -349,6 +480,9 @@ pub(super) fn resolve(
         context_mode,
         ollama_default_context,
         auto_context_max,
+        usage_queue_capacity,
+        scopes,
+        warming,
         breaker_failures,
         breaker_cooldown_seconds,
         sources,
@@ -393,7 +527,15 @@ impl RuntimeSettings {
         let modified = file
             .as_deref()
             .and_then(|path| std::fs::metadata(path).ok()?.modified().ok());
+        if let Some(value) = process_env("FREELLAMA_USAGE_QUEUE_CAPACITY") {
+            anyhow::ensure!(
+                value.trim().parse::<std::num::NonZeroUsize>().is_ok(),
+                "FREELLAMA_USAGE_QUEUE_CAPACITY must be a positive integer"
+            );
+        }
         let tunables = resolve(&pinned, &parsed, num_parallel, &process_env);
+        tunables.scopes.validate()?;
+        tunables.warming.validate()?;
         Ok(Self {
             current: Arc::new(std::sync::RwLock::new(tunables)),
             pinned: Arc::new(pinned),
@@ -449,11 +591,26 @@ impl RuntimeSettings {
                 return Err(message);
             }
         };
+        let next = resolve(&self.pinned, &parsed, self.num_parallel, &process_env);
+        if let Err(error) = next
+            .scopes
+            .validate()
+            .and_then(|()| next.warming.validate())
+        {
+            let message = error.to_string();
+            status.last_error = Some(message.clone());
+            return Err(message);
+        }
+        if next.usage_queue_capacity != self.get().usage_queue_capacity {
+            let message =
+                "usage_queue_capacity is fixed at startup; restart to change it".to_owned();
+            status.last_error = Some(message.clone());
+            return Err(message);
+        }
         status.last_error = None;
         status.reloads += 1;
         status.last_reload_unix = Some(super::telemetry::now_seconds());
         drop(status);
-        let next = resolve(&self.pinned, &parsed, self.num_parallel, &process_env);
         let mut current = self.current.write().expect("tunables poisoned");
         if *current == next {
             return Ok(None);
@@ -734,6 +891,70 @@ mod tests {
             .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
             .collect();
         move |name| map.get(name).cloned()
+    }
+
+    #[test]
+    fn history_and_warming_environment_override_file_with_finite_validation() {
+        let file = RuntimeFile {
+            scopes: Some(super::super::ScopePolicy {
+                max_count: 10,
+                ..Default::default()
+            }),
+            warming: Some(super::super::WarmingPolicy {
+                base_seconds: 120,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let env = |name: &str| match name {
+            "FREELLAMA_SCOPE_MAX_COUNT" => Some("3".to_owned()),
+            "FREELLAMA_KEEP_ALIVE_BASE_SECONDS" => Some("90".to_owned()),
+            "FREELLAMA_USAGE_QUEUE_CAPACITY" => Some("8".to_owned()),
+            _ => None,
+        };
+        let resolved = resolve(&PinnedTunables::default(), &file, 1, &env);
+        assert_eq!(resolved.scopes.max_count, 3);
+        assert_eq!(resolved.warming.base_seconds, 90);
+        assert_eq!(resolved.usage_queue_capacity.get(), 8);
+        assert_eq!(resolved.sources["scopes"], "env");
+        assert_eq!(resolved.sources["warming"], "env");
+        assert!(resolved.warming.validate().is_ok());
+    }
+
+    #[test]
+    fn reload_changes_scope_policy_but_rejects_startup_queue_capacity() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("runtime.toml");
+        std::fs::write(
+            &path,
+            "usage_queue_capacity = 128\n[scopes]\nmax_count = 10\n",
+        )
+        .unwrap();
+        let settings =
+            RuntimeSettings::new(PinnedTunables::default(), Some(path.clone()), 1).unwrap();
+        std::fs::write(
+            &path,
+            "usage_queue_capacity = 128\n[scopes]\nmax_count = 2\n",
+        )
+        .unwrap();
+        assert!(settings.reload(true).unwrap().is_some());
+        assert_eq!(settings.get().scopes.max_count, 2);
+        std::fs::write(
+            &path,
+            "usage_queue_capacity = 129\n[scopes]\nmax_count = 5\n",
+        )
+        .unwrap();
+        assert!(
+            settings
+                .reload(true)
+                .unwrap_err()
+                .contains("fixed at startup")
+        );
+        assert_eq!(settings.get().scopes.max_count, 2);
+        std::fs::write(&path, "usage_queue_capacity = 0\n").unwrap();
+        assert!(RuntimeFile::load(&path).is_err());
+        std::fs::write(&path, "[warming]\nmin_seconds = 50\nbase_seconds = 10\n").unwrap();
+        assert!(RuntimeFile::load(&path).is_err());
     }
 
     #[test]

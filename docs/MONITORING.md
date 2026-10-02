@@ -1,4 +1,4 @@
-# Monitoring and live tuning
+# Runtime status and live tuning
 
 `freellama serve` reports what it is doing, records what it did, and accepts new limits without a
 restart. Everything on this page is served under `/_freellama/v1/` and needs the same bearer token
@@ -71,10 +71,23 @@ until capacity recovers, its deadline expires, or it is cancelled.
 
 ## Record usage
 
-Every managed task appends one JSON line to the usage ledger: time, model, backend, task kind,
-priority, outcome, HTTP status, prompt and output tokens, duration, queue wait, load time, and
-output tokens per second. No prompt or response text is stored. `serve` replays the ledger at
-startup so daily totals survive a restart, and rotates it to `usage.jsonl.1` at 16 MB.
+Every managed task updates in-memory usage totals and offers one record to a bounded writer queue.
+The record contains time, model, backend, task kind, priority, outcome, HTTP status, prompt and
+output tokens, duration, queue wait, load time, and output tokens per second. It contains no prompt
+or response text. One worker writes records in order; task completion does not wait for disk.
+
+The writer queue defaults to 128 records. Configure its positive startup-only capacity through
+`usage_queue_capacity` or `FREELLAMA_USAGE_QUEUE_CAPACITY`; runtime reload does not resize the worker.
+A full queue or unavailable worker drops the record; a disk
+failure records a failed write. Inspect `usage_ledger` in `status`, or `ledger` in `usage`, for
+`pending`, `failed`, `dropped`, `records`, `capacity`, and `last_error`. The durability contract is
+`asynchronous_best_effort`: pending records can be lost on a crash, and in-memory totals can exceed
+persisted totals. Error evidence remains visible after later successful writes.
+
+`serve` replays a bounded regular-file ledger at startup and rotates it to `usage.jsonl.1` at
+16 MiB. Successful writes contribute to restart totals; completion is not a zero-loss persistence
+promise. Embedded callers can use the bounded `flush_ledger` barrier for orderly teardown; it
+confirms attempted writes, not recovery of dropped/failed records or a filesystem sync.
 
 The ledger lives next to the feedback file in the platform data directory. Choose another path with
 `--usage-file` (or `FREELLAMA_USAGE_FILE`), or keep totals in memory only with `--ephemeral-usage`.
@@ -127,6 +140,10 @@ The CPU backend is adaptive by default because oversubscribing it shows up as a 
 rather than an error. Every change is counted in metrics and shown in `status`.
 
 ## Model residency and eviction
+
+Omitted managed `keep_alive` values use finite retention informed by measured reuse and loading.
+Explicit values take precedence. For governed prewarming, profile compatibility, and retention
+settings, see [Scope history and model warming](SCOPES_AND_WARMING.md).
 
 When a model about to load needs room, FreeLlama unloads idle runners itself (`keep_alive: 0`)
 instead of letting the load wait, fail, or spill to CPU. It does this in three cases: host RAM

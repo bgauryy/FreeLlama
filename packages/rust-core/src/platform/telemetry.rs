@@ -1,8 +1,7 @@
 //! Monitoring: Prometheus counters, a usage ledger, and per-day usage totals.
 //!
-//! Counters are process-lifetime (Prometheus convention: a restart resets them and `rate()`
-//! handles it). The usage ledger is the durable side: one JSON line per finished managed task,
-//! appended to an optional file and replayed at startup so daily totals survive restarts.
+//! Counters are process-lifetime. The optional ledger is a bounded, asynchronous best-effort
+//! sink: successful appends are replayed at startup; pending records are not durable yet.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -10,15 +9,22 @@ use std::{
     collections::BTreeMap,
     fmt::Write as _,
     io::{BufRead, Write as _},
+    num::NonZeroUsize,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex as StdMutex},
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    sync::{Arc, Mutex as StdMutex, mpsc},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 /// Rotate the ledger to `<file>.1` past this size; the replay reads at most this much.
 const LEDGER_MAX_BYTES: u64 = 16 * 1024 * 1024;
 /// Daily totals kept in memory.
 const MAX_USAGE_DAYS: usize = 400;
+const LEDGER_QUEUE_CAPACITY: NonZeroUsize = NonZeroUsize::new(128).unwrap();
+
+enum LedgerCommand {
+    Record(Box<TaskRecord>),
+    Flush(tokio::sync::oneshot::Sender<()>),
+}
 
 /// One finished managed task, as written to the ledger.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -105,6 +111,9 @@ struct Inner {
     limit_changes: BTreeMap<(String, String), u64>,
     ledger_error: Option<String>,
     ledger_records: u64,
+    ledger_pending: u64,
+    ledger_failed: u64,
+    ledger_dropped: u64,
     /// backend -> exponentially weighted wall time of successful tasks.
     average_ms: BTreeMap<String, u64>,
 }
@@ -114,6 +123,8 @@ struct Inner {
 pub struct Telemetry {
     inner: Arc<StdMutex<Inner>>,
     ledger: Option<Arc<PathBuf>>,
+    writer: Option<Arc<mpsc::SyncSender<LedgerCommand>>>,
+    ledger_capacity: usize,
     started: Instant,
 }
 
@@ -136,9 +147,17 @@ impl Telemetry {
     /// Create a sink, replaying daily totals from `ledger` when it exists.
     #[must_use]
     pub fn new(ledger: Option<PathBuf>) -> Self {
-        let telemetry = Self {
+        Self::with_ledger_capacity(ledger, LEDGER_QUEUE_CAPACITY)
+    }
+
+    /// Configure the maximum queued writes; zero capacity is excluded by the type.
+    #[must_use]
+    pub fn with_ledger_capacity(ledger: Option<PathBuf>, capacity: NonZeroUsize) -> Self {
+        let mut telemetry = Self {
             inner: Arc::new(StdMutex::new(Inner::default())),
             ledger: ledger.map(Arc::new),
+            writer: None,
+            ledger_capacity: capacity.get(),
             started: Instant::now(),
         };
         if let Some(path) = telemetry.ledger.as_deref() {
@@ -152,6 +171,16 @@ impl Telemetry {
                 }
                 Err(error) => telemetry.lock().ledger_error = Some(error.to_string()),
             }
+            let (sender, receiver) = mpsc::sync_channel(capacity.get());
+            let path = path.clone();
+            let inner = Arc::clone(&telemetry.inner);
+            match std::thread::Builder::new()
+                .name("freellama-ledger".into())
+                .spawn(move || ledger_worker(&path, &inner, receiver))
+            {
+                Ok(_) => telemetry.writer = Some(Arc::new(sender)),
+                Err(error) => telemetry.lock().ledger_error = Some(error.to_string()),
+            }
         }
         telemetry
     }
@@ -160,6 +189,7 @@ impl Telemetry {
         self.inner.lock().expect("telemetry state poisoned")
     }
 
+    #[allow(clippy::unused_async)] // Preserve the caller's async interface without awaiting I/O.
     pub(super) async fn record_task(&self, record: TaskRecord) {
         {
             let mut inner = self.lock();
@@ -187,21 +217,62 @@ impl Telemetry {
             }
             add_usage(&mut inner, &record);
         }
-        let Some(path) = self.ledger.clone() else {
+        if self.ledger.is_none() {
             return;
-        };
-        // File append and rotation are blocking; keep them off the runtime workers.
-        let written = tokio::task::spawn_blocking(move || append(&path, &record))
-            .await
-            .unwrap_or_else(|error| Err(std::io::Error::other(error.to_string())));
-        let mut inner = self.lock();
-        match written {
-            Ok(()) => {
-                inner.ledger_error = None;
-                inner.ledger_records += 1;
-            }
-            Err(error) => inner.ledger_error = Some(error.to_string()),
         }
+        // Never make task completion wait for disk or for room in the ledger queue.
+        let mut inner = self.lock();
+        inner.ledger_pending += 1;
+        let queued = self
+            .writer
+            .as_ref()
+            .map(|writer| writer.try_send(LedgerCommand::Record(Box::new(record))));
+        if !matches!(queued, Some(Ok(()))) {
+            inner.ledger_pending -= 1;
+            inner.ledger_dropped += 1;
+            inner.ledger_error = Some(
+                match queued {
+                    Some(Err(mpsc::TrySendError::Full(_))) => {
+                        "Usage ledger queue is full; record dropped."
+                    }
+                    _ => "Usage ledger worker is unavailable; record dropped.",
+                }
+                .into(),
+            );
+        }
+    }
+
+    /// Wait at most `timeout` for previously queued records. A successful flush means the
+    /// worker has attempted them, not that failed/dropped records were recovered or fsynced.
+    /// Dropping the final sink closes the queue and lets its single worker drain and exit.
+    pub async fn flush_ledger(&self, timeout: Duration) -> bool {
+        if self.ledger.is_none() {
+            return true;
+        }
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let flushed = tokio::time::timeout(timeout, async {
+            let Some(writer) = &self.writer else {
+                return false;
+            };
+            let mut command = LedgerCommand::Flush(sender);
+            loop {
+                match writer.try_send(command) {
+                    Ok(()) => return receiver.await.is_ok(),
+                    Err(mpsc::TrySendError::Disconnected(_)) => return false,
+                    Err(mpsc::TrySendError::Full(returned)) => {
+                        command = returned;
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                }
+            }
+        })
+        .await;
+        if matches!(flushed, Ok(true)) {
+            return true;
+        }
+        self.lock().ledger_error =
+            Some("Usage ledger flush did not complete within its bounded wait.".into());
+        false
     }
 
     /// Recent average wall time of successful tasks on `backend`, for `Retry-After` estimates.
@@ -268,6 +339,11 @@ impl Telemetry {
                 "path": self.ledger.as_deref(),
                 "records": inner.ledger_records,
                 "last_error": inner.ledger_error,
+                "pending": inner.ledger_pending,
+                "failed": inner.ledger_failed,
+                "dropped": inner.ledger_dropped,
+                "capacity": self.ledger_capacity,
+                "durability": "asynchronous_best_effort",
             },
         })
     }
@@ -279,6 +355,11 @@ impl Telemetry {
             "path": self.ledger.as_deref(),
             "records": inner.ledger_records,
             "last_error": inner.ledger_error,
+            "pending": inner.ledger_pending,
+            "failed": inner.ledger_failed,
+            "dropped": inner.ledger_dropped,
+            "capacity": self.ledger_capacity,
+            "durability": "asynchronous_best_effort",
         })
     }
 
@@ -512,6 +593,63 @@ fn add_usage(inner: &mut Inner, record: &TaskRecord) {
     }
 }
 
+fn ledger_worker(path: &Path, inner: &StdMutex<Inner>, receiver: mpsc::Receiver<LedgerCommand>) {
+    for command in receiver {
+        match command {
+            LedgerCommand::Record(record) => {
+                let written = append(path, &record);
+                let mut inner = inner.lock().expect("telemetry state poisoned");
+                inner.ledger_pending -= 1;
+                match written {
+                    Ok(()) => inner.ledger_records += 1,
+                    Err(error) => {
+                        inner.ledger_failed += 1;
+                        inner.ledger_error = Some(error.to_string());
+                    }
+                }
+            }
+            LedgerCommand::Flush(sender) => {
+                let _ = sender.send(());
+            }
+        }
+    }
+}
+
+fn require_regular(metadata: &std::fs::Metadata) -> std::io::Result<()> {
+    if metadata.is_file() {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Usage ledger must be a regular file.",
+        ))
+    }
+}
+
+/// Check both the path and opened handle. Nonblocking open prevents a FIFO substituted
+/// between those checks from waiting for a reader/writer on Unix.
+fn open_regular(path: &Path, append: bool) -> std::io::Result<std::fs::File> {
+    match std::fs::metadata(path) {
+        Ok(metadata) => require_regular(&metadata)?,
+        Err(error) if append && error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let mut options = std::fs::OpenOptions::new();
+    if append {
+        options.create(true).append(true);
+    } else {
+        options.read(true);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    require_regular(&file.metadata()?)?;
+    Ok(file)
+}
+
 fn append(path: &Path, record: &TaskRecord) -> std::io::Result<()> {
     if let Some(parent) = path
         .parent()
@@ -519,23 +657,27 @@ fn append(path: &Path, record: &TaskRecord) -> std::io::Result<()> {
     {
         std::fs::create_dir_all(parent)?;
     }
-    if std::fs::metadata(path).is_ok_and(|meta| meta.len() >= LEDGER_MAX_BYTES) {
-        let mut rotated = path.as_os_str().to_owned();
-        rotated.push(".1");
-        std::fs::rename(path, rotated)?;
+    match std::fs::metadata(path) {
+        Ok(metadata) => {
+            require_regular(&metadata)?;
+            if metadata.len() >= LEDGER_MAX_BYTES {
+                let mut rotated = path.as_os_str().to_owned();
+                rotated.push(".1");
+                std::fs::rename(path, rotated)?;
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
     }
     let mut line = serde_json::to_string(record).map_err(std::io::Error::other)?;
     line.push('\n');
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
+    let mut file = open_regular(path, true)?;
     file.write_all(line.as_bytes())
 }
 
 /// Read ledger records back; malformed lines are skipped, not fatal.
 fn replay(path: &Path) -> std::io::Result<Vec<TaskRecord>> {
-    let file = match std::fs::File::open(path) {
+    let file = match open_regular(path, false) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error),
@@ -644,6 +786,7 @@ mod tests {
         telemetry
             .record_task(record("a", now_seconds(), "ok"))
             .await;
+        assert!(telemetry.flush_ledger(Duration::from_secs(1)).await);
         std::fs::OpenOptions::new()
             .append(true)
             .open(&path)
@@ -655,6 +798,150 @@ mod tests {
         assert_eq!(usage["totals"]["tasks"], 1);
         assert_eq!(usage["ledger"]["records"], 1);
         assert!(usage["ledger"]["last_error"].is_null());
+    }
+
+    #[tokio::test]
+    async fn bounded_queue_reports_loss_without_delaying_tasks() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let telemetry = Telemetry {
+            inner: Arc::new(StdMutex::new(Inner::default())),
+            ledger: Some(Arc::new(PathBuf::from("unused-test-ledger"))),
+            writer: Some(Arc::new(sender)),
+            ledger_capacity: 1,
+            started: Instant::now(),
+        };
+        for _ in 0..3 {
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                telemetry.record_task(record("a", now_seconds(), "ok")),
+            )
+            .await
+            .unwrap();
+        }
+        let receipt = telemetry.ledger_receipt();
+        assert_eq!(receipt["records"], 0);
+        assert_eq!(receipt["pending"], 1);
+        assert_eq!(receipt["dropped"], 2);
+        assert_eq!(receipt["capacity"], 1);
+        assert!(
+            receipt["last_error"]
+                .as_str()
+                .unwrap()
+                .contains("queue is full")
+        );
+        assert_eq!(telemetry.usage(1)["totals"]["tasks"], 3);
+        assert!(!telemetry.flush_ledger(Duration::from_millis(10)).await);
+        drop(receiver);
+        telemetry
+            .record_task(record("a", now_seconds(), "ok"))
+            .await;
+        assert_eq!(telemetry.ledger_receipt()["dropped"], 3);
+        assert!(
+            telemetry.ledger_receipt()["last_error"]
+                .as_str()
+                .unwrap()
+                .contains("unavailable")
+        );
+    }
+
+    #[tokio::test]
+    async fn one_worker_serializes_records_and_exits_after_final_sender_drops() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("usage.jsonl");
+        let telemetry = Telemetry::new(Some(path.clone()));
+        for index in 0..100 {
+            telemetry
+                .record_task(record(&format!("model-{index}"), now_seconds(), "ok"))
+                .await;
+        }
+        assert!(telemetry.flush_ledger(Duration::from_secs(1)).await);
+        let receipt = telemetry.ledger_receipt();
+        assert_eq!(receipt["records"], 100);
+        assert_eq!(receipt["pending"], 0);
+        assert_eq!(receipt["failed"], 0);
+        assert_eq!(receipt["dropped"], 0);
+        assert_eq!(replay(&path).unwrap().len(), 100);
+        let sender = Arc::downgrade(telemetry.writer.as_ref().unwrap());
+        let worker_state = Arc::downgrade(&telemetry.inner);
+        let clone = telemetry.clone();
+        drop(telemetry);
+        assert!(sender.upgrade().is_some());
+        drop(clone);
+        assert!(
+            sender.upgrade().is_none(),
+            "final sink drop must close its worker queue"
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while worker_state.upgrade().is_some() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("closed ledger worker must exit and release its state");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_is_rejected_on_replay_and_when_substituted_after_startup() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("usage.jsonl");
+        let telemetry = Telemetry::new(Some(path.clone()));
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(
+            replay(&path).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            append(&path, &record("a", now_seconds(), "ok"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            telemetry.record_task(record("a", now_seconds(), "ok")),
+        )
+        .await
+        .unwrap();
+        assert!(telemetry.flush_ledger(Duration::from_secs(1)).await);
+        let receipt = telemetry.ledger_receipt();
+        assert_eq!(receipt["failed"], 1);
+        assert_eq!(receipt["pending"], 0);
+        assert_eq!(receipt["records"], 0);
+        assert!(
+            receipt["last_error"]
+                .as_str()
+                .unwrap()
+                .contains("regular file")
+        );
+        let restarted = Telemetry::new(Some(path.clone()));
+        assert!(
+            restarted.ledger_receipt()["last_error"]
+                .as_str()
+                .unwrap()
+                .contains("regular file")
+        );
+        std::fs::remove_file(&path).unwrap();
+        telemetry
+            .record_task(record("a", now_seconds(), "ok"))
+            .await;
+        assert!(telemetry.flush_ledger(Duration::from_secs(1)).await);
+        let recovered = telemetry.ledger_receipt();
+        assert_eq!(recovered["records"], 1);
+        assert_eq!(recovered["failed"], 1);
+        assert!(
+            recovered["last_error"]
+                .as_str()
+                .unwrap()
+                .contains("regular file"),
+            "a successful retry must not erase earlier loss evidence"
+        );
     }
 
     #[tokio::test]

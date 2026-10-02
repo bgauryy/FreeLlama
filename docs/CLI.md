@@ -30,7 +30,9 @@ flowchart TD
 | `status` | Live queues (also as a page at `http://127.0.0.1:11435/_freellama/ui`), current and adaptive limits, circuit breakers, loaded models, host memory, Ollama's effective settings, today's usage | Yes |
 | `usage` | Task and token totals per day and per model (`--days`, default 7) | Yes |
 | `config` | Effective runtime settings and the source of each; `--reload` re-reads the runtime file | Yes |
-| `session` | Create an affinity scope for related tasks | Yes |
+| `session` | Create model affinity for related tasks | Yes |
+| `scope` | Create, inspect, fork, or delete bounded message history | Yes |
+| `warm` | Warm an installed model through managed admission | Yes |
 | `route` | Choose a model and request profile without executing it | Yes |
 | `recommend` | Return an installed route or a reviewed installation plan | Yes |
 | `natural-route` | Convert natural language to a route intent locally, then route it | Yes |
@@ -209,6 +211,8 @@ Useful task options include:
 
 - `--model` for an exact installed model.
 - `--session` for affinity across related requests.
+- `--scope-id` and `--scope-revision` together for bounded message history.
+- `--keep-alive` for an explicit residency duration.
 - `--context-tokens` for a minimum context requirement.
 - repeatable `--required-capability` constraints.
 - repeatable `--image` paths for vision tasks.
@@ -237,8 +241,11 @@ route preview honors an existing affinity but does not create or change one. Onl
 admitted task execution binds the session to its selected model. Reuse never bypasses capability,
 policy, or memory checks.
 
-The CLI has no keep-alive flag. MCP `run_task` accepts `keepAlive`: `"0"` unloads after the request,
-`"-1"` pins the runner, and omission leaves Ollama's default in place.
+`task --keep-alive` and MCP `run_task.keepAlive` control residency: `"0"` requests immediate
+unload, `"-1"` requests indefinite retention, and omission selects finite adaptive retention.
+`session` retains affinity only; use `scope` for revision-protected message history and `warm`
+for an admitted runner load. See [Scope history and model warming](SCOPES_AND_WARMING.md) for
+input shapes, limits, and CLI examples.
 
 ## Earn medium routing confidence
 
@@ -282,7 +289,7 @@ npx @octocodeai/freellama tools
 ```
 
 The command prints the maintained parity map. MCP-only operations are `delegate_research` and the
-online `models { view: "library" }` view. CLI-only operations include `serve`, `proxy`, `session`,
+online `models { view: "library" }` view. CLI-only operations include `serve`, `proxy`,
 `recommend`, `natural-route`, `bench-all`, `policy-from-eval`, `run`, and `eval`.
 
-For the nine MCP tool contracts, read the [MCP package reference](../packages/mcp/README.md).
+For the MCP tool contracts, read the [MCP package reference](../packages/mcp/README.md).

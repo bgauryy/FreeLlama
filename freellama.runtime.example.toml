@@ -46,3 +46,32 @@
 # Override the probed Ollama default when the server's environment is not visible (remote or
 # another user's process).
 # ollama_default_context = 4096
+
+# --- Usage ledger queue (startup only) ---
+# Positive bounded queue; use FREELLAMA_USAGE_QUEUE_CAPACITY to override. A changed value is
+# rejected on reload because the writer queue is created at startup. Shutdown flush waits 2s.
+# usage_queue_capacity = 128
+
+# --- Opt-in process-local history scopes ---
+# Explicit POST /scopes creates storage. Histories never persist by default. Every append requires
+# the current revision; overflow fails without truncation. Delete/expiry invalidates in-flight commits.
+# Individual FREELLAMA_SCOPE_* environment settings override these fields.
+# [scopes]
+# max_count = 128
+# max_messages = 256
+# max_bytes = 1048576
+# max_estimated_tokens = 32768
+# total_max_bytes = 16777216
+# ttl_seconds = 3600
+
+# --- Managed model warming and omitted keep_alive ---
+# Explicit caller keep_alive wins. Otherwise finite residency uses recent per-model reuse,
+# observed cold-load time and live host pressure. Admission and memory safety remain enforced.
+# Individual FREELLAMA_KEEP_ALIVE_* environment settings override these fields.
+# [warming]
+# min_seconds = 15
+# max_seconds = 900
+# base_seconds = 60
+# reuse_gain_seconds = 30
+# load_multiplier = 2.0
+# pressure_factor = 0.25

@@ -49,7 +49,9 @@ mod residency;
 pub mod resources;
 mod routing;
 mod runtime;
+mod scopes;
 mod telemetry;
+mod warming;
 
 pub use discovery::{
     MachineProfile, host_has_unified_memory, host_total_memory_bytes, machine_profile,
@@ -60,7 +62,9 @@ pub use routing::{
     RouteInput, SessionAffinity, TaskKind, TaskPriority, select_route,
 };
 pub use runtime::{AdaptiveMode, ContextMode, RuntimeFile};
+pub use scopes::ScopePolicy;
 pub use telemetry::Telemetry;
+pub use warming::WarmingPolicy;
 
 use admission::{AdmissionPool, MAX_CAPACITY_BYPASSES, PRIORITY_WEIGHTS, priority_index};
 use error::{ApiError, resource_error};
@@ -442,6 +446,7 @@ struct PlatformState {
     policies: Arc<BTreeMap<TaskKind, Vec<String>>>,
     recommendations: Arc<RecommendationCatalog>,
     sessions: Arc<RwLock<SessionAffinity>>,
+    scopes: scopes::ScopeStore,
     catalog_cache: CatalogCache,
     catalog_refresh: Arc<Mutex<()>>,
     intent_model: String,
@@ -818,7 +823,8 @@ fn build(config: &PlatformConfig) -> Result<(Router, PlatformState)> {
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
     });
-    let telemetry = Telemetry::new(usage_file.clone());
+    let telemetry =
+        Telemetry::with_ledger_capacity(usage_file.clone(), tunables.usage_queue_capacity);
     let raw_admission = proxy::RawAdmission::new(
         tunables.raw_max_concurrent_requests,
         tunables.raw_queue_wait(),
@@ -866,6 +872,7 @@ fn build(config: &PlatformConfig) -> Result<(Router, PlatformState)> {
         policies: Arc::new(policies),
         recommendations: Arc::new(recommendation_catalog),
         sessions: Arc::new(RwLock::new(SessionAffinity::default())),
+        scopes: scopes::ScopeStore::default(),
         catalog_cache: Arc::new(RwLock::new(None)),
         catalog_refresh: Arc::new(Mutex::new(())),
         intent_model: config.intent_model.clone(),
@@ -918,6 +925,16 @@ fn build(config: &PlatformConfig) -> Result<(Router, PlatformState)> {
             &format!("{API_ROOT}/sessions/{{session_id}}"),
             delete(delete_session),
         )
+        .route(&format!("{API_ROOT}/scopes"), post(scopes::create))
+        .route(
+            &format!("{API_ROOT}/scopes/{{id}}"),
+            get(scopes::get).delete(scopes::delete),
+        )
+        .route(
+            &format!("{API_ROOT}/scopes/{{id}}/fork"),
+            post(scopes::fork),
+        )
+        .route(&format!("{API_ROOT}/warm"), post(warming::warm))
         .route(&format!("{API_ROOT}/tasks"), post(run_task))
         .route(&format!("{API_ROOT}/jobs"), get(jobs::list))
         .route(
@@ -992,7 +1009,11 @@ pub async fn serve(config: PlatformConfig) -> Result<()> {
             let _ = tokio::signal::ctrl_c().await;
         })
         .await
-        .context("serve platform")
+        .context("serve platform")?;
+    if !state.telemetry.flush_ledger(Duration::from_secs(2)).await {
+        eprintln!("usage ledger flush did not finish within shutdown deadline");
+    }
+    Ok(())
 }
 
 /// Liveness plus a load-shedding signal.
@@ -1486,11 +1507,17 @@ async fn kill_session(
     })))
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(deny_unknown_fields)]
 struct TaskInput {
     #[serde(flatten)]
     route: RouteInput,
+    scope_id: Option<String>,
+    scope_revision: Option<u64>,
+    #[serde(skip)]
+    route_fields: BTreeSet<String>,
+    #[serde(skip)]
+    operation: warming::ManagedOperation,
     #[serde(default)]
     messages: Vec<Value>,
     prompt: Option<String>,
@@ -1505,11 +1532,7 @@ struct TaskInput {
     #[serde(default)]
     priority: TaskPriority,
     tools: Option<Value>,
-    /// Overrides the default `keep_alive` sent to Ollama. `"-1"` is normalized to Ollama's
-    /// numeric `-1` infinite-residency form; durations such as `"5m"` and `"0"` pass through. Defaults to
-    /// `"5m"` when omitted, matching prior behavior exactly — callers that never set this see no
-    /// change. A one-off embedding call is the clearest case for `"0"`: no reason to keep a model
-    /// resident after a single vector is computed.
+    /// Explicit caller residency override; omission uses the finite adaptive policy.
     keep_alive: Option<String>,
     /// Advanced Ollama controls which do not belong to routing. `num_ctx` stays owned by
     /// `context_tokens`, and backend placement owns `num_gpu`, so the route receipt always matches
@@ -1525,6 +1548,62 @@ struct TaskInput {
     timeout_seconds: Option<u64>,
     #[serde(skip)]
     job_progress: Option<jobs::JobProgress>,
+}
+
+#[derive(Deserialize)]
+#[serde(remote = "TaskInput", deny_unknown_fields)]
+struct TaskInputWire {
+    #[serde(flatten)]
+    route: RouteInput,
+    scope_id: Option<String>,
+    scope_revision: Option<u64>,
+    #[serde(skip)]
+    route_fields: BTreeSet<String>,
+    #[serde(skip)]
+    operation: warming::ManagedOperation,
+    #[serde(default)]
+    messages: Vec<Value>,
+    prompt: Option<String>,
+    /// Base64-encoded images (Ollama's own `images` format — no data URI prefix) attached to the
+    /// single message built from `prompt`. For multi-turn `messages`, put `images` directly on
+    /// the relevant message object instead; this field only applies to the `prompt` convenience
+    /// path.
+    images: Option<Vec<String>>,
+    input: Option<Value>,
+    /// Service class affects admission only; it never changes model selection or bypasses a
+    /// backend's weighted capacity.
+    #[serde(default)]
+    priority: TaskPriority,
+    tools: Option<Value>,
+    /// Explicit caller residency override; omission uses the finite adaptive policy.
+    keep_alive: Option<String>,
+    /// Advanced Ollama controls which do not belong to routing. `num_ctx` stays owned by
+    /// `context_tokens`, and backend placement owns `num_gpu`, so the route receipt always matches
+    /// what is sent upstream.
+    #[serde(default)]
+    request_options: OllamaRequestOptions,
+    /// Per-request admission wait in seconds, capped by the server's `max_queue_wait_seconds`.
+    #[serde(default)]
+    max_wait_seconds: Option<u64>,
+    #[serde(default)]
+    defer: bool,
+    /// Total time including discovery, queueing, loading and generation; capped by the server.
+    timeout_seconds: Option<u64>,
+    #[serde(skip)]
+    job_progress: Option<jobs::JobProgress>,
+}
+
+impl<'de> Deserialize<'de> for TaskInput {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = Value::deserialize(deserializer)?;
+        let fields = value
+            .as_object()
+            .map(|object| object.keys().cloned().collect())
+            .unwrap_or_default();
+        let mut input = TaskInputWire::deserialize(value).map_err(serde::de::Error::custom)?;
+        input.route_fields = fields;
+        Ok(input)
+    }
 }
 
 /// Explicitly independent managed work. Dependencies are intentionally not accepted: a batch is

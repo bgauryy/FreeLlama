@@ -134,6 +134,18 @@ Only physically verified warm samples are saved. A corrupt or unsupported snapsh
 fail instead of silently discarding routing evidence. Use `--ephemeral-feedback` only for
 disposable tests.
 
+## Bound conversation history and residency
+
+Scope histories and deferred jobs are process-local and are discarded on restart. Configure
+`[scopes]` and `[warming]` limits in the runtime file from measured workload needs; finite history
+bounds and automatic retention remain separate from host-memory reserves. Warm loads use the same
+admission and placement checks as tasks. See [Scope history and model warming](SCOPES_AND_WARMING.md)
+for expected revisions, forks, explicit history reads, and residency precedence.
+
+Usage persistence is asynchronous best effort. Inspect pending, dropped, failed, and error evidence
+in `status.usage_ledger`; task success does not prove its usage record reached disk. See
+[Usage recording](MONITORING.md#record-usage) for replay, rotation, and shutdown boundaries.
+
 ## Configure MCP
 
 Set these values in the MCP host environment:
@@ -155,7 +167,7 @@ direct Ollama requests, and managed FreeLlama tasks send their own `num_ctx`.
 
 ## Verify lifecycle and placement
 
-`keep_alive:0` no longer sacrifices placement evidence. FreeLlama temporarily holds the runner,
+`keep_alive:0` preserves placement evidence. FreeLlama temporarily holds the runner,
 observes `/api/ps`, records eligible feedback, explicitly unloads it, and verifies that it is no
 longer resident before returning. Inspect both `execution.observation` and
 `execution.lifecycle.status`.
@@ -200,7 +212,7 @@ Promote a release only when all conditions pass:
 6. Restart testing proves feedback reloads and a corrupt snapshot fails startup.
 7. Immediate unload reports verified pre-unload placement and verified post-unload absence.
 8. Every claimed hardware row has a real archived acceptance receipt.
-9. The MCP schema remains nine tools and within its context budget.
+9. The MCP schemas match the published tool surface and pass its context-budget contract.
 
 Rollback by returning the listener to loopback, stopping the new service, and starting the prior
 checksummed binary with the same policy and feedback snapshot. Never downgrade across an unsupported

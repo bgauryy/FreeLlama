@@ -16,7 +16,8 @@ const mainRs = path.join(here, "..", "..", "..", "cli", "src", "main.rs");
 
 // MCP side: every `server.registerTool("<name>", ...)` call. A newline follows the `(`, so match
 // across it rather than on a single line.
-const registered = [...readFileSync(indexTs, "utf8").matchAll(/registerTool\(\s*"([a-z_]+)"/g)]
+const toolSources = [indexTs, path.join(here, "..", "..", "src", "context-tools.ts")];
+const registered = [...toolSources.map((file) => readFileSync(file, "utf8")).join("\n").matchAll(/registerTool\(\s*"([a-z_]+)"/g)]
   .map((m) => m[1])
   .sort();
 

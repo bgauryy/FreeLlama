@@ -18,28 +18,62 @@ pub(super) fn size_context(
     decision: &mut RouteDecision,
     model: &CatalogModel,
 ) -> Result<Value, ApiError> {
+    if matches!(input.operation, super::warming::ManagedOperation::Warm) {
+        return Ok(json!({"mode":"warm_profile","tokens":decision.options["num_ctx"]}));
+    }
+    if input.scope_id.is_some() && input.route.context_tokens.is_some() {
+        let payload = serde_json::to_string(&input.messages).expect("messages serialize");
+        let mut estimated = estimated_text_tokens(&payload);
+        for schema in [input.tools.as_ref(), input.request_options.format.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            estimated = estimated.saturating_add(estimated_text_tokens(&schema.to_string()));
+        }
+        let output = decision.options["num_predict"].as_u64().ok_or_else(|| {
+            ApiError::bad_request("scoped history requires a finite positive output budget")
+        })?;
+        let required = estimated
+            .saturating_add(output)
+            .saturating_add(TEMPLATE_MARGIN);
+        let available = decision.options["num_ctx"].as_u64().unwrap_or_default();
+        if required > available {
+            return Err(ApiError::bad_request(format!(
+                "complete scoped history plus output reserve requires approximately {required} tokens, above configured context {available}; compact explicitly or increase context_tokens"
+            )));
+        }
+        return Ok(
+            json!({"mode":"scope_explicit_estimate","tokens":available,"estimated_input_tokens":estimated,"output_reserve_tokens":output,"template_margin_tokens":TEMPLATE_MARGIN,"exact_token_count":false}),
+        );
+    }
     if input.route.context_tokens.is_some() {
         return Ok(json!({"mode": "explicit", "tokens": decision.options["num_ctx"]}));
     }
     // Image/audio token cost is model-dependent. Base64 bytes are not text tokens.
-    if matches!(input.route.task, TaskKind::Embedding | TaskKind::Vision)
-        || input
-            .images
-            .as_ref()
-            .is_some_and(|images| !images.is_empty())
-        || input.messages.iter().any(|message| {
-            message.get("images").is_some()
-                || message.get("audio").is_some()
-                || message
-                    .get("content")
-                    .is_some_and(|content| !content.is_string())
-        })
+    if input.scope_id.is_none()
+        && (matches!(input.route.task, TaskKind::Embedding | TaskKind::Vision)
+            || input
+                .images
+                .as_ref()
+                .is_some_and(|images| !images.is_empty())
+            || input.messages.iter().any(|message| {
+                message.get("images").is_some()
+                    || message.get("audio").is_some()
+                    || message
+                        .get("content")
+                        .is_some_and(|content| !content.is_string())
+            }))
     {
         return Ok(
             json!({"mode": "profile", "reason": "modality_requires_model_specific_estimator"}),
         );
     }
     let Some(output) = decision.options.get("num_predict").and_then(Value::as_u64) else {
+        if input.scope_id.is_some() {
+            return Err(ApiError::bad_request(
+                "scoped history requires a finite positive output budget",
+            ));
+        }
         return Ok(json!({"mode": "profile", "reason": "output_budget_not_bounded"}));
     };
     let payload = if input.messages.is_empty() {

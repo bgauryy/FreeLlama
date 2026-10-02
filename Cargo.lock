@@ -431,6 +431,7 @@ dependencies = [
  "base64",
  "clap",
  "http-body",
+ "libc",
  "napi",
  "napi-build",
  "napi-derive",

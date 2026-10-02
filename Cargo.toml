@@ -22,6 +22,7 @@ all = "warn"
 pedantic = "warn"
 
 [workspace.dependencies]
+libc = "0.2"
 anyhow = "1.0"
 axum = "0.8"
 base64 = "0.22"

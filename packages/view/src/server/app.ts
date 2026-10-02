@@ -1,6 +1,6 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { readFile, stat } from "node:fs/promises";
-import { extname, resolve } from "node:path";
+import { extname, isAbsolute, relative as relativePath, resolve } from "node:path";
 import type { Snapshot } from "../shared/contracts";
 
 type Middleware = (
@@ -60,8 +60,11 @@ async function serveFile(
       ? "index.html"
       : decodeURIComponent(pathname).replace(/^\//, "");
   const file = resolve(base, relative);
+  const contained = relativePath(base, file);
   if (
-    !file.startsWith(`${base}/`) ||
+    !contained ||
+    contained.split(/[\\/]/)[0] === ".." ||
+    isAbsolute(contained) ||
     relative.split(/[\\/]/).some((part) => part.startsWith("."))
   ) {
     json(res, 404, { error: "Not found." });

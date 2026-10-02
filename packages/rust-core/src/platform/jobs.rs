@@ -66,6 +66,7 @@ struct Job {
     error: Option<Value>,
     cancel: watch::Sender<bool>,
     done: watch::Receiver<bool>,
+    completion_committed: bool,
 }
 
 impl Job {
@@ -168,6 +169,28 @@ impl JobProgress {
         job.backend = Some(backend.into());
     }
 
+    /// Linearize history commit against cancellation. After commit, cancellation waits for the
+    /// completed receipt instead of labelling a committed append as cancelled.
+    pub(super) fn commit_result<T>(
+        &self,
+        commit: impl FnOnce() -> Result<T, ApiError>,
+    ) -> Result<T, ApiError> {
+        let mut job = self
+            .job
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *job.cancel.borrow() {
+            return Err(ApiError::task_cancelled());
+        }
+        let result = commit()?;
+        job.completion_committed = true;
+        Ok(result)
+    }
+
+    pub(super) fn result_budget() -> usize {
+        MAX_RESULT_BYTES
+    }
+
     fn finish(&self, outcome: Result<Json<Value>, ApiError>) {
         // Size validation happens before locking a job, and never locks the registry.
         let outcome = outcome.and_then(|Json(result)| {
@@ -248,6 +271,7 @@ pub(super) async fn submit(
         error: None,
         cancel,
         done: done_receiver,
+        completion_committed: false,
     };
     let receipt = job.receipt(false);
     let job = Arc::new(Mutex::new(job));
@@ -347,9 +371,11 @@ async fn cancel_job(state: &PlatformState, id: &str) -> Result<Arc<Mutex<Job>>, 
             drop(current);
             return Ok(job);
         }
-        current.status = JobStatus::Cancelling;
-        current.reason = "cancellation_requested";
-        let _ = current.cancel.send(true);
+        if !current.completion_committed {
+            current.status = JobStatus::Cancelling;
+            current.reason = "cancellation_requested";
+            let _ = current.cancel.send(true);
+        }
         current.done.clone()
     };
     // A receipt saying cancelled is returned only after the worker has dropped its permits.
@@ -470,6 +496,7 @@ mod tests {
             error: None,
             cancel,
             done,
+            completion_committed: false,
         }
     }
 

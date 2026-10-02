@@ -34,7 +34,7 @@ import {
 } from "./config.js";
 import * as native from "./native.js";
 import { doctor, machine, health, status, usage, SERVER_VERSION } from "./native.js";
-import { ensureServe, stopAutostartedServe } from "./serve.js";
+import { ensureServe, withServe, stopAutostartedServe } from "./serve.js";
 import {
   ollamaFetch,
   ollamaPull,
@@ -81,17 +81,10 @@ import { libraryTrialCandidate } from "./model-search.js";
 import { enrichInstalledModels, libraryReference, modelKnowledge, OllamaLibraryClient, publicModelGuidance } from "./model-knowledge.js";
 import { MODEL_EVIDENCE, assessDelegatedAnswer } from "./delegate.js";
 
+import { registerContextTools } from "./context-tools.js";
+
 const execFileAsync = promisify(execFile);
 
-/** Serve-backed native calls start the bundled `freellama serve` first when nothing answers. */
-function withServe<Args extends unknown[], R>(
-  call: (endpoint: string | null | undefined, ...args: Args) => Promise<R>,
-): (endpoint: string | null | undefined, ...args: Args) => Promise<R> {
-  return async (endpoint, ...args) => {
-    await ensureServe(endpoint ?? undefined);
-    return call(endpoint, ...args);
-  };
-}
 const createSession = withServe(native.createSession);
 const deleteSession = withServe(native.deleteSession);
 const killSession = withServe(native.killSession);
@@ -264,15 +257,13 @@ for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
 }
 
 
-const INSTRUCTIONS = `Offload work to local Ollama models.
-1. models{view:"installed"}, then models{view:"resident"}: see what exists and what is loaded; never assume a tag. doctor only diagnoses.
-2. run_task{prompt} executes on a routed model and returns the answer as text; add model to pin one. run_task preview never executes; code_review aliases coding. Use requiredCapabilities:["tools"] to preview tool eligibility; omit preview and supply the payload to execute.
-3. delegate_research is narrow read-only workspace research; verify its citations.
-balanced falls back; quality needs policy or model. medium needs policy + benchmark. observed needs /api/ps proof. Caller executes tools.
-defer:true returns job.id; task_jobs uses jobId to get/cancel/remove it. Remove stops active work. Bounded; lost on restart.
+const INSTRUCTIONS = `models{view:"installed"}, then models{view:"resident"}: inspect tags and residency.
+run_task{prompt} runs; model selects an exact tag. run_task preview never executes; code_review aliases coding. requiredCapabilities:["tools"] previews tools; omit preview and supply the payload to execute. Caller executes tools.
+quality needs policy or model; medium needs policy+benchmark; observed needs /api/ps proof.
+scope stores process-local history; run_task needs scopeId+scopeRevision. warm_model uses managed admission. defer:true returns job.id; task_jobs uses jobId. Restart loses history/jobs.
 The caller owns task decomposition, prompts and format; findings are candidates, not accepted defects. The operator owns endpoints, exact --cpu-model assignments, lifecycle. Ollama plus the OS/driver run physical CPU/GPU.
 ask approval for one exact tag and reported size before ollama_manage; search or recommendation is never download permission.
-run_task and delegate_research use \`freellama serve\` (default :11435; started automatically when absent). Docs: freellama://docs/index.`;
+serve defaults :11435, auto-started. Docs: freellama://docs/index.`;
 
 const server = new McpServer(
   { name: "freellama", version: SERVER_VERSION },
@@ -316,8 +307,8 @@ server.registerTool(
     inputSchema: {
       endpoint: ollamaEndpointParam,
       serveEndpoint: endpointParam,
-      view: z.enum(["summary", "scheduler", "config", "full", "status", "usage"]).optional().describe("summary default; status/usage need serve"),
-      days: z.number().int().min(1).max(366).optional().describe("usage view only; default 7"),
+      view: z.enum(["summary", "scheduler", "config", "full", "status", "usage"]).optional(),
+      days: z.number().int().min(1).max(366).optional(),
     },
     outputSchema: doctorResultSchema,
     annotations: { readOnlyHint: true },
@@ -401,10 +392,10 @@ server.registerTool(
   "session",
   {
     description:
-      "Use when: create/delete affinity; kill also cancels requests. Do not use when: history/KV storage or shared-model unload. Returns: handle or receipt.",
+      "Use when: affinity/cancel. Do not use when: history or unload. Returns: handle/receipt.",
     inputSchema: {
       action: z.enum(["create", "delete", "kill"]),
-      sessionId: z.string().uuid().optional().describe("required for delete/kill"),
+      sessionId: z.string().uuid().optional(),
       endpoint: endpointParam,
     },
     outputSchema: sessionResultSchema,
@@ -430,33 +421,33 @@ server.registerTool(
   "models",
   {
     description:
-      "Use when: model discovery. Do not use when: execution or mutation; search never permits a pull. " +
-      "Returns: inventory, placement, or candidates. Library: model='<family>' lists tags and fit.",
+      "Use when: discovery. Do not use when: execution/mutation. " +
+      "Returns: inventory/placement/candidates; library model lists tags.",
     inputSchema: {
       view: z
         .enum(["installed", "resident", "detail", "raw", "library"])
         .optional()
-        .describe('installed (default, needs serve) | resident (needs serve) | detail | raw | library'),
-      model: z.string().min(1).optional().describe('required for view "detail"; for "library", step 2 family name'),
+        ,
+      model: z.string().min(1).optional(),
       includeVerbose: z
         .boolean()
         .optional()
-        .describe('detail only: include license/modelfile'),
-      includeLibrary: z.boolean().optional().describe('installed/detail: sourced Ollama guidance; default false'),
-      includeReadme: z.boolean().optional().describe('library tags/enriched detail: README, max 65,536 chars'),
-      query: z.string().min(1).optional().describe('"library" step 1: free text, e.g. "qwen", "embed"'),
+        ,
+      includeLibrary: z.boolean().optional(),
+      includeReadme: z.boolean().optional(),
+      query: z.string().min(1).optional(),
       capabilities: z
         .array(z.enum(["vision", "tools", "thinking", "embedding", "cloud"]))
         .min(1)
         .max(5)
         .optional()
-        .describe('"library" step 1: filter chips; combined as AND by the site'),
+        ,
       order: z
         .enum(["popular", "newest"])
         .optional()
-        .describe('library search; default popular'),
-      limit: z.number().int().positive().max(50).optional().describe('"library" search or raw/tag page size; raw default 20'),
-      cursor: z.string().min(1).optional().describe('opaque continuation cursor for raw models or library tags'),
+        ,
+      limit: z.number().int().positive().max(50).optional(),
+      cursor: z.string().min(1).optional(),
       endpoint: endpointParam,
       ollamaEndpoint: ollamaEndpointParam,
     },
@@ -727,23 +718,27 @@ async function libraryLookup({
     }
 }
 
+registerContextTools(server);
+
 server.registerTool(
   "run_task",
   {
     description:
-      "Use when: chat, tools, or embeddings. Do not use when: file lookup; use delegate_research. " +
+      "Use when: chat/tools/embeddings. Do not use when: file lookup. " +
       "preview:true only decides. Returns: response and receipts.",
     inputSchema: {
       endpoint: endpointParam,
-      task: taskParam,
+      task: taskParam.removeDefault().optional().describe("caller owns prompts and output format."),
       objective: objectiveParam,
-      model: z.string().min(1).optional().describe("Exact installed model."),
-      sessionId: z.string().uuid().optional().describe("Model affinity from session{create}, not history."),
+      model: z.string().min(1).optional(),
+      sessionId: z.string().uuid().optional(),
+      scopeId: z.string().uuid().optional(),
+      scopeRevision: z.number().int().nonnegative().optional(),
       contextTokens: z.number().int().positive().optional().describe("Total input + output window (num_ctx)."),
       executionPreference: executionPreferenceParam,
       minPlacementEvidence: minPlacementEvidenceParam,
       requiredCapabilities: requiredCapabilitiesParam,
-      prompt: z.string().min(1).optional().describe("Chat input when messages is omitted."),
+      prompt: z.string().min(1).optional(),
       systemPrompt: systemPromptParam,
       images: z
         .array(z.string().min(1))
@@ -756,13 +751,13 @@ server.registerTool(
       input: z
         .union([z.string().min(1), z.array(z.string().min(1)).min(1)])
         .optional()
-        .describe('embedding only; accepts batches'),
+        ,
       tools: localToolsParam,
-      keepAlive: z.string().min(1).optional().describe('"0" unloads now, "-1" pins, default 5m'),
+      keepAlive: z.string().min(1).optional().describe('"0" unloads now, "-1" pins; omitted = adaptive finite TTL'),
       format: z
         .union([z.literal("json"), z.record(z.unknown())])
         .optional()
-        .describe('Structured output: json or JSON Schema'),
+        ,
       think: z
         .union([z.boolean(), z.enum(["low", "medium", "high"])])
         .optional(),
@@ -771,13 +766,13 @@ server.registerTool(
         .optional()
         .describe("num_ctx/contextTokens and num_gpu/placement are routing-owned; num_predict caps output."),
       logprobs: z.boolean().optional(),
-      topLogprobs: z.number().int().nonnegative().optional().describe("Requires logprobs:true"),
+      topLogprobs: z.number().int().nonnegative().optional(),
       minConfidence: minConfidenceParam,
-      priority: z.enum(["interactive", "normal", "background"]).optional().describe("Fair admission class; default normal."),
-      maxWaitSeconds: z.number().int().positive().optional().describe("Admission/resource wait; capped by server limit, default 120s."),
-      timeoutSeconds: z.number().int().positive().optional().describe("Total deadline, including waiting; server-capped."),
-      defer: z.boolean().optional().describe("Return a job ID for task_jobs; lost on restart."),
-      returnEmbeddings: z.boolean().optional().describe("Include raw vectors; default false."),
+      priority: z.enum(["interactive", "normal", "background"]).optional(),
+      maxWaitSeconds: z.number().int().positive().optional(),
+      timeoutSeconds: z.number().int().positive().optional(),
+      defer: z.boolean().optional(),
+      returnEmbeddings: z.boolean().optional(),
       preview: z
         .boolean()
         .optional()
@@ -794,6 +789,8 @@ server.registerTool(
     objective,
     model,
     sessionId,
+    scopeId,
+    scopeRevision,
     contextTokens,
     executionPreference,
     minPlacementEvidence,
@@ -819,9 +816,14 @@ server.registerTool(
     preview,
   }) => {
     try {
-      const canonicalTask = canonicalTaskKind(task);
+      const canonicalTask = canonicalTaskKind(task ?? "completion");
+      if ((scopeId === undefined) !== (scopeRevision === undefined)) {
+        return errorResult(new Error("scopeId and scopeRevision must be supplied together."));
+      }
       if (preview) {
         const executionOnlyFields = ([
+          ["scopeId", scopeId],
+          ["scopeRevision", scopeRevision],
           ["prompt", prompt],
           ["systemPrompt", systemPrompt],
           ["images", images],
@@ -901,7 +903,7 @@ server.registerTool(
       // are spent. So when the caller sets a floor, preview the decision with a `route` call
       // first — free, no generation — and refuse before anything runs. Only costs the extra round
       // trip when the option is actually used.
-      if (minConfidence) {
+      if (minConfidence && scopeId === undefined) {
         const decision = parsedResult(
           // minConfidence is forwarded so the CORE gate refuses, with its actionable message naming
         // the two commands that raise the grade. The belowConfidence() check below stays only as a
@@ -914,12 +916,14 @@ server.registerTool(
       }
       const result = parsedResult(
         await runTaskRequest(endpoint ?? DEFAULT_SERVE_ENDPOINT, {
-          task: canonicalTask,
-          objective: objective ?? "balanced",
+          task: scopeId !== undefined && task === undefined ? undefined : canonicalTask,
+          objective: objective ?? (scopeId === undefined ? "balanced" : undefined),
           model,
           session_id: sessionId,
+          scope_id: scopeId,
+          scope_revision: scopeRevision,
           context_tokens: contextTokens,
-          required_capabilities: effectiveRequiredCapabilities ?? [],
+          required_capabilities: effectiveRequiredCapabilities,
           prompt,
           images,
           messages: taskMessages({ systemPrompt, messages, prompt, images }),
@@ -931,8 +935,8 @@ server.registerTool(
           max_wait_seconds: maxWaitSeconds,
           timeout_seconds: timeoutSeconds,
           defer: defer ?? false,
-          execution_preference: executionPreference ?? "auto",
-          min_placement_evidence: minPlacementEvidence ?? "configured",
+          execution_preference: executionPreference,
+          min_placement_evidence: minPlacementEvidence,
           request_options: {
             format,
             think,
@@ -964,7 +968,7 @@ server.registerTool(
       endpoint: endpointParam,
       action: z.enum(["list", "get", "cancel", "remove"]),
       jobId: z.string().uuid().optional(),
-      returnEmbeddings: z.boolean().optional().describe("get only: raw vectors; default false."),
+      returnEmbeddings: z.boolean().optional(),
     },
     outputSchema: objectResultSchema,
     annotations: { destructiveHint: true },
@@ -1016,6 +1020,9 @@ server.registerTool(
     try {
       for (const item of tasks) {
         const task = item.task as Record<string, unknown>;
+        if ((task.scopeId === undefined) !== (task.scopeRevision === undefined)) {
+          return errorResult(new Error(`batch item ${item.id}: scopeId and scopeRevision must be supplied together.`));
+        }
         if (task.task === "embedding") {
           if (task.input === undefined || task.prompt !== undefined || task.systemPrompt !== undefined || task.messages !== undefined || task.tools !== undefined) {
             return errorResult(new Error(`batch item ${item.id}: embedding requires input and accepts no chat payload.`));
@@ -1037,14 +1044,16 @@ server.registerTool(
           id: item.id,
           independent: item.independent,
           task: {
-            task: task.task === "code_review" ? "coding" : task.task,
-            objective: (task as Record<string, unknown>).objective ?? "balanced",
+            task: task.task === "code_review" ? "coding" : (task.task ?? (task.scopeId === undefined ? "completion" : undefined)),
+            objective: task.objective ?? (task.scopeId === undefined ? "balanced" : undefined),
             model: task.model,
-            session_id: (task as Record<string, unknown>).sessionId,
+            session_id: task.sessionId,
+            scope_id: task.scopeId,
+            scope_revision: task.scopeRevision,
             context_tokens: (task as Record<string, unknown>).contextTokens,
-            execution_preference: (task as Record<string, unknown>).executionPreference ?? "auto",
-            min_placement_evidence: (task as Record<string, unknown>).minPlacementEvidence ?? "configured",
-            required_capabilities: (task as Record<string, unknown>).requiredCapabilities ?? [],
+            execution_preference: task.executionPreference,
+            min_placement_evidence: task.minPlacementEvidence,
+            required_capabilities: task.requiredCapabilities,
             priority: task.priority ?? "normal",
             max_wait_seconds: task.maxWaitSeconds,
             timeout_seconds: task.timeoutSeconds,
@@ -1083,7 +1092,7 @@ server.registerTool(
       "Use when: approved pull or unload. Do not use when: deletion/discovery. " +
       "timeoutSeconds is pull-only. Returns: lifecycle receipt.",
     inputSchema: {
-      action: z.enum(["pull", "stop"]).describe('"pull" = disk, "stop" = memory'),
+      action: z.enum(["pull", "stop"]),
       model: z.string().min(1),
       ollamaEndpoint: ollamaEndpointParam,
       timeoutSeconds: z
@@ -1091,7 +1100,7 @@ server.registerTool(
         .int()
         .positive()
         .optional()
-        .describe(`"pull" only. Defaults to ${DEFAULT_PULL_TIMEOUT_SECONDS}s.`),
+        ,
     },
     outputSchema: manageResultSchema,
     annotations: { destructiveHint: false },
@@ -1178,32 +1187,32 @@ server.registerTool(
   "delegate_research",
   {
     description:
-      "Use when: a narrow lookup needs an allowed workspace. Do not use when: mutation, broad judgment, or external facts. " +
-      "Returns: answer, citations, verdict. Verify or escalate yourself.",
+      "Use when: workspace lookup. Do not use when: mutation or external facts. " +
+      "Returns: answer/citations/verdict; verify citations.",
     inputSchema: {
-      question: z.string().min(1).describe("narrow and self-contained, answerable by reading files"),
+      question: z.string().min(1),
       workspacePath: z
         .string()
         .min(1)
-        .describe("Directory inside FREELLAMA_MCP_ALLOWED_ROOTS"),
+        ,
       adapter: z
         .enum(["bash", "octocode"])
         .optional()
-        .describe('default bash'),
+        ,
       model: z
         .string()
         .min(1)
         .optional()
-        .describe("default FREELLAMA_MCP_DEFAULT_MODEL, else the routed coding model"),
+        ,
       endpoint: endpointParam,
       executionPreference: executionPreferenceParam,
       minPlacementEvidence: minPlacementEvidenceParam,
-      legacyText: z.boolean().optional().describe("Include duplicate JSON text; default false"),
+      legacyText: z.boolean().optional(),
       agent: z
         .object({
           maxTurns: z.number().int().positive().optional(),
-          contextTokens: z.number().int().positive().optional().describe("Total window, including output and margin."),
-          outputTokens: z.number().int().positive().optional().describe("Per-call output cap, reserved from context."),
+          contextTokens: z.number().int().positive().optional(),
+          outputTokens: z.number().int().positive().optional(),
           temperature: z.number().nonnegative().optional(),
           seed: z.number().int().nonnegative().optional(),
           think: z.boolean().optional(),
@@ -1213,7 +1222,7 @@ server.registerTool(
         })
         .strict()
         .optional()
-        .describe("Per-call budget. Retry, repair and compaction tuning: FREELLAMA_AGENT_* env vars."),
+        ,
     },
     outputSchema: researchResultSchema,
     annotations: { destructiveHint: false },

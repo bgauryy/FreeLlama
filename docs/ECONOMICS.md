@@ -32,8 +32,10 @@ that FreeLlama does not emit. An MCP host that feeds both `structuredContent` an
 can avoid roughly the listed amount; a host that already keeps only one representation does not.
 The canonical structured payload still exists for deterministic clients that need it.
 
-The nine-tool schema plus initialization instructions stays below 4,500 estimated tokens, using
-the same rough conversion. The integration suite enforces this ceiling for the complete tool list.
+The integration suite bounds the complete tool schema and initialization instructions using
+the same rough token conversion. Read the
+[protocol context-budget contract](../packages/mcp/test/integration/protocol.test.ts) for the
+enforced ceiling.
 This is tool-schema **rent**, not a saving: clients pay it whenever they expose
 the entire tool list to a model. Read the bundled documentation resource on demand and do not expose
 unneeded tools in a client that supports tool filtering.

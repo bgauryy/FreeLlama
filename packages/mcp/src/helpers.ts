@@ -189,11 +189,11 @@ export async function ollamaPull(
   return { status: "empty" };
 }
 
-// Self-evident params carry no `.describe()`: the name says it, the default is in the server
+// Self-evident params carry no ``: the name says it, the default is in the server
 // instructions, and every description is re-sent on every request. Only params whose BEHAVIOUR
 // isn't obvious from the name keep one.
-export const endpointParam = z.string().min(1).optional().describe("serve :11435");
-export const ollamaEndpointParam = z.string().min(1).optional().describe("Ollama :11434");
+export const endpointParam = z.string().min(1).optional();
+export const ollamaEndpointParam = z.string().min(1).optional();
 export const TASK_KINDS = [
   "completion",
   "coding",
@@ -225,13 +225,11 @@ export const objectiveParam = z
 export const executionPreferenceParam = z
   .enum(["auto", "prefer_cpu", "prefer_gpu"])
   .optional()
-  .describe(
-    'Backend hint with fallback.',
-  );
+  ;
 export const minPlacementEvidenceParam = z
   .enum(["configured", "observed"])
   .optional()
-  .describe('observed requires physical proof');
+  ;
 // Router grades only "low" | "medium". A low/capability-only pick once selected a far-too-small
 // model for a demanding task — the answer still looked confident.
 const CONFIDENCE_RANK: Record<string, number> = { low: 1, medium: 2 };
@@ -292,7 +290,7 @@ export const localToolsParam = z.array(z.object({
     parameters: z.record(z.unknown()).optional(),
   }).passthrough(),
 }).passthrough()).min(1).optional()
-  .describe("Local functions; JSON Schema parameters.");
+  ;
 
 /** Only explicitly supplied instructions become a system message; existing messages stay intact. */
 export function taskMessages({ systemPrompt, messages, prompt, images }: {
@@ -311,10 +309,12 @@ export function taskMessages({ systemPrompt, messages, prompt, images }: {
 // The stable parts are typed so an MCP client can construct a batch without guessing. The
 // forwarded Ollama controls remain deliberately open because Ollama evolves them independently.
 export const batchTaskParam = z.object({
-  task: taskParam,
+  task: taskParam.removeDefault().optional().describe("caller owns prompts and output format."),
   objective: objectiveParam,
   model: z.string().min(1).optional(),
   sessionId: z.string().uuid().optional(),
+  scopeId: z.string().uuid().optional(),
+  scopeRevision: z.number().int().nonnegative().optional(),
   contextTokens: z.number().int().positive().optional(),
   executionPreference: executionPreferenceParam,
   minPlacementEvidence: minPlacementEvidenceParam,
