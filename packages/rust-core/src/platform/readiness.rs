@@ -2,7 +2,7 @@
 use super::{
     PlatformState, TaskKind,
     execution::{ManagedDecision, model_memory_requirement, upstream_is_loopback},
-    resources::{ResourceCapacityAssessment, ResourceSnapshot},
+    resources::{ResourceCapacityAssessment, ResourceDemand, ResourceSnapshot},
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -42,8 +42,13 @@ pub(super) async fn assess(
             .await;
     let resources = state.resources.snapshot().await;
     let required = footprint["required_available_bytes"].as_u64().unwrap_or(0);
+    let demand = if required == 0 && footprint["source"] == "matching_resident_context" {
+        ResourceDemand::resident()
+    } else {
+        ResourceDemand::load(required)
+    };
     let assessment = upstream_is_loopback(&decision.execution.upstream)
-        .then(|| resources.assess_capacity(required, false));
+        .then(|| resources.assess_demand(demand, false));
     let task_cost = task_cost
         .min(u32::try_from(decision.execution.admission.total()).unwrap_or(u32::MAX))
         .max(1);

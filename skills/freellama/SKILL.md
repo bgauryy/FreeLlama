@@ -5,7 +5,7 @@ description: "Use when delegating token-heavy work to local Ollama models throug
 
 # FreeLlama
 
-Operate FreeLlama as governed local-model delegation, not as a frontier-model replacement. MCP tools: `doctor`, `models`, `run_task`, `ollama_manage`, `ollama_delete`, `delegate_research`; `npx @octocodeai/freellama tools` maps them to CLI equivalents.
+Operate FreeLlama as governed local-model delegation, not as a frontier-model replacement. MCP tools: `doctor`, `session`, `models`, `run_task`, `task_jobs`, `run_task_batch`, `ollama_manage`, `ollama_delete`, `delegate_research`; `npx @octocodeai/freellama tools` maps them to CLI equivalents.
 
 Flow: `PREREQUISITE → DIAGNOSE → DECIDE → EXECUTE → VERIFY`
 
@@ -27,7 +27,7 @@ One managed call contains one task; only the calling agent knows which tasks are
 
 1. Call `doctor`. FreeLlama does not install or replace Ollama; if Ollama is missing or unreachable, direct the operator to `https://ollama.com/download` or `ollama serve`, then stop—do not recommend or pull a model.
 2. Read `doctor.machine.memory_bytes`, then `models{view:"installed"}` and `models{view:"resident"}`. Treat `execution.backend` as configuration and `execution.observation.processor` as physical evidence. A mismatch or partial placement warning invalidates feedback. For authenticated serve, set `FREELLAMA_AUTH_TOKEN_FILE` to the same permission-restricted file used at startup.
-3. Check `/_freellama/v1/health` admission slots. Zero slots means queueing up to the configured wait, not a reservation; a 503 is load shedding, so retry or lower fan-out.
+3. Check `/_freellama/v1/health` admission slots. Zero slots means queueing up to the configured wait, not a reservation. Read structured refusal codes: queue saturation returns 429, while resource/deadline failures have their own receipts.
 
 ## Decide
 
@@ -55,6 +55,8 @@ Call `run_task{task,prompt|messages,images?,model?,executionPreference?,minPlace
 ### C — embeddings
 
 Batch `run_task{task:"embedding",input:[...]}` and leave `returnEmbeddings:false` unless code, not the orchestrator, needs vectors. Use embeddings for grouping, dedup candidates, classification, and similarity—not identifier search. `examples/local-rag.sh` is the runnable pattern.
+
+For work that may wait, use `run_task{defer:true,timeoutSeconds,priority,...}` and inspect its ID with `task_jobs{action:"get",jobId}`. `timeoutSeconds` includes discovery, queueing, loading, and inference. `task_jobs{action:"cancel",jobId}` waits for local permit release; it does not prove Ollama stopped decoding. Jobs and bounded results are process-local and expire; they are not resumed after restart. Preview accepts routing fields only: omit payloads, priorities, deadlines, and `defer`, then make a separate execution call.
 
 ### D — choose or install a model
 

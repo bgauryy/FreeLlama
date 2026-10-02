@@ -156,6 +156,15 @@ export function runTaskBatchRequest(
   request: unknown,
 ): Promise<string>;
 
+/** Lists process-local job metadata without prompts or results. */
+export function listTaskJobs(endpoint?: string | undefined | null): Promise<string>;
+/** Reads one deferred job and its retained result. */
+export function getTaskJob(endpoint: string | undefined | null, jobId: string): Promise<string>;
+/** Cancels one deferred job and waits for its local permits to be released. */
+export function cancelTaskJob(endpoint: string | undefined | null, jobId: string): Promise<string>;
+/** Stop one deferred task, release local permits, then discard its retained record. */
+export function removeTaskJob(endpoint: string | undefined | null, jobId: string): Promise<string>;
+
 /**
  * Converts a free-text natural-language intent into a route.
  * @param endpoint FreeLlama serve endpoint, defaults to http://127.0.0.1:11435

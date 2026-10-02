@@ -8,6 +8,7 @@ describe("caller-owned task prompts", () => {
   let server: Server;
   let endpoint: string;
   const requests: { path: string; body: any }[] = [];
+  let refusal: { status: number; body: Record<string, unknown> } | undefined;
 
   beforeAll(async () => {
     server = createServer(async (request, response) => {
@@ -15,6 +16,11 @@ describe("caller-owned task prompts", () => {
       for await (const chunk of request) raw += chunk;
       requests.push({ path: request.url!, body: JSON.parse(raw) });
       response.setHeader("content-type", "application/json");
+      if (refusal) {
+        response.statusCode = refusal.status;
+        response.end(JSON.stringify(refusal.body));
+        return;
+      }
       response.end(JSON.stringify(request.url?.endsWith("task-batches")
         ? { results: [{ id: "review", ok: true, response: { message: { content: "Caller-defined prose." }, done: true } }] }
         : { response: { message: { content: "Caller-defined prose." }, done: true } }));
@@ -25,7 +31,7 @@ describe("caller-owned task prompts", () => {
     endpoint = `http://127.0.0.1:${address.port}`;
     client = await connectClient();
   });
-  beforeEach(() => { requests.length = 0; });
+  beforeEach(() => { requests.length = 0; refusal = undefined; });
   afterAll(async () => {
     await client?.close();
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
@@ -38,6 +44,45 @@ describe("caller-owned task prompts", () => {
     expect(requests[0].body).toMatchObject({ task: "completion", objective: "balanced", prompt: "Hello", messages: [] });
     const tools = (await client.listTools()).tools;
     expect(tools.find((tool) => tool.name === "run_task")?.inputSchema.required ?? []).not.toContain("task");
+  });
+
+  it.each(["run_task", "run_task_batch"])("%s forwards a bounded caller waiting budget", async (name) => {
+    const task = { prompt: "Hello", maxWaitSeconds: 30, timeoutSeconds: 60 };
+    const result = await client.callTool({ name, arguments: name === "run_task"
+      ? { endpoint, ...task }
+      : { endpoint, tasks: [{ id: "review", independent: true, task }] },
+    });
+    expect(result.isError, JSON.stringify(result)).not.toBe(true);
+    const sent = name === "run_task" ? requests[0].body : requests[0].body.tasks[0].task;
+    expect(sent.max_wait_seconds).toBe(30);
+    expect(sent.timeout_seconds).toBe(60);
+  });
+
+  it("rejects an execution wait budget in a routing-only preview", async () => {
+    const result = await client.callTool({ name: "run_task", arguments: {
+      endpoint, preview: true, maxWaitSeconds: 30,
+    } });
+    expect(result.isError).toBe(true);
+    expect(requests).toHaveLength(0);
+  });
+
+  it.each([
+    { status: 429, body: { error: "queue full", code: "admission_queue_full", retry_after_seconds: 7 } },
+    { status: 503, body: { error: "capacity unavailable", code: "resource_admission_unavailable",
+      retry_after_seconds: 3, resource_admission: { status: "deadline_exceeded", waited_ms: 1000 } } },
+    { status: 502, body: { error: "runner disconnected", code: "upstream_transport_error",
+      lifecycle: { requested: "immediate_unload", status: "verified" } } },
+  ])("preserves the complete HTTP $status refusal receipt through native MCP", async (fixture) => {
+    refusal = fixture;
+    for (const name of ["run_task", "run_task_batch"]) {
+      const result = await client.callTool({ name, arguments: name === "run_task"
+        ? { endpoint, prompt: "Hello" }
+        : { endpoint, tasks: [{ id: "review", independent: true, task: { prompt: "Hello" } }] },
+      });
+      expect(result.isError).toBe(true);
+      expect(JSON.parse((result.content as { text: string }[])[0].text)).toEqual(fixture.body);
+      expect(result.structuredContent).toEqual(fixture.body);
+    }
   });
 
   it("advertises local-model prompts and typed function descriptors", async () => {

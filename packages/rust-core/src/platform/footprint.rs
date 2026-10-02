@@ -2,17 +2,25 @@
 use super::CatalogModel;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{collections::VecDeque, path::PathBuf};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    path::PathBuf,
+};
 
 /// Measured runner sizes, newest last, plus the settings that scale an estimate. With a file,
 /// samples survive restarts, so estimates come from Ollama's own measurements from the start.
 #[derive(Default)]
-pub(super) struct FootprintHistory(VecDeque<Sample>, RuntimeHints, Option<PathBuf>);
+pub(super) struct FootprintHistory {
+    samples: VecDeque<Sample>,
+    hints: RuntimeHints,
+    backend_hints: BTreeMap<String, RuntimeHints>,
+    file: Option<PathBuf>,
+}
 
 /// Ollama settings that scale a runner's memory beyond file size + one F16 KV sequence.
 ///
-/// Read from `FreeLlama`'s own environment, which usually matches an Ollama started from the same
-/// shell or service definition; `doctor` reports where the Ollama process's values differ.
+/// Resolved independently from each backend's observed process environment, with explicit source
+/// receipts when only launchd, the `FreeLlama` environment, or documented defaults are available.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct RuntimeHints {
     /// `OLLAMA_NUM_PARALLEL`: Ollama allocates one KV cache per parallel slot.
@@ -86,11 +94,23 @@ impl Sample {
 
 impl FootprintHistory {
     pub(super) fn with_hints(hints: RuntimeHints) -> Self {
-        Self(VecDeque::new(), hints, None)
+        Self {
+            hints,
+            ..Self::default()
+        }
+    }
+
+    pub(super) fn with_backend_hints(mut self, backend: String, hints: RuntimeHints) -> Self {
+        self.set_backend_hints(backend, hints);
+        self
+    }
+
+    pub(super) fn set_backend_hints(&mut self, backend: String, hints: RuntimeHints) {
+        self.backend_hints.insert(backend, hints);
     }
 
     pub(super) fn len(&self) -> usize {
-        self.0.len()
+        self.samples.len()
     }
 
     /// Load and keep saving samples at `path`. An unreadable or corrupt file starts empty: it is
@@ -100,22 +120,22 @@ impl FootprintHistory {
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Vec<Sample>>(&bytes).ok())
         {
-            self.0 = samples
+            self.samples = samples
                 .into_iter()
                 .rev()
                 .take(HISTORY_LIMIT)
                 .rev()
                 .collect();
         }
-        self.2 = Some(path);
+        self.file = Some(path);
         self
     }
 
     fn save(&self) {
         static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let Some(path) = &self.2 else { return };
+        let Some(path) = &self.file else { return };
         // A few kilobytes at most, written only when a measurement changes.
-        let Ok(bytes) = serde_json::to_vec(&self.0) else {
+        let Ok(bytes) = serde_json::to_vec(&self.samples) else {
             return;
         };
         // Unique per process and write: two servers sharing a data directory must not rename
@@ -168,20 +188,24 @@ impl FootprintHistory {
         if context == 0 || bytes == 0 {
             return false;
         }
-        let hints = self.1;
+        let hints = self
+            .backend_hints
+            .get(backend)
+            .copied()
+            .unwrap_or(self.hints);
         let same = |sample: &Sample| {
             sample.taken_under(backend, digest, hints) && sample.context == context
         };
         let previous = self
-            .0
+            .samples
             .iter()
             .find(|sample| same(sample))
             .map_or(0, |sample| sample.bytes);
         if previous >= bytes {
             return false;
         }
-        self.0.retain(|sample| !same(sample));
-        self.0.push_back(Sample {
+        self.samples.retain(|sample| !same(sample));
+        self.samples.push_back(Sample {
             backend: backend.to_owned(),
             digest: digest.to_owned(),
             context,
@@ -189,8 +213,8 @@ impl FootprintHistory {
             num_parallel: hints.num_parallel,
             kv_cache_percent: hints.kv_cache_percent,
         });
-        while self.0.len() > HISTORY_LIMIT {
-            self.0.pop_front();
+        while self.samples.len() > HISTORY_LIMIT {
+            self.samples.pop_front();
         }
         true
     }
@@ -219,12 +243,16 @@ impl FootprintHistory {
             return json!({"required_available_bytes":0,"source":"matching_resident_context","exact":false,
                 "note":"resident allocation already reflected in host telemetry; runner growth remains possible"});
         }
-        let hints = self.1;
+        let hints = self
+            .backend_hints
+            .get(backend)
+            .copied()
+            .unwrap_or(self.hints);
         let digest = model.digest.as_deref().unwrap_or_default();
         let comparable =
             |sample: &&Sample| !digest.is_empty() && sample.taken_under(backend, digest, hints);
         let observed = self
-            .0
+            .samples
             .iter()
             .filter(comparable)
             .filter(|sample| sample.context >= context)
@@ -245,7 +273,7 @@ impl FootprintHistory {
         } else {
             model.kv_cache_bytes_per_token_f16.and_then(|per_token| {
                 let (smaller_context, bytes) = self
-                    .0
+                    .samples
                     .iter()
                     .filter(comparable)
                     .filter(|sample| sample.context < context)
@@ -266,7 +294,7 @@ impl FootprintHistory {
                 .saturating_add(graph)
         });
         json!({"required_available_bytes":estimate,"source":if observed.is_some() {"observed_same_digest_at_equal_or_larger_context"} else if measured_plus_kv.is_some() {"observed_smaller_context_plus_kv"} else if kv.is_some() {"model_file_plus_kv_plus_graph"} else {"model_file_plus_assumed_kv_plus_graph"},
-            "exact":false,"kv_metadata_available":kv.is_some(),"history_samples":self.0.len(),
+            "exact":false,"kv_metadata_available":kv.is_some(),"history_samples":self.samples.len(),
             "ollama_num_parallel":hints.num_parallel,"kv_cache_percent_of_f16":hints.kv_cache_percent,
             "note":"capacity reservation estimate; OS telemetry and Ollama final admission remain authoritative"})
     }
@@ -349,6 +377,56 @@ mod tests {
     }
 
     #[test]
+    fn each_backend_uses_its_own_parallelism_and_cache_settings() {
+        let mut shaped = model();
+        shaped.kv_cache_bytes_per_token_f16 = Some(10);
+        let mut history = FootprintHistory::with_hints(RuntimeHints::default()).with_backend_hints(
+            "cpu".into(),
+            RuntimeHints {
+                num_parallel: 4,
+                kv_cache_percent: 50,
+            },
+        );
+        // The default graph allowance is 1100; CPU KV is 100 * 10 * 4 * 50%.
+        assert_eq!(
+            history.requirement("gpu", &shaped, 100, None, true)["required_available_bytes"],
+            2100
+        );
+        assert_eq!(
+            history.requirement("cpu", &shaped, 100, None, true)["required_available_bytes"],
+            3100
+        );
+        history.observe(
+            "cpu",
+            Some("a"),
+            &json!({"status":"verified","digest":"a","size":5000,"context_length":100}),
+        );
+        assert_eq!(
+            history.requirement("cpu", &shaped, 100, None, true)["required_available_bytes"],
+            5000
+        );
+        assert_eq!(history.samples.back().unwrap().num_parallel, 4);
+        assert_eq!(history.samples.back().unwrap().kv_cache_percent, 50);
+        // A restarted process may change parallelism. Measurements made under the previous
+        // settings must no longer provide a too-small exact-fit estimate.
+        history.set_backend_hints(
+            "cpu".into(),
+            RuntimeHints {
+                num_parallel: 8,
+                kv_cache_percent: 100,
+            },
+        );
+        assert_eq!(
+            history.requirement("cpu", &shaped, 100, None, true)["required_available_bytes"],
+            9100
+        );
+        assert_eq!(
+            history.requirement("gpu", &shaped, 100, None, true)["required_available_bytes"],
+            2100
+        );
+    }
+
+    #[test]
     fn a_smaller_measurement_grows_by_exactly_the_extra_kv_cache() {
         let mut shaped = model();
         shaped.kv_cache_bytes_per_token_f16 = Some(10);
@@ -425,7 +503,7 @@ mod tests {
             Some("a"),
             &json!({"status":"mismatch","size":1000,"context_length":1}),
         );
-        assert!(history.0.is_empty());
+        assert!(history.samples.is_empty());
         for context in 1..=100 {
             history.observe(
                 "cpu",
@@ -433,6 +511,6 @@ mod tests {
                 &json!({"status":"verified","digest":"a","size":1000,"context_length":context}),
             );
         }
-        assert_eq!(history.0.len(), 64);
+        assert_eq!(history.samples.len(), 64);
     }
 }

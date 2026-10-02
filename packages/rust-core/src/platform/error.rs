@@ -44,6 +44,10 @@ enum ResourceFailureReceipt {
 }
 
 impl ApiError {
+    pub(super) fn invalid_task_request(error: &axum::extract::rejection::JsonRejection) -> Self {
+        Self::new(error.status(), error.body_text()).with_code("invalid_task_request")
+    }
+
     pub(super) fn new(status: StatusCode, error: impl std::fmt::Display) -> Self {
         Self {
             status,
@@ -83,6 +87,10 @@ impl ApiError {
         Self::new(StatusCode::UNPROCESSABLE_ENTITY, error)
     }
 
+    pub(super) fn task_cancelled() -> Self {
+        Self::new(StatusCode::CONFLICT, "task cancelled").with_code("task_cancelled")
+    }
+
     pub(super) fn session_killed() -> Self {
         let mut error = Self::new(
             StatusCode::CONFLICT,
@@ -108,8 +116,14 @@ impl ApiError {
         self
     }
 
+    pub(super) fn with_lifecycle(mut self, lifecycle: Value) -> Self {
+        self.body.lifecycle = Some(lifecycle);
+        self
+    }
+
     pub(super) fn with_resource_deadline(mut self, phase: &'static str, waited_ms: u128) -> Self {
         self.body.code = Some("resource_admission_unavailable");
+        self.body.retry_after_seconds.get_or_insert(5);
         self.body.resource_admission = Some(ResourceFailureReceipt::Deadline {
             status: "deadline_exceeded",
             phase,
@@ -164,6 +178,28 @@ mod structured_error_tests {
     use super::{ApiError, resource_error, resources};
     use axum::{body::to_bytes, http::StatusCode, response::IntoResponse};
     use serde_json::{Value, json};
+
+    #[tokio::test]
+    async fn partial_resource_deadlines_include_retry_guidance() {
+        let response = ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "resource deadline")
+            .with_resource_deadline("initial_reservation", 1001)
+            .into_response();
+        assert_eq!(response.headers()["retry-after"], "5");
+        let payload: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(payload["retry_after_seconds"], 5);
+        assert_eq!(payload["code"], "resource_admission_unavailable");
+        assert_eq!(
+            payload["resource_admission"]["phase"],
+            "initial_reservation"
+        );
+        let custom = ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "resource deadline")
+            .with_retry_after(11)
+            .with_resource_deadline("reservation_revalidation", 20)
+            .into_batch_result("custom".into());
+        assert_eq!(custom["retry_after_seconds"], 11);
+    }
 
     #[tokio::test]
     async fn ordinary_errors_keep_the_existing_string_only_body() {

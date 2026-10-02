@@ -43,6 +43,22 @@ generation, embedding vectors are withheld by default, impossible models are exc
 and models with unusable research evidence are refused without tool calls. Tests that require a
 specific unavailable model report a skip reason.
 
+Live inference tests also inspect routing readiness and report a skip when the host cannot admit
+the model. These skips do not qualify inference throughput or physical placement. The pull/delete
+lifecycle test is disabled unless the operator explicitly sets `FREELLAMA_TEST_PULL_TAG` to
+`qwen2.5:0.5b` and `FREELLAMA_TEST_PULL_SIZE_BYTES` to the exact reported download size. The test
+rechecks that size and reads every installed-model page before allowing the round trip.
+
+## Model metadata contracts
+
+Model metadata unit contracts cover README extraction, complete tag pages, family-versus-variant
+features, digest matching, cloud aliases, cache expiry and eviction, response bounds, and lookup
+failures. MCP integration's `model-knowledge.test.ts` exercises the built server with deterministic
+local HTTP fixtures for both Ollama API data and public HTML. It checks optional enrichment,
+assigned-backend inventory, tag pagination, validation, and preservation of benchmark/policy evidence.
+The fixture tests perform no inference, pulls, or deletions. See the
+[metadata reference](MODEL_METADATA.md) for the public states these tests protect.
+
 ## Run static Rust checks
 
 ```bash
@@ -52,6 +68,9 @@ cargo clippy --all-targets -- -D warnings
 
 Routing regressions run in the default Rust suite; none are hidden behind `#[ignore]`. Add a
 focused contract test for each repaired behavior and keep it enabled in ordinary release checks.
+Resource contracts cover conservative full host-memory reservations when discrete-GPU telemetry is
+missing, and immediate-unload cleanup after a failed inference response body. The latter also checks
+that uncertain inference is never replayed and ordinary keep-alive requests retain their runner.
 The local-agent tier runs all context fitting, compaction, pagination, repeat-suppression, and
 strict action-shape contracts. It is included in `yarn test:all`, so adapter regressions cannot be
 missed by the root release matrix.
@@ -70,6 +89,41 @@ operator-assigned eligible model, an explicit model overrides that hint and repo
 two warm samples do not steer `auto`, the third sample on both backends enables a token-normalized
 comparison, differences of 10% or less remain noise, and one GPU plus one CPU request overlap even
 when both admission pools contain one unit.
+
+`resource_governor_contract` verifies that tasks held for memory remain counted in the bounded
+queue after releasing execution slots, resume when memory recovers, and release their queue entries
+and reservations on cancellation. A separate contract requires released reservations to wake
+waiters before the next telemetry sample. MCP integration checks forward `maxWaitSeconds` for
+single and batch execution and reject it in a decision-only preview.
+Admission contracts also cover expired deadlines, queue-limit reductions during resource-to-slot
+handoff, and cancellation after that handoff. Governor contracts require CPU pressure to recover
+independently while a memory hold still protects cold loads.
+MCP integration also requires native refusals to preserve error codes, retry timing, resource
+assessments, and unload receipts in both text and structured output.
+
+`task_jobs_contract` covers deferred acceptance, metadata privacy, memory recovery, cancellation
+of waiting and active requests, removal of active and completed jobs without affecting other IDs,
+total deadlines during inference, and input-size/batch boundaries.
+Registry unit tests cover active-job limits, terminal eviction, expiry, and result-size limits.
+Cancellation must retain its receipt even when another operation evicts the completed record.
+Request-validation contracts preserve structured JSON errors for invalid task and batch bodies.
+MCP `task-jobs.test.ts` exercises submission, inspection, result retrieval, cancellation, and removal through
+the native binding, plus preview rejection and embedding-vector summaries. Separate footprint and
+process-attribution tests require independent CPU/GPU settings; `smart_placement_contract` requires
+a resident routing preview to agree with execution under a low-memory-only hold.
+
+Run the isolated control timing experiments separately from the full suite:
+
+```bash
+cargo test --test control_timing_contract -- --include-ignored --nocapture
+cargo test --test task_jobs_contract measure_deferred_control_latency -- --ignored --nocapture
+```
+
+These fixed-budget experiments use simulated backends to measure status, discovery, queue
+controls, and resource recovery. They emit `CONTROL_TIMING` records with 20 samples, median, and
+95th-percentile latency. They verify both backend inventories and released reservations; they
+do not measure model tokens per second. Process-refresh contracts require updated observations
+after cache expiry and reject old footprint measurements after parallelism changes.
 
 ## Validate CPU and GPU concurrency
 

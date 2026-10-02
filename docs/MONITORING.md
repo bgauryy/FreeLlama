@@ -17,6 +17,10 @@ token and keeps it only for the browser tab.
 | `GET /metrics` | | | Prometheus text exposition |
 | `GET /config` | `freellama config` | | Effective runtime settings and the source of each |
 | `POST /config/reload` | `freellama config --reload` | | Re-read the runtime file now; `422` keeps the last good values |
+| `GET /jobs` | `freellama jobs` | `task_jobs {action:"list"}` | Deferred job metadata without prompts or retained results |
+| `GET /jobs/:id` | `freellama jobs --id <uuid>` | `task_jobs {action:"get", jobId}` | One job receipt and its retained result or error |
+| `POST /jobs/:id/cancel` | `freellama jobs --id <uuid> --cancel` | `task_jobs {action:"cancel", jobId}` | Cancellation receipt after local permits are released |
+| `DELETE /jobs/:id` | `freellama jobs --id <uuid> --remove` | `task_jobs {action:"remove", jobId}` | Stops active work, releases local permits, and removes the retained record |
 
 ## Read the live status
 
@@ -35,6 +39,35 @@ token and keeps it only for the browser tab.
   process), `launchctl getenv` for the macOS app, FreeLlama's own environment, or Ollama's default.
   A remote endpoint is never probed and is reported as unknown.
 - **`usage_today`**: tasks, errors, tokens, and busy time since midnight UTC.
+- **`task_jobs`**: deferred task IDs, selected models, configured backends, priorities, total
+  deadlines, states, and waiting reasons. States cover discovery, admission, resources, runner
+  transitions, loading, execution, and completion. Metadata excludes the original payload.
+
+Use `run_task {defer:true}` in MCP or `task --defer` in the CLI to get a job handle. A list or
+status request omits results; fetching one ID returns its retained result or structured failure.
+Terminal states are `completed`, `failed`, `cancelled`, and `expired`. Cancellation is per task,
+waits for local permits to be released, and does not unload a shared runner. Process-local job
+retention limits are documented in [CLI controls](CLI.md#execute-tasks).
+
+Removal uses the same exact job ID. It cancels active work before discarding the record, returns
+`{id, removed:true, status, scope:"process_memory"}`, and omits the saved result. The ID then returns
+`404` on lookup or another removal. Other jobs and installed models are unaffected. Local
+cancellation closes the upstream request; physical computation may continue on a shared runner.
+
+`ollama.config` describes the primary process; `ollama.cpu_config` describes the CPU process when
+configured. Process attribution matches `OLLAMA_HOST` to the selected endpoint, so separate
+parallelism and KV cache settings size each backend independently. Fallback sources remain visible
+when process settings cannot be observed.
+
+Process settings are cached for five seconds and refreshed on discovery or monitoring requests,
+including after an Ollama restart. Each config receipt includes `observed_at` and
+`observation_scope: "process_snapshot"`. Refresh also updates backend memory estimates and
+invalidates the use of measurements taken under different parallelism or KV cache settings.
+FreeLlama admission limits remain governed by its runtime configuration.
+
+Each backend's admission `queue_depth` includes both `slot_waiters` and `resource_waiters`.
+A resource waiter returns its execution slot after two seconds but remains in the bounded queue
+until capacity recovers, its deadline expires, or it is cancelled.
 
 ## Record usage
 
@@ -58,20 +91,20 @@ OpenMetrics-compatible scraper at it.
 
 ## Back-pressure
 
-FreeLlama refuses work it cannot start soon instead of letting it pile up inside Ollama:
+FreeLlama waits for safe capacity within a deadline and bounds the retained backlog:
 
 | Situation | Status | `code` |
 |---|---|---|
 | Managed queue full | `429` | `admission_queue_full` |
 | Raw proxy over its cap after `raw_queue_wait_seconds` | `429` | |
 | Managed wait exceeded `max_queue_wait_seconds` (or the task's `max_wait_seconds`) | `503` | `admission_timeout` |
-| Host memory held by the pressure gate | `503` | `resource_admission_unavailable` |
+| Host resources remain held when the waiting budget expires | `503` | `resource_admission_unavailable` |
 | Backend circuit open | `503` | `upstream_circuit_open` |
 
-Every refusal carries a `Retry-After` header and `retry_after_seconds` in the body. For a queue it
+These capacity refusals carry a `Retry-After` header and `retry_after_seconds` in the body. For a queue it
 is estimated from the queue depth, the current limit, and the backend's recent average task time
-(1 to 120 seconds). A task can ask for a shorter wait with `max_wait_seconds`; it is capped by the
-configured maximum.
+(1 to 120 seconds). A task can ask for a shorter wait with `max_wait_seconds` (`maxWaitSeconds`
+in MCP); the server caps it at the configured maximum.
 
 ## Circuit breaker
 

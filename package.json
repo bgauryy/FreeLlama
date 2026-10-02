@@ -7,6 +7,7 @@
   "workspaces": [
     "packages/mcp",
     "packages/cli",
+    "packages/view",
     "packages/native/*"
   ],
   "napi": {
@@ -23,6 +24,9 @@
     ]
   },
   "scripts": {
+    "dev:view": "yarn workspace @octocodeai/freellama-view dev",
+    "build:view": "yarn workspace @octocodeai/freellama-view build",
+    "start:view": "yarn workspace @octocodeai/freellama-view start",
     "build": "yarn build:rust && yarn build:native && yarn workspaces foreach -A --topological run build",
     "build:native": "napi build --platform --release --manifest-path packages/rust-core/Cargo.toml --features napi --no-js --no-dts-header --dts .napi-generated.d.ts -o packages/mcp/native && node packages/mcp/scripts/remove-generated-dts.mjs",
     "build:rust": "cargo build --release",

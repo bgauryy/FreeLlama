@@ -63,6 +63,10 @@ Managed work follows a decision contract. Raw Ollama traffic follows a compatibi
 Read [Product positioning](docs/PRODUCT_POSITIONING.md) for the audience and category decision, or
 [Architecture](docs/ARCHITECTURE.md) for the complete ownership and request flows.
 
+For a live Vite + React localhost dashboard, run `yarn dev:view` with the control plane running.
+The [runtime view package](packages/view/README.md) covers backend queues, memory, model residency,
+usage, and effective settings through a typed read-only local backend.
+
 ## Understand why it exists
 
 Calling Ollama directly is the right choice when the caller already knows the exact model and
@@ -281,13 +285,14 @@ explicitly. See the [MCP build and client guidance](packages/mcp/README.md).
 
 ## Control FreeLlama through MCP
 
-The MCP server exposes eight tools to compatible AI-agent hosts:
+The MCP server exposes nine tools to compatible AI-agent hosts:
 
 | MCP tool | Control | Important behavior |
 |---|---|---|
 | `doctor` | Diagnose Ollama, host, versions, and memory settings | `summary` is compact by default; use `scheduler`, `config`, or `full` only for diagnosis |
 | `models` | Inspect installed, resident, detailed, raw, or online-library models | Raw inventory and library tags are paged; reports managed CPU/GPU placement where available |
 | `run_task` | Preview or execute chat, vision, and embedding work | Applies routing, confidence, admission, and response trimming |
+| `task_jobs` | List states, retrieve results, cancel, or remove deferred work by ID | Removal stops active work and discards its retained record after local permits are released |
 | `run_task_batch` | Execute caller-declared independent work | Requires stable IDs and `independent:true`; bounds dispatch and returns each sibling result/error |
 | `session` | Create or release bounded model affinity for related tasks | Stores neither prompt history nor Ollama KV; expires when idle |
 | `ollama_manage` | Pull or unload an exact model | Keeps lifecycle work explicit |
@@ -702,6 +707,7 @@ observable, and bounded local research can keep intermediate context out of the 
 | [CPU and GPU routing](docs/CPU_GPU_ROUTING.md) | Portable two-process setup, placement proof, concurrency, and feedback |
 | [Resource-routing decision](docs/ADR_RESOURCE_AWARE_BACKEND_ROUTING.md) | Design alternatives and bounded agent authority |
 | [Model selection](docs/MODEL_SELECTION.md) | Evidence, qualification, recommendations, and CPU-helper selection |
+| [Ollama model metadata](docs/MODEL_METADATA.md) | Supported features, sourced use-case guidance, exact-tag matching, and optional README enrichment |
 | [Ollama sidecar](docs/OLLAMA_SIDECAR.md) | Compatibility and responsibility boundary with Ollama |
 | [System optimization](docs/OLLAMA_SYSTEM_OPTIMIZATION.md) | Ollama settings, K/V cache, parallelism, and measured tradeoffs |
 | [Token economics](docs/ECONOMICS.md) | Context isolation, measurements, and cost limits |

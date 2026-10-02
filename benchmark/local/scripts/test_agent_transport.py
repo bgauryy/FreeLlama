@@ -108,13 +108,13 @@ class AgentTransportTests(unittest.TestCase):
                     self.assertEqual(record["model_metadata"]["cache_token_metrics"]["status"], "reported")
 
     def test_retry_only_when_inference_was_refused(self):
-        busy = HTTPError("url", 503, "busy", {}, None)
+        busy = HTTPError("url", 503, "busy", {}, io.BytesIO())
         self.assertTrue(retryable_chat_error(busy))
         busy.close()
         self.assertTrue(retryable_chat_error(URLError(ConnectionRefusedError())))
         for error in [TimeoutError(), URLError(TimeoutError()),
-                      HTTPError("url", 504, "timeout", {}, None),
-                      HTTPError("url", 400, "invalid", {}, None),
+                      HTTPError("url", 504, "timeout", {}, io.BytesIO()),
+                      HTTPError("url", 400, "invalid", {}, io.BytesIO()),
                       URLError(ConnectionResetError())]:
             with self.subTest(error=error):
                 self.assertFalse(retryable_chat_error(error))

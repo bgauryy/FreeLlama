@@ -92,6 +92,10 @@ The control API exposes these endpoints:
 | `POST /_freellama/v1/sessions` | New model-affinity session | No |
 | `DELETE /_freellama/v1/sessions/:session_id` | Release model-affinity session | No |
 | `POST /_freellama/v1/tasks` | Managed chat, vision, tools, or embedding task | Yes |
+| `GET /_freellama/v1/jobs` | Deferred job metadata without prompts or results | No |
+| `GET /_freellama/v1/jobs/:id` | One deferred receipt and retained result | No |
+| `POST /_freellama/v1/jobs/:id/cancel` | Cancel one deferred task and release its local permits | No new inference |
+| `DELETE /_freellama/v1/jobs/:id` | Cancel active work, release local permits, and remove its retained record | No new inference |
 
 The machine profile is host-derived rather than model-name-derived. It reports total physical
 memory on macOS (`sysctl`), Linux (`/proc`), and Windows (system APIs), along with CPU, OS,
@@ -124,6 +128,16 @@ metadata is cached for 30 seconds; residency is refreshed before routing.
 A failed `/api/show` response skips that model instead of failing the entire catalog. An unreachable
 configured backend fails catalog discovery closed because FreeLlama cannot prove the assigned model's
 state.
+
+### Public model metadata
+
+Public model enrichment belongs to the MCP layer's `model-knowledge.ts` and `model-search.ts`.
+Installed/detail requests can opt into GET-only Ollama family and full tag-page lookups. The layer
+matches exact tags and digest prefixes, preserves local supported features, and attaches family-scoped
+source excerpts and usage notes. Its bounded in-memory cache expires successes after one hour and
+failures after one minute. Failed or unmatched lookups leave local inventory and evidence intact.
+Public claims do not enter the Rust catalog, task policy, quality confidence, or routing decisions.
+See [Ollama model metadata](MODEL_METADATA.md) for the public contract and request bounds.
 
 ## Deterministic routing
 
@@ -204,7 +218,12 @@ The implementation separates [admission scheduling](../packages/rust-core/src/pl
 [typed errors](../packages/rust-core/src/platform/error.rs). The platform module wires HTTP endpoints,
 configuration, discovery, and shared state; extracting these owners preserves the public routing API.
 
-Managed tasks combine routing with admission and backend-aware transition coordination:
+Managed tasks combine routing with admission and backend-aware transition coordination. With
+`defer:true`, the server returns HTTP `202` and a process-local job handle, then runs the same task
+path. The bounded registry owns receipts and cancellation, while the existing governor owns
+admission. Batch items cannot defer. Per-task `timeout_seconds` bounds discovery, waiting, loading,
+and inference together, capped by the server task timeout. See [CLI controls](CLI.md#execute-tasks)
+for retention limits and [monitoring](MONITORING.md) for the observable lifecycle.
 
 ```mermaid
 flowchart TD
@@ -252,13 +271,22 @@ After six capacity bypasses, the scheduler reserves released capacity for the ol
 so a stream of small requests cannot indefinitely starve a larger request. Cancellation releases
 that reservation. Admission, resource waiting, and transition locking share one queue deadline.
 
+A task waiting for host resources returns its execution slot after two seconds and continues
+waiting within the same deadline. It remains counted against the backend's bounded queue, so
+memory pressure cannot create an invisible backlog. Health reports slot and resource waiters
+separately. Returning to slot admission transfers the existing queue registration atomically;
+new arrivals and a smaller reloaded queue limit cannot displace accepted work. Expired deadlines
+prevent admission even when an execution slot is free. Cancellation removes either waiter, and releasing a memory reservation wakes resource
+waiters immediately; host telemetry still obeys the sampling and recovery policy below.
+
 FreeLlama acquires the admission slot before a transition lock to avoid deadlock. A model marked
 resident during discovery is checked again while the shared transition lock is held; stale or
 unavailable residency falls back to the exclusive transition path. Session affinity is bound only
 after successful upstream execution, so refused and failed tasks cannot change later routing.
 An explicit `done:false` chat response or a reported upstream error is a failure, even with HTTP 200.
 It cannot train runtime feedback or bind affinity. Completed failed exchanges retain the raw response
-and honor a requested immediate unload; transport failures do not prove upstream cancellation.
+and honor a requested immediate unload. Transport failures also attempt that unload and return its
+lifecycle receipt, but a disconnected inference response alone does not prove upstream cancellation.
 Resource failures return a readable `error`, a stable `code`, and structured `resource_admission`
 data, including per-item batch failures.
 
@@ -271,8 +299,11 @@ The K/V preflight derives single-sequence F16 K+V bytes-per-token only for suppo
 architectures with sufficient metadata. Explicit key/value dimensions take precedence; sliding-window,
 shared-KV, recurrent, and unknown layouts report unknown. F16 is advisory because quantized KV can
 use less memory. The coarse model-file budget refuses files over 80% of local CPU/unified RAM only
-for loopback backends. Upstream parallelism and actual KV precision remain unknown; Ollama remains
-the live loader and final memory authority.
+for loopback backends. Forecasts use each backend's independently attributed parallelism and KV
+cache settings where process inspection is available, with explicit fallback sources otherwise.
+Process observations refresh on requests after five seconds; measurements made under different
+settings cannot supply an exact-fit estimate. Ollama remains the live loader and final memory
+authority. Configured settings alone do not prove physical processor placement.
 
 The shared [resource governor](../packages/rust-core/src/platform/resources.rs) samples local
 available-memory estimates, load per logical CPU, OS memory pressure, active swap-out growth, and
@@ -280,6 +311,10 @@ thermal throttling when reported. It holds new local work below the larger of 15
 1 GiB, and requires two healthy samples above the larger of 20% or 2 GiB to resume. Historical swap
 occupancy alone is not pressure. Samples are cached for two seconds; unavailable signals stay unknown.
 Remote backends bypass this host gate.
+
+Each pressure signal recovers independently after two fresh samples that meet its recovery
+threshold. A recovered CPU-load signal therefore clears even while RAM remains low. That keeps
+unchanged resident runners eligible under a memory-only hold while cold loads continue waiting.
 
 The default `require_memory` telemetry policy holds local inference when available RAM is missing,
 even when a raw request has no model-footprint estimate. `best_effort` is an explicit opt-in;
@@ -295,8 +330,10 @@ across both backends. Verified runner footprints replace that estimate only for 
 immutable model digest, and equal-or-larger observed context. Exact resident digest/context matches
 avoid double-counting existing allocations. The reservation is rechecked after transition locking;
 an increased requirement that no longer fits refuses with 503, without waiting while holding the
-backend lock. Permits release on completion or cancellation. These estimates do not measure discrete
-GPU free VRAM, constrain external allocations, or preempt an already-running model.
+backend lock. Permits release on completion or cancellation. On discrete-GPU hosts, observed free
+VRAM discounts the estimated host-memory requirement by the bytes the GPU can hold. Missing VRAM
+telemetry reserves the full estimated footprint in host RAM. The governor cannot constrain external
+allocations or preempt an already-running model.
 
 Managed text tasks without explicit `context_tokens` select the smallest 2K/4K/8K/16K/32K bucket
 that covers the UTF-8 prompt/schema estimate, output reserve, and 512-token template margin, bounded
@@ -305,8 +342,11 @@ Multimodal and embedding requests retain their profiles. The execution receipt e
 `context_sizing`; previews contain routing fields only and therefore retain task defaults.
 Managed chat sends `truncate:false` and `shift:false` so supporting Ollama backends refuse overflow
 instead of silently losing earlier instructions. Managed embeddings send `truncate:false` too.
-Managed execution supplies `num_thread` as half the logical CPU count, at least one, unless the
-caller specifies it. `runtime_options` reports the forwarded values; runner support is not assumed.
+Only the dedicated CPU backend supplies a thread default: half the logical CPU count on other
+platforms, while macOS leaves Ollama to select its performance cores. `FREELLAMA_CPU_NUM_THREAD`
+overrides that default; explicit request options take precedence. The primary backend leaves thread
+selection to Ollama to avoid changing the options of a shared runner. `runtime_options` reports
+forwarded values; runner support is not assumed.
 
 Resident tasks share a backend lock. Nonresident tasks take that backend's exclusive lock so a cold
 load cannot race another managed task on the same server. CPU and GPU backends have separate locks
@@ -378,6 +418,7 @@ flowchart TD
     TOOL -->|"doctor"| NAPI["Native core diagnostics"]
     TOOL -->|"models"| MIX["Control API or direct Ollama/library HTTP"]
     TOOL -->|"run_task"| TASK["Control API route or task"]
+    TOOL -->|"task_jobs"| JOB["Deferred receipts and per-task cancellation"]
     TOOL -->|"ollama_manage"| LIFE["Direct Ollama pull or unload"]
     TOOL -->|"ollama_delete"| DELETE["Explicit destructive Ollama delete"]
     TOOL -->|"delegate_research"| AD["Confined adapter subprocess"]

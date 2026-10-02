@@ -11,7 +11,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::telemetry::Gauge;
-use super::{CatalogModel, PlatformState, get_json, host_has_unified_memory, ollama_env, runtime};
+use super::{CatalogModel, PlatformState, host_has_unified_memory, ollama_env, runtime};
 
 /// Ollama's own default `num_ctx` for `model` on `placement`, when it can be known, with the
 /// source it came from. Order follows Ollama's resolution in `server/routes.go`: a Modelfile
@@ -31,11 +31,22 @@ pub(super) async fn ollama_default_context(
     if let Some(value) = state.tunables().ollama_default_context {
         return Some((value, "config"));
     }
+    let settings = if placement == "cpu" {
+        match &state.cpu_ollama {
+            Some(settings) => Some(settings.read().await.clone()),
+            None => None,
+        }
+    } else {
+        Some(state.ollama.read().await.clone())
+    };
+    if let Some(value) = settings
+        .as_ref()
+        .and_then(super::ollama_env::OllamaSettings::context_length)
+    {
+        return Some((value, "ollama_context_length"));
+    }
     if placement == "cpu" {
         return None;
-    }
-    if let Some(value) = state.ollama.context_length() {
-        return Some((value, "ollama_context_length"));
     }
     if host_has_unified_memory() {
         return None;
@@ -44,7 +55,11 @@ pub(super) async fn ollama_default_context(
     let total = observation.gpu_memory_total_bytes?;
     Some((
         ollama_env::vram_tier_default_context(
-            total.saturating_sub(state.ollama.gpu_overhead_bytes()),
+            total.saturating_sub(
+                settings
+                    .as_ref()
+                    .map_or(0, super::ollama_env::OllamaSettings::gpu_overhead_bytes),
+            ),
         ),
         "vram_tier",
     ))
@@ -73,8 +88,12 @@ pub(super) fn adaptive_applies(state: &PlatformState, backend: &str) -> bool {
 /// Loaded runners per backend from `/api/ps`, or the error that prevented reading them.
 async fn loaded_models(state: &PlatformState) -> Vec<Value> {
     let mut loaded = Vec::new();
-    for (backend, upstream, _) in backend_views(state) {
-        match get_json(&state.client, &upstream, "/api/ps").await {
+    let (gpu, cpu) = super::backend_residency(state).await;
+    for ((backend, upstream, _), result) in backend_views(state)
+        .into_iter()
+        .zip(std::iter::once(gpu).chain(cpu))
+    {
+        match result {
             Ok(ps) => {
                 state
                     .footprints
@@ -114,6 +133,7 @@ async fn loaded_models(state: &PlatformState) -> Vec<Value> {
 
 /// One compact view of what the machine and `FreeLlama` are doing right now.
 pub(super) async fn status(State(state): State<PlatformState>) -> Json<Value> {
+    state.refresh_ollama_settings().await;
     let snapshot = state.resources.snapshot().await;
     let tunables = state.tunables();
     let breakers = state.breakers.receipt();
@@ -137,10 +157,16 @@ pub(super) async fn status(State(state): State<PlatformState>) -> Json<Value> {
         .collect::<serde_json::Map<_, _>>();
     let default_context = ollama_default_context(&state, None, "gpu").await;
     let observation = &snapshot.observation;
+    let gpu_settings = state.ollama.read().await.receipt();
+    let cpu_settings = match &state.cpu_ollama {
+        Some(settings) => Some(settings.read().await.receipt()),
+        None => None,
+    };
     Json(json!({
         "status": if snapshot.holding { "holding" } else { "ok" },
         "backends": backends,
         "raw_proxy": state.raw_admission.receipt(),
+        "task_jobs": super::jobs::snapshot(&state.jobs),
         "loaded_models": loaded_models(&state).await,
         "host": {
             "status": snapshot.status,
@@ -162,7 +188,8 @@ pub(super) async fn status(State(state): State<PlatformState>) -> Json<Value> {
             "sample_age_ms": snapshot.sample_age_ms,
         },
         "ollama": {
-            "config": state.ollama.receipt(),
+            "config": gpu_settings,
+            "cpu_config": cpu_settings,
             "default_context": default_context.map(|(tokens, source)| json!({"tokens": tokens, "source": source})),
             "context_mode": tunables.context_mode,
         },
@@ -201,8 +228,13 @@ pub(super) async fn usage(
 }
 
 pub(super) async fn config(State(state): State<PlatformState>) -> Json<Value> {
+    state.refresh_ollama_settings().await;
     let mut receipt = state.runtime.receipt();
-    receipt["ollama"] = state.ollama.receipt();
+    receipt["ollama"] = state.ollama.read().await.receipt();
+    receipt["cpu_ollama"] = match &state.cpu_ollama {
+        Some(settings) => settings.read().await.receipt(),
+        None => Value::Null,
+    };
     Json(receipt)
 }
 
@@ -229,6 +261,7 @@ fn float(value: u64) -> f64 {
 
 #[allow(clippy::too_many_lines)] // One flat list of gauge families is easier to audit than helpers.
 pub(super) async fn metrics(State(state): State<PlatformState>) -> Response {
+    state.refresh_ollama_settings().await;
     let snapshot = state.resources.snapshot().await;
     let tunables = state.tunables();
     let mut gauges = Vec::new();
@@ -447,7 +480,7 @@ pub(super) async fn metrics(State(state): State<PlatformState>) -> Response {
     gauges.push(Gauge::new(
         "freellama_ollama_num_parallel",
         "OLLAMA_NUM_PARALLEL of the primary Ollama (probed, else Ollama's default).",
-        float(state.ollama.num_parallel()),
+        float(state.ollama.read().await.num_parallel()),
     ));
 
     let body = state.telemetry.render_prometheus(&gauges);

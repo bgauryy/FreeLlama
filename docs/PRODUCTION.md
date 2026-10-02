@@ -28,7 +28,14 @@ published tag:
 powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Version VERSION
 ```
 
-There is no repository-hosted release automation. Build and test every claimed target in a clean
+The [release workflow](../.github/workflows/release.yml) builds CLI and native artifacts for eight
+targets, assembles packages, verifies package contents, and publishes on version tags. The
+[CI workflow](../.github/workflows/ci.yml) runs Rust checks on macOS, Linux, and Windows, plus
+JavaScript/native checks on macOS and Linux. These workflows do not prove driver compatibility or
+complete the hardware promotion checklist below. Release publishing depends on artifact builds,
+not on a successful run of every CI or hardware lane; verify those receipts before tagging.
+
+For manual assembly, build and test every claimed target in a clean
 environment, place each executable and matching addon under `release-artifacts/<target>/`, run
 `yarn release:assemble release-artifacts release` and `yarn release:verify:publish`, then attach
 `release/SHA256SUMS` and binaries to the release. Publish the eight `@octocodeai/freellama-native-*` packages
@@ -94,7 +101,7 @@ CPU-only hosts must pass hardware validation before promotion. See
 Put the values in the service manager that owns each Ollama process: launchd on macOS, systemd or
 the container definition on Linux, and the Windows service wrapper. Shell exports and
 `launchctl setenv` are useful diagnostics but are login-session state, not a reboot-persistent
-production configuration. After a real service restart, rerun `doctor` and `scripts/check.sh` and
+production configuration. After a real service restart, rerun `doctor` and `skills/freellama/scripts/check.sh` and
 require the same visible values before admitting work.
 
 ## Create the security and state files
@@ -193,7 +200,7 @@ Promote a release only when all conditions pass:
 6. Restart testing proves feedback reloads and a corrupt snapshot fails startup.
 7. Immediate unload reports verified pre-unload placement and verified post-unload absence.
 8. Every claimed hardware row has a real archived acceptance receipt.
-9. The MCP schema remains eight tools and within its context budget.
+9. The MCP schema remains nine tools and within its context budget.
 
 Rollback by returning the listener to loopback, stopping the new service, and starting the prior
 checksummed binary with the same policy and feedback snapshot. Never downgrade across an unsupported

@@ -116,13 +116,21 @@ async fn get_json(endpoint: &str, path: &str, timeout: Duration) -> Result<Value
 }
 
 async fn post_json(endpoint: &str, path: &str, body: &Value, timeout: Duration) -> Result<Value> {
-    let response =
-        authenticated(client().post(format!("{}{path}", endpoint.trim_end_matches('/'))))?
-            .timeout(timeout)
-            .json(body)
-            .send()
-            .await
-            .map_err(to_napi_err)?;
+    request_json(
+        client()
+            .post(format!("{}{path}", endpoint.trim_end_matches('/')))
+            .json(body),
+        timeout,
+    )
+    .await
+}
+
+async fn request_json(request: reqwest::RequestBuilder, timeout: Duration) -> Result<Value> {
+    let response = authenticated(request)?
+        .timeout(timeout)
+        .send()
+        .await
+        .map_err(to_napi_err)?;
     // `error_for_status()` discards the body — and the body is where every useful refusal lives.
     // A `min_confidence` refusal names the grade, the evidence, the model it would have picked and
     // the two commands that raise the grade; all of that was collapsing into a bare
@@ -134,14 +142,11 @@ async fn post_json(endpoint: &str, path: &str, body: &Value, timeout: Duration) 
     let text = response.text().await.map_err(to_napi_err)?;
     let value = serde_json::from_str::<Value>(&text);
     if !status.is_success() {
-        let detail = value.as_ref().map_or_else(
-            |_| text.clone(),
-            |json| {
-                json.get("error")
-                    .and_then(Value::as_str)
-                    .map_or_else(|| json.to_string(), ToOwned::to_owned)
-            },
-        );
+        // Keep codes, retry timing, resource assessments and cleanup receipts across the native
+        // rejection boundary. Extracting only `error` made agents lose the back-pressure contract.
+        let detail = value
+            .as_ref()
+            .map_or_else(|_| text.clone(), ToString::to_string);
         return Err(napi::Error::from_reason(detail));
     }
     value.map_err(|error| {
@@ -474,6 +479,79 @@ pub async fn run_task_batch_request(endpoint: Option<String>, request: Value) ->
     )
     .await?;
     pretty(&value)
+}
+
+/// Lists bounded process-local deferred task receipts, without prompts or retained results.
+///
+/// # Errors
+/// Returns an error if the managed server is unreachable or refuses the request.
+#[napi]
+pub async fn list_task_jobs(endpoint: Option<String>) -> Result<String> {
+    pretty(
+        &get_json(
+            &endpoint_or_default(endpoint),
+            "/_freellama/v1/jobs",
+            control_timeout(),
+        )
+        .await?,
+    )
+}
+
+/// Reads a deferred task receipt and its retained result, if completed.
+///
+/// # Errors
+/// Returns an error for an invalid ID, an expired job, or an unavailable server.
+#[napi]
+pub async fn get_task_job(endpoint: Option<String>, job_id: String) -> Result<String> {
+    let id =
+        uuid::Uuid::parse_str(&job_id).map_err(|error| Error::from_reason(error.to_string()))?;
+    pretty(
+        &get_json(
+            &endpoint_or_default(endpoint),
+            &format!("/_freellama/v1/jobs/{id}"),
+            control_timeout(),
+        )
+        .await?,
+    )
+}
+
+/// Cancels one deferred task and waits for its local admission permits to be released.
+///
+/// # Errors
+/// Returns an error for an invalid ID, an expired job, or an unavailable server.
+#[napi]
+pub async fn cancel_task_job(endpoint: Option<String>, job_id: String) -> Result<String> {
+    let id =
+        uuid::Uuid::parse_str(&job_id).map_err(|error| Error::from_reason(error.to_string()))?;
+    pretty(
+        &post_json(
+            &endpoint_or_default(endpoint),
+            &format!("/_freellama/v1/jobs/{id}/cancel"),
+            &Value::Null,
+            task_timeout(),
+        )
+        .await?,
+    )
+}
+
+/// Stops one deferred task, waits for local permits, and removes its retained record.
+///
+/// # Errors
+/// Returns an error for an invalid ID, a missing job, or an unavailable server.
+#[napi]
+pub async fn remove_task_job(endpoint: Option<String>, job_id: String) -> Result<String> {
+    let id = uuid::Uuid::parse_str(&job_id).map_err(to_napi_err)?;
+    let endpoint = endpoint_or_default(endpoint);
+    pretty(
+        &request_json(
+            client().delete(format!(
+                "{}/_freellama/v1/jobs/{id}",
+                endpoint.trim_end_matches('/')
+            )),
+            task_timeout(),
+        )
+        .await?,
+    )
 }
 
 /// Converts a free-text natural-language intent into a route, via

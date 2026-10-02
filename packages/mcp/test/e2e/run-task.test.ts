@@ -60,12 +60,21 @@ describe.runIf(releaseServeAvailable)("run_task against a live serve", () => {
     }
   });
 
-  it("actually routes and executes a prompt", async () => {
+  it("actually routes and executes a prompt", async ({ skip }) => {
+    const preview = await call("run_task", { task: "completion", objective: "fastest", preview: true });
+    expect(preview.isError ?? false, preview.content[0].text).toBe(false);
+    if (preview.structuredContent.agent_plan?.dispatch_readiness !== "runnable_now") {
+      skip(`live inference requires available capacity: ${JSON.stringify(preview.structuredContent.agent_plan)}`);
+    }
     const result = await call("run_task", {
       task: "completion",
       objective: "fastest",
       prompt: "Reply with exactly the word: PONG",
       keepAlive: "0",
+      model: preview.structuredContent.selected_model,
+      timeoutSeconds: 60,
+      maxWaitSeconds: 5,
+      options: { num_predict: 16 },
     });
     expect(result.isError ?? false, result.content[0].text).toBe(false);
     expect(result.structuredContent.route?.selected_model).toBeTruthy();

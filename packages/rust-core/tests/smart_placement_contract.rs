@@ -146,12 +146,29 @@ async fn resident_runner_is_served_under_a_low_memory_hold() {
     let (upstream, server) = backend(mock.clone()).await;
     // Available memory is below the hold reserve: the loaded model itself is what used it.
     let governor = ResourceGovernor::with_sampler(policy(), || sample(50, Some(0))).unwrap();
-    let (status, body) = run(
-        app(&config(upstream, governor)).unwrap(),
-        "big:latest",
-        "hi",
-    )
-    .await;
+    let platform = app(&config(upstream, governor)).unwrap();
+    let preview = platform
+        .clone()
+        .oneshot(
+            Request::post("/_freellama/v1/routes")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"task":"completion","objective":"fastest",
+                "model":"big:latest","context_tokens":4096})
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(preview.status(), StatusCode::OK);
+    let preview: Value =
+        serde_json::from_slice(&to_bytes(preview.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(
+        preview["execution"]["agent_plan"]["dispatch_readiness"], "runnable_now",
+        "{preview}"
+    );
+    let (status, body) = run(platform, "big:latest", "hi").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
         body["execution"]["memory_reservation"]["source"],

@@ -19,11 +19,11 @@ normalized OCR transcription rather than accepting any nonempty visual response.
 `--vision-stop` for model-specific repetition guards; pass `--vision-stop '\n'` for a one-line OCR
 fixture.
 
-The manual GitHub workflow targets labeled self-hosted runners for Apple Metal, NVIDIA Linux, AMD
-Linux, and NVIDIA Windows. Each corresponding GitHub environment must define the endpoint and
-exact model tags. The runner must already have Bash and Python 3, the services, models, drivers,
-and authentication configured. Set `FREELLAMA_HARDWARE_AUTH_TOKEN_FILE` to the token path on each
-runner. A missing runner, token, or model is not a pass.
+Run this command on each prepared Apple Metal, NVIDIA Linux, AMD Linux, and NVIDIA Windows host
+you intend to support. The repository has no hardware-qualification GitHub workflow; its hosted
+CI and release builds do not exercise those accelerators. Each host needs Python 3, the services,
+exact installed model tags, drivers, and authentication configured. Pass the host's token path
+with `--auth-token-file`. A missing host, token, or model is not a pass.
 
 Promote a row only when the uploaded JSON has `verdict: "accept"`. Results are machine- and
 workload-specific; do not copy one accelerator's receipt into another row.

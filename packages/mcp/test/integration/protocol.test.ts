@@ -7,12 +7,12 @@
 // checkable is asserted (probed once at collection time via top-level await).
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { connectClient, serveAuthHeaders, serveIsUp, SERVE_ENDPOINT } from "../setup/client.js";
+import { connectClient, REPO_ROOT, serveAuthHeaders, serveIsUp, SERVE_ENDPOINT } from "../setup/client.js";
 
 type Tool = { name: string; description?: string; annotations?: any; outputSchema?: any; inputSchema?: any; title?: string };
 type ToolResult = { isError?: boolean; content: { text: string }[]; structuredContent?: any };
 
-const EXPECTED_TOOLS = ["doctor", "models", "run_task", "run_task_batch", "session", "ollama_manage", "ollama_delete", "delegate_research"];
+const EXPECTED_TOOLS = ["doctor", "models", "run_task", "task_jobs", "run_task_batch", "session", "ollama_manage", "ollama_delete", "delegate_research"];
 
 // Whether `freellama serve` is up decides which half of the contract is checkable.
 const serveUp = await serveIsUp();
@@ -230,6 +230,7 @@ describe("tool contract", () => {
     expect(byName.get("ollama_delete")!.annotations.destructiveHint).toBe(true);
     expect(tools.filter((tool) => tool.annotations?.destructiveHint === true).map((tool) => tool.name)).toEqual([
       "session",
+      "task_jobs",
       "ollama_delete",
     ]);
     // Belt and braces: the prose warning must survive too.
@@ -264,7 +265,8 @@ describe("tool contract", () => {
     expect(doctor.structuredContent.machine?.memory_bytes).toBeGreaterThan(0);
     expect(doctor.structuredContent.machine_unavailable).toBeUndefined();
 
-    const route = await call("run_task", { task: "completion", preview: true });
+    // An explicit unavailable endpoint tests refusal without triggering default-endpoint autostart.
+    const route = await call("run_task", { endpoint: "http://127.0.0.1:1", task: "completion", preview: true });
     expect(route.isError).toBe(true);
     // Error results must not carry structuredContent.
     expect(route.structuredContent).toBeUndefined();
@@ -304,19 +306,30 @@ describe("tool contract", () => {
     }
   });
 
-  it.runIf(serveUp)("withholds embedding vectors by default and returns them on opt-in", async () => {
+  it.runIf(serveUp)("withholds embedding vectors by default and returns them on opt-in", async ({ skip }) => {
+    let cursor: string | undefined;
+    let installed = false;
+    do {
+      const raw = await call("models", { view: "raw", limit: 50, ...(cursor ? { cursor } : {}) });
+      expect(raw.isError ?? false, raw.content[0].text).toBe(false);
+      installed = raw.structuredContent.models.some((entry: { name: string }) => entry.name === "nomic-embed-text:latest");
+      cursor = raw.structuredContent.page?.next_cursor ?? undefined;
+    } while (!installed && cursor);
+    if (!installed) skip("nomic-embed-text:latest is not installed");
+    const preview = await call("run_task", { task: "embedding", model: "nomic-embed-text:latest", preview: true });
+    expect(preview.isError ?? false, preview.content[0].text).toBe(false);
+    if (preview.structuredContent.agent_plan?.dispatch_readiness !== "runnable_now")
+      skip(`embedding needs available capacity: ${JSON.stringify(preview.structuredContent.agent_plan)}`);
     const embed = await call("run_task", {
       task: "embedding",
       objective: "fastest",
       model: "nomic-embed-text:latest",
       input: "protocol smoke test",
       keepAlive: "0",
+      timeoutSeconds: 30,
+      maxWaitSeconds: 5,
     });
-    if (embed.isError) {
-      // nomic-embed-text not installed on this machine — the e2e tier covers execution.
-      console.warn(`embedding check skipped: ${embed.content[0].text.slice(0, 80)}`);
-      return;
-    }
+    expect(embed.isError ?? false, embed.content[0].text).toBe(false);
     const withheld = embed.structuredContent.response.embeddings_omitted;
     expect(withheld).toBeTruthy();
     expect(embed.structuredContent.response.embeddings).toBeUndefined();
@@ -439,7 +452,7 @@ describe("tool contract", () => {
     expect([...adapterTool.inputSchema.properties.adapter.enum].sort()).toEqual(["bash", "octocode"]);
   });
 
-  it("delegate_research exposes typed runtime and fail-closed context policy", () => {
+  it("delegate_research exposes typed budgets and keeps deployment tuning out of requests", () => {
     const delegate = byName.get("delegate_research")!;
     expect(delegate.inputSchema.properties.minPlacementEvidence.enum).toEqual(["configured", "observed"]);
     expect(delegate.inputSchema.properties.endpoint).toBeTruthy();
@@ -447,10 +460,23 @@ describe("tool contract", () => {
     const agent = delegate.inputSchema.properties.agent;
     const properties = agent.anyOf?.[0]?.properties ?? agent.properties;
     expect(properties.contextTokens.type).toBe("integer");
-    expect(properties.retryAttempts.exclusiveMinimum).toBe(0);
-    const context = properties.context.anyOf?.[0] ?? properties.context;
-    expect(context.properties.pinnedOverflow.enum).toEqual(["error", "clip"]);
-    expect(context.properties.compactRetainRatio.exclusiveMaximum).toBe(1);
+    expect(properties.maxTurns.exclusiveMinimum).toBe(0);
+    expect(properties.outputTokens.exclusiveMinimum).toBe(0);
+    expect(properties.requestTimeoutSeconds.exclusiveMinimum).toBe(0);
+    expect(properties.toolTimeoutSeconds.exclusiveMinimum).toBe(0);
+    expect(properties.retryAttempts).toBeUndefined();
+    expect(properties.context).toBeUndefined();
+    expect((agent.anyOf?.[0] ?? agent).additionalProperties).toBe(false);
+  });
+
+  it("refuses unsupported per-call compaction tuning before research starts", async () => {
+    const result = await call("delegate_research", {
+      question: "Find the task router.",
+      workspacePath: REPO_ROOT,
+      agent: { context: { pinnedOverflow: "clip" } },
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toMatch(/context|unrecognized/i);
   });
 
   it("keeps the schema surface within the token budget", () => {
@@ -472,7 +498,8 @@ describe("tool contract", () => {
     expect(data.models.length).toBeGreaterThan(0);
     for (const model of data.models) {
       expect(typeof model.name).toBe("string");
-      expect(typeof model.cloudOnly).toBe("boolean");
+      expect(typeof model.cloudAvailable).toBe("boolean");
+      expect(model.cloudOnly).toBeNull();
       expect(typeof model.installed).toBe("boolean");
     }
     expect(data.nextStep).toMatch(/model:/);

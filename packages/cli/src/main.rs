@@ -9,7 +9,7 @@ use freellama::{
     model_bench::{BenchConfig, Capability, benchmark_all},
     platform::{
         ExecutionPreference, Objective, PlacementEvidence, PlatformConfig, RouteInput, TaskKind,
-        serve as serve_platform,
+        TaskPriority, serve as serve_platform,
     },
     proxy::{ProxyConfig, serve},
     run_suite, validate_endpoints, write_json,
@@ -101,6 +101,36 @@ mod telemetry_cli_tests {
     use super::*;
 
     #[test]
+    fn initialization_is_ready_only_with_runtime_service_and_installed_models() {
+        assert_eq!(initialization_status(false, true, true), "blocked");
+        assert_eq!(initialization_status(true, false, true), "setup_required");
+        assert_eq!(initialization_status(true, true, false), "setup_required");
+        assert_eq!(initialization_status(true, true, true), "ready");
+    }
+
+    #[test]
+    fn job_removal_requires_one_valid_id_and_cannot_also_cancel() {
+        let id = "b0bf3d83-4e2e-4bcb-a11e-a3c7a8a66d54";
+        let parsed = Cli::try_parse_from(["freellama", "jobs", "--id", id, "--remove"]).unwrap();
+        assert!(matches!(
+            parsed.command,
+            Command::Jobs {
+                id: Some(_),
+                remove: true,
+                cancel: false,
+                ..
+            }
+        ));
+        assert!(Cli::try_parse_from(["freellama", "jobs", "--remove"]).is_err());
+        assert!(
+            Cli::try_parse_from(["freellama", "jobs", "--id", "../other", "--remove"]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["freellama", "jobs", "--id", id, "--cancel", "--remove"]).is_err()
+        );
+    }
+
+    #[test]
     fn telemetry_policy_parses_on_serve_and_proxy_and_rejects_typos() {
         for command in ["serve", "proxy"] {
             for policy in ["best-effort", "require-memory", "require-all"] {
@@ -185,6 +215,23 @@ struct BackendArgs {
     /// Model to assign to --cpu-upstream. Repeat for multiple models.
     #[arg(long, requires = "cpu_upstream")]
     cpu_model: Vec<String>,
+}
+
+/// Per-task execution controls, separate from side-effect-free routing.
+#[derive(Debug, Clone, clap::Args)]
+struct TaskExecutionArgs {
+    /// Return a job ID immediately; use `jobs` to inspect or cancel it.
+    #[arg(long)]
+    defer: bool,
+    /// Total deadline including discovery, waiting, loading, and inference; capped by server.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    timeout_seconds: Option<u64>,
+    /// Fair admission class; interactive tasks receive more turns without starving background work.
+    #[arg(long, value_enum, default_value_t = TaskPriority::Normal)]
+    priority: TaskPriority,
+    /// Admission/resource wait budget; capped by server.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    max_wait_seconds: Option<u64>,
 }
 
 /// Production state and network boundary for `serve`.
@@ -436,6 +483,24 @@ enum Command {
         min_confidence: Option<String>,
         #[arg(long = "required-capability")]
         required_capabilities: Vec<String>,
+        #[command(flatten)]
+        execution: TaskExecutionArgs,
+    },
+    /// List deferred tasks, read one result, or cancel/remove one task by ID.
+    Jobs {
+        #[arg(
+            long,
+            env = "FREELLAMA_SERVE_ENDPOINT",
+            default_value = "http://127.0.0.1:11435"
+        )]
+        endpoint: String,
+        #[arg(long)]
+        id: Option<Uuid>,
+        #[arg(long, requires = "id", conflicts_with = "remove")]
+        cancel: bool,
+        /// Stop active work, release local permits, then remove its retained record.
+        #[arg(long, requires = "id")]
+        remove: bool,
     },
     /// Run an optional Ollama-compatible telemetry and policy sidecar.
     Proxy {
@@ -679,6 +744,7 @@ async fn main() -> Result<()> {
             input_file,
             min_confidence,
             required_capabilities,
+            execution,
         } => {
             request_task(
                 prompt,
@@ -694,9 +760,39 @@ async fn main() -> Result<()> {
                 input_file,
                 min_confidence,
                 required_capabilities,
+                execution,
             )
             .await?;
         }
+        Command::Jobs {
+            endpoint,
+            id,
+            cancel,
+            remove,
+        } => match (id, cancel, remove) {
+            (Some(id), _, true) => {
+                let response = authenticate_request(cli_client().delete(format!(
+                    "{}/_freellama/v1/jobs/{id}",
+                    endpoint.trim_end_matches('/')
+                )))?
+                .timeout(cli_task_timeout())
+                .send()
+                .await?;
+                print_response(response).await?;
+            }
+            (Some(id), true, false) => {
+                print_post(
+                    &endpoint,
+                    &format!("/_freellama/v1/jobs/{id}/cancel"),
+                    &Value::Null,
+                )
+                .await?;
+            }
+            (Some(id), false, false) => {
+                print_get(&endpoint, &format!("/_freellama/v1/jobs/{id}")).await?;
+            }
+            (None, _, _) => print_get(&endpoint, "/_freellama/v1/jobs").await?,
+        },
         Command::Proxy {
             listen,
             upstream,
@@ -1035,6 +1131,16 @@ fn generate_auth_token(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+fn initialization_status(ollama_ready: bool, serve_ready: bool, has_models: bool) -> &'static str {
+    if !ollama_ready {
+        "blocked"
+    } else if !serve_ready || !has_models {
+        "setup_required"
+    } else {
+        "ready"
+    }
+}
+
 /// Side-effect-free first-run receipt. Initialization must discover the real host and inventory
 /// before discussing a model, and discovery must never be interpreted as pull permission.
 async fn initialize(ollama_endpoint: String, serve_endpoint: String) -> Result<()> {
@@ -1119,7 +1225,8 @@ async fn initialize(ollama_endpoint: String, serve_endpoint: String) -> Result<(
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
-            "status": if ollama_ready { "ready" } else { "blocked" },
+            "status": initialization_status(ollama_ready, serve_ready, !installed_models.is_empty()),
+            "readiness": {"ollama":ollama_ready,"managed_service":serve_ready,"installed_models":!installed_models.is_empty()},
             "ollama_endpoint": ollama_endpoint,
             "serve_endpoint": serve_endpoint,
             "diagnostics": diagnostics,
@@ -1212,6 +1319,7 @@ async fn request_task(
     input_file: Option<PathBuf>,
     min_confidence: Option<String>,
     required_capabilities: Vec<String>,
+    execution: TaskExecutionArgs,
 ) -> Result<()> {
     let route = route_input(
         task,
@@ -1225,6 +1333,10 @@ async fn request_task(
         min_confidence,
     );
     let mut body = serde_json::to_value(route)?;
+    body["defer"] = json!(execution.defer);
+    body["timeout_seconds"] = json!(execution.timeout_seconds);
+    body["priority"] = json!(execution.priority);
+    body["max_wait_seconds"] = json!(execution.max_wait_seconds);
 
     // Ollama takes images as base64 with no data-URI prefix, attached to the user message.
     // Without this the CLI could select a vision model but never hand it anything to look at —
@@ -1499,7 +1611,7 @@ fn authenticate_request(request: reqwest::RequestBuilder) -> Result<reqwest::Req
 /// Hand-maintained rather than generated from the MCP server, so the CLI keeps no Node dependency.
 /// The trade-off is that adding or removing a tool means updating this table.
 fn print_tool_map() {
-    println!("FreeLlama exposes 8 MCP tools. Equivalents for a CLI-only agent:\n");
+    println!("FreeLlama exposes 9 MCP tools. Equivalents for a CLI-only agent:\n");
     let rows = [
         (
             "doctor",
@@ -1515,6 +1627,11 @@ fn print_tool_map() {
             "run_task",
             "freellama task --task <t> <prompt>",
             "route AND execute; preview:true is decision-only",
+        ),
+        (
+            "task_jobs",
+            "freellama jobs [--id <uuid>] [--cancel|--remove]",
+            "inspect, cancel, or remove process-local deferred tasks",
         ),
         (
             "run_task_batch",

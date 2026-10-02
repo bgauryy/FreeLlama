@@ -5,7 +5,7 @@
 //! environment. Every value here carries the source it came from so callers can see how much to
 //! trust it. Sources, strongest first:
 //!
-//! 1. `process`: the environment of the single same-user `ollama serve` process (Linux
+//! 1. `process`: the environment of the unique `ollama serve` process matching the endpoint (Linux
 //!    `/proc/<pid>/environ`, macOS `ps eww`). Only loopback endpoints are inspected.
 //! 2. `launchd`: `launchctl getenv` on macOS, which is what Ollama.app inherits.
 //! 3. `freellama_env`: this process's environment (the same shell or unit as Ollama, often).
@@ -38,6 +38,7 @@ pub(super) struct OllamaSettings {
     pub(super) settings: BTreeMap<&'static str, Setting>,
     /// Why process inspection did or did not contribute.
     pub(super) process_inspection: String,
+    observed_at: u64,
 }
 
 impl OllamaSettings {
@@ -89,6 +90,9 @@ impl OllamaSettings {
             })
             .collect::<serde_json::Map<_, _>>();
         json!({
+            "observed_at": self.observed_at,
+            "observation_scope": "process_snapshot",
+            "refresh_interval_seconds": 5,
             "settings": settings,
             "effective": {
                 "num_parallel": self.num_parallel(),
@@ -102,7 +106,7 @@ impl OllamaSettings {
 /// Resolve each tracked setting from the strongest source that has it.
 pub(super) fn probe(endpoint: &str) -> OllamaSettings {
     let (process, process_inspection) = if endpoint_is_loopback(endpoint) {
-        process_environment()
+        process_environment(endpoint)
     } else {
         (
             None,
@@ -164,6 +168,7 @@ pub(super) fn resolve(
     OllamaSettings {
         settings,
         process_inspection,
+        observed_at: super::telemetry::now_seconds(),
     }
 }
 
@@ -185,7 +190,9 @@ fn endpoint_is_loopback(endpoint: &str) -> bool {
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn tracked_only<'a>(pairs: impl Iterator<Item = (&'a str, &'a str)>) -> BTreeMap<String, String> {
     pairs
-        .filter(|(name, value)| TRACKED.contains(name) && !value.trim().is_empty())
+        .filter(|(name, value)| {
+            (TRACKED.contains(name) || *name == "OLLAMA_HOST") && !value.trim().is_empty()
+        })
         .map(|(name, value)| (name.to_owned(), value.to_owned()))
         .collect()
 }
@@ -197,8 +204,82 @@ pub(super) fn parse_proc_environ(bytes: &[u8]) -> BTreeMap<String, String> {
     tracked_only(text.split('\0').filter_map(|entry| entry.split_once('=')))
 }
 
+/// Exact executable/argument recognition; a shell mentioning Ollama is not its server.
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn is_ollama_serve(mut args: impl Iterator<Item = impl AsRef<str>>) -> bool {
+    args.next().is_some_and(|program| {
+        std::path::Path::new(program.as_ref())
+            .file_name()
+            .is_some_and(|name| name == "ollama")
+    }) && args.next().is_some_and(|arg| arg.as_ref() == "serve")
+}
+
+/// The host setting is read only for attribution, never included in a generic environment dump.
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn matches_endpoint(environment: &BTreeMap<String, String>, endpoint: &str) -> bool {
+    let Some(target) = reqwest::Url::parse(endpoint).ok() else {
+        return false;
+    };
+    let host = environment
+        .get("OLLAMA_HOST")
+        .map_or("http://127.0.0.1:11434", String::as_str);
+    let configured = if host.contains("://") {
+        host.to_owned()
+    } else {
+        format!("http://{host}")
+    };
+    let Some(configured) = reqwest::Url::parse(&configured).ok() else {
+        return false;
+    };
+    let address = |url: &reqwest::Url| {
+        url.host_str().and_then(|host| {
+            if host == "localhost" {
+                Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+            } else {
+                host.trim_matches(['[', ']'])
+                    .parse::<std::net::IpAddr>()
+                    .ok()
+            }
+        })
+    };
+    let local = match (address(&configured), address(&target)) {
+        (Some(bind), Some(target)) if target.is_loopback() => {
+            bind == target || (bind.is_unspecified() && bind.is_ipv4() == target.is_ipv4())
+        }
+        _ => false,
+    };
+    let port = configured.port().unwrap_or(11434);
+    local && Some(port) == target.port_or_known_default()
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn select_process(
+    candidates: Vec<(String, BTreeMap<String, String>)>,
+    endpoint: &str,
+) -> (Option<BTreeMap<String, String>>, String) {
+    let mut matching = candidates
+        .into_iter()
+        .filter(|(_, env)| matches_endpoint(env, endpoint));
+    let Some((pid, environment)) = matching.next() else {
+        return (
+            None,
+            "unavailable: no readable ollama serve process matches this endpoint".into(),
+        );
+    };
+    if matching.next().is_some() {
+        return (
+            None,
+            "ambiguous: multiple ollama serve processes match this endpoint".into(),
+        );
+    }
+    (
+        Some(environment),
+        format!("observed: ollama serve pid {pid} for {endpoint}"),
+    )
+}
+
 #[cfg(target_os = "linux")]
-fn process_environment() -> (Option<BTreeMap<String, String>>, String) {
+fn process_environment(endpoint: &str) -> (Option<BTreeMap<String, String>>, String) {
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return (None, "unavailable: /proc is not readable".to_owned());
     };
@@ -214,102 +295,54 @@ fn process_environment() -> (Option<BTreeMap<String, String>>, String) {
         let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
             continue;
         };
-        let mut args = cmdline
-            .split(|byte| *byte == 0)
-            .filter(|arg| !arg.is_empty());
-        let is_ollama = args
-            .next()
-            .is_some_and(|program| program.ends_with(b"/ollama") || program == b"ollama");
-        if is_ollama && args.any(|arg| arg == b"serve") {
-            candidates.push(pid.to_owned());
+        let text = String::from_utf8_lossy(&cmdline);
+        if is_ollama_serve(text.split('\0').filter(|arg| !arg.is_empty()))
+            && let Ok(bytes) = std::fs::read(format!("/proc/{pid}/environ"))
+        {
+            candidates.push((pid.to_owned(), parse_proc_environ(&bytes)));
         }
     }
-    match candidates.as_slice() {
-        [] => (
-            None,
-            "unavailable: no ollama serve process found".to_owned(),
-        ),
-        [pid] => match std::fs::read(format!("/proc/{pid}/environ")) {
-            Ok(bytes) => (
-                Some(parse_proc_environ(&bytes)),
-                format!("observed: ollama serve pid {pid}"),
-            ),
-            Err(error) => (
-                None,
-                format!(
-                    "unavailable: cannot read the environment of ollama pid {pid} ({error}); run FreeLlama as the same user as Ollama"
-                ),
-            ),
-        },
-        _ => (
-            None,
-            format!(
-                "ambiguous: {} ollama serve processes; not attributing one to this endpoint",
-                candidates.len()
-            ),
-        ),
-    }
+    select_process(candidates, endpoint)
 }
 
 #[cfg(target_os = "macos")]
-fn process_environment() -> (Option<BTreeMap<String, String>>, String) {
+fn process_environment(endpoint: &str) -> (Option<BTreeMap<String, String>>, String) {
     use std::time::Duration;
+    // A full `ps command` listing exceeds the telemetry output cap on busy hosts and can lose a
+    // server near its tail. Query exact process names first, then inspect only those PIDs.
     let Some(listing) = super::resources::bounded_command_with(
-        "ps",
-        &["-axo", "pid=,command="],
+        "pgrep",
+        &["-x", "ollama"],
         Duration::from_millis(1500),
     ) else {
         return (None, "unavailable: could not list processes".to_owned());
     };
-    let candidates: Vec<&str> = listing
-        .lines()
-        .filter(|line| {
-            line.contains("/ollama") && line.split_whitespace().any(|token| token == "serve")
-        })
-        .collect();
-    match candidates.as_slice() {
-        [] => (
-            None,
-            "unavailable: no ollama serve process found".to_owned(),
-        ),
-        [line] => {
-            let Some(pid) = line.split_whitespace().next() else {
-                return (
-                    None,
-                    "unavailable: could not parse the ollama pid".to_owned(),
-                );
-            };
-            match super::resources::bounded_command_with(
-                "ps",
-                &["eww", "-p", pid, "-o", "command="],
-                Duration::from_millis(1500),
-            ) {
-                Some(command) => (
-                    Some(tracked_only(
-                        command
-                            .split_whitespace()
-                            .filter_map(|token| token.split_once('=')),
-                    )),
-                    format!("observed: ollama serve pid {pid}"),
+    let mut candidates = Vec::new();
+    for pid in listing
+        .split_whitespace()
+        .filter(|pid| pid.bytes().all(|b| b.is_ascii_digit()))
+    {
+        if let Some(command) = super::resources::bounded_command_with(
+            "ps",
+            &["eww", "-p", pid, "-o", "command="],
+            Duration::from_millis(1500),
+        ) && is_ollama_serve(command.split_whitespace())
+        {
+            candidates.push((
+                pid.to_owned(),
+                tracked_only(
+                    command
+                        .split_whitespace()
+                        .filter_map(|token| token.split_once('=')),
                 ),
-                None => (
-                    None,
-                    format!("unavailable: could not inspect ollama pid {pid}"),
-                ),
-            }
+            ));
         }
-        _ => (
-            None,
-            format!(
-                "ambiguous: {} ollama serve processes; not attributing one to this endpoint",
-                candidates.len()
-            ),
-        ),
     }
+    select_process(candidates, endpoint)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn process_environment() -> (Option<BTreeMap<String, String>>, String) {
+fn process_environment(_endpoint: &str) -> (Option<BTreeMap<String, String>>, String) {
     (
         None,
         "unsupported: process inspection is implemented for Linux and macOS".to_owned(),
@@ -360,6 +393,59 @@ pub(super) fn modelfile_num_ctx(show: &Value) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_commands_and_per_endpoint_processes_are_attributed() {
+        assert!(is_ollama_serve("ollama serve".split_whitespace()));
+        assert!(is_ollama_serve(
+            "/opt/homebrew/bin/ollama serve".split_whitespace()
+        ));
+        assert!(!is_ollama_serve(
+            "sh -c /opt/homebrew/bin/ollama serve".split_whitespace()
+        ));
+        assert!(!is_ollama_serve("ollama run serve".split_whitespace()));
+        assert!(!matches_endpoint(
+            &BTreeMap::from([("OLLAMA_HOST".into(), "127.0.0.2:11434".into())]),
+            "http://127.0.0.1:11434"
+        ));
+        assert!(matches_endpoint(
+            &BTreeMap::from([("OLLAMA_HOST".into(), "0.0.0.0:11434".into())]),
+            "http://127.0.0.1:11434"
+        ));
+        assert!(matches_endpoint(
+            &BTreeMap::from([("OLLAMA_HOST".into(), "[::1]:11434".into())]),
+            "http://[::1]:11434"
+        ));
+        let primary = BTreeMap::from([("OLLAMA_NUM_PARALLEL".into(), "2".into())]);
+        let cpu = BTreeMap::from([
+            ("OLLAMA_HOST".into(), "127.0.0.1:11436".into()),
+            ("OLLAMA_NUM_PARALLEL".into(), "4".into()),
+        ]);
+        let candidates = vec![("1".into(), primary.clone()), ("2".into(), cpu)];
+        assert_eq!(
+            select_process(candidates.clone(), "http://localhost:11434").0,
+            Some(primary.clone())
+        );
+        assert_eq!(
+            select_process(candidates.clone(), "http://127.0.0.1:11436")
+                .0
+                .unwrap()["OLLAMA_NUM_PARALLEL"],
+            "4"
+        );
+        assert!(
+            select_process(candidates, "http://127.0.0.1:11437")
+                .0
+                .is_none()
+        );
+        assert!(
+            select_process(
+                vec![("1".into(), primary.clone()), ("2".into(), primary)],
+                "http://127.0.0.1:11434"
+            )
+            .0
+            .is_none()
+        );
+    }
 
     #[test]
     fn observed_process_wins_and_its_unset_names_are_not_backfilled() {

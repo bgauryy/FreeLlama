@@ -26,6 +26,8 @@ struct AdmissionState {
     max_waiters: usize,
     next_ticket: u64,
     waiting: Vec<AdmissionWaiter>,
+    /// Requests that returned their execution slot while waiting for host resources.
+    resource_waiting: Vec<(u64, Instant)>,
     /// Weighted round-robin credits, ordered interactive, normal, background.
     credits: [u8; 3],
     /// A selected waiter owns the next charge until it wakes and claims it. Reserving the choice
@@ -41,6 +43,10 @@ struct AdmissionState {
 }
 
 impl AdmissionState {
+    fn queue_depth(&self) -> usize {
+        self.waiting.len() + self.resource_waiting.len()
+    }
+
     fn free(&self) -> usize {
         self.limit.saturating_sub(self.active)
     }
@@ -85,6 +91,66 @@ struct AdmissionWaitGuard {
     count_cancellation: bool,
 }
 
+/// Resource waiting uses queue capacity, but no execution units. Cancellation returns it.
+pub(super) struct ResourceWaitGuard {
+    pool: AdmissionPool,
+    ticket: u64,
+    count_cancellation: bool,
+}
+
+impl ResourceWaitGuard {
+    pub(super) fn finish(mut self) {
+        self.count_cancellation = false;
+    }
+
+    pub(super) async fn acquire(
+        self,
+        cost: usize,
+        priority: TaskPriority,
+        deadline: tokio::time::Instant,
+    ) -> Result<(AdmissionPermit, u128), AdmissionFailure> {
+        let pool = self.pool.clone();
+        let queued = Instant::now();
+        {
+            let mut state = pool.state.lock().expect("admission state poisoned");
+            state
+                .resource_waiting
+                .retain(|(ticket, _)| *ticket != self.ticket);
+            state.waiting.push(AdmissionWaiter {
+                ticket: self.ticket,
+                cost,
+                priority,
+                enqueued_at: queued,
+                bypasses: 0,
+            });
+        }
+        let registration = AdmissionWaitGuard {
+            pool: pool.clone(),
+            ticket: self.ticket,
+            count_cancellation: true,
+        };
+        // Convert the existing registration under one lock. A fresh arrival or a smaller
+        // reloaded queue limit cannot take away capacity already owned by this request.
+        self.finish();
+        pool.acquire_registered(registration, queued, deadline)
+            .await
+    }
+}
+
+impl Drop for ResourceWaitGuard {
+    fn drop(&mut self) {
+        let mut state = self.pool.state.lock().expect("admission state poisoned");
+        state
+            .resource_waiting
+            .retain(|(ticket, _)| *ticket != self.ticket);
+        if self.count_cancellation {
+            state.queue_cancellations = state.queue_cancellations.saturating_add(1);
+        }
+        drop(state);
+        self.pool.changed.notify_waiters();
+    }
+}
+
 impl Drop for AdmissionWaitGuard {
     fn drop(&mut self) {
         let mut state = self.pool.state.lock().expect("admission state poisoned");
@@ -101,6 +167,7 @@ impl Drop for AdmissionWaitGuard {
     }
 }
 
+#[derive(Clone, Copy)]
 pub(super) enum AdmissionFailure {
     QueueFull,
     TimedOut,
@@ -165,8 +232,23 @@ impl AdmissionPool {
         self.state
             .lock()
             .expect("admission state poisoned")
-            .waiting
-            .len()
+            .queue_depth()
+    }
+
+    pub(super) fn register_resource_waiter(&self) -> Result<ResourceWaitGuard, AdmissionFailure> {
+        let mut state = self.state.lock().expect("admission state poisoned");
+        if state.queue_depth() >= state.max_waiters {
+            state.queue_full_rejections = state.queue_full_rejections.saturating_add(1);
+            return Err(AdmissionFailure::QueueFull);
+        }
+        let ticket = state.next_ticket;
+        state.next_ticket = state.next_ticket.wrapping_add(1);
+        state.resource_waiting.push((ticket, Instant::now()));
+        Ok(ResourceWaitGuard {
+            pool: self.clone(),
+            ticket,
+            count_cancellation: true,
+        })
     }
 
     pub(super) fn record_transition_timeout(&self) {
@@ -183,6 +265,7 @@ impl AdmissionPool {
                 max_waiters: max_waiters.max(1),
                 next_ticket: 0,
                 waiting: Vec::new(),
+                resource_waiting: Vec::new(),
                 credits: PRIORITY_WEIGHTS,
                 granted: None,
                 in_flight: 0,
@@ -209,10 +292,14 @@ impl AdmissionPool {
             "slots_available": state.free(),
             "active_units": state.active,
             "in_flight": state.in_flight,
-            "queue_depth": state.waiting.len(),
+            "queue_depth": state.queue_depth(),
+            "slot_waiters": state.waiting.len(),
+            "resource_waiters": state.resource_waiting.len(),
             "queue_limit": state.max_waiters,
             "oldest_wait_ms": state.waiting.iter()
-                .map(|waiter| waiter.enqueued_at.elapsed().as_millis())
+                .map(|waiter| waiter.enqueued_at)
+                .chain(state.resource_waiting.iter().map(|(_, enqueued)| *enqueued))
+                .map(|enqueued| enqueued.elapsed().as_millis())
                 .max(),
             "admitted": state.admitted,
             "released": state.released,
@@ -284,7 +371,11 @@ impl AdmissionPool {
         let queued = Instant::now();
         let ticket = {
             let mut state = self.state.lock().expect("admission state poisoned");
-            if state.waiting.len() >= state.max_waiters {
+            if tokio::time::Instant::now() >= deadline {
+                state.queue_timeouts = state.queue_timeouts.saturating_add(1);
+                return Err(AdmissionFailure::TimedOut);
+            }
+            if state.queue_depth() >= state.max_waiters {
                 state.queue_full_rejections = state.queue_full_rejections.saturating_add(1);
                 return Err(AdmissionFailure::QueueFull);
             }
@@ -299,16 +390,34 @@ impl AdmissionPool {
             });
             ticket
         };
-        let mut registration = AdmissionWaitGuard {
+        let registration = AdmissionWaitGuard {
             pool: self.clone(),
             ticket,
             count_cancellation: true,
         };
+        self.acquire_registered(registration, queued, deadline)
+            .await
+    }
+
+    async fn acquire_registered(
+        &self,
+        mut registration: AdmissionWaitGuard,
+        queued: Instant,
+        deadline: tokio::time::Instant,
+    ) -> Result<(AdmissionPermit, u128), AdmissionFailure> {
+        let ticket = registration.ticket;
         self.changed.notify_waiters();
         loop {
             let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
             let (acquired, selected, units) = {
                 let mut state = self.state.lock().expect("admission state poisoned");
+                if tokio::time::Instant::now() >= deadline {
+                    state.queue_timeouts = state.queue_timeouts.saturating_add(1);
+                    registration.count_cancellation = false;
+                    return Err(AdmissionFailure::TimedOut);
+                }
                 let mut selected = false;
                 if state.granted.is_none() {
                     if let Some(index) = Self::selected_waiter(&mut state) {
@@ -354,5 +463,102 @@ impl AdmissionPool {
                 return Err(AdmissionFailure::TimedOut);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn cancelling_after_resource_to_slot_handoff_reclaims_the_waiter() {
+        let pool = AdmissionPool::new(1, 1);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let (holder, _) = pool
+            .acquire(1, TaskPriority::Normal, deadline)
+            .await
+            .unwrap_or_else(|_| panic!("holder"));
+        let resource = pool
+            .register_resource_waiter()
+            .unwrap_or_else(|_| panic!("resource waiter"));
+        let pending = tokio::spawn(resource.acquire(1, TaskPriority::Normal, deadline));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while pool.receipt()["slot_waiters"] != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(pool.receipt()["resource_waiters"], 0);
+        assert_eq!(pool.queue_depth(), 1);
+        pending.abort();
+        let _ = pending.await;
+        assert_eq!(pool.queue_depth(), 0);
+        assert_eq!(pool.receipt()["queue_cancellations"], 1);
+        drop(holder);
+        assert_eq!(pool.receipt()["in_flight"], 0);
+    }
+
+    #[tokio::test]
+    async fn an_expired_deadline_cannot_admit_work_into_a_free_slot() {
+        let pool = AdmissionPool::new(1, 2);
+        let result = pool
+            .acquire(
+                1,
+                TaskPriority::Normal,
+                tokio::time::Instant::now() - Duration::from_secs(1),
+            )
+            .await;
+        assert!(matches!(result, Err(AdmissionFailure::TimedOut)));
+        assert_eq!(pool.receipt()["admitted"], 0);
+        assert_eq!(pool.receipt()["queue_depth"], 0);
+        assert_eq!(pool.receipt()["queue_timeouts"], 1);
+    }
+
+    #[tokio::test]
+    async fn a_resource_waiter_keeps_its_place_when_the_queue_limit_is_reduced() {
+        let pool = AdmissionPool::new(1, 2);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let (holder, _) = pool
+            .acquire(1, TaskPriority::Normal, deadline)
+            .await
+            .unwrap_or_else(|_| panic!("holder"));
+        let resource = pool
+            .register_resource_waiter()
+            .unwrap_or_else(|_| panic!("resource waiter"));
+        let other = pool.clone();
+        let queued =
+            tokio::spawn(async move { other.acquire(1, TaskPriority::Normal, deadline).await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while pool.queue_depth() != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        pool.set_max_waiters(1);
+        let mut returning = tokio::spawn(resource.acquire(1, TaskPriority::Normal, deadline));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut returning)
+                .await
+                .is_err(),
+            "accepted work must retain its queue registration during resource-to-slot handoff"
+        );
+        assert_eq!(pool.queue_depth(), 2);
+        assert_eq!(pool.receipt()["queue_full_rejections"], 0);
+        drop(holder);
+        let (first, _) = queued
+            .await
+            .unwrap()
+            .unwrap_or_else(|_| panic!("queued task"));
+        drop(first);
+        let (second, _) = returning
+            .await
+            .unwrap()
+            .unwrap_or_else(|_| panic!("returning task"));
+        drop(second);
+        assert_eq!(pool.queue_depth(), 0);
+        assert_eq!(pool.receipt()["in_flight"], 0);
     }
 }

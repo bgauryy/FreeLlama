@@ -192,8 +192,8 @@ export async function ollamaPull(
 // Self-evident params carry no `.describe()`: the name says it, the default is in the server
 // instructions, and every description is re-sent on every request. Only params whose BEHAVIOUR
 // isn't obvious from the name keep one.
-export const endpointParam = z.string().min(1).optional().describe("serve endpoint, default :11435");
-export const ollamaEndpointParam = z.string().min(1).optional().describe("Ollama endpoint, default :11434");
+export const endpointParam = z.string().min(1).optional().describe("serve :11435");
+export const ollamaEndpointParam = z.string().min(1).optional().describe("Ollama :11434");
 export const TASK_KINDS = [
   "completion",
   "coding",
@@ -209,7 +209,7 @@ export type McpTaskKind = (typeof MCP_TASK_KINDS)[number];
 export const taskParam = z
   .enum(MCP_TASK_KINDS)
   .default("completion")
-  .describe("code_review=coding; caller owns prompts and output format.");
+  .describe("caller owns prompts and output format.");
 
 /**
  * MCP accepts the name humans and agents naturally use for a review, while the Rust routing
@@ -221,26 +221,24 @@ export function canonicalTaskKind(task: McpTaskKind): (typeof TASK_KINDS)[number
 }
 export const objectiveParam = z
   .enum(["fastest", "balanced", "quality"])
-  .optional()
-  .describe('balanced works without policy; quality needs policy or explicit model');
+  .optional();
 export const executionPreferenceParam = z
   .enum(["auto", "prefer_cpu", "prefer_gpu"])
   .optional()
   .describe(
-    'Backend hint; auto uses runtime feedback. Preferences allow fallback.',
+    'Backend hint with fallback.',
   );
 export const minPlacementEvidenceParam = z
   .enum(["configured", "observed"])
   .optional()
-  .describe('observed requires Ollama /api/ps placement proof');
+  .describe('observed requires physical proof');
 // Router grades only "low" | "medium". A low/capability-only pick once selected a far-too-small
 // model for a demanding task — the answer still looked confident.
 const CONFIDENCE_RANK: Record<string, number> = { low: 1, medium: 2 };
 
 export const minConfidenceParam = z
   .enum(["low", "medium"])
-  .optional()
-  .describe('Minimum evidence: medium needs policy + benchmark; low accepts capabilities.');
+  .optional();
 
 /**
  * Fail closed when a route decision isn't backed well enough for what the caller asked.
@@ -278,11 +276,10 @@ export const REQUIRED_CAPABILITIES = [
 export const requiredCapabilitiesParam = z
   .array(z.enum(REQUIRED_CAPABILITIES))
   .max(REQUIRED_CAPABILITIES.length)
-  .optional()
-  .describe('Hard capability requirements; fails closed.');
+  .optional();
 
 export const systemPromptParam = z.string().optional()
-  .describe("Local model instructions, prepended verbatim. No default.");
+  .describe("Local model instructions; verbatim.");
 export const messagesParam = z.array(z.object({
   role: z.enum(["system", "user", "assistant", "tool"]),
   content: z.string().optional(),
@@ -295,7 +292,7 @@ export const localToolsParam = z.array(z.object({
     parameters: z.record(z.unknown()).optional(),
   }).passthrough(),
 }).passthrough()).min(1).optional()
-  .describe("Local model functions; parameters is JSON Schema. Caller executes calls.");
+  .describe("Local functions; JSON Schema parameters.");
 
 /** Only explicitly supplied instructions become a system message; existing messages stay intact. */
 export function taskMessages({ systemPrompt, messages, prompt, images }: {
@@ -323,6 +320,8 @@ export const batchTaskParam = z.object({
   minPlacementEvidence: minPlacementEvidenceParam,
   requiredCapabilities: requiredCapabilitiesParam,
   priority: z.enum(["interactive", "normal", "background"]).optional(),
+  maxWaitSeconds: z.number().int().positive().optional(),
+  timeoutSeconds: z.number().int().positive().optional(),
   prompt: z.string().min(1).optional(),
   systemPrompt: systemPromptParam,
   messages: messagesParam,
@@ -363,6 +362,7 @@ export const deleteResultSchema = z.object({
 }).passthrough();
 export const modelsResultSchema = z.object({
   models: z.array(z.record(z.unknown())).optional(), tags: z.array(z.record(z.unknown())).optional(), page: z.unknown().optional(),
+  knowledge: z.unknown().optional(), library: z.unknown().optional(),
 }).passthrough();
 export const taskResultSchema = z.object({
   selected_model: z.string().optional(), context_window_fit: z.string().optional(), execution: z.unknown().optional(), response: z.unknown().optional(), telemetry: z.unknown().optional(),
@@ -570,8 +570,26 @@ export function parsedResult(raw: string) {
   return structuredResult(value as Record<string, unknown>);
 }
 
+/** Error receipts also have structured content; only successful payloads can be transformed. */
+export function isStructuredSuccess(
+  result: ReturnType<typeof parsedResult>,
+): result is ReturnType<typeof structuredResult> {
+  return !("isError" in result && result.isError) && "structuredContent" in result
+    && result.structuredContent !== undefined;
+}
+
 export function errorResult(error: unknown) {
   const message = error instanceof Error ? error.message : String(error);
+  let receipt: Record<string, unknown> | undefined;
+  try {
+    const parsed: unknown = JSON.parse(message);
+    if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
+      && typeof (parsed as Record<string, unknown>).error === "string") {
+      receipt = parsed as Record<string, unknown>;
+    }
+  } catch {
+    // Transport and extractor errors can be plain text; retain their diagnostic below.
+  }
   // Native managed calls reach the local `freellama serve` process. A bare reqwest connection
   // error makes an agent retry a tool that cannot work yet; keep the original diagnostic, but
   // add the one safe recovery action. Do not do this for Ollama's direct endpoint errors: this
@@ -589,7 +607,8 @@ export function errorResult(error: unknown) {
     : ollamaUnavailable
       ? `${message}\n\nOllama is not running at that address. Ask the user to start Ollama (the app, or \`ollama serve\`); retrying before that cannot succeed.`
       : message;
-  return { content: [{ type: "text" as const, text: actionableMessage }], isError: true };
+  return { content: [{ type: "text" as const, text: actionableMessage }], isError: true,
+    ...(receipt ? { structuredContent: receipt } : {}) };
 }
 
 const adapterCallSchema = z

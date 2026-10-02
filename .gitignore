@@ -9,6 +9,7 @@ node_modules
 *.node
 .napi-generated.d.ts
 packages/mcp/dist/
+packages/view/dist/
 
 # Local agent workspaces — not part of the repo
 .octocode/

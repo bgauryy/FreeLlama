@@ -48,11 +48,19 @@ contract is visible without archaeology.
 
 ## Finding a model you do not have — `models {view:"library"}`, two steps
 
-1. **Search** (`query`, `capabilities`, `order`) returns *family* names, popular-ordered. A family
-   is **not pullable**. `cloudOnly` marks models that only run on Ollama's hosted service. Site
-   rank is not pull count — judge with `pulls`, not position.
+1. **Search** (`query`, `capabilities`, `order`) returns *family* names, popular-ordered, without
+   exact-tag sizing. Ollama resolves an omitted tag to `latest`; inspect the tags before recommending
+   a download. `cloudAvailable` identifies a hosted-access badge, while `cloudOnly:null` means local
+   availability is not established by that badge. Site rank is not pull count — judge with `pulls`,
+   not position.
 2. **Inspect** (`model:"<family>"`) returns each tag with size, context window, modalities, and
    `fitsInMemory` computed against this machine.
+
+Installed/detail views accept `includeLibrary:true` for cached public guidance after exact-tag and
+digest-prefix matching. Local supported features filter family claims; public use cases remain
+unmeasured and do not change routing confidence. Request `includeReadme:true` in enriched detail or
+library step 2 for bounded README text. The [metadata reference](../../../../docs/MODEL_METADATA.md)
+owns the response fields, cache policy, and failure states.
 
 Pulling from step 1 alone means guessing the size, which is how a 143GB tag looked like a candidate
 on a 48GB machine. Step 2 **fails closed**: with `serve` unreachable there is no machine profile, so

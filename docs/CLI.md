@@ -22,7 +22,7 @@ flowchart TD
 
 | Command | Purpose | Needs `freellama serve` |
 |---|---|---|
-| `init` | Inspect prerequisites and print a side-effect-free first-run plan | No |
+| `init` | Inspect prerequisites and print a side-effect-free first-run plan with readiness flags | No |
 | `serve` | Run the control plane and Ollama-compatible proxy | Starts it |
 | `auth-token` | Create a new mode-0600 bearer-token file without printing the secret | No |
 | `models` | List installed models, capabilities, residency, and evidence | Yes |
@@ -102,7 +102,8 @@ the Ollama server (read from its process environment where visible; Ollama's own
 chat costs 2, and vision costs 4 (capped to the selected backend's pool). A saturated GPU pool does
 not consume CPU permits. `--max-queue-wait-seconds` defaults to 120; when no permit becomes
 available, FreeLlama refuses the task with HTTP 503 (`admission_timeout`) instead of waiting forever.
-A task may ask for a shorter wait with `max_wait_seconds`; it can never exceed the configured one.
+A task can ask for a shorter wait with `max_wait_seconds` (`maxWaitSeconds` in MCP); it can never
+exceed the configured one. Omit it to use the server's waiting budget.
 That deadline covers weighted admission, host-resource waiting, and model-transition locking together.
 `--max-queued-tasks` (default 16) and `--cpu-max-queued-tasks` (default 8) also bound how many
 parsed requests can be retained per backend; a full queue receives 429 (`admission_queue_full`)
@@ -159,6 +160,10 @@ placement; the default `configured` accepts the operator assignment and observes
 
 Start with the read-only guided receipt, then inspect available models. `init` never pulls a model;
 it stops at exact-tag approval and prints the next prerequisite, serve, managed-task, and MCP steps.
+Its `status` is `blocked` when Ollama is unavailable, `setup_required` when the managed service or
+installed models are missing, and `ready` when all three are present. Separate `readiness` flags
+identify the missing part. Readiness does not qualify a model for a particular task; use a route
+preview to inspect eligibility and rejection reasons.
 
 ```bash
 npx @octocodeai/freellama init
@@ -209,6 +214,23 @@ Useful task options include:
 - repeatable `--image` paths for vision tasks.
 - `--input-file` for batched embedding input, one item per line.
 - `--min-confidence low|medium` to refuse insufficiently evidenced routes before generation.
+- `--priority interactive|normal|background` for fair admission scheduling.
+- `--max-wait-seconds` for a shorter admission/resource wait budget.
+- `--timeout-seconds` for a total deadline including discovery, waiting, loading, and inference.
+- `--defer` to return a job ID immediately.
+
+Inspect deferred work with `jobs`, retrieve a result with `jobs --id <uuid>`, and cancel one task
+with `jobs --id <uuid> --cancel`. Remove one task with `jobs --id <uuid> --remove`: active work is
+cancelled first, then its retained record and result are deleted. Use the exact ID returned at
+submission; `--cancel` and `--remove` are mutually exclusive. The same operations are available
+through MCP `task_jobs`.
+Cancellation and removal wait for local execution permits to be released; they do not unload a shared model
+or confirm that the physical runner has stopped.
+
+Jobs stay in server memory: at most 64 receipts, 1 MiB per input, and 2 MiB per retained result or
+error. Finished receipts expire after 10 minutes and can be evicted earlier to make room for new
+work. A restart discards all jobs. Admission queue limits still apply, and deferred work can fail
+after acceptance. See [monitoring](MONITORING.md) for states and waiting reasons.
 
 Create a session with `session`, then pass its identifier to related `route` or `task` calls. A
 route preview honors an existing affinity but does not create or change one. Only a successfully
@@ -263,4 +285,4 @@ The command prints the maintained parity map. MCP-only operations are `delegate_
 online `models { view: "library" }` view. CLI-only operations include `serve`, `proxy`, `session`,
 `recommend`, `natural-route`, `bench-all`, `policy-from-eval`, `run`, and `eval`.
 
-For the six MCP tool contracts, read the [MCP package reference](../packages/mcp/README.md).
+For the nine MCP tool contracts, read the [MCP package reference](../packages/mcp/README.md).

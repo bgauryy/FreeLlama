@@ -15,7 +15,10 @@ use std::process::{Command, Stdio};
 use std::{collections::BTreeMap, io::Read};
 
 use serde::{Deserialize, Serialize};
-use tokio::{sync::Mutex, task::JoinHandle};
+use tokio::{
+    sync::{Mutex, Notify},
+    task::JoinHandle,
+};
 
 const GIB: u64 = 1024 * 1024 * 1024;
 
@@ -341,6 +344,7 @@ impl std::error::Error for ResourceWaitError {}
 pub struct ResourcePermit {
     pub receipt: ResourceReceipt,
     reservations: Arc<AtomicU64>,
+    changed: Arc<Notify>,
     bytes: u64,
 }
 
@@ -352,6 +356,7 @@ impl ResourcePermit {
         let bytes = std::mem::take(&mut self.bytes);
         if bytes > 0 {
             self.reservations.fetch_sub(bytes, Ordering::AcqRel);
+            self.changed.notify_waiters();
         }
     }
 
@@ -363,7 +368,7 @@ impl ResourcePermit {
 
 impl Drop for ResourcePermit {
     fn drop(&mut self) {
-        self.reservations.fetch_sub(self.bytes, Ordering::AcqRel);
+        self.release();
     }
 }
 
@@ -372,10 +377,14 @@ struct SampleState {
     saved: Option<(Instant, HostResources)>,
     pending: Option<JoinHandle<HostResources>>,
     sample_count: u64,
-    reasons: Vec<PressureReason>,
-    healthy_samples: u32,
-    held_since: Option<Instant>,
+    holds: Vec<PressureHold>,
     stale: bool,
+}
+
+struct PressureHold {
+    reason: PressureReason,
+    healthy_samples: u32,
+    since: Instant,
 }
 
 /// A hold whose signal stops being reported (a sensor that goes quiet after a throttle event)
@@ -388,6 +397,7 @@ pub struct ResourceGovernor {
     sampler: Arc<dyn Fn() -> HostResources + Send + Sync>,
     state: Arc<Mutex<SampleState>>,
     reservations: Arc<AtomicU64>,
+    changed: Arc<Notify>,
 }
 
 impl std::fmt::Debug for ResourceGovernor {
@@ -432,6 +442,7 @@ impl ResourceGovernor {
             sampler: Arc::new(sampler),
             state: Arc::default(),
             reservations: Arc::new(AtomicU64::new(0)),
+            changed: Arc::default(),
         })
     }
 
@@ -472,38 +483,42 @@ impl ResourceGovernor {
             state.pending = None;
             let previous = state.saved.as_ref().map(|(_, sample)| sample);
             let triggered = pressure_reasons(&observed, previous, &self.policy);
-            let stale_hold = state
-                .held_since
-                .is_some_and(|since| since.elapsed() >= MAX_UNOBSERVED_HOLD);
-            let recovered = triggered.is_empty()
-                && state.reasons.iter().all(|reason| {
-                    recovered_reason(*reason, &observed, previous, &self.policy)
-                        || (stale_hold && !reason_observed(*reason, &observed))
-                });
-            if !triggered.is_empty() {
-                for reason in triggered {
-                    if !state.reasons.contains(&reason) {
-                        state.reasons.push(reason);
-                    }
+            // Recover each signal independently. Low RAM must not preserve an obsolete CPU
+            // hold forever and prevent safe reuse of an unchanged resident runner.
+            let recovered: Vec<_> = state
+                .holds
+                .iter()
+                .filter_map(|hold| {
+                    let signal_expired = hold.since.elapsed() >= MAX_UNOBSERVED_HOLD;
+                    (!triggered.contains(&hold.reason)
+                        && (recovered_reason(hold.reason, &observed, previous, &self.policy)
+                            || (signal_expired && !reason_observed(hold.reason, &observed))))
+                    .then_some(hold.reason)
+                })
+                .collect();
+            for reason in triggered {
+                if !state.holds.iter().any(|hold| hold.reason == reason) {
+                    state.holds.push(PressureHold {
+                        reason,
+                        healthy_samples: 0,
+                        since: Instant::now(),
+                    });
                 }
-                state.healthy_samples = 0;
-                state.held_since.get_or_insert_with(Instant::now);
-            } else if !state.reasons.is_empty() && recovered {
-                state.healthy_samples = state.healthy_samples.saturating_add(1);
-                if state.healthy_samples >= self.policy.recovery_samples {
-                    state.reasons.clear();
-                    state.healthy_samples = 0;
-                    state.held_since = None;
-                }
-            } else {
-                state.healthy_samples = 0;
             }
+            state.holds.retain_mut(|hold| {
+                hold.healthy_samples = if recovered.contains(&hold.reason) {
+                    hold.healthy_samples.saturating_add(1)
+                } else {
+                    0
+                };
+                hold.healthy_samples < self.policy.recovery_samples
+            });
             state.sample_count = state.sample_count.saturating_add(1);
             state.saved = Some((Instant::now(), observed));
         }
         let (saved_at, observation) = state.saved.as_ref().expect("sample is saved");
         let reserved_bytes = self.reservations.load(Ordering::Acquire);
-        let holding = !state.reasons.is_empty();
+        let holding = !state.holds.is_empty();
         ResourceSnapshot {
             status: if holding {
                 "holding"
@@ -518,8 +533,13 @@ impl ResourceGovernor {
                 "unknown"
             },
             holding,
-            reasons: state.reasons.clone(),
-            healthy_samples: state.healthy_samples,
+            reasons: state.holds.iter().map(|hold| hold.reason).collect(),
+            healthy_samples: state
+                .holds
+                .iter()
+                .map(|hold| hold.healthy_samples)
+                .min()
+                .unwrap_or(0),
             sample_count: state.sample_count,
             sample_age_ms: saved_at.elapsed().as_millis(),
             reserved_bytes,
@@ -574,6 +594,7 @@ impl ResourceGovernor {
                     assessment: None,
                 },
                 reservations: self.reservations.clone(),
+                changed: self.changed.clone(),
                 bytes: 0,
             });
         }
@@ -582,6 +603,10 @@ impl ResourceGovernor {
         let mut last_assessment = None;
         let mut recovering_capacity = false;
         loop {
+            // Register before observing capacity, so a concurrent release cannot be missed.
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
             let Ok(snapshot) = tokio::time::timeout_at(deadline, self.snapshot()).await else {
                 break;
             };
@@ -610,6 +635,7 @@ impl ResourceGovernor {
                 return Ok(ResourcePermit {
                     receipt,
                     reservations: self.reservations.clone(),
+                    changed: self.changed.clone(),
                     bytes: required_available_bytes,
                 });
             }
@@ -625,10 +651,12 @@ impl ResourceGovernor {
             if tokio::time::Instant::now() >= deadline {
                 break;
             }
-            tokio::time::sleep_until(
-                (tokio::time::Instant::now() + self.policy.sample_interval).min(deadline),
-            )
-            .await;
+            tokio::select! {
+                () = changed => {},
+                () = tokio::time::sleep_until(
+                    (tokio::time::Instant::now() + self.policy.sample_interval).min(deadline),
+                ) => {},
+            }
             if tokio::time::Instant::now() >= deadline {
                 break;
             }
@@ -1619,6 +1647,42 @@ mod tests {
             assert_eq!(governor.snapshot().await.holding, expected);
             tokio::time::sleep(Duration::from_millis(7)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn recovered_cpu_pressure_clears_while_memory_pressure_remains() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let governor = ResourceGovernor::with_sampler(quick_policy(), move || {
+            let mut sample = healthy();
+            sample.available_memory_bytes = Some(GIB);
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                sample.load_average_one_minute = Some(20.0);
+            }
+            sample
+        })
+        .unwrap();
+        let initial = governor.snapshot().await;
+        assert!(initial.reasons.contains(&PressureReason::HighCpuLoad));
+        governor.invalidate().await;
+        assert!(
+            governor
+                .snapshot()
+                .await
+                .reasons
+                .contains(&PressureReason::HighCpuLoad),
+            "one fresh recovery sample must not clear CPU pressure"
+        );
+        governor.invalidate().await;
+        let recovered = governor.snapshot().await;
+        assert_eq!(recovered.reasons, vec![PressureReason::LowAvailableMemory]);
+        assert!(recovered.holding, "cold loads still need memory recovery");
+        assert!(
+            recovered
+                .assess_demand(ResourceDemand::resident(), false)
+                .admissible,
+            "an old CPU-pressure signal must not block an unchanged resident runner"
+        );
+        assert!(!recovered.assess_capacity(GIB, false).admissible);
     }
 
     #[tokio::test]

@@ -41,6 +41,7 @@ mod error;
 mod execution;
 mod footprint;
 mod intent;
+mod jobs;
 mod monitor;
 mod ollama_env;
 mod readiness;
@@ -461,12 +462,50 @@ struct PlatformState {
     breakers: runtime::Breakers,
     adaptive_gpu: runtime::AdaptiveLimiter,
     adaptive_cpu: runtime::AdaptiveLimiter,
-    /// The primary Ollama server's effective configuration, probed at startup.
-    ollama: Arc<ollama_env::OllamaSettings>,
+    /// Cached process observations, refreshed before discovery and monitoring.
+    ollama: Arc<RwLock<ollama_env::OllamaSettings>>,
+    cpu_ollama: Option<Arc<RwLock<ollama_env::OllamaSettings>>>,
+    ollama_refresh: Arc<Mutex<Instant>>,
     raw_admission: proxy::RawAdmission,
+    jobs: Arc<std::sync::Mutex<jobs::JobRegistry>>,
 }
 
 impl PlatformState {
+    async fn refresh_ollama_settings(&self) {
+        let mut refreshed = self.ollama_refresh.lock().await;
+        if refreshed.elapsed() < Duration::from_secs(5) {
+            return;
+        }
+        let gpu = self.upstream.clone();
+        let cpu = self.cpu_upstream.clone();
+        // Process inspection is bounded blocking work; it must not block Tokio's control threads.
+        if let Ok((gpu, cpu)) = tokio::task::spawn_blocking(move || {
+            (
+                ollama_env::probe(&gpu),
+                cpu.as_deref().map(ollama_env::probe),
+            )
+        })
+        .await
+        {
+            let mut footprints = self.footprints.lock().await;
+            footprints.set_backend_hints(
+                self.upstream.clone(),
+                footprint::RuntimeHints::from_lookup(|name| gpu.lookup(name)),
+            );
+            if let (Some(endpoint), Some(settings)) = (&self.cpu_upstream, &cpu) {
+                footprints.set_backend_hints(
+                    endpoint.clone(),
+                    footprint::RuntimeHints::from_lookup(|name| settings.lookup(name)),
+                );
+            }
+            *self.ollama.write().await = gpu;
+            if let (Some(target), Some(settings)) = (&self.cpu_ollama, cpu) {
+                *target.write().await = settings;
+            }
+        }
+        *refreshed = Instant::now();
+    }
+
     fn tunables(&self) -> runtime::Tunables {
         self.runtime.get()
     }
@@ -754,6 +793,7 @@ fn build(config: &PlatformConfig) -> Result<(Router, PlatformState)> {
     let policies = load_policies(config.policy_file.as_ref())?;
     let recommendation_catalog = load_catalog(config.recommendation_catalog.as_ref())?;
     let ollama = ollama_env::probe(&config.upstream);
+    let cpu_ollama = config.cpu_upstream.as_deref().map(ollama_env::probe);
     let runtime_file = config.runtime_config.clone().or_else(|| {
         std::env::var_os("FREELLAMA_RUNTIME_CONFIG")
             .filter(|value| !value.is_empty())
@@ -792,9 +832,15 @@ fn build(config: &PlatformConfig) -> Result<(Router, PlatformState)> {
     let state = PlatformState {
         resources: config.resource_governor.clone(),
         footprints: Arc::new(Mutex::new({
-            let history = footprint::FootprintHistory::with_hints(
+            let mut history = footprint::FootprintHistory::with_hints(
                 footprint::RuntimeHints::from_lookup(|name| ollama.lookup(name)),
             );
+            if let (Some(upstream), Some(settings)) = (&config.cpu_upstream, &cpu_ollama) {
+                history = history.with_backend_hints(
+                    upstream.clone(),
+                    footprint::RuntimeHints::from_lookup(|name| settings.lookup(name)),
+                );
+            }
             // Measured runner sizes live next to the usage ledger, so a restart keeps them.
             match &usage_file {
                 Some(ledger) => history.with_file(ledger.with_file_name("footprints.json")),
@@ -842,8 +888,11 @@ fn build(config: &PlatformConfig) -> Result<(Router, PlatformState)> {
         breakers: runtime::Breakers::default(),
         adaptive_gpu: runtime::AdaptiveLimiter::default(),
         adaptive_cpu: runtime::AdaptiveLimiter::default(),
-        ollama: Arc::new(ollama),
+        ollama: Arc::new(RwLock::new(ollama)),
+        cpu_ollama: cpu_ollama.map(|settings| Arc::new(RwLock::new(settings))),
+        ollama_refresh: Arc::new(Mutex::new(Instant::now())),
         raw_admission: raw_admission.clone(),
+        jobs: Arc::default(),
     };
     let fallback_config = ProxyConfig::new(&config.listen, &config.upstream, config.allow_remote)
         .with_raw_admission(raw_admission)
@@ -870,6 +919,15 @@ fn build(config: &PlatformConfig) -> Result<(Router, PlatformState)> {
             delete(delete_session),
         )
         .route(&format!("{API_ROOT}/tasks"), post(run_task))
+        .route(&format!("{API_ROOT}/jobs"), get(jobs::list))
+        .route(
+            &format!("{API_ROOT}/jobs/{{id}}"),
+            get(jobs::get).delete(jobs::remove),
+        )
+        .route(
+            &format!("{API_ROOT}/jobs/{{id}}/cancel"),
+            post(jobs::cancel),
+        )
         .route(&format!("{API_ROOT}/task-batches"), post(run_task_batch))
         .route(&format!("{API_ROOT}/metrics"), get(monitor::metrics))
         .route(&format!("{API_ROOT}/status"), get(monitor::status))
@@ -1299,6 +1357,7 @@ async fn interpret_natural_route(
             TaskPriority::Interactive,
             1,
             queue_deadline,
+            None,
         )
         .await?;
         let intent_bytes = tokio::time::timeout_at(
@@ -1427,7 +1486,7 @@ async fn kill_session(
     })))
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TaskInput {
     #[serde(flatten)]
@@ -1460,6 +1519,12 @@ struct TaskInput {
     /// Per-request admission wait in seconds, capped by the server's `max_queue_wait_seconds`.
     #[serde(default)]
     max_wait_seconds: Option<u64>,
+    #[serde(default)]
+    defer: bool,
+    /// Total time including discovery, queueing, loading and generation; capped by the server.
+    timeout_seconds: Option<u64>,
+    #[serde(skip)]
+    job_progress: Option<jobs::JobProgress>,
 }
 
 /// Explicitly independent managed work. Dependencies are intentionally not accepted: a batch is
@@ -1512,8 +1577,9 @@ fn next_batch_task(
 
 async fn run_task_batch(
     State(state): State<PlatformState>,
-    Json(input): Json<TaskBatchInput>,
+    input: Result<Json<TaskBatchInput>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<Value>, ApiError> {
+    let Json(input) = input.map_err(|error| ApiError::invalid_task_request(&error))?;
     if input.tasks.is_empty() || input.tasks.len() > MAX_BATCH_TASKS {
         return Err(ApiError::bad_request(format!(
             "tasks must contain 1 to {MAX_BATCH_TASKS} items"
@@ -1524,6 +1590,11 @@ async fn run_task_batch(
         if item.id.trim().is_empty() || !ids.insert(item.id.clone()) {
             return Err(ApiError::bad_request(
                 "every batch item needs a distinct, non-empty id",
+            ));
+        }
+        if item.task.defer {
+            return Err(ApiError::bad_request(
+                "batch tasks cannot defer; submit individual jobs instead",
             ));
         }
         if !item.independent {
@@ -1553,7 +1624,10 @@ async fn run_task_batch(
             let index = next_batch_task(&mut pending, &input.tasks, &mut credits);
             let task = input.tasks[index].task.clone();
             let task_state = state.clone();
-            let handle = running.spawn(Box::pin(run_task(State(task_state), Json(task))));
+            let handle = running.spawn(Box::pin(execution::execute_task(
+                State(task_state),
+                Json(task),
+            )));
             in_flight.insert(handle.id(), index);
         }
         if let Some(joined) = running.join_next_with_id().await {
@@ -1589,7 +1663,7 @@ async fn run_task_batch(
     })))
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct OllamaRequestOptions {
     format: Option<Value>,
@@ -1600,6 +1674,7 @@ struct OllamaRequestOptions {
 }
 
 async fn discover_models(state: &PlatformState) -> Result<Vec<CatalogModel>, ApiError> {
+    state.refresh_ollama_settings().await;
     if let Some(mut models) = snapshot_catalog(&state.catalog_cache).await {
         refresh_residency(state, &mut models).await?;
         return Ok(models);
@@ -1630,10 +1705,16 @@ async fn fill_catalog(state: &PlatformState) -> Result<Vec<CatalogModel>, ApiErr
 }
 
 async fn fetch_catalog(state: &PlatformState) -> Result<Vec<CatalogModel>, ApiError> {
-    let mut models = fetch_catalog_from(state, &state.upstream).await?;
+    let (gpu, cpu) = tokio::join!(fetch_catalog_from(state, &state.upstream), async {
+        match &state.cpu_upstream {
+            Some(upstream) => Some(fetch_catalog_from(state, upstream).await),
+            None => None,
+        }
+    });
+    let mut models = gpu?;
     models.retain(|model| !state.cpu_models.contains(&model.name));
-    if let Some(cpu_upstream) = &state.cpu_upstream {
-        let mut cpu_models = fetch_catalog_from(state, cpu_upstream).await?;
+    if let Some(cpu) = cpu {
+        let mut cpu_models = cpu?;
         cpu_models.retain(|model| state.cpu_models.contains(&model.name));
         models.extend(cpu_models);
     }
@@ -1645,8 +1726,12 @@ async fn fetch_catalog_from(
     state: &PlatformState,
     upstream: &str,
 ) -> Result<Vec<CatalogModel>, ApiError> {
-    let tags = get_json(&state.client, upstream, "/api/tags").await?;
-    let ps = get_json(&state.client, upstream, "/api/ps").await?;
+    let (tags, ps) = tokio::join!(
+        get_json(&state.client, upstream, "/api/tags"),
+        get_json(&state.client, upstream, "/api/ps")
+    );
+    let tags = tags?;
+    let ps = ps?;
     let resident = ps
         .get("models")
         .and_then(Value::as_array)
@@ -1865,16 +1950,15 @@ async fn refresh_residency(
     state: &PlatformState,
     models: &mut [CatalogModel],
 ) -> Result<(), ApiError> {
-    let gpu = get_json(&state.client, &state.upstream, "/api/ps").await?;
+    let (gpu, cpu) = backend_residency(state).await;
+    let gpu = gpu?;
     let gpu_running = gpu
         .get("models")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let cpu_running = if let Some(cpu_upstream) = &state.cpu_upstream {
-        get_json(&state.client, cpu_upstream, "/api/ps")
-            .await?
-            .get("models")
+    let cpu_running = if let Some(cpu) = cpu {
+        cpu?.get("models")
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default()
@@ -1900,6 +1984,18 @@ async fn refresh_residency(
             .and_then(Value::as_u64);
     }
     Ok(())
+}
+
+/// Independent runner observations share a deadline window rather than adding backend delays.
+async fn backend_residency(
+    state: &PlatformState,
+) -> (Result<Value, ApiError>, Option<Result<Value, ApiError>>) {
+    tokio::join!(get_json(&state.client, &state.upstream, "/api/ps"), async {
+        match state.cpu_upstream.as_deref() {
+            Some(upstream) => Some(get_json(&state.client, upstream, "/api/ps").await),
+            None => None,
+        }
+    })
 }
 
 /// Primary-backend admission budget in weighted units. Default 2 — one ordinary chat generation
@@ -1977,6 +2073,52 @@ async fn get_json(client: &Client, upstream: &str, path: &str) -> Result<Value, 
 #[cfg(test)]
 mod kv_estimate_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn process_settings_refresh_after_cache_expiry_and_preserve_fresh_cache() {
+        let mut config = PlatformConfig::new(
+            "127.0.0.1:11435",
+            "http://127.0.0.1:11439",
+            None,
+            None,
+            "helper:latest",
+        );
+        config.cpu_upstream = Some("http://127.0.0.1:11438".into());
+        config.cpu_models.insert("cpu-helper:latest".into());
+        let (_, state) = build(&config).unwrap();
+        let old = ollama_env::resolve(
+            Some(&BTreeMap::from([(
+                "OLLAMA_NUM_PARALLEL".into(),
+                "99".into(),
+            )])),
+            |_| None,
+            |_| None,
+            "test".into(),
+        );
+        *state.ollama.write().await = old.clone();
+        *state.cpu_ollama.as_ref().unwrap().write().await = old;
+        state.refresh_ollama_settings().await;
+        assert_eq!(
+            state.ollama.read().await.num_parallel(),
+            99,
+            "fresh observations must be reused"
+        );
+        *state.ollama_refresh.lock().await =
+            Instant::now().checked_sub(Duration::from_secs(6)).unwrap();
+        state.refresh_ollama_settings().await;
+        assert_ne!(state.ollama.read().await.num_parallel(), 99);
+        assert_ne!(
+            state
+                .cpu_ollama
+                .as_ref()
+                .unwrap()
+                .read()
+                .await
+                .num_parallel(),
+            99
+        );
+        assert!(state.ollama_refresh.lock().await.elapsed() < Duration::from_secs(5));
+    }
 
     fn llama_shape() -> Value {
         json!({"model_info": {

@@ -1,5 +1,5 @@
 //! Managed execution: route selection, capacity reservation, forwarding, and evidence receipts.
-use super::admission::{AdmissionFailure, AdmissionPermit, AdmissionPool};
+use super::admission::{AdmissionFailure, AdmissionPermit, AdmissionPool, ResourceWaitGuard};
 use super::error::{ApiError, resource_error};
 use super::{
     CatalogModel, ExecutionPreference, FEEDBACK_SCHEMA_VERSION, OllamaRequestOptions,
@@ -443,63 +443,73 @@ pub(super) async fn admit(
     priority: TaskPriority,
     batch_items: usize,
     deadline: tokio::time::Instant,
+    resource_waiter: Option<ResourceWaitGuard>,
 ) -> Result<(AdmissionPermit, u32, u128), ApiError> {
     let budget = u32::try_from(execution.admission.total())
         .unwrap_or(u32::MAX)
         .max(1);
     let cost = task_cost_for(task, batch_items).min(budget).max(1);
-    let wait = state.tunables().max_queue_wait();
-    match execution
-        .admission
-        .acquire(cost as usize, priority, deadline)
-        .await
-    {
+    let acquired = if let Some(waiter) = resource_waiter {
+        waiter.acquire(cost as usize, priority, deadline).await
+    } else {
+        execution
+            .admission
+            .acquire(cost as usize, priority, deadline)
+            .await
+    };
+    match acquired {
         Ok((permit, queued)) => Ok((permit, cost, queued)),
-        Err(failure) => {
-            let retry_after = super::runtime::retry_after_seconds(
-                execution.admission.queue_depth(),
-                execution.admission.total(),
-                state.average_task_ms(execution.placement),
-            );
-            let (status, code) = match failure {
-                // A full queue is FreeLlama's own configured cap, not an upstream fault.
-                AdmissionFailure::QueueFull => {
-                    (StatusCode::TOO_MANY_REQUESTS, "admission_queue_full")
-                }
-                AdmissionFailure::TimedOut => {
-                    (StatusCode::SERVICE_UNAVAILABLE, "admission_timeout")
-                }
-            };
-            let (reason, setting) = match failure {
-                AdmissionFailure::QueueFull => (
-                    "admission queue full".to_owned(),
-                    if execution.placement == "cpu" {
-                        "--cpu-max-queued-tasks"
-                    } else {
-                        "--max-queued-tasks"
-                    },
-                ),
-                AdmissionFailure::TimedOut => (
-                    format!("no admission slot within {}s", wait.as_secs()),
-                    if execution.placement == "cpu" {
-                        "--cpu-max-concurrent-tasks"
-                    } else {
-                        "--max-concurrent-tasks"
-                    },
-                ),
-            };
-            Err(ApiError::new(
-                status,
-                format!(
-                    "server busy: {reason} (task cost {cost} of {budget} units; priority \
-                     {priority:?} on the {} backend). Retry after {retry_after}s, or raise {setting}.",
-                    execution.placement,
-                ),
-            )
-            .with_code(code)
-            .with_retry_after(retry_after))
-        }
+        Err(failure) => Err(admission_error(state, execution, priority, cost, failure)),
     }
+}
+
+fn admission_error(
+    state: &PlatformState,
+    execution: &ExecutionTarget,
+    priority: TaskPriority,
+    cost: u32,
+    failure: AdmissionFailure,
+) -> ApiError {
+    let budget = execution.admission.total();
+    let wait = state.tunables().max_queue_wait();
+    let retry_after = super::runtime::retry_after_seconds(
+        execution.admission.queue_depth(),
+        execution.admission.total(),
+        state.average_task_ms(execution.placement),
+    );
+    let (status, code) = match failure {
+        // A full queue is FreeLlama's own configured cap, not an upstream fault.
+        AdmissionFailure::QueueFull => (StatusCode::TOO_MANY_REQUESTS, "admission_queue_full"),
+        AdmissionFailure::TimedOut => (StatusCode::SERVICE_UNAVAILABLE, "admission_timeout"),
+    };
+    let (reason, setting) = match failure {
+        AdmissionFailure::QueueFull => (
+            "admission queue full".to_owned(),
+            if execution.placement == "cpu" {
+                "--cpu-max-queued-tasks"
+            } else {
+                "--max-queued-tasks"
+            },
+        ),
+        AdmissionFailure::TimedOut => (
+            format!("no admission slot within {}s", wait.as_secs()),
+            if execution.placement == "cpu" {
+                "--cpu-max-concurrent-tasks"
+            } else {
+                "--max-concurrent-tasks"
+            },
+        ),
+    };
+    ApiError::new(
+        status,
+        format!(
+            "server busy: {reason} (task cost {cost} of {budget} units; priority \
+             {priority:?} on the {} backend). Retry after {retry_after}s, or raise {setting}.",
+            execution.placement,
+        ),
+    )
+    .with_code(code)
+    .with_retry_after(retry_after)
 }
 
 pub(super) fn transition_timeout(execution: &ExecutionTarget) -> ApiError {
@@ -516,19 +526,79 @@ pub(super) fn transition_timeout(execution: &ExecutionTarget) -> ApiError {
 
 pub(super) async fn run_task(
     State(state): State<PlatformState>,
+    input: Result<Json<TaskInput>, axum::extract::rejection::JsonRejection>,
+) -> Result<axum::response::Response, ApiError> {
+    use axum::response::IntoResponse;
+    let Json(input) = input.map_err(|error| ApiError::invalid_task_request(&error))?;
+    if input.defer {
+        return super::jobs::submit(state, input)
+            .await
+            .map(|job| (StatusCode::ACCEPTED, job).into_response());
+    }
+    execute_task(State(state), Json(input))
+        .await
+        .map(IntoResponse::into_response)
+}
+
+pub(super) fn task_deadline(seconds: Option<u64>) -> Result<Duration, ApiError> {
+    if seconds == Some(0) {
+        return Err(ApiError::bad_request("timeout_seconds must be positive"));
+    }
+    let ceiling = super::platform_task_timeout();
+    Ok(seconds.map_or(ceiling, Duration::from_secs).min(ceiling))
+}
+
+pub(super) async fn execute_task(
+    State(state): State<PlatformState>,
     Json(input): Json<TaskInput>,
 ) -> Result<Json<Value>, ApiError> {
+    let timeout = input
+        .timeout_seconds
+        .map(|seconds| task_deadline(Some(seconds)))
+        .transpose()?;
+    let cancellation = input
+        .job_progress
+        .as_ref()
+        .map(super::jobs::JobProgress::cancellation);
+    let deadline = timeout.map(|timeout| {
+        input.job_progress.as_ref().map_or_else(
+            || tokio::time::Instant::now() + timeout,
+            super::jobs::JobProgress::deadline,
+        )
+    });
     let started = Instant::now();
     let session_id = input.route.session_id.clone();
     let task = super::task_key(input.route.task);
     let priority = input.priority;
     let requested_model = input.route.model.clone();
-    let result = super::with_session_cancellation(
+    let work = super::with_session_cancellation(
         &state,
         session_id.as_deref(),
         Box::pin(run_session_task(State(state.clone()), Json(input))),
-    )
-    .await;
+    );
+    let bounded = async {
+        if let Some(deadline) = deadline {
+            tokio::time::timeout_at(deadline, work)
+                .await
+                .unwrap_or_else(|_| {
+                    Err(
+                        ApiError::new(StatusCode::GATEWAY_TIMEOUT, "task total deadline exceeded")
+                            .with_code("task_deadline_exceeded"),
+                    )
+                })
+        } else {
+            work.await
+        }
+    };
+    let result = if let Some(mut cancellation) = cancellation {
+        tokio::select! {
+            biased;
+            _ = cancellation.wait_for(|cancelled| *cancelled) => Err(ApiError::task_cancelled()),
+            result = bounded => result,
+        }
+    } else {
+        bounded.await
+    };
     let record = task_record(&result, started, task, priority, requested_model.as_deref());
     if record.outcome == "ok" {
         state
@@ -596,6 +666,7 @@ async fn run_session_task(
     State(state): State<PlatformState>,
     Json(mut input): Json<TaskInput>,
 ) -> Result<Json<Value>, ApiError> {
+    let progress = input.job_progress.clone();
     // Function definitions are an execution requirement, not merely an optional payload field.
     // Derive the capability at the server boundary so direct HTTP/NAPI callers cannot accidentally
     // route tool work to a completion-only model.
@@ -650,6 +721,9 @@ async fn run_session_task(
         .await;
     execution_receipt["context_sizing"] = context_sizing;
     execution_receipt["model_digest"] = json!(managed.model.digest);
+    if let Some(progress) = &progress {
+        progress.route(&managed.route.selected_model, managed.execution.placement);
+    }
     let resource_model = managed.model;
     let decision = managed.route;
     let execution = managed.execution;
@@ -704,6 +778,13 @@ async fn run_session_task(
         |seconds| Duration::from_secs(seconds.max(1)).min(state.tunables().max_queue_wait()),
     );
     let queue_deadline = tokio::time::Instant::now() + queue_wait;
+    if let Some(progress) = &progress {
+        progress.update(
+            super::jobs::JobStatus::WaitingForAdmission,
+            "waiting_for_backend_capacity",
+            None,
+        );
+    }
     let (mut slot, mut cost, mut queue_wait_ms) = admit(
         &state,
         &execution,
@@ -711,6 +792,7 @@ async fn run_session_task(
         input.priority,
         batch_items,
         queue_deadline,
+        None,
     )
     .await?;
 
@@ -718,6 +800,13 @@ async fn run_session_task(
     // wait for memory used to keep its slot for the whole queue deadline, blocking resident
     // requests that need no new memory at all (head-of-line blocking). After the short bound it
     // gives the slot back, waits for memory, then queues for a slot again with memory reserved.
+    if let Some(progress) = &progress {
+        progress.update(
+            super::jobs::JobStatus::WaitingForResources,
+            "checking_host_resources",
+            None,
+        );
+    }
     let resource_started = Instant::now();
     let (sized, evictions) = make_room(
         &state,
@@ -727,6 +816,19 @@ async fn run_session_task(
         queue_deadline,
     )
     .await;
+    if let Some(progress) = &progress {
+        let snapshot = state.resources.snapshot().await;
+        progress.update(
+            super::jobs::JobStatus::WaitingForResources,
+            "waiting_for_safe_memory_and_pressure",
+            Some(json!({
+                "required_available_bytes": sized["required_available_bytes"],
+                "effective_available_bytes": snapshot.effective_available_bytes,
+                "reserve_bytes": snapshot.hold_reserve_bytes,
+                "pressure_reasons": snapshot.reasons,
+            })),
+        );
+    }
     let quick_deadline =
         (tokio::time::Instant::now() + SLOT_HELD_RESOURCE_WAIT).min(queue_deadline);
     let reserved = tokio::time::timeout_at(
@@ -756,6 +858,13 @@ async fn run_session_task(
             ));
         }
         _ => {
+            let resource_waiter =
+                execution
+                    .admission
+                    .register_resource_waiter()
+                    .map_err(|failure| {
+                        admission_error(&state, &execution, input.priority, cost, failure)
+                    })?;
             drop(slot);
             let reserved = tokio::time::timeout_at(
                 queue_deadline,
@@ -769,17 +878,33 @@ async fn run_session_task(
                     None,
                 ),
             )
-            .await
-            .map_err(|_| {
-                ApiError::new(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "resource admission deadline exceeded",
-                )
-                .with_resource_deadline(
-                    "initial_reservation",
-                    resource_started.elapsed().as_millis(),
-                )
-            })??;
+            .await;
+            let reserved = reserved
+                .map_err(|_| {
+                    ApiError::new(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "resource admission deadline exceeded",
+                    )
+                    .with_resource_deadline(
+                        "initial_reservation",
+                        resource_started.elapsed().as_millis(),
+                    )
+                })
+                .and_then(std::convert::identity);
+            let reserved = match reserved {
+                Ok(reserved) => reserved,
+                Err(error) => {
+                    resource_waiter.finish();
+                    return Err(error);
+                }
+            };
+            if let Some(progress) = &progress {
+                progress.update(
+                    super::jobs::JobStatus::WaitingForAdmission,
+                    "resources_reserved_waiting_for_backend_capacity",
+                    None,
+                );
+            }
             let (readmitted, readmitted_cost, requeued_ms) = admit(
                 &state,
                 &execution,
@@ -787,6 +912,7 @@ async fn run_session_task(
                 input.priority,
                 batch_items,
                 queue_deadline,
+                Some(resource_waiter),
             )
             .await?;
             slot = readmitted;
@@ -815,6 +941,13 @@ async fn run_session_task(
     // the transition lock. Recheck while holding the read side: if the selected runner is still
     // resident, that lock prevents a managed writer from transitioning it during execution. A
     // stale or unavailable snapshot falls back to the exclusive side before the request is sent.
+    if let Some(progress) = &progress {
+        progress.update(
+            super::jobs::JobStatus::WaitingForRunner,
+            "waiting_for_runner_transition",
+            None,
+        );
+    }
     let transition_started = Instant::now();
     let transition = tokio::time::timeout_at(queue_deadline, async {
         if decision.resident {
@@ -866,6 +999,17 @@ async fn run_session_task(
     let selected_model = decision.selected_model.clone();
     let session_id = input.route.session_id.clone();
     let mut permits = [resource_permit, resource_recheck];
+    if let Some(progress) = &progress {
+        progress.update(
+            if admission_mode == "resident_shared" {
+                super::jobs::JobStatus::Running
+            } else {
+                super::jobs::JobStatus::Loading
+            },
+            "forwarding_to_ollama",
+            None,
+        );
+    }
     let forward = forward_managed_task(
         &state,
         decision,
@@ -886,29 +1030,39 @@ async fn run_session_task(
     // reservation that covered the load is returned as soon as the runner is resident instead of
     // being counted a second time until the response ends. (With mmap'd weights on Linux the
     // page cache still reads as available, so there the reservation is held to the end.)
-    let result =
-        if host_has_unified_memory() && permits.iter().any(|permit| permit.reserved_bytes() > 0) {
-            let client = state.client.clone();
-            let upstream = execution.upstream.clone();
-            let watch = async {
-                loop {
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                    if model_is_resident(&client, &upstream, &selected_model).await {
+    let result = if progress.is_some()
+        || host_has_unified_memory() && permits.iter().any(|permit| permit.reserved_bytes() > 0)
+    {
+        let client = state.client.clone();
+        let upstream = execution.upstream.clone();
+        let watch = async {
+            loop {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                if model_is_resident(&client, &upstream, &selected_model).await {
+                    if let Some(progress) = &progress {
+                        progress.update(
+                            super::jobs::JobStatus::Running,
+                            "resident_runner_observed",
+                            None,
+                        );
+                    }
+                    if host_has_unified_memory() {
                         permits
                             .iter_mut()
                             .for_each(resources::ResourcePermit::release);
-                        break;
                     }
+                    break;
                 }
-                std::future::pending::<()>().await;
-            };
-            tokio::select! {
-                result = forward => result,
-                () = watch => unreachable!("the residency watch never completes"),
             }
-        } else {
-            forward.await
+            std::future::pending::<()>().await;
         };
+        tokio::select! {
+            result = forward => result,
+            () = watch => unreachable!("the residency watch never completes"),
+        }
+    } else {
+        forward.await
+    };
     drop(transition);
     drop(permits);
 
@@ -1094,19 +1248,29 @@ pub(super) async fn model_memory_requirement(
         let full = footprint["required_available_bytes"].as_u64().unwrap_or(0);
         if full > 0 {
             let observation = state.resources.snapshot().await.observation;
-            footprint["full_estimate_bytes"] = json!(full);
-            if let Some(vram_free) = observation.gpu_memory_free_bytes {
-                footprint["gpu_memory_free_bytes"] = json!(vram_free);
-                footprint["gpu_telemetry_source"] = json!(observation.gpu_telemetry_source);
-                footprint["required_available_bytes"] = json!(full.saturating_sub(vram_free));
-                footprint["source"] = json!("discrete_gpu_spill_estimate");
-            } else {
-                footprint["required_available_bytes"] = json!(0);
-                footprint["source"] = json!("discrete_gpu_without_vram_telemetry");
-            }
+            apply_discrete_gpu_budget(&mut footprint, full, &observation);
         }
     }
     footprint
+}
+
+fn apply_discrete_gpu_budget(
+    footprint: &mut Value,
+    full: u64,
+    observation: &resources::HostResources,
+) {
+    footprint["full_estimate_bytes"] = json!(full);
+    if let Some(vram_free) = observation.gpu_memory_free_bytes {
+        footprint["gpu_memory_free_bytes"] = json!(vram_free);
+        footprint["gpu_telemetry_source"] = json!(observation.gpu_telemetry_source);
+        footprint["required_available_bytes"] = json!(full.saturating_sub(vram_free));
+        footprint["source"] = json!("discrete_gpu_spill_estimate");
+    } else {
+        // Unknown VRAM is not evidence that the GPU can hold any part of the runner. Charge
+        // the full estimate to RAM so missing vendor tools cannot bypass host admission.
+        footprint["required_available_bytes"] = json!(full);
+        footprint["source"] = json!("discrete_gpu_unknown_vram_full_host_reservation");
+    }
 }
 
 /// Size the load for `model` and, when it would not fit, unload idle runners first. Returns the
@@ -1505,7 +1669,21 @@ async fn forward_managed_task(
     if upstream_failed {
         observe_completion(state, execution, &decision.selected_model, true, None).await;
     }
-    let (status, value) = posted?;
+    let (status, value) = match posted {
+        Ok(response) => response,
+        Err(error) => {
+            // The runner may have loaded before the response or its body failed. We replaced
+            // the caller's zero TTL with 30s to observe placement, so finish the owned cleanup
+            // even when no response can be decoded. Never replay uncertain inference.
+            return Err(if immediate_unload {
+                error.with_lifecycle(
+                    unload_after_observation(state, execution, &decision.selected_model).await,
+                )
+            } else {
+                error
+            });
+        }
+    };
     let value = validate_upstream_completion(
         state,
         execution,
@@ -1939,4 +2117,29 @@ pub(super) fn memory_kv_preflight_with_memory(
         "live_available_memory_bytes": null,
         "authority": "Ollama owns live free-memory, runner graph, cache-type, and final load admission",
     })
+}
+
+#[cfg(test)]
+mod gpu_budget_tests {
+    use super::*;
+
+    #[test]
+    fn missing_vram_telemetry_reserves_the_full_footprint() {
+        let mut footprint = json!({"required_available_bytes": 8000});
+        apply_discrete_gpu_budget(&mut footprint, 8000, &resources::HostResources::default());
+        assert_eq!(footprint["required_available_bytes"], 8000);
+    }
+
+    #[test]
+    fn observed_vram_only_discounts_memory_it_can_hold() {
+        for (free, expected) in [(0, 8000), (3000, 5000), (9000, 0)] {
+            let mut footprint = json!({"required_available_bytes": 8000});
+            let observation = resources::HostResources {
+                gpu_memory_free_bytes: Some(free),
+                ..resources::HostResources::default()
+            };
+            apply_discrete_gpu_budget(&mut footprint, 8000, &observation);
+            assert_eq!(footprint["required_available_bytes"], expected);
+        }
+    }
 }

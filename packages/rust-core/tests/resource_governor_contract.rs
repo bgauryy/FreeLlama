@@ -78,6 +78,7 @@ async fn platform(
     let (primary, _, primary_server) = backend().await;
     let (cpu, receive, cpu_server) = backend().await;
     let mut config = PlatformConfig::new("127.0.0.1:11435", primary, None, None, "test:latest")
+        .with_cpu_max_queued_tasks(1)
         .with_max_queue_wait(wait);
     config.cpu_upstream = Some(cpu);
     config.cpu_models.insert("test:latest".into());
@@ -250,6 +251,86 @@ async fn recovery_admits_waiting_work_and_completion_releases_forecast_memory() 
     }
 }
 
+async fn cpu_admission(platform: &Router) -> Value {
+    let response = platform
+        .clone()
+        .oneshot(
+            Request::get("/_freellama/v1/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    body["backends"]["cpu"]["admission"].clone()
+}
+
+#[tokio::test]
+async fn memory_waiters_stay_counted_bounded_and_cancellable_after_releasing_slots() {
+    let available = Arc::new(AtomicU64::new(100));
+    let governor = governor(available.clone());
+    let (platform, mut receive, servers) = platform(governor.clone(), Duration::from_secs(6)).await;
+    let first = platform.clone();
+    let pending = tokio::spawn(async move { first.oneshot(task()).await.unwrap() });
+    // The execution slot is returned after two seconds of resource waiting.
+    tokio::time::sleep(Duration::from_millis(2300)).await;
+    assert!(
+        !pending.is_finished(),
+        "resource pressure must wait within the configured deadline"
+    );
+    let admission = cpu_admission(&platform).await;
+    assert_eq!(admission["in_flight"], 0);
+    assert_eq!(admission["queue_depth"], 1, "{admission}");
+    assert_eq!(admission["resource_waiters"], 1);
+    assert!(
+        receive.try_recv().is_err(),
+        "no inference while memory is held"
+    );
+    let excess = tokio::time::timeout(Duration::from_millis(500), platform.clone().oneshot(task()))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(excess.status(), StatusCode::TOO_MANY_REQUESTS);
+    pending.abort();
+    let _ = pending.await;
+    assert_eq!(cpu_admission(&platform).await["queue_depth"], 0);
+    assert_eq!(governor.snapshot().await.reserved_bytes, 0);
+    available.store(9000, Ordering::SeqCst);
+    let next = platform.clone();
+    let recovered = tokio::spawn(async move { next.oneshot(task()).await.unwrap() });
+    let (_, release) = next_execution(&mut receive).await;
+    release.send(()).unwrap();
+    assert_eq!(recovered.await.unwrap().status(), StatusCode::OK);
+    for server in servers {
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn a_task_waiting_without_a_slot_resumes_when_memory_recovers() {
+    let available = Arc::new(AtomicU64::new(100));
+    let governor = governor(available.clone());
+    let (platform, mut receive, servers) = platform(governor, Duration::from_secs(6)).await;
+    let first = platform.clone();
+    let pending = tokio::spawn(async move { first.oneshot(task()).await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(2300)).await;
+    assert!(!pending.is_finished());
+    assert_eq!(cpu_admission(&platform).await["in_flight"], 0);
+    available.store(9000, Ordering::SeqCst);
+    let (_, release) = next_execution(&mut receive).await;
+    release.send(()).unwrap();
+    let response = pending.await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert!(body["admission"]["resource_wait_ms"].as_u64().unwrap() >= 2000);
+    assert_eq!(cpu_admission(&platform).await["queue_depth"], 0);
+    for server in servers {
+        server.abort();
+    }
+}
+
 #[tokio::test]
 async fn separate_backend_clones_share_forecast_capacity_and_drop_releases_it() {
     let governor = governor(Arc::new(AtomicU64::new(9000)));
@@ -272,6 +353,50 @@ async fn separate_backend_clones_share_forecast_capacity_and_drop_releases_it() 
         .await
         .unwrap();
     assert_eq!(governor.snapshot().await.reserved_bytes, 5000);
+    drop(second);
+    assert_eq!(governor.snapshot().await.reserved_bytes, 0);
+}
+
+#[tokio::test]
+async fn releasing_a_reservation_wakes_waiters_before_the_next_telemetry_sample() {
+    let governor = ResourceGovernor::with_sampler(
+        ResourcePolicy {
+            sample_interval: Duration::from_secs(5),
+            hold_available_min_bytes: 100,
+            resume_available_min_bytes: 200,
+            ..ResourcePolicy::default()
+        },
+        || HostResources {
+            source: "reservation_wakeup_contract".into(),
+            total_memory_bytes: Some(10_000),
+            available_memory_bytes: Some(9000),
+            ..HostResources::default()
+        },
+    )
+    .unwrap();
+    let first = governor
+        .wait_for_capacity("http://127.0.0.1:11434", 5000, Duration::from_secs(1))
+        .await
+        .unwrap();
+    let other = governor.clone();
+    let mut pending = tokio::spawn(async move {
+        other
+            .wait_for_capacity("http://127.0.0.1:11436", 5000, Duration::from_secs(1))
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!pending.is_finished());
+    drop(first);
+    let second = tokio::time::timeout(Duration::from_millis(250), &mut pending)
+        .await
+        .expect("released capacity must wake the waiter promptly")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        governor.snapshot().await.sample_count,
+        1,
+        "reuse cached telemetry instead of polling the OS"
+    );
     drop(second);
     assert_eq!(governor.snapshot().await.reserved_bytes, 0);
 }
