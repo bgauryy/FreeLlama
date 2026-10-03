@@ -63,6 +63,14 @@ describe("tool contract", () => {
     expect(instructions).toMatch(/findings are candidates, not accepted defects/);
     expect(instructions).toMatch(/requiredCapabilities:\["tools"\].*omit preview and supply the payload/s);
     expect(instructions).toContain("Docs: freellama://docs/index");
+    expect(instructions).toContain("Scoped run_task needs scopeId+scopeRevision");
+    const requiredTaskFields = byName.get("run_task")!.inputSchema.required ?? [];
+    expect(requiredTaskFields).not.toContain("scopeId");
+    expect(requiredTaskFields).not.toContain("scopeRevision");
+    expect(instructions).toContain("Check isError first; prefer structuredContent, else content[].text");
+    expect(instructions).toContain("page.next_cursor→cursor unchanged");
+    expect(instructions).toContain("default-endpoint autostart optional");
+    expect(byName.get("delegate_research")!.description).toContain("discard verification.recommendation=escalate");
   });
 
   it("exposes a bounded placement preference instead of an unsafe backend override", () => {

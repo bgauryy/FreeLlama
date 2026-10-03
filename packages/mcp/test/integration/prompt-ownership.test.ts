@@ -66,6 +66,15 @@ describe("caller-owned task prompts", () => {
     expect(requests).toHaveLength(0);
   });
 
+  it.each(["run_task", "run_task_batch"])("%s rejects unknown top-level controls before contacting serve", async (name) => {
+    const result = await client.callTool({ name, arguments: name === "run_task"
+      ? { endpoint, prompt: "Hello", numGpu: 0 }
+      : { endpoint, tasks: [{ id: "review", independent: true, task: { prompt: "Hello" } }], numGpu: 0 },
+    });
+    expect(result.isError).toBe(true);
+    expect(requests).toHaveLength(0);
+  });
+
   it.each([
     { status: 429, body: { error: "queue full", code: "admission_queue_full", retry_after_seconds: 7 } },
     { status: 503, body: { error: "capacity unavailable", code: "resource_admission_unavailable",

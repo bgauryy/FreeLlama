@@ -9,7 +9,11 @@ permissions:
   contents: read
 
 jobs:
+  checks:
+    uses: ./.github/workflows/ci.yml
+
   build:
+    needs: checks
     name: build ${{ matrix.id }}
     strategy:
       fail-fast: false
@@ -72,6 +76,18 @@ jobs:
           cp "target/${{ matrix.target }}/release/$exe" release-target/
           ls release-target
           test -f "release-target/freellama.${{ matrix.id }}.node"
+      - name: Verify target CLI version
+        shell: bash
+        run: |
+          exe=freellama; [[ "${{ matrix.id }}" == win32-* ]] && exe=freellama.exe
+          version=$(node -p 'require("./package.json").version')
+          test "$(./release-target/$exe --version)" = "freellama $version"
+      - name: Load N-API addon on the target host
+        if: ${{ !matrix.zig }}
+        run: node -e "const n = require('./release-target/freellama.${{ matrix.id }}.node'); if (typeof n.machine !== 'function') throw new Error('missing machine binding')"
+      - name: Load musl N-API addon in an Alpine Node runtime
+        if: matrix.zig
+        run: docker run --rm -v "$PWD/release-target:/artifacts:ro" node:22-alpine node -e "const n = require('/artifacts/freellama.${{ matrix.id }}.node'); if (typeof n.machine !== 'function') throw new Error('missing machine binding')"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.id }}
@@ -101,6 +117,12 @@ jobs:
       - run: yarn build:native && yarn workspace @octocodeai/freellama-mcp-server build
       - run: yarn typecheck && yarn test
       - run: yarn release:verify:publish
+        env:
+          FREELLAMA_RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+      - name: Check all npm versions before publishing any package
+        run: yarn release:verify:registry
+        env:
+          FREELLAMA_RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
       - name: Publish npm packages
         if: startsWith(github.ref, 'refs/tags/')
         env:

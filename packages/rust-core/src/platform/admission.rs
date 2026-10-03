@@ -36,6 +36,7 @@ struct AdmissionState {
     in_flight: usize,
     admitted: u64,
     released: u64,
+    policy_epoch: u64,
     queue_full_rejections: u64,
     queue_timeouts: u64,
     queue_cancellations: u64,
@@ -72,6 +73,12 @@ struct AdmissionWaiter {
 pub(super) struct AdmissionPermit {
     pool: AdmissionPool,
     cost: usize,
+}
+
+impl AdmissionPermit {
+    pub(super) fn units(&self) -> usize {
+        self.cost
+    }
 }
 
 impl Drop for AdmissionPermit {
@@ -202,10 +209,14 @@ impl AdmissionPool {
     pub(super) fn set_ceiling(&self, ceiling: usize) {
         let ceiling = ceiling.max(1);
         let mut state = self.state.lock().expect("admission state poisoned");
+        let previous = (state.limit, state.ceiling);
         if state.limit >= state.ceiling || state.limit > ceiling {
             state.limit = ceiling;
         }
         state.ceiling = ceiling;
+        if previous != (state.limit, state.ceiling) {
+            state.policy_epoch = state.policy_epoch.wrapping_add(1);
+        }
         drop(state);
         self.changed.notify_waiters();
     }
@@ -213,7 +224,11 @@ impl AdmissionPool {
     /// Set the current limit within `1..=ceiling`; returns the value applied.
     pub(super) fn set_limit(&self, limit: usize) -> usize {
         let mut state = self.state.lock().expect("admission state poisoned");
-        state.limit = limit.clamp(1, state.ceiling);
+        let next = limit.clamp(1, state.ceiling);
+        if next != state.limit {
+            state.policy_epoch = state.policy_epoch.wrapping_add(1);
+            state.limit = next;
+        }
         let applied = state.limit;
         drop(state);
         self.changed.notify_waiters();
@@ -271,6 +286,7 @@ impl AdmissionPool {
                 in_flight: 0,
                 admitted: 0,
                 released: 0,
+                policy_epoch: 0,
                 queue_full_rejections: 0,
                 queue_timeouts: 0,
                 queue_cancellations: 0,
@@ -303,6 +319,7 @@ impl AdmissionPool {
                 .max(),
             "admitted": state.admitted,
             "released": state.released,
+            "policy_epoch": state.policy_epoch,
             "queue_full_rejections": state.queue_full_rejections,
             "queue_timeouts": state.queue_timeouts,
             "queue_cancellations": state.queue_cancellations,
@@ -425,12 +442,21 @@ impl AdmissionPool {
                         selected = true;
                     }
                 }
-                if state.granted == Some(ticket) {
-                    let index = state
-                        .waiting
-                        .iter()
-                        .position(|waiter| waiter.ticket == ticket)
-                        .expect("granted admission waiter must remain queued");
+                let granted_index = if state.granted == Some(ticket) {
+                    Some(
+                        state
+                            .waiting
+                            .iter()
+                            .position(|waiter| waiter.ticket == ticket)
+                            .expect("granted admission waiter must remain queued"),
+                    )
+                } else {
+                    None
+                };
+                // A reduction may occur after selection and before the chosen waiter wakes.
+                if let Some(index) = granted_index
+                    .filter(|&index| state.charge(state.waiting[index].cost) <= state.free())
+                {
                     let waiter = state.waiting.remove(index);
                     let units = state.charge(waiter.cost);
                     state.active = state.active.saturating_add(units);
@@ -469,7 +495,141 @@ impl AdmissionPool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use std::{
+        future::Future,
+        sync::atomic::{AtomicUsize, Ordering},
+        task::{Context, Poll, Wake, Waker},
+        time::Duration,
+    };
+
+    #[derive(Default)]
+    struct WakeCount(AtomicUsize);
+
+    impl Wake for WakeCount {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn policy_epoch_detects_limit_and_ceiling_transitions_away_and_back() {
+        let pool = AdmissionPool::new(4, 4);
+        pool.set_limit(4);
+        pool.set_ceiling(4);
+        assert_eq!(pool.receipt()["policy_epoch"], 0);
+        pool.set_limit(2);
+        pool.set_limit(4);
+        assert_eq!(pool.receipt()["policy_epoch"], 2);
+        pool.set_ceiling(2);
+        pool.set_ceiling(4);
+        assert_eq!(pool.receipt()["policy_epoch"], 4);
+        assert_eq!(pool.total(), 4);
+    }
+
+    #[tokio::test]
+    async fn claiming_a_grant_wakes_waiters_for_remaining_capacity() {
+        let pool = AdmissionPool::new(4, 4);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let (holder, _) = pool
+            .acquire(4, TaskPriority::Normal, deadline)
+            .await
+            .unwrap_or_else(|_| panic!("holder"));
+        let mut chosen = Box::pin(pool.acquire(1, TaskPriority::Interactive, deadline));
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(chosen.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        let mut following = Box::pin(pool.acquire(1, TaskPriority::Normal, deadline));
+        let notification_count = Arc::new(WakeCount::default());
+        let waker = Waker::from(Arc::clone(&notification_count));
+        let mut context = Context::from_waker(&waker);
+        assert!(following.as_mut().poll(&mut context).is_pending());
+
+        drop(holder);
+        assert!(following.as_mut().poll(&mut context).is_pending());
+        let before_claim = notification_count.0.load(Ordering::Relaxed);
+        let (chosen_permit, _) = chosen.await.unwrap_or_else(|_| panic!("chosen waiter"));
+        assert_eq!(pool.available(), 3);
+        assert!(
+            notification_count.0.load(Ordering::Relaxed) > before_claim,
+            "a sleeping follower must be woken while the chosen task retains its permit"
+        );
+        let (following_permit, _) = following
+            .await
+            .unwrap_or_else(|_| panic!("following waiter"));
+        assert_eq!(pool.receipt()["in_flight"], 2);
+        assert_eq!(pool.available(), 2);
+        drop(chosen_permit);
+        drop(following_permit);
+        assert_eq!(pool.available(), 4);
+        assert_eq!(pool.receipt()["admitted"], pool.receipt()["released"]);
+    }
+
+    async fn assert_grant_respects_reduced_capacity(reduce: fn(&AdmissionPool)) {
+        let pool = AdmissionPool::new(4, 4);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let (anchor, _) = pool
+            .acquire(1, TaskPriority::Normal, deadline)
+            .await
+            .unwrap_or_else(|_| panic!("anchor"));
+        let (released, _) = pool
+            .acquire(1, TaskPriority::Normal, deadline)
+            .await
+            .unwrap_or_else(|_| panic!("released holder"));
+        let mut chosen = Box::pin(pool.acquire(3, TaskPriority::Interactive, deadline));
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(chosen.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+
+        drop(released);
+        let mut following = Box::pin(pool.acquire(1, TaskPriority::Normal, deadline));
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(following.as_mut().poll(cx)))
+                .await
+                .is_pending(),
+            "the interactive waiter must own the grant before it wakes"
+        );
+        assert!(pool.state.lock().unwrap().granted.is_some());
+        reduce(&pool);
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(chosen.as_mut().poll(cx)))
+                .await
+                .is_pending(),
+            "a grant must not admit more units than the reduced capacity permits"
+        );
+        assert_eq!(pool.receipt()["active_units"], 1);
+        assert_eq!(pool.receipt()["in_flight"], 1);
+        drop(following);
+        drop(anchor);
+        let (permit, _) = chosen
+            .await
+            .unwrap_or_else(|_| panic!("grant must resume after capacity is released"));
+        assert_eq!(pool.receipt()["active_units"], 2);
+        assert_eq!(pool.total(), 2);
+        drop(permit);
+        assert_eq!(pool.receipt()["active_units"], 0);
+        assert_eq!(pool.receipt()["admitted"], pool.receipt()["released"]);
+    }
+
+    #[tokio::test]
+    async fn an_adaptive_reduction_revalidates_a_grant_before_admission() {
+        assert_grant_respects_reduced_capacity(|pool| {
+            pool.set_limit(2);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_ceiling_reload_revalidates_a_grant_before_admission() {
+        assert_grant_respects_reduced_capacity(|pool| pool.set_ceiling(2)).await;
+    }
 
     #[tokio::test]
     async fn cancelling_after_resource_to_slot_handoff_reclaims_the_waiter() {

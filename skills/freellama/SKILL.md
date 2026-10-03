@@ -50,7 +50,7 @@ Call `delegate_research{question,workspacePath,model?,adapter?,executionPreferen
 
 ### B — supplied content or vision
 
-Call `run_task{task,prompt|messages,images?,model?,executionPreference?,minPlacementEvidence?,keepAlive?,minConfidence?,preview?}`. It has no file access. `preview:true` is free; `minConfidence` gates quality evidence. `minPlacementEvidence:"observed"` additionally refuses cold, mixed, or mismatched processor placement; warm once with `"configured"`, inspect the receipt, then require `"observed"`. Images are base64 without a data-URI prefix and require an explicitly trialled vision model. Choose output limits and stop sequences from the tested output contract. Load `references/model-selection.md` before model choice.
+Preview with `run_task{preview:true,task?,model?,executionPreference?,minPlacementEvidence?,minConfidence?}` and routing constraints only. Execute separately with `prompt` or `messages`, plus applicable runtime controls. `run_task` has no file access; `minConfidence` gates quality evidence. `minPlacementEvidence:"observed"` refuses cold, mixed, or mismatched processor placement. Warm once with `"configured"`, inspect the receipt, then require `"observed"`. Images are base64 without a data-URI prefix and require an explicitly trialled vision model. Choose output limits and stop sequences from the tested output contract. Load `references/model-selection.md` before model choice.
 
 ### C — embeddings
 
@@ -70,11 +70,11 @@ same admission and fit checks. Explicit `keepAlive` wins over finite adaptive re
 
 ### E — choose or install a model
 
-Ask for missing workload/modality, quality, latency, context, privacy, download, disk, and memory constraints. Diagnose the host, prefer qualified installed models, then search `models{view:"library"}` by family and inspect exact pullable tags with `models{view:"detail",model}`. Present at most two evidence-backed candidates. Ask approval for one exact tag and size before `ollama_manage{action:"pull"}`; discovery never grants installation permission. Load `references/model-selection.md`, then `references/ollama-config.md` for fit.
+Ask for missing workload/modality, quality, latency, context, privacy, download, disk, and memory constraints. Diagnose the host and prefer qualified installed models. Search `models{view:"library"}` for families, then inspect pullable tags with `models{view:"library",model:"FAMILY"}`. The `detail` view inspects an installed model. Present at most two evidence-backed candidates. Ask approval for one exact tag and size before `ollama_manage{action:"pull"}`; discovery never grants installation permission. Load `references/model-selection.md`, then `references/ollama-config.md` for fit.
 
 ### F — diagnose a failure
 
-Run `doctor`, resident models, then `scripts/check.sh` (read-only; exit 0 means healthy). Load `references/troubleshooting.md` for symptom routing. Never treat a 503, confidence refusal, CPU spill, or proxy/serve 404 as the same failure.
+Run `doctor`, resident models, then `scripts/check.sh`. Exit 0 means required service checks passed; inspect warnings and resource admission before executing a task. Load `references/troubleshooting.md` for symptom routing. Never treat a 503, confidence refusal, CPU spill, or proxy/serve 404 as the same failure.
 
 ## Verify every result
 
@@ -84,7 +84,7 @@ Run `doctor`, resident models, then `scripts/check.sh` (read-only; exit 0 means 
 | `verify` | unmeasured/weak model, judgment-shaped task, or outside the measured call envelope | independent frontier-tier check |
 | `escalate` | unusable model or zero successful calls | discard the answer |
 
-Keep `pinnedOverflow:"error"`; clipping the system prompt/question requires explicit human acceptance. Accept adaptive placement feedback only when `execution.observation.status:"verified"`; for `keepAlive:"0"`, also inspect the observe-then-unload `execution.lifecycle`. Persist model-specific token calibration and bounded placement feedback; use ephemeral modes only for disposable tests. An assigned CPU backend can still execute an MLX model fully on GPU. Never co-resident two large models without memory arithmetic. Never delete `~/.ollama/models` files directly; `ollama_delete` needs exact-tag approval in the current conversation. Operators own endpoints, CPU tag assignments, Ollama settings, pulls, stops, and deletes.
+Keep `FREELLAMA_AGENT_PINNED_OVERFLOW=error`; clipping the system prompt/question requires explicit human acceptance. Accept adaptive placement feedback only when `execution.observation.status:"verified"`; for `keepAlive:"0"`, also inspect the observe-then-unload `execution.lifecycle`. Persist model-specific token calibration and bounded placement feedback; use ephemeral modes only for disposable tests. An assigned CPU backend can still execute an MLX model fully on GPU. Never co-resident two large models without memory arithmetic. Never delete `~/.ollama/models` files directly; `ollama_delete` needs exact-tag approval in the current conversation. Operators own endpoints, CPU tag assignments, Ollama settings, pulls, stops, and deletes.
 
 ## Routes and deterministic helpers
 

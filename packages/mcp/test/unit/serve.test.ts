@@ -1,14 +1,29 @@
+import type { SpawnOptions } from "node:child_process";
 import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
 
+const fixtureLaunch = vi.hoisted(() => ({ script: undefined as string | undefined }));
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  return {
+    ...actual,
+    spawn(command: string, args: string[], options: SpawnOptions) {
+      // Launch generated fixture scripts through Node to avoid host loader delays for executable scripts.
+      if (command === fixtureLaunch.script) return actual.spawn(process.execPath, [command, ...args], options);
+      return actual.spawn(command, args, options);
+    },
+  };
+});
+
 let folder: string | undefined;
 let serve: typeof import("../../src/serve.js") | undefined;
 const listeners: Server[] = [];
 afterEach(async () => {
   serve?.stopAutostartedServe();
+  fixtureLaunch.script = undefined;
   await Promise.all(listeners.splice(0).map((listener) => new Promise<void>((resolve) => listener.close(() => resolve()))));
   if (folder) await rm(folder, { recursive: true, force: true });
   vi.unstubAllEnvs();
@@ -43,6 +58,7 @@ it.skipIf(process.platform === "win32")("reports an unexecutable binary without 
     createServer((req,res) => { res.end('{}'); }).listen(Number(listen.split(':').at(-1)), '127.0.0.1');
   });\n`);
   await chmod(binary, 0o700);
+  fixtureLaunch.script = binary;
   await expect(serve!.ensureServe(undefined)).resolves.toBeUndefined();
   expect((await fetch(`${endpoint}/_freellama/v1/health`)).status).toBe(200);
 }, 10_000);
@@ -56,6 +72,7 @@ it.skipIf(process.platform === "win32")("keeps a new child tracked when an older
     process.on('SIGTERM', () => server.close(() => setTimeout(() => process.exit(0), 600)));
   });\n`);
   await chmod(binary, 0o700);
+  fixtureLaunch.script = binary;
   await serve!.ensureServe(undefined);
   serve!.stopAutostartedServe();
   await new Promise((resolve) => setTimeout(resolve, 100));

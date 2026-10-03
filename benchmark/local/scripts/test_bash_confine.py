@@ -72,11 +72,17 @@ class ReadOnlyShellTests(unittest.TestCase):
 
     ALLOWED = [
         "cat readme.md",
+        "jq '{name: .name}' data.json",
+        'jq "{name: .name}" data.json',
+        "sed -n '1{p;}' readme.md",
         "grep -rn \"ok\" . --exclude-dir={node_modules,.git}",
         "grep -n 'fn [a-z]+$' readme.md | head -5",
         'grep -rn "/api/tags" . 2>/dev/null | wc -l',
-        "find . -name '*.md' | sort | xargs wc -l",
+        "find . -name '*.md' | sort | wc -l",
+        "printf '%s\\n' hello | xargs echo",
         "sed -n '1,20p' readme.md",
+        "sed -e '1p' -e 's/ok/new/g' readme.md",
+        "sed --expression='s/ok/new/g' readme.md",
         "git log --oneline -3",
         "ls -la && wc -l readme.md",
         'grep -n "Vec<String>" readme.md',
@@ -95,6 +101,67 @@ class ReadOnlyShellTests(unittest.TestCase):
             with self.subTest(command=command):
                 with self.assertRaises(ValueError):
                     validate_command(self.root, command)
+
+    def test_all_sed_programs_and_joined_write_flags_are_blocked_without_os_sandbox(self):
+        from unittest.mock import patch
+        (self.root / "program.sed").write_text("w escaped.txt\n")
+        commands = [
+            "sed -e '1p' -e 'w escaped.txt' readme.md",
+            "sed -e '1p' --expression='w escaped.txt' readme.md",
+            "sed -e '1p' -e'w escaped.txt' readme.md",
+            "sed -f program.sed readme.md",
+            "sed -nfprogram.sed readme.md",
+            "sed --file=program.sed readme.md",
+            "sort -oescaped.txt readme.md",
+            "sed -e '1p' -e 'wescaped.txt' readme.md",
+            "sed -e '1p' -e '\\|ok|w escaped.txt' readme.md",
+            "sed 's/ok/new/w escaped.txt' readme.md",
+        ]
+        with patch.dict("os.environ", {"FREELLAMA_AGENT_OS_SANDBOX": "off"}):
+            with ReadOnlyShell(self.root) as shell:
+                for command in commands:
+                    with self.subTest(command=command):
+                        with self.assertRaisesRegex(ValueError, "sed|sort"):
+                            shell.run(command, 5)
+                        self.assertFalse((self.root / "escaped.txt").exists())
+        self.assertEqual((self.root / "readme.md").read_text(), "ok\n")
+
+    def test_dynamic_and_symlink_paths_are_refused_without_os_sandbox(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as outside:
+            external = Path(outside) / "secret"
+            external.write_text("outside scratch sentinel\n")
+            (self.root / "link").symlink_to(external)
+            commands = {
+                "cat link": "relative path escapes workspace",
+                "grep -flink readme.md": "grep -f",
+                "rg -flink readme.md": "rg -f",
+                "file -flink": "file -f",
+                "jq -flink readme.md": "jq -f",
+                "jq --from-file=readme.md readme.md": "jq --from-file",
+                "jq -Llink '.' readme.md": "jq -L",
+                "wc --files0-from=readme.md": "wc --files0-from",
+                "sort --files0-from=readme.md": "sort --files0-from",
+                "xargs -alink echo": "xargs argument files",
+                "git -Clink log": "git -C",
+                "git --git-dir=link log": "relative path escapes workspace",
+                "cat li{n,k}": "brace-expanded paths",
+                "cat l*": "relative path escapes workspace",
+                "printf '%s\\n' '-o' 'escaped.txt' 'readme.md' | xargs sort": "xargs filesystem arguments",
+                "printf '/et%s/passwd\\n' c | xargs cat": "xargs filesystem arguments",
+                "rg -L ok .": "recursive symlink following",
+                "grep -R ok .": "recursive symlink following",
+                "find -L .": "recursive symlink following",
+            }
+            with patch.dict("os.environ", {"FREELLAMA_AGENT_OS_SANDBOX": "off"}):
+                with ReadOnlyShell(self.root) as shell:
+                    for command, reason in commands.items():
+                        with self.subTest(command=command):
+                            with self.assertRaisesRegex(ValueError, reason):
+                                shell.run(command, 5)
+            self.assertFalse((self.root / "escaped.txt").exists())
+            self.assertEqual(external.read_text(), "outside scratch sentinel\n")
+        self.assertEqual((self.root / "readme.md").read_text(), "ok\n")
 
     def test_research_commands_are_allowed(self):
         for command in self.ALLOWED:

@@ -170,6 +170,8 @@ async fn managed_warm_is_an_empty_request_with_finite_residency() {
     let calls = captured.lock().await;
     assert_eq!(calls[0]["messages"], json!([]));
     assert_eq!(calls[0]["options"]["num_ctx"], 4096);
+    assert_eq!(calls[0]["truncate"], false);
+    assert_eq!(calls[0]["shift"], false);
     assert!(calls[0]["keep_alive"].as_str().unwrap().ends_with('s'));
     drop(calls);
     let (status, _) = request(

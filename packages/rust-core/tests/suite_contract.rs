@@ -82,12 +82,40 @@ fn local_conservative_posture_warns_when_cloud_and_unbounded_queue_are_visible()
 fn mac_thermal_parser_returns_a_small_status_not_raw_system_output() {
     assert_eq!(
         parse_macos_thermal_status("Note: No thermal warning level has been recorded\n"),
-        serde_json::json!({ "status": "normal" })
+        serde_json::json!({ "status": "unknown", "reason": "thermal_warning_not_recorded" })
     );
-    assert_eq!(
-        parse_macos_thermal_status("Note: Thermal warning level: 2\n"),
-        serde_json::json!({ "status": "warning", "level": "2" })
-    );
+    for output in [
+        "Note: Thermal warning level: 2\n",
+        "Thermal Warning Level = 2\n",
+        "Note: No thermal warning level has been recorded\nThermal Warning Level = 2\n",
+    ] {
+        assert_eq!(
+            parse_macos_thermal_status(output),
+            serde_json::json!({ "status": "warning", "level": "2" })
+        );
+    }
+    for output in [
+        "Note: Thermal warning level: 0\n",
+        "Thermal Warning Level = 0\n",
+    ] {
+        assert_eq!(
+            parse_macos_thermal_status(output),
+            serde_json::json!({ "status": "normal" })
+        );
+    }
+    for output in [
+        "",
+        "Note: Thermal warning level: unknown SECRET=must_not_escape\n",
+        "Thermal Warning Level = -1\n",
+        "Thermal Warning Level = 4294967296\n",
+        "Unrelated thermal warning level text: 2\n",
+        "Unrelated thermal warning level: 2\n",
+    ] {
+        assert_eq!(
+            parse_macos_thermal_status(output),
+            serde_json::json!({ "status": "unknown", "reason": "thermal_warning_unavailable_or_invalid" })
+        );
+    }
 }
 
 #[test]

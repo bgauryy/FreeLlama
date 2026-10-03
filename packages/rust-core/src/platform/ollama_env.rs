@@ -39,9 +39,19 @@ pub(super) struct OllamaSettings {
     /// Why process inspection did or did not contribute.
     pub(super) process_inspection: String,
     observed_at: u64,
+    process_observed: bool,
 }
 
 impl OllamaSettings {
+    /// Missing settings are genuinely unset only after an endpoint-attributed process read.
+    pub(super) fn comparable_process_settings(&self) -> Option<Value> {
+        self.process_observed.then(|| {
+            json!({
+                "settings": self.settings,
+                "process": self.process_inspection,
+            })
+        })
+    }
     fn raw(&self, name: &str) -> Option<&str> {
         self.settings.get(name)?.value.as_deref()
     }
@@ -122,6 +132,16 @@ pub(super) fn probe(endpoint: &str) -> OllamaSettings {
     )
 }
 
+/// Fresh endpoint-attributed settings for learning; diagnostic fallback sources are insufficient.
+pub(super) fn probe_comparable_process(endpoint: &str) -> Option<Value> {
+    if !endpoint_is_loopback(endpoint) {
+        return None;
+    }
+    let (process, inspection) = process_environment(endpoint);
+    let process = process?;
+    resolve(Some(&process), |_| None, |_| None, inspection).comparable_process_settings()
+}
+
 /// Pure resolution step, separated from the OS probes so the precedence is testable.
 pub(super) fn resolve(
     process: Option<&BTreeMap<String, String>>,
@@ -169,6 +189,7 @@ pub(super) fn resolve(
         settings,
         process_inspection,
         observed_at: super::telemetry::now_seconds(),
+        process_observed: process.is_some(),
     }
 }
 

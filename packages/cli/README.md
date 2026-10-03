@@ -1,10 +1,13 @@
 # `freellama` CLI package
 
-This package is prepared to publish the `freellama` command through npm. Version 0.1.0 is not
-published to a registry. In a checkout after `yarn install`, `npx` resolves the workspace package;
-otherwise, use the release binary built at `target/release/freellama`. The JavaScript launcher
-locates the compiled Rust binary and hands the current process to it. Routing and execution logic
-remain in [`freellama-core`](../rust-core/README.md).
+Meet the agentic tool:
+
+![A cartoon llama with a full halo and small wings holds a glowing wrench beneath an open golden gate.](assets/logo.jpg)
+
+This package provides the `freellama` command through npm. Its JavaScript launcher locates the
+compiled Rust CLI in the matching optional native package and forwards arguments, signals, and exit
+status. In a source checkout, it uses `target/release/freellama` after a build. Routing and execution
+logic remain in [`freellama-core`](../rust-core/README.md).
 
 ```mermaid
 flowchart LR
@@ -67,9 +70,12 @@ models already eligible on the requested backend and reports any fallback in the
 `--min-placement-evidence observed` fails closed unless resident `/api/ps` evidence matches; use
 the default `configured` for the first bounded warm-up.
 
-The health endpoint advertises the backend, guarded-preference, and three-sample runtime-feedback
-contracts plus per-backend admission capacity. Treat a missing contract as a stale running binary,
-then rebuild and restart before testing placement.
+The health endpoint advertises backend, guarded-preference, runtime-feedback, and versioned feedback
+persistence contracts, plus per-backend admission capacity. Comparable speed samples require matching
+model digest, observed context, controls, process settings, and serial admission identity. A successful
+parallel request can report verified placement without qualifying a speed sample. See
+[feedback and adaptive profiles](../../docs/MONITORING.md#adaptive-concurrency) for sample eligibility.
+Treat a missing contract as a stale running binary, then rebuild and restart before testing placement.
 
 Authentication covers both control routes and raw Ollama passthrough. A nonloopback listener also
 requires `--allow-remote`; terminate TLS and add tenant authorization outside FreeLlama. The CLI
@@ -86,6 +92,7 @@ From the repository root:
 ```bash
 yarn install
 yarn build
+node packages/cli/bin/freellama.js --help
 ```
 
 `yarn build` compiles the host Rust release binary. In a checkout, the launcher uses

@@ -86,7 +86,7 @@ request-specific `num_ctx` from the selected task profile. The coding adapters f
 conversation inside `FREELLAMA_AGENT_NUM_CTX`: by default, they preserve the system prompt and
 original question, compact the oldest observations first, retain recent evidence, and fail before
 the Ollama call if pinned content cannot fit. Raising the Ollama server's global context does not
-disable adapter compaction or increase its configured budget. See [Agent adapters](../AGENTS.md)
+disable adapter compaction or increase its configured budget. See [Agent adapters](../../AGENTS.md)
 for the complete pagination and compaction contract.
 
 ## Current Mac audit
@@ -222,10 +222,10 @@ memory, swap, and failure counts. A higher token rate is not an improvement if
 quality falls, requests fail, or model transitions dominate the workload.
 
 Use `cargo run -- bench-all` (`packages/rust-core/src/model_bench.rs`) for model selection evidence.
-Use [CPU and GPU model routing](CPU_GPU_ROUTING.md) for the separate-process benchmark and
+Use [CPU and GPU model routing](../CPU_GPU_ROUTING.md) for the separate-process benchmark and
 verification procedure.
 
-- Local-model router RFC — lived in the gitignored `.octocode/` workspace and is no longer in the tree; the shipped design it argued for is [ARCHITECTURE.md](ARCHITECTURE.md)
+- Local-model router RFC — lived in the gitignored `.octocode/` workspace and is no longer in the tree; the shipped design it argued for is [ARCHITECTURE.md](../ARCHITECTURE.md)
 
 ## Recommended next work
 

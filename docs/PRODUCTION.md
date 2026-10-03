@@ -32,8 +32,9 @@ The [release workflow](../.github/workflows/release.yml) builds CLI and native a
 targets, assembles packages, verifies package contents, and publishes on version tags. The
 [CI workflow](../.github/workflows/ci.yml) runs Rust checks on macOS, Linux, and Windows, plus
 JavaScript/native checks on macOS and Linux. These workflows do not prove driver compatibility or
-complete the hardware promotion checklist below. Release publishing depends on artifact builds,
-not on a successful run of every CI or hardware lane; verify those receipts before tagging.
+complete the hardware promotion checklist below. Release artifact builds depend on the reusable CI checks.
+The publish step also verifies that a version tag matches the workspace version.
+Live E2E and hardware qualification remain separate operator checks; verify those receipts before tagging.
 
 For manual assembly, build and test every claimed target in a clean
 environment, place each executable and matching addon under `release-artifacts/<target>/`, run
@@ -59,8 +60,11 @@ swap, eviction churn, or unacceptable queueing.
 | `OLLAMA_MAX_QUEUE` | Workload-specific, bounded value | Limits Ollama's internal queue independently of FreeLlama admission |
 
 Do not set a global `OLLAMA_CONTEXT_LENGTH` merely to maximize the advertised window. Managed
-FreeLlama tasks send the smallest sufficient request-specific `num_ctx`; a larger context and a
-larger `OLLAMA_NUM_PARALLEL` multiply K/V-cache memory. Direct Ollama clients still follow the
+FreeLlama text tasks estimate a sufficient context and can omit `num_ctx` when Ollama's known default
+covers the request within the configured automatic bound. Explicit context requests send `num_ctx`.
+A larger context and a larger `OLLAMA_NUM_PARALLEL` multiply K/V-cache memory. See
+[context sizing](MONITORING.md#context-sizing-and-ollamas-defaults) for defaults and receipts.
+Direct Ollama clients still follow the
 server's context configuration. Current context documentation describes VRAM-tiered 4k/32k/256k
 defaults while the FAQ still says 4096, so treat `/api/ps` `context_length` after load as authority.
 
@@ -95,7 +99,7 @@ flowchart LR
 
 These values are conservative starting points, not universal constants. NVIDIA, AMD, Apple, and
 CPU-only hosts must pass hardware validation before promotion. See
-[Ollama and FreeLlama optimization](OLLAMA_SYSTEM_OPTIMIZATION.md) for the ownership boundary and
+[Ollama and FreeLlama optimization](dev/OLLAMA_SYSTEM_OPTIMIZATION.md) for the ownership boundary and
 [Run models on CPU and GPU](CPU_GPU_ROUTING.md) for device-specific controls.
 
 Put the values in the service manager that owns each Ollama process: launchd on macOS, systemd or

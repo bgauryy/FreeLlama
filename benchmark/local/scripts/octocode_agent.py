@@ -29,7 +29,7 @@ from agent_context import (
     parse_json_action,
     write_failure_result,
 )
-from agent_transport import chat_request, request_headers, unwrap_chat_response, PromptCacheUsage, retryable_chat_error, resolve_model_identity
+from agent_transport import chat_request, request_headers, unwrap_chat_response, PromptCacheUsage, retryable_chat_error, resolve_model_identity, chat_error_details
 
 OCTOCODE_TOOLS = {"localViewStructure", "localFindFiles", "localSearchCode", "localGetFileContent", "lspGetSemantics"}
 PATH_KEYS = ("path", "uri")
@@ -111,7 +111,7 @@ def run_octocode(
 
 
 def system_prompt(workspace: str) -> str:
-    return f"""You are a local coding agent in an isolated benchmark workspace at {workspace}. You may not read or search files directly — you can only call the `octocode` local tools below. Return exactly one JSON object per turn.
+    return f"""You are a local code-research agent in a read-only workspace at {workspace}. Read or search files only through the `octocode` local tools below. Return exactly one JSON object per turn.
 
 Tools (call as {{"action":"octocode","tool":"<name>","queries":{{...}}}}):
 
@@ -139,13 +139,13 @@ lspGetSemantics - LSP semantic queries: definitions, references, callers/callees
   uri (string, required, absolute path), type ("definition"|"references"|"callers"|
   "callees"|"documentSymbols"|"hover"), symbolName (exact name), lineHint (int from a prior
   search result — never guess it).
-  Empty result means the server is still indexing, not "not found". Retry once or prefer
-  localSearchCode instead (needs no index, never cold).
+  An empty result is ambiguous: indexing or unavailable analysis can produce no symbols.
+  Retry once or use localSearchCode; an empty LSP result alone does not prove absence.
 
 Read another page of an earlier step: {{"action":"page","step":2,"page":2}}
-Long output is PAGINATED, never truncated — you see page 1 and the total, and nothing is discarded.
-"Not found" is only a real answer once you have seen every page you need. Paging re-reads stored
-output and does NOT re-run the tool, so it is cheaper than repeating a search.
+Full tool output is stored in pages; you see page 1 and the total. Context fitting can shorten
+an observation in the conversation. Request its stored page to recover the evidence without
+re-running the tool. Claim "not found" only after checking the relevant search scope and pages.
 
 Finish with: {{"action":"finish","answer":"concise final answer with repository-relative evidence"}}
 
@@ -155,13 +155,13 @@ is rejected and costs one bounded repair turn.
 
 SCOPE YOUR SEARCHES. Pass excludeDir/exclude on every search in a real workspace —
 ["node_modules","target",".venv","dist","build",".git","vendor","__pycache__",".octocode"] — or
-vendored and generated files will bury the answer. Matches under fixtures/, mocks/ or examples/ are
-scaffolding, NOT the real implementation. Prefer src/, packages/*/src/ and lib/, and name the file
-you took the answer from. Absence of a match is weak evidence: widen the pattern before concluding
+vendored and generated files will bury the answer. For implementation questions, prefer src/,
+packages/*/src/ and lib/ before fixtures, mocks, or examples. If the question targets tests or examples,
+inspect those files. Name the file that supplies the answer. Absence of a match is weak evidence: widen the pattern before concluding
 something does not exist.
-ASKED FOR A DEFAULT? Find the DECLARATION, not test occurrences. Declarations look like
+For a production default, find its declaration before relying on test occurrences. Declarations look like
 `default=`, `unwrap_or(`, `const `, `static `, or a settings schema initializer.
-Test files define nothing — they only consume values declared elsewhere.
+For a test-specific default or fixture, inspect its test declaration.
 
 All paths you pass must resolve inside the workspace; relative paths are resolved against the
 workspace root automatically. Orient cheap (localViewStructure) before reading in
@@ -196,6 +196,7 @@ def _main(resources: ExitStack) -> int:
     execution_receipts: list[dict[str, Any]] = []
     answer = ""
     failure: str | None = None
+    transport_error: dict[str, Any] | None = None
     calibration_dir = os.environ.get("FREELLAMA_AGENT_TOKEN_CALIBRATION_DIR", "").strip()
     calibration_model_identity = (
         resolve_model_identity(managed_endpoint or endpoint, model, messages[0]["content"])
@@ -281,7 +282,8 @@ def _main(resources: ExitStack) -> int:
         try:
             response = call_model()
         except (HTTPError, URLError, TimeoutError) as error:
-            failure = f"agent response failed: {type(error).__name__}: {error}"
+            diagnostic, transport_error = chat_error_details(error)
+            failure = f"agent response failed: {diagnostic}"
             break
         raw = str(response.get("message", {}).get("content", ""))
         try:
@@ -359,7 +361,8 @@ def _main(resources: ExitStack) -> int:
                     raise ValueError("forced final response was not finish")
                 answer = str(final_action.get("answer", "")).strip()
             except (HTTPError, URLError, TimeoutError, ValueError, json.JSONDecodeError) as error:
-                failure = f"agent exceeded {runtime.max_turns} turns and finalization failed: {type(error).__name__}: {error}"
+                diagnostic, transport_error = chat_error_details(error)
+                failure = f"agent exceeded {runtime.max_turns} turns and finalization failed: {diagnostic}"
 
     if not answer:
         answer = failure or "agent stopped without a final answer"
@@ -382,6 +385,7 @@ def _main(resources: ExitStack) -> int:
             "execution_preference": execution_preference,
             "min_placement_evidence": min_placement_evidence,
             "execution_receipts": execution_receipts,
+            **({"transport_error": transport_error} if transport_error else {}),
             "cache_token_metrics": cache_usage.metadata(),
             "calibration_model_identity": calibration_model_identity,
         },

@@ -13,6 +13,7 @@ use anyhow::{Context, Result};
 use axum::{Json, extract::State, http::StatusCode};
 use reqwest::Client;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     sync::Arc,
     time::{Duration, Instant},
@@ -138,7 +139,7 @@ fn require_observed_placement(
         .expect("selected route comes from the supplied catalog");
     let observation = physical_placement_observation(
         execution.placement,
-        selected.resident.then_some(selected.size),
+        selected.resident_size,
         selected.resident_vram,
     );
     if observation["status"] == "verified" {
@@ -158,6 +159,7 @@ pub(super) async fn select_managed_route(
     models: &[CatalogModel],
     sessions: &SessionAffinity,
     task_cost_units: u32,
+    profile_input: Option<&TaskInput>,
 ) -> Result<ManagedDecision, ApiError> {
     let has_session_affinity = input
         .session_id
@@ -167,22 +169,18 @@ pub(super) async fn select_managed_route(
     let route_is_pinned = input.model.is_some() || has_session_affinity;
     let gpu_candidate = route_candidate_for(state, input, models, sessions, "gpu");
     let cpu_candidate = route_candidate_for(state, input, models, sessions, "cpu");
-    let (gpu_work_unit_ns, cpu_work_unit_ns) = {
-        let feedback = state.feedback.read().await;
-        (
-            gpu_candidate.as_ref().and_then(|route| {
-                feedback
-                    .gpu
-                    .get(&input.task)
-                    .and_then(|stats| stats.average_for_model(&route.selected_model))
-            }),
-            cpu_candidate.as_ref().and_then(|route| {
-                feedback
-                    .cpu
-                    .get(&input.task)
-                    .and_then(|stats| stats.average_for_model(&route.selected_model))
-            }),
+    let (gpu_work_unit_ns, cpu_work_unit_ns) = if route_is_pinned {
+        (None, None)
+    } else {
+        matching_route_profile_scores(
+            state,
+            input,
+            models,
+            task_cost_units,
+            profile_input,
+            (gpu_candidate.as_ref(), cpu_candidate.as_ref()),
         )
+        .await
     };
     let desired = desired_placement(PlacementSignals {
         route_is_pinned,
@@ -254,6 +252,46 @@ pub(super) async fn select_managed_route(
         reason,
         placement_evidence: input.min_placement_evidence,
     })
+}
+
+async fn matching_route_profile_scores(
+    state: &PlatformState,
+    input: &RouteInput,
+    models: &[CatalogModel],
+    task_cost_units: u32,
+    profile_input: Option<&TaskInput>,
+    candidates: (Option<&RouteDecision>, Option<&RouteDecision>),
+) -> (Option<u128>, Option<u128>) {
+    if input.execution_preference != ExecutionPreference::Auto
+        || !matches!(
+            input.objective,
+            super::Objective::Fastest | super::Objective::Balanced
+        )
+    {
+        return (None, None);
+    }
+    let (Some(gpu), Some(cpu), Some(payload)) = (candidates.0, candidates.1, profile_input) else {
+        return (None, None);
+    };
+    let (gpu_profile, cpu_profile) = tokio::join!(
+        routing_profile(state, input, gpu, models, task_cost_units, payload),
+        routing_profile(state, input, cpu, models, task_cost_units, payload)
+    );
+    let feedback = state.feedback.read().await;
+    (
+        gpu_profile.as_ref().and_then(|profile| {
+            feedback
+                .gpu
+                .get(&input.task)
+                .and_then(|stats| stats.average_for_profile(profile))
+        }),
+        cpu_profile.as_ref().and_then(|profile| {
+            feedback
+                .cpu
+                .get(&input.task)
+                .and_then(|stats| stats.average_for_profile(profile))
+        }),
+    )
 }
 
 fn requests_immediate_unload(value: Option<&str>) -> bool {
@@ -369,7 +407,15 @@ fn build_managed_request(
     if matches!(input.operation, super::warming::ManagedOperation::Warm) {
         return Ok((
             "/api/chat",
-            json!({"model":decision.selected_model,"messages":[],"stream":false,"keep_alive":keep_alive,"options":decision.options}),
+            json!({
+                "model": decision.selected_model,
+                "messages": [],
+                "stream": false,
+                "truncate": false,
+                "shift": false,
+                "keep_alive": keep_alive,
+                "options": decision.options,
+            }),
         ));
     }
     if matches!(input.route.task, TaskKind::Embedding) {
@@ -435,26 +481,31 @@ fn build_managed_request(
 pub(super) async fn admit(
     state: &PlatformState,
     execution: &ExecutionTarget,
-    task: TaskKind,
+    requested_cost: u32,
     priority: TaskPriority,
-    batch_items: usize,
     deadline: tokio::time::Instant,
     resource_waiter: Option<ResourceWaitGuard>,
 ) -> Result<(AdmissionPermit, u32, u128), ApiError> {
     let budget = u32::try_from(execution.admission.total())
         .unwrap_or(u32::MAX)
         .max(1);
-    let cost = task_cost_for(task, batch_items).min(budget).max(1);
+    let cost = requested_cost.min(budget).max(1);
     let acquired = if let Some(waiter) = resource_waiter {
-        waiter.acquire(cost as usize, priority, deadline).await
+        waiter
+            .acquire(requested_cost.max(1) as usize, priority, deadline)
+            .await
     } else {
         execution
             .admission
-            .acquire(cost as usize, priority, deadline)
+            .acquire(requested_cost.max(1) as usize, priority, deadline)
             .await
     };
     match acquired {
-        Ok((permit, queued)) => Ok((permit, cost, queued)),
+        Ok((permit, queued)) => {
+            let charged = u32::try_from(permit.units())
+                .expect("admission charge cannot exceed the u32 requested cost");
+            Ok((permit, charged, queued))
+        }
         Err(failure) => Err(admission_error(state, execution, priority, cost, failure)),
     }
 }
@@ -767,6 +818,7 @@ async fn run_session_task(
     }
     require_active_session(&state, input.route.session_id.as_deref()).await?;
     let batch_items = input_batch_items(&input);
+    let requested_cost = task_cost_for(input.route.task, batch_items, &state.tunables());
     let models = discover_models(&state).await?;
     let sessions = state.sessions.read().await;
     let mut managed = select_managed_route(
@@ -774,7 +826,8 @@ async fn run_session_task(
         &input.route,
         &models,
         &sessions,
-        task_cost_for(input.route.task, batch_items),
+        requested_cost,
+        Some(&input),
     )
     .await?;
     drop(sessions);
@@ -808,9 +861,7 @@ async fn run_session_task(
         ));
     }
 
-    let mut execution_receipt = managed
-        .execution_receipt(task_cost_for(input.route.task, batch_items), &state)
-        .await;
+    let mut execution_receipt = managed.execution_receipt(requested_cost, &state).await;
     execution_receipt["context_sizing"] = context_sizing;
     execution_receipt["model_digest"] = json!(managed.model.digest);
     if let Some(progress) = &progress {
@@ -891,9 +942,8 @@ async fn run_session_task(
     let (mut slot, mut cost, mut queue_wait_ms) = admit(
         &state,
         &execution,
-        decision.task,
+        requested_cost,
         input.priority,
-        batch_items,
         queue_deadline,
         None,
     )
@@ -1011,9 +1061,8 @@ async fn run_session_task(
             let (readmitted, readmitted_cost, requeued_ms) = admit(
                 &state,
                 &execution,
-                decision.task,
+                requested_cost,
                 input.priority,
-                batch_items,
                 queue_deadline,
                 Some(resource_waiter),
             )
@@ -1258,15 +1307,203 @@ fn record_upstream_outcome(
     }
 }
 
-/// Feed adaptive concurrency and the service-time average with one finished upstream call.
+#[derive(Clone, Copy)]
+struct ProfileEvidence<'a> {
+    task: TaskKind,
+    model: &'a str,
+    catalog_digest: Option<&'a str>,
+    upstream: &'a str,
+    body: &'a Value,
+    placement: &'a Value,
+    dispatch_admission: &'a Value,
+    completion_admission: &'a Value,
+    dispatch_settings: Option<&'a Value>,
+    completion_settings: Option<&'a Value>,
+    warm: bool,
+}
+
+fn unchanged_admission_interval(start: &Value, end: &Value) -> bool {
+    [
+        "admitted",
+        "released",
+        "policy_epoch",
+        "slots_total",
+        "slots_ceiling",
+        "active_units",
+        "in_flight",
+    ]
+    .into_iter()
+    .all(|field| {
+        start[field]
+            .as_u64()
+            .is_some_and(|value| end[field].as_u64() == Some(value))
+    })
+}
+
+fn profile_from_observations(
+    evidence: ProfileEvidence<'_>,
+) -> Result<super::runtime::ExecutionProfile, &'static str> {
+    if evidence.placement["status"] != "verified" {
+        return Err("physical_placement_unverified");
+    }
+    let processor = evidence.placement["processor"]
+        .as_str()
+        .ok_or("processor_identity_unknown")?;
+    let digest = evidence.placement["digest"]
+        .as_str()
+        .filter(|digest| !digest.is_empty())
+        .ok_or("model_revision_unknown")?;
+    if evidence.catalog_digest != Some(digest) {
+        return Err("model_revision_mismatch_or_unknown");
+    }
+    let context = evidence.placement["context_length"]
+        .as_u64()
+        .filter(|context| *context > 0)
+        .ok_or("observed_context_unknown")?;
+    let options = evidence.body["options"]
+        .as_object()
+        .ok_or("effective_options_unknown")?;
+    if options.get("num_ctx").and_then(Value::as_u64) != Some(context) {
+        return Err("effective_context_mismatch_or_unknown");
+    }
+    if !evidence.warm {
+        return Err("runner_transition_not_comparable");
+    }
+    if evidence.dispatch_admission["in_flight"] != 1
+        || evidence.completion_admission["in_flight"] != 1
+        || !unchanged_admission_interval(evidence.dispatch_admission, evidence.completion_admission)
+    {
+        return Err("admission_occupancy_or_policy_not_comparable");
+    }
+    let settings = evidence
+        .dispatch_settings
+        .ok_or("backend_process_settings_unknown")?;
+    if evidence.completion_settings != Some(settings) {
+        return Err("backend_process_settings_changed_or_unknown");
+    }
+    let controls: serde_json::Map<String, Value> = [
+        "options",
+        "think",
+        "format",
+        "tools",
+        "logprobs",
+        "top_logprobs",
+        "dimensions",
+    ]
+    .into_iter()
+    .map(|key| (key.to_owned(), evidence.body[key].clone()))
+    .collect();
+    let metric_kind = super::runtime::ThroughputMetricKind::for_task(evidence.task);
+    let mut material = json!({
+        "metric_kind": metric_kind,
+        "task": evidence.task, "model": evidence.model, "digest": digest,
+        "upstream": evidence.upstream, "processor": processor, "context_tokens": context,
+        "controls": controls, "backend_settings": settings,
+        "admission_class": {"in_flight":1,"limit":evidence.dispatch_admission["slots_total"],
+            "ceiling":evidence.dispatch_admission["slots_ceiling"],"charged_units":evidence.dispatch_admission["active_units"]},
+    });
+    material.sort_all_objects();
+    let bytes = serde_json::to_vec(&material).expect("profile material serializes");
+    Ok(super::runtime::ExecutionProfile {
+        id: format!("{:x}", Sha256::digest(bytes)),
+        task: evidence.task,
+        model: evidence.model.to_owned(),
+        digest: digest.to_owned(),
+        context_tokens: context,
+        processor: processor.to_owned(),
+        metric_kind,
+    })
+}
+
+async fn comparable_backend_settings(
+    _state: &PlatformState,
+    execution: &ExecutionTarget,
+) -> Option<Value> {
+    let endpoint = execution.upstream.clone();
+    tokio::task::spawn_blocking(move || super::ollama_env::probe_comparable_process(&endpoint))
+        .await
+        .ok()
+        .flatten()
+}
+
+async fn routing_profile(
+    state: &PlatformState,
+    input: &RouteInput,
+    route: &RouteDecision,
+    models: &[CatalogModel],
+    requested_cost: u32,
+    payload: &TaskInput,
+) -> Option<super::runtime::ExecutionProfile> {
+    input.context_tokens?;
+    if matches!(payload.operation, super::warming::ManagedOperation::Warm) {
+        return None;
+    }
+    let execution = execution_target(state, &route.selected_model);
+    let before = execution.admission.receipt();
+    if before["in_flight"] != 0 || before["active_units"] != 0 {
+        return None;
+    }
+    let settings = comparable_backend_settings(state, &execution).await?;
+    let loaded = resident_entry(&state.client, &execution.upstream, &route.selected_model).await?;
+    let after = execution.admission.receipt();
+    if !unchanged_admission_interval(&before, &after) {
+        return None;
+    }
+    let mut effective = route.clone();
+    apply_request_options(input.task, &mut effective, &payload.request_options).ok()?;
+    let mut body = if matches!(input.task, TaskKind::Embedding) {
+        json!({"options":effective.options})
+    } else {
+        json!({"options":effective.options,"think":effective.think,"tools":payload.tools,
+            "format":payload.request_options.format,"logprobs":payload.request_options.logprobs,
+            "top_logprobs":payload.request_options.top_logprobs})
+    };
+    apply_execution_options(&mut body, &execution);
+    let model = models
+        .iter()
+        .find(|model| model.name == route.selected_model)?;
+    let mut placement = physical_placement_observation(
+        execution.placement,
+        loaded["size"].as_u64(),
+        loaded["size_vram"].as_u64(),
+    );
+    placement["digest"] = loaded["digest"].clone();
+    placement["context_length"] = loaded["context_length"].clone();
+    let mut prospective = before;
+    prospective["in_flight"] = json!(1);
+    prospective["active_units"] = json!(
+        u64::from(requested_cost)
+            .min(prospective["slots_total"].as_u64()?)
+            .max(1)
+    );
+    profile_from_observations(ProfileEvidence {
+        task: input.task,
+        model: &route.selected_model,
+        catalog_digest: model.digest.as_deref(),
+        upstream: &execution.upstream,
+        body: &body,
+        placement: &placement,
+        dispatch_admission: &prospective,
+        completion_admission: &prospective,
+        dispatch_settings: Some(&settings),
+        completion_settings: Some(&settings),
+        warm: true,
+    })
+    .ok()
+}
+
+/// Feed adaptive concurrency with comparable observed feedback or a backend safety signal.
 async fn observe_completion(
     state: &PlatformState,
     execution: &ExecutionTarget,
-    model: &str,
     failed: bool,
-    output_tokens_per_second: Option<f64>,
+    profile: Option<&super::runtime::ExecutionProfile>,
+    metric: Option<super::runtime::ThroughputMetric>,
 ) {
     if !super::monitor::adaptive_applies(state, execution.placement) {
+        state
+            .adaptive_for(execution.placement)
+            .reset_healthy_streak();
         return;
     }
     let observation = state.resources.snapshot().await.observation;
@@ -1279,10 +1516,10 @@ async fn observe_completion(
     let change = state.adaptive_for(execution.placement).observe(
         &execution.admission,
         &super::runtime::Completion {
-            model,
+            profile,
             failed,
             memory_pressure,
-            output_tokens_per_second,
+            metric: metric.filter(|_| profile.is_some()),
         },
     );
     super::runtime::note_limit_change(&state.telemetry, execution.placement, change);
@@ -1710,8 +1947,9 @@ async fn validate_upstream_completion(
     value: Value,
     immediate_unload: bool,
 ) -> Result<Value, ApiError> {
-    let incomplete = path == "/api/chat" && value["done"] == false;
     let reported_error = value.get("error").is_some_and(|error| !error.is_null());
+    let incomplete =
+        status.is_success() && !reported_error && path == "/api/chat" && value["done"] != true;
     if !status.is_success() || incomplete || reported_error {
         // A completed HTTP exchange can still contain an incomplete generation or an error.
         // Do not train feedback or bind affinity. Honor this request's immediate-unload contract,
@@ -1727,7 +1965,7 @@ async fn validate_upstream_completion(
             "upstream_error"
         };
         let message = if incomplete {
-            "Ollama returned done:false for a non-streaming managed request".to_owned()
+            "Ollama did not return done:true for a non-streaming managed request".to_owned()
         } else {
             value["error"]
                 .as_str()
@@ -1764,6 +2002,16 @@ async fn forward_managed_task(
     immediate_unload: bool,
     breaker_probe: Option<super::runtime::BreakerProbe>,
 ) -> Result<Json<Value>, ApiError> {
+    let mut completion_guard = super::monitor::adaptive_applies(state, execution.placement)
+        .then(|| state.adaptive_for(execution.placement).completion_guard());
+    let initial_admission = execution.admission.receipt();
+    let dispatch_settings =
+        if admission_mode == "resident_shared" && initial_admission["in_flight"] == 1 {
+            comparable_backend_settings(state, execution).await
+        } else {
+            None
+        };
+    let dispatch_admission = execution.admission.receipt();
     let posted = post_json_with_retries(state, &execution.upstream, path, &body).await;
     let upstream_failed = match &posted {
         Err(_) => true,
@@ -1771,7 +2019,7 @@ async fn forward_managed_task(
     };
     record_upstream_outcome(state, execution, breaker_probe, upstream_failed);
     if upstream_failed {
-        observe_completion(state, execution, &decision.selected_model, true, None).await;
+        observe_completion(state, execution, true, None, None).await;
     }
     let (status, value) = match posted {
         Ok(response) => response,
@@ -1799,21 +2047,63 @@ async fn forward_managed_task(
     )
     .await?;
     let metrics = runtime_metrics(&value);
+    let placement = observe_physical_placement(state, execution, &decision.selected_model).await;
+    let feedback_accepted = placement["status"] == "verified";
+    let observed_admission = execution.admission.receipt();
+    let completion_settings = if dispatch_settings.is_some()
+        && unchanged_admission_interval(&dispatch_admission, &observed_admission)
+    {
+        comparable_backend_settings(state, execution).await
+    } else {
+        None
+    };
+    let completion_admission = execution.admission.receipt();
+    let learning_profile = profile_from_observations(ProfileEvidence {
+        task: decision.task,
+        model: &decision.selected_model,
+        catalog_digest: execution_receipt["model_digest"].as_str(),
+        upstream: &execution.upstream,
+        body: &body,
+        placement: &placement,
+        dispatch_admission: &dispatch_admission,
+        completion_admission: &completion_admission,
+        dispatch_settings: dispatch_settings.as_ref(),
+        completion_settings: completion_settings.as_ref(),
+        warm: admission_mode == "resident_shared",
+    });
+    let diagnostic_work_score = if admission_mode == "resident_shared" {
+        feedback_work_unit_ns(decision.task, &value)
+    } else {
+        None
+    };
+    let work_score = learning_profile.as_ref().ok().and(diagnostic_work_score);
+    let adaptive_metric = adaptive_throughput_metric(decision.task, &value);
+    execution_receipt["throughput_learning"] = json!({
+        "eligible": work_score.is_some(),
+        "profile_eligible": learning_profile.is_ok(),
+        "adaptive_eligible": learning_profile.is_ok() && adaptive_metric.is_some(),
+        "reason": learning_profile.as_ref().err().copied().unwrap_or(if work_score.is_some() {"comparable_observed_profile"} else {"work_unit_metrics_unknown"}),
+        "profile": learning_profile.as_ref().ok(),
+        "metric_kind": adaptive_metric.map(|metric| metric.kind),
+        "metric_value": adaptive_metric.map(|metric| metric.tokens_per_second),
+        "scope": "observed_controls_and_serial_freellama_admission",
+    });
     observe_completion(
         state,
         execution,
-        &decision.selected_model,
         false,
-        metrics["output_tokens_per_second"].as_f64(),
+        learning_profile.as_ref().ok(),
+        adaptive_metric,
     )
     .await;
-    let placement = observe_physical_placement(state, execution, &decision.selected_model).await;
+    if let Some(guard) = &mut completion_guard {
+        guard.complete();
+    }
     state.footprints.lock().await.observe(
         &execution.upstream,
         execution_receipt["model_digest"].as_str(),
         &placement,
     );
-    let feedback_accepted = placement["status"] == "verified";
     execution_receipt["observation"] = placement;
     let slots_total = execution.admission.total();
     // Report throttling rather than hiding it. A caller that fans out embeddings needs to know it
@@ -1828,15 +2118,18 @@ async fn forward_managed_task(
         };
         let observation = by_task.entry(decision.task).or_default();
         if feedback_accepted {
-            let warm_score = if admission_mode == "resident_shared" {
-                feedback_work_unit_ns(decision.task, &value)
-            } else {
-                None
-            };
-            observation.record(&decision.selected_model, warm_score, queue_wait_ms);
+            observation.record(
+                &decision.selected_model,
+                diagnostic_work_score,
+                queue_wait_ms,
+            );
+            if let (Ok(profile), Some(duration)) = (&learning_profile, work_score) {
+                observation.record_profile(profile, duration);
+            }
         }
         let mut receipt = observation.receipt();
         receipt["accepted"] = json!(feedback_accepted);
+        receipt["throughput_learning"] = execution_receipt["throughput_learning"].clone();
         receipt["reason"] = json!(if feedback_accepted {
             "physical_placement_verified"
         } else {
@@ -1940,25 +2233,30 @@ async fn observe_physical_placement(
         return json!({
             "processor": "unknown",
             "status": "unavailable",
+            "resident": null,
             "source": "ollama_api_ps_after_execution"
         });
     };
-    let running = ps
-        .get("models")
-        .and_then(Value::as_array)
-        .and_then(|models| {
-            models.iter().find(|entry| {
-                entry
-                    .get("name")
-                    .or_else(|| entry.get("model"))
-                    .and_then(Value::as_str)
-                    == Some(model)
-            })
+    let Some(models) = ps.get("models").and_then(Value::as_array) else {
+        return json!({
+            "processor": "unknown",
+            "status": "unavailable",
+            "resident": null,
+            "source": "ollama_api_ps_after_execution"
         });
+    };
+    let running = models.iter().find(|entry| {
+        entry
+            .get("name")
+            .or_else(|| entry.get("model"))
+            .and_then(Value::as_str)
+            == Some(model)
+    });
     let Some(running) = running else {
         return json!({
             "processor": "unknown",
             "status": "not_resident",
+            "resident": false,
             "source": "ollama_api_ps_after_execution"
         });
     };
@@ -1967,6 +2265,7 @@ async fn observe_physical_placement(
         running.get("size").and_then(Value::as_u64),
         running.get("size_vram").and_then(Value::as_u64),
     );
+    observation["resident"] = json!(true);
     observation["context_length"] = running
         .get("context_length")
         .cloned()
@@ -2018,7 +2317,6 @@ pub(super) fn physical_placement_observation(
         (_, Some(0)) => "cpu",
         (Some(size), Some(vram)) if size > 0 && vram >= size => "gpu",
         (Some(size), Some(vram)) if size > 0 && vram > 0 => "mixed",
-        (None, Some(vram)) if vram > 0 => "gpu",
         _ => "unknown",
     };
     let status = if processor == "unknown" {
@@ -2053,9 +2351,26 @@ pub(super) fn feedback_work_unit_ns(task: TaskKind, response: &Value) -> Option<
         )
     };
     match (duration, units) {
-        (Some(duration), Some(units)) if duration > 0 && units > 0 => Some(duration / units),
+        (Some(duration), Some(units)) if duration > 0 && units > 0 && duration / units > 0 => {
+            Some(duration / units)
+        }
         _ => None,
     }
+}
+
+fn adaptive_throughput_metric(
+    task: TaskKind,
+    response: &Value,
+) -> Option<super::runtime::ThroughputMetric> {
+    let rate = if matches!(task, TaskKind::Embedding) {
+        tokens_per_second(Some(1), Some(feedback_work_unit_ns(task, response)?))?
+    } else {
+        runtime_metrics(response)["output_tokens_per_second"].as_f64()?
+    };
+    (rate.is_finite() && rate > 0.0).then_some(super::runtime::ThroughputMetric {
+        kind: super::runtime::ThroughputMetricKind::for_task(task),
+        tokens_per_second: rate,
+    })
 }
 
 /// Extract prompt-free performance fields from an Ollama response.
@@ -2097,38 +2412,19 @@ fn tokens_per_second(count: Option<u64>, duration_ns: Option<u64>) -> Option<f64
     Some(count as f64 * 1_000_000_000.0 / duration_ns as f64)
 }
 
-/// Admission cost of a task, in slot units.
-///
-/// A flat per-request count is the wrong unit for local inference: embedding, text generation, and
-/// image-prefill work are not interchangeable. `FreeLlama` can apply coarse task weights because it
-/// knows the task class; Ollama receives an opaque HTTP request and sees memory only after it starts
-/// scheduling the runner.
-///
-/// Deliberately coarse. These are relative costs, not a memory model; Ollama owns the real
-/// memory-fit decision (`server/sched.go` evicts when a load is predicted to exceed 80% of free
-/// memory) and duplicating that here would mean maintaining a worse copy of it.
-pub(super) fn task_cost(task: TaskKind) -> u32 {
-    match task {
-        // No autoregressive decode; batching remains the preferred throughput path.
-        TaskKind::Embedding => 1,
-        // Image payload and multimodal prefill in addition to generation.
-        TaskKind::Vision => 4,
-        _ => 2,
-    }
-}
-
 /// Charge an embedding batch for its actual cardinality. Ollama executes a batched `/api/embed`
 /// request as more work than a single string even though it remains materially cheaper than N
-/// independent HTTP calls. The cap prevents an input array from reserving more than the backend
-/// can ever supply; `admit` applies the final backend-specific cap.
-fn task_cost_for(task: TaskKind, batch_items: usize) -> u32 {
+/// independent HTTP calls. Arithmetic saturates at the maximum supported weight; `admit` applies
+/// the backend-specific cap when the task acquires its permit.
+fn task_cost_for(task: TaskKind, batch_items: usize, tunables: &super::runtime::Tunables) -> u32 {
+    let base = tunables.task_cost(task);
     if !matches!(task, TaskKind::Embedding) {
-        return task_cost(task);
+        return base;
     }
     let items = u32::try_from(batch_items.max(1)).unwrap_or(u32::MAX);
-    // One unit covers up to four compact embedding inputs; each additional group of four adds a
-    // unit. This is an intentionally transparent queueing weight, not an invented VRAM estimate.
-    items.saturating_add(3) / 4
+    // The configured base covers each group of up to four inputs. This is a queueing weight,
+    // not a VRAM estimate.
+    items.div_ceil(4).saturating_mul(base)
 }
 
 fn input_batch_items(input: &TaskInput) -> usize {
@@ -2244,6 +2540,310 @@ mod gpu_budget_tests {
             };
             apply_discrete_gpu_budget(&mut footprint, 8000, &observation);
             assert_eq!(footprint["required_available_bytes"], expected);
+        }
+    }
+}
+
+#[cfg(test)]
+mod execution_profile_tests {
+    use super::super::runtime::{
+        AdaptiveLimiter, Completion, ThroughputMetric, ThroughputMetricKind,
+    };
+    use super::*;
+    use std::collections::BTreeMap;
+
+    struct Observations {
+        task: TaskKind,
+        body: Value,
+        placement: Value,
+        start: Value,
+        end: Value,
+        settings: Option<Value>,
+        end_settings: Option<Value>,
+        digest: String,
+        upstream: String,
+    }
+    impl Observations {
+        fn new() -> Self {
+            let settings = super::super::ollama_env::resolve(
+                Some(&BTreeMap::new()),
+                |_| None,
+                |_| None,
+                "observed fixture pid 42".into(),
+            )
+            .comparable_process_settings();
+            let admission = json!({"in_flight":1,"active_units":2,"slots_total":4,"slots_ceiling":4,"admitted":1,"released":0,"policy_epoch":0});
+            Self {
+                task: TaskKind::Completion,
+                body: json!({"options":{"num_ctx":4096,"num_predict":512},"think":false,"prompt":"private prompt"}),
+                placement: json!({"status":"verified","processor":"gpu","digest":"revision-a","context_length":4096}),
+                start: admission.clone(),
+                end: admission,
+                end_settings: settings.clone(),
+                settings,
+                digest: "revision-a".into(),
+                upstream: "http://127.0.0.1:11434".into(),
+            }
+        }
+        fn profile(&self) -> Result<super::super::runtime::ExecutionProfile, &'static str> {
+            profile_from_observations(ProfileEvidence {
+                task: self.task,
+                model: "model:latest",
+                catalog_digest: Some(&self.digest),
+                upstream: &self.upstream,
+                body: &self.body,
+                placement: &self.placement,
+                dispatch_admission: &self.start,
+                completion_admission: &self.end,
+                dispatch_settings: self.settings.as_ref(),
+                completion_settings: self.end_settings.as_ref(),
+                warm: true,
+            })
+        }
+    }
+
+    fn trained_limiter(
+        profile: &super::super::runtime::ExecutionProfile,
+    ) -> (AdmissionPool, AdaptiveLimiter) {
+        let pool = AdmissionPool::new(4, 4);
+        let limiter = AdaptiveLimiter::default();
+        for _ in 0..3 {
+            limiter.observe(
+                &pool,
+                &Completion {
+                    profile: Some(profile),
+                    failed: false,
+                    memory_pressure: false,
+                    metric: Some(ThroughputMetric {
+                        kind: ThroughputMetricKind::OutputTokensPerSecond,
+                        tokens_per_second: 100.0,
+                    }),
+                },
+            );
+        }
+        (pool, limiter)
+    }
+
+    #[test]
+    fn comparable_profile_accumulates_but_distinct_execution_controls_do_not_mix() {
+        let original = Observations::new().profile().unwrap();
+        let changes: &[fn(&mut Observations)] = &[
+            |facts| {
+                facts.body["options"]["num_ctx"] = json!(8192);
+                facts.placement["context_length"] = json!(8192);
+            },
+            |facts| {
+                facts.digest = "revision-b".into();
+                facts.placement["digest"] = json!("revision-b");
+            },
+            |facts| {
+                facts.placement["processor"] = json!("cpu");
+                facts.upstream = "http://127.0.0.1:11436".into();
+            },
+            |facts| {
+                facts.body["options"]["num_thread"] = json!(1);
+            },
+            |facts| {
+                facts.body["options"]["temperature"] = json!(0.8);
+            },
+            |facts| {
+                facts.body["think"] = json!(true);
+            },
+            |facts| {
+                facts.body["tools"] = json!([{"type":"function","function":{"name":"inspect"}}]);
+            },
+            |facts| {
+                facts.body["format"] = json!({"type":"object"});
+            },
+            |facts| {
+                facts.settings.as_mut().unwrap()["settings"]["OLLAMA_FLASH_ATTENTION"]["value"] =
+                    json!("1");
+                facts.end_settings = facts.settings.clone();
+            },
+            |facts| {
+                facts.start["slots_total"] = json!(2);
+                facts.end = facts.start.clone();
+            },
+            |facts| {
+                facts.start["active_units"] = json!(3);
+                facts.end = facts.start.clone();
+            },
+        ];
+        for change in changes {
+            let (pool, limiter) = trained_limiter(&original);
+            let baseline = limiter.receipt(&pool, true);
+            assert_eq!(baseline["profile_windows"]["completion"]["samples"], 3);
+            let mut facts = Observations::new();
+            change(&mut facts);
+            let distinct = facts.profile().unwrap();
+            assert_ne!(distinct.id, original.id);
+            assert_eq!(
+                limiter.observe(
+                    &pool,
+                    &Completion {
+                        profile: Some(&distinct),
+                        failed: false,
+                        memory_pressure: false,
+                        metric: Some(ThroughputMetric {
+                            kind: ThroughputMetricKind::OutputTokensPerSecond,
+                            tokens_per_second: 10.0
+                        })
+                    }
+                ),
+                None
+            );
+            assert_eq!(
+                pool.total(),
+                4,
+                "a slow distinct profile must not reduce the limit"
+            );
+            assert_eq!(
+                limiter.receipt(&pool, true)["current_profile_count"],
+                1,
+                "only one current task window is retained"
+            );
+        }
+        let (pool, limiter) = trained_limiter(&original);
+        assert_eq!(
+            limiter.observe(
+                &pool,
+                &Completion {
+                    profile: Some(&original),
+                    failed: false,
+                    memory_pressure: false,
+                    metric: Some(ThroughputMetric {
+                        kind: ThroughputMetricKind::OutputTokensPerSecond,
+                        tokens_per_second: 10.0
+                    })
+                }
+            ),
+            Some(("decrease", 2))
+        );
+        let mut same = Observations::new();
+        same.body["prompt"] = json!("different private content");
+        assert_eq!(
+            same.profile().unwrap(),
+            original,
+            "raw prompts must not enter profile identity"
+        );
+    }
+
+    #[test]
+    fn comparable_embedding_input_rate_can_recover_a_reduced_limit() {
+        let pool = AdmissionPool::new(4, 4);
+        pool.set_limit(2);
+        let limiter = AdaptiveLimiter::default();
+        let mut facts = Observations::new();
+        facts.task = TaskKind::Embedding;
+        facts.body = json!({"options":{"num_ctx":4096}});
+        let profile = facts.profile().unwrap();
+        assert_eq!(
+            profile.metric_kind,
+            ThroughputMetricKind::InputTokensPerSecond
+        );
+        assert_ne!(profile.id, Observations::new().profile().unwrap().id);
+        let response = json!({"prompt_eval_count":20,"total_duration":200_000_000});
+        let completion = Completion {
+            profile: Some(&profile),
+            failed: false,
+            memory_pressure: false,
+            metric: adaptive_throughput_metric(TaskKind::Embedding, &response),
+        };
+        for _ in 0..5 {
+            limiter.observe(&pool, &completion);
+        }
+        assert_eq!(
+            pool.total(),
+            3,
+            "comparable positive embedding input-rate completions must recover"
+        );
+        let receipt = limiter.receipt(&pool, true);
+        assert_eq!(
+            receipt["profile_windows"]["embedding"]["metric_kind"],
+            "input_tokens_per_second"
+        );
+        assert_eq!(receipt["profile_windows"]["embedding"]["rate"], 100.0);
+        assert_eq!(receipt["baseline_output_tokens_per_second"], json!({}));
+        let slow = json!({"prompt_eval_count":20,"total_duration":2_000_000_000_u64});
+        assert_eq!(
+            limiter.observe(
+                &pool,
+                &Completion {
+                    metric: adaptive_throughput_metric(TaskKind::Embedding, &slow),
+                    ..completion
+                }
+            ),
+            Some(("decrease", 1))
+        );
+        limiter.observe(&pool, &completion);
+        limiter.observe(
+            &pool,
+            &Completion {
+                metric: Some(ThroughputMetric {
+                    kind: ThroughputMetricKind::OutputTokensPerSecond,
+                    tokens_per_second: 100.0,
+                }),
+                ..completion
+            },
+        );
+        assert_eq!(
+            limiter.receipt(&pool, true)["healthy_streak"],
+            0,
+            "unlike metric kinds cannot bridge recovery"
+        );
+        assert_eq!(
+            limiter.receipt(&pool, true)["profile_windows"]["embedding"]["samples"],
+            6,
+            "metric mismatch cannot train"
+        );
+        assert_eq!(
+            adaptive_throughput_metric(
+                TaskKind::Embedding,
+                &json!({"prompt_eval_count":0,"total_duration":20})
+            )
+            .map(|metric| metric.tokens_per_second),
+            None
+        );
+    }
+
+    #[test]
+    fn missing_identity_and_changed_or_parallel_intervals_are_explicitly_unqualified() {
+        type UnqualifiedCase = (&'static str, fn(&mut Observations));
+        let cases: &[UnqualifiedCase] = &[
+            ("model_revision_unknown", |facts| {
+                facts.placement["digest"] = Value::Null;
+            }),
+            ("observed_context_unknown", |facts| {
+                facts.placement["context_length"] = Value::Null;
+            }),
+            ("effective_context_mismatch_or_unknown", |facts| {
+                facts.body["options"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("num_ctx");
+            }),
+            ("backend_process_settings_unknown", |facts| {
+                facts.settings = None;
+            }),
+            ("backend_process_settings_changed_or_unknown", |facts| {
+                facts.end_settings.as_mut().unwrap()["process"] = json!("observed fixture pid 43");
+            }),
+            ("admission_occupancy_or_policy_not_comparable", |facts| {
+                facts.start["in_flight"] = json!(2);
+                facts.end = facts.start.clone();
+            }),
+            ("admission_occupancy_or_policy_not_comparable", |facts| {
+                facts.end["admitted"] = json!(2);
+                facts.end["released"] = json!(1);
+            }),
+            ("admission_occupancy_or_policy_not_comparable", |facts| {
+                facts.end["policy_epoch"] = json!(2);
+            }),
+        ];
+        for (reason, change) in cases {
+            let mut facts = Observations::new();
+            change(&mut facts);
+            assert_eq!(facts.profile(), Err(*reason));
         }
     }
 }

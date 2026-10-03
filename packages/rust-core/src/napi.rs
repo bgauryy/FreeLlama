@@ -103,16 +103,11 @@ fn authenticated(request: reqwest::RequestBuilder) -> Result<reqwest::RequestBui
 }
 
 async fn get_json(endpoint: &str, path: &str, timeout: Duration) -> Result<Value> {
-    authenticated(client().get(format!("{}{path}", endpoint.trim_end_matches('/'))))?
-        .timeout(timeout)
-        .send()
-        .await
-        .map_err(to_napi_err)?
-        .error_for_status()
-        .map_err(to_napi_err)?
-        .json::<Value>()
-        .await
-        .map_err(to_napi_err)
+    request_json(
+        client().get(format!("{}{path}", endpoint.trim_end_matches('/'))),
+        timeout,
+    )
+    .await
 }
 
 async fn post_json(endpoint: &str, path: &str, body: &Value, timeout: Duration) -> Result<Value> {
@@ -125,31 +120,30 @@ async fn post_json(endpoint: &str, path: &str, body: &Value, timeout: Duration) 
     .await
 }
 
-async fn request_json(request: reqwest::RequestBuilder, timeout: Duration) -> Result<Value> {
+async fn checked_response(
+    request: reqwest::RequestBuilder,
+    timeout: Duration,
+) -> Result<reqwest::Response> {
     let response = authenticated(request)?
         .timeout(timeout)
         .send()
         .await
         .map_err(to_napi_err)?;
-    // `error_for_status()` discards the body — and the body is where every useful refusal lives.
-    // A `min_confidence` refusal names the grade, the evidence, the model it would have picked and
-    // the two commands that raise the grade; all of that was collapsing into a bare
-    // "HTTP status client error (422)". Same defect, same fix as the CLI's `print_response`.
-    let status = response.status();
-    // Axum's extractor failures are text/plain, while application refusals are JSON. Reading JSON
-    // unconditionally turned a useful compatibility error (for example, an older running server
-    // rejecting a newly added field) into the opaque "error decoding response body".
-    let text = response.text().await.map_err(to_napi_err)?;
-    let value = serde_json::from_str::<Value>(&text);
-    if !status.is_success() {
-        // Keep codes, retry timing, resource assessments and cleanup receipts across the native
-        // rejection boundary. Extracting only `error` made agents lose the back-pressure contract.
-        let detail = value
-            .as_ref()
-            .map_or_else(|_| text.clone(), ToString::to_string);
-        return Err(napi::Error::from_reason(detail));
+    if response.status().is_success() {
+        return Ok(response);
     }
-    value.map_err(|error| {
+    // Preserve application refusal receipts and plain-text extractor errors for every method.
+    let text = response.text().await.map_err(to_napi_err)?;
+    let detail = serde_json::from_str::<Value>(&text)
+        .map_or_else(|_| text.clone(), |value| value.to_string());
+    Err(napi::Error::from_reason(detail))
+}
+
+async fn request_json(request: reqwest::RequestBuilder, timeout: Duration) -> Result<Value> {
+    let response = checked_response(request, timeout).await?;
+    let status = response.status();
+    let text = response.text().await.map_err(to_napi_err)?;
+    serde_json::from_str::<Value>(&text).map_err(|error| {
         napi::Error::from_reason(format!(
             "FreeLlama returned HTTP {status} with invalid JSON: {error}"
         ))
@@ -157,13 +151,11 @@ async fn request_json(request: reqwest::RequestBuilder, timeout: Duration) -> Re
 }
 
 async fn delete_json(endpoint: &str, path: &str, timeout: Duration) -> Result<()> {
-    authenticated(client().delete(format!("{}{path}", endpoint.trim_end_matches('/'))))?
-        .timeout(timeout)
-        .send()
-        .await
-        .map_err(to_napi_err)?
-        .error_for_status()
-        .map_err(to_napi_err)?;
+    checked_response(
+        client().delete(format!("{}{path}", endpoint.trim_end_matches('/'))),
+        timeout,
+    )
+    .await?;
     Ok(())
 }
 

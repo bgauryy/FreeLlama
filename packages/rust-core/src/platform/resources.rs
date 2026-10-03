@@ -30,6 +30,24 @@ pub enum MemoryPressure {
     Critical,
 }
 
+/// Driver-defined activity for observed devices, across all processes. This is diagnostic only:
+/// it neither attributes work to Ollama nor establishes complete device coverage.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct GpuActivityObservation {
+    pub source: String,
+    pub scope: &'static str,
+    pub window: &'static str,
+    pub devices: Vec<GpuDeviceActivity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct GpuDeviceActivity {
+    pub device: String,
+    /// Missing, unsupported or malformed percentages stay unknown; observed zero is retained.
+    pub busy_percent: Option<f64>,
+    pub memory_busy_percent: Option<f64>,
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct HostResources {
     pub source: String,
@@ -60,6 +78,8 @@ pub struct HostResources {
     pub gpu_memory_total_bytes: Option<u64>,
     pub gpu_memory_free_bytes: Option<u64>,
     pub gpu_telemetry_source: Option<String>,
+    /// Optional all-process activity; never used as an admission or pressure signal.
+    pub gpu_activity: Option<GpuActivityObservation>,
     pub unavailable: Vec<String>,
 }
 
@@ -944,7 +964,8 @@ fn parse_memory_psi(text: &str) -> Option<(f64, MemoryPressure)> {
     Some((some, level))
 }
 
-/// `nvidia-smi --query-gpu=memory.total,memory.used --format=csv,noheader,nounits` (MiB per GPU).
+/// NVIDIA CSV's first two fields are memory.total,memory.used (MiB per GPU); optional activity
+/// fields follow them without changing the memory accounting contract.
 #[cfg(any(target_os = "linux", test))]
 fn parse_nvidia_smi(text: &str) -> Option<(u64, u64)> {
     const MIB: u64 = 1024 * 1024;
@@ -968,23 +989,25 @@ fn parse_nvidia_smi(text: &str) -> Option<(u64, u64)> {
 
 #[cfg(target_os = "linux")]
 fn sample_gpu_linux(observed: &mut HostResources, read: impl Fn(&str) -> Option<String>) {
-    if let Some((total, free)) = bounded_command_with(
+    let nvidia = bounded_command_with(
         "nvidia-smi",
         &[
-            "--query-gpu=memory.total,memory.used",
+            "--query-gpu=memory.total,memory.used,utilization.gpu,utilization.memory,uuid",
             "--format=csv,noheader,nounits",
         ],
         Duration::from_millis(1500),
-    )
-    .as_deref()
-    .and_then(parse_nvidia_smi)
-    {
+    );
+    observed.gpu_activity = nvidia
+        .as_deref()
+        .and_then(super::device_activity::parse_nvidia_activity);
+    if let Some((total, free)) = nvidia.as_deref().and_then(parse_nvidia_smi) {
         observed.gpu_memory_total_bytes = Some(total);
         observed.gpu_memory_free_bytes = Some(free);
         observed.gpu_telemetry_source = Some("nvidia_smi".into());
         return;
     }
     // amdgpu exposes VRAM counters per DRM card; integrated APUs report a small carve-out.
+    // AMD activity is not collected by this slice and remains unknown.
     let mut total = 0_u64;
     let mut used = 0_u64;
     for card in 0..8 {
@@ -1219,6 +1242,9 @@ fn sample_macos() -> HostResources {
         sys.as_deref().unwrap_or_default(),
         therm.as_deref().unwrap_or_default(),
     );
+    result.gpu_activity = bounded_command("/usr/sbin/ioreg", &["-r", "-c", "AGXAccelerator", "-l"])
+        .as_deref()
+        .and_then(super::device_activity::parse_apple_activity);
     for (name, missing) in [
         ("vm_stat", vm.is_none()),
         ("sysctl", sys.is_none()),
@@ -1433,6 +1459,29 @@ mod tests {
         );
         assert_eq!(parse_nvidia_smi("[N/A], [N/A]\n"), None);
         assert_eq!(parse_nvidia_smi(""), None);
+        assert_eq!(
+            parse_nvidia_smi("24576, 1024, [N/A], 0, GPU-a\n24576, 23552, 31, [N/A], GPU-b\n"),
+            Some((48 * GIB, 24 * GIB))
+        );
+    }
+
+    #[test]
+    fn optional_gpu_activity_never_changes_pressure_or_required_telemetry() {
+        let mut observed = healthy();
+        let before = pressure_reasons(&observed, None, &ResourcePolicy::default());
+        let required = observed.missing_required(TelemetryPolicy::RequireAll);
+        observed.gpu_activity =
+            super::super::device_activity::parse_nvidia_activity("24576, 1024, 100, 100, GPU-a\n");
+        assert_eq!(
+            pressure_reasons(&observed, None, &ResourcePolicy::default()),
+            before
+        );
+        assert_eq!(
+            observed.missing_required(TelemetryPolicy::RequireAll),
+            required
+        );
+        let serialized = serde_json::to_value(HostResources::default()).unwrap();
+        assert!(serialized["gpu_activity"].is_null());
     }
 
     #[tokio::test]

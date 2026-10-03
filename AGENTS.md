@@ -98,11 +98,13 @@ caller's real workspace under `delegate_research`, so commands are confined in l
 denylist (the old regex denylist let `echo x > file`, `git checkout -- .` and `$(...)` path tricks
 through):
 - ✅ Allowed: an allowlist of read-only tools (ls, find, grep, rg, cat, head, tail, wc, sort, uniq,
-  cut, tr, sed without `-i`/`w`/`e`, jq, diff, xargs, tree, read-only git subcommands), joined by
+  cut, tr, bounded read-only sed ranges/substitutions, jq, diff, xargs with output-only targets,
+  tree, read-only git subcommands), joined by
   pipes, `&&` or `;`.
 - ❌ Refused: any other program (no awk, python, curl, rm), writing/executing flags
   (`find -delete/-exec`, `sort -o`, `rg --pre`, `git -c`), output redirection, `$(...)`, backticks,
-  `$VAR`/`${...}`, loops and subshells, and paths outside the workspace.
+  `$VAR`/`${...}`, loops and subshells, sed script files, filesystem-reading xargs targets,
+  recursive symlink-follow options, and paths or symlinks outside the workspace.
 - Execution: `bash --restricted` with `PATH` holding only the allowlisted tools, a scrubbed
   environment (`HOME` = workspace), and an OS sandbox when the host allows one (`bwrap` on Linux,
   `sandbox-exec` on macOS; recorded as `model_metadata.sandbox`). `FREELLAMA_AGENT_OS_SANDBOX=off`
@@ -256,7 +258,7 @@ the loop/model fields and the two timeouts in camelCase; retry, repair and compa
 deployment settings only, which keeps them out of every `tools/list` payload. Defaults and validation live once in `AgentRuntimeConfig` and
 `ContextPolicy`; both adapters consume those shared schemas.
 
-Contracts: `benchmark/local/scripts/test_agent_context.py` (63 context/pagination contracts) and
+Contracts: `benchmark/local/scripts/test_agent_context.py` (context and pagination contracts) and
 `test_agent_actions.py` (strict Bash and Octocode action shapes).
 
 ## Add a new agent

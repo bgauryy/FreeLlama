@@ -12,12 +12,14 @@ describe("scope and warming client contracts", () => {
   let endpoint: string;
   let client: Client;
   const requests: { method: string; path: string; body: any }[] = [];
+  let refusal: Record<string, unknown> | undefined;
   beforeAll(async () => {
     server = createServer(async (request, response) => {
       let raw = "";
       for await (const chunk of request) raw += chunk;
       requests.push({ method: request.method!, path: request.url!, body: raw ? JSON.parse(raw) : undefined });
       response.setHeader("content-type", "application/json");
+      if (refusal) { response.writeHead(404).end(JSON.stringify(refusal)); return; }
       if (request.method === "DELETE") { response.writeHead(204).end(); return; }
       response.end(JSON.stringify(request.url?.includes("tasks")
         ? { response: { message: { role: "assistant", content: "ok" }, done: true } }
@@ -29,7 +31,7 @@ describe("scope and warming client contracts", () => {
     endpoint = `http://127.0.0.1:${address.port}`;
     client = await connectClient({ FREELLAMA_AUTOSTART_SERVE: "0" });
   });
-  beforeEach(() => { requests.length = 0; });
+  beforeEach(() => { requests.length = 0; refusal = undefined; });
   afterAll(async () => {
     await client?.close();
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
@@ -58,6 +60,12 @@ describe("scope and warming client contracts", () => {
     const removed = await call("scope", { action: "delete", scopeId: id });
     expect(requests[0].body).toEqual({ revision: 7 });
     expect(removed.structuredContent).toEqual({ deleted: true, scope_id: id });
+  });
+  it.each(["get", "delete"])("preserves scope %s refusal codes and details", async (action) => {
+    refusal = { error: "scope missing", code: "scope_not_found", scope_id: id };
+    const result = await call("scope", { action, scopeId: id });
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toEqual(refusal);
   });
   it.each(["run_task", "run_task_batch"])("%s preserves scoped defaults and forwards explicit overrides", async (name) => {
     const task = { scopeId: id, scopeRevision: 3, prompt: "continue" };

@@ -36,6 +36,7 @@ fn candidate(name: &str, size: u64, capabilities: &[Capability], resident: bool)
         kv_cache_bytes_per_token_f16: None,
         modelfile_num_ctx: None,
         resident,
+        resident_size: resident.then_some(size),
         resident_vram: resident.then_some(size),
         benchmark: BTreeMap::new(),
         policy_rank: [
@@ -361,7 +362,7 @@ async fn chat_task_preserves_typed_history_and_advanced_ollama_controls() {
                  Json(body): Json<Value>| async move {
                     *captured.lock().await = Some(body);
                     Json(json!({
-                        "message": {"role": "assistant", "content": "done"},
+                        "message": {"role": "assistant", "content": "done"}, "done": true,
                         "eval_count": 1,
                         "eval_duration": 1_000_000_u64
                     }))
@@ -657,7 +658,7 @@ async fn assigned_cpu_model_uses_the_cpu_ollama_backend() {
                         if let Some(captured) = captured {
                             *captured.lock().await = Some(body);
                         }
-                        Json(json!({"message": {"role": "assistant", "content": "ok"}}))
+                        Json(json!({"message": {"role": "assistant", "content": "ok"}, "done": true}))
                     }
                 }),
             )
@@ -876,7 +877,7 @@ async fn preview_honors_cpu_preference_and_exposes_the_execution_receipt() {
 /// route while still closing the observe -> compare -> decide loop.
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
-async fn auto_placement_uses_three_sample_backend_feedback() {
+async fn auto_placement_does_not_use_samples_without_observed_profile_identity() {
     let backend = |model: &'static str, total_duration: u64, resident_vram: u64| {
         Router::new()
             .route(
@@ -910,6 +911,7 @@ async fn auto_placement_uses_three_sample_backend_feedback() {
                     Json(json!({
                         "message": {"role": "assistant", "content": "OK"},
                         "total_duration": total_duration,
+                        "done": true,
                         "eval_count": 1,
                         "eval_duration": total_duration
                     }))
@@ -1008,8 +1010,8 @@ async fn auto_placement_uses_three_sample_backend_feedback() {
         .unwrap();
     let body: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
-    assert_eq!(body["selected_model"], "cpu-model");
-    assert_eq!(body["execution"]["reason"], "measured_backend_faster");
+    assert_eq!(body["selected_model"], before_threshold["selected_model"]);
+    assert_eq!(body["execution"]["reason"], "router_default");
 
     let health = platform
         .oneshot(
@@ -1064,6 +1066,7 @@ async fn physical_gpu_observation_overrides_cpu_assignment_and_withholds_feedbac
             post(|| async {
                 Json(json!({
                     "message": {"role": "assistant", "content": "OK"},
+                    "done": true,
                     "eval_count": 1,
                     "eval_duration": 1_000_000
                 }))
@@ -1176,6 +1179,7 @@ async fn gpu_and_cpu_backends_have_independent_admission_pools() {
                         active.fetch_sub(1, Ordering::SeqCst);
                         Json(json!({
                             "message": {"role": "assistant", "content": "OK"},
+                            "done": true,
                             "total_duration": 40_000_000_u64
                         }))
                     }
@@ -1328,7 +1332,7 @@ async fn assigned_intent_model_uses_the_cpu_ollama_backend() {
                         } else {
                             "unexpected primary interpreter call"
                         };
-                        Json(json!({"message": {"role": "assistant", "content": content}}))
+                        Json(json!({"message": {"role": "assistant", "content": content}, "done": true}))
                     }
                 }),
             )
@@ -1399,10 +1403,10 @@ async fn natural_route_respects_backend_admission() {
                     .as_array()
                     .is_some_and(|messages| messages.len() > 1);
                 if is_intent {
-                    Json(json!({"message": {"role": "assistant", "content": r#"{"task":"completion","objective":"fastest","context_tokens":null,"requires_tools":false,"requires_vision":false}"#}}))
+                    Json(json!({"message": {"role": "assistant", "content": r#"{"task":"completion","objective":"fastest","context_tokens":null,"requires_tools":false,"requires_vision":false}"#}, "done": true}))
                 } else {
                     tokio::time::sleep(Duration::from_millis(250)).await;
-                    Json(json!({"message": {"role": "assistant", "content": "held"}}))
+                    Json(json!({"message": {"role": "assistant", "content": "held"}, "done": true}))
                 }
             }),
         );
@@ -1476,7 +1480,7 @@ async fn prompt_task_forwards_images_onto_the_built_message() {
                 |State(captured): State<Arc<Mutex<Option<Value>>>>,
                  Json(body): Json<Value>| async move {
                     *captured.lock().await = Some(body);
-                    Json(json!({"message": {"role": "assistant", "content": "a red square"}}))
+                    Json(json!({"message": {"role": "assistant", "content": "a red square"}, "done": true}))
                 },
             ),
         )
@@ -1535,7 +1539,7 @@ async fn prompt_task_without_images_sends_no_images_field() {
                 |State(captured): State<Arc<Mutex<Option<Value>>>>,
                  Json(body): Json<Value>| async move {
                     *captured.lock().await = Some(body);
-                    Json(json!({"message": {"role": "assistant", "content": "hi"}}))
+                    Json(json!({"message": {"role": "assistant", "content": "hi"}, "done": true}))
                 },
             ),
         )
@@ -2915,7 +2919,7 @@ async fn vision_tasks_cost_more_admission_than_embeddings() {
                 c.1.fetch_max(now, Ordering::SeqCst);
                 tokio::time::sleep(Duration::from_millis(120)).await;
                 c.0.fetch_sub(1, Ordering::SeqCst);
-                Json(json!({"message": {"role": "assistant", "content": "seen"}}))
+                Json(json!({"message": {"role": "assistant", "content": "seen"}, "done": true}))
             }),
         )
         .with_state(counters.clone());

@@ -79,7 +79,7 @@ import {
 } from "./helpers.js";
 import { libraryTrialCandidate } from "./model-search.js";
 import { enrichInstalledModels, libraryReference, modelKnowledge, OllamaLibraryClient, publicModelGuidance } from "./model-knowledge.js";
-import { MODEL_EVIDENCE, assessDelegatedAnswer } from "./delegate.js";
+import { MODEL_EVIDENCE, assessDelegatedAnswer, researchErrorResult } from "./delegate.js";
 
 import { registerContextTools } from "./context-tools.js";
 
@@ -257,13 +257,14 @@ for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
 }
 
 
-const INSTRUCTIONS = `models{view:"installed"}, then models{view:"resident"}: inspect tags and residency.
-run_task{prompt} runs; model selects an exact tag. run_task preview never executes; code_review aliases coding. requiredCapabilities:["tools"] previews tools; omit preview and supply the payload to execute. Caller executes tools.
-quality needs policy or model; medium needs policy+benchmark; observed needs /api/ps proof.
-scope stores process-local history; run_task needs scopeId+scopeRevision. warm_model uses managed admission. defer:true returns job.id; task_jobs uses jobId. Restart loses history/jobs.
-The caller owns task decomposition, prompts and format; findings are candidates, not accepted defects. The operator owns endpoints, exact --cpu-model assignments, lifecycle. Ollama plus the OS/driver run physical CPU/GPU.
-ask approval for one exact tag and reported size before ollama_manage; search or recommendation is never download permission.
-serve defaults :11435, auto-started. Docs: freellama://docs/index.`;
+const INSTRUCTIONS = `models{view:"installed"}; models{view:"resident"} for residency.
+run_task preview never executes; code_review aliases coding. Preview routing only; requiredCapabilities:["tools"] previews tools; omit preview and supply the payload. Caller executes tools.
+quality needs policy/model; medium needs policy+benchmark; observed needs /api/ps proof.
+Scoped run_task needs scopeId+scopeRevision. Scopes store history; sessions affinity, not messages/KV. defer:true: job.id→task_jobs.jobId unchanged. Restart loses scopes/sessions/jobs.
+Check isError first; prefer structuredContent, else content[].text. page.next_cursor→cursor unchanged.
+caller owns task decomposition/prompts/format/verification; findings are candidates, not accepted defects. operator owns endpoints, exact --cpu-model assignments/lifecycle. Ollama plus the OS/driver run physical CPU/GPU.
+ask approval for one exact tag and reported size before ollama_manage pull; search or recommendation is never download permission. Stop/delete need exact-tag approval.
+serve :11435; default-endpoint autostart optional. Docs: freellama://docs/index.`;
 
 const server = new McpServer(
   { name: "freellama", version: SERVER_VERSION },
@@ -303,13 +304,13 @@ for (const name of packagedDocs) {
 server.registerTool(
   "doctor",
   {
-    description: "Use when: runtime/config diagnosis or live status/usage. Do not use when: model selection. Returns: summary; full opts in.",
-    inputSchema: {
+    description: "Use when: diagnosis/status/usage. Do not use when: choosing models. Returns: summary; opt into detail.",
+    inputSchema: z.object({
       endpoint: ollamaEndpointParam,
       serveEndpoint: endpointParam,
       view: z.enum(["summary", "scheduler", "config", "full", "status", "usage"]).optional(),
       days: z.number().int().min(1).max(366).optional(),
-    },
+    }).strict(),
     outputSchema: doctorResultSchema,
     annotations: { readOnlyHint: true },
   },
@@ -392,12 +393,12 @@ server.registerTool(
   "session",
   {
     description:
-      "Use when: affinity/cancel. Do not use when: history or unload. Returns: handle/receipt.",
-    inputSchema: {
+      "Use when: affinity/session kill. Do not use when: job cancel/history/unload. Returns: receipt.",
+    inputSchema: z.object({
       action: z.enum(["create", "delete", "kill"]),
       sessionId: z.string().uuid().optional(),
       endpoint: endpointParam,
-    },
+    }).strict(),
     outputSchema: sessionResultSchema,
     annotations: { destructiveHint: true },
   },
@@ -421,9 +422,9 @@ server.registerTool(
   "models",
   {
     description:
-      "Use when: discovery. Do not use when: execution/mutation. " +
-      "Returns: inventory/placement/candidates; library model lists tags.",
-    inputSchema: {
+      "Use when: inventory/library. Do not use when: execution/mutation. " +
+      "Returns: models; library finds families, then one family's tags.",
+    inputSchema: z.object({
       view: z
         .enum(["installed", "resident", "detail", "raw", "library"])
         .optional()
@@ -450,7 +451,7 @@ server.registerTool(
       cursor: z.string().min(1).optional(),
       endpoint: endpointParam,
       ollamaEndpoint: ollamaEndpointParam,
-    },
+    }).strict(),
     outputSchema: modelsResultSchema,
     annotations: { readOnlyHint: true },
   },
@@ -502,7 +503,7 @@ server.registerTool(
           // Ollama's own docs say to check the GPU/CPU split, but /api/ps exposes only the raw
           // `size`/`size_vram` bytes it is derived from. The CLI computes it; the API doesn't.
           const models = (data.models ?? []).filter((entry) => entry.resident === true).map((entry) => {
-            const size = typeof entry.size === "number" ? entry.size : null;
+            const size = typeof entry.resident_size === "number" ? entry.resident_size : null;
             const vram = typeof entry.resident_vram === "number" ? entry.resident_vram : null;
             if (size === null || vram === null || size === 0) return entry;
             const gpuPercent = Math.round((vram / size) * 100);
@@ -724,9 +725,8 @@ server.registerTool(
   "run_task",
   {
     description:
-      "Use when: chat/tools/embeddings. Do not use when: file lookup. " +
-      "preview:true only decides. Returns: response and receipts.",
-    inputSchema: {
+      "Use when: supplied chat/tools/embeddings. Do not use when: files. Returns: response/receipts.",
+    inputSchema: z.object({
       endpoint: endpointParam,
       task: taskParam.removeDefault().optional().describe("caller owns prompts and output format."),
       objective: objectiveParam,
@@ -779,7 +779,7 @@ server.registerTool(
         .describe(
           "true = routing fields only; rejects payloads and runtime controls; never executes",
         ),
-    },
+    }).strict(),
     outputSchema: taskResultSchema,
     annotations: { destructiveHint: false },
   },
@@ -962,14 +962,14 @@ server.registerTool(
   "task_jobs",
   {
     description:
-      "Use when: task lifecycle by jobId. Do not use when: new work. " +
-      "Returns: receipts/results. Remove stops active work; lost on restart.",
-    inputSchema: {
+      "Use when: task jobs. Do not use when: new work/session kill. " +
+      "Returns: status/result; remove cancels first.",
+    inputSchema: z.object({
       endpoint: endpointParam,
       action: z.enum(["list", "get", "cancel", "remove"]),
       jobId: z.string().uuid().optional(),
       returnEmbeddings: z.boolean().optional(),
-    },
+    }).strict(),
     outputSchema: objectResultSchema,
     annotations: { destructiveHint: true },
   },
@@ -1006,13 +1006,13 @@ server.registerTool(
   "run_task_batch",
   {
     description:
-      "Use when: independent work. Do not use when: dependencies. " +
-      "Inputs: [{id, independent:true, task}]; maxParallelism caps dispatch. Returns: ordered receipts.",
-    inputSchema: {
+      "Use when: independent:true work. Do not use when: dependencies. " +
+      "Returns: ordered receipts; maxParallelism caps dispatch.",
+    inputSchema: z.object({
       tasks: z.array(batchItemParam).min(1).max(64),
       maxParallelism: z.number().int().positive().max(64).optional(),
       endpoint: endpointParam,
-    },
+    }).strict(),
     outputSchema: batchResultSchema,
     annotations: { destructiveHint: false },
   },
@@ -1089,9 +1089,9 @@ server.registerTool(
   "ollama_manage",
   {
     description:
-      "Use when: approved pull or unload. Do not use when: deletion/discovery. " +
-      "timeoutSeconds is pull-only. Returns: lifecycle receipt.",
-    inputSchema: {
+      "Use when: approved pull/stop. Do not use when: delete/discovery. " +
+      "Returns: receipt; timeoutSeconds is pull-only.",
+    inputSchema: z.object({
       action: z.enum(["pull", "stop"]),
       model: z.string().min(1),
       ollamaEndpoint: ollamaEndpointParam,
@@ -1101,7 +1101,7 @@ server.registerTool(
         .positive()
         .optional()
         ,
-    },
+    }).strict(),
     outputSchema: manageResultSchema,
     annotations: { destructiveHint: false },
   },
@@ -1139,12 +1139,11 @@ server.registerTool(
   "ollama_delete",
   {
     description:
-      "DESTRUCTIVE AND IRREVERSIBLE. Use when: a human requests one exact tag. Do not use when: freeing memory, " +
-      "age cleanup, or inferred tags. Returns: deleted tag.",
-    inputSchema: {
+      "DESTRUCTIVE AND IRREVERSIBLE. Use when: human names exact tag. Do not use when: inferred cleanup. Returns: deleted tag.",
+    inputSchema: z.object({
       model: z.string().min(1),
       ollamaEndpoint: ollamaEndpointParam,
-    },
+    }).strict(),
     outputSchema: deleteResultSchema,
     annotations: { destructiveHint: true },
   },
@@ -1187,9 +1186,9 @@ server.registerTool(
   "delegate_research",
   {
     description:
-      "Use when: workspace lookup. Do not use when: mutation or external facts. " +
-      "Returns: answer/citations/verdict; verify citations.",
-    inputSchema: {
+      "Use when: workspace lookup. Do not use when: mutation/external facts. " +
+      "Returns: citations/answer; discard verification.recommendation=escalate, otherwise verify citations.",
+    inputSchema: z.object({
       question: z.string().min(1),
       workspacePath: z
         .string()
@@ -1223,7 +1222,7 @@ server.registerTool(
         .strict()
         .optional()
         ,
-    },
+    }).strict(),
     outputSchema: researchResultSchema,
     annotations: { destructiveHint: false },
   },
@@ -1235,7 +1234,7 @@ server.registerTool(
       resolvedWorkspace = await assertAllowedWorkspace(workspacePath);
       chosenModel = model ?? DEFAULT_DELEGATE_MODEL ?? await routedResearchModel(endpoint, executionPreference, minPlacementEvidence);
     } catch (error) {
-      return errorResult(error);
+      return researchErrorResult(error);
     }
     // Pre-flight, not post-hoc: a model this repo measured at 0-38% will not become right by
     // running it, so refuse before spending a model load and 10-40s of wall time on it.
@@ -1261,7 +1260,7 @@ server.registerTool(
       await writeFile(promptFile, `${question}\n`, "utf8");
       const adapter = RESEARCH_ADAPTERS[chosenAdapter];
       if (!existsSync(adapter)) {
-        return errorResult(
+        return researchErrorResult(
           new Error(
             `research adapter not found at ${adapter}. In a published install it should be bundled ` +
               "under <package>/adapters; in-repo it comes from benchmark/local/scripts. Reinstall, " +
@@ -1327,7 +1326,7 @@ server.registerTool(
       } catch {
         // No usable result file: a hard kill (the SIGKILL timeout above) or a crash before the
         // adapter could finish writing. Here the exec error genuinely is the best account.
-        return errorResult(
+        return researchErrorResult(
           adapterError ??
             new Error(
               "research adapter exited without writing a readable result file — it was killed " +
@@ -1382,12 +1381,14 @@ server.registerTool(
       // Citations point into `evidence` by step instead of repeating each command a second time.
       const citations = succeeded.map((step) => ({ step: step.step, tool: step.tool, path: step.path }));
       if (adapterError) {
-        return errorResult(
-          new Error(
-            `research adapter failed: ${result.final_answer}` +
-              (evidenceText ? `\nEvidence collected before the failure:\n${evidenceText}` : ""),
-          ),
-        );
+        const diagnostic = `research adapter failed: ${result.final_answer}` +
+          (evidenceText ? `\nEvidence collected before the failure:\n${evidenceText}` : "");
+        const refusal = z.object({ receipt: z.object({ error: z.string() }).passthrough() })
+          .safeParse(result.model_metadata?.transport_error);
+        if (refusal.success) {
+          return researchErrorResult(new Error(JSON.stringify(refusal.data.receipt)), diagnostic);
+        }
+        return researchErrorResult(new Error(diagnostic));
       }
       // Grade on what actually read something. A run of failed commands is ungrounded no matter
       // how many of them there were.
@@ -1433,7 +1434,7 @@ server.registerTool(
         `\n(${chosenModel}, ${result.tool_calls.length} tool call(s))`;
       return structuredResult(payload, legacyText === true ? { legacyJson: true } : { text: answerText });
     } catch (error) {
-      return errorResult(error);
+      return researchErrorResult(error);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

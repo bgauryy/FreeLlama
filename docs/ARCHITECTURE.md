@@ -260,19 +260,23 @@ flowchart TD
 
 Admission is independent per backend and uses weighted fair round robin: interactive gets three
 turns, normal two, and background one, preserving FIFO inside each class and preventing starvation.
-The primary/GPU pool defaults to two weighted units and the
-optional CPU pool defaults to one. A saturated GPU burst therefore cannot consume the permit held
-for a small CPU helper. Those values represent one ordinary chat and one embedding, not detected
-hardware capacity; operators can tune both budgets from queue-wait and resident-memory evidence.
+The primary/GPU pool defaults to two weighted units per observed `OLLAMA_NUM_PARALLEL` slot,
+falling back to two. The optional CPU pool defaults to one. A saturated GPU burst therefore cannot
+consume the permit held for a small CPU helper. With one parallel slot, those values represent one
+ordinary chat and one embedding. Operators can tune both budgets from queue-wait and resident-memory evidence.
 After FreeLlama admission, each Ollama process applies its own `OLLAMA_MAX_QUEUE`, scheduler,
 `OLLAMA_NUM_PARALLEL`, and loaded-model limit. Raw proxy requests bypass weighted admission but
 still pass the raw concurrency cap, backend exclusion, and host-pressure gate.
 
-| Task | Cost |
+| Task | Default cost |
 |---|---:|
 | Embedding | `ceil(input_items / 4)` |
 | Chat, coding, tools, browser, or long context | 2 |
 | Vision | 4 |
+
+The runtime file's `[task_costs]` table overrides task-kind base costs. Embeddings multiply their
+base by `ceil(input_items / 4)`; the acquired charge is capped to the backend's current capacity.
+See [monitoring controls](MONITORING.md#adaptive-concurrency) for validation and reload behavior.
 
 After six capacity bypasses, the scheduler reserves released capacity for the oldest blocked waiter,
 so a stream of small requests cannot indefinitely starve a larger request. Cancellation releases

@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_call:
   push:
     branches: [main]
   pull_request:
@@ -29,7 +30,7 @@ jobs:
       - run: cargo fmt --all --check
       # Several code paths are cfg-gated per OS, so clippy must run on every OS: the
       # Sep 1 failures lived in cfg(not(macos)) blocks that a macOS-only check never compiles.
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace
 
   js:
@@ -50,10 +51,12 @@ jobs:
       # .yarnrc.yml pins Yarn 4. setup-node's yarn cache probe ran the 1.x binary and failed.
       - run: corepack enable
       - run: yarn install --immutable
+      - run: yarn npm audit --all --recursive --environment production
       - run: yarn build:native
       - run: yarn workspace @octocodeai/freellama-mcp-server build
       - run: yarn typecheck
       - run: yarn test
+      - run: yarn test:release
       - run: yarn release:verify
 
   python:
@@ -64,6 +67,8 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+      - name: Hardware harness contract tests
+        run: python3 -m unittest discover -s benchmark/hardware -p 'test_*.py'
       - name: Adapter contract tests
         run: |
           for t in benchmark/local/scripts/test_*.py; do

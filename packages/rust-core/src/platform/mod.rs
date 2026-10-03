@@ -36,6 +36,7 @@ use crate::{
 
 mod admission;
 mod context;
+mod device_activity;
 mod discovery;
 mod error;
 mod execution;
@@ -71,7 +72,7 @@ use error::{ApiError, resource_error};
 pub use execution::runtime_metrics;
 use execution::{
     admit, apply_execution_options, execution_target, intent_memory_requirement,
-    physical_placement_observation, run_task, select_managed_route, task_cost, transition_timeout,
+    physical_placement_observation, run_task, select_managed_route, transition_timeout,
 };
 #[cfg(test)]
 use execution::{feedback_work_unit_ns, memory_kv_preflight_with_memory, upstream_is_loopback};
@@ -553,6 +554,12 @@ struct FeedbackStats {
     total_work_unit_ns: u128,
     total_queue_wait_ms: u128,
     last_work_unit_ns: Option<u64>,
+    #[serde(default)]
+    profile: Option<runtime::ExecutionProfile>,
+    #[serde(default)]
+    profile_duration_samples: u64,
+    #[serde(default)]
+    profile_total_work_unit_ns: u128,
 }
 
 impl FeedbackStats {
@@ -579,10 +586,23 @@ impl FeedbackStats {
             .then(|| self.total_work_unit_ns / u128::from(self.duration_samples))
     }
 
-    fn average_for_model(&self, model: &str) -> Option<u128> {
-        (self.model.as_deref() == Some(model))
-            .then(|| self.average_work_unit_ns())
-            .flatten()
+    fn record_profile(&mut self, profile: &runtime::ExecutionProfile, duration: u64) {
+        if self.profile.as_ref() != Some(profile) {
+            self.profile = Some(profile.clone());
+            self.profile_duration_samples = 0;
+            self.profile_total_work_unit_ns = 0;
+        }
+        self.profile_duration_samples = self.profile_duration_samples.saturating_add(1);
+        self.profile_total_work_unit_ns = self
+            .profile_total_work_unit_ns
+            .saturating_add(u128::from(duration));
+    }
+
+    fn average_for_profile(&self, profile: &runtime::ExecutionProfile) -> Option<u128> {
+        (self.profile.as_ref() == Some(profile)
+            && self.profile_duration_samples >= MIN_FEEDBACK_SAMPLES
+            && self.profile_total_work_unit_ns > 0)
+            .then(|| self.profile_total_work_unit_ns / u128::from(self.profile_duration_samples))
     }
 
     fn receipt(&self) -> Value {
@@ -590,7 +610,10 @@ impl FeedbackStats {
             "model": self.model,
             "completed": self.completed,
             "duration_samples": self.duration_samples,
-            "decision_ready": self.duration_samples >= MIN_FEEDBACK_SAMPLES && self.total_work_unit_ns > 0,
+            "decision_ready": self.profile.as_ref().and_then(|profile| self.average_for_profile(profile)).is_some(),
+            "learning_profile": self.profile,
+            "profile_duration_samples": self.profile_duration_samples,
+            "profile_policy": "one_current_profile_per_task_serial_only",
             "decision_metric": "nanoseconds_per_work_unit",
             "average_work_unit_ns": self.average_work_unit_ns(),
             "average_queue_wait_ms": (self.completed > 0)
@@ -1091,7 +1114,7 @@ async fn health(State(state): State<PlatformState>) -> Json<Value> {
             "max_queue_wait_seconds": state.tunables().max_queue_wait().as_secs(),
             "raw_proxy_max_concurrent_requests": state.tunables().raw_max_concurrent_requests,
             "raw_proxy": state.raw_admission.receipt(),
-            "costs": {"embedding": "ceil(input_items/4)", "chat": 2, "vision": 4},
+            "costs": state.tunables().admission_costs(),
             "priority_fairness": {"policy": "weighted_fair_round_robin", "weights": {"interactive": 3, "normal": 2, "background": 1}, "starvation_prevention": "oldest_capacity_reservation", "max_capacity_bypasses": MAX_CAPACITY_BYPASSES},
             "queue_deadline_scope": "admission_resources_and_transition",
             "resources": resource_snapshot,
@@ -1134,7 +1157,7 @@ async fn models(State(state): State<PlatformState>) -> Result<Json<Value>, ApiEr
             let model_type = ModelType::from_capabilities(model.capabilities.iter().copied());
             let mut observation = physical_placement_observation(
                 execution.placement,
-                model.resident.then_some(model.size),
+                model.resident_size,
                 model.resident_vram,
             );
             observation["source"] = json!("ollama_api_ps_catalog");
@@ -1233,13 +1256,12 @@ async fn recommendations(
     require_active_session(&state, input.session_id.as_deref()).await?;
     let models = discover_models(&state).await?;
     let sessions = state.sessions.read().await;
+    let requested_cost = state.tunables().task_cost(input.task);
     let route_result =
-        select_managed_route(&state, &input, &models, &sessions, task_cost(input.task)).await;
+        select_managed_route(&state, &input, &models, &sessions, requested_cost, None).await;
     let (installed_route, installed_execution, installed_route_error) = match route_result {
         Ok(managed) => {
-            let execution = managed
-                .execution_receipt(task_cost(managed.route.task), &state)
-                .await;
+            let execution = managed.execution_receipt(requested_cost, &state).await;
             (Some(managed.route), Some(execution), None)
         }
         Err(error) => (None, None, Some(error.body.error)),
@@ -1286,13 +1308,12 @@ async fn route(
     require_active_session(&state, input.session_id.as_deref()).await?;
     let models = discover_models(&state).await?;
     let sessions = state.sessions.read().await;
+    let requested_cost = state.tunables().task_cost(input.task);
     let managed =
-        select_managed_route(&state, &input, &models, &sessions, task_cost(input.task)).await?;
+        select_managed_route(&state, &input, &models, &sessions, requested_cost, None).await?;
     drop(sessions);
     let mut value = serde_json::to_value(&managed.route).expect("RouteDecision serializes");
-    value["execution"] = managed
-        .execution_receipt(task_cost(managed.route.task), &state)
-        .await;
+    value["execution"] = managed.execution_receipt(requested_cost, &state).await;
     Ok(Json(value))
 }
 
@@ -1374,9 +1395,8 @@ async fn interpret_natural_route(
         let (intent_slot, _, _) = admit(
             &state,
             &intent_target,
-            TaskKind::Completion,
+            state.tunables().task_cost(TaskKind::Completion),
             TaskPriority::Interactive,
-            1,
             queue_deadline,
             None,
         )
@@ -1431,12 +1451,14 @@ async fn interpret_natural_route(
     let route_input = intent.clone().into_route_input(input.session_id);
     let models = discover_models(&state).await?;
     let sessions = state.sessions.read().await;
+    let requested_cost = state.tunables().task_cost(route_input.task);
     let managed = select_managed_route(
         &state,
         &route_input,
         &models,
         &sessions,
-        task_cost(route_input.task),
+        requested_cost,
+        None,
     )
     .await?;
     drop(sessions);
@@ -1445,9 +1467,7 @@ async fn interpret_natural_route(
         interpreter_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         intent,
         guard_adjustments,
-        execution: managed
-            .execution_receipt(task_cost(managed.route.task), &state)
-            .await,
+        execution: managed.execution_receipt(requested_cost, &state).await,
         route: managed.route,
     }))
 }
@@ -1868,6 +1888,9 @@ async fn fetch_catalog_from(
             kv_cache_bytes_per_token_f16,
             modelfile_num_ctx,
             resident: running.is_some(),
+            resident_size: running
+                .and_then(|value| value.get("size"))
+                .and_then(Value::as_u64),
             resident_vram: running
                 .and_then(|value| value.get("size_vram"))
                 .and_then(Value::as_u64),
@@ -2058,6 +2081,9 @@ async fn refresh_residency(
                 == Some(model.name.as_str())
         });
         model.resident = resident.is_some();
+        model.resident_size = resident
+            .and_then(|value| value.get("size"))
+            .and_then(Value::as_u64);
         model.resident_vram = resident
             .and_then(|value| value.get("size_vram"))
             .and_then(Value::as_u64);
@@ -2264,6 +2290,7 @@ mod kv_estimate_tests {
             kv_cache_bytes_per_token_f16: Some(10),
             modelfile_num_ctx: None,
             resident: false,
+            resident_size: None,
             resident_vram: None,
             benchmark: BTreeMap::new(),
             policy_rank: BTreeMap::new(),
@@ -2450,14 +2477,51 @@ mod feedback_tests {
         for _ in 0..3 {
             stats.record("model-a", Some(100), 4);
         }
-        assert_eq!(stats.average_for_model("model-a"), Some(100));
-        assert_eq!(stats.average_for_model("model-b"), None);
+        assert_eq!(stats.average_work_unit_ns(), Some(100));
+        assert_eq!(stats.profile, None);
 
         stats.record("model-b", Some(50), 2);
         assert_eq!(stats.model.as_deref(), Some("model-b"));
         assert_eq!(stats.completed, 1);
         assert_eq!(stats.duration_samples, 1);
-        assert_eq!(stats.average_for_model("model-a"), None);
+        assert_eq!(stats.profile, None);
+    }
+
+    #[test]
+    fn legacy_feedback_is_retained_as_diagnostics_without_becoming_profile_evidence() {
+        let legacy = json!({"model":"model-a","completed":7,"duration_samples":5,
+            "total_work_unit_ns":500,"total_queue_wait_ms":14,"last_work_unit_ns":100});
+        let mut stats: FeedbackStats = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(stats.average_work_unit_ns(), Some(100));
+        assert_eq!(stats.receipt()["decision_ready"], false);
+        let profile = super::runtime::ExecutionProfile {
+            id: "profile-a".into(),
+            task: TaskKind::Completion,
+            model: "model-a".into(),
+            digest: "revision-a".into(),
+            context_tokens: 4096,
+            processor: "gpu".into(),
+            metric_kind: super::runtime::ThroughputMetricKind::OutputTokensPerSecond,
+        };
+        for _ in 0..3 {
+            stats.record_profile(&profile, 50);
+        }
+        assert_eq!(stats.average_for_profile(&profile), Some(50));
+        let stored = serde_json::to_value(&stats).unwrap();
+        for field in legacy.as_object().unwrap().keys() {
+            assert_eq!(
+                stored[field], legacy[field],
+                "legacy aggregate must survive additive profile learning"
+            );
+        }
+        let restarted: FeedbackStats = serde_json::from_value(stored).unwrap();
+        assert_eq!(restarted.average_for_profile(&profile), Some(50));
+        let mut changed = profile.clone();
+        changed.id = "profile-b".into();
+        stats.record_profile(&changed, 10);
+        assert_eq!(stats.average_for_profile(&profile), None);
+        assert_eq!(stats.average_for_profile(&changed), None);
+        assert_eq!(stats.profile_duration_samples, 1);
     }
 
     #[test]

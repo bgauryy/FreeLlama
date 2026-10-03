@@ -3,7 +3,7 @@
 Load when choosing or installing a model, or when `minConfidence:"medium"` refuses every route.
 Why: capability metadata and parameter counts are not quality evidence.
 
-Start with Flow D in `SKILL.md`; it owns request-intent questions, host inspection, candidate
+Start with Flow E in `SKILL.md`; it owns request-intent questions, host inspection, candidate
 presentation, and exact-tag approval gate. This reference owns how to qualify the candidates:
 
 1. For quality-sensitive work, preview with `minConfidence:"medium"`.

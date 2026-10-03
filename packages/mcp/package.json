@@ -1,6 +1,6 @@
 {
   "name": "@octocodeai/freellama-mcp-server",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "MCP server exposing FreeLlama core as tools, via native NAPI bindings into packages/rust-core.",
   "repository": {
     "type": "git",
@@ -28,7 +28,10 @@
     "native/package.json",
     "adapters/*.py",
     "docs",
-    "README.md"
+    "README.md",
+    "LICENSE-APACHE",
+    "LICENSE-MIT",
+    "assets/logo.jpg"
   ],
   "scripts": {
     "build": "node scripts/build.mjs",
@@ -46,14 +49,14 @@
     "zod": "^3.24.1"
   },
   "optionalDependencies": {
-    "@octocodeai/freellama-native-darwin-arm64": "0.2.0",
-    "@octocodeai/freellama-native-darwin-x64": "0.2.0",
-    "@octocodeai/freellama-native-linux-arm64-gnu": "0.2.0",
-    "@octocodeai/freellama-native-linux-arm64-musl": "0.2.0",
-    "@octocodeai/freellama-native-linux-x64-gnu": "0.2.0",
-    "@octocodeai/freellama-native-linux-x64-musl": "0.2.0",
-    "@octocodeai/freellama-native-win32-arm64-msvc": "0.2.0",
-    "@octocodeai/freellama-native-win32-x64-msvc": "0.2.0"
+    "@octocodeai/freellama-native-darwin-arm64": "0.2.1",
+    "@octocodeai/freellama-native-darwin-x64": "0.2.1",
+    "@octocodeai/freellama-native-linux-arm64-gnu": "0.2.1",
+    "@octocodeai/freellama-native-linux-arm64-musl": "0.2.1",
+    "@octocodeai/freellama-native-linux-x64-gnu": "0.2.1",
+    "@octocodeai/freellama-native-linux-x64-musl": "0.2.1",
+    "@octocodeai/freellama-native-win32-arm64-msvc": "0.2.1",
+    "@octocodeai/freellama-native-win32-x64-msvc": "0.2.1"
   },
   "license": "Apache-2.0 OR MIT",
   "publishConfig": {

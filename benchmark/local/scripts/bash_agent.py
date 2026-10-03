@@ -30,7 +30,7 @@ from agent_context import (
 )
 import shell_sandbox
 from shell_sandbox import ReadOnlyShell
-from agent_transport import chat_request, request_headers, unwrap_chat_response, PromptCacheUsage, retryable_chat_error, resolve_model_identity
+from agent_transport import chat_request, request_headers, unwrap_chat_response, PromptCacheUsage, retryable_chat_error, resolve_model_identity, chat_error_details
 
 # Nothing is clipped any more. `calls[].result` is written to result.json on disk and read by the
 # MCP layer — it never enters the model's context, so there was never a reason to shorten it. What
@@ -75,7 +75,7 @@ def run_shell(root: Path, command_text: str, timeout_seconds: float, shell: Read
 
 
 def system_prompt() -> str:
-    return """You are a local coding agent in an isolated benchmark workspace containing a pinned repository, rooted at the current directory. You solve tasks using ONLY raw POSIX shell commands — no editors, no special tools, no network access. Return exactly one JSON object per turn:
+    return """You are a local code-research agent in a read-only workspace rooted at the current directory. Use raw POSIX shell commands without editors, special tools, or network access. Return exactly one JSON object per turn:
 
 {"action":"shell","command":"one shell command, e.g. grep -n \\"class Group\\" click/src/click/core.py"}
 {"action":"page","step":2,"page":2}
@@ -84,15 +84,16 @@ def system_prompt() -> str:
 These are the complete action schemas. Use only `shell`, `page`, or `finish`; every shown field is
 required with the shown type. An invalid shape is rejected and costs one bounded repair turn.
 
-Long output is PAGINATED, never truncated: you are shown page 1 and told the total. Nothing is
-discarded, so "not found" is only a real answer once you have seen every page you need. Send the
-page action to read another page of a previous step — it re-reads stored output and does not re-run
-the command, so it is cheaper than repeating the search.
+Full command output is stored in pages; you see page 1 and the total. Context fitting can shorten
+an observation in the conversation. Request its stored page to recover the evidence without
+re-running the command. Claim "not found" only after checking the relevant search scope and pages.
 
 The shell is READ-ONLY and restricted. Available tools: ls, find, grep, rg, cat, head, tail, wc,
-sort, uniq, cut, tr, nl, sed (no -i), jq, diff, xargs, tree, file, stat, and read-only git
+sort, uniq, cut, tr, nl, sed (bounded read-only inline programs), jq, diff, xargs
+(only echo, printf, true, or false targets), tree, file, stat, and read-only git
 (log, show, grep, ls-files, diff, blame, status). There is no awk, python, network, output
-redirection, $(...) substitution, $VARIABLES, or loops: write paths and patterns literally and
+redirection, script-file loading, recursive symlink following, paths outside the workspace,
+$(...) substitution, $VARIABLES, or loops: write paths and patterns literally and
 chain tools with pipes, one pipeline per turn. A refused command costs a turn, so follow these
 rules. Be decisive: most tasks need 2-6 commands. Call finish as soon as the requested facts are
 established.
@@ -100,15 +101,15 @@ established.
 SCOPE YOUR SEARCHES. A real workspace holds far more than its source, and an unscoped grep drowns
 the answer in vendored and generated files. Always exclude them:
   grep -rn "PATTERN" . --exclude-dir={node_modules,target,.venv,venv,dist,build,.git,vendor,__pycache__,.octocode,site-packages}
-Matches under fixtures/, test/fixtures/, mocks/ or examples/ are usually scaffolding, NOT the real
-implementation — a mock named like the thing you are looking for is a trap, not an answer. Prefer
-src/, packages/*/src/, lib/ and the repo root, and name the file you took the answer from.
+For implementation questions, prefer src/, packages/*/src/, lib/ and the repo root before fixtures,
+mocks, or examples. If the question targets tests or examples, inspect those files. Name the file
+that supplies the answer.
 If a search returns nothing, widen the pattern before concluding the thing does not exist: absence
 of a grep hit is weak evidence, and "not found" is only a real answer once you have looked in the
 source directories.
-ASKED FOR A DEFAULT? Find the DECLARATION, not test occurrences. Declarations look like
+For a production default, find its declaration before relying on test occurrences. Declarations look like
 `default=`, `unwrap_or(`, `const `, `static `, or a settings schema initializer.
-Test files define nothing — they only consume values declared elsewhere."""
+For a test-specific default or fixture, inspect its test declaration."""
 
 
 def _main(resources: ExitStack) -> int:
@@ -138,6 +139,7 @@ def _main(resources: ExitStack) -> int:
     execution_receipts: list[dict[str, Any]] = []
     answer = ""
     failure: str | None = None
+    transport_error: dict[str, Any] | None = None
     calibration_dir = os.environ.get("FREELLAMA_AGENT_TOKEN_CALIBRATION_DIR", "").strip()
     calibration_model_identity = (
         resolve_model_identity(managed_endpoint or endpoint, model, messages[0]["content"])
@@ -224,7 +226,8 @@ def _main(resources: ExitStack) -> int:
         try:
             response = call_model()
         except (HTTPError, URLError, TimeoutError) as error:
-            failure = f"agent response failed: {type(error).__name__}: {error}"
+            diagnostic, transport_error = chat_error_details(error)
+            failure = f"agent response failed: {diagnostic}"
             break
         raw = str(response.get("message", {}).get("content", ""))
         try:
@@ -298,7 +301,8 @@ def _main(resources: ExitStack) -> int:
                     raise ValueError("forced final response was not finish")
                 answer = str(final_action.get("answer", "")).strip()
             except (HTTPError, URLError, TimeoutError, ValueError, json.JSONDecodeError) as error:
-                failure = f"agent exceeded {runtime.max_turns} turns and finalization failed: {type(error).__name__}: {error}"
+                diagnostic, transport_error = chat_error_details(error)
+                failure = f"agent exceeded {runtime.max_turns} turns and finalization failed: {diagnostic}"
 
     if not answer:
         answer = failure or "agent stopped without a final answer"
@@ -322,6 +326,7 @@ def _main(resources: ExitStack) -> int:
             "execution_preference": execution_preference,
             "min_placement_evidence": min_placement_evidence,
             "execution_receipts": execution_receipts,
+            **({"transport_error": transport_error} if transport_error else {}),
             "cache_token_metrics": cache_usage.metadata(),
             "calibration_model_identity": calibration_model_identity,
         },

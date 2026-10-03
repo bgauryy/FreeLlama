@@ -55,8 +55,8 @@ The metadata receipt contains `scope_id`, `revision`, `route_defaults`, `limits`
 `bytes`, `estimated_tokens`, `expires_at`, and `storage:"process_local"`. Full history can include images, thinking, and tool calls; request it only when needed. Counts and estimates
 describe the stored transcript; they are not an exact tokenizer result or runner-memory estimate.
 Token estimates derive from the full serialized message bytes and count both media and extra fields.
-This conservative estimate can refuse media-heavy history before inference; it does not measure
-exact image token cost.
+This storage-budget estimate can refuse media-heavy history before inference; it does not measure
+image token cost or determine the model context required to execute the history.
 
 Fork requires `revision` and accepts optional replacement routing defaults and limit overrides. It creates a
 separate history snapshot with revision `0`; later writes to either scope do not change the other.
@@ -85,7 +85,12 @@ not append history.
 Limits reject an oversized transcript instead of silently deleting earlier instructions. If a task
 cannot fit, narrow its input, create a compact replacement scope, or fork a suitable snapshot. The
 caller owns any semantic summary and its verification. Stored history also contributes to managed
-context sizing; the selected model's context boundary still applies.
+context sizing; the selected model's context boundary still applies. Scoped image or audio input
+requires explicit `context_tokens` (`contextTokens` through MCP). Its context receipt estimates
+text and reports total multimodal token cost as unknown. Encoded media is retained in history,
+but its bytes are not counted as text tokens. Text plus the finite output reserve must fit the
+requested window; Ollama determines the remaining model-specific fit with truncation and shifting
+disabled. A passing estimate alone does not prove the complete multimodal input fits.
 
 Scopes are process-local. Restarting `serve` discards them. Scope identifiers are handles within one
 operator service, not tenant authorization credentials. Apply external tenant isolation where
@@ -165,11 +170,20 @@ A cold warm request can therefore wait or refuse. Read the `warm` receipt alongs
 physical residency or placement. Use configured placement for an initial load,
 inspect its receipt, and require observed placement for subsequent work when placement matters.
 
+`warm.loaded` reports observed residency independently of CPU/GPU placement: `true` when the exact
+runner is present, `false` when a successful residency query finds it absent, and `null` when that
+query is unavailable. A resident runner can still have a placement mismatch. Managed non-streaming
+chat requires Ollama's `done:true`; an absent or non-boolean completion marker is an upstream error.
+These are separate observations in Ollama's [chat response](https://docs.ollama.com/api/chat) and
+[running-model inventory](https://docs.ollama.com/api/ps).
+
 With `keep_alive:"0"`, warming observes placement and then unloads. The `warm` receipt describes
 residency after unload: `loaded:false` on verified unload, with
 `residency_source:"ollama_api_ps_after_unload"`.
 
-Use a context/task profile compatible with the following task. Warming a different profile can
+Warming uses the same truncation and context-shift policy as managed chat. This preserves a
+compatible runner profile instead of forcing a transition solely because warming omitted those
+controls. Use a context/task profile compatible with the following task. Warming a different profile can
 require another runner transition. Warm residency does not reserve a later execution slot. Cache reuse depends on the compatible
 profile, unchanged prefix, and inference backend. See [Managed execution](ARCHITECTURE.md#managed-task-execution).
 

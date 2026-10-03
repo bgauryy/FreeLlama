@@ -27,6 +27,7 @@ fn model(name: &str, size: u64, capabilities: &[Capability]) -> CatalogModel {
         kv_cache_bytes_per_token_f16: None,
         modelfile_num_ctx: None,
         resident: false,
+        resident_size: None,
         resident_vram: None,
         benchmark: BTreeMap::new(),
         policy_rank: BTreeMap::new(),

@@ -24,9 +24,11 @@ returns `execution.preference_satisfied:false`; raw `/api/*` is never rewritten.
 ## Feedback loop
 
 `auto` records verified resident latency by task/backend/model: decode time per output token for
-generation and total time per embedding input token. It needs three samples
-on both backends and more than a 10% advantage before steering `fastest` or `balanced`. Cold loads
-do not count. `quality`, explicit models, and session-pinned work never follow latency feedback.
+generation and total time per embedding input token. It needs three comparable warm serial samples
+on both backends and more than a 10% advantage before steering `fastest` or `balanced`. Profile
+identity includes the model, context, payload controls, and observed process settings. Unknown or
+changed evidence does not qualify a learned route. Cold loads do not count. `quality`, explicit
+models, and session-pinned work never follow latency feedback.
 Capacity may choose a backend when the other pool is full.
 
 Unknown, mixed, or assignment-mismatched placement is returned but never trains a backend bucket.
@@ -38,9 +40,11 @@ before a consequential task; never infer readiness from one fast call.
 ## Resource contract
 
 Primary and CPU backends use independent weighted pools, so a GPU burst cannot consume a CPU
-helper's permit. Defaults are primary 2 and CPU 1; costs are embedding 1, chat 2, vision 4 capped to
-the pool. These defaults describe one unit of useful work, not the Mac used for measurements. Tune with
-`--max-concurrent-tasks` and `--cpu-max-concurrent-tasks`. Ollama still owns within-process decode
+helper's permit. The primary default is 2 units per observed `OLLAMA_NUM_PARALLEL` slot, falling back
+to 2; CPU defaults to 1. Default base costs are embedding 1, chat 2, and vision 4. Embeddings
+multiply their base by `ceil(input_items/4)`; the acquired charge is capped to the pool. Tune capacity
+with `--max-concurrent-tasks` and `--cpu-max-concurrent-tasks`, and base costs through `[task_costs]`.
+See [monitoring controls](../../../docs/MONITORING.md#adaptive-concurrency). Ollama still owns within-process decode
 parallelism through `OLLAMA_NUM_PARALLEL`, which multiplies KV memory.
 Run `doctor` on the target host. `machine.memory_bytes` is total physical RAM on macOS, Linux, and
 Windows; `unified_memory_bytes` is non-null only when system and accelerator memory are known to be

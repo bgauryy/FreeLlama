@@ -1,5 +1,9 @@
 # FreeLlama MCP server
 
+Meet the agentic tool:
+
+![A cartoon llama with a full halo and small wings holds a glowing wrench beneath an open golden gate.](assets/logo.jpg)
+
 Exposes FreeLlama's local-LLM control plane, and Ollama's lifecycle, as
 [MCP](https://modelcontextprotocol.io) tools, built on the official
 [TypeScript SDK](https://github.com/modelcontextprotocol/typescript-sdk).
@@ -114,7 +118,7 @@ Use this economical sequence:
 For a delegated agent, estimated usable input is `contextTokens - outputTokens - safetyMarginTokens`
 (the default margin is 256). The adapter pins the system instruction and question, preserves the
 newest observations, compacts older observations into breadcrumbs, and refuses a pinned overflow
-by default. `pinnedOverflow:"clip"` is a deliberate quality-risk override. Initial token counting
+by default. `FREELLAMA_AGENT_PINNED_OVERFLOW=clip` is a deliberate quality-risk override. Initial token counting
 is conservative; successful Ollama calls calibrate later estimates.
 
 Do not confuse operational evidence with answer quality. A receipt can prove admission, token
@@ -231,10 +235,10 @@ artifact); `native/index.js` and `native/index.d.ts` are hand-written and checke
 npx @octocodeai/freellama-mcp-server
 ```
 
-**From a source checkout:**
+**From the repository root after building:**
 
 ```bash
-node dist/index.js
+node packages/mcp/dist/index.js
 ```
 
 The server speaks MCP over stdio — configure it in your MCP client, do not run it interactively.
@@ -261,7 +265,7 @@ Vitest, in three tiers (all TypeScript, under `test/`):
 | Tier | Command (from this package) | Checks | Needs |
 |---|---|---|---|
 | `test/unit/` | `yarn test` (watch: `yarn test:watch`) | pure functions straight from `src/*.ts` — no build step, this is the TDD loop | nothing, ~0.5s |
-| `test/integration/` | `yarn test:integration` | the built server over the real MCP protocol: tool contract, structured content, guardrails; rebuilds `dist/` itself | live Ollama on :11434, ~5s |
+| `test/integration/` | `yarn test:integration` | the built server over the real MCP protocol: tool contract, structured content, guardrails; rebuilds `dist/` itself | Ollama at `FREELLAMA_OLLAMA_ENDPOINT` (default :11434) |
 | `test/e2e/` | `yarn test:e2e` | every tool against the live system: real routing/execution, pull → delete round trip (net-zero), a real delegated research run | serve + Ollama + models, ~40s |
 
 The same commands work from the repository root (`yarn test` there also runs the CLI package's tests).
@@ -328,10 +332,10 @@ Memory admission, authentication, and capability requirements apply in every mod
 - Preview: set `preview: true`; pass routing fields such as `task`, `objective`, `model`,
   `contextTokens`, `requiredCapabilities`, and placement/confidence gates. To preview tool use,
   pass `requiredCapabilities: ["tools"]` rather than function definitions.
-- Execution: omit `preview` (or set it to `false`) and pass `prompt`/`messages` for generative
+- Execution: omit `preview` (or set it to `false`) and pass `prompt`, `systemPrompt`, or `messages` for generative
   tasks or `input` for embeddings, plus any applicable Ollama runtime controls.
 
-Preview rejects `prompt`, `messages`, `input`, `images`, `tools`, `keepAlive`, `format`, `think`,
+Preview rejects `prompt`, `systemPrompt`, `messages`, `input`, `images`, `tools`, `keepAlive`, `format`, `think`,
 `options`, `logprobs`, `topLogprobs`, `returnEmbeddings`, `priority`, `maxWaitSeconds`, `timeoutSeconds`, and
 `defer`, `scopeId`, and `scopeRevision`. This prevents a client from attaching
 work to a decision-only call and mistakenly assuming it ran.
@@ -361,9 +365,10 @@ loading, and inference. The server caps it at its task timeout. The admission wa
 separate; a queue refusal can happen before the total deadline. `priority` selects a fair scheduling
 class without bypassing resource checks.
 
-You own the task instructions. Pass system prompts as `messages` entries with `role:"system"`;
-FreeLlama preserves their content and order without prepending its own task prompt. A plain `prompt`
-becomes one user message, and a supplied `messages` array takes precedence. This also applies to
+You own the task instructions. Pass system prompts as `messages` entries with `role:"system"`,
+or use `systemPrompt` to prepend one caller-supplied system message. FreeLlama preserves existing
+messages and adds no task instructions of its own. A plain `prompt` becomes one user message,
+and a supplied `messages` array takes precedence over `prompt`. This also applies to
 `task:"code_review"` (an alias for `coding`) and `run_task_batch`: no review wrapper, mandatory
 JSON review format, or review-specific output-token minimum is added.
 
@@ -398,9 +403,13 @@ managed tasks execute on the primary GPU-capable process.
 Set `executionPreference` on `run_task` to `auto` (default), `prefer_cpu`, or `prefer_gpu`. This is a
 guarded hint: only exact operator-assigned CPU models are eligible, explicit model/session pins win,
 and `preview: true` returns `execution.preference_satisfied`, placement, upstream, admission, and a
-reason without generating. Automatic feedback normalizes work by tokens, waits for three successful
-warm, physically verified samples per task on both backends, requires a 10% advantage, and never
-steers the `quality` objective. `minPlacementEvidence:"observed"` fails closed unless resident
+reason without generating. Automatic feedback normalizes work by tokens and requires three
+comparable warm serial samples on both backends with a 10% advantage. It matches model digest,
+explicit observed context, effective controls, endpoint-attributed process settings, and managed
+admission class. Unknown identity, parallel intervals, and decision-only payload-free previews
+use capacity and policy signals. Stored legacy totals do not qualify speed hints. Feedback does
+not steer the `quality` objective. See [automatic feedback](../../docs/CPU_GPU_ROUTING.md#understand-automatic-feedback).
+`minPlacementEvidence:"observed"` fails closed unless resident
 `/api/ps` evidence matches the configured processor; warm cold models once with `"configured"`.
 `keepAlive:"0"` uses an observe-then-unload transaction: FreeLlama retains the runner long enough
 to inspect `/api/ps`, accepts feedback only for verified placement, requests an explicit unload,
@@ -515,6 +524,13 @@ an external TLS and authorization layer for untrusted or multi-tenant networks.
 
 ### Runtime evidence
 
+Admission weights can be set by task kind in the server runtime file's `[task_costs]` table.
+Inspect `doctor {view:"full"}` at `platform_health.admission.costs.base_by_task` for effective
+weights and `run_task {preview:true}` for current cost and capacity advice. The table changes
+managed admission; it does not create Ollama
+slots or relax memory guards. Existing queued work keeps its captured cost. See
+[monitoring controls](../../docs/MONITORING.md#adaptive-concurrency).
+
 **No measurements are compiled in.** In a repository checkout, per-model research grades load from
 `benchmark/evidence/model-evidence.json`. A published package does not include that repository
 file, so its evidence table is empty unless you set `FREELLAMA_MCP_MODEL_EVIDENCE`. An unmeasured
@@ -548,16 +564,17 @@ See `skills/freellama/references/proxy-vs-serve.md` for the `proxy` vs `serve` d
 `packages/mcp/` is the portable JavaScript package. Its `package.json` lists the platform packages
 as exact-version optional dependencies; it intentionally does not embed a `.node` binary. Publish
 the eight `packages/native/*` packages first, then publish `@octocodeai/freellama` (`npx @octocodeai/freellama`) and `@octocodeai/freellama-mcp-server` (`npx @octocodeai/freellama-mcp-server`)
-at the same version. `yarn release:verify:publish` refuses a release if any platform package has a
-missing, empty, or unpacked executable/addon pair.
+at the same version. `yarn release:verify:publish` refuses a release if any of the ten packages
+omits `assets/logo.jpg`, or if any platform package has a missing, empty, or unpacked
+executable/addon pair.
 
 ```bash
 cd packages/mcp
 npm pack --dry-run   # confirm exactly what a publish would ship
 ```
 
-Version 0.1.0 is not published to a registry. Treat `npm publish` as a real, irreversible public
-action, and confirm with the repository owner first.
+Treat `npm publish` as a public release action. Follow the repository
+[release procedure](../../RELEASE.md) and obtain the repository owner's release authorization first.
 
 ## Why native bindings
 

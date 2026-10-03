@@ -1,6 +1,6 @@
 {
   "name": "freellama-workspace",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "type": "module",
   "description": "Workspace root for FreeLlama's internal Rust core, portable JavaScript entry points, and per-platform native artifact packages.",
@@ -27,7 +27,7 @@
     "dev:view": "yarn workspace @octocodeai/freellama-view dev",
     "build:view": "yarn workspace @octocodeai/freellama-view build",
     "start:view": "yarn workspace @octocodeai/freellama-view start",
-    "build": "yarn build:rust && yarn build:native && yarn workspaces foreach -A --topological run build",
+    "build": "yarn build:licenses && yarn build:rust && yarn build:native && yarn workspaces foreach -A --topological run build",
     "build:native": "napi build --platform --release --manifest-path packages/rust-core/Cargo.toml --features napi --no-js --no-dts-header --dts .napi-generated.d.ts -o packages/mcp/native && node packages/mcp/scripts/remove-generated-dts.mjs",
     "build:rust": "cargo build --release",
     "typecheck": "yarn workspaces foreach -A run typecheck",
@@ -37,11 +37,15 @@
     "test:e2e": "vitest run -c packages/mcp/vitest.e2e.config.ts",
     "test:rust": "cargo test --workspace",
     "test:agents": "python3 -m unittest discover -s benchmark/local/scripts -p 'test_*.py'",
-    "test:all": "yarn typecheck && yarn test && yarn test:rust && yarn test:agents && yarn test:integration && yarn test:e2e",
+    "test:all": "yarn typecheck && yarn test && yarn test:rust && yarn test:agents && yarn test:hardware && yarn test:release && yarn test:integration && yarn test:e2e",
     "verify:production": "yarn build && cargo fmt --all --check && cargo clippy --workspace --all-targets --all-features -- -D warnings && yarn test:all && yarn release:verify:publish",
     "release:assemble": "node scripts/assemble-release.mjs",
     "release:verify": "node scripts/verify-release-packages.mjs",
-    "release:verify:publish": "FREELLAMA_REQUIRE_ALL_PLATFORMS=1 node scripts/verify-release-packages.mjs"
+    "release:verify:publish": "FREELLAMA_REQUIRE_ALL_PLATFORMS=1 node scripts/verify-release-packages.mjs",
+    "build:licenses": "node scripts/bundle-licenses.mjs",
+    "test:release": "node --test scripts/test-release-packages.mjs scripts/test-release-registry.mjs",
+    "test:hardware": "python3 -m unittest discover -s benchmark/hardware -p 'test_*.py'",
+    "release:verify:registry": "node scripts/verify-release-registry.mjs"
   },
   "devDependencies": {
     "@napi-rs/cli": "^3.8.6",

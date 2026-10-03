@@ -185,6 +185,7 @@ pub(super) async fn status(State(state): State<PlatformState>) -> Json<Value> {
             "gpu_memory_total_bytes": observation.gpu_memory_total_bytes,
             "gpu_memory_free_bytes": observation.gpu_memory_free_bytes,
             "gpu_telemetry_source": observation.gpu_telemetry_source,
+            "gpu_activity": observation.gpu_activity,
             "sample_age_ms": snapshot.sample_age_ms,
         },
         "ollama": {

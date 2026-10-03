@@ -1,6 +1,6 @@
 {
   "name": "@octocodeai/freellama-native-win32-x64-msvc",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "FreeLlama native Rust artifacts for Windows x64",
   "license": "Apache-2.0 OR MIT",
   "os": [
@@ -12,7 +12,10 @@
   "main": "freellama.win32-x64-msvc.node",
   "files": [
     "freellama.exe",
-    "freellama.win32-x64-msvc.node"
+    "freellama.win32-x64-msvc.node",
+    "LICENSE-APACHE",
+    "LICENSE-MIT",
+    "assets/logo.jpg"
   ],
   "publishConfig": {
     "access": "public",

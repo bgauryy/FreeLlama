@@ -13,6 +13,93 @@ pub(super) fn estimated_text_tokens(text: &str) -> u64 {
     (text.len() as u64).div_ceil(3)
 }
 
+fn has_unestimated_modality(input: &TaskInput) -> bool {
+    matches!(input.route.task, TaskKind::Embedding | TaskKind::Vision)
+        || input
+            .images
+            .as_ref()
+            .is_some_and(|images| !images.is_empty())
+        || input.messages.iter().any(|message| {
+            message.get("images").is_some()
+                || message.get("audio").is_some()
+                || message
+                    .get("content")
+                    .is_some_and(|content| !content.is_string())
+        })
+}
+
+/// Project only the execution estimate; the caller's payload and stored history stay intact.
+/// Encoded media and structured content require a model-specific tokenizer, not byte counting.
+fn scoped_text_payload(input: &TaskInput) -> String {
+    let messages: Vec<Value> = input
+        .messages
+        .iter()
+        .map(|message| {
+            let fields = message.as_object().expect("scope messages are objects");
+            Value::Object(
+                fields
+                    .iter()
+                    .filter(|(key, value)| {
+                        !matches!(key.as_str(), "images" | "audio")
+                            && (key.as_str() != "content" || value.is_string())
+                    })
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            )
+        })
+        .collect();
+    serde_json::to_string(&messages).expect("messages serialize")
+}
+
+fn size_scoped_explicit_context(
+    input: &TaskInput,
+    decision: &RouteDecision,
+    unestimated_modality: bool,
+) -> Result<Value, ApiError> {
+    let payload = if unestimated_modality {
+        scoped_text_payload(input)
+    } else {
+        serde_json::to_string(&input.messages).expect("messages serialize")
+    };
+    let mut estimated = estimated_text_tokens(&payload);
+    for schema in [input.tools.as_ref(), input.request_options.format.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        estimated = estimated.saturating_add(estimated_text_tokens(&schema.to_string()));
+    }
+    let output = decision.options["num_predict"].as_u64().ok_or_else(|| {
+        ApiError::bad_request("scoped history requires a finite positive output budget")
+    })?;
+    let required = estimated
+        .saturating_add(output)
+        .saturating_add(TEMPLATE_MARGIN);
+    let available = decision.options["num_ctx"].as_u64().unwrap_or_default();
+    if required > available {
+        let estimate_scope = if unestimated_modality {
+            "scoped text and metadata"
+        } else {
+            "complete scoped history"
+        };
+        return Err(ApiError::bad_request(format!(
+            "{estimate_scope} plus output reserve requires approximately {required} tokens, above configured context {available}; compact explicitly or increase context_tokens"
+        )));
+    }
+    if unestimated_modality {
+        return Ok(json!({
+            "mode":"scope_explicit_multimodal", "tokens":available,
+            "estimator":"utf8_bytes_div_3", "estimate_scope":"text_and_metadata_only",
+            "estimated_text_input_tokens":estimated, "estimated_input_tokens":null,
+            "modality_tokens":null, "reason":"modality_requires_model_specific_estimator",
+            "output_reserve_tokens":output, "template_margin_tokens":TEMPLATE_MARGIN,
+            "total_fit_verified":false, "exact_token_count":false,
+        }));
+    }
+    Ok(
+        json!({"mode":"scope_explicit_estimate","tokens":available,"estimated_input_tokens":estimated,"output_reserve_tokens":output,"template_margin_tokens":TEMPLATE_MARGIN,"exact_token_count":false}),
+    )
+}
+
 pub(super) fn size_context(
     input: &TaskInput,
     decision: &mut RouteDecision,
@@ -21,49 +108,30 @@ pub(super) fn size_context(
     if matches!(input.operation, super::warming::ManagedOperation::Warm) {
         return Ok(json!({"mode":"warm_profile","tokens":decision.options["num_ctx"]}));
     }
-    if input.scope_id.is_some() && input.route.context_tokens.is_some() {
-        let payload = serde_json::to_string(&input.messages).expect("messages serialize");
-        let mut estimated = estimated_text_tokens(&payload);
-        for schema in [input.tools.as_ref(), input.request_options.format.as_ref()]
-            .into_iter()
-            .flatten()
+    let unestimated_modality = has_unestimated_modality(input);
+    if input.scope_id.is_some() {
+        if decision.options["num_predict"]
+            .as_u64()
+            .is_none_or(|output| output == 0)
         {
-            estimated = estimated.saturating_add(estimated_text_tokens(&schema.to_string()));
+            return Err(ApiError::bad_request(
+                "scoped history requires a finite positive output budget",
+            ));
         }
-        let output = decision.options["num_predict"].as_u64().ok_or_else(|| {
-            ApiError::bad_request("scoped history requires a finite positive output budget")
-        })?;
-        let required = estimated
-            .saturating_add(output)
-            .saturating_add(TEMPLATE_MARGIN);
-        let available = decision.options["num_ctx"].as_u64().unwrap_or_default();
-        if required > available {
-            return Err(ApiError::bad_request(format!(
-                "complete scoped history plus output reserve requires approximately {required} tokens, above configured context {available}; compact explicitly or increase context_tokens"
-            )));
+        if unestimated_modality && input.route.context_tokens.is_none() {
+            return Err(ApiError::bad_request(
+                "scoped multimodal history requires explicit context_tokens; total token cost requires a model-specific estimator",
+            ));
         }
-        return Ok(
-            json!({"mode":"scope_explicit_estimate","tokens":available,"estimated_input_tokens":estimated,"output_reserve_tokens":output,"template_margin_tokens":TEMPLATE_MARGIN,"exact_token_count":false}),
-        );
+    }
+    if input.scope_id.is_some() && input.route.context_tokens.is_some() {
+        return size_scoped_explicit_context(input, decision, unestimated_modality);
     }
     if input.route.context_tokens.is_some() {
         return Ok(json!({"mode": "explicit", "tokens": decision.options["num_ctx"]}));
     }
     // Image/audio token cost is model-dependent. Base64 bytes are not text tokens.
-    if input.scope_id.is_none()
-        && (matches!(input.route.task, TaskKind::Embedding | TaskKind::Vision)
-            || input
-                .images
-                .as_ref()
-                .is_some_and(|images| !images.is_empty())
-            || input.messages.iter().any(|message| {
-                message.get("images").is_some()
-                    || message.get("audio").is_some()
-                    || message
-                        .get("content")
-                        .is_some_and(|content| !content.is_string())
-            }))
-    {
+    if input.scope_id.is_none() && unestimated_modality {
         return Ok(
             json!({"mode": "profile", "reason": "modality_requires_model_specific_estimator"}),
         );
@@ -220,5 +288,36 @@ mod tests {
         model.advertised_context = Some(3000);
         size_context(&input, &mut decision, &model).unwrap();
         assert_eq!(decision.options["num_ctx"], 3000);
+    }
+
+    #[test]
+    fn scoped_structured_content_has_no_total_estimate_or_automatic_sizing() {
+        let (mut input, model, mut decision) = request("hello");
+        input.scope_id = Some("scope".into());
+        input.messages =
+            vec![json!({"role":"user","content":[{"type":"image","data":"a".repeat(20_000)}]})];
+        assert!(size_context(&input, &mut decision, &model).is_err());
+        input.route.context_tokens = Some(4096);
+        decision.options["num_ctx"] = json!(4096);
+        let original = input.messages.clone();
+        let receipt = size_context(&input, &mut decision, &model).unwrap();
+        assert_eq!(receipt["total_fit_verified"], false);
+        assert!(receipt["estimated_input_tokens"].is_null());
+        assert!(receipt["estimated_text_input_tokens"].as_u64().unwrap() < 512);
+        assert_eq!(input.messages, original);
+    }
+
+    #[test]
+    fn scoped_output_budget_must_be_positive_with_automatic_or_explicit_context() {
+        let (mut input, model, mut decision) = request("hello");
+        input.scope_id = Some("scope".into());
+        input.messages = vec![json!({"role":"user","content":"hello"})];
+        for context in [None, Some(4096)] {
+            input.route.context_tokens = context;
+            for output in [0, -1, -2] {
+                decision.options["num_predict"] = json!(output);
+                assert!(size_context(&input, &mut decision, &model).is_err());
+            }
+        }
     }
 }

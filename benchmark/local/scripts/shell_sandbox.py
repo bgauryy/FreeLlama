@@ -50,16 +50,19 @@ READ_ONLY_GIT = frozenset({
 # Per-tool flags that write a file or run another program.
 _FORBIDDEN_FLAGS: dict[str, tuple[str, ...]] = {
     "find": ("-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-fprintf", "-fls"),
-    "sort": ("-o", "--output", "--compress-program"),
-    "rg": ("--pre", "--pre-glob", "--search-zip", "-z"),
+    "sort": ("-o", "--output", "--compress-program", "--files0-from"),
+    "wc": ("--files0-from",),
+    "grep": ("-f", "--file"),
+    "egrep": ("-f", "--file"),
+    "fgrep": ("-f", "--file"),
+    "rg": ("--pre", "--pre-glob", "--search-zip", "-z", "-f", "--file"),
     "tree": ("-o",),
-    "file": ("-C", "--compile"),
-    "git": ("-c", "--config-env", "--exec-path", "--output", "-o", "--ext-diff", "--textconv", "--open-files-in-pager", "-O"),
+    "file": ("-C", "--compile", "-f", "--files-from"),
+    "jq": ("-f", "--from-file", "-L", "--library-path"),
+    "git": ("-C", "-c", "--config-env", "--exec-path", "--output", "-o", "--ext-diff", "--textconv", "--open-files-in-pager", "-O"),
     "diff": ("--to-file",),
 }
 _SED_IN_PLACE = re.compile(r"^(?:-[a-zA-Z]*i|--in-place)")
-# sed commands that write (w/W), execute (e) or read arbitrary files (r/R), including the s///w flag.
-_SED_WRITE = re.compile(r"(?:^|[;{}\n]|\d|\$|/)\s*!?\s*[wWerR](?:\s|$)|s(.).*?\1.*?\1[gpiImMe0-9]*[we]")
 
 # Shell syntax that would hide a command or a path from validation.
 _HIDDEN_EXPANSION = re.compile(r"\$\(|`|<\(|>\(|\$'|\$\{|\$[A-Za-z_0-9@*#?!$-]")
@@ -165,15 +168,20 @@ def _check_tool(words: list[str]) -> None:
             f"(allowed: {', '.join(READ_ONLY_TOOLS)})"
         )
     for flag in _FORBIDDEN_FLAGS.get(name, ()):
-        if any(arg == flag or arg.startswith(flag + "=") for arg in args):
-            raise ValueError(f"command blocked: `{name} {flag}` writes or executes")
+        if any(
+            arg == flag or arg.startswith(flag + "=")
+            or (len(flag) == 2 and flag.startswith("-") and not arg.startswith("--")
+                and arg.startswith("-") and flag[1] in arg[1:])
+            for arg in args
+        ):
+            raise ValueError(f"command blocked: `{name} {flag}` loads external arguments, writes or executes")
     if name == "sed":
         for arg in args:
             if _SED_IN_PLACE.match(arg):
                 raise ValueError("command blocked: sed -i edits files")
-        scripts = [arg for arg in args if not arg.startswith("-")]
-        if scripts and _SED_WRITE.search(scripts[0]):
-            raise ValueError("command blocked: sed w/r/e commands read, write or execute files")
+        scripts = _sed_programs(args)
+        for script in scripts:
+            _check_sed_program(script)
     if name == "git":
         subcommand = next((arg for arg in args if not arg.startswith("-")), None)
         if subcommand not in READ_ONLY_GIT:
@@ -182,7 +190,120 @@ def _check_tool(words: list[str]) -> None:
                 f"(allowed: {', '.join(sorted(READ_ONLY_GIT))})"
             )
     if name == "xargs":
-        _check_tool(_xargs_command(args))
+        if any(arg == "--arg-file" or arg.startswith("--arg-file=")
+               or (arg.startswith("-a") and not arg.startswith("--")) for arg in args):
+            raise ValueError("command blocked: xargs argument files cannot be confined")
+        target = _xargs_command(args)
+        if target[0] not in {"echo", "printf", "true", "false"}:
+            raise ValueError("command blocked: xargs filesystem arguments cannot be confined")
+        _check_tool(target)
+
+
+def _check_sed_program(program: str) -> None:
+    """Accept the bounded read-only sed grammar, including addressed substitutions."""
+    index = 0
+
+    def delimited(start: int) -> int:
+        delimiter = program[start]
+        cursor = start + 1
+        while cursor < len(program):
+            if program[cursor] == "\\":
+                cursor += 2
+            elif program[cursor] == delimiter:
+                return cursor + 1
+            else:
+                cursor += 1
+        raise ValueError("command blocked: unterminated sed expression")
+
+    while index < len(program):
+        while index < len(program) and (program[index].isspace() or program[index] in ";{}"):
+            index += 1
+        if index == len(program):
+            return
+        # An address may be numeric, last-line, or a delimited regular expression.
+        for address in range(2):
+            if index < len(program) and program[index].isdigit():
+                while index < len(program) and program[index].isdigit():
+                    index += 1
+            elif index < len(program) and program[index] == "$":
+                index += 1
+            elif index < len(program) and program[index] == "/":
+                index = delimited(index)
+            elif index + 1 < len(program) and program[index] == "\\":
+                index = delimited(index + 1)
+            else:
+                break
+            while index < len(program) and program[index].isspace():
+                index += 1
+            if address == 0 and index < len(program) and program[index] == ",":
+                index += 1
+                continue
+            break
+        while index < len(program) and (program[index].isspace() or program[index] == "!"):
+            index += 1
+        if index == len(program):
+            raise ValueError("command blocked: sed command is missing")
+        command = program[index]
+        index += 1
+        if command == "s" and index < len(program):
+            index = delimited(index)
+            # The replacement shares the first delimiter, so include it in the next scan.
+            index = delimited(index - 1)
+            flags_start = index
+            while index < len(program) and program[index] not in ";}\n":
+                index += 1
+            flags = program[flags_start:index].strip()
+            if any(flag not in "gIp0123456789" for flag in flags):
+                raise ValueError("command blocked: sed substitution flags can read, write or execute")
+        elif command not in "pPdDqQnNhHgGx={}":
+            raise ValueError("command blocked: sed command can read, write or execute files")
+        if command not in "{}" and index < len(program) and not (program[index].isspace() or program[index] in ";{}"):
+            raise ValueError("command blocked: unsupported sed command argument")
+
+
+def _sed_programs(args: list[str]) -> list[str]:
+    """Inspect every inline program; loading another file would hide its commands."""
+    programs: list[str] = []
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--":
+            programs.extend(args[index + 1:])
+            break
+        if arg == "--file" or arg.startswith("--file="):
+            raise ValueError("command blocked: sed script files can read, write or execute")
+        if arg == "--expression":
+            index += 1
+            if index >= len(args):
+                raise ValueError("command blocked: sed expression is missing")
+            programs.append(args[index])
+        elif arg.startswith("--expression="):
+            programs.append(arg.split("=", 1)[1])
+        elif arg.startswith("-") and not arg.startswith("--"):
+            # n/E/r are no-argument mode switches. e/f end a short-option cluster and
+            # consume the remainder (or next argument), so attached programs stay visible.
+            short = arg[1:]
+            for offset, option in enumerate(short):
+                if option == "f":
+                    raise ValueError("command blocked: sed script files can read, write or execute")
+                if option == "e":
+                    program = short[offset + 1:]
+                    if not program:
+                        index += 1
+                        if index >= len(args):
+                            raise ValueError("command blocked: sed expression is missing")
+                        program = args[index]
+                    programs.append(program)
+                    break
+                if option not in "nEr":
+                    raise ValueError("command blocked: unsupported sed option")
+        elif not arg.startswith("--"):
+            if not programs:
+                programs.append(arg)
+        else:
+            raise ValueError("command blocked: unsupported sed option")
+        index += 1
+    return programs
 
 
 def _xargs_command(args: list[str]) -> list[str]:
@@ -209,7 +330,40 @@ def validate_command(root: Path, command_text: str) -> str:
             "command blocked: command substitution, process substitution and $-expansion are "
             "not allowed; write paths and patterns literally"
         )
+    # Quoted program braces are literal; unquoted brace paths expand before execution.
+    brace_tokens = shlex.shlex(command_text, posix=False)
+    brace_tokens.whitespace_split = True
+    brace_tokens.commenters = ""
+    for token in brace_tokens:
+        if token.startswith(("'", '"', "--exclude-dir=")):
+            continue
+        if "{" in token or "}" in token:
+            raise ValueError("command blocked: brace-expanded paths cannot be confined")
     for segment in _segments(command_text):
+        for word in segment[1:]:
+            if word.startswith("--exclude-dir="):
+                continue
+            if word == "<":
+                continue
+            if word.startswith("-"):
+                if "=" not in word:
+                    continue
+                word = word.split("=", 1)[1]
+            candidate = root / word
+            candidates = [Path(match) for match in glob.glob(str(candidate))] if _GLOB_CHARS.search(word) else [candidate]
+            for candidate in candidates:
+                if candidate.exists() or candidate.is_symlink():
+                    resolved = candidate.resolve()
+                    if resolved != root.resolve() and root.resolve() not in resolved.parents:
+                        raise ValueError("command blocked: relative path escapes workspace")
+        tool = segment[0]
+        follow_flags = {"rg": "L", "grep": "R", "egrep": "R", "fgrep": "R", "find": "L", "tree": "l", "du": "L"}.get(tool)
+        if follow_flags and any(
+            arg == "--follow" or arg == "--dereference" or arg == "--dereference-recursive"
+            or (arg.startswith("-") and not arg.startswith("--") and follow_flags in arg[1:])
+            for arg in segment[1:]
+        ):
+            raise ValueError("command blocked: recursive symlink following cannot be confined")
         if "=" in segment[0] and not segment[0].startswith("="):
             raise ValueError("command blocked: variable assignment is not allowed")
         if segment[0] in {"for", "while", "until", "if", "case", "function", "{", "eval", "exec", "source", "."}:

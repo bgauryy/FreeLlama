@@ -32,8 +32,9 @@ dependency rather than compiling Rust during installation.
 | JavaScript watch | `yarn test:watch` | None |
 | Rust contracts | `yarn test:rust` | Rust toolchain |
 | Local-agent contracts | `yarn test:agents` | Python 3 standard library |
+| Hardware runner contracts | `python3 -m unittest discover -s benchmark/hardware -p 'test_*.py'` | Python 3 standard library; no inference |
 | TypeScript | `yarn typecheck` | None after install |
-| MCP integration | `yarn test:integration` | Ollama on `127.0.0.1:11434` |
+| MCP integration | `yarn test:integration` | Ollama at `FREELLAMA_OLLAMA_ENDPOINT` (default `127.0.0.1:11434`) |
 | MCP end to end | `yarn test:e2e` | Ollama, `freellama serve`, and required models |
 | All configured tiers | `yarn test:all` | Requirements of every included tier |
 | Production verification | `yarn verify:production` | Build, formatting, strict Clippy, all test tiers, and package verification |
@@ -42,6 +43,10 @@ The end-to-end suite checks behavior rather than schema shape: confidence refusa
 generation, embedding vectors are withheld by default, impossible models are excluded by memory,
 and models with unusable research evidence are refused without tool calls. Tests that require a
 specific unavailable model report a skip reason.
+
+Isolated end-to-end services inherit `FREELLAMA_OLLAMA_ENDPOINT`; they use the same selected Ollama
+endpoint as the prerequisite check. A controlled endpoint fixture verifies this wiring without
+inference.
 
 Live inference tests also inspect routing readiness and report a skip when the host cannot admit
 the model. These skips do not qualify inference throughput or physical placement. The pull/delete
@@ -100,6 +105,9 @@ handoff, and cancellation after that handoff. Governor contracts require CPU pre
 independently while a memory hold still protects cold loads.
 MCP integration also requires native refusals to preserve error codes, retry timing, resource
 assessments, and unload receipts in both text and structured output.
+GET and DELETE refusals retain scope codes and job error details, while successful DELETE accepts an
+empty HTTP 204 body. Unknown top-level tool arguments are rejected before any server request;
+caller-owned message and function-definition extension fields remain preserved.
 
 `task_jobs_contract` covers deferred acceptance, metadata privacy, memory recovery, cancellation
 of waiting and active requests, removal of active and completed jobs without affecting other IDs,
@@ -110,6 +118,12 @@ Cancellation must retain its receipt even when another operation evicts the comp
 failed/stale append refusal, and payload-free managed warming. The warming unit contract
 exercises bounded reuse, load, and pressure adjustments. For request fields and failure codes, see
 [Scope history and model warming](SCOPES_AND_WARMING.md).
+`warming_receipt_contract` separates observed residency from processor verification, retains unknown
+residency when inspection fails, rejects incomplete chat responses, and verifies unload after failure.
+`resident_placement_contract` distinguishes installed file size from resident runner size across
+fresh discovery, cache refresh, observed routing, and scoped execution. Missing total runner memory
+with positive VRAM stays unknown and cannot qualify observed GPU routing or adaptive feedback.
+The MCP resident-view fixture checks percentages against resident bytes and preserves disk size.
 
 Usage-ledger unit contracts cover ordered writes, bounded queue overflow, failed writes, regular-file
 validation, replay, and flush behavior. `monitoring_contract` also checks that a blocked ledger path
@@ -120,6 +134,14 @@ protocol integration contracts verify that spawn failure leaves the MCP connecti
 fixture-backed library requests fail on unexpected product errors. External catalog availability
 is separate from these deterministic checks. Runtime-view `app-windows.test.ts` checks legitimate
 Windows static paths alongside traversal refusal.
+
+Launcher fixtures use `process.execPath` to avoid an extra PATH-resolved shell wrapper. After the
+MCP fixture's real executable-permission refusal, a test-only transport launches that exact fixture
+script through the same Node executable. Real child processes, HTTP listeners, signals, and exit
+tracking still exercise the lifecycle contract. On the October 2, 2026 host, raw process samples
+placed the failed fixture launches in the macOS dynamic loader before JavaScript loaded. This
+fixture correction preserves test and production deadlines; it does not measure production
+startup performance or identify the underlying host loader policy.
 
 Request-validation contracts preserve structured JSON errors for invalid task and batch bodies.
 MCP `task-jobs.test.ts` exercises submission, inspection, result retrieval, cancellation, and removal through
@@ -166,6 +188,22 @@ For promotion, use the portable [hardware acceptance runner](../benchmark/hardwa
 archive its JSON receipt with the release evidence. Compilation alone does not validate a driver,
 physical placement, shared-memory contention, or OCR quality.
 
+The runner measures separate sequential and parallel runs of identical workloads across at least
+three pairs, and checks every result before reporting successful-task throughput. It requires a
+configurable median gain (default 5%). Resident GPU bytes establish placement; they do not measure
+device busy percentage, bandwidth or energy efficiency. Sustained throughput and tail latency
+require a representative workload and separate device/thermal observations.
+
+The historical CPU/GPU observations above predate the corrected paired-run acceptance gate.
+They remain records of those runs, and do not qualify a release under the current gate.
+
+For a GPU workload with independent expected answers, use
+`benchmark/hardware/run_workload.py --workload MANIFEST.json --output RECEIPT.json`. It accepts
+distinct generation or vision cases, runs at least three alternating pairs, retains every
+result, and rejects incomplete or incorrect workloads. Its client deadline also bounds a hung
+measurement worker. See the [hardware guide](../benchmark/hardware/README.md) for the manifest
+contract.
+
 ## Verify release packages
 
 ```bash
@@ -182,6 +220,12 @@ at the exact same version. A successful local pack dry run proves package conten
 prove registry publication or another hardware class.
 
 ## Test one layer while iterating
+
+The October 2, 2026 fixture investigation retained failed launches, raw dynamic-loader samples,
+and passing reruns. After the executable-fixture correction described above, the normal
+`yarn test` command passed 152 tests in 1.83 seconds of suite time. Test and production deadlines
+remain unchanged. Preserve failed and passing receipts together; this result does not qualify
+production startup timing.
 
 ```bash
 yarn build:native

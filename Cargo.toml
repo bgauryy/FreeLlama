@@ -4,7 +4,7 @@ members = ["packages/rust-core", "packages/cli"]
 
 # Shared across both crates so versions cannot drift between the library and the CLI that wraps it.
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 license = "Apache-2.0 OR MIT"
 rust-version = "1.85"

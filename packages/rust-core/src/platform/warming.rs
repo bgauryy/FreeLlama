@@ -150,7 +150,7 @@ pub(super) fn completion_receipt(execution: &Value) -> Value {
     } else {
         (&execution["observation"], "ollama_api_ps_after_execution")
     };
-    json!({"requested":true,"loaded":observation["status"] == "verified","load_response_validated":true,"residency_source":source,"model_shared_across_scopes":true,"kv_transfer_between_models":false})
+    json!({"requested":true,"loaded":observation["resident"],"load_response_validated":true,"residency_source":source,"model_shared_across_scopes":true,"kv_transfer_between_models":false})
 }
 
 #[cfg(test)]

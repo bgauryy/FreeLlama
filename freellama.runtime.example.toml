@@ -75,3 +75,12 @@
 # reuse_gain_seconds = 30
 # load_multiplier = 2.0
 # pressure_factor = 0.25
+
+# --- Task admission costs ---
+# Optional per-kind positive u32 base weights. Unspecified kinds keep their defaults:
+# embedding 1, vision 4, all other kinds 2. Embeddings multiply the base by ceil(input_items/4).
+# Reload affects new task executions; already queued/active work keeps its captured cost.
+# Lower a weight only after a matched workload shows useful parallelism and memory remains safe.
+# For example, qualified light OCR can use two slots within a four-unit budget:
+# [task_costs]
+# vision = 2

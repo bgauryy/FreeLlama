@@ -126,6 +126,7 @@ pub struct CatalogModel {
     /// Content identity from Ollama's manifest; absent metadata must not be treated as a tag hash.
     #[serde(default)]
     pub digest: Option<String>,
+    /// Installed model file bytes reported by `/api/tags`, used for routing and forecasts.
     pub size: u64,
     pub capabilities: BTreeSet<Capability>,
     pub advertised_context: Option<u64>,
@@ -139,6 +140,9 @@ pub struct CatalogModel {
     #[serde(default)]
     pub modelfile_num_ctx: Option<u64>,
     pub resident: bool,
+    /// Loaded runner bytes reported by `/api/ps`, distinct from the installed file size.
+    #[serde(default)]
+    pub resident_size: Option<u64>,
     pub resident_vram: Option<u64>,
     pub benchmark: BTreeMap<Capability, f64>,
     pub policy_rank: BTreeMap<TaskKind, usize>,

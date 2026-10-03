@@ -62,6 +62,45 @@ def retryable_chat_error(error: Exception) -> bool:
     return isinstance(error, URLError) and isinstance(error.reason, ConnectionRefusedError)
 
 
+def chat_error_details(error: Exception) -> tuple[str, dict[str, Any] | None]:
+    """Retain bounded application refusal receipts, excluding request/auth payloads."""
+    diagnostic = f"{type(error).__name__}: {error}"
+    if not isinstance(error, HTTPError):
+        return diagnostic, None
+    details: dict[str, Any] = {"status": error.code}
+    try:
+        body = error.read(64 * 1024 + 1)
+        if len(body) > 64 * 1024:
+            return diagnostic, details
+        payload = json.loads(body)
+        if not isinstance(payload, dict) or not isinstance(payload.get("error"), str):
+            return diagnostic, details
+        receipt_fields = {
+            "error", "code", "reason", "retry_after_seconds", "resource_admission", "lifecycle",
+            "placement", "execution", "admission", "route", "decision", "quality", "feedback",
+        }
+        payload_fields = {
+            "prompt", "system", "system_prompt", "messages", "content", "input", "images", "tools",
+            "request", "request_options", "headers", "authorization", "token", "api_key", "auth_token",
+        }
+
+        def receipt_value(value: Any) -> Any:
+            if isinstance(value, dict):
+                return {key: receipt_value(item) for key, item in value.items() if key.lower() not in payload_fields}
+            if isinstance(value, list):
+                return [receipt_value(item) for item in value]
+            return value
+
+        receipt = {key: receipt_value(value) for key, value in payload.items() if key in receipt_fields}
+        details["receipt"] = receipt
+        diagnostic = f"HTTP {error.code}: {receipt['error']}"
+    except (OSError, ValueError, RecursionError):
+        pass
+    finally:
+        error.close()
+    return diagnostic, details
+
+
 class PromptCacheUsage:
     """Aggregate optional Ollama cache reads without treating unavailable turns as zero."""
 

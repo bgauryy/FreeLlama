@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
+    num::NonZeroU32,
     path::{Path, PathBuf},
     sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant, SystemTime},
@@ -59,6 +60,8 @@ pub struct RuntimeFile {
     /// expensive to lose, lower it for one that is cheap to reload.
     pub eviction_costs: Option<BTreeMap<String, f64>>,
     pub adaptive_concurrency: Option<AdaptiveMode>,
+    /// Admission units per task; embeddings charge this base for each four-input group.
+    pub task_costs: Option<BTreeMap<super::TaskKind, NonZeroU32>>,
     pub context_mode: Option<ContextMode>,
     pub ollama_default_context: Option<u64>,
     pub auto_context_max: Option<u64>,
@@ -113,6 +116,7 @@ pub struct Tunables {
     pub evict_idle_models: bool,
     pub eviction_costs: BTreeMap<String, f64>,
     pub adaptive_concurrency: AdaptiveMode,
+    pub task_costs: BTreeMap<super::TaskKind, NonZeroU32>,
     pub context_mode: ContextMode,
     pub ollama_default_context: Option<u64>,
     pub auto_context_max: u64,
@@ -128,6 +132,26 @@ pub struct Tunables {
 }
 
 impl Tunables {
+    pub(super) fn task_cost(&self, task: super::TaskKind) -> u32 {
+        self.task_costs
+            .get(&task)
+            .map_or_else(|| default_task_cost(task).get(), |cost| cost.get())
+    }
+
+    pub(super) fn admission_costs(&self) -> Value {
+        let embedding = self.task_cost(super::TaskKind::Embedding);
+        json!({
+            "base_by_task": self.task_costs,
+            "embedding": if embedding == 1 {
+                "ceil(input_items/4)".to_owned()
+            } else {
+                format!("{embedding} * ceil(input_items/4)")
+            },
+            "chat": self.task_cost(super::TaskKind::Completion),
+            "vision": self.task_cost(super::TaskKind::Vision),
+        })
+    }
+
     pub(super) fn max_queue_wait(&self) -> Duration {
         Duration::from_millis(self.max_queue_wait_ms.max(1))
     }
@@ -158,6 +182,15 @@ impl Tunables {
             .collect::<serde_json::Map<_, _>>();
         Value::Object(settings)
     }
+}
+
+fn default_task_cost(task: super::TaskKind) -> NonZeroU32 {
+    let cost = match task {
+        super::TaskKind::Embedding => 1,
+        super::TaskKind::Vision => 4,
+        _ => 2,
+    };
+    NonZeroU32::new(cost).expect("default admission costs are positive")
 }
 
 #[allow(clippy::too_many_lines)] // One `pick!` per setting keeps the precedence auditable.
@@ -306,6 +339,17 @@ pub(super) fn resolve(
         AdaptiveMode::Cpu,
         "default"
     );
+    let mut task_costs: BTreeMap<_, _> = <super::TaskKind as clap::ValueEnum>::value_variants()
+        .iter()
+        .copied()
+        .map(|task| (task, default_task_cost(task)))
+        .collect();
+    if let Some(overrides) = &file.task_costs {
+        task_costs.extend(overrides.iter().map(|(task, cost)| (*task, *cost)));
+        sources.insert("task_costs", "file");
+    } else {
+        sources.insert("task_costs", "default");
+    }
     let context_mode = pick!(
         "context_mode",
         None::<ContextMode>,
@@ -477,6 +521,7 @@ pub(super) fn resolve(
         evict_idle_models,
         eviction_costs,
         adaptive_concurrency,
+        task_costs,
         context_mode,
         ollama_default_context,
         auto_context_max,
@@ -750,21 +795,87 @@ impl Breakers {
 
 /// Additive-increase / multiplicative-decrease control of one backend's admission limit.
 ///
-/// A bad completion (upstream failure, host memory pressure, or output throughput below 70% of
-/// that model's healthy baseline) halves the limit, at most once per `DECREASE_SPACING`. Five
-/// healthy completions in a row raise it by one unit, up to the configured ceiling. The fixed
-/// setting stays the ceiling, so this can only make `FreeLlama` more conservative.
+/// A bad completion (upstream failure, host memory pressure, or comparable throughput below 70% of
+/// that comparable profile's healthy baseline) halves the limit, at most once per `DECREASE_SPACING`. Five
+/// comparable positive-rate completions in a row raise it by one unit, up to the configured
+/// ceiling. The fixed setting stays the ceiling, so this can only make `FreeLlama` more conservative.
 #[derive(Clone, Default)]
 pub(super) struct AdaptiveLimiter {
     inner: Arc<StdMutex<AdaptiveState>>,
 }
 
+/// An incomplete, invalid, or cancelled forward cannot bridge healthy observations.
+pub(super) struct AdaptiveCompletionGuard {
+    limiter: AdaptiveLimiter,
+    completed: bool,
+}
+
+impl AdaptiveCompletionGuard {
+    pub(super) fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for AdaptiveCompletionGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.limiter.reset_healthy_streak();
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct AdaptiveState {
-    baseline_tps: HashMap<String, (f64, u32)>,
+    baseline_tps: BTreeMap<super::TaskKind, ProfileBaseline>,
     healthy_streak: u32,
+    last_profile: Option<String>,
     last_decrease: Option<Instant>,
     last_reason: Option<String>,
+}
+
+/// Rate units are part of execution comparability, including persisted profile identity.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ThroughputMetricKind {
+    #[default]
+    OutputTokensPerSecond,
+    InputTokensPerSecond,
+}
+
+impl ThroughputMetricKind {
+    pub(super) const fn for_task(task: super::TaskKind) -> Self {
+        if matches!(task, super::TaskKind::Embedding) {
+            Self::InputTokensPerSecond
+        } else {
+            Self::OutputTokensPerSecond
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ThroughputMetric {
+    pub(super) kind: ThroughputMetricKind,
+    pub(super) tokens_per_second: f64,
+}
+
+/// Prompt-free identity of one observed execution configuration and admission class.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct ExecutionProfile {
+    pub(super) id: String,
+    pub(super) task: super::TaskKind,
+    pub(super) model: String,
+    pub(super) digest: String,
+    pub(super) context_tokens: u64,
+    pub(super) processor: String,
+    #[serde(default)]
+    pub(super) metric_kind: ThroughputMetricKind,
+}
+
+#[derive(Debug)]
+struct ProfileBaseline {
+    profile: ExecutionProfile,
+    rate: f64,
+    samples: u32,
 }
 
 pub(super) const DECREASE_SPACING: Duration = Duration::from_secs(10);
@@ -775,13 +886,25 @@ const BASELINE_ALPHA: f64 = 0.2;
 
 /// One finished task as the controller sees it.
 pub(super) struct Completion<'a> {
-    pub(super) model: &'a str,
+    pub(super) profile: Option<&'a ExecutionProfile>,
     pub(super) failed: bool,
     pub(super) memory_pressure: bool,
-    pub(super) output_tokens_per_second: Option<f64>,
+    pub(super) metric: Option<ThroughputMetric>,
 }
 
 impl AdaptiveLimiter {
+    pub(super) fn completion_guard(&self) -> AdaptiveCompletionGuard {
+        AdaptiveCompletionGuard {
+            limiter: self.clone(),
+            completed: false,
+        }
+    }
+
+    pub(super) fn reset_healthy_streak(&self) {
+        let mut state = self.inner.lock().expect("adaptive state poisoned");
+        state.healthy_streak = 0;
+        state.last_profile = None;
+    }
     /// Feed one completion; returns `Some((direction, new_limit))` when the limit changed.
     pub(super) fn observe(
         &self,
@@ -789,10 +912,17 @@ impl AdaptiveLimiter {
         completion: &Completion<'_>,
     ) -> Option<(&'static str, usize)> {
         let mut state = self.inner.lock().expect("adaptive state poisoned");
-        let slow = completion.output_tokens_per_second.and_then(|tps| {
-            let (baseline, samples) = state.baseline_tps.get(completion.model).copied()?;
-            (samples >= BASELINE_MIN_SAMPLES && tps < baseline * THROUGHPUT_DROP_RATIO)
-                .then_some((tps, baseline))
+        let slow = completion.metric.and_then(|metric| {
+            let tps = metric.tokens_per_second;
+            let profile = completion.profile?;
+            let baseline = state.baseline_tps.get(&profile.task)?;
+            (baseline.profile == *profile
+                && metric.kind == profile.metric_kind
+                && baseline.samples >= BASELINE_MIN_SAMPLES
+                && tps.is_finite()
+                && tps > 0.0
+                && tps < baseline.rate * THROUGHPUT_DROP_RATIO)
+                .then_some((tps, baseline.rate))
         });
         let reason = if completion.failed {
             Some("upstream_failure".to_owned())
@@ -817,19 +947,48 @@ impl AdaptiveLimiter {
             state.last_reason = Some(reason);
             return (next < current).then_some(("decrease", next));
         }
-        if let Some(tps) = completion.output_tokens_per_second.filter(|tps| *tps > 0.0) {
+        let Some(profile) = completion.profile else {
+            state.healthy_streak = 0;
+            state.last_profile = None;
+            return None;
+        };
+        let Some(metric) = completion.metric.filter(|metric| {
+            metric.kind == profile.metric_kind
+                && metric.tokens_per_second.is_finite()
+                && metric.tokens_per_second > 0.0
+        }) else {
+            state.healthy_streak = 0;
+            return None;
+        };
+        let tps = metric.tokens_per_second;
+        if state.last_profile.as_deref() != Some(&profile.id) {
+            state.healthy_streak = 0;
+            state.last_profile = Some(profile.id.clone());
+        }
+        {
             let entry = state
                 .baseline_tps
-                .entry(completion.model.to_owned())
-                .or_insert((tps, 0));
-            entry.0 = if entry.1 == 0 {
+                .entry(profile.task)
+                .or_insert_with(|| ProfileBaseline {
+                    profile: profile.clone(),
+                    rate: tps,
+                    samples: 0,
+                });
+            if entry.profile != *profile {
+                *entry = ProfileBaseline {
+                    profile: profile.clone(),
+                    rate: tps,
+                    samples: 0,
+                };
+            }
+            entry.rate = if entry.samples == 0 {
                 tps
             } else {
-                entry.0 * (1.0 - BASELINE_ALPHA) + tps * BASELINE_ALPHA
+                entry.rate * (1.0 - BASELINE_ALPHA) + tps * BASELINE_ALPHA
             };
-            entry.1 = entry.1.saturating_add(1);
+            entry.samples = entry.samples.saturating_add(1);
         }
-        state.healthy_streak += 1;
+        state.healthy_streak = state.healthy_streak.saturating_add(1);
         if state.healthy_streak >= HEALTHY_STREAK_FOR_INCREASE && pool.total() < pool.ceiling() {
             state.healthy_streak = 0;
             let current = pool.total();
@@ -847,8 +1006,15 @@ impl AdaptiveLimiter {
             "ceiling": pool.ceiling(),
             "healthy_streak": state.healthy_streak,
             "last_decrease_reason": state.last_reason,
-            "baseline_output_tokens_per_second": state.baseline_tps.iter()
-                .map(|(model, (tps, samples))| (model.clone(), json!({"tps": tps, "samples": samples})))
+            "profile_policy": "one_current_profile_per_task_serial_only",
+            "current_profile_count": state.baseline_tps.len(),
+            "profile_windows": state.baseline_tps.iter()
+                .map(|(task, baseline)| (*task, json!({"metric_kind":baseline.profile.metric_kind,"rate":baseline.rate,"samples":baseline.samples,"profile":baseline.profile})))
+                .collect::<BTreeMap<_, _>>(),
+            "baseline_output_tokens_per_second_scope": "legacy_model_summary",
+            "baseline_output_tokens_per_second": state.baseline_tps.values()
+                .filter(|baseline| baseline.profile.metric_kind == ThroughputMetricKind::OutputTokensPerSecond)
+                .map(|baseline| (baseline.profile.model.clone(), json!({"tps": baseline.rate, "samples": baseline.samples, "profile": baseline.profile})))
                 .collect::<serde_json::Map<_, _>>(),
         })
     }
@@ -1101,11 +1267,15 @@ mod tests {
     fn adaptive_limit_halves_on_trouble_and_climbs_back_slowly() {
         let pool = AdmissionPool::new(8, 4);
         let limiter = AdaptiveLimiter::default();
+        let profile = test_profile("profile-a");
         let healthy = |tps| Completion {
-            model: "m",
+            profile: Some(&profile),
             failed: false,
             memory_pressure: false,
-            output_tokens_per_second: Some(tps),
+            metric: Some(ThroughputMetric {
+                kind: ThroughputMetricKind::OutputTokensPerSecond,
+                tokens_per_second: tps,
+            }),
         };
         for _ in 0..3 {
             assert_eq!(limiter.observe(&pool, &healthy(40.0)), None);
@@ -1134,16 +1304,145 @@ mod tests {
         let change = limiter.observe(
             &pool,
             &Completion {
-                model: "m",
+                profile: None,
                 failed: false,
                 memory_pressure: true,
-                output_tokens_per_second: None,
+                metric: None,
             },
         );
         assert_eq!(change, Some(("decrease", 2)));
         assert_eq!(
             limiter.receipt(&pool, true)["last_decrease_reason"],
             "host_memory_pressure"
+        );
+    }
+
+    fn test_profile(id: &str) -> ExecutionProfile {
+        ExecutionProfile {
+            id: id.into(),
+            task: super::super::TaskKind::Completion,
+            model: "m".into(),
+            digest: "revision-a".into(),
+            context_tokens: 4096,
+            processor: "gpu".into(),
+            metric_kind: ThroughputMetricKind::OutputTokensPerSecond,
+        }
+    }
+
+    #[test]
+    fn unknown_or_nonserial_intervals_break_consecutive_recovery() {
+        let pool = AdmissionPool::new(8, 4);
+        let limiter = AdaptiveLimiter::default();
+        let profile = test_profile("serial");
+        let healthy = Completion {
+            profile: Some(&profile),
+            failed: false,
+            memory_pressure: false,
+            metric: Some(ThroughputMetric {
+                kind: ThroughputMetricKind::OutputTokensPerSecond,
+                tokens_per_second: 40.0,
+            }),
+        };
+        for _ in 0..3 {
+            limiter.observe(&pool, &healthy);
+        }
+        let unknown_parallel_interval = Completion {
+            profile: None,
+            metric: Some(ThroughputMetric {
+                kind: ThroughputMetricKind::OutputTokensPerSecond,
+                tokens_per_second: 20.0,
+            }),
+            ..healthy
+        };
+        limiter.observe(&pool, &unknown_parallel_interval);
+        assert_eq!(
+            limiter.receipt(&pool, true)["healthy_streak"],
+            0,
+            "unknown parallel interval cannot bridge a consecutive serial streak"
+        );
+        for tps in [
+            None,
+            Some(0.0),
+            Some(-1.0),
+            Some(f64::NAN),
+            Some(f64::INFINITY),
+        ] {
+            limiter.observe(&pool, &healthy);
+            limiter.observe(
+                &pool,
+                &Completion {
+                    metric: tps.map(|tokens_per_second| ThroughputMetric {
+                        kind: ThroughputMetricKind::OutputTokensPerSecond,
+                        tokens_per_second,
+                    }),
+                    ..healthy
+                },
+            );
+            assert_eq!(
+                limiter.receipt(&pool, true)["healthy_streak"],
+                0,
+                "missing or invalid rate must reset recovery"
+            );
+        }
+    }
+
+    #[test]
+    fn incomplete_or_cancelled_completions_reset_the_recovery_streak() {
+        let pool = AdmissionPool::new(8, 4);
+        let limiter = AdaptiveLimiter::default();
+        let profile = test_profile("serial");
+        let healthy = Completion {
+            profile: Some(&profile),
+            failed: false,
+            memory_pressure: false,
+            metric: Some(ThroughputMetric {
+                kind: ThroughputMetricKind::OutputTokensPerSecond,
+                tokens_per_second: 40.0,
+            }),
+        };
+        for _ in 0..3 {
+            limiter.observe(&pool, &healthy);
+        }
+        let incomplete = limiter.completion_guard();
+        drop(incomplete);
+        limiter.observe(&pool, &healthy);
+        assert_eq!(limiter.receipt(&pool, true)["healthy_streak"], 1);
+        let mut complete = limiter.completion_guard();
+        limiter.observe(&pool, &healthy);
+        complete.complete();
+        drop(complete);
+        assert_eq!(limiter.receipt(&pool, true)["healthy_streak"], 2);
+    }
+
+    #[test]
+    fn profile_windows_are_bounded_by_task_kinds_and_fully_visible() {
+        let pool = AdmissionPool::new(8, 4);
+        let limiter = AdaptiveLimiter::default();
+        let tasks = <super::super::TaskKind as clap::ValueEnum>::value_variants();
+        for task in tasks {
+            for revision in 0..20 {
+                let mut profile = test_profile(&format!("{task:?}-{revision}"));
+                profile.task = *task;
+                limiter.observe(
+                    &pool,
+                    &Completion {
+                        profile: Some(&profile),
+                        failed: false,
+                        memory_pressure: false,
+                        metric: Some(ThroughputMetric {
+                            kind: ThroughputMetricKind::OutputTokensPerSecond,
+                            tokens_per_second: 40.0,
+                        }),
+                    },
+                );
+            }
+        }
+        let receipt = limiter.receipt(&pool, true);
+        assert_eq!(receipt["current_profile_count"], tasks.len());
+        assert_eq!(
+            receipt["profile_windows"].as_object().unwrap().len(),
+            tasks.len(),
+            "same model across tasks must not collapse diagnostic windows"
         );
     }
 

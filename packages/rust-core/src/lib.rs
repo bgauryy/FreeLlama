@@ -1094,18 +1094,29 @@ pub fn local_conservative_config_posture(config: &Value, observed_process: &Valu
 /// Reduce macOS `pmset -g therm` output to a narrow, non-sensitive thermal status.
 #[must_use]
 pub fn parse_macos_thermal_status(output: &str) -> Value {
-    if output.contains("No thermal warning level has been recorded") {
-        return json!({ "status": "normal" });
+    let recorded_level = output.lines().find_map(|line| {
+        let (key, value) = line.rsplit_once([':', '='])?;
+        let key = key.trim().to_ascii_lowercase();
+        matches!(
+            key.as_str(),
+            "thermal warning level" | "note: thermal warning level"
+        )
+        .then(|| value.trim().parse::<u32>().ok())
+        .flatten()
+    });
+    if let Some(level) = recorded_level {
+        return if level == 0 {
+            json!({ "status": "normal" })
+        } else {
+            json!({ "status": "warning", "level": level.to_string() })
+        };
     }
-    if let Some(level) = output
-        .lines()
-        .find(|line| line.to_ascii_lowercase().contains("thermal warning level"))
-        .and_then(|line| line.rsplit_once(':').map(|(_, value)| value.trim()))
-        .filter(|level| !level.is_empty())
-    {
-        return json!({ "status": "warning", "level": level });
-    }
-    json!({ "status": "unknown" })
+    let reason = if output.contains("No thermal warning level has been recorded") {
+        "thermal_warning_not_recorded"
+    } else {
+        "thermal_warning_unavailable_or_invalid"
+    };
+    json!({ "status": "unknown", "reason": reason })
 }
 
 fn host_runtime_signals() -> Value {

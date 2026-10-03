@@ -67,7 +67,7 @@ Ollama residency.
 
 Read [Architecture](ARCHITECTURE.md) for all managed flows,
 [CPU and GPU model routing](CPU_GPU_ROUTING.md) for the two-process procedure, and
-[Ollama and FreeLlama optimization](OLLAMA_SYSTEM_OPTIMIZATION.md) for the full tuning boundary.
+[Ollama and FreeLlama optimization](dev/OLLAMA_SYSTEM_OPTIMIZATION.md) for the full tuning boundary.
 
 ## Sources
 

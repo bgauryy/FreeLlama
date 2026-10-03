@@ -11,13 +11,72 @@ from pathlib import Path
 from unittest.mock import patch
 from urllib.error import HTTPError, URLError
 
-from agent_transport import chat_request, request_headers, unwrap_chat_response, PromptCacheUsage, retryable_chat_error
+from agent_transport import chat_request, request_headers, unwrap_chat_response, PromptCacheUsage, retryable_chat_error, chat_error_details
 from agent_context import ObservationStore
 import bash_agent
 import octocode_agent
 
 
 class AgentTransportTests(unittest.TestCase):
+    def test_http_refusal_receipts_are_bounded_and_exclude_nested_request_secrets(self):
+        body = {
+            "error": "inference refused", "code": "upstream_task_failed",
+            "lifecycle": {"status": "failed", "reason": "cleanup incomplete",
+                          "request": {"prompt": "private"}, "authorization": "secret"},
+            "request_options": {"token": "secret"},
+        }
+        error = HTTPError("url", 502, "Bad Gateway", {}, io.BytesIO(json.dumps(body).encode()))
+        diagnostic, details = chat_error_details(error)
+        self.assertEqual(diagnostic, "HTTP 502: inference refused")
+        self.assertEqual(details, {"status": 502, "receipt": {
+            "error": "inference refused", "code": "upstream_task_failed",
+            "lifecycle": {"status": "failed", "reason": "cleanup incomplete"},
+        }})
+        for body in [b"<html>private</html>", b'{"error": "' + b"private" * 10_000 + b'"}',
+                     b'{"error": {"prompt": "private"}}', b"[]"]:
+            with self.subTest(body_size=len(body)):
+                error = HTTPError("url", 422, "Unprocessable Entity", {}, io.BytesIO(body))
+                diagnostic, details = chat_error_details(error)
+                self.assertEqual(details, {"status": 422})
+                self.assertNotIn("private", diagnostic)
+                self.assertTrue(error.closed)
+
+    def test_both_adapters_preserve_refusals_without_replaying_or_echoing_payloads(self):
+        receipt = {
+            "error": "physical placement is not verified: configured=gpu, observed=unknown",
+            "code": "placement_unverified",
+            "reason": "observed evidence required",
+            "resource_admission": {"status": "held", "required_available_bytes": 4096},
+            "retry_after_seconds": 5,
+            "lifecycle": {"requested": "immediate_unload", "status": "verified"},
+            "placement": {"processor": "unknown", "status": "unverified"},
+        }
+        for adapter in [bash_agent, octocode_agent]:
+            for finalizing in [False, True]:
+                with self.subTest(adapter=adapter.__name__, finalizing=finalizing), tempfile.TemporaryDirectory() as root:
+                    prompt = Path(root) / "prompt.txt"
+                    prompt.write_text("private research question", encoding="utf-8")
+                    result_path = Path(root) / "result.json"
+                    settings = {
+                        "FREELLAMA_TARGET_MODEL": "test:latest", "FREELLAMA_BENCH_WORKSPACE": root,
+                        "FREELLAMA_BENCH_PROMPT": str(prompt), "FREELLAMA_AGENT_RESULT": str(result_path),
+                        "FREELLAMA_AGENT_MANAGED_ENDPOINT": "http://managed.invalid",
+                        "FREELLAMA_AGENT_MAX_TURNS": "1", "FREELLAMA_AGENT_RETRY_BACKOFF_SECONDS": "0",
+                    }
+                    refused = HTTPError("http://managed.invalid/_freellama/v1/tasks", 422, "Unprocessable Entity", {},
+                                        io.BytesIO(json.dumps({**receipt, "prompt": "private research question",
+                                                              "authorization": "Bearer private-token"}).encode()))
+                    pending = {"message": {"content": '{"action":"page","step":999,"page":1}'}}
+                    with patch.dict(os.environ, settings, clear=True), redirect_stdout(io.StringIO()), \
+                         patch.object(adapter, "request_json", side_effect=[pending, refused] if finalizing else [refused]) as request:
+                        self.assertEqual(adapter.main(), 1)
+                    self.assertEqual(request.call_count, 2 if finalizing else 1)
+                    record = json.loads(result_path.read_text())
+                    self.assertEqual(record["model_metadata"]["transport_error"], {"status": 422, "receipt": receipt})
+                    self.assertIn(receipt["error"], record["final_answer"])
+                    self.assertNotIn("private research question", result_path.read_text())
+                    self.assertNotIn("private-token", result_path.read_text())
+
     def test_unverified_model_identity_disables_persistent_calibration_in_both_adapters(self):
         for adapter in [bash_agent, octocode_agent]:
             with self.subTest(adapter=adapter.__name__), tempfile.TemporaryDirectory() as root:

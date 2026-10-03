@@ -37,6 +37,7 @@ flowchart TD
 | `recommend` | Return an installed route or a reviewed installation plan | Yes |
 | `natural-route` | Convert natural language to a route intent locally, then route it | Yes |
 | `task` | Route and execute one nonstreaming task | Yes |
+| `jobs` | List, inspect, cancel, or remove deferred tasks and warming operations | Yes |
 | `proxy` | Run only the Ollama-compatible retry and telemetry sidecar | No |
 | `bench-all` | Measure installed models by capability group | No |
 | `policy-from-eval` | Generate policy from quality-evaluation pass rates | No |
@@ -100,8 +101,10 @@ placement.
 environment variable, or runtime-file value it defaults to 2 units per `OLLAMA_NUM_PARALLEL` slot of
 the Ollama server (read from its process environment where visible; Ollama's own default is 1, so 2).
 `freellama config` shows the effective value and where it came from.
-`--cpu-max-concurrent-tasks` controls the independent CPU pool and defaults to 1. Embedding costs 1,
-chat costs 2, and vision costs 4 (capped to the selected backend's pool). A saturated GPU pool does
+`--cpu-max-concurrent-tasks` controls the independent CPU pool and defaults to 1. Default base costs
+are embedding 1, chat 2, and vision 4. Embeddings multiply their base by `ceil(input_items/4)`;
+the acquired charge is capped to the selected backend's pool. Configure overrides in `[task_costs]`;
+see [monitoring controls](MONITORING.md#adaptive-concurrency). A saturated GPU pool does
 not consume CPU permits. `--max-queue-wait-seconds` defaults to 120; when no permit becomes
 available, FreeLlama refuses the task with HTTP 503 (`admission_timeout`) instead of waiting forever.
 A task can ask for a shorter wait with `max_wait_seconds` (`maxWaitSeconds` in MCP); it can never
@@ -213,7 +216,7 @@ Useful task options include:
 - `--session` for affinity across related requests.
 - `--scope-id` and `--scope-revision` together for bounded message history.
 - `--keep-alive` for an explicit residency duration.
-- `--context-tokens` for a minimum context requirement.
+- `--context-tokens` for the complete input and output context window (`num_ctx`).
 - repeatable `--required-capability` constraints.
 - repeatable `--image` paths for vision tasks.
 - `--input-file` for batched embedding input, one item per line.
@@ -266,7 +269,7 @@ Generate the policy from correctness data and the benchmark report from local ru
 
 ```bash
 npx @octocodeai/freellama policy-from-eval \
-  --aggregate benchmark/local/results/<model>/aggregate.json \
+  --aggregate benchmark/local/results/MODEL/aggregate.json \
   --task coding \
   --min-pass 0.8 \
   --out platform.toml
@@ -277,6 +280,8 @@ npx @octocodeai/freellama serve --recommendation-catalog recommendations.example
 
 `serve` discovers `platform.toml` and `benchmark-report.json` in its working directory. Explicit
 `--policy-file` and `--benchmark-report` values take precedence.
+
+Replace `MODEL` with the directory containing your completed quality-evaluation aggregate.
 
 `policy-from-eval` reads `pass_at_1`, not the throughput produced by `bench-all`. It refuses expired
 aggregates and fewer than three trials unless `--allow-smoke` is explicit, and it skips models that
