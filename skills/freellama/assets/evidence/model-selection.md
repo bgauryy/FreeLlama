@@ -13,8 +13,9 @@ evidence, `fastest` can only filter on advertised capability (`completion` + `to
 that. A name/param-count table is not evidence either, just a different guess.
 
 So: pass `minConfidence:"medium"` for anything quality-sensitive, and expect a refusal until the
-two inputs below exist. `objective: "balanced"` and `"quality"` need a configured policy at all;
-`"fastest"` does not.
+two inputs below exist. Default `objective:"balanced"` prefers policy-qualified candidates but
+falls back to eligible models with low confidence when none qualify. `"quality"` requires a
+configured policy unless the caller pins an explicit model; `"fastest"` needs no policy.
 
 ## Making `minConfidence:"medium"` reachable — the step nobody does
 
@@ -22,7 +23,7 @@ two inputs below exist. `objective: "balanced"` and `"quality"` need a configure
 
 | Input | Supplies | Without it |
 |---|---|---|
-| `--policy-file` | a *quality* contract: which models are vouched for on this task | `low`, and `objective: balanced/quality` errors outright |
+| `--policy-file` | a *quality* contract: which models are vouched for on this task | `low`; balanced can fall back, while quality without an explicit model refuses |
 | `--benchmark-report` | local *functional* measurement from `npx @octocodeai/freellama bench-all` | `low`, evidence `configured_task_policy` |
 
 Neither alone is enough, deliberately: a policy without measurement is an unverified claim, and
@@ -47,11 +48,19 @@ contract is visible without archaeology.
 
 ## Finding a model you do not have — `models {view:"library"}`, two steps
 
-1. **Search** (`query`, `capabilities`, `order`) returns *family* names, popular-ordered. A family
-   is **not pullable**. `cloudOnly` marks models that only run on Ollama's hosted service. Site
-   rank is not pull count — judge with `pulls`, not position.
+1. **Search** (`query`, `capabilities`, `order`) returns *family* names, popular-ordered, without
+   exact-tag sizing. Ollama resolves an omitted tag to `latest`; inspect the tags before recommending
+   a download. `cloudAvailable` identifies a hosted-access badge, while `cloudOnly:null` means local
+   availability is not established by that badge. Site rank is not pull count — judge with `pulls`,
+   not position.
 2. **Inspect** (`model:"<family>"`) returns each tag with size, context window, modalities, and
    `fitsInMemory` computed against this machine.
+
+Installed/detail views accept `includeLibrary:true` for cached public guidance after exact-tag and
+digest-prefix matching. Local supported features filter family claims; public use cases remain
+unmeasured and do not change routing confidence. Request `includeReadme:true` in enriched detail or
+library step 2 for bounded README text. The [metadata reference](../../../../docs/MODEL_METADATA.md)
+owns the response fields, cache policy, and failure states.
 
 Pulling from step 1 alone means guessing the size, which is how a 143GB tag looked like a candidate
 on a 48GB machine. Step 2 **fails closed**: with `serve` unreachable there is no machine profile, so

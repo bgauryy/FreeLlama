@@ -1,7 +1,8 @@
 use freellama::{
     Comparison, GuardrailStatus, RunReport, Suite, Verdict, compare,
     local_conservative_config_posture, max_loaded_models_advisory, ollama_config_diagnostics,
-    parse_macos_thermal_status, parse_ollama_cli_version, parse_ollama_process_environment,
+    ollama_env_advisories, parse_macos_thermal_status, parse_ollama_cli_version,
+    parse_ollama_process_environment,
 };
 
 #[test]
@@ -15,6 +16,21 @@ fn doctor_identifies_a_cli_server_version_mismatch() {
     assert_eq!(diagnostic.client_version.as_deref(), Some("0.13.5"));
     assert_eq!(diagnostic.server_version, "0.32.15");
     assert!(!diagnostic.matches_server);
+}
+
+#[test]
+fn context_default_advisory_reports_upstream_documentation_drift() {
+    let values = ollama_env_advisories(|_| None);
+    let advisory = &values["OLLAMA_CONTEXT_LENGTH"];
+    let effective = advisory["effective_default"].as_str().unwrap_or_default();
+    assert!(effective.contains("VRAM-tiered"), "got {effective:?}");
+    assert!(
+        advisory["note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("/api/ps"),
+        "the actionable authority must be named"
+    );
 }
 
 #[test]
@@ -66,12 +82,40 @@ fn local_conservative_posture_warns_when_cloud_and_unbounded_queue_are_visible()
 fn mac_thermal_parser_returns_a_small_status_not_raw_system_output() {
     assert_eq!(
         parse_macos_thermal_status("Note: No thermal warning level has been recorded\n"),
-        serde_json::json!({ "status": "normal" })
+        serde_json::json!({ "status": "unknown", "reason": "thermal_warning_not_recorded" })
     );
-    assert_eq!(
-        parse_macos_thermal_status("Note: Thermal warning level: 2\n"),
-        serde_json::json!({ "status": "warning", "level": "2" })
-    );
+    for output in [
+        "Note: Thermal warning level: 2\n",
+        "Thermal Warning Level = 2\n",
+        "Note: No thermal warning level has been recorded\nThermal Warning Level = 2\n",
+    ] {
+        assert_eq!(
+            parse_macos_thermal_status(output),
+            serde_json::json!({ "status": "warning", "level": "2" })
+        );
+    }
+    for output in [
+        "Note: Thermal warning level: 0\n",
+        "Thermal Warning Level = 0\n",
+    ] {
+        assert_eq!(
+            parse_macos_thermal_status(output),
+            serde_json::json!({ "status": "normal" })
+        );
+    }
+    for output in [
+        "",
+        "Note: Thermal warning level: unknown SECRET=must_not_escape\n",
+        "Thermal Warning Level = -1\n",
+        "Thermal Warning Level = 4294967296\n",
+        "Unrelated thermal warning level text: 2\n",
+        "Unrelated thermal warning level: 2\n",
+    ] {
+        assert_eq!(
+            parse_macos_thermal_status(output),
+            serde_json::json!({ "status": "unknown", "reason": "thermal_warning_unavailable_or_invalid" })
+        );
+    }
 }
 
 #[test]

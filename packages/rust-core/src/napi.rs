@@ -21,7 +21,7 @@ use napi_derive::napi;
 use reqwest::Client;
 use serde_json::{Value, json};
 
-/// Default for the 5 functions that need a running `freellama serve` (proxy + control plane).
+/// Default for functions that need a running `freellama serve` (proxy + control plane).
 /// Overridable via `FREELLAMA_SERVE_ENDPOINT` so a non-default port/host doesn't need a recompile.
 const DEFAULT_SERVE_ENDPOINT: &str = "http://127.0.0.1:11435";
 /// Default for `doctor`, which talks to Ollama directly and needs no `freellama serve` at all —
@@ -41,7 +41,7 @@ fn control_timeout() -> Duration {
     )
 }
 
-/// Timeout for the two calls that make a model actually generate. A cold load of a large model can
+/// Timeout for managed inference and model loading. A cold load of a large model can
 /// legitimately take minutes — Ollama's own `OLLAMA_LOAD_TIMEOUT` is 5m before it even gives up on
 /// the load — so this has to be generous or it would abort work that was going to succeed.
 /// Overridable via `FREELLAMA_TASK_TIMEOUT_SECONDS`.
@@ -103,48 +103,47 @@ fn authenticated(request: reqwest::RequestBuilder) -> Result<reqwest::RequestBui
 }
 
 async fn get_json(endpoint: &str, path: &str, timeout: Duration) -> Result<Value> {
-    authenticated(client().get(format!("{}{path}", endpoint.trim_end_matches('/'))))?
-        .timeout(timeout)
-        .send()
-        .await
-        .map_err(to_napi_err)?
-        .error_for_status()
-        .map_err(to_napi_err)?
-        .json::<Value>()
-        .await
-        .map_err(to_napi_err)
+    request_json(
+        client().get(format!("{}{path}", endpoint.trim_end_matches('/'))),
+        timeout,
+    )
+    .await
 }
 
 async fn post_json(endpoint: &str, path: &str, body: &Value, timeout: Duration) -> Result<Value> {
-    let response =
-        authenticated(client().post(format!("{}{path}", endpoint.trim_end_matches('/'))))?
-            .timeout(timeout)
-            .json(body)
-            .send()
-            .await
-            .map_err(to_napi_err)?;
-    // `error_for_status()` discards the body — and the body is where every useful refusal lives.
-    // A `min_confidence` refusal names the grade, the evidence, the model it would have picked and
-    // the two commands that raise the grade; all of that was collapsing into a bare
-    // "HTTP status client error (422)". Same defect, same fix as the CLI's `print_response`.
-    let status = response.status();
-    // Axum's extractor failures are text/plain, while application refusals are JSON. Reading JSON
-    // unconditionally turned a useful compatibility error (for example, an older running server
-    // rejecting a newly added field) into the opaque "error decoding response body".
-    let text = response.text().await.map_err(to_napi_err)?;
-    let value = serde_json::from_str::<Value>(&text);
-    if !status.is_success() {
-        let detail = value.as_ref().map_or_else(
-            |_| text.clone(),
-            |json| {
-                json.get("error")
-                    .and_then(Value::as_str)
-                    .map_or_else(|| json.to_string(), ToOwned::to_owned)
-            },
-        );
-        return Err(napi::Error::from_reason(detail));
+    request_json(
+        client()
+            .post(format!("{}{path}", endpoint.trim_end_matches('/')))
+            .json(body),
+        timeout,
+    )
+    .await
+}
+
+async fn checked_response(
+    request: reqwest::RequestBuilder,
+    timeout: Duration,
+) -> Result<reqwest::Response> {
+    let response = authenticated(request)?
+        .timeout(timeout)
+        .send()
+        .await
+        .map_err(to_napi_err)?;
+    if response.status().is_success() {
+        return Ok(response);
     }
-    value.map_err(|error| {
+    // Preserve application refusal receipts and plain-text extractor errors for every method.
+    let text = response.text().await.map_err(to_napi_err)?;
+    let detail = serde_json::from_str::<Value>(&text)
+        .map_or_else(|_| text.clone(), |value| value.to_string());
+    Err(napi::Error::from_reason(detail))
+}
+
+async fn request_json(request: reqwest::RequestBuilder, timeout: Duration) -> Result<Value> {
+    let response = checked_response(request, timeout).await?;
+    let status = response.status();
+    let text = response.text().await.map_err(to_napi_err)?;
+    serde_json::from_str::<Value>(&text).map_err(|error| {
         napi::Error::from_reason(format!(
             "FreeLlama returned HTTP {status} with invalid JSON: {error}"
         ))
@@ -152,13 +151,11 @@ async fn post_json(endpoint: &str, path: &str, body: &Value, timeout: Duration) 
 }
 
 async fn delete_json(endpoint: &str, path: &str, timeout: Duration) -> Result<()> {
-    authenticated(client().delete(format!("{}{path}", endpoint.trim_end_matches('/'))))?
-        .timeout(timeout)
-        .send()
-        .await
-        .map_err(to_napi_err)?
-        .error_for_status()
-        .map_err(to_napi_err)?;
+    checked_response(
+        client().delete(format!("{}{path}", endpoint.trim_end_matches('/'))),
+        timeout,
+    )
+    .await?;
     Ok(())
 }
 
@@ -204,6 +201,32 @@ pub async fn health(endpoint: Option<String>) -> Result<String> {
     pretty(&value)
 }
 
+/// Live platform view: per-backend admission, queues, adaptive limits and circuit breakers,
+/// loaded models, host memory, Ollama's effective settings, and today's usage.
+///
+/// # Errors
+///
+/// Returns an error if `freellama serve` is unreachable.
+#[napi]
+pub async fn status(endpoint: Option<String>) -> Result<String> {
+    let endpoint = endpoint_or_default(endpoint);
+    let value = get_json(&endpoint, "/_freellama/v1/status", control_timeout()).await?;
+    pretty(&value)
+}
+
+/// Usage totals for the last `days` days (default 7), per day and per model.
+///
+/// # Errors
+///
+/// Returns an error if `freellama serve` is unreachable.
+#[napi]
+pub async fn usage(endpoint: Option<String>, days: Option<u32>) -> Result<String> {
+    let endpoint = endpoint_or_default(endpoint);
+    let path = format!("/_freellama/v1/usage?days={}", days.unwrap_or(7));
+    let value = get_json(&endpoint, &path, control_timeout()).await?;
+    pretty(&value)
+}
+
 /// Create a bounded, expiring model-affinity handle. It stores no prompt history or Ollama KV.
 ///
 /// # Errors
@@ -236,6 +259,25 @@ pub async fn delete_session(endpoint: Option<String>, session_id: String) -> Res
         control_timeout(),
     )
     .await
+}
+
+/// Cancel managed requests for one session and invalidate its affinity handle.
+///
+/// # Errors
+/// Returns an error if the server is unreachable or the session does not exist.
+#[napi]
+pub async fn kill_session(endpoint: Option<String>, session_id: String) -> Result<String> {
+    uuid::Uuid::parse_str(&session_id)
+        .map_err(|error| Error::from_reason(format!("invalid session UUID: {error}")))?;
+    let endpoint = endpoint_or_default(endpoint);
+    let value = post_json(
+        &endpoint,
+        &format!("/_freellama/v1/sessions/{session_id}/kill"),
+        &json!({}),
+        control_timeout(),
+    )
+    .await?;
+    pretty(&value)
 }
 
 /// Installed-model inventory with capabilities, residency, and advertised context, as discovered
@@ -411,6 +453,96 @@ pub async fn run_task_request(endpoint: Option<String>, request: Value) -> Resul
     pretty(&value)
 }
 
+/// Creates opt-in, bounded process-local conversation history.
+/// # Errors
+/// Returns an error if the server is unavailable or rejects the scope limits or messages.
+#[napi]
+pub async fn create_scope(endpoint: Option<String>, request: Value) -> Result<String> {
+    pretty(
+        &post_json(
+            &endpoint_or_default(endpoint),
+            "/_freellama/v1/scopes",
+            &request,
+            control_timeout(),
+        )
+        .await?,
+    )
+}
+
+/// Reads scope metadata; history is returned only when explicitly requested.
+/// # Errors
+/// Returns an error for an invalid ID or missing/expired scope.
+#[napi]
+pub async fn get_scope(
+    endpoint: Option<String>,
+    scope_id: String,
+    include_messages: Option<bool>,
+) -> Result<String> {
+    let id = uuid::Uuid::parse_str(&scope_id).map_err(to_napi_err)?;
+    pretty(
+        &get_json(
+            &endpoint_or_default(endpoint),
+            &format!(
+                "/_freellama/v1/scopes/{id}?include_messages={}",
+                include_messages.unwrap_or(false)
+            ),
+            control_timeout(),
+        )
+        .await?,
+    )
+}
+
+/// Copies a specified revision into an independent scope.
+/// # Errors
+/// Returns an error for an invalid ID, stale revision, or rejected limits.
+#[napi]
+pub async fn fork_scope(
+    endpoint: Option<String>,
+    scope_id: String,
+    request: Value,
+) -> Result<String> {
+    let id = uuid::Uuid::parse_str(&scope_id).map_err(to_napi_err)?;
+    pretty(
+        &post_json(
+            &endpoint_or_default(endpoint),
+            &format!("/_freellama/v1/scopes/{id}/fork"),
+            &request,
+            control_timeout(),
+        )
+        .await?,
+    )
+}
+
+/// Deletes history and invalidates in-flight commits for this scope.
+/// # Errors
+/// Returns an error for an invalid ID or unavailable server.
+#[napi]
+pub async fn delete_scope(endpoint: Option<String>, scope_id: String) -> Result<()> {
+    let id = uuid::Uuid::parse_str(&scope_id).map_err(to_napi_err)?;
+    delete_json(
+        &endpoint_or_default(endpoint),
+        &format!("/_freellama/v1/scopes/{id}"),
+        control_timeout(),
+    )
+    .await
+}
+
+/// Preloads an exact installed model through managed admission and deadlines.
+/// # Errors
+/// Returns an error if the server refuses placement, capacity, or the request.
+#[napi]
+pub async fn warm_model_request(endpoint: Option<String>, request: Value) -> Result<String> {
+    pretty(
+        &post_json(
+            &endpoint_or_default(endpoint),
+            "/_freellama/v1/warm",
+            &request,
+            task_timeout(),
+        )
+        .await?,
+    )
+}
+
 /// Executes caller-declared independent managed tasks with bounded, priority-fair dispatch.
 ///
 /// # Errors
@@ -429,6 +561,79 @@ pub async fn run_task_batch_request(endpoint: Option<String>, request: Value) ->
     )
     .await?;
     pretty(&value)
+}
+
+/// Lists bounded process-local deferred task receipts, without prompts or retained results.
+///
+/// # Errors
+/// Returns an error if the managed server is unreachable or refuses the request.
+#[napi]
+pub async fn list_task_jobs(endpoint: Option<String>) -> Result<String> {
+    pretty(
+        &get_json(
+            &endpoint_or_default(endpoint),
+            "/_freellama/v1/jobs",
+            control_timeout(),
+        )
+        .await?,
+    )
+}
+
+/// Reads a deferred task receipt and its retained result, if completed.
+///
+/// # Errors
+/// Returns an error for an invalid ID, an expired job, or an unavailable server.
+#[napi]
+pub async fn get_task_job(endpoint: Option<String>, job_id: String) -> Result<String> {
+    let id =
+        uuid::Uuid::parse_str(&job_id).map_err(|error| Error::from_reason(error.to_string()))?;
+    pretty(
+        &get_json(
+            &endpoint_or_default(endpoint),
+            &format!("/_freellama/v1/jobs/{id}"),
+            control_timeout(),
+        )
+        .await?,
+    )
+}
+
+/// Cancels one deferred task and waits for its local admission permits to be released.
+///
+/// # Errors
+/// Returns an error for an invalid ID, an expired job, or an unavailable server.
+#[napi]
+pub async fn cancel_task_job(endpoint: Option<String>, job_id: String) -> Result<String> {
+    let id =
+        uuid::Uuid::parse_str(&job_id).map_err(|error| Error::from_reason(error.to_string()))?;
+    pretty(
+        &post_json(
+            &endpoint_or_default(endpoint),
+            &format!("/_freellama/v1/jobs/{id}/cancel"),
+            &Value::Null,
+            task_timeout(),
+        )
+        .await?,
+    )
+}
+
+/// Stops one deferred task, waits for local permits, and removes its retained record.
+///
+/// # Errors
+/// Returns an error for an invalid ID, a missing job, or an unavailable server.
+#[napi]
+pub async fn remove_task_job(endpoint: Option<String>, job_id: String) -> Result<String> {
+    let id = uuid::Uuid::parse_str(&job_id).map_err(to_napi_err)?;
+    let endpoint = endpoint_or_default(endpoint);
+    pretty(
+        &request_json(
+            client().delete(format!(
+                "{}/_freellama/v1/jobs/{id}",
+                endpoint.trim_end_matches('/')
+            )),
+            task_timeout(),
+        )
+        .await?,
+    )
 }
 
 /// Converts a free-text natural-language intent into a route, via

@@ -7,11 +7,19 @@ import { createRequire } from "node:module";
 // is not reliably detectable by Node's CJS/ESM interop. Destructuring after a default import
 // sidesteps that entirely.
 import native from "../native/index.js";
-export const { doctor, machine, health, createSession, deleteSession, listModels, route, runTask, runTaskRequest, runTaskBatchRequest } = native as {
+export const { createScope, getScope, forkScope, deleteScope, warmModelRequest, doctor, machine, health, status, usage, createSession, deleteSession, killSession, listModels, route, runTask, runTaskRequest, runTaskBatchRequest, listTaskJobs, getTaskJob, cancelTaskJob, removeTaskJob } = native as {
+  createScope: (endpoint: string | null | undefined, request: unknown) => Promise<string>;
+  getScope: (endpoint: string | null | undefined, scopeId: string, includeMessages?: boolean) => Promise<string>;
+  forkScope: (endpoint: string | null | undefined, scopeId: string, request: unknown) => Promise<string>;
+  deleteScope: (endpoint: string | null | undefined, scopeId: string) => Promise<void>;
+  warmModelRequest: (endpoint: string | null | undefined, request: unknown) => Promise<string>;
   doctor: (endpoint?: string | null) => Promise<string>;
   machine: (endpoint?: string | null) => Promise<string>;
   health: (endpoint?: string | null) => Promise<string>;
+  status: (endpoint?: string | null) => Promise<string>;
+  usage: (endpoint?: string | null, days?: number | null) => Promise<string>;
   createSession: (endpoint?: string | null) => Promise<string>;
+  killSession: (endpoint: string | null | undefined, sessionId: string) => Promise<string>;
   deleteSession: (endpoint: string | null | undefined, sessionId: string) => Promise<void>;
   listModels: (endpoint?: string | null) => Promise<string>;
   route: (
@@ -46,6 +54,10 @@ export const { doctor, machine, health, createSession, deleteSession, listModels
   ) => Promise<string>;
   runTaskRequest: (endpoint: string | null | undefined, request: unknown) => Promise<string>;
   runTaskBatchRequest: (endpoint: string | null | undefined, request: unknown) => Promise<string>;
+  listTaskJobs: (endpoint?: string | null) => Promise<string>;
+  getTaskJob: (endpoint: string | null | undefined, jobId: string) => Promise<string>;
+  cancelTaskJob: (endpoint: string | null | undefined, jobId: string) => Promise<string>;
+  removeTaskJob: (endpoint: string | null | undefined, jobId: string) => Promise<string>;
 };
 
 // Single source of truth for the version — a hardcoded literal here silently drifts from the

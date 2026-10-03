@@ -1,0 +1,2849 @@
+//! Managed execution: route selection, capacity reservation, forwarding, and evidence receipts.
+use super::admission::{AdmissionFailure, AdmissionPermit, AdmissionPool, ResourceWaitGuard};
+use super::error::{ApiError, resource_error};
+use super::{
+    CatalogModel, ExecutionPreference, FEEDBACK_SCHEMA_VERSION, OllamaRequestOptions,
+    PlacementEvidence, PlacementSignals, PlatformState, RouteDecision, RouteInput, SessionAffinity,
+    TaskInput, TaskKind, TaskPriority, context, desired_placement, discover_models, get_json,
+    host_has_unified_memory, host_total_memory_bytes, persist_feedback, require_active_session,
+    residency, resources, select_route,
+};
+use crate::{model_bench::Capability, proxy};
+use anyhow::{Context, Result};
+use axum::{Json, extract::State, http::StatusCode};
+use reqwest::Client;
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
+
+/// How long a request may wait for host memory while holding its admission slot.
+const SLOT_HELD_RESOURCE_WAIT: Duration = Duration::from_secs(2);
+
+#[derive(Clone)]
+pub(super) struct ExecutionTarget {
+    pub(super) placement: &'static str,
+    pub(super) upstream: String,
+    pub(super) transition: Arc<RwLock<()>>,
+    pub(super) admission: AdmissionPool,
+}
+
+enum TransitionPermit {
+    Shared(OwnedRwLockReadGuard<()>),
+    Exclusive(OwnedRwLockWriteGuard<()>),
+}
+
+impl TransitionPermit {
+    fn admission_mode(&self) -> &'static str {
+        match self {
+            Self::Shared(_guard) => "resident_shared",
+            Self::Exclusive(_guard) => "nonresident_transition_exclusive",
+        }
+    }
+}
+
+pub(super) fn execution_target(state: &PlatformState, model: &str) -> ExecutionTarget {
+    if state.cpu_models.contains(model)
+        && let Some(upstream) = &state.cpu_upstream
+    {
+        return ExecutionTarget {
+            placement: "cpu",
+            upstream: upstream.clone(),
+            transition: Arc::clone(&state.cpu_managed_execution),
+            admission: state.cpu_admission.clone(),
+        };
+    }
+    ExecutionTarget {
+        placement: "gpu",
+        upstream: state.upstream.clone(),
+        transition: Arc::clone(&state.managed_execution),
+        admission: state.gpu_admission.clone(),
+    }
+}
+
+pub(super) struct ManagedDecision {
+    pub(super) route: RouteDecision,
+    pub(super) model: CatalogModel,
+    pub(super) execution: ExecutionTarget,
+    pub(super) preference: ExecutionPreference,
+    pub(super) preference_satisfied: bool,
+    pub(super) reason: &'static str,
+    pub(super) placement_evidence: PlacementEvidence,
+}
+
+impl ManagedDecision {
+    pub(super) async fn execution_receipt(&self, task_cost: u32, state: &PlatformState) -> Value {
+        let capacity = super::readiness::assess(self, state, task_cost).await;
+        json!({
+            // `placement` is retained for compatibility. `backend` names the configured Ollama
+            // process; neither field is physical proof. The task response replaces the pending
+            // observation below with Ollama's post-run `/api/ps` evidence.
+            "placement": self.execution.placement,
+            "backend": if self.execution.placement == "cpu" { "cpu" } else { "primary" },
+            "requested_processor": self.execution.placement,
+            "upstream": self.execution.upstream,
+            "preference": self.preference,
+            "preference_satisfied": self.preference_satisfied,
+            "reason": self.reason,
+            "min_placement_evidence": self.placement_evidence,
+            "observation": {
+                "processor": "unknown",
+                "status": "pending",
+                "source": "ollama_api_ps_after_execution"
+            },
+            "admission": {
+                "slots_total": self.execution.admission.total(),
+                "slots_available": capacity.slots_available,
+            },
+            "resource_snapshot": capacity.resources,
+            "resource_assessment": capacity.assessment,
+            "memory_reservation": capacity.footprint,
+            "agent_plan": capacity.plan,
+            "memory_kv_preflight": memory_kv_preflight(&self.model, &self.route, self.execution.placement, &self.execution.upstream),
+        })
+    }
+}
+
+fn route_candidate_for(
+    state: &PlatformState,
+    input: &RouteInput,
+    models: &[CatalogModel],
+    sessions: &SessionAffinity,
+    placement: &str,
+) -> Option<RouteDecision> {
+    let candidates = models
+        .iter()
+        .filter(|model| execution_target(state, &model.name).placement == placement)
+        .cloned()
+        .collect::<Vec<_>>();
+    (!candidates.is_empty())
+        .then(|| select_route(input, &candidates, sessions).ok())
+        .flatten()
+}
+
+fn require_observed_placement(
+    input: &RouteInput,
+    models: &[CatalogModel],
+    route: &RouteDecision,
+    execution: &ExecutionTarget,
+) -> Result<(), ApiError> {
+    if !matches!(input.min_placement_evidence, PlacementEvidence::Observed) {
+        return Ok(());
+    }
+    let selected = models
+        .iter()
+        .find(|model| model.name == route.selected_model)
+        .expect("selected route comes from the supplied catalog");
+    let observation = physical_placement_observation(
+        execution.placement,
+        selected.resident_size,
+        selected.resident_vram,
+    );
+    if observation["status"] == "verified" {
+        return Ok(());
+    }
+    Err(ApiError::bad_request(format!(
+        "physical placement is not verified for {}: configured={}, observed={}. Run one bounded task with min_placement_evidence=configured, inspect execution.observation, then retry with observed",
+        route.selected_model,
+        execution.placement,
+        observation["processor"].as_str().unwrap_or("unknown")
+    )))
+}
+
+pub(super) async fn select_managed_route(
+    state: &PlatformState,
+    input: &RouteInput,
+    models: &[CatalogModel],
+    sessions: &SessionAffinity,
+    task_cost_units: u32,
+    profile_input: Option<&TaskInput>,
+) -> Result<ManagedDecision, ApiError> {
+    let has_session_affinity = input
+        .session_id
+        .as_deref()
+        .and_then(|id| sessions.assigned(id))
+        .is_some();
+    let route_is_pinned = input.model.is_some() || has_session_affinity;
+    let gpu_candidate = route_candidate_for(state, input, models, sessions, "gpu");
+    let cpu_candidate = route_candidate_for(state, input, models, sessions, "cpu");
+    let (gpu_work_unit_ns, cpu_work_unit_ns) = if route_is_pinned {
+        (None, None)
+    } else {
+        matching_route_profile_scores(
+            state,
+            input,
+            models,
+            task_cost_units,
+            profile_input,
+            (gpu_candidate.as_ref(), cpu_candidate.as_ref()),
+        )
+        .await
+    };
+    let desired = desired_placement(PlacementSignals {
+        route_is_pinned,
+        objective: input.objective,
+        execution_preference: input.execution_preference,
+        gpu_work_unit_ns,
+        cpu_work_unit_ns,
+        gpu_slots_available: state.gpu_admission.available(),
+        cpu_slots_available: state.cpu_admission.available(),
+        gpu_task_cost: usize::try_from(
+            task_cost_units.min(u32::try_from(state.gpu_admission.total()).unwrap_or(u32::MAX)),
+        )
+        .unwrap_or(usize::MAX)
+        .max(1),
+        cpu_task_cost: usize::try_from(
+            task_cost_units.min(u32::try_from(state.cpu_admission.total()).unwrap_or(u32::MAX)),
+        )
+        .unwrap_or(usize::MAX)
+        .max(1),
+        cpu_configured: state.cpu_upstream.is_some(),
+    });
+
+    let preferred = desired.and_then(|(placement, reason)| {
+        if route_is_pinned {
+            return None;
+        }
+        (if placement == "cpu" {
+            cpu_candidate.clone()
+        } else {
+            gpu_candidate.clone()
+        })
+        .map(|route| (route, reason))
+    });
+    let (route, mut reason) = if let Some(preferred) = preferred {
+        preferred
+    } else {
+        (
+            select_route(input, models, sessions).map_err(ApiError::bad_request)?,
+            if desired.is_some() {
+                "preferred_backend_unavailable_or_ineligible"
+            } else {
+                "router_default"
+            },
+        )
+    };
+    if input.model.is_some() {
+        reason = "explicit_model";
+    } else if has_session_affinity {
+        reason = "session_affinity";
+    }
+    let execution = execution_target(state, &route.selected_model);
+    require_observed_placement(input, models, &route, &execution)?;
+    let preference_satisfied = match input.execution_preference {
+        ExecutionPreference::Auto => true,
+        ExecutionPreference::PreferCpu => execution.placement == "cpu",
+        ExecutionPreference::PreferGpu => execution.placement == "gpu",
+    };
+    let model = models
+        .iter()
+        .find(|model| model.name == route.selected_model)
+        .expect("selected route comes from the supplied catalog")
+        .clone();
+    Ok(ManagedDecision {
+        route,
+        model,
+        execution,
+        preference: input.execution_preference,
+        preference_satisfied,
+        reason,
+        placement_evidence: input.min_placement_evidence,
+    })
+}
+
+async fn matching_route_profile_scores(
+    state: &PlatformState,
+    input: &RouteInput,
+    models: &[CatalogModel],
+    task_cost_units: u32,
+    profile_input: Option<&TaskInput>,
+    candidates: (Option<&RouteDecision>, Option<&RouteDecision>),
+) -> (Option<u128>, Option<u128>) {
+    if input.execution_preference != ExecutionPreference::Auto
+        || !matches!(
+            input.objective,
+            super::Objective::Fastest | super::Objective::Balanced
+        )
+    {
+        return (None, None);
+    }
+    let (Some(gpu), Some(cpu), Some(payload)) = (candidates.0, candidates.1, profile_input) else {
+        return (None, None);
+    };
+    let (gpu_profile, cpu_profile) = tokio::join!(
+        routing_profile(state, input, gpu, models, task_cost_units, payload),
+        routing_profile(state, input, cpu, models, task_cost_units, payload)
+    );
+    let feedback = state.feedback.read().await;
+    (
+        gpu_profile.as_ref().and_then(|profile| {
+            feedback
+                .gpu
+                .get(&input.task)
+                .and_then(|stats| stats.average_for_profile(profile))
+        }),
+        cpu_profile.as_ref().and_then(|profile| {
+            feedback
+                .cpu
+                .get(&input.task)
+                .and_then(|stats| stats.average_for_profile(profile))
+        }),
+    )
+}
+
+fn requests_immediate_unload(value: Option<&str>) -> bool {
+    matches!(value.map(str::trim), Some("0" | "0s" | "0m" | "0h"))
+}
+
+/// Thread count for CPU-placed runners, or `None` to let Ollama choose.
+///
+/// Ollama compares `num_thread` when deciding whether a loaded runner can serve a request, so a
+/// value that differs from what other clients send forces a reload. It is therefore set only on
+/// the dedicated CPU backend, where `FreeLlama` is the only client. The GPU backend is left alone:
+/// injecting `logical/2` there made every raw request without `num_thread` reload the runner
+/// managed traffic had just loaded, and on Apple Silicon (no SMT) it halved CPU throughput.
+fn cpu_num_thread() -> Option<u64> {
+    if let Some(value) = std::env::var("FREELLAMA_CPU_NUM_THREAD")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+    {
+        return Some(value);
+    }
+    if cfg!(target_os = "macos") {
+        // Ollama already sizes to performance cores; efficiency cores slow llama.cpp's barriers.
+        return None;
+    }
+    // x86 SMT: half the logical CPUs approximates physical cores and leaves the siblings free.
+    std::thread::available_parallelism()
+        .ok()
+        .map(|cores| (cores.get() as u64 / 2).max(1))
+}
+
+pub(super) fn apply_execution_options(body: &mut Value, target: &ExecutionTarget) {
+    if target.placement == "cpu" {
+        if let (Some(options), Some(threads)) = (
+            body.get_mut("options").and_then(Value::as_object_mut),
+            cpu_num_thread(),
+        ) {
+            options
+                .entry("num_thread")
+                .or_insert_with(|| json!(threads));
+        }
+        // The process-level CPU library override is ignored by some Metal builds. Ollama's
+        // request contract treats num_gpu as a runner load option; pinning zero here makes the
+        // explicit CPU assignment real while the second process prevents GPU-runner churn on the
+        // primary backend.
+        body["options"]["num_gpu"] = json!(0);
+    }
+}
+
+fn apply_request_options(
+    task: TaskKind,
+    decision: &mut RouteDecision,
+    request: &OllamaRequestOptions,
+) -> Result<(), ApiError> {
+    for reserved in ["num_ctx", "num_gpu"] {
+        if request
+            .options
+            .as_ref()
+            .is_some_and(|options| options.contains_key(reserved))
+        {
+            return Err(ApiError::bad_request(anyhow::anyhow!(
+                "request_options.options.{reserved} is routing-owned; use context_tokens for num_ctx and execution_preference/operator backend assignment for num_gpu"
+            )));
+        }
+    }
+    if let Some(format) = &request.format
+        && !matches!(format, Value::Object(_))
+        && format.as_str() != Some("json")
+    {
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "request_options.format must be \"json\" or a JSON schema object"
+        )));
+    }
+    if let Some(think) = &request.think
+        && !think.is_boolean()
+        && !matches!(think.as_str(), Some("low" | "medium" | "high"))
+    {
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "request_options.think must be a boolean or one of low, medium, high"
+        )));
+    }
+    if request.top_logprobs.is_some() && request.logprobs != Some(true) {
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "request_options.top_logprobs requires logprobs=true"
+        )));
+    }
+    if matches!(task, TaskKind::Embedding)
+        && (request.format.is_some()
+            || request.think.is_some()
+            || request.logprobs.is_some()
+            || request.top_logprobs.is_some())
+    {
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "embedding tasks accept request_options.options only; format, think, and logprobs are chat controls"
+        )));
+    }
+    let options = decision
+        .options
+        .as_object_mut()
+        .expect("route options are always an object");
+    options.extend(request.options.clone().unwrap_or_default());
+    if let Some(think) = &request.think {
+        decision.think = think.clone();
+    }
+    Ok(())
+}
+
+fn build_managed_request(
+    input: &mut TaskInput,
+    decision: &RouteDecision,
+    keep_alive: &Value,
+) -> Result<(&'static str, Value), ApiError> {
+    if matches!(input.operation, super::warming::ManagedOperation::Warm) {
+        return Ok((
+            "/api/chat",
+            json!({
+                "model": decision.selected_model,
+                "messages": [],
+                "stream": false,
+                "truncate": false,
+                "shift": false,
+                "keep_alive": keep_alive,
+                "options": decision.options,
+            }),
+        ));
+    }
+    if matches!(input.route.task, TaskKind::Embedding) {
+        let value = input
+            .input
+            .take()
+            .context("embedding task requires input")
+            .map_err(ApiError::bad_request)?;
+        return Ok((
+            "/api/embed",
+            json!({
+                "model": decision.selected_model,
+                "input": value,
+                "truncate": false,
+                "keep_alive": keep_alive,
+                "options": decision.options,
+            }),
+        ));
+    }
+
+    let messages = if input.messages.is_empty() {
+        let mut message = json!({
+            "role": "user",
+            "content": input.prompt.take().context("task requires prompt or messages").map_err(ApiError::bad_request)?
+        });
+        if let Some(images) = input.images.take() {
+            message["images"] = json!(images);
+        }
+        vec![message]
+    } else {
+        std::mem::take(&mut input.messages)
+    };
+    let mut body = json!({
+        "model": decision.selected_model,
+        "messages": messages,
+        "stream": false,
+        "truncate": false,
+        "shift": false,
+        "keep_alive": keep_alive,
+        "options": decision.options,
+    });
+    if !decision.think.is_null() {
+        body["think"] = decision.think.clone();
+    }
+    if let Some(tools) = input.tools.take() {
+        body["tools"] = tools;
+    }
+    if let Some(format) = input.request_options.format.take() {
+        body["format"] = format;
+    }
+    if let Some(logprobs) = input.request_options.logprobs {
+        body["logprobs"] = json!(logprobs);
+    }
+    if let Some(top_logprobs) = input.request_options.top_logprobs {
+        body["top_logprobs"] = json!(top_logprobs);
+    }
+    Ok(("/api/chat", body))
+}
+
+/// Wait for an admission slot sized to the task, or refuse.
+///
+/// Returns the held permit, the cost charged, and how long the caller queued.
+pub(super) async fn admit(
+    state: &PlatformState,
+    execution: &ExecutionTarget,
+    requested_cost: u32,
+    priority: TaskPriority,
+    deadline: tokio::time::Instant,
+    resource_waiter: Option<ResourceWaitGuard>,
+) -> Result<(AdmissionPermit, u32, u128), ApiError> {
+    let budget = u32::try_from(execution.admission.total())
+        .unwrap_or(u32::MAX)
+        .max(1);
+    let cost = requested_cost.min(budget).max(1);
+    let acquired = if let Some(waiter) = resource_waiter {
+        waiter
+            .acquire(requested_cost.max(1) as usize, priority, deadline)
+            .await
+    } else {
+        execution
+            .admission
+            .acquire(requested_cost.max(1) as usize, priority, deadline)
+            .await
+    };
+    match acquired {
+        Ok((permit, queued)) => {
+            let charged = u32::try_from(permit.units())
+                .expect("admission charge cannot exceed the u32 requested cost");
+            Ok((permit, charged, queued))
+        }
+        Err(failure) => Err(admission_error(state, execution, priority, cost, failure)),
+    }
+}
+
+fn admission_error(
+    state: &PlatformState,
+    execution: &ExecutionTarget,
+    priority: TaskPriority,
+    cost: u32,
+    failure: AdmissionFailure,
+) -> ApiError {
+    let budget = execution.admission.total();
+    let wait = state.tunables().max_queue_wait();
+    let retry_after = super::runtime::retry_after_seconds(
+        execution.admission.queue_depth(),
+        execution.admission.total(),
+        state.average_task_ms(execution.placement),
+    );
+    let (status, code) = match failure {
+        // A full queue is FreeLlama's own configured cap, not an upstream fault.
+        AdmissionFailure::QueueFull => (StatusCode::TOO_MANY_REQUESTS, "admission_queue_full"),
+        AdmissionFailure::TimedOut => (StatusCode::SERVICE_UNAVAILABLE, "admission_timeout"),
+    };
+    let (reason, setting) = match failure {
+        AdmissionFailure::QueueFull => (
+            "admission queue full".to_owned(),
+            if execution.placement == "cpu" {
+                "--cpu-max-queued-tasks"
+            } else {
+                "--max-queued-tasks"
+            },
+        ),
+        AdmissionFailure::TimedOut => (
+            format!("no admission slot within {}s", wait.as_secs()),
+            if execution.placement == "cpu" {
+                "--cpu-max-concurrent-tasks"
+            } else {
+                "--max-concurrent-tasks"
+            },
+        ),
+    };
+    ApiError::new(
+        status,
+        format!(
+            "server busy: {reason} (task cost {cost} of {budget} units; priority \
+             {priority:?} on the {} backend). Retry after {retry_after}s, or raise {setting}.",
+            execution.placement,
+        ),
+    )
+    .with_code(code)
+    .with_retry_after(retry_after)
+}
+
+pub(super) fn transition_timeout(execution: &ExecutionTarget) -> ApiError {
+    execution.admission.record_transition_timeout();
+    ApiError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        format!(
+            "server busy: {} backend transition exceeded the admission-and-transition queue deadline",
+            execution.placement
+        ),
+    )
+    .with_retry_after(5)
+}
+
+pub(super) async fn run_task(
+    State(state): State<PlatformState>,
+    input: Result<Json<TaskInput>, axum::extract::rejection::JsonRejection>,
+) -> Result<axum::response::Response, ApiError> {
+    use axum::response::IntoResponse;
+    let Json(input) = input.map_err(|error| ApiError::invalid_task_request(&error))?;
+    if input.defer {
+        return super::jobs::submit(state, input)
+            .await
+            .map(|job| (StatusCode::ACCEPTED, job).into_response());
+    }
+    execute_task(State(state), Json(input))
+        .await
+        .map(IntoResponse::into_response)
+}
+
+pub(super) fn task_deadline(seconds: Option<u64>) -> Result<Duration, ApiError> {
+    if seconds == Some(0) {
+        return Err(ApiError::bad_request("timeout_seconds must be positive"));
+    }
+    let ceiling = super::platform_task_timeout();
+    Ok(seconds.map_or(ceiling, Duration::from_secs).min(ceiling))
+}
+
+pub(super) async fn execute_task(
+    State(state): State<PlatformState>,
+    Json(mut input): Json<TaskInput>,
+) -> Result<Json<Value>, ApiError> {
+    let timeout = input
+        .timeout_seconds
+        .map(|seconds| task_deadline(Some(seconds)))
+        .transpose()?
+        .or_else(|| {
+            (input.scope_id.is_some()
+                || matches!(input.operation, super::warming::ManagedOperation::Warm))
+            .then(super::platform_task_timeout)
+        });
+    let cancellation = input
+        .job_progress
+        .as_ref()
+        .map(super::jobs::JobProgress::cancellation);
+    let deadline = timeout.map(|timeout| {
+        input.job_progress.as_ref().map_or_else(
+            || tokio::time::Instant::now() + timeout,
+            super::jobs::JobProgress::deadline,
+        )
+    });
+    let started = Instant::now();
+    let mut scope_lease = None;
+    let preparation = state
+        .scopes
+        .prepare(&mut input, &state.tunables().scopes)
+        .map(|lease| scope_lease = lease);
+    let operation = input.operation;
+    let job_progress = input.job_progress.clone();
+    let session_id = input.route.session_id.clone();
+    let task = super::task_key(input.route.task);
+    let priority = input.priority;
+    let requested_model = input.route.model.clone();
+    let scoped = scope_lease.is_some();
+    let mut scope_session_cancellation = None;
+    let work = async {
+        preparation?;
+        if scoped && let Some(id) = session_id.as_deref() {
+            scope_session_cancellation = state.sessions.read().await.cancellation(id);
+        }
+        super::with_session_cancellation(
+            &state,
+            session_id.as_deref(),
+            Box::pin(run_session_task(State(state.clone()), Json(input))),
+        )
+        .await
+    };
+    let bounded = async {
+        if let Some(deadline) = deadline {
+            tokio::time::timeout_at(deadline, work)
+                .await
+                .unwrap_or_else(|_| {
+                    Err(
+                        ApiError::new(StatusCode::GATEWAY_TIMEOUT, "task total deadline exceeded")
+                            .with_code("task_deadline_exceeded"),
+                    )
+                })
+        } else {
+            work.await
+        }
+    };
+    let mut result = if let Some(mut cancellation) = cancellation.clone() {
+        tokio::select! {
+            biased;
+            _ = cancellation.wait_for(|cancelled| *cancelled) => Err(ApiError::task_cancelled()),
+            result = bounded => result,
+        }
+    } else {
+        bounded.await
+    };
+    // Retain measured inference costs even when the final history transaction fails.
+    let mut record = task_record(&result, started, task, priority, requested_model.as_deref());
+    if let Some(lease) = scope_lease
+        && let Ok(Json(value)) = &mut result
+    {
+        if let Err(error) = commit_scoped_completion(
+            &state,
+            lease,
+            value,
+            session_id.as_deref(),
+            job_progress.as_ref(),
+            deadline,
+            scope_session_cancellation.as_ref(),
+        )
+        .await
+        {
+            record.outcome = "error".into();
+            record.status = error.status().as_u16();
+            result = Err(error);
+        }
+    }
+    record_completion(&state, record, started).await;
+    if matches!(operation, super::warming::ManagedOperation::Warm)
+        && let Ok(Json(value)) = &mut result
+    {
+        value["warm"] = super::warming::completion_receipt(&value["execution"]);
+    }
+    result
+}
+
+async fn record_completion(
+    state: &PlatformState,
+    mut record: super::telemetry::TaskRecord,
+    started: Instant,
+) {
+    record.duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    if record.outcome == "ok" {
+        state
+            .activity
+            .completed(&record.backend, &record.model, record.load_ms);
+    }
+    state.telemetry.record_task(record).await;
+}
+
+async fn commit_scoped_completion(
+    state: &PlatformState,
+    lease: super::scopes::ScopeLease,
+    value: &mut Value,
+    session_id: Option<&str>,
+    progress: Option<&super::jobs::JobProgress>,
+    deadline: Option<tokio::time::Instant>,
+    session_cancellation: Option<&tokio::sync::watch::Receiver<bool>>,
+) -> Result<(), ApiError> {
+    let mut sessions = if let Some(deadline) = deadline {
+        tokio::time::timeout_at(deadline, state.sessions.write())
+            .await
+            .map_err(|_| scope_commit_deadline())?
+    } else {
+        state.sessions.write().await
+    };
+    if session_cancellation.is_some_and(|signal| *signal.borrow()) {
+        return Err(ApiError::session_killed());
+    }
+    let commit = || lease.commit(value, &state.tunables().scopes, deadline);
+    if let Some(progress) = progress {
+        progress.commit_result(commit)?;
+    } else {
+        commit()?;
+    }
+    if let Some(id) = session_id
+        && let Some(model) = value["route"]["selected_model"].as_str()
+    {
+        sessions.bind(id, model);
+    }
+    Ok(())
+}
+
+pub(super) fn scope_commit_deadline() -> ApiError {
+    ApiError::new(
+        StatusCode::GATEWAY_TIMEOUT,
+        "task total deadline exceeded before history commit",
+    )
+    .with_code("task_deadline_exceeded")
+}
+
+/// Usage-ledger row for a finished managed call, successful or not.
+fn task_record(
+    result: &Result<Json<Value>, ApiError>,
+    started: Instant,
+    task: &str,
+    priority: TaskPriority,
+    requested_model: Option<&str>,
+) -> super::telemetry::TaskRecord {
+    let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let priority = match priority {
+        TaskPriority::Interactive => "interactive",
+        TaskPriority::Normal => "normal",
+        TaskPriority::Background => "background",
+    };
+    let mut record = super::telemetry::TaskRecord {
+        ts: super::telemetry::now_seconds(),
+        model: requested_model.unwrap_or("unrouted").to_owned(),
+        backend: "none".into(),
+        task: task.to_owned(),
+        priority: priority.to_owned(),
+        outcome: "ok".into(),
+        status: 200,
+        prompt_tokens: 0,
+        output_tokens: 0,
+        duration_ms,
+        queue_wait_ms: 0,
+        load_ms: 0,
+        output_tokens_per_second: None,
+    };
+    match result {
+        Ok(Json(value)) => {
+            if let Some(model) = value["route"]["selected_model"].as_str() {
+                model.clone_into(&mut record.model);
+            }
+            if let Some(backend) = value["execution"]["placement"].as_str() {
+                backend.clone_into(&mut record.backend);
+            }
+            let metrics = &value["metrics"];
+            record.prompt_tokens = metrics["prompt_tokens"].as_u64().unwrap_or(0);
+            record.output_tokens = metrics["output_tokens"].as_u64().unwrap_or(0);
+            record.load_ms = metrics["load_duration_ns"].as_u64().unwrap_or(0) / 1_000_000;
+            record.output_tokens_per_second = metrics["output_tokens_per_second"].as_f64();
+            record.queue_wait_ms = value["admission"]["total_wait_ms"].as_u64().unwrap_or(0);
+        }
+        Err(error) => {
+            record.outcome = "error".into();
+            record.status = error.status().as_u16();
+        }
+    }
+    record
+}
+
+#[allow(clippy::too_many_lines)] // Explicit RAII lifetime across admission, revalidation and forwarding.
+async fn run_session_task(
+    State(state): State<PlatformState>,
+    Json(mut input): Json<TaskInput>,
+) -> Result<Json<Value>, ApiError> {
+    let progress = input.job_progress.clone();
+    // Function definitions are an execution requirement, not merely an optional payload field.
+    // Derive the capability at the server boundary so direct HTTP/NAPI callers cannot accidentally
+    // route tool work to a completion-only model.
+    if input.tools.is_some() {
+        input.route.required_capabilities.insert(Capability::Tools);
+    }
+    require_active_session(&state, input.route.session_id.as_deref()).await?;
+    let batch_items = input_batch_items(&input);
+    let requested_cost = task_cost_for(input.route.task, batch_items, &state.tunables());
+    let models = discover_models(&state).await?;
+    let sessions = state.sessions.read().await;
+    let mut managed = select_managed_route(
+        &state,
+        &input.route,
+        &models,
+        &sessions,
+        requested_cost,
+        Some(&input),
+    )
+    .await?;
+    drop(sessions);
+
+    apply_request_options(input.route.task, &mut managed.route, &input.request_options)?;
+    let mut context_sizing = context::size_context(&input, &mut managed.route, &managed.model)?;
+    if managed.route.resident && context_sizing["mode"] == "prompt_estimate" {
+        let loaded = resident_entry(
+            &state.client,
+            &managed.execution.upstream,
+            &managed.route.selected_model,
+        )
+        .await;
+        if let Some(reused) =
+            context::reuse_resident_context(&mut managed.route, &managed.model, loaded.as_ref())
+        {
+            context_sizing["reused_resident_context"] = json!(reused);
+        }
+    }
+    let leave_context_to_ollama =
+        context_left_to_ollama(&state, &mut managed, &context_sizing).await;
+    let preflight = memory_kv_preflight(
+        &managed.model,
+        &managed.route,
+        managed.execution.placement,
+        &managed.execution.upstream,
+    );
+    if preflight["refuses"] == true {
+        return Err(ApiError::bad_request(
+            "model file size alone exceeds the 80% local CPU/unified host budget; select a smaller model or configure an Ollama backend on a separate host",
+        ));
+    }
+
+    let mut execution_receipt = managed.execution_receipt(requested_cost, &state).await;
+    execution_receipt["context_sizing"] = context_sizing;
+    execution_receipt["model_digest"] = json!(managed.model.digest);
+    if let Some(progress) = &progress {
+        progress.route(&managed.route.selected_model, managed.execution.placement);
+    }
+    let resource_model = managed.model;
+    let decision = managed.route;
+    let execution = managed.execution;
+    // From here until the task ends this model counts as busy: eviction planning leaves it
+    // alone, and its recent demand makes it more expensive to unload later.
+    let _active = state
+        .activity
+        .begin(execution.placement, &decision.selected_model);
+    // Fail fast while this backend's circuit is open instead of queueing for a dead upstream.
+    // The guard lets exactly one probe through after the cooldown.
+    let breaker_probe = match state.breakers.check(execution.placement) {
+        Ok(probe) => probe,
+        Err(remaining) => {
+            return Err(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "{} backend circuit open after repeated upstream failures; retry in {}s",
+                    execution.placement,
+                    remaining.as_secs().max(1)
+                ),
+            )
+            .with_code("upstream_circuit_open")
+            .with_retry_after(remaining.as_secs().max(1)));
+        }
+    };
+    let immediate_unload = requests_immediate_unload(input.keep_alive.as_deref());
+    // `keep_alive:0` makes Ollama unload before its response reaches FreeLlama, so `/api/ps`
+    // cannot prove where the work ran. Hold the runner briefly, observe it, then issue and verify
+    // an explicit unload before returning. The caller still receives immediate-unload semantics.
+    let keep_alive = if immediate_unload {
+        json!("30s")
+    } else {
+        let (value, receipt) = super::warming::keep_alive(
+            &state,
+            input.keep_alive.take(),
+            execution.placement,
+            &decision.selected_model,
+        )
+        .await;
+        execution_receipt["keep_alive"] = receipt;
+        value
+    };
+    if immediate_unload {
+        execution_receipt["keep_alive"] = json!({"mode":"explicit","value":0,"reason":"caller_immediate_unload_with_placement_observation","finite":true});
+    }
+    let (path, mut body) = build_managed_request(&mut input, &decision, &keep_alive)?;
+    apply_execution_options(&mut body, &execution);
+    if let Some(default_context) = leave_context_to_ollama {
+        // Ollama's own default covers this request: leave `num_ctx` unset so the runner stays
+        // in Ollama's automatic mode (shared with raw clients, OOM shrink-and-retry intact).
+        if let Some(options) = body["options"].as_object_mut() {
+            options.remove("num_ctx");
+        }
+        execution_receipt["context_sizing"]["num_ctx_sent"] = json!(false);
+        execution_receipt["context_sizing"]["ollama_default_context"] = default_context;
+    }
+    execution_receipt["runtime_options"] = body["options"].clone();
+    // Slot first, THEN the transition lock — in both branches. The order matters: if the
+    // non-resident path took the write lock before its slot while resident tasks held slots and
+    // waited on the read lock, the two would deadlock. One consistent order removes that entirely.
+    let queue_wait = input.max_wait_seconds.map_or_else(
+        || state.tunables().max_queue_wait(),
+        |seconds| Duration::from_secs(seconds.max(1)).min(state.tunables().max_queue_wait()),
+    );
+    let queue_deadline = tokio::time::Instant::now() + queue_wait;
+    if let Some(progress) = &progress {
+        progress.update(
+            super::jobs::JobStatus::WaitingForAdmission,
+            "waiting_for_backend_capacity",
+            None,
+        );
+    }
+    let (mut slot, mut cost, mut queue_wait_ms) = admit(
+        &state,
+        &execution,
+        requested_cost,
+        input.priority,
+        queue_deadline,
+        None,
+    )
+    .await?;
+
+    // Wait for host memory while holding the admission slot only briefly. A cold load that must
+    // wait for memory used to keep its slot for the whole queue deadline, blocking resident
+    // requests that need no new memory at all (head-of-line blocking). After the short bound it
+    // gives the slot back, waits for memory, then queues for a slot again with memory reserved.
+    if let Some(progress) = &progress {
+        progress.update(
+            super::jobs::JobStatus::WaitingForResources,
+            "checking_host_resources",
+            None,
+        );
+    }
+    let resource_started = Instant::now();
+    let (sized, evictions) = make_room(
+        &state,
+        &execution,
+        &resource_model,
+        &decision,
+        queue_deadline,
+    )
+    .await;
+    if let Some(progress) = &progress {
+        let snapshot = state.resources.snapshot().await;
+        progress.update(
+            super::jobs::JobStatus::WaitingForResources,
+            "waiting_for_safe_memory_and_pressure",
+            Some(json!({
+                "required_available_bytes": sized["required_available_bytes"],
+                "effective_available_bytes": snapshot.effective_available_bytes,
+                "reserve_bytes": snapshot.hold_reserve_bytes,
+                "pressure_reasons": snapshot.reasons,
+            })),
+        );
+    }
+    let quick_deadline =
+        (tokio::time::Instant::now() + SLOT_HELD_RESOURCE_WAIT).min(queue_deadline);
+    let reserved = tokio::time::timeout_at(
+        quick_deadline,
+        reserve_task_resources(
+            &state,
+            &execution,
+            &resource_model,
+            &decision,
+            quick_deadline,
+            None,
+            Some(sized),
+        ),
+    )
+    .await;
+    let (resource_permit, mut footprint) = match reserved {
+        Ok(Ok(reserved)) => reserved,
+        Ok(Err(error)) if !error.is_resource_wait() => return Err(error),
+        _ if tokio::time::Instant::now() >= queue_deadline => {
+            return Err(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "resource admission deadline exceeded",
+            )
+            .with_resource_deadline(
+                "initial_reservation",
+                resource_started.elapsed().as_millis(),
+            ));
+        }
+        _ => {
+            let resource_waiter =
+                execution
+                    .admission
+                    .register_resource_waiter()
+                    .map_err(|failure| {
+                        admission_error(&state, &execution, input.priority, cost, failure)
+                    })?;
+            drop(slot);
+            let reserved = tokio::time::timeout_at(
+                queue_deadline,
+                reserve_task_resources(
+                    &state,
+                    &execution,
+                    &resource_model,
+                    &decision,
+                    queue_deadline,
+                    None,
+                    None,
+                ),
+            )
+            .await;
+            let reserved = reserved
+                .map_err(|_| {
+                    ApiError::new(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "resource admission deadline exceeded",
+                    )
+                    .with_resource_deadline(
+                        "initial_reservation",
+                        resource_started.elapsed().as_millis(),
+                    )
+                })
+                .and_then(std::convert::identity);
+            let reserved = match reserved {
+                Ok(reserved) => reserved,
+                Err(error) => {
+                    resource_waiter.finish();
+                    return Err(error);
+                }
+            };
+            if let Some(progress) = &progress {
+                progress.update(
+                    super::jobs::JobStatus::WaitingForAdmission,
+                    "resources_reserved_waiting_for_backend_capacity",
+                    None,
+                );
+            }
+            let (readmitted, readmitted_cost, requeued_ms) = admit(
+                &state,
+                &execution,
+                requested_cost,
+                input.priority,
+                queue_deadline,
+                Some(resource_waiter),
+            )
+            .await?;
+            slot = readmitted;
+            cost = readmitted_cost;
+            queue_wait_ms = queue_wait_ms.saturating_add(requeued_ms);
+            reserved
+        }
+    };
+    if !evictions.is_empty() {
+        footprint["evicted_idle_models"] = json!(
+            evictions
+                .iter()
+                .flat_map(|receipt| receipt["unloaded_ok"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default())
+                .collect::<Vec<_>>()
+        );
+        footprint["eviction"] = json!(evictions);
+    }
+    let mut resource_wait_ms = resource_started.elapsed().as_millis();
+    execution_receipt["resource_admission"] = json!(resource_permit.receipt);
+    execution_receipt["memory_reservation"] = footprint;
+
+    // Residency was discovered before admission and can be stale by the time this request reaches
+    // the transition lock. Recheck while holding the read side: if the selected runner is still
+    // resident, that lock prevents a managed writer from transitioning it during execution. A
+    // stale or unavailable snapshot falls back to the exclusive side before the request is sent.
+    if let Some(progress) = &progress {
+        progress.update(
+            super::jobs::JobStatus::WaitingForRunner,
+            "waiting_for_runner_transition",
+            None,
+        );
+    }
+    let transition_started = Instant::now();
+    let transition = tokio::time::timeout_at(queue_deadline, async {
+        if decision.resident {
+            let shared = Arc::clone(&execution.transition).read_owned().await;
+            if model_is_resident(&state.client, &execution.upstream, &decision.selected_model).await
+            {
+                TransitionPermit::Shared(shared)
+            } else {
+                drop(shared);
+                TransitionPermit::Exclusive(Arc::clone(&execution.transition).write_owned().await)
+            }
+        } else {
+            TransitionPermit::Exclusive(Arc::clone(&execution.transition).write_owned().await)
+        }
+    })
+    .await
+    .map_err(|_| transition_timeout(&execution))?;
+    let transition_wait_ms = transition_started.elapsed().as_millis();
+    let recheck_started = Instant::now();
+    let (resource_recheck, footprint) = tokio::time::timeout_at(
+        queue_deadline,
+        reserve_task_resources(
+            &state,
+            &execution,
+            &resource_model,
+            &decision,
+            queue_deadline,
+            Some(resource_permit.receipt.reserved_bytes),
+            None,
+        ),
+    )
+    .await
+    .map_err(|_| {
+        transition_timeout(&execution).with_resource_deadline(
+            "reservation_revalidation",
+            recheck_started.elapsed().as_millis(),
+        )
+    })??;
+    resource_wait_ms = resource_wait_ms.saturating_add(recheck_started.elapsed().as_millis());
+    execution_receipt["resource_revalidation"] = json!(resource_recheck.receipt);
+    let previous = execution_receipt["memory_reservation"].clone();
+    execution_receipt["memory_reservation"] = footprint;
+    for key in ["evicted_idle_models", "eviction"] {
+        if let Some(value) = previous.get(key) {
+            execution_receipt["memory_reservation"][key] = value.clone();
+        }
+    }
+    let admission_mode = transition.admission_mode();
+    let selected_model = decision.selected_model.clone();
+    let session_id = input.route.session_id.clone();
+    let mut permits = [resource_permit, resource_recheck];
+    if let Some(progress) = &progress {
+        progress.update(
+            if admission_mode == "resident_shared" {
+                super::jobs::JobStatus::Running
+            } else {
+                super::jobs::JobStatus::Loading
+            },
+            "forwarding_to_ollama",
+            None,
+        );
+    }
+    let forward = forward_managed_task(
+        &state,
+        decision,
+        &execution,
+        execution_receipt,
+        path,
+        body,
+        admission_mode,
+        slot,
+        queue_wait_ms,
+        transition_wait_ms,
+        resource_wait_ms,
+        cost,
+        immediate_unload,
+        breaker_probe,
+    );
+    // On unified memory a loaded runner's weights are wired and visible in OS telemetry, so the
+    // reservation that covered the load is returned as soon as the runner is resident instead of
+    // being counted a second time until the response ends. (With mmap'd weights on Linux the
+    // page cache still reads as available, so there the reservation is held to the end.)
+    let result = if progress.is_some()
+        || host_has_unified_memory() && permits.iter().any(|permit| permit.reserved_bytes() > 0)
+    {
+        let client = state.client.clone();
+        let upstream = execution.upstream.clone();
+        let watch = async {
+            loop {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                if model_is_resident(&client, &upstream, &selected_model).await {
+                    if let Some(progress) = &progress {
+                        progress.update(
+                            super::jobs::JobStatus::Running,
+                            "resident_runner_observed",
+                            None,
+                        );
+                    }
+                    if host_has_unified_memory() {
+                        permits
+                            .iter_mut()
+                            .for_each(resources::ResourcePermit::release);
+                    }
+                    break;
+                }
+            }
+            std::future::pending::<()>().await;
+        };
+        tokio::select! {
+            result = forward => result,
+            () = watch => unreachable!("the residency watch never completes"),
+        }
+    } else {
+        forward.await
+    };
+    drop(transition);
+    drop(permits);
+
+    // Affinity means the last model that successfully executed for the session. An upstream error
+    // must not pin a model the caller never received a successful result from.
+    if result.is_ok()
+        && input.scope_id.is_none()
+        && let Some(id) = session_id.as_deref()
+    {
+        state.sessions.write().await.bind(id, &selected_model);
+    }
+    result
+}
+
+/// Decide whether to leave `num_ctx` to Ollama for this request.
+///
+/// Only for prompt-sized contexts (an explicit `context_tokens` is always sent), and only when
+/// Ollama's default for this model is known, covers the sized context, and does not exceed
+/// `auto_context_max` (a 256k tier default would allocate a huge KV cache). A resident runner
+/// whose context was reused keeps being addressed explicitly. On success the decision's
+/// `num_ctx` is set to the default so memory estimates match what Ollama will allocate.
+async fn context_left_to_ollama(
+    state: &PlatformState,
+    managed: &mut ManagedDecision,
+    context_sizing: &Value,
+) -> Option<Value> {
+    let tunables = state.tunables();
+    if tunables.context_mode != super::ContextMode::OllamaDefault
+        || context_sizing["mode"] != "prompt_estimate"
+        || context_sizing.get("reused_resident_context").is_some()
+    {
+        return None;
+    }
+    let sized = managed.route.options["num_ctx"].as_u64()?;
+    let (default, source) = super::monitor::ollama_default_context(
+        state,
+        Some(&managed.model),
+        managed.execution.placement,
+    )
+    .await?;
+    let window = managed.model.advertised_context.unwrap_or(u64::MAX);
+    if default < sized || default > tunables.auto_context_max || default > window {
+        return None;
+    }
+    // A runner already loaded with some other explicit context would be reloaded by an
+    // automatic request; keep addressing it explicitly (reuse handles the larger-window case).
+    if managed.route.resident {
+        let loaded = resident_entry(
+            &state.client,
+            &managed.execution.upstream,
+            &managed.route.selected_model,
+        )
+        .await;
+        if loaded
+            .as_ref()
+            .and_then(|entry| entry["context_length"].as_u64())
+            .is_some_and(|loaded| loaded != default)
+        {
+            return None;
+        }
+    }
+    managed.route.options["num_ctx"] = json!(default);
+    managed
+        .route
+        .reasons
+        .push("context_left_to_ollama_default".to_owned());
+    Some(json!({"tokens": default, "source": source}))
+}
+
+/// Feed the circuit breaker with one upstream call's outcome.
+fn record_upstream_outcome(
+    state: &PlatformState,
+    execution: &ExecutionTarget,
+    probe: Option<super::runtime::BreakerProbe>,
+    failed: bool,
+) {
+    let tunables = state.tunables();
+    drop(probe);
+    if state.breakers.record(
+        execution.placement,
+        !failed,
+        tunables.breaker_failures,
+        tunables.breaker_cooldown(),
+    ) {
+        state.telemetry.record_breaker_open(execution.placement);
+        eprintln!(
+            "circuit breaker: {} backend open for {}s after repeated upstream failures",
+            execution.placement, tunables.breaker_cooldown_seconds
+        );
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ProfileEvidence<'a> {
+    task: TaskKind,
+    model: &'a str,
+    catalog_digest: Option<&'a str>,
+    upstream: &'a str,
+    body: &'a Value,
+    placement: &'a Value,
+    dispatch_admission: &'a Value,
+    completion_admission: &'a Value,
+    dispatch_settings: Option<&'a Value>,
+    completion_settings: Option<&'a Value>,
+    warm: bool,
+}
+
+fn unchanged_admission_interval(start: &Value, end: &Value) -> bool {
+    [
+        "admitted",
+        "released",
+        "policy_epoch",
+        "slots_total",
+        "slots_ceiling",
+        "active_units",
+        "in_flight",
+    ]
+    .into_iter()
+    .all(|field| {
+        start[field]
+            .as_u64()
+            .is_some_and(|value| end[field].as_u64() == Some(value))
+    })
+}
+
+fn profile_from_observations(
+    evidence: ProfileEvidence<'_>,
+) -> Result<super::runtime::ExecutionProfile, &'static str> {
+    if evidence.placement["status"] != "verified" {
+        return Err("physical_placement_unverified");
+    }
+    let processor = evidence.placement["processor"]
+        .as_str()
+        .ok_or("processor_identity_unknown")?;
+    let digest = evidence.placement["digest"]
+        .as_str()
+        .filter(|digest| !digest.is_empty())
+        .ok_or("model_revision_unknown")?;
+    if evidence.catalog_digest != Some(digest) {
+        return Err("model_revision_mismatch_or_unknown");
+    }
+    let context = evidence.placement["context_length"]
+        .as_u64()
+        .filter(|context| *context > 0)
+        .ok_or("observed_context_unknown")?;
+    let options = evidence.body["options"]
+        .as_object()
+        .ok_or("effective_options_unknown")?;
+    if options.get("num_ctx").and_then(Value::as_u64) != Some(context) {
+        return Err("effective_context_mismatch_or_unknown");
+    }
+    if !evidence.warm {
+        return Err("runner_transition_not_comparable");
+    }
+    if evidence.dispatch_admission["in_flight"] != 1
+        || evidence.completion_admission["in_flight"] != 1
+        || !unchanged_admission_interval(evidence.dispatch_admission, evidence.completion_admission)
+    {
+        return Err("admission_occupancy_or_policy_not_comparable");
+    }
+    let settings = evidence
+        .dispatch_settings
+        .ok_or("backend_process_settings_unknown")?;
+    if evidence.completion_settings != Some(settings) {
+        return Err("backend_process_settings_changed_or_unknown");
+    }
+    let controls: serde_json::Map<String, Value> = [
+        "options",
+        "think",
+        "format",
+        "tools",
+        "logprobs",
+        "top_logprobs",
+        "dimensions",
+    ]
+    .into_iter()
+    .map(|key| (key.to_owned(), evidence.body[key].clone()))
+    .collect();
+    let metric_kind = super::runtime::ThroughputMetricKind::for_task(evidence.task);
+    let mut material = json!({
+        "metric_kind": metric_kind,
+        "task": evidence.task, "model": evidence.model, "digest": digest,
+        "upstream": evidence.upstream, "processor": processor, "context_tokens": context,
+        "controls": controls, "backend_settings": settings,
+        "admission_class": {"in_flight":1,"limit":evidence.dispatch_admission["slots_total"],
+            "ceiling":evidence.dispatch_admission["slots_ceiling"],"charged_units":evidence.dispatch_admission["active_units"]},
+    });
+    material.sort_all_objects();
+    let bytes = serde_json::to_vec(&material).expect("profile material serializes");
+    Ok(super::runtime::ExecutionProfile {
+        id: format!("{:x}", Sha256::digest(bytes)),
+        task: evidence.task,
+        model: evidence.model.to_owned(),
+        digest: digest.to_owned(),
+        context_tokens: context,
+        processor: processor.to_owned(),
+        metric_kind,
+    })
+}
+
+async fn comparable_backend_settings(
+    _state: &PlatformState,
+    execution: &ExecutionTarget,
+) -> Option<Value> {
+    let endpoint = execution.upstream.clone();
+    tokio::task::spawn_blocking(move || super::ollama_env::probe_comparable_process(&endpoint))
+        .await
+        .ok()
+        .flatten()
+}
+
+async fn routing_profile(
+    state: &PlatformState,
+    input: &RouteInput,
+    route: &RouteDecision,
+    models: &[CatalogModel],
+    requested_cost: u32,
+    payload: &TaskInput,
+) -> Option<super::runtime::ExecutionProfile> {
+    input.context_tokens?;
+    if matches!(payload.operation, super::warming::ManagedOperation::Warm) {
+        return None;
+    }
+    let execution = execution_target(state, &route.selected_model);
+    let before = execution.admission.receipt();
+    if before["in_flight"] != 0 || before["active_units"] != 0 {
+        return None;
+    }
+    let settings = comparable_backend_settings(state, &execution).await?;
+    let loaded = resident_entry(&state.client, &execution.upstream, &route.selected_model).await?;
+    let after = execution.admission.receipt();
+    if !unchanged_admission_interval(&before, &after) {
+        return None;
+    }
+    let mut effective = route.clone();
+    apply_request_options(input.task, &mut effective, &payload.request_options).ok()?;
+    let mut body = if matches!(input.task, TaskKind::Embedding) {
+        json!({"options":effective.options})
+    } else {
+        json!({"options":effective.options,"think":effective.think,"tools":payload.tools,
+            "format":payload.request_options.format,"logprobs":payload.request_options.logprobs,
+            "top_logprobs":payload.request_options.top_logprobs})
+    };
+    apply_execution_options(&mut body, &execution);
+    let model = models
+        .iter()
+        .find(|model| model.name == route.selected_model)?;
+    let mut placement = physical_placement_observation(
+        execution.placement,
+        loaded["size"].as_u64(),
+        loaded["size_vram"].as_u64(),
+    );
+    placement["digest"] = loaded["digest"].clone();
+    placement["context_length"] = loaded["context_length"].clone();
+    let mut prospective = before;
+    prospective["in_flight"] = json!(1);
+    prospective["active_units"] = json!(
+        u64::from(requested_cost)
+            .min(prospective["slots_total"].as_u64()?)
+            .max(1)
+    );
+    profile_from_observations(ProfileEvidence {
+        task: input.task,
+        model: &route.selected_model,
+        catalog_digest: model.digest.as_deref(),
+        upstream: &execution.upstream,
+        body: &body,
+        placement: &placement,
+        dispatch_admission: &prospective,
+        completion_admission: &prospective,
+        dispatch_settings: Some(&settings),
+        completion_settings: Some(&settings),
+        warm: true,
+    })
+    .ok()
+}
+
+/// Feed adaptive concurrency with comparable observed feedback or a backend safety signal.
+async fn observe_completion(
+    state: &PlatformState,
+    execution: &ExecutionTarget,
+    failed: bool,
+    profile: Option<&super::runtime::ExecutionProfile>,
+    metric: Option<super::runtime::ThroughputMetric>,
+) {
+    if !super::monitor::adaptive_applies(state, execution.placement) {
+        state
+            .adaptive_for(execution.placement)
+            .reset_healthy_streak();
+        return;
+    }
+    let observation = state.resources.snapshot().await.observation;
+    let memory_pressure = matches!(
+        observation.memory_pressure,
+        Some(resources::MemoryPressure::Warning | resources::MemoryPressure::Critical)
+    ) || observation
+        .memory_psi_some_avg10
+        .is_some_and(|stall| stall >= ADAPTIVE_PSI_THRESHOLD);
+    let change = state.adaptive_for(execution.placement).observe(
+        &execution.admission,
+        &super::runtime::Completion {
+            profile,
+            failed,
+            memory_pressure,
+            metric: metric.filter(|_| profile.is_some()),
+        },
+    );
+    super::runtime::note_limit_change(&state.telemetry, execution.placement, change);
+}
+
+/// PSI memory `some avg10` (percent of the last 10s with a task stalled on memory) at which a
+/// completion counts as "under pressure" for adaptive concurrency.
+const ADAPTIVE_PSI_THRESHOLD: f64 = 10.0;
+
+/// Retry 500/502 (load-model blips), but not 503 busy or 504 timeout. Same as passthrough.
+/// Retrying 503 while holding an admission slot — and on a cold load, the exclusive write lock —
+/// amplifies the saturation the semaphore exists to shed.
+fn retryable_managed_status(status: StatusCode) -> bool {
+    proxy::retryable_upstream_status(status)
+}
+
+pub(super) async fn intent_memory_requirement(
+    state: &PlatformState,
+    target: &ExecutionTarget,
+) -> u64 {
+    if !upstream_is_loopback(&target.upstream)
+        || !(target.placement == "cpu" || host_has_unified_memory())
+    {
+        return 0;
+    }
+    // The interpreter is a cold-capable model request too. Reserve its reported file size even
+    // when resident, so a runner transition cannot invalidate a zero-byte reservation.
+    get_json(&state.client, &target.upstream, "/api/tags")
+        .await
+        .ok()
+        .and_then(|catalog| catalog["models"].as_array().cloned())
+        .and_then(|models| {
+            models.into_iter().find(|model| {
+                model["name"] == state.intent_model || model["model"] == state.intent_model
+            })
+        })
+        .and_then(|model| model["size"].as_u64())
+        .unwrap_or(0)
+}
+
+pub(super) async fn model_memory_requirement(
+    state: &PlatformState,
+    execution: &ExecutionTarget,
+    model: &CatalogModel,
+    decision: &RouteDecision,
+) -> Value {
+    let loopback = upstream_is_loopback(&execution.upstream);
+    let host_relevant = loopback && (execution.placement == "cpu" || host_has_unified_memory());
+    // A discrete GPU holds the model in VRAM, but whatever does not fit spills into system RAM
+    // ("mixed" placement), which used to be reserved as zero. Estimate the full footprint, then
+    // charge host memory only for the part the GPU's current free VRAM cannot hold.
+    let discrete_gpu = loopback && !host_relevant;
+    let current = if (host_relevant || discrete_gpu) && model.digest.is_some() {
+        resident_entry(&state.client, &execution.upstream, &model.name).await
+    } else {
+        None
+    };
+    let context = decision.options["num_ctx"].as_u64().unwrap_or(0);
+    let mut footprint = state.footprints.lock().await.requirement(
+        &execution.upstream,
+        model,
+        context,
+        current.as_ref(),
+        host_relevant || discrete_gpu,
+    );
+    if discrete_gpu {
+        let full = footprint["required_available_bytes"].as_u64().unwrap_or(0);
+        if full > 0 {
+            let observation = state.resources.snapshot().await.observation;
+            apply_discrete_gpu_budget(&mut footprint, full, &observation);
+        }
+    }
+    footprint
+}
+
+fn apply_discrete_gpu_budget(
+    footprint: &mut Value,
+    full: u64,
+    observation: &resources::HostResources,
+) {
+    footprint["full_estimate_bytes"] = json!(full);
+    if let Some(vram_free) = observation.gpu_memory_free_bytes {
+        footprint["gpu_memory_free_bytes"] = json!(vram_free);
+        footprint["gpu_telemetry_source"] = json!(observation.gpu_telemetry_source);
+        footprint["required_available_bytes"] = json!(full.saturating_sub(vram_free));
+        footprint["source"] = json!("discrete_gpu_spill_estimate");
+    } else {
+        // Unknown VRAM is not evidence that the GPU can hold any part of the runner. Charge
+        // the full estimate to RAM so missing vendor tools cannot bypass host admission.
+        footprint["required_available_bytes"] = json!(full);
+        footprint["source"] = json!("discrete_gpu_unknown_vram_full_host_reservation");
+    }
+}
+
+/// Size the load for `model` and, when it would not fit, unload idle runners first. Returns the
+/// footprint (re-measured after any unload) and the eviction receipts.
+///
+/// Runs once per task, after it has a slot and before the resource timeouts start. It used to run
+/// inside the 2-second slot-held reservation attempt, which cancelled it halfway through a
+/// multi-second unload: runners were gone but no receipt was kept, and the retry planned a second
+/// round from telemetry that had not caught up yet, unloading runners it did not need to.
+async fn make_room(
+    state: &PlatformState,
+    execution: &ExecutionTarget,
+    model: &CatalogModel,
+    decision: &RouteDecision,
+    deadline: tokio::time::Instant,
+) -> (Value, Vec<Value>) {
+    let mut evictions = Vec::new();
+    let mut footprint = model_memory_requirement(state, execution, model, decision).await;
+    if !state.tunables().evict_idle_models {
+        return (footprint, evictions);
+    }
+    // Discrete GPU: make room in VRAM before Ollama must. Ollama would either evict by its
+    // own least-recently-used order (possibly a model with work queued here) or spill layers
+    // to the CPU; FreeLlama knows which runners are idle and cheap to reload.
+    if let (Some(full), Some(free)) = (
+        footprint["full_estimate_bytes"].as_u64(),
+        footprint["gpu_memory_free_bytes"].as_u64(),
+    ) {
+        // A resident copy at a smaller context is replaced, so its VRAM comes back too.
+        let own = resident_entry(&state.client, &execution.upstream, &decision.selected_model)
+            .await
+            .and_then(|entry| entry["size_vram"].as_u64())
+            .unwrap_or(0);
+        let shortfall = full.saturating_sub(free.saturating_add(own));
+        // A model larger than the whole GPU spills whatever is unloaded; emptying VRAM for it
+        // would only make every other model reload.
+        let fits_the_gpu = state
+            .resources
+            .snapshot()
+            .await
+            .observation
+            .gpu_memory_total_bytes
+            .is_none_or(|total| full <= total);
+        if shortfall > 0
+            && fits_the_gpu
+            && let Some(receipt) = evict_detached(
+                state,
+                execution,
+                &decision.selected_model,
+                residency::Freed::Vram,
+                shortfall,
+                deadline,
+            )
+            .await
+        {
+            evictions.push(receipt);
+            footprint = model_memory_requirement(state, execution, model, decision).await;
+        }
+    }
+    let bytes = footprint["required_available_bytes"].as_u64().unwrap_or(0);
+    if bytes > 0 {
+        let snapshot = state.resources.snapshot().await;
+        // A host already holding for low memory recovers only above the resume reserve, and
+        // idle runners are often exactly what holds that memory, so both cases evict.
+        let assessment = snapshot.assess_capacity(bytes, snapshot.holding);
+        let memory_hold = snapshot.reasons.iter().any(|reason| {
+            matches!(
+                reason,
+                resources::PressureReason::LowAvailableMemory
+                    | resources::PressureReason::OsMemoryPressure
+                    | resources::PressureReason::ActiveSwapping
+            )
+        });
+        let evict = match assessment.denial_reason {
+            Some(resources::CapacityDenialReason::InsufficientCapacity) => true,
+            Some(resources::CapacityDenialReason::HostPressure) => memory_hold,
+            _ => false,
+        };
+        if evict {
+            let shortfall = assessment
+                .required_with_reserve_bytes
+                .unwrap_or(u64::MAX)
+                .saturating_sub(assessment.effective_available_bytes.unwrap_or(0));
+            let freed = if footprint["source"] == "discrete_gpu_spill_estimate" {
+                residency::Freed::HostSpill
+            } else {
+                residency::Freed::Total
+            };
+            if let Some(receipt) = evict_detached(
+                state,
+                execution,
+                &decision.selected_model,
+                freed,
+                shortfall,
+                deadline,
+            )
+            .await
+            {
+                evictions.push(receipt);
+                footprint = model_memory_requirement(state, execution, model, decision).await;
+            }
+        }
+    }
+    (footprint, evictions)
+}
+
+/// Run an eviction that a deadline can stop waiting for but never cancel halfway: the unloads,
+/// the receipt and the telemetry refresh always complete together.
+async fn evict_detached(
+    state: &PlatformState,
+    execution: &ExecutionTarget,
+    keep: &str,
+    freed: residency::Freed,
+    shortfall: u64,
+    deadline: tokio::time::Instant,
+) -> Option<Value> {
+    let (state, execution, keep) = (state.clone(), execution.clone(), keep.to_owned());
+    let eviction = tokio::spawn(async move {
+        evict_idle_models(&state, &execution, &keep, freed, shortfall).await
+    });
+    tokio::time::timeout_at(deadline, eviction)
+        .await
+        .ok()?
+        .ok()?
+}
+
+async fn reserve_task_resources(
+    state: &PlatformState,
+    execution: &ExecutionTarget,
+    model: &CatalogModel,
+    decision: &RouteDecision,
+    deadline: tokio::time::Instant,
+    already_reserved: Option<u64>,
+    sized: Option<Value>,
+) -> Result<(resources::ResourcePermit, Value), ApiError> {
+    let footprint = match sized {
+        Some(footprint) => footprint,
+        None => model_memory_requirement(state, execution, model, decision).await,
+    };
+    let bytes = footprint["required_available_bytes"]
+        .as_u64()
+        .unwrap_or(0)
+        .saturating_sub(already_reserved.unwrap_or(0));
+    let resident = footprint["source"] == "matching_resident_context";
+    if already_reserved.is_some() {
+        // Refresh under the transition guard, but never wait for pressure recovery while holding
+        // that guard: an unload request may be what makes recovery possible.
+        state.resources.snapshot().await;
+    }
+    let demand = if resident && bytes == 0 {
+        resources::ResourceDemand::resident()
+    } else {
+        resources::ResourceDemand::load(bytes)
+    };
+    let permit = state
+        .resources
+        .wait_for_demand(
+            &execution.upstream,
+            demand,
+            if already_reserved.is_some() {
+                Duration::ZERO
+            } else {
+                deadline.saturating_duration_since(tokio::time::Instant::now())
+            },
+        )
+        .await
+        .map_err(resource_error)?;
+    Ok((permit, footprint))
+}
+
+/// Unload the cheapest set of idle runners on `execution` that frees about `shortfall` bytes.
+///
+/// A cold load used to wait for memory that only idle resident models were holding; `FreeLlama`
+/// never unloaded them, so the request held its slot and then failed with 503. The victims come
+/// from `residency::plan`: never the target, a pinned or `keep_alive: -1` model, or one with
+/// tasks queued or running here; among the rest, the set whose loss costs least (measured reload
+/// time, recent demand, operator weight). `keep_alive: 0` is safe for a runner that is still
+/// serving a raw client: Ollama unloads it once those requests finish.
+async fn evict_idle_models(
+    state: &PlatformState,
+    execution: &ExecutionTarget,
+    keep: &str,
+    freed: residency::Freed,
+    shortfall: u64,
+) -> Option<Value> {
+    let ps = get_json(&state.client, &execution.upstream, "/api/ps")
+        .await
+        .ok()?;
+    state
+        .footprints
+        .lock()
+        .await
+        .observe_resident(&execution.upstream, &ps);
+    let tunables = state.tunables();
+    let plan = residency::plan(
+        &ps,
+        &state.activity,
+        &residency::PlanInputs {
+            backend: execution.placement,
+            keep,
+            pinned: &tunables.pinned_models,
+            weights: &tunables.eviction_costs,
+            freed,
+            shortfall,
+        },
+    );
+    let mut evicted = Vec::new();
+    let mut claimed = Vec::new();
+    for victim in &plan.victims {
+        // A task may have been routed to this runner since the plan was made.
+        if state
+            .activity
+            .usage(execution.placement, &victim.name)
+            .active
+            > 0
+        {
+            claimed.push(victim.name.clone());
+            continue;
+        }
+        let body = json!({"model": victim.name, "keep_alive": 0, "stream": false});
+        if post_json_with_retries(state, &execution.upstream, "/api/generate", &body)
+            .await
+            .is_ok_and(|(status, _)| status.is_success())
+        {
+            evicted.push(victim.name.clone());
+        }
+    }
+    // Give Ollama a moment to release the runners before capacity is re-read.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !evicted.is_empty() && Instant::now() < deadline {
+        let mut still_loaded = false;
+        for name in &evicted {
+            if model_is_resident(&state.client, &execution.upstream, name).await {
+                still_loaded = true;
+                break;
+            }
+        }
+        if !still_loaded {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    if plan.victims.is_empty() {
+        return None;
+    }
+    state
+        .telemetry
+        .record_evictions(execution.placement, evicted.len());
+    if !evicted.is_empty() {
+        // The cached sample predates the unload; the next capacity check must re-read.
+        state.resources.invalidate().await;
+    }
+    let mut receipt = plan.receipt();
+    receipt["backend"] = json!(execution.placement);
+    receipt["for_model"] = json!(keep);
+    receipt["memory"] = json!(match freed {
+        residency::Freed::Total => "host",
+        residency::Freed::Vram => "vram",
+        residency::Freed::HostSpill => "host_spill",
+    });
+    receipt["unloaded_ok"] = json!(evicted);
+    receipt["claimed_before_unload"] = json!(claimed);
+    receipt["at"] = json!(super::telemetry::now_seconds());
+    *state
+        .last_eviction
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(receipt.clone());
+    Some(receipt)
+}
+
+/// POST JSON upstream, retrying transient failures on the same backoff schedule the passthrough
+/// proxy uses (`proxy::retry_delay`).
+///
+/// The managed-task path was the one retry-capable caller that had no retries: an Ollama 500 —
+/// which it returns under load-model contention, the exact condition managed routing creates —
+/// failed the whole task, while the byte-identical request through the passthrough proxy would
+/// have survived it. The asymmetry was worse than it looks, because the caller holds the
+/// `managed_execution` admission permit across this call: failing bare also threw away an
+/// exclusive slot it had already queued for, so the retry it needed was the expensive one to skip.
+async fn post_json_with_retries(
+    state: &PlatformState,
+    upstream: &str,
+    path: &str,
+    body: &Value,
+) -> Result<(StatusCode, Value), ApiError> {
+    let url = format!("{}{path}", upstream.trim_end_matches('/'));
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        let more_attempts = attempt < proxy::MAX_ATTEMPTS;
+        match state.client.post(&url).json(body).send().await {
+            Ok(response) if retryable_managed_status(response.status()) && more_attempts => {
+                eprintln!(
+                    "managed task retry attempt={attempt} status={} path={path}",
+                    response.status()
+                );
+                tokio::time::sleep(proxy::retry_delay(attempt)).await;
+            }
+            Ok(response) => {
+                let status = response.status();
+                let bytes = response.bytes().await.map_err(ApiError::upstream)?;
+                // A failing Ollama does not always answer in JSON (a wedged runner can return a
+                // plain-text or HTML body). Parsing strictly here used to convert a truthful 500
+                // into a misleading "decode error", hiding the real upstream status from the
+                // caller — so fall back to carrying the body through as text.
+                let value = serde_json::from_slice::<Value>(&bytes).unwrap_or_else(
+                    |_| json!({ "error": String::from_utf8_lossy(&bytes).trim().to_owned() }),
+                );
+                return Ok((status, value));
+            }
+            // A timeout is NOT a transient hiccup here. This client's per-attempt budget is
+            // `platform_task_timeout()` (900s by default), and the caller holds both an admission
+            // slot and — on the non-resident path — the exclusive `managed_execution` write lock
+            // across every attempt. Retrying a timeout would therefore hold the whole managed
+            // plane for up to 3 x 900s, which is exactly the "one hung request deadlocks every
+            // subsequent managed task" failure the client timeout was added to prevent. Connection
+            // errors are still retried: those fail fast and cost nothing to re-pay.
+            Err(error) if more_attempts && error.is_connect() && !error.is_timeout() => {
+                eprintln!("managed task retry attempt={attempt} error={error:#} path={path}");
+                tokio::time::sleep(proxy::retry_delay(attempt)).await;
+            }
+            Err(error) => return Err(ApiError::upstream(error)),
+        }
+    }
+}
+
+async fn validate_upstream_completion(
+    state: &PlatformState,
+    execution: &ExecutionTarget,
+    model: &str,
+    path: &str,
+    status: StatusCode,
+    value: Value,
+    immediate_unload: bool,
+) -> Result<Value, ApiError> {
+    let reported_error = value.get("error").is_some_and(|error| !error.is_null());
+    let incomplete =
+        status.is_success() && !reported_error && path == "/api/chat" && value["done"] != true;
+    if !status.is_success() || incomplete || reported_error {
+        // A completed HTTP exchange can still contain an incomplete generation or an error.
+        // Do not train feedback or bind affinity. Honor this request's immediate-unload contract,
+        // but never replay the uncertain generation to manufacture a completed response.
+        let lifecycle = if immediate_unload {
+            Some(unload_after_observation(state, execution, model).await)
+        } else {
+            None
+        };
+        let code = if incomplete {
+            "upstream_incomplete_response"
+        } else {
+            "upstream_error"
+        };
+        let message = if incomplete {
+            "Ollama did not return done:true for a non-streaming managed request".to_owned()
+        } else {
+            value["error"]
+                .as_str()
+                .map_or_else(|| value.to_string(), str::to_owned)
+        };
+        return Err(ApiError::new(
+            if status.is_success() {
+                StatusCode::BAD_GATEWAY
+            } else {
+                status
+            },
+            message,
+        )
+        .with_upstream_response(code, value, lifecycle));
+    }
+    Ok(value)
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn forward_managed_task(
+    state: &PlatformState,
+    decision: RouteDecision,
+    execution: &ExecutionTarget,
+    mut execution_receipt: Value,
+    path: &str,
+    body: Value,
+    admission_mode: &str,
+    // This permit remains owned until completion, including validation and requested unload.
+    slot: AdmissionPermit,
+    queue_wait_ms: u128,
+    transition_wait_ms: u128,
+    resource_wait_ms: u128,
+    cost: u32,
+    immediate_unload: bool,
+    breaker_probe: Option<super::runtime::BreakerProbe>,
+) -> Result<Json<Value>, ApiError> {
+    let mut completion_guard = super::monitor::adaptive_applies(state, execution.placement)
+        .then(|| state.adaptive_for(execution.placement).completion_guard());
+    let initial_admission = execution.admission.receipt();
+    let dispatch_settings =
+        if admission_mode == "resident_shared" && initial_admission["in_flight"] == 1 {
+            comparable_backend_settings(state, execution).await
+        } else {
+            None
+        };
+    let dispatch_admission = execution.admission.receipt();
+    let posted = post_json_with_retries(state, &execution.upstream, path, &body).await;
+    let upstream_failed = match &posted {
+        Err(_) => true,
+        Ok((status, _)) => matches!(status.as_u16(), 500 | 502 | 504),
+    };
+    record_upstream_outcome(state, execution, breaker_probe, upstream_failed);
+    if upstream_failed {
+        observe_completion(state, execution, true, None, None).await;
+    }
+    let (status, value) = match posted {
+        Ok(response) => response,
+        Err(error) => {
+            // The runner may have loaded before the response or its body failed. We replaced
+            // the caller's zero TTL with 30s to observe placement, so finish the owned cleanup
+            // even when no response can be decoded. Never replay uncertain inference.
+            return Err(if immediate_unload {
+                error.with_lifecycle(
+                    unload_after_observation(state, execution, &decision.selected_model).await,
+                )
+            } else {
+                error
+            });
+        }
+    };
+    let value = validate_upstream_completion(
+        state,
+        execution,
+        &decision.selected_model,
+        path,
+        status,
+        value,
+        immediate_unload,
+    )
+    .await?;
+    let metrics = runtime_metrics(&value);
+    let placement = observe_physical_placement(state, execution, &decision.selected_model).await;
+    let feedback_accepted = placement["status"] == "verified";
+    let observed_admission = execution.admission.receipt();
+    let completion_settings = if dispatch_settings.is_some()
+        && unchanged_admission_interval(&dispatch_admission, &observed_admission)
+    {
+        comparable_backend_settings(state, execution).await
+    } else {
+        None
+    };
+    let completion_admission = execution.admission.receipt();
+    let learning_profile = profile_from_observations(ProfileEvidence {
+        task: decision.task,
+        model: &decision.selected_model,
+        catalog_digest: execution_receipt["model_digest"].as_str(),
+        upstream: &execution.upstream,
+        body: &body,
+        placement: &placement,
+        dispatch_admission: &dispatch_admission,
+        completion_admission: &completion_admission,
+        dispatch_settings: dispatch_settings.as_ref(),
+        completion_settings: completion_settings.as_ref(),
+        warm: admission_mode == "resident_shared",
+    });
+    let diagnostic_work_score = if admission_mode == "resident_shared" {
+        feedback_work_unit_ns(decision.task, &value)
+    } else {
+        None
+    };
+    let work_score = learning_profile.as_ref().ok().and(diagnostic_work_score);
+    let adaptive_metric = adaptive_throughput_metric(decision.task, &value);
+    execution_receipt["throughput_learning"] = json!({
+        "eligible": work_score.is_some(),
+        "profile_eligible": learning_profile.is_ok(),
+        "adaptive_eligible": learning_profile.is_ok() && adaptive_metric.is_some(),
+        "reason": learning_profile.as_ref().err().copied().unwrap_or(if work_score.is_some() {"comparable_observed_profile"} else {"work_unit_metrics_unknown"}),
+        "profile": learning_profile.as_ref().ok(),
+        "metric_kind": adaptive_metric.map(|metric| metric.kind),
+        "metric_value": adaptive_metric.map(|metric| metric.tokens_per_second),
+        "scope": "observed_controls_and_serial_freellama_admission",
+    });
+    observe_completion(
+        state,
+        execution,
+        false,
+        learning_profile.as_ref().ok(),
+        adaptive_metric,
+    )
+    .await;
+    if let Some(guard) = &mut completion_guard {
+        guard.complete();
+    }
+    state.footprints.lock().await.observe(
+        &execution.upstream,
+        execution_receipt["model_digest"].as_str(),
+        &placement,
+    );
+    execution_receipt["observation"] = placement;
+    let slots_total = execution.admission.total();
+    // Report throttling rather than hiding it. A caller that fans out embeddings needs to know it
+    // is queueing here — otherwise the only symptom is latency it cannot attribute.
+    let slots_available = execution.admission.available();
+    let feedback_receipt = {
+        let mut feedback = state.feedback.write().await;
+        let by_task = if execution.placement == "cpu" {
+            &mut feedback.cpu
+        } else {
+            &mut feedback.gpu
+        };
+        let observation = by_task.entry(decision.task).or_default();
+        if feedback_accepted {
+            observation.record(
+                &decision.selected_model,
+                diagnostic_work_score,
+                queue_wait_ms,
+            );
+            if let (Ok(profile), Some(duration)) = (&learning_profile, work_score) {
+                observation.record_profile(profile, duration);
+            }
+        }
+        let mut receipt = observation.receipt();
+        receipt["accepted"] = json!(feedback_accepted);
+        receipt["throughput_learning"] = execution_receipt["throughput_learning"].clone();
+        receipt["reason"] = json!(if feedback_accepted {
+            "physical_placement_verified"
+        } else {
+            "physical_placement_unverified_or_mismatched"
+        });
+        let snapshot = feedback.clone();
+        drop(feedback);
+        let persistence = if feedback_accepted {
+            if let Some(path) = state.feedback_file.clone() {
+                // A synchronous fsync-and-rename on a runtime worker stalls every task sharing it.
+                let written =
+                    tokio::task::spawn_blocking(move || persist_feedback(&path, &snapshot))
+                        .await
+                        .unwrap_or_else(|error| {
+                            Err(anyhow::anyhow!("feedback writer panicked: {error}"))
+                        });
+                match written {
+                    Ok(()) => {
+                        *state.feedback_persistence_error.write().await = None;
+                        json!({"enabled": true, "persisted": true, "schema_version": FEEDBACK_SCHEMA_VERSION})
+                    }
+                    Err(error) => {
+                        let message = error.to_string();
+                        *state.feedback_persistence_error.write().await = Some(message.clone());
+                        json!({"enabled": true, "persisted": false, "error": message})
+                    }
+                }
+            } else {
+                json!({"enabled": false, "persisted": false})
+            }
+        } else {
+            json!({"enabled": state.feedback_file.is_some(), "persisted": false, "reason": "sample_not_accepted"})
+        };
+        receipt["persistence"] = persistence;
+        receipt
+    };
+    if immediate_unload {
+        execution_receipt["lifecycle"] =
+            unload_after_observation(state, execution, &decision.selected_model).await;
+    }
+    drop(slot);
+    Ok(Json(json!({
+        "route": decision,
+        "execution": execution_receipt,
+        "admission": {
+            "mode": admission_mode,
+            "queue_wait_ms": queue_wait_ms,
+            "transition_wait_ms": transition_wait_ms,
+            "resource_wait_ms": resource_wait_ms,
+            "total_wait_ms": queue_wait_ms.saturating_add(transition_wait_ms).saturating_add(resource_wait_ms),
+            "slots_total": slots_total,
+            "slots_available_during_call": slots_available,
+            "cost": cost,
+        },
+        "metrics": metrics,
+        "feedback": feedback_receipt,
+        "response": value
+    })))
+}
+
+async fn unload_after_observation(
+    state: &PlatformState,
+    execution: &ExecutionTarget,
+    model: &str,
+) -> Value {
+    let body = json!({"model": model, "keep_alive": 0, "stream": false});
+    match post_json_with_retries(state, &execution.upstream, "/api/generate", &body).await {
+        Ok((status, _)) if status.is_success() => {
+            let observation = observe_physical_placement(state, execution, model).await;
+            let unloaded = observation["status"] == "not_resident";
+            json!({
+                "requested": "immediate_unload",
+                "status": if unloaded { "verified" } else { "failed" },
+                "post_unload_observation": observation,
+            })
+        }
+        Ok((status, body)) => json!({
+            "requested": "immediate_unload",
+            "status": "failed",
+            "upstream_status": status.as_u16(),
+            "error": body,
+        }),
+        Err(error) => json!({
+            "requested": "immediate_unload",
+            "status": "failed",
+            "error": error.body.error,
+        }),
+    }
+}
+
+/// Observe the processor that Ollama actually loaded after a managed request. An assignment to
+/// the CPU daemon plus `num_gpu:0` is a request, not proof: Metal/MLX builds may still put every
+/// byte in VRAM. Unknown/mixed/mismatched observations are returned to the caller and excluded
+/// from adaptive feedback so the scheduler cannot learn from a false device label.
+async fn observe_physical_placement(
+    state: &PlatformState,
+    execution: &ExecutionTarget,
+    model: &str,
+) -> Value {
+    let Ok(ps) = get_json(&state.client, &execution.upstream, "/api/ps").await else {
+        return json!({
+            "processor": "unknown",
+            "status": "unavailable",
+            "resident": null,
+            "source": "ollama_api_ps_after_execution"
+        });
+    };
+    let Some(models) = ps.get("models").and_then(Value::as_array) else {
+        return json!({
+            "processor": "unknown",
+            "status": "unavailable",
+            "resident": null,
+            "source": "ollama_api_ps_after_execution"
+        });
+    };
+    let running = models.iter().find(|entry| {
+        entry
+            .get("name")
+            .or_else(|| entry.get("model"))
+            .and_then(Value::as_str)
+            == Some(model)
+    });
+    let Some(running) = running else {
+        return json!({
+            "processor": "unknown",
+            "status": "not_resident",
+            "resident": false,
+            "source": "ollama_api_ps_after_execution"
+        });
+    };
+    let mut observation = physical_placement_observation(
+        execution.placement,
+        running.get("size").and_then(Value::as_u64),
+        running.get("size_vram").and_then(Value::as_u64),
+    );
+    observation["resident"] = json!(true);
+    observation["context_length"] = running
+        .get("context_length")
+        .cloned()
+        .unwrap_or(Value::Null);
+    observation["digest"] = running.get("digest").cloned().unwrap_or(Value::Null);
+    observation
+}
+
+/// The `/api/ps` entry for `model` on `upstream`, if it is loaded.
+async fn resident_entry(client: &Client, upstream: &str, model: &str) -> Option<Value> {
+    get_json(client, upstream, "/api/ps")
+        .await
+        .ok()?
+        .get("models")?
+        .as_array()?
+        .iter()
+        .find(|entry| {
+            entry
+                .get("name")
+                .or_else(|| entry.get("model"))
+                .and_then(Value::as_str)
+                == Some(model)
+        })
+        .cloned()
+}
+
+async fn model_is_resident(client: &Client, upstream: &str, model: &str) -> bool {
+    get_json(client, upstream, "/api/ps")
+        .await
+        .ok()
+        .and_then(|ps| ps.get("models").and_then(Value::as_array).cloned())
+        .is_some_and(|models| {
+            models.iter().any(|entry| {
+                entry
+                    .get("name")
+                    .or_else(|| entry.get("model"))
+                    .and_then(Value::as_str)
+                    == Some(model)
+            })
+        })
+}
+
+pub(super) fn physical_placement_observation(
+    requested: &str,
+    size: Option<u64>,
+    size_vram: Option<u64>,
+) -> Value {
+    let processor = match (size, size_vram) {
+        (_, Some(0)) => "cpu",
+        (Some(size), Some(vram)) if size > 0 && vram >= size => "gpu",
+        (Some(size), Some(vram)) if size > 0 && vram > 0 => "mixed",
+        _ => "unknown",
+    };
+    let status = if processor == "unknown" {
+        "unavailable"
+    } else if processor == requested {
+        "verified"
+    } else {
+        "mismatch"
+    };
+    json!({
+        "processor": processor,
+        "status": status,
+        "source": "ollama_api_ps_after_execution",
+        "size": size,
+        "size_vram": size_vram,
+    })
+}
+
+/// Normalize unlike prompt sizes before backend feedback compares them. Generation speed uses
+/// decode nanoseconds per output token; embeddings use total nanoseconds per input token because
+/// Ollama does not report a separate embedding-evaluation duration.
+pub(super) fn feedback_work_unit_ns(task: TaskKind, response: &Value) -> Option<u64> {
+    let (duration, units) = if matches!(task, TaskKind::Embedding) {
+        (
+            response.get("total_duration").and_then(Value::as_u64),
+            response.get("prompt_eval_count").and_then(Value::as_u64),
+        )
+    } else {
+        (
+            response.get("eval_duration").and_then(Value::as_u64),
+            response.get("eval_count").and_then(Value::as_u64),
+        )
+    };
+    match (duration, units) {
+        (Some(duration), Some(units)) if duration > 0 && units > 0 && duration / units > 0 => {
+            Some(duration / units)
+        }
+        _ => None,
+    }
+}
+
+fn adaptive_throughput_metric(
+    task: TaskKind,
+    response: &Value,
+) -> Option<super::runtime::ThroughputMetric> {
+    let rate = if matches!(task, TaskKind::Embedding) {
+        tokens_per_second(Some(1), Some(feedback_work_unit_ns(task, response)?))?
+    } else {
+        runtime_metrics(response)["output_tokens_per_second"].as_f64()?
+    };
+    (rate.is_finite() && rate > 0.0).then_some(super::runtime::ThroughputMetric {
+        kind: super::runtime::ThroughputMetricKind::for_task(task),
+        tokens_per_second: rate,
+    })
+}
+
+/// Extract prompt-free performance fields from an Ollama response.
+#[must_use]
+pub fn runtime_metrics(response: &Value) -> Value {
+    let prompt_count = response.get("prompt_eval_count").and_then(Value::as_u64);
+    let cached_count = response
+        .get("prompt_eval_cached_count")
+        .and_then(Value::as_u64)
+        .filter(|cached| prompt_count.is_some_and(|total| *cached <= total));
+    let uncached_count = prompt_count
+        .zip(cached_count)
+        .map(|(total, cached)| total - cached);
+    let prompt_duration = response.get("prompt_eval_duration").and_then(Value::as_u64);
+    let output_count = response.get("eval_count").and_then(Value::as_u64);
+    let output_duration = response.get("eval_duration").and_then(Value::as_u64);
+    json!({
+        "total_duration_ns": response.get("total_duration").and_then(Value::as_u64),
+        "load_duration_ns": response.get("load_duration").and_then(Value::as_u64),
+        "prompt_tokens": prompt_count,
+        "cached_prompt_tokens": cached_count,
+        "uncached_prompt_tokens": uncached_count,
+        "prompt_duration_ns": prompt_duration,
+        "prompt_tokens_per_second": tokens_per_second(uncached_count, prompt_duration),
+        "output_tokens": output_count,
+        "output_duration_ns": output_duration,
+        "output_tokens_per_second": tokens_per_second(output_count, output_duration),
+    })
+}
+
+fn tokens_per_second(count: Option<u64>, duration_ns: Option<u64>) -> Option<f64> {
+    let (Some(count), Some(duration_ns)) = (count, duration_ns) else {
+        return None;
+    };
+    if duration_ns == 0 {
+        return None;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    Some(count as f64 * 1_000_000_000.0 / duration_ns as f64)
+}
+
+/// Charge an embedding batch for its actual cardinality. Ollama executes a batched `/api/embed`
+/// request as more work than a single string even though it remains materially cheaper than N
+/// independent HTTP calls. Arithmetic saturates at the maximum supported weight; `admit` applies
+/// the backend-specific cap when the task acquires its permit.
+fn task_cost_for(task: TaskKind, batch_items: usize, tunables: &super::runtime::Tunables) -> u32 {
+    let base = tunables.task_cost(task);
+    if !matches!(task, TaskKind::Embedding) {
+        return base;
+    }
+    let items = u32::try_from(batch_items.max(1)).unwrap_or(u32::MAX);
+    // The configured base covers each group of up to four inputs. This is a queueing weight,
+    // not a VRAM estimate.
+    items.div_ceil(4).saturating_mul(base)
+}
+
+fn input_batch_items(input: &TaskInput) -> usize {
+    input
+        .input
+        .as_ref()
+        .and_then(Value::as_array)
+        .map_or(1, Vec::len)
+        .max(1)
+}
+
+/// Advisory F16 estimate and a coarse local model-size budget, not Ollama's live loader check.
+/// Cache precision and runner parallelism belong to the selected Ollama process, so reading the
+/// gateway's environment cannot establish either. An F16 estimate can exceed actual quantized
+/// cache usage and must not be presented as a known minimum or used to reject that configuration.
+fn memory_kv_preflight(
+    model: &CatalogModel,
+    route: &RouteDecision,
+    placement: &str,
+    upstream: &str,
+) -> Value {
+    let requested_context = route
+        .options
+        .get("num_ctx")
+        .and_then(Value::as_u64)
+        .or(model.advertised_context);
+    let host_relevant =
+        upstream_is_loopback(upstream) && (placement == "cpu" || host_has_unified_memory());
+    memory_kv_preflight_with_memory(
+        model,
+        requested_context,
+        host_relevant,
+        host_total_memory_bytes(),
+    )
+}
+
+pub(super) fn upstream_is_loopback(upstream: &str) -> bool {
+    reqwest::Url::parse(upstream)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .is_some_and(|host| {
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .trim_matches(['[', ']'])
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|address| address.is_loopback())
+        })
+}
+
+pub(super) fn memory_kv_preflight_with_memory(
+    model: &CatalogModel,
+    requested_context: Option<u64>,
+    host_relevant: bool,
+    host_memory_bytes: Option<u64>,
+) -> Value {
+    let kv_cache_bytes = model
+        .kv_cache_bytes_per_token_f16
+        .zip(requested_context)
+        .and_then(|(per_token, context)| per_token.checked_mul(context));
+    let model_plus_kv_bytes = kv_cache_bytes.and_then(|kv| model.size.checked_add(kv));
+    let host_budget = host_memory_bytes.map(|total| total / 5 * 4);
+    let refuses = host_relevant && host_budget.is_some_and(|budget| model.size > budget);
+    let estimate_exceeds_budget = host_relevant
+        && model_plus_kv_bytes
+            .zip(host_budget)
+            .is_some_and(|(needed, budget)| needed > budget);
+    let status = if refuses {
+        "refuse_model_file_exceeds_host_budget"
+    } else if estimate_exceeds_budget {
+        "f16_estimate_exceeds_host_budget"
+    } else if kv_cache_bytes.is_some() {
+        "estimated_f16_single_sequence"
+    } else {
+        "unknown_model_metadata"
+    };
+    json!({
+        "status": status,
+        "refuses": refuses,
+        "known_model_bytes": model.size,
+        "requested_context_tokens": requested_context,
+        "kv_cache_bytes_f16_estimate": kv_cache_bytes,
+        "model_plus_kv_bytes_f16_estimate": model_plus_kv_bytes,
+        "host_memory_bytes": host_memory_bytes,
+        "host_budget_bytes": host_budget,
+        "host_memory_relevant": host_relevant,
+        "threshold": "model_file_only_80_percent_of_total_host_memory_when_loopback_cpu_or_unified",
+        "assumptions": "unquantized F16, one sequence, uniform full attention, no padding or runner overhead; loopback assumed local",
+        "upstream_parallelism": "unknown",
+        "upstream_kv_cache_type": "unknown",
+        "live_available_memory_bytes": null,
+        "authority": "Ollama owns live free-memory, runner graph, cache-type, and final load admission",
+    })
+}
+
+#[cfg(test)]
+mod gpu_budget_tests {
+    use super::*;
+
+    #[test]
+    fn missing_vram_telemetry_reserves_the_full_footprint() {
+        let mut footprint = json!({"required_available_bytes": 8000});
+        apply_discrete_gpu_budget(&mut footprint, 8000, &resources::HostResources::default());
+        assert_eq!(footprint["required_available_bytes"], 8000);
+    }
+
+    #[test]
+    fn observed_vram_only_discounts_memory_it_can_hold() {
+        for (free, expected) in [(0, 8000), (3000, 5000), (9000, 0)] {
+            let mut footprint = json!({"required_available_bytes": 8000});
+            let observation = resources::HostResources {
+                gpu_memory_free_bytes: Some(free),
+                ..resources::HostResources::default()
+            };
+            apply_discrete_gpu_budget(&mut footprint, 8000, &observation);
+            assert_eq!(footprint["required_available_bytes"], expected);
+        }
+    }
+}
+
+#[cfg(test)]
+mod execution_profile_tests {
+    use super::super::runtime::{
+        AdaptiveLimiter, Completion, ThroughputMetric, ThroughputMetricKind,
+    };
+    use super::*;
+    use std::collections::BTreeMap;
+
+    struct Observations {
+        task: TaskKind,
+        body: Value,
+        placement: Value,
+        start: Value,
+        end: Value,
+        settings: Option<Value>,
+        end_settings: Option<Value>,
+        digest: String,
+        upstream: String,
+    }
+    impl Observations {
+        fn new() -> Self {
+            let settings = super::super::ollama_env::resolve(
+                Some(&BTreeMap::new()),
+                |_| None,
+                |_| None,
+                "observed fixture pid 42".into(),
+            )
+            .comparable_process_settings();
+            let admission = json!({"in_flight":1,"active_units":2,"slots_total":4,"slots_ceiling":4,"admitted":1,"released":0,"policy_epoch":0});
+            Self {
+                task: TaskKind::Completion,
+                body: json!({"options":{"num_ctx":4096,"num_predict":512},"think":false,"prompt":"private prompt"}),
+                placement: json!({"status":"verified","processor":"gpu","digest":"revision-a","context_length":4096}),
+                start: admission.clone(),
+                end: admission,
+                end_settings: settings.clone(),
+                settings,
+                digest: "revision-a".into(),
+                upstream: "http://127.0.0.1:11434".into(),
+            }
+        }
+        fn profile(&self) -> Result<super::super::runtime::ExecutionProfile, &'static str> {
+            profile_from_observations(ProfileEvidence {
+                task: self.task,
+                model: "model:latest",
+                catalog_digest: Some(&self.digest),
+                upstream: &self.upstream,
+                body: &self.body,
+                placement: &self.placement,
+                dispatch_admission: &self.start,
+                completion_admission: &self.end,
+                dispatch_settings: self.settings.as_ref(),
+                completion_settings: self.end_settings.as_ref(),
+                warm: true,
+            })
+        }
+    }
+
+    fn trained_limiter(
+        profile: &super::super::runtime::ExecutionProfile,
+    ) -> (AdmissionPool, AdaptiveLimiter) {
+        let pool = AdmissionPool::new(4, 4);
+        let limiter = AdaptiveLimiter::default();
+        for _ in 0..3 {
+            limiter.observe(
+                &pool,
+                &Completion {
+                    profile: Some(profile),
+                    failed: false,
+                    memory_pressure: false,
+                    metric: Some(ThroughputMetric {
+                        kind: ThroughputMetricKind::OutputTokensPerSecond,
+                        tokens_per_second: 100.0,
+                    }),
+                },
+            );
+        }
+        (pool, limiter)
+    }
+
+    #[test]
+    fn comparable_profile_accumulates_but_distinct_execution_controls_do_not_mix() {
+        let original = Observations::new().profile().unwrap();
+        let changes: &[fn(&mut Observations)] = &[
+            |facts| {
+                facts.body["options"]["num_ctx"] = json!(8192);
+                facts.placement["context_length"] = json!(8192);
+            },
+            |facts| {
+                facts.digest = "revision-b".into();
+                facts.placement["digest"] = json!("revision-b");
+            },
+            |facts| {
+                facts.placement["processor"] = json!("cpu");
+                facts.upstream = "http://127.0.0.1:11436".into();
+            },
+            |facts| {
+                facts.body["options"]["num_thread"] = json!(1);
+            },
+            |facts| {
+                facts.body["options"]["temperature"] = json!(0.8);
+            },
+            |facts| {
+                facts.body["think"] = json!(true);
+            },
+            |facts| {
+                facts.body["tools"] = json!([{"type":"function","function":{"name":"inspect"}}]);
+            },
+            |facts| {
+                facts.body["format"] = json!({"type":"object"});
+            },
+            |facts| {
+                facts.settings.as_mut().unwrap()["settings"]["OLLAMA_FLASH_ATTENTION"]["value"] =
+                    json!("1");
+                facts.end_settings = facts.settings.clone();
+            },
+            |facts| {
+                facts.start["slots_total"] = json!(2);
+                facts.end = facts.start.clone();
+            },
+            |facts| {
+                facts.start["active_units"] = json!(3);
+                facts.end = facts.start.clone();
+            },
+        ];
+        for change in changes {
+            let (pool, limiter) = trained_limiter(&original);
+            let baseline = limiter.receipt(&pool, true);
+            assert_eq!(baseline["profile_windows"]["completion"]["samples"], 3);
+            let mut facts = Observations::new();
+            change(&mut facts);
+            let distinct = facts.profile().unwrap();
+            assert_ne!(distinct.id, original.id);
+            assert_eq!(
+                limiter.observe(
+                    &pool,
+                    &Completion {
+                        profile: Some(&distinct),
+                        failed: false,
+                        memory_pressure: false,
+                        metric: Some(ThroughputMetric {
+                            kind: ThroughputMetricKind::OutputTokensPerSecond,
+                            tokens_per_second: 10.0
+                        })
+                    }
+                ),
+                None
+            );
+            assert_eq!(
+                pool.total(),
+                4,
+                "a slow distinct profile must not reduce the limit"
+            );
+            assert_eq!(
+                limiter.receipt(&pool, true)["current_profile_count"],
+                1,
+                "only one current task window is retained"
+            );
+        }
+        let (pool, limiter) = trained_limiter(&original);
+        assert_eq!(
+            limiter.observe(
+                &pool,
+                &Completion {
+                    profile: Some(&original),
+                    failed: false,
+                    memory_pressure: false,
+                    metric: Some(ThroughputMetric {
+                        kind: ThroughputMetricKind::OutputTokensPerSecond,
+                        tokens_per_second: 10.0
+                    })
+                }
+            ),
+            Some(("decrease", 2))
+        );
+        let mut same = Observations::new();
+        same.body["prompt"] = json!("different private content");
+        assert_eq!(
+            same.profile().unwrap(),
+            original,
+            "raw prompts must not enter profile identity"
+        );
+    }
+
+    #[test]
+    fn comparable_embedding_input_rate_can_recover_a_reduced_limit() {
+        let pool = AdmissionPool::new(4, 4);
+        pool.set_limit(2);
+        let limiter = AdaptiveLimiter::default();
+        let mut facts = Observations::new();
+        facts.task = TaskKind::Embedding;
+        facts.body = json!({"options":{"num_ctx":4096}});
+        let profile = facts.profile().unwrap();
+        assert_eq!(
+            profile.metric_kind,
+            ThroughputMetricKind::InputTokensPerSecond
+        );
+        assert_ne!(profile.id, Observations::new().profile().unwrap().id);
+        let response = json!({"prompt_eval_count":20,"total_duration":200_000_000});
+        let completion = Completion {
+            profile: Some(&profile),
+            failed: false,
+            memory_pressure: false,
+            metric: adaptive_throughput_metric(TaskKind::Embedding, &response),
+        };
+        for _ in 0..5 {
+            limiter.observe(&pool, &completion);
+        }
+        assert_eq!(
+            pool.total(),
+            3,
+            "comparable positive embedding input-rate completions must recover"
+        );
+        let receipt = limiter.receipt(&pool, true);
+        assert_eq!(
+            receipt["profile_windows"]["embedding"]["metric_kind"],
+            "input_tokens_per_second"
+        );
+        assert_eq!(receipt["profile_windows"]["embedding"]["rate"], 100.0);
+        assert_eq!(receipt["baseline_output_tokens_per_second"], json!({}));
+        let slow = json!({"prompt_eval_count":20,"total_duration":2_000_000_000_u64});
+        assert_eq!(
+            limiter.observe(
+                &pool,
+                &Completion {
+                    metric: adaptive_throughput_metric(TaskKind::Embedding, &slow),
+                    ..completion
+                }
+            ),
+            Some(("decrease", 1))
+        );
+        limiter.observe(&pool, &completion);
+        limiter.observe(
+            &pool,
+            &Completion {
+                metric: Some(ThroughputMetric {
+                    kind: ThroughputMetricKind::OutputTokensPerSecond,
+                    tokens_per_second: 100.0,
+                }),
+                ..completion
+            },
+        );
+        assert_eq!(
+            limiter.receipt(&pool, true)["healthy_streak"],
+            0,
+            "unlike metric kinds cannot bridge recovery"
+        );
+        assert_eq!(
+            limiter.receipt(&pool, true)["profile_windows"]["embedding"]["samples"],
+            6,
+            "metric mismatch cannot train"
+        );
+        assert_eq!(
+            adaptive_throughput_metric(
+                TaskKind::Embedding,
+                &json!({"prompt_eval_count":0,"total_duration":20})
+            )
+            .map(|metric| metric.tokens_per_second),
+            None
+        );
+    }
+
+    #[test]
+    fn missing_identity_and_changed_or_parallel_intervals_are_explicitly_unqualified() {
+        type UnqualifiedCase = (&'static str, fn(&mut Observations));
+        let cases: &[UnqualifiedCase] = &[
+            ("model_revision_unknown", |facts| {
+                facts.placement["digest"] = Value::Null;
+            }),
+            ("observed_context_unknown", |facts| {
+                facts.placement["context_length"] = Value::Null;
+            }),
+            ("effective_context_mismatch_or_unknown", |facts| {
+                facts.body["options"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("num_ctx");
+            }),
+            ("backend_process_settings_unknown", |facts| {
+                facts.settings = None;
+            }),
+            ("backend_process_settings_changed_or_unknown", |facts| {
+                facts.end_settings.as_mut().unwrap()["process"] = json!("observed fixture pid 43");
+            }),
+            ("admission_occupancy_or_policy_not_comparable", |facts| {
+                facts.start["in_flight"] = json!(2);
+                facts.end = facts.start.clone();
+            }),
+            ("admission_occupancy_or_policy_not_comparable", |facts| {
+                facts.end["admitted"] = json!(2);
+                facts.end["released"] = json!(1);
+            }),
+            ("admission_occupancy_or_policy_not_comparable", |facts| {
+                facts.end["policy_epoch"] = json!(2);
+            }),
+        ];
+        for (reason, change) in cases {
+            let mut facts = Observations::new();
+            change(&mut facts);
+            assert_eq!(facts.profile(), Err(*reason));
+        }
+    }
+}

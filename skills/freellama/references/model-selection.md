@@ -3,7 +3,7 @@
 Load when choosing or installing a model, or when `minConfidence:"medium"` refuses every route.
 Why: capability metadata and parameter counts are not quality evidence.
 
-Start with Flow D in `SKILL.md`; it owns request-intent questions, host inspection, candidate
+Start with Flow E in `SKILL.md`; it owns request-intent questions, host inspection, candidate
 presentation, and exact-tag approval gate. This reference owns how to qualify the candidates:
 
 1. For quality-sensitive work, preview with `minConfidence:"medium"`.
@@ -12,6 +12,10 @@ presentation, and exact-tag approval gate. This reference owns how to qualify th
 3. Generate policy with `policy-from-eval`; never manufacture it from throughput.
 4. For library search, fetch families first, then inspect one family for pullable tags and
    `fitsInMemory`. With `serve` down, do not guess a tag.
+
+Default balanced routing needs no policy setup: it prefers qualified candidates when available,
+otherwise falls back with low confidence and no quality evidence. Explicit `minConfidence:"medium"`
+still refuses insufficient evidence. Quality routing requires a policy unless you pin a model.
 
 Fastest routing without evidence is only a capability filter and can select a 0.5B model for code
 repair. Vision tags also require a real image trial; names and family claims have failed in both

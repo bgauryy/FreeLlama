@@ -20,8 +20,19 @@ export function machine(endpoint?: string | undefined | null): Promise<string>;
 /** Current managed-platform health, including admission and session bounds. */
 export function health(endpoint?: string | undefined | null): Promise<string>;
 
+/**
+ * Live platform view: admission, queues, adaptive limits and circuit breakers per backend,
+ * loaded models, host memory, Ollama's effective settings, and today's usage.
+ */
+export function status(endpoint?: string | undefined | null): Promise<string>;
+
+/** Usage totals per day and per model over the last `days` days (default 7). */
+export function usage(endpoint?: string | undefined | null, days?: number | undefined | null): Promise<string>;
+
 /** Create a bounded, idle-expiring model-affinity handle; it stores no prompt history or KV. */
 export function createSession(endpoint?: string | undefined | null): Promise<string>;
+
+export function killSession(endpoint: string | undefined | null, sessionId: string): Promise<string>;
 
 /** Release a model-affinity handle after related work has completed. */
 export function deleteSession(
@@ -145,6 +156,15 @@ export function runTaskBatchRequest(
   request: unknown,
 ): Promise<string>;
 
+/** Lists process-local job metadata without prompts or results. */
+export function listTaskJobs(endpoint?: string | undefined | null): Promise<string>;
+/** Reads one deferred job and its retained result. */
+export function getTaskJob(endpoint: string | undefined | null, jobId: string): Promise<string>;
+/** Cancels one deferred job and waits for its local permits to be released. */
+export function cancelTaskJob(endpoint: string | undefined | null, jobId: string): Promise<string>;
+/** Stop one deferred task, release local permits, then discard its retained record. */
+export function removeTaskJob(endpoint: string | undefined | null, jobId: string): Promise<string>;
+
 /**
  * Converts a free-text natural-language intent into a route.
  * @param endpoint FreeLlama serve endpoint, defaults to http://127.0.0.1:11435
@@ -156,3 +176,11 @@ export function naturalRoute(
   text: string,
   sessionId?: string | undefined | null,
 ): Promise<string>;
+
+/** Opt-in bounded process-local history. Metadata by default. */
+export function createScope(endpoint: string | undefined | null, request: unknown): Promise<string>;
+export function getScope(endpoint: string | undefined | null, scopeId: string, includeMessages?: boolean | null): Promise<string>;
+export function forkScope(endpoint: string | undefined | null, scopeId: string, request: unknown): Promise<string>;
+export function deleteScope(endpoint: string | undefined | null, scopeId: string): Promise<void>;
+/** Empty-payload preload through managed admission and deadlines. */
+export function warmModelRequest(endpoint: string | undefined | null, request: unknown): Promise<string>;

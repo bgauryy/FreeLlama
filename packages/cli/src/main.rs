@@ -1,3 +1,5 @@
+mod context_cli;
+
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -9,7 +11,7 @@ use freellama::{
     model_bench::{BenchConfig, Capability, benchmark_all},
     platform::{
         ExecutionPreference, Objective, PlacementEvidence, PlatformConfig, RouteInput, TaskKind,
-        serve as serve_platform,
+        TaskPriority, serve as serve_platform,
     },
     proxy::{ProxyConfig, serve},
     run_suite, validate_endpoints, write_json,
@@ -32,6 +34,15 @@ struct Cli {
 /// Admission tuning, grouped so `start_platform` stays within a readable argument count.
 #[derive(Debug, Clone, Copy, clap::Args)]
 struct AdmissionArgs {
+    /// Required local telemetry: RAM by default; best-effort explicitly permits unknown RAM.
+    #[arg(long, value_enum)]
+    resource_telemetry_policy: Option<TelemetryPolicyArg>,
+    /// Available host-memory percentage held back before admitting model work (default 15).
+    #[arg(long)]
+    resource_hold_available_percent: Option<u32>,
+    /// Available-memory percentage required for recovery (default 20; greater than hold).
+    #[arg(long)]
+    resource_resume_available_percent: Option<u32>,
     /// Primary/GPU admission budget in weighted units — embedding 1, chat 2, vision 4 (default 2,
     /// or `FREELLAMA_MAX_CONCURRENT_TASKS`). This is not a literal task count.
     #[arg(long, alias = "gpu-admission-slots")]
@@ -45,16 +56,153 @@ struct AdmissionArgs {
     /// contract; waiting forever would hide load as unattributable latency.
     #[arg(long)]
     max_queue_wait_seconds: Option<u64>,
-    /// Bound raw Ollama-compatible proxy requests with immediate 503. This is a generic primary
-    /// backend cap only; use managed tasks for weighted CPU/GPU admission.
+    /// Maximum managed requests retained while the primary/GPU pool is saturated (default 16,
+    /// or `FREELLAMA_MAX_QUEUED_TASKS`). Excess work receives 503 immediately.
+    #[arg(long)]
+    max_queued_tasks: Option<usize>,
+    /// Maximum managed requests retained while the CPU pool is saturated (default 8, or
+    /// `FREELLAMA_CPU_MAX_QUEUED_TASKS`).
+    #[arg(long)]
+    cpu_max_queued_tasks: Option<usize>,
+    /// Bound raw Ollama-compatible proxy streams (default 1 in `serve`). Over the cap a request
+    /// waits up to --raw-queue-wait-seconds, then gets 429 with Retry-After. This is a generic
+    /// primary-backend cap; use managed tasks for weighted CPU/GPU admission.
     #[arg(long)]
     raw_proxy_max_concurrent_requests: Option<usize>,
+    /// How long a raw generation may wait for a slot or for managed execution (default 10, or
+    /// `FREELLAMA_RAW_QUEUE_WAIT_SECONDS`; 0 refuses at once).
+    #[arg(long)]
+    raw_queue_wait_seconds: Option<u64>,
     /// Maximum live session-affinity handles (default 1024). Sessions contain no prompt/KV data.
     #[arg(long)]
     max_sessions: Option<usize>,
     /// Expire idle affinity handles after this many seconds (default 3600).
     #[arg(long)]
     session_ttl_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum TelemetryPolicyArg {
+    BestEffort,
+    RequireMemory,
+    RequireAll,
+}
+
+impl From<TelemetryPolicyArg> for freellama::platform::resources::TelemetryPolicy {
+    fn from(value: TelemetryPolicyArg) -> Self {
+        match value {
+            TelemetryPolicyArg::BestEffort => Self::BestEffort,
+            TelemetryPolicyArg::RequireMemory => Self::RequireMemory,
+            TelemetryPolicyArg::RequireAll => Self::RequireAll,
+        }
+    }
+}
+
+#[cfg(test)]
+mod telemetry_cli_tests {
+    use super::*;
+
+    #[test]
+    fn initialization_is_ready_only_with_runtime_service_and_installed_models() {
+        assert_eq!(initialization_status(false, true, true), "blocked");
+        assert_eq!(initialization_status(true, false, true), "setup_required");
+        assert_eq!(initialization_status(true, true, false), "setup_required");
+        assert_eq!(initialization_status(true, true, true), "ready");
+    }
+
+    #[test]
+    fn job_removal_requires_one_valid_id_and_cannot_also_cancel() {
+        let id = "b0bf3d83-4e2e-4bcb-a11e-a3c7a8a66d54";
+        let parsed = Cli::try_parse_from(["freellama", "jobs", "--id", id, "--remove"]).unwrap();
+        assert!(matches!(
+            parsed.command,
+            Command::Jobs {
+                id: Some(_),
+                remove: true,
+                cancel: false,
+                ..
+            }
+        ));
+        assert!(Cli::try_parse_from(["freellama", "jobs", "--remove"]).is_err());
+        assert!(
+            Cli::try_parse_from(["freellama", "jobs", "--id", "../other", "--remove"]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["freellama", "jobs", "--id", id, "--cancel", "--remove"]).is_err()
+        );
+    }
+
+    #[test]
+    fn telemetry_policy_parses_on_serve_and_proxy_and_rejects_typos() {
+        for command in ["serve", "proxy"] {
+            for policy in ["best-effort", "require-memory", "require-all"] {
+                Cli::try_parse_from(["freellama", command, "--resource-telemetry-policy", policy])
+                    .expect("supported telemetry policy");
+            }
+            assert!(
+                Cli::try_parse_from([
+                    "freellama",
+                    command,
+                    "--resource-telemetry-policy",
+                    "allow-all"
+                ])
+                .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_policy_reaches_the_governor_and_default_requires_memory() {
+        for (value, expected) in [
+            ("best-effort", "best_effort"),
+            ("require-memory", "require_memory"),
+            ("require-all", "require_all"),
+        ] {
+            let parsed =
+                Cli::try_parse_from(["freellama", "serve", "--resource-telemetry-policy", value])
+                    .unwrap();
+            let Command::Serve {
+                admission: args, ..
+            } = parsed.command
+            else {
+                panic!("expected serve")
+            };
+            let mut config = PlatformConfig::new(
+                "127.0.0.1:11435",
+                "http://127.0.0.1:11434",
+                None,
+                None,
+                "test",
+            );
+            configure_resource_policy(&mut config, &args).unwrap();
+            assert_eq!(
+                serde_json::to_value(
+                    config
+                        .resource_governor
+                        .snapshot()
+                        .await
+                        .policy
+                        .telemetry_policy
+                )
+                .unwrap(),
+                expected
+            );
+        }
+        // Memory telemetry is required where a collector exists; Windows has none, so its
+        // default is best-effort rather than refusing every local request.
+        let default_policy = if cfg!(any(target_os = "linux", target_os = "macos")) {
+            "require_memory"
+        } else {
+            "best_effort"
+        };
+        assert_eq!(
+            serde_json::to_value(
+                freellama::platform::resources::ResourcePolicy::default().telemetry_policy
+            )
+            .unwrap(),
+            default_policy
+        );
+    }
 }
 
 /// Ollama backend placement, grouped so device-specific routing stays an explicit serve concern.
@@ -69,6 +217,26 @@ struct BackendArgs {
     /// Model to assign to --cpu-upstream. Repeat for multiple models.
     #[arg(long, requires = "cpu_upstream")]
     cpu_model: Vec<String>,
+}
+
+/// Per-task execution controls, separate from side-effect-free routing.
+#[derive(Debug, Clone, clap::Args)]
+struct TaskExecutionArgs {
+    /// Override model residency; omitted uses the server adaptive finite TTL.
+    #[arg(long)]
+    keep_alive: Option<String>,
+    /// Return a job ID immediately; use `jobs` to inspect or cancel it.
+    #[arg(long)]
+    defer: bool,
+    /// Total deadline including discovery, waiting, loading, and inference; capped by server.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    timeout_seconds: Option<u64>,
+    /// Fair admission class; interactive tasks receive more turns without starving background work.
+    #[arg(long, value_enum, default_value_t = TaskPriority::Normal)]
+    priority: TaskPriority,
+    /// Admission/resource wait budget; capped by server.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    max_wait_seconds: Option<u64>,
 }
 
 /// Production state and network boundary for `serve`.
@@ -88,15 +256,33 @@ struct ProductionArgs {
     /// `FREELLAMA_AUTH_TOKEN_FILE`).
     #[arg(long)]
     allow_remote: bool,
+    /// Live-tunable settings (TOML), re-read when the file changes. Defaults to
+    /// `FREELLAMA_RUNTIME_CONFIG`; see `freellama.runtime.example.toml`.
+    #[arg(long)]
+    runtime_config: Option<PathBuf>,
+    /// JSON-lines usage ledger, replayed at startup for daily totals. Defaults to the platform
+    /// data directory (or `FREELLAMA_USAGE_FILE`).
+    #[arg(long)]
+    usage_file: Option<PathBuf>,
+    /// Keep usage totals in memory only.
+    #[arg(long, conflicts_with = "usage_file")]
+    ephemeral_usage: bool,
 }
 
+// Parsed once per process, so the size gap between `Serve` and the small commands costs nothing.
+// Windows' larger `PathBuf` pushes the gap past clippy's threshold there.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Inspect prerequisites and print a side-effect-free first-run plan. Never pulls a model.
     Init {
         #[arg(long, default_value = "http://127.0.0.1:11434")]
         ollama_endpoint: String,
-        #[arg(long, default_value = "http://127.0.0.1:11435")]
+        #[arg(
+            long,
+            env = "FREELLAMA_SERVE_ENDPOINT",
+            default_value = "http://127.0.0.1:11435"
+        )]
         serve_endpoint: String,
     },
     /// Generate a strong bearer token into a new mode-0600 file. Refuses to overwrite.
@@ -129,27 +315,89 @@ enum Command {
     },
     /// List installed local models with capabilities, residency, and local evidence.
     Models {
-        #[arg(long, default_value = "http://127.0.0.1:11435")]
+        #[arg(
+            long,
+            env = "FREELLAMA_SERVE_ENDPOINT",
+            default_value = "http://127.0.0.1:11435"
+        )]
         endpoint: String,
     },
-    /// Print the Mac execution profile visible to the platform.
+    /// Print the machine execution profile (CPU, memory, GPU, backends) visible to the platform.
     Machine {
-        #[arg(long, default_value = "http://127.0.0.1:11435")]
+        #[arg(
+            long,
+            env = "FREELLAMA_SERVE_ENDPOINT",
+            default_value = "http://127.0.0.1:11435"
+        )]
         endpoint: String,
+    },
+    /// Live view: admission and queues per backend, loaded models, host memory and GPU, circuit
+    /// breakers, adaptive limits, Ollama's effective settings, and today's usage.
+    Status {
+        #[arg(
+            long,
+            env = "FREELLAMA_SERVE_ENDPOINT",
+            default_value = "http://127.0.0.1:11435"
+        )]
+        endpoint: String,
+    },
+    /// Usage totals per day and per model (tasks, errors, tokens, busy and queue time).
+    Usage {
+        #[arg(
+            long,
+            env = "FREELLAMA_SERVE_ENDPOINT",
+            default_value = "http://127.0.0.1:11435"
+        )]
+        endpoint: String,
+        #[arg(long, default_value_t = 7)]
+        days: u32,
+    },
+    /// Effective runtime settings and where each came from; --reload re-reads the config file.
+    Config {
+        #[arg(
+            long,
+            env = "FREELLAMA_SERVE_ENDPOINT",
+            default_value = "http://127.0.0.1:11435"
+        )]
+        endpoint: String,
+        #[arg(long)]
+        reload: bool,
     },
     /// Create an isolated session for model affinity across related tasks.
     Session {
-        #[arg(long, default_value = "http://127.0.0.1:11435")]
+        #[arg(
+            long,
+            env = "FREELLAMA_SERVE_ENDPOINT",
+            default_value = "http://127.0.0.1:11435"
+        )]
         endpoint: String,
     },
+    /// Manage opt-in process-local conversation history.
+    Scope {
+        #[arg(
+            long,
+            global = true,
+            env = "FREELLAMA_SERVE_ENDPOINT",
+            default_value = "http://127.0.0.1:11435"
+        )]
+        endpoint: String,
+        #[command(subcommand)]
+        action: context_cli::ScopeAction,
+    },
+    /// Preload an exact installed chat model through managed resource admission.
+    Warm(context_cli::WarmArgs),
     /// Resolve a task to a local model and Ollama request profile without running it.
     Route {
-        #[arg(long, default_value = "http://127.0.0.1:11435")]
+        #[arg(
+            long,
+            env = "FREELLAMA_SERVE_ENDPOINT",
+            default_value = "http://127.0.0.1:11435"
+        )]
         endpoint: String,
         #[arg(long, value_enum, default_value_t = TaskKind::Completion)]
         task: TaskKind,
-        /// `balanced`/`quality` need a task policy; without one the router refuses. Use `fastest`
-        /// until `freellama policy-from-eval` has produced one.
+        /// `balanced` prefers task-policy candidates, falling back with low confidence.
+        /// `quality` needs a policy unless an explicit model is supplied.
         #[arg(long, value_enum, default_value_t = Objective::Balanced)]
         objective: Objective,
         #[arg(long)]
@@ -167,7 +415,7 @@ enum Command {
         /// Refuse rather than return a route graded below this ("low" or "medium"). "medium"
         /// needs both a policy file and a benchmark report; without them every route grades "low"
         /// and this refuses — which is the point.
-        #[arg(long)]
+        #[arg(long, value_parser = ["low", "medium"])]
         min_confidence: Option<String>,
         /// Extra capability the model must advertise (repeatable), e.g. `--required-capability vision`.
         #[arg(long = "required-capability")]
@@ -175,12 +423,16 @@ enum Command {
     },
     /// Recommend an installed route or a reviewed, side-effect-free model installation plan.
     Recommend {
-        #[arg(long, default_value = "http://127.0.0.1:11435")]
+        #[arg(
+            long,
+            env = "FREELLAMA_SERVE_ENDPOINT",
+            default_value = "http://127.0.0.1:11435"
+        )]
         endpoint: String,
         #[arg(long, value_enum, default_value_t = TaskKind::Completion)]
         task: TaskKind,
-        /// `balanced`/`quality` need a task policy; without one the router refuses. Use `fastest`
-        /// until `freellama policy-from-eval` has produced one.
+        /// `balanced` prefers task-policy candidates, falling back with low confidence.
+        /// `quality` needs a policy unless an explicit model is supplied.
         #[arg(long, value_enum, default_value_t = Objective::Balanced)]
         objective: Objective,
         /// Restrict installation planning to this exact model tag.
@@ -200,7 +452,11 @@ enum Command {
     NaturalRoute {
         /// Natural-language task description.
         text: String,
-        #[arg(long, default_value = "http://127.0.0.1:11435")]
+        #[arg(
+            long,
+            env = "FREELLAMA_SERVE_ENDPOINT",
+            default_value = "http://127.0.0.1:11435"
+        )]
         endpoint: String,
         #[arg(long)]
         session: Option<String>,
@@ -209,26 +465,34 @@ enum Command {
     Task {
         /// Prompt to send as a single user message.
         prompt: String,
-        #[arg(long, default_value = "http://127.0.0.1:11435")]
+        #[arg(
+            long,
+            env = "FREELLAMA_SERVE_ENDPOINT",
+            default_value = "http://127.0.0.1:11435"
+        )]
         endpoint: String,
-        #[arg(long, value_enum, default_value_t = TaskKind::Completion)]
-        task: TaskKind,
-        /// `balanced`/`quality` need a task policy; without one the router refuses. Use `fastest`
-        /// until `freellama policy-from-eval` has produced one.
-        #[arg(long, value_enum, default_value_t = Objective::Balanced)]
-        objective: Objective,
+        #[arg(long, value_enum)]
+        task: Option<TaskKind>,
+        /// `balanced` prefers task-policy candidates, falling back with low confidence.
+        /// `quality` needs a policy unless an explicit model is supplied.
+        #[arg(long, value_enum)]
+        objective: Option<Objective>,
         #[arg(long)]
         model: Option<String>,
         #[arg(long)]
         session: Option<String>,
         #[arg(long)]
         context_tokens: Option<u64>,
+        #[arg(long, requires = "scope_revision")]
+        scope_id: Option<Uuid>,
+        #[arg(long, requires = "scope_id")]
+        scope_revision: Option<u64>,
         /// Prefer an operator-configured backend. Falls back safely when it has no eligible model.
-        #[arg(long, value_enum, default_value_t = ExecutionPreference::Auto)]
-        execution_preference: ExecutionPreference,
+        #[arg(long, value_enum)]
+        execution_preference: Option<ExecutionPreference>,
         /// `observed` fails closed unless the selected resident model matches physical placement.
-        #[arg(long, value_enum, default_value_t = PlacementEvidence::Configured)]
-        min_placement_evidence: PlacementEvidence,
+        #[arg(long, value_enum)]
+        min_placement_evidence: Option<PlacementEvidence>,
         /// Attach an image (repeatable). Required for `--task vision`: without one the model is
         /// routed correctly but has nothing to look at, and says so.
         #[arg(long = "image")]
@@ -238,10 +502,28 @@ enum Command {
         #[arg(long)]
         input_file: Option<PathBuf>,
         /// Refuse rather than run a route graded below this ("low" or "medium").
-        #[arg(long)]
+        #[arg(long, value_parser = ["low", "medium"])]
         min_confidence: Option<String>,
         #[arg(long = "required-capability")]
         required_capabilities: Vec<String>,
+        #[command(flatten)]
+        execution: TaskExecutionArgs,
+    },
+    /// List deferred tasks, read one result, or cancel/remove one task by ID.
+    Jobs {
+        #[arg(
+            long,
+            env = "FREELLAMA_SERVE_ENDPOINT",
+            default_value = "http://127.0.0.1:11435"
+        )]
+        endpoint: String,
+        #[arg(long)]
+        id: Option<Uuid>,
+        #[arg(long, requires = "id", conflicts_with = "remove")]
+        cancel: bool,
+        /// Stop active work, release local permits, then remove its retained record.
+        #[arg(long, requires = "id")]
+        remove: bool,
     },
     /// Run an optional Ollama-compatible telemetry and policy sidecar.
     Proxy {
@@ -249,12 +531,16 @@ enum Command {
         listen: String,
         #[arg(long, default_value = "http://127.0.0.1:11434")]
         upstream: String,
+        /// Required local telemetry; defaults to require-memory like managed execution.
+        #[arg(long, value_enum)]
+        resource_telemetry_policy: Option<TelemetryPolicyArg>,
         /// Explicitly permit binding beyond localhost. Add authentication before using this.
         #[arg(long)]
         allow_remote: bool,
-        /// Per-attempt upstream timeout. Raise this for endpoints that legitimately run long
-        /// (e.g. `/api/pull`); the default suits chat/generate-style requests.
-        #[arg(long, default_value_t = 120)]
+        /// Longest silence allowed from Ollama, including the wait for headers while a model
+        /// loads. Not a total deadline: a stream that keeps producing bytes is never cut off.
+        /// The default matches Ollama's own 5-minute model load timeout.
+        #[arg(long, default_value_t = 300)]
         request_timeout_seconds: u64,
         /// Opt-in: on a true connection-refused failure (Ollama's process is gone, not just
         /// slow or erroring), quit and relaunch the macOS Ollama app once, then retry the
@@ -397,8 +683,23 @@ async fn main() -> Result<()> {
         Command::Machine { endpoint } => {
             print_get(&endpoint, "/_freellama/v1/machine").await?;
         }
+        Command::Scope { endpoint, action } => context_cli::run_scope(&endpoint, action).await?,
+        Command::Warm(args) => context_cli::run_warm(args).await?,
         Command::Session { endpoint } => {
             print_post(&endpoint, "/_freellama/v1/sessions", &json!({})).await?;
+        }
+        Command::Status { endpoint } => {
+            print_get(&endpoint, "/_freellama/v1/status").await?;
+        }
+        Command::Usage { endpoint, days } => {
+            print_get(&endpoint, &format!("/_freellama/v1/usage?days={days}")).await?;
+        }
+        Command::Config { endpoint, reload } => {
+            if reload {
+                print_post(&endpoint, "/_freellama/v1/config/reload", &json!({})).await?;
+            } else {
+                print_get(&endpoint, "/_freellama/v1/config").await?;
+            }
         }
         Command::Route {
             endpoint,
@@ -462,12 +763,15 @@ async fn main() -> Result<()> {
             model,
             session,
             context_tokens,
+            scope_id,
+            scope_revision,
             execution_preference,
             min_placement_evidence,
             images,
             input_file,
             min_confidence,
             required_capabilities,
+            execution,
         } => {
             request_task(
                 prompt,
@@ -477,18 +781,51 @@ async fn main() -> Result<()> {
                 model,
                 session,
                 context_tokens,
+                scope_id,
+                scope_revision,
                 execution_preference,
                 min_placement_evidence,
                 images,
                 input_file,
                 min_confidence,
                 required_capabilities,
+                execution,
             )
             .await?;
         }
+        Command::Jobs {
+            endpoint,
+            id,
+            cancel,
+            remove,
+        } => match (id, cancel, remove) {
+            (Some(id), _, true) => {
+                let response = authenticate_request(cli_client().delete(format!(
+                    "{}/_freellama/v1/jobs/{id}",
+                    endpoint.trim_end_matches('/')
+                )))?
+                .timeout(cli_task_timeout())
+                .send()
+                .await?;
+                print_response(response).await?;
+            }
+            (Some(id), true, false) => {
+                print_post(
+                    &endpoint,
+                    &format!("/_freellama/v1/jobs/{id}/cancel"),
+                    &Value::Null,
+                )
+                .await?;
+            }
+            (Some(id), false, false) => {
+                print_get(&endpoint, &format!("/_freellama/v1/jobs/{id}")).await?;
+            }
+            (None, _, _) => print_get(&endpoint, "/_freellama/v1/jobs").await?,
+        },
         Command::Proxy {
             listen,
             upstream,
+            resource_telemetry_policy,
             allow_remote,
             request_timeout_seconds,
             auto_restart_ollama,
@@ -499,6 +836,16 @@ async fn main() -> Result<()> {
                 .with_auto_restart_ollama(auto_restart_ollama);
             if let Some(max) = max_concurrent_requests {
                 config = config.with_max_concurrent_requests(max);
+            }
+            if let Some(value) = resource_telemetry_policy {
+                let policy = freellama::platform::resources::ResourcePolicy {
+                    telemetry_policy: value.into(),
+                    ..freellama::platform::resources::ResourcePolicy::default()
+                };
+                config = config.with_resource_governor(
+                    freellama::platform::resources::ResourceGovernor::new(policy)
+                        .map_err(anyhow::Error::msg)?,
+                );
             }
             serve(config).await?;
         }
@@ -606,6 +953,7 @@ async fn start_platform(args: PlatformStartArgs) -> Result<()> {
         policy_file,
         args.intent_model,
     );
+    configure_resource_policy(&mut config, &args.admission)?;
     if let Some(cpu_upstream) = args.backends.cpu_upstream {
         eprintln!(
             "freellama: assigning {} model(s) to CPU Ollama at {cpu_upstream}",
@@ -625,9 +973,19 @@ async fn start_platform(args: PlatformStartArgs) -> Result<()> {
     if let Some(seconds) = args.admission.max_queue_wait_seconds {
         config = config.with_max_queue_wait(Duration::from_secs(seconds));
     }
+    if let Some(max) = args.admission.max_queued_tasks {
+        config = config.with_max_queued_tasks(max);
+    }
+    if let Some(max) = args.admission.cpu_max_queued_tasks {
+        config = config.with_cpu_max_queued_tasks(max);
+    }
     if let Some(max) = args.admission.raw_proxy_max_concurrent_requests {
         config = config.with_raw_proxy_max_concurrent_requests(max);
     }
+    if let Some(seconds) = args.admission.raw_queue_wait_seconds {
+        config = config.with_raw_queue_wait(Duration::from_secs(seconds));
+    }
+    config = with_runtime_and_usage(config, &args.production);
     if let Some(max) = args.admission.max_sessions {
         config = config.with_max_sessions(max);
     }
@@ -664,14 +1022,75 @@ async fn start_platform(args: PlatformStartArgs) -> Result<()> {
     if args.production.allow_remote {
         config = config.with_remote_access(true);
     }
-    eprintln!(
-        "freellama: per-backend admission budgets: GPU {} units, CPU {} units (embedding 1, chat \
-         2, vision 4). These are weighted units, not literal task counts; pair same-model GPU \
-         concurrency changes with OLLAMA_NUM_PARALLEL and KV-cache validation.",
-        config.resolved_max_concurrent_tasks(),
-        config.resolved_cpu_max_concurrent_tasks()
-    );
+    report_admission_config(&config);
     serve_platform(config).await
+}
+
+fn configure_resource_policy(config: &mut PlatformConfig, args: &AdmissionArgs) -> Result<()> {
+    if args.resource_hold_available_percent.is_some()
+        || args.resource_resume_available_percent.is_some()
+        || args.resource_telemetry_policy.is_some()
+    {
+        let mut policy = freellama::platform::resources::ResourcePolicy::default();
+        if let Some(value) = args.resource_hold_available_percent {
+            policy.hold_available_percent = value;
+        }
+        if let Some(value) = args.resource_resume_available_percent {
+            policy.resume_available_percent = value;
+        }
+        if let Some(value) = args.resource_telemetry_policy {
+            policy.telemetry_policy = value.into();
+        }
+        config.resource_governor = freellama::platform::resources::ResourceGovernor::new(policy)
+            .map_err(anyhow::Error::msg)?;
+    }
+    Ok(())
+}
+
+/// The live-tunable runtime file and the usage ledger (on by default, next to the feedback file).
+fn with_runtime_and_usage(
+    mut config: PlatformConfig,
+    production: &ProductionArgs,
+) -> PlatformConfig {
+    if let Some(path) = &production.runtime_config {
+        eprintln!("freellama: watching runtime config {}", path.display());
+        config = config.with_runtime_config(path);
+    }
+    if !production.ephemeral_usage {
+        let path = production
+            .usage_file
+            .clone()
+            .or_else(|| std::env::var_os("FREELLAMA_USAGE_FILE").map(PathBuf::from))
+            .or_else(|| default_feedback_file().map(|path| path.with_file_name("usage.jsonl")));
+        if let Some(path) = path {
+            eprintln!("freellama: recording task usage at {}", path.display());
+            config = config.with_usage_file(path);
+        }
+    }
+    config
+}
+
+fn report_admission_config(config: &PlatformConfig) {
+    eprintln!(
+        "freellama: per-backend admission budgets from flags/env: GPU {} units / {} queued, CPU {} \
+         units / {} queued (embedding 1, chat 2, vision 4); a --runtime-config file sets \
+         any value no flag or env var set, and `freellama config` shows the effective values. Units are not literal task \
+         counts; pair same-model GPU concurrency changes with OLLAMA_NUM_PARALLEL and KV-cache \
+         validation.",
+        config.resolved_max_concurrent_tasks(),
+        config.resolved_max_queued_tasks(),
+        config.resolved_cpu_max_concurrent_tasks(),
+        config.resolved_cpu_max_queued_tasks()
+    );
+    eprintln!(
+        "freellama: raw passthrough cap: {} streaming request(s); managed routes remain preferred",
+        config.resolved_raw_proxy_max_concurrent_requests()
+    );
+    eprintln!(
+        "freellama: without an explicit GPU budget the default follows the Ollama server's \
+         OLLAMA_NUM_PARALLEL (2 units per parallel slot); `freellama config` shows the effective \
+         value and its source"
+    );
 }
 
 fn default_feedback_file() -> Option<PathBuf> {
@@ -739,6 +1158,16 @@ fn generate_auth_token(path: &std::path::Path) -> Result<()> {
     file.sync_all().context("sync authentication token")?;
     println!("Created authentication token file {}", path.display());
     Ok(())
+}
+
+fn initialization_status(ollama_ready: bool, serve_ready: bool, has_models: bool) -> &'static str {
+    if !ollama_ready {
+        "blocked"
+    } else if !serve_ready || !has_models {
+        "setup_required"
+    } else {
+        "ready"
+    }
 }
 
 /// Side-effect-free first-run receipt. Initialization must discover the real host and inventory
@@ -825,7 +1254,8 @@ async fn initialize(ollama_endpoint: String, serve_endpoint: String) -> Result<(
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
-            "status": if ollama_ready { "ready" } else { "blocked" },
+            "status": initialization_status(ollama_ready, serve_ready, !installed_models.is_empty()),
+            "readiness": {"ollama":ollama_ready,"managed_service":serve_ready,"installed_models":!installed_models.is_empty()},
             "ollama_endpoint": ollama_endpoint,
             "serve_endpoint": serve_endpoint,
             "diagnostics": diagnostics,
@@ -900,37 +1330,56 @@ async fn request_recommendation(endpoint: String, route: RouteInput) -> Result<(
     .await
 }
 
-/// Nine parameters because `task` mirrors the platform's own request shape one-for-one; grouping
-/// them into a struct here would add a type that exists only to satisfy a lint, and would drift
-/// from the endpoint it mirrors.
+/// Forward caller controls without resolving defaults locally; scopes own omitted routing fields.
 #[allow(clippy::too_many_arguments)]
 async fn request_task(
     prompt: String,
     endpoint: String,
-    task: TaskKind,
-    objective: Objective,
+    task: Option<TaskKind>,
+    objective: Option<Objective>,
     model: Option<String>,
     session: Option<String>,
     context_tokens: Option<u64>,
-    execution_preference: ExecutionPreference,
-    min_placement_evidence: PlacementEvidence,
+    scope_id: Option<Uuid>,
+    scope_revision: Option<u64>,
+    execution_preference: Option<ExecutionPreference>,
+    min_placement_evidence: Option<PlacementEvidence>,
     images: Vec<PathBuf>,
     input_file: Option<PathBuf>,
     min_confidence: Option<String>,
     required_capabilities: Vec<String>,
+    execution: TaskExecutionArgs,
 ) -> Result<()> {
-    let route = route_input(
-        task,
-        objective,
-        model,
-        session,
-        context_tokens,
-        execution_preference,
-        min_placement_evidence,
-        &required_capabilities,
-        min_confidence,
-    );
-    let mut body = serde_json::to_value(route)?;
+    let mut body = json!({
+        "model": model, "session_id": session, "context_tokens": context_tokens,
+        "scope_id": scope_id, "scope_revision": scope_revision,
+        "min_confidence": min_confidence,
+    });
+    if let Some(task) = task {
+        body["task"] = json!(task);
+    }
+    if let Some(objective) = objective {
+        body["objective"] = json!(objective);
+    }
+    if let Some(preference) = execution_preference {
+        body["execution_preference"] = json!(preference);
+    }
+    if let Some(evidence) = min_placement_evidence {
+        body["min_placement_evidence"] = json!(evidence);
+    }
+    if !required_capabilities.is_empty() {
+        body["required_capabilities"] = json!(required_capabilities);
+    }
+    body["keep_alive"] = json!(execution.keep_alive);
+    body["defer"] = json!(execution.defer);
+    body["timeout_seconds"] = json!(execution.timeout_seconds);
+    body["priority"] = json!(execution.priority);
+    body["max_wait_seconds"] = json!(execution.max_wait_seconds);
+
+    // Omitted flags must remain absent so scoped routing defaults can apply.
+    body.as_object_mut()
+        .expect("task object")
+        .retain(|_, value| !value.is_null());
 
     // Ollama takes images as base64 with no data-URI prefix, attached to the user message.
     // Without this the CLI could select a vision model but never hand it anything to look at —
@@ -962,7 +1411,7 @@ async fn request_task(
         return print_post(&endpoint, "/_freellama/v1/tasks", &body).await;
     }
 
-    let field = if matches!(task, TaskKind::Embedding) {
+    let field = if matches!(task, Some(TaskKind::Embedding)) {
         "input"
     } else {
         "prompt"
@@ -1177,11 +1626,13 @@ async fn print_get(endpoint: &str, path: &str) -> Result<()> {
 
 async fn print_post(endpoint: &str, path: &str, body: &Value) -> Result<()> {
     // `/tasks` and `/natural-routes` run a model; everything else is a decision.
-    let timeout = if path.ends_with("/tasks") || path.ends_with("/natural-routes") {
-        cli_task_timeout()
-    } else {
-        cli_control_timeout()
-    };
+    let timeout =
+        if path.ends_with("/tasks") || path.ends_with("/natural-routes") || path.ends_with("/warm")
+        {
+            cli_task_timeout()
+        } else {
+            cli_control_timeout()
+        };
     let request = cli_client()
         .post(format!("{}{path}", endpoint.trim_end_matches('/')))
         .timeout(timeout)
@@ -1205,8 +1656,18 @@ fn authenticate_request(request: reqwest::RequestBuilder) -> Result<reqwest::Req
 /// Hand-maintained rather than generated from the MCP server, so the CLI keeps no Node dependency.
 /// The trade-off is that adding or removing a tool means updating this table.
 fn print_tool_map() {
-    println!("FreeLlama exposes 8 MCP tools. Equivalents for a CLI-only agent:\n");
+    println!("FreeLlama exposes 11 MCP tools. Equivalents for a CLI-only agent:\n");
     let rows = [
+        (
+            "scope",
+            "freellama scope <create|get|fork|delete>",
+            "bounded process-local history, revision-safe task continuation",
+        ),
+        (
+            "warm_model",
+            "freellama warm --model <exact-tag>",
+            "managed preload with adaptive finite residency",
+        ),
         (
             "doctor",
             "freellama doctor",
@@ -1221,6 +1682,11 @@ fn print_tool_map() {
             "run_task",
             "freellama task --task <t> <prompt>",
             "route AND execute; preview:true is decision-only",
+        ),
+        (
+            "task_jobs",
+            "freellama jobs [--id <uuid>] [--cancel|--remove]",
+            "inspect, cancel, or remove process-local deferred tasks",
         ),
         (
             "run_task_batch",
@@ -1252,7 +1718,7 @@ fn print_tool_map() {
         println!("  {tool:<18} {cli:<38} {what}");
     }
     println!(
-        "\nCLI-only: init, serve, proxy, machine, session, bench-all, policy-from-eval, eval, run, \
+        "\nCLI-only: init, serve, proxy, machine, bench-all, policy-from-eval, eval, run, \
          natural-route, recommend."
     );
     println!("Orchestration guidance for either surface: skills/freellama/SKILL.md");

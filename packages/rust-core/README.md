@@ -1,7 +1,7 @@
 # `freellama-core`
 
 `freellama-core` is the embeddable Rust implementation behind the CLI and MCP server. It owns model
-discovery, deterministic routing, session affinity, admission control, managed execution,
+discovery, deterministic routing, session affinity, scope history, admission control, managed execution,
 benchmarking, recommendation planning, and policy generation.
 
 The crate is named `freellama-core`; its library is named `freellama`, so consumers import
@@ -29,6 +29,11 @@ flowchart LR
 | `napi` | Feature-gated Node.js binding and the only FFI boundary |
 | `lib` | Diagnostics, frozen-suite execution, and build comparison |
 
+Scopes retain bounded process-local transcripts with expected revisions. Warming reuses managed
+admission and placement; adaptive keep-alive remains finite unless a caller explicitly overrides it.
+See [Scope history and model warming](../../docs/SCOPES_AND_WARMING.md) for the shared HTTP, CLI,
+and MCP contract.
+
 ## Understand admission
 
 The platform combines an independent 3:2:1 priority-fair weighted admission pool and transition
@@ -39,14 +44,18 @@ costs 4 (capped to the pool size).
 - A cold model takes an exclusive lock on its assigned backend.
 - Independent CPU and GPU backends can therefore progress concurrently.
 - A task that cannot acquire its weighted permit before the queue deadline receives HTTP 503.
+- Each backend also bounds retained waiters (16 primary, 8 CPU by default); cancellation removes a
+  waiter immediately and health reports the queue/in-flight counters.
 
-The primary/GPU pool defaults to two weighted units; the optional CPU pool defaults to one. An
+The primary/GPU pool derives its default weighted budget from observed Ollama parallelism;
+the optional CPU pool defaults to one. Inspect resolved values with `config`. An
 embedding batch costs `ceil(input_items / 4)`, ordinary chat costs 2, and vision costs 4 capped to
 the pool size. Runtime
 feedback records successful resident-task work-unit latency by task and backend: decode
 nanoseconds/output token for generation and total nanoseconds/input token for embeddings. Only
 after three samples exist on each backend and one is more than 10% faster may `auto` steer; it never
-does so for quality routing, explicit models, or session-pinned routes.
+does so for quality routing, explicit models, or session-pinned routes. A historical speed winner
+must also have enough available cost units; otherwise an eligible ready backend wins.
 
 Every upstream HTTP client has a timeout. Without it, a stalled request could retain an exclusive
 transition lock and block later managed tasks.
@@ -108,6 +117,12 @@ them to role/content pairs. Their nested `request_options` supports `format`, `t
 `logprobs`, and `top_logprobs`. The route's `context_tokens` owns `num_ctx`, and backend placement
 owns `num_gpu`; callers cannot override those two keys through `options`. Raw passthrough remains the
 full-control escape hatch, including streaming.
+
+When `context_tokens` is omitted, managed text execution sizes context from the supplied prompt,
+schemas and output budget, up to 32K and the selected model's limit. Explicit context and multimodal
+profiles are preserved. `execution.context_sizing` reports the estimate. Chat uses `truncate:false`
+and `shift:false`; embeddings use `truncate:false`. Unsupported upstream versions may ignore these
+fields, so qualify overflow behavior when deploying a different Ollama version.
 
 Installed-model metadata includes a derived `model_type`: `generative`, `multimodal`,
 `embedding_only`, or `unknown`. It is a display summary only. Capability filtering and routing use

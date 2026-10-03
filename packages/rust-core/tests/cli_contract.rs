@@ -8,7 +8,14 @@ const CLI_SOURCE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../cli/src/main.r
 
 #[test]
 fn cli_tool_map_lists_every_registered_mcp_tool() {
-    let mcp = fs::read_to_string(Path::new(MCP_SOURCE)).expect("read MCP source");
+    let mcp = [
+        MCP_SOURCE,
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../mcp/src/context-tools.ts"),
+    ]
+    .iter()
+    .map(|file| fs::read_to_string(file).expect("read MCP registration source"))
+    .collect::<Vec<_>>()
+    .join("\n");
     let cli = fs::read_to_string(Path::new(CLI_SOURCE)).expect("read CLI source");
 
     let registered: Vec<String> = mcp
@@ -32,7 +39,7 @@ fn cli_tool_map_lists_every_registered_mcp_tool() {
         .find("fn print_tool_map()")
         .expect("print_tool_map() not found in the CLI source");
     let map_body = &cli[map_start..];
-    let map_body = &map_body[..map_body.find("\n}\n").map_or(map_body.len(), |end| end)];
+    let map_body = &map_body[..map_body.find("\n}\n").unwrap_or(map_body.len())];
 
     for tool in &registered {
         assert!(
@@ -64,7 +71,6 @@ fn cli_tool_map_lists_every_cli_only_command() {
         "serve",
         "proxy",
         "machine",
-        "session",
         "bench-all",
         "policy-from-eval",
         "eval",
@@ -98,11 +104,10 @@ fn cli_can_actually_exercise_the_task_kinds_it_advertises() {
         cli.contains("fn base64_encode"),
         "images must be base64-encoded before Ollama will accept them"
     );
-    assert_eq!(
-        cli.matches("execution_preference: ExecutionPreference")
-            .count(),
-        6,
-        "route, recommend, task, the route/task helpers, and route_input must preserve the backend preference; recommendation passes the typed RouteInput"
+    assert!(
+        cli.contains("execution_preference: ExecutionPreference")
+            && cli.contains("execution_preference: Option<ExecutionPreference>"),
+        "routing uses a resolved preference; task omission preserves saved scope defaults"
     );
     assert!(
         cli.contains("request_recommendation(endpoint: String, route: RouteInput)"),

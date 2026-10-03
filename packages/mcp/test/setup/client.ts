@@ -34,7 +34,7 @@ export function serveAuthHeaders(): Record<string, string> | undefined {
 
 export async function connectClient(env?: Record<string, string>): Promise<Client> {
   const transport = new StdioClientTransport({
-    command: "node",
+    command: process.execPath,
     args: [SERVER_ENTRY],
     // The SDK's implicit child environment is intentionally allowlisted and drops product-specific
     // variables. Always pass the test process environment explicitly so endpoint/config overrides
@@ -83,9 +83,12 @@ export async function startIsolatedServe(): Promise<IsolatedServe> {
       "serve",
       "--listen",
       `127.0.0.1:${address.port}`,
+      "--upstream",
+      process.env.FREELLAMA_OLLAMA_ENDPOINT ?? "http://127.0.0.1:11434",
       "--recommendation-catalog",
       "recommendations.example.toml",
       "--ephemeral-feedback",
+      "--ephemeral-usage",
     ],
     { cwd: REPO_ROOT, stdio: ["ignore", "ignore", "pipe"] },
   );

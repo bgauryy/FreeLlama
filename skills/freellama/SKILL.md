@@ -5,7 +5,7 @@ description: "Use when delegating token-heavy work to local Ollama models throug
 
 # FreeLlama
 
-Operate FreeLlama as governed local-model delegation, not as a frontier-model replacement. MCP tools: `doctor`, `models`, `run_task`, `ollama_manage`, `ollama_delete`, `delegate_research`; `npx @octocodeai/freellama tools` maps them to CLI equivalents.
+Operate FreeLlama as governed local-model delegation, not as a frontier-model replacement. MCP tools: `doctor`, `session`, `scope`, `warm_model`, `models`, `run_task`, `task_jobs`, `run_task_batch`, `ollama_manage`, `ollama_delete`, `delegate_research`; `npx @octocodeai/freellama tools` maps them to CLI equivalents.
 
 Flow: `PREREQUISITE → DIAGNOSE → DECIDE → EXECUTE → VERIFY`
 
@@ -27,7 +27,7 @@ One managed call contains one task; only the calling agent knows which tasks are
 
 1. Call `doctor`. FreeLlama does not install or replace Ollama; if Ollama is missing or unreachable, direct the operator to `https://ollama.com/download` or `ollama serve`, then stop—do not recommend or pull a model.
 2. Read `doctor.machine.memory_bytes`, then `models{view:"installed"}` and `models{view:"resident"}`. Treat `execution.backend` as configuration and `execution.observation.processor` as physical evidence. A mismatch or partial placement warning invalidates feedback. For authenticated serve, set `FREELLAMA_AUTH_TOKEN_FILE` to the same permission-restricted file used at startup.
-3. Check `/_freellama/v1/health` admission slots. Zero slots means queueing up to the configured wait, not a reservation; a 503 is load shedding, so retry or lower fan-out.
+3. Check `/_freellama/v1/health` admission slots. Zero slots means queueing up to the configured wait, not a reservation. Read structured refusal codes: queue saturation returns 429, while resource/deadline failures have their own receipts.
 
 ## Decide
 
@@ -35,10 +35,11 @@ One managed call contains one task; only the calling agent knows which tasks are
 |---|---|
 | Grounded lookup over >~1k source tokens, OCR, embeddings, bulk transforms, privacy/rate-limited work | Tiny lookups already in context, architecture/review judgment, ambiguous synthesis |
 
-Prefer deterministic search when an identifier is known; embeddings are for no-keyword similarity. Treat every measured number as one-machine evidence, not a default. Models at or below 12B were unreliable for broad research in the recorded trials.
+Prefer deterministic search when an identifier is known; embeddings are for no-keyword similarity. Treat every measured number as one-machine evidence, not a default. Use the exact model’s workload evidence; parameter count does not qualify a research result.
 
-Before offloading, map the work to `completion`, `coding`, `code_repair`, `tools`, `browser`,
-`vision`, `embedding`, or `long_context`, plus required capabilities and context. Prefer a
+Ordinary chat can omit `task` and use the `completion` default. Choose `coding`, `code_repair`,
+`tools`, `browser`, `vision`, `embedding`, or `long_context` when that routing profile fits; callers
+own prompts and system messages. Add capability/context constraints when needed. Prefer a
 qualified installed model; never infer inventory from a model family name or this skill's examples.
 
 ## Execute one flow
@@ -49,19 +50,31 @@ Call `delegate_research{question,workspacePath,model?,adapter?,executionPreferen
 
 ### B — supplied content or vision
 
-Call `run_task{task,prompt|messages,images?,model?,executionPreference?,minPlacementEvidence?,keepAlive?,minConfidence?,preview?}`. It has no file access. `preview:true` is free; `minConfidence` gates quality evidence. `minPlacementEvidence:"observed"` additionally refuses cold, mixed, or mismatched processor placement; warm once with `"configured"`, inspect the receipt, then require `"observed"`. Images are base64 without a data-URI prefix and require an explicitly trialled vision model. GLM-OCR needs a model-specific repetition guard: `options.stop:["```"]` handles fence tails; add `"\n"` only for a one-line transcription contract. Load `references/model-selection.md` before model choice.
+Preview with `run_task{preview:true,task?,model?,executionPreference?,minPlacementEvidence?,minConfidence?}` and routing constraints only. Execute separately with `prompt` or `messages`, plus applicable runtime controls. `run_task` has no file access; `minConfidence` gates quality evidence. `minPlacementEvidence:"observed"` refuses cold, mixed, or mismatched processor placement. Warm once with `"configured"`, inspect the receipt, then require `"observed"`. Images are base64 without a data-URI prefix and require an explicitly trialled vision model. Choose output limits and stop sequences from the tested output contract. Load `references/model-selection.md` before model choice.
 
 ### C — embeddings
 
 Batch `run_task{task:"embedding",input:[...]}` and leave `returnEmbeddings:false` unless code, not the orchestrator, needs vectors. Use embeddings for grouping, dedup candidates, classification, and similarity—not identifier search. `examples/local-rag.sh` is the runnable pattern.
 
-### D — choose or install a model
+For work that may wait, use `run_task{defer:true,timeoutSeconds,priority,...}` and inspect its ID with `task_jobs{action:"get",jobId}`. `timeoutSeconds` includes discovery, queueing, loading, and inference. `task_jobs{action:"cancel",jobId}` waits for local permit release; it does not prove Ollama stopped decoding. Jobs and bounded results are process-local and expire; they are not resumed after restart. Preview accepts routing fields only: omit payloads, priorities, deadlines, and `defer`, then make a separate execution call.
 
-Ask for missing workload/modality, quality, latency, context, privacy, download, disk, and memory constraints. Diagnose the host, prefer qualified installed models, then search `models{view:"library"}` by family and inspect exact pullable tags with `models{view:"detail",model}`. Present at most two evidence-backed candidates. Ask approval for one exact tag and size before `ollama_manage{action:"pull"}`; discovery never grants installation permission. Load `references/model-selection.md`, then `references/ollama-config.md` for fit.
+### D — retain history or prepare a runner
 
-### E — diagnose a failure
+Use `scope{action:"create",messages}` for bounded process-local history; `session` stores only
+model affinity. Pass `scopeId` and `scopeRevision` with new input to `run_task`, then use its
+returned revision. Fork at the expected revision before independent parallel branches. Read history
+only with `includeMessages:true`; failures and cancellations do not append. Use
+`warm_model{model,contextTokens,keepAlive?}` to load an exact installed runner profile through the
+same admission and fit checks. Explicit `keepAlive` wins over finite adaptive retention. Load
+`references/context-management.md` for scope limits and cache ownership.
 
-Run `doctor`, resident models, then `scripts/check.sh` (read-only; exit 0 means healthy). Load `references/troubleshooting.md` for symptom routing. Never treat a 503, confidence refusal, CPU spill, or proxy/serve 404 as the same failure.
+### E — choose or install a model
+
+Ask for missing workload/modality, quality, latency, context, privacy, download, disk, and memory constraints. Diagnose the host and prefer qualified installed models. Search `models{view:"library"}` for families, then inspect pullable tags with `models{view:"library",model:"FAMILY"}`. The `detail` view inspects an installed model. Present at most two evidence-backed candidates. Ask approval for one exact tag and size before `ollama_manage{action:"pull"}`; discovery never grants installation permission. Load `references/model-selection.md`, then `references/ollama-config.md` for fit.
+
+### F — diagnose a failure
+
+Run `doctor`, resident models, then `scripts/check.sh`. Exit 0 means required service checks passed; inspect warnings and resource admission before executing a task. Load `references/troubleshooting.md` for symptom routing. Never treat a 503, confidence refusal, CPU spill, or proxy/serve 404 as the same failure.
 
 ## Verify every result
 
@@ -71,7 +84,7 @@ Run `doctor`, resident models, then `scripts/check.sh` (read-only; exit 0 means 
 | `verify` | unmeasured/weak model, judgment-shaped task, or outside the measured call envelope | independent frontier-tier check |
 | `escalate` | unusable model or zero successful calls | discard the answer |
 
-Keep `pinnedOverflow:"error"`; clipping the system prompt/question requires explicit human acceptance. Accept adaptive placement feedback only when `execution.observation.status:"verified"`; for `keepAlive:"0"`, also inspect the observe-then-unload `execution.lifecycle`. Persist model-specific token calibration and bounded placement feedback; use ephemeral modes only for disposable tests. An assigned CPU backend can still execute an MLX model fully on GPU. Never co-resident two large models without memory arithmetic. Never delete `~/.ollama/models` files directly; `ollama_delete` needs exact-tag approval in the current conversation. Operators own endpoints, CPU tag assignments, Ollama settings, pulls, stops, and deletes.
+Keep `FREELLAMA_AGENT_PINNED_OVERFLOW=error`; clipping the system prompt/question requires explicit human acceptance. Accept adaptive placement feedback only when `execution.observation.status:"verified"`; for `keepAlive:"0"`, also inspect the observe-then-unload `execution.lifecycle`. Persist model-specific token calibration and bounded placement feedback; use ephemeral modes only for disposable tests. An assigned CPU backend can still execute an MLX model fully on GPU. Never co-resident two large models without memory arithmetic. Never delete `~/.ollama/models` files directly; `ollama_delete` needs exact-tag approval in the current conversation. Operators own endpoints, CPU tag assignments, Ollama settings, pulls, stops, and deletes.
 
 ## Routes and deterministic helpers
 

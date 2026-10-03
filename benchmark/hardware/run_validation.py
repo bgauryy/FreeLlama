@@ -6,7 +6,9 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import math
 import platform
+import statistics
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -33,6 +35,32 @@ def timed_call(url: str, body: dict[str, Any], token: str | None) -> dict[str, A
     return {"wall_seconds": round(time.monotonic() - started, 6), "payload": payload}
 
 
+def measure_pair(url: str, gpu: dict[str, Any], cpu: dict[str, Any], token: str | None,
+                 parallel: bool) -> dict[str, Any]:
+    started = time.monotonic()
+    if parallel:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            gpu_future = executor.submit(timed_call, url, gpu, token)
+            cpu_future = executor.submit(timed_call, url, cpu, token)
+            cases = {"gpu_coding": gpu_future.result(), "cpu_embedding": cpu_future.result()}
+    else:
+        cases = {"gpu_coding": timed_call(url, gpu, token),
+                 "cpu_embedding": timed_call(url, cpu, token)}
+    return {"wall_seconds": round(time.monotonic() - started, 6), "cases": cases}
+
+
+def valid_embeddings(value: Any) -> bool:
+    if not isinstance(value, list) or len(value) != 2:
+        return False
+    dimension = len(value[0]) if isinstance(value[0], list) else 0
+    return dimension > 0 and all(
+        isinstance(vector, list) and len(vector) == dimension and all(
+            type(number) in (int, float) and (type(number) is int or math.isfinite(number))
+            for number in vector
+        ) for vector in value
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--endpoint", default="http://127.0.0.1:11435")
@@ -44,7 +72,13 @@ def main() -> int:
     parser.add_argument("--vision-stop", action="append", default=[])
     parser.add_argument("--auth-token-file", type=Path)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--trials", type=int, default=3)
+    parser.add_argument("--minimum-speedup", type=float, default=1.05)
     args = parser.parse_args()
+    if args.trials < 3:
+        parser.error("--trials must be at least 3 for repeated hardware qualification")
+    if not math.isfinite(args.minimum_speedup) or args.minimum_speedup <= 1:
+        parser.error("--minimum-speedup must be finite and greater than 1")
     token = args.auth_token_file.read_text(encoding="utf-8").strip() if args.auth_token_file else None
     root = args.endpoint.rstrip("/")
     health = call(f"{root}/_freellama/v1/health", None, token)
@@ -69,15 +103,21 @@ def main() -> int:
         "execution_preference": "prefer_cpu",
         "keep_alive": "5m",
     }
-    started = time.monotonic()
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        gpu_future = executor.submit(timed_call, tasks_url, gpu, token)
-        cpu_future = executor.submit(timed_call, tasks_url, cpu, token)
-        gpu_result = gpu_future.result()
-        cpu_result = cpu_future.result()
-    parallel_wall = round(time.monotonic() - started, 6)
-
-    cases = {"gpu_coding": gpu_result, "cpu_embedding": cpu_result}
+    # Populate compatible runners and prefix caches before timing. Interleave pair order to
+    # reduce a systematic warm-up/order advantage; both modes send identical task bodies.
+    warmup = {"gpu_coding": timed_call(tasks_url, gpu, token),
+              "cpu_embedding": timed_call(tasks_url, cpu, token)}
+    trials = []
+    for index in range(args.trials):
+        order = ["sequential", "parallel"] if index % 2 == 0 else ["parallel", "sequential"]
+        trial: dict[str, Any] = {"order": order}
+        for mode in order:
+            trial[mode] = measure_pair(tasks_url, gpu, cpu, token, mode == "parallel")
+        trials.append(trial)
+    sequential_median = statistics.median(trial["sequential"]["wall_seconds"] for trial in trials)
+    parallel_wall = statistics.median(trial["parallel"]["wall_seconds"] for trial in trials)
+    speedup = sequential_median / parallel_wall if parallel_wall > 0 else 0.0
+    cases = dict(trials[-1]["parallel"]["cases"])
     if args.vision_model or args.vision_image:
         if not (args.vision_model and args.vision_image):
             parser.error("--vision-model and --vision-image must be provided together")
@@ -109,19 +149,24 @@ def main() -> int:
     if not health.get("feedback", {}).get("persistence", {}).get("enabled"):
         failures.append("health: persistent feedback is not enabled")
     expectations = {"gpu_coding": "gpu", "cpu_embedding": "cpu", "gpu_vision": "gpu"}
-    for name, result in cases.items():
-        observation = result["payload"].get("execution", {}).get("observation", {})
-        expected = expectations[name]
-        if observation.get("status") != "verified" or observation.get("processor") != expected:
-            failures.append(f"{name}: expected verified {expected}, got {observation}")
-        if result["payload"].get("admission", {}).get("queue_wait_ms") is None:
-            failures.append(f"{name}: missing admission receipt")
-    gpu_message = gpu_result["payload"].get("response", {}).get("message", {}).get("content", "")
-    if "HARDWARE_GPU_OK" not in gpu_message:
-        failures.append(f"gpu_coding: unexpected response {gpu_message!r}")
-    embeddings = cpu_result["payload"].get("response", {}).get("embeddings")
-    if not isinstance(embeddings, list) or len(embeddings) != 2:
-        failures.append("cpu_embedding: expected two embedding vectors")
+    checked = [("warmup", warmup)]
+    checked.extend((f"trial{index + 1}/{mode}", trial[mode]["cases"])
+                   for index, trial in enumerate(trials) for mode in ("sequential", "parallel"))
+    checked.append(("final", cases))
+    for label, results in checked:
+        for name, result in results.items():
+            observation = result["payload"].get("execution", {}).get("observation", {})
+            expected = expectations[name]
+            if observation.get("status") != "verified" or observation.get("processor") != expected:
+                failures.append(f"{label}/{name}: expected verified {expected}, got {observation}")
+            if result["payload"].get("admission", {}).get("queue_wait_ms") is None:
+                failures.append(f"{label}/{name}: missing admission receipt")
+        gpu_message = results["gpu_coding"]["payload"].get("response", {}).get("message", {}).get("content", "")
+        if gpu_message.strip() != "HARDWARE_GPU_OK":
+            failures.append(f"{label}/gpu_coding: unexpected response {gpu_message!r}")
+        embeddings = results["cpu_embedding"]["payload"].get("response", {}).get("embeddings")
+        if not valid_embeddings(embeddings):
+            failures.append(f"{label}/cpu_embedding: expected two nonempty finite numeric vectors of equal dimension")
     if "gpu_vision" in cases:
         vision_text = cases["gpu_vision"]["payload"].get("response", {}).get("message", {}).get("content", "")
         if not vision_text.strip():
@@ -131,8 +176,8 @@ def main() -> int:
             expected = " ".join(args.vision_expected_text.split())
             if normalized != expected:
                 failures.append(f"gpu_vision: expected {expected!r}, got {normalized!r}")
-    if parallel_wall >= gpu_result["wall_seconds"] + cpu_result["wall_seconds"]:
-        failures.append("parallel CPU/GPU wall time did not beat the sum of isolated request durations")
+    if speedup < args.minimum_speedup:
+        failures.append(f"measured CPU/GPU speedup {speedup:.3f} below {args.minimum_speedup:.3f}")
 
     report = {
         "schema_version": 1,
@@ -145,6 +190,18 @@ def main() -> int:
         "endpoint": root,
         "health": health,
         "parallel_wall_seconds": parallel_wall,
+        "performance": {
+            "primary_kpi": "successful_task_requests_per_minute",
+            "sequential_median_seconds": sequential_median,
+            "parallel_median_seconds": parallel_wall,
+            "speedup": speedup,
+            "minimum_speedup": args.minimum_speedup,
+            "parallel_requests_per_minute": 120 / parallel_wall if parallel_wall > 0 and not failures else None,
+            "measured_hardware_utilization": "unknown",
+            "warmup": warmup,
+            "trials": trials,
+            "note": "Separate matched sequential and parallel wall clocks; residency is not a device utilization measurement.",
+        },
         "cases": cases,
         "vision_expected_text": args.vision_expected_text,
         "failures": failures,

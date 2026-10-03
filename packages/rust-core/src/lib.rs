@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-const OLLAMA_CONFIG_SETTING_NAMES: [&str; 21] = [
+pub(crate) const OLLAMA_CONFIG_SETTING_NAMES: [&str; 21] = [
     "OLLAMA_DEBUG",
     "OLLAMA_HOST",
     "OLLAMA_CONTEXT_LENGTH",
@@ -589,16 +589,17 @@ fn ollama_environment_getenv(name: &str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
-        .or_else(|| {
-            #[cfg(target_os = "macos")]
-            {
-                launchctl_getenv(name)
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                None
-            }
-        })
+        .or_else(|| service_manager_getenv(name))
+}
+
+#[cfg(target_os = "macos")]
+fn service_manager_getenv(name: &str) -> Option<String> {
+    launchctl_getenv(name)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn service_manager_getenv(_name: &str) -> Option<String> {
+    None
 }
 
 fn ollama_environment_source() -> &'static str {
@@ -652,10 +653,10 @@ fn local_ollama_process_environment(endpoint: &str) -> Value {
 
     #[cfg(not(target_os = "macos"))]
     {
-        return json!({
+        json!({
             "status": "unsupported_platform",
             "reason": "same-user Ollama process inspection is currently implemented only for macOS",
-        });
+        })
     }
 
     #[cfg(target_os = "macos")]
@@ -778,12 +779,21 @@ fn ollama_cli_output(executable: &Path) -> std::io::Result<(String, String)> {
 /// the failure this exists to prevent.
 #[must_use]
 pub fn timeout_from_env(name: &str, fallback: u64) -> Duration {
+    timeout_from_value(std::env::var(name).ok().as_deref(), fallback)
+}
+
+fn timeout_from_value(raw: Option<&str>, fallback: u64) -> Duration {
+    let representable = |seconds: &u64| {
+        *seconds > 0
+            && std::time::Instant::now()
+                .checked_add(Duration::from_secs(*seconds))
+                .is_some()
+    };
     Duration::from_secs(
-        std::env::var(name)
-            .ok()
-            .and_then(|raw| raw.parse::<u64>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(fallback),
+        raw.and_then(|raw| raw.parse::<u64>().ok())
+            .filter(representable)
+            .or_else(|| Some(fallback).filter(representable))
+            .unwrap_or(DEFAULT_TASK_TIMEOUT_SECS),
     )
 }
 
@@ -828,8 +838,8 @@ where
         },
         "OLLAMA_CONTEXT_LENGTH": {
             "value": getenv("OLLAMA_CONTEXT_LENGTH"),
-            "effective_default": "4096 tokens (Ollama 0.33.x FAQ; override with OLLAMA_CONTEXT_LENGTH)",
-            "note": "The single largest memory lever. FreeLlama's own routing always sends an explicit num_ctx, so tasks routed through `serve` are unaffected — but anything talking to Ollama directly inherits this default.",
+            "effective_default": "documentation drift: current context docs use VRAM-tiered 4k/32k/256k; FAQ still says 4096",
+            "note": "The single largest memory lever. FreeLlama's managed routing sends an explicit num_ctx. For direct Ollama work, do not infer a tier from host RAM: inspect the loaded runner's context_length through /api/ps.",
         },
         "OLLAMA_KV_CACHE_TYPE": {
             "value": getenv("OLLAMA_KV_CACHE_TYPE"),
@@ -1068,7 +1078,7 @@ pub fn local_conservative_config_posture(config: &Value, observed_process: &Valu
             "OLLAMA_MAX_LOADED_MODELS": rule("OLLAMA_MAX_LOADED_MODELS", "1", max_loaded_status, "Start with one resident model per process; raise only after measured concurrent-fit validation."),
             "OLLAMA_NUM_PARALLEL": rule("OLLAMA_NUM_PARALLEL", "1", parallel_status, "Raise only after validating the multiplied context/KV memory and tail latency."),
             "OLLAMA_MAX_QUEUE": rule("OLLAMA_MAX_QUEUE", "1-16", queue_status, "Keep Ollama's internal backlog finite; FreeLlama admission is a separate queue."),
-            "OLLAMA_CONTEXT_LENGTH": rule("OLLAMA_CONTEXT_LENGTH", "unset (Ollama default 4096)", context_status, "Use per-request num_ctx for managed work; qualify any global override."),
+            "OLLAMA_CONTEXT_LENGTH": rule("OLLAMA_CONTEXT_LENGTH", "unset; observe the VRAM-tiered runtime default with /api/ps", context_status, "Use per-request num_ctx for managed work; current upstream pages disagree on a fixed default, so qualify any global override and inspect the loaded runner."),
             "OLLAMA_FLASH_ATTENTION": rule("OLLAMA_FLASH_ATTENTION", "auto", flash_status, "Ollama enables it automatically on supported backends; forcing it is not a performance claim."),
             "OLLAMA_KV_CACHE_TYPE": rule("OLLAMA_KV_CACHE_TYPE", "f16", kv_status, "q8_0/q4_0 are process-wide quality-versus-memory choices and require workload qualification."),
         },
@@ -1084,18 +1094,29 @@ pub fn local_conservative_config_posture(config: &Value, observed_process: &Valu
 /// Reduce macOS `pmset -g therm` output to a narrow, non-sensitive thermal status.
 #[must_use]
 pub fn parse_macos_thermal_status(output: &str) -> Value {
-    if output.contains("No thermal warning level has been recorded") {
-        return json!({ "status": "normal" });
+    let recorded_level = output.lines().find_map(|line| {
+        let (key, value) = line.rsplit_once([':', '='])?;
+        let key = key.trim().to_ascii_lowercase();
+        matches!(
+            key.as_str(),
+            "thermal warning level" | "note: thermal warning level"
+        )
+        .then(|| value.trim().parse::<u32>().ok())
+        .flatten()
+    });
+    if let Some(level) = recorded_level {
+        return if level == 0 {
+            json!({ "status": "normal" })
+        } else {
+            json!({ "status": "warning", "level": level.to_string() })
+        };
     }
-    if let Some(level) = output
-        .lines()
-        .find(|line| line.to_ascii_lowercase().contains("thermal warning level"))
-        .and_then(|line| line.rsplit_once(':').map(|(_, value)| value.trim()))
-        .filter(|level| !level.is_empty())
-    {
-        return json!({ "status": "warning", "level": level });
-    }
-    json!({ "status": "unknown" })
+    let reason = if output.contains("No thermal warning level has been recorded") {
+        "thermal_warning_not_recorded"
+    } else {
+        "thermal_warning_unavailable_or_invalid"
+    };
+    json!({ "status": "unknown", "reason": reason })
 }
 
 fn host_runtime_signals() -> Value {
@@ -1127,6 +1148,8 @@ fn host_runtime_signals() -> Value {
         })
     }
 }
+
+const DOCTOR_LOCAL_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Query the diagnostic endpoints required by the harness.
 ///
@@ -1164,17 +1187,34 @@ pub async fn doctor(endpoint: &str) -> Result<Value> {
     let server_version = version
         .get("version")
         .and_then(Value::as_str)
-        .context("Ollama version response has no version")?;
-    let cli = find_path_command("ollama").and_then(|invoked_path| {
-        let resolved_path = invoked_path.canonicalize().ok();
-        let (stdout, stderr) = ollama_cli_output(&invoked_path).ok()?;
-        let mut diagnostic = parse_ollama_cli_version(server_version, &stdout, &stderr);
-        diagnostic.invoked_path = Some(invoked_path.display().to_string());
-        diagnostic.resolved_path = resolved_path.map(|path| path.display().to_string());
-        Some(diagnostic)
-    });
+        .context("Ollama version response has no version")?
+        .to_owned();
+    // `ollama --version`, `ps` and `launchctl` are synchronous subprocesses. Run them off the
+    // async runtime and bound them: a wedged CLI must not hang the tool meant for diagnosing hangs.
+    let local = {
+        let (server_version, endpoint) = (server_version.clone(), endpoint.to_owned());
+        tokio::task::spawn_blocking(move || {
+            let cli = find_path_command("ollama").and_then(|invoked_path| {
+                let resolved_path = invoked_path.canonicalize().ok();
+                let (stdout, stderr) = ollama_cli_output(&invoked_path).ok()?;
+                let mut diagnostic = parse_ollama_cli_version(&server_version, &stdout, &stderr);
+                diagnostic.invoked_path = Some(invoked_path.display().to_string());
+                diagnostic.resolved_path = resolved_path.map(|path| path.display().to_string());
+                Some(diagnostic)
+            });
+            (cli, local_ollama_process_environment(&endpoint))
+        })
+    };
+    let (cli, observed_process_environment) =
+        match tokio::time::timeout(DOCTOR_LOCAL_PROBE_TIMEOUT, local).await {
+            Ok(Ok(result)) => result,
+            _ => (
+                None,
+                json!({"status": "unavailable", "reason": "local process probes timed out"}),
+            ),
+        };
+    let server_version = server_version.as_str();
     let categorized_config = ollama_config_diagnostics(server_version, ollama_environment_getenv);
-    let observed_process_environment = local_ollama_process_environment(endpoint);
     let local_conservative_posture =
         local_conservative_config_posture(&categorized_config, &observed_process_environment);
     let env_config = categorized_config["categories"]["memory_scheduler"].clone();
@@ -1458,4 +1498,27 @@ pub fn validate_endpoints(baseline: &str, candidate: &str) -> Result<()> {
         bail!("baseline and candidate must be isolated Ollama servers on different endpoints");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod timeout_value_tests {
+    use super::*;
+
+    #[test]
+    fn deadlines_reject_unrepresentable_durations_without_panicking() {
+        assert_eq!(
+            timeout_from_value(Some("18446744073709551615"), 30),
+            Duration::from_secs(30)
+        );
+        assert_eq!(timeout_from_value(Some("0"), 30), Duration::from_secs(30));
+        assert_eq!(
+            timeout_from_value(Some("invalid"), 30),
+            Duration::from_secs(30)
+        );
+        assert_eq!(timeout_from_value(Some("10"), 30), Duration::from_secs(10));
+        assert_eq!(
+            timeout_from_value(None, u64::MAX),
+            Duration::from_secs(DEFAULT_TASK_TIMEOUT_SECS)
+        );
+    }
 }

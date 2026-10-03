@@ -1,10 +1,13 @@
 # `freellama` CLI package
 
-This package is prepared to publish the `freellama` command through npm. Version 0.1.0 is not
-published to a registry. In a checkout after `yarn install`, `npx` resolves the workspace package;
-otherwise, use the release binary built at `target/release/freellama`. The JavaScript launcher
-locates the compiled Rust binary and hands the current process to it. Routing and execution logic
-remain in [`freellama-core`](../rust-core/README.md).
+Meet the agentic tool:
+
+![A cartoon llama with a full halo and small wings holds a glowing wrench beneath an open golden gate.](assets/logo.jpg)
+
+This package provides the `freellama` command through npm. Its JavaScript launcher locates the
+compiled Rust CLI in the matching optional native package and forwards arguments, signals, and exit
+status. In a source checkout, it uses `target/release/freellama` after a build. Routing and execution
+logic remain in [`freellama-core`](../rust-core/README.md).
 
 ```mermaid
 flowchart LR
@@ -40,7 +43,9 @@ npx @octocodeai/freellama task --task completion --objective fastest "Reply with
 ```
 
 Read the repository [CLI reference](../../docs/CLI.md) for the complete command map, task kinds, routing
-confidence, policy generation, and admission controls.
+confidence, policy generation, and admission controls. Use the
+[Scope history and model warming reference](../../docs/SCOPES_AND_WARMING.md) for `scope`, `warm`,
+and the scoped task flags.
 
 ## Run separate CPU and GPU backends
 
@@ -57,17 +62,20 @@ Managed tasks for assigned models use the CPU backend; other managed models and 
 passthrough use the primary backend. See [CPU and GPU model routing](../../docs/CPU_GPU_ROUTING.md)
 for the process setup, verification steps, and measured concurrency result.
 
-The primary admission pool defaults to two weighted units and the independent CPU pool to one.
-These are conservative work-cost limits, not values derived from the development machine. Override
+The primary admission pool derives its default weighted budget from observed Ollama parallelism;
+the independent CPU pool defaults to one unit. Inspect the effective values with `config`. Override
 them with `--max-concurrent-tasks` and `--cpu-max-concurrent-tasks`. `route`, `recommend`, and
 `task` also accept `--execution-preference auto|prefer-cpu|prefer-gpu`; this only chooses among
 models already eligible on the requested backend and reports any fallback in the execution receipt.
 `--min-placement-evidence observed` fails closed unless resident `/api/ps` evidence matches; use
 the default `configured` for the first bounded warm-up.
 
-The health endpoint advertises the backend, guarded-preference, and three-sample runtime-feedback
-contracts plus per-backend admission capacity. Treat a missing contract as a stale running binary,
-then rebuild and restart before testing placement.
+The health endpoint advertises backend, guarded-preference, runtime-feedback, and versioned feedback
+persistence contracts, plus per-backend admission capacity. Comparable speed samples require matching
+model digest, observed context, controls, process settings, and serial admission identity. A successful
+parallel request can report verified placement without qualifying a speed sample. See
+[feedback and adaptive profiles](../../docs/MONITORING.md#adaptive-concurrency) for sample eligibility.
+Treat a missing contract as a stale running binary, then rebuild and restart before testing placement.
 
 Authentication covers both control routes and raw Ollama passthrough. A nonloopback listener also
 requires `--allow-remote`; terminate TLS and add tenant authorization outside FreeLlama. The CLI
@@ -84,6 +92,7 @@ From the repository root:
 ```bash
 yarn install
 yarn build
+node packages/cli/bin/freellama.js --help
 ```
 
 `yarn build` compiles the host Rust release binary. In a checkout, the launcher uses
@@ -112,7 +121,7 @@ npx @octocodeai/freellama tools
 ```
 
 The output is contract-tested against the MCP server source. `delegate_research` and the online
-model-library view are MCP-only. Control-plane startup, proxy startup, sessions, recommendation,
+model-library view are MCP-only. Control-plane startup, proxy startup, recommendation,
 benchmarks, policy generation, and frozen-suite comparison are CLI-only.
 
 Use the surfaces together: the CLI starts and verifies the local services; MCP lets an agent inspect

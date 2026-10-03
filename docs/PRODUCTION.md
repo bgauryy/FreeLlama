@@ -28,7 +28,15 @@ published tag:
 powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Version VERSION
 ```
 
-There is no repository-hosted release automation. Build and test every claimed target in a clean
+The [release workflow](../.github/workflows/release.yml) builds CLI and native artifacts for eight
+targets, assembles packages, verifies package contents, and publishes on version tags. The
+[CI workflow](../.github/workflows/ci.yml) runs Rust checks on macOS, Linux, and Windows, plus
+JavaScript/native checks on macOS and Linux. These workflows do not prove driver compatibility or
+complete the hardware promotion checklist below. Release artifact builds depend on the reusable CI checks.
+The publish step also verifies that a version tag matches the workspace version.
+Live E2E and hardware qualification remain separate operator checks; verify those receipts before tagging.
+
+For manual assembly, build and test every claimed target in a clean
 environment, place each executable and matching addon under `release-artifacts/<target>/`, run
 `yarn release:assemble release-artifacts release` and `yarn release:verify:publish`, then attach
 `release/SHA256SUMS` and binaries to the release. Publish the eight `@octocodeai/freellama-native-*` packages
@@ -52,9 +60,13 @@ swap, eviction churn, or unacceptable queueing.
 | `OLLAMA_MAX_QUEUE` | Workload-specific, bounded value | Limits Ollama's internal queue independently of FreeLlama admission |
 
 Do not set a global `OLLAMA_CONTEXT_LENGTH` merely to maximize the advertised window. Managed
-FreeLlama tasks send the smallest sufficient request-specific `num_ctx`; a larger context and a
-larger `OLLAMA_NUM_PARALLEL` multiply K/V-cache memory. Direct Ollama clients still follow the
-server's context configuration, which defaults to 4096 tokens in current Ollama.
+FreeLlama text tasks estimate a sufficient context and can omit `num_ctx` when Ollama's known default
+covers the request within the configured automatic bound. Explicit context requests send `num_ctx`.
+A larger context and a larger `OLLAMA_NUM_PARALLEL` multiply K/V-cache memory. See
+[context sizing](MONITORING.md#context-sizing-and-ollamas-defaults) for defaults and receipts.
+Direct Ollama clients still follow the
+server's context configuration. Current context documentation describes VRAM-tiered 4k/32k/256k
+defaults while the FAQ still says 4096, so treat `/api/ps` `context_length` after load as authority.
 
 `freellama doctor` returns `local_conservative_config_posture` as a **non-mutating** portable
 starting profile. It names the source of each value (`observed_process` or `configuration_hint`),
@@ -63,11 +75,13 @@ parallel stream, and a finite internal queue before benchmarking. It also report
 `host_runtime_signals` with source and permission scope. Treat unavailable GPU-memory, thermal, or
 power signals as unavailable; do not substitute host RAM or a guessed value.
 
-FreeLlama and Ollama have separate queues. FreeLlama acquires a weighted backend permit and waits
-for at most `--max-queue-wait-seconds`. An admitted request can then enter Ollama's internal queue,
-which is bounded by `OLLAMA_MAX_QUEUE`. Raw compatibility traffic bypasses FreeLlama admission and
-enters the primary Ollama queue directly. Set both limits from observed latency and overload
-behavior; changing one does not configure the other.
+FreeLlama and Ollama have separate queues. FreeLlama caps retained managed waiters per backend with
+`--max-queued-tasks`/`--cpu-max-queued-tasks`, then waits for at most
+`--max-queue-wait-seconds`. An admitted request can then enter Ollama's internal queue,
+which is bounded by `OLLAMA_MAX_QUEUE`. Raw compatibility traffic bypasses weighted managed
+admission and enters the primary Ollama queue through a separate one-stream default cap in `serve`.
+Set all limits from observed latency and overload behavior; changing one does not configure the
+others.
 
 The following flow shows where each production setting applies:
 
@@ -76,20 +90,22 @@ flowchart LR
     C["Client"] --> FQ["FreeLlama admission<br/>weighted budget + wait deadline"]
     FQ -->|"refused"| E503["503 server busy"]
     FQ -->|"admitted"| OQ["Ollama queue<br/>OLLAMA_MAX_QUEUE"]
-    RAW["Raw /api/* or /v1/*"] --> OQ
+    RAW["Raw /api/* or /v1/*"] --> RC["Raw stream cap<br/>default 1 in serve"]
+    RC -->|"refused"| E503
+    RC -->|"admitted until EOF/drop"| OQ
     OQ --> S["Ollama scheduler<br/>loaded models + parallel streams"]
     S --> M["Runner memory<br/>num_ctx x K/V cache"]
 ```
 
 These values are conservative starting points, not universal constants. NVIDIA, AMD, Apple, and
 CPU-only hosts must pass hardware validation before promotion. See
-[Ollama and FreeLlama optimization](OLLAMA_SYSTEM_OPTIMIZATION.md) for the ownership boundary and
+[Ollama and FreeLlama optimization](dev/OLLAMA_SYSTEM_OPTIMIZATION.md) for the ownership boundary and
 [Run models on CPU and GPU](CPU_GPU_ROUTING.md) for device-specific controls.
 
 Put the values in the service manager that owns each Ollama process: launchd on macOS, systemd or
 the container definition on Linux, and the Windows service wrapper. Shell exports and
 `launchctl setenv` are useful diagnostics but are login-session state, not a reboot-persistent
-production configuration. After a real service restart, rerun `doctor` and `scripts/check.sh` and
+production configuration. After a real service restart, rerun `doctor` and `skills/freellama/scripts/check.sh` and
 require the same visible values before admitting work.
 
 ## Create the security and state files
@@ -122,6 +138,18 @@ Only physically verified warm samples are saved. A corrupt or unsupported snapsh
 fail instead of silently discarding routing evidence. Use `--ephemeral-feedback` only for
 disposable tests.
 
+## Bound conversation history and residency
+
+Scope histories and deferred jobs are process-local and are discarded on restart. Configure
+`[scopes]` and `[warming]` limits in the runtime file from measured workload needs; finite history
+bounds and automatic retention remain separate from host-memory reserves. Warm loads use the same
+admission and placement checks as tasks. See [Scope history and model warming](SCOPES_AND_WARMING.md)
+for expected revisions, forks, explicit history reads, and residency precedence.
+
+Usage persistence is asynchronous best effort. Inspect pending, dropped, failed, and error evidence
+in `status.usage_ledger`; task success does not prove its usage record reached disk. See
+[Usage recording](MONITORING.md#record-usage) for replay, rotation, and shutdown boundaries.
+
 ## Configure MCP
 
 Set these values in the MCP host environment:
@@ -143,7 +171,7 @@ direct Ollama requests, and managed FreeLlama tasks send their own `num_ctx`.
 
 ## Verify lifecycle and placement
 
-`keep_alive:0` no longer sacrifices placement evidence. FreeLlama temporarily holds the runner,
+`keep_alive:0` preserves placement evidence. FreeLlama temporarily holds the runner,
 observes `/api/ps`, records eligible feedback, explicitly unloads it, and verifies that it is no
 longer resident before returning. Inspect both `execution.observation` and
 `execution.lifecycle.status`.
@@ -188,7 +216,7 @@ Promote a release only when all conditions pass:
 6. Restart testing proves feedback reloads and a corrupt snapshot fails startup.
 7. Immediate unload reports verified pre-unload placement and verified post-unload absence.
 8. Every claimed hardware row has a real archived acceptance receipt.
-9. The MCP schema remains eight tools and within its context budget.
+9. The MCP schemas match the published tool surface and pass its context-budget contract.
 
 Rollback by returning the listener to loopback, stopping the new service, and starting the prior
 checksummed binary with the same policy and feedback snapshot. Never downgrade across an unsupported

@@ -68,8 +68,8 @@ files by pattern, code search, semantic content retrieval, and LSP-based queries
 
 **Decoding/runtime config:** defaults are `temperature=0`, `seed=42`, `num_predict=512`,
 `tool_timeout_seconds=45`, `max_turns=10` (`delegate_research` sets 8), and `num_ctx=8192`.
-All operational values are validated environment settings; use the `delegate_research.agent`
-object for per-call overrides. See **Adapter configuration schema** below. Safety confinement and
+All operational values are validated environment settings; the `delegate_research.agent`
+object overrides the per-call budget (turns, context, output, decoding, timeouts). See **Adapter configuration schema** below. Safety confinement and
 the JSON-only action contract are invariants, not configuration knobs.
 
 **Use when:** You need an agent to answer code-research questions efficiently, with access to
@@ -93,10 +93,22 @@ awk, etc). No specialized tools; must solve problems using only what the shell p
 
 **Location:** `benchmark/local/scripts/bash_agent.py`
 
-**Command restrictions:**
-- ✅ Allowed: ls, find, grep, cat, head, tail, awk, sed, sort, uniq, wc, file, locate, etc.
-- ❌ Blocked (regex denylist in the script): `sudo`, `rm -rf /`, `curl`, `wget`, `nc`, `ssh`, fork
-  bombs, device-file redirects.
+**Command restrictions** (`benchmark/local/scripts/shell_sandbox.py`): the adapter runs against the
+caller's real workspace under `delegate_research`, so commands are confined in layers, not by a
+denylist (the old regex denylist let `echo x > file`, `git checkout -- .` and `$(...)` path tricks
+through):
+- ✅ Allowed: an allowlist of read-only tools (ls, find, grep, rg, cat, head, tail, wc, sort, uniq,
+  cut, tr, bounded read-only sed ranges/substitutions, jq, diff, xargs with output-only targets,
+  tree, read-only git subcommands), joined by
+  pipes, `&&` or `;`.
+- ❌ Refused: any other program (no awk, python, curl, rm), writing/executing flags
+  (`find -delete/-exec`, `sort -o`, `rg --pre`, `git -c`), output redirection, `$(...)`, backticks,
+  `$VAR`/`${...}`, loops and subshells, sed script files, filesystem-reading xargs targets,
+  recursive symlink-follow options, and paths or symlinks outside the workspace.
+- Execution: `bash --restricted` with `PATH` holding only the allowlisted tools, a scrubbed
+  environment (`HOME` = workspace), and an OS sandbox when the host allows one (`bwrap` on Linux,
+  `sandbox-exec` on macOS; recorded as `model_metadata.sandbox`). `FREELLAMA_AGENT_OS_SANDBOX=off`
+  disables only the OS layer.
 
 **Decoding/runtime config (same schema as above):** the Bash tool timeout defaults to 30 seconds;
 every other default matches Octocode. Override `FREELLAMA_AGENT_TOOL_TIMEOUT_SECONDS` when the
@@ -242,10 +254,11 @@ input budget, and compaction count.
 | Compaction/paging | `KEEP_RECENT`, `COMPACT_PREVIEW_CHARS`, `COMPACT_RETAIN_RATIO`, `CLIP_HEAD_RATIO`, `OBSERVATION_PAGE_CHARS`, `PINNED_OVERFLOW` |
 
 Prefix each table entry with `FREELLAMA_AGENT_`. The MCP `delegate_research.agent` object exposes
-the same fields in camelCase. Defaults and validation live once in `AgentRuntimeConfig` and
+the loop/model fields and the two timeouts in camelCase; retry, repair and compaction tuning are
+deployment settings only, which keeps them out of every `tools/list` payload. Defaults and validation live once in `AgentRuntimeConfig` and
 `ContextPolicy`; both adapters consume those shared schemas.
 
-Contracts: `benchmark/local/scripts/test_agent_context.py` (63 context/pagination contracts) and
+Contracts: `benchmark/local/scripts/test_agent_context.py` (context and pagination contracts) and
 `test_agent_actions.py` (strict Bash and Octocode action shapes).
 
 ## Add a new agent

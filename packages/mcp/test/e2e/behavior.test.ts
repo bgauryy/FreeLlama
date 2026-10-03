@@ -19,7 +19,12 @@ describe.runIf(releaseServeAvailable)("behavior: every tool against the live sys
 
   beforeAll(async () => {
     isolated = await startIsolatedServe();
-    client = await connectClient({ FREELLAMA_SERVE_ENDPOINT: isolated.endpoint });
+    client = await connectClient({
+      FREELLAMA_SERVE_ENDPOINT: isolated.endpoint,
+      FREELLAMA_AGENT_CHARS_PER_TOKEN: "3.5",
+      FREELLAMA_AGENT_OBSERVATION_PAGE_CHARS: "2048",
+      FREELLAMA_AGENT_PINNED_OVERFLOW: "error",
+    });
   });
 
   afterAll(async () => {
@@ -158,12 +163,17 @@ describe.runIf(releaseServeAvailable)("behavior: every tool against the live sys
     );
     if (!hasDefaultModel) skip("qwen3.8:27b-mlx is not installed");
 
+    const preview = await call("run_task", { task: "coding", objective: "fastest", model: "qwen3.8:27b-mlx", preview: true });
+    expect(preview.isError ?? false, preview.content?.[0]?.text).toBe(false);
+    if (preview.structuredContent.agent_plan?.dispatch_readiness !== "runnable_now")
+      skip(`live research requires available capacity: ${JSON.stringify(preview.structuredContent.agent_plan)}`);
+
     const groundedResult = await call("delegate_research", {
       question: "In packages/rust-core/Cargo.toml, what optional feature enables the Node addon?",
       workspacePath: REPO_ROOT,
+      model: "qwen3.8:27b-mlx",
       agent: {
         contextTokens: 8192,
-        context: { charsPerToken: 3.5, observationPageChars: 2048, pinnedOverflow: "error" },
       },
     }, 300_000);
     expect(groundedResult.isError ?? false, groundedResult.content?.[0]?.text).toBe(false);

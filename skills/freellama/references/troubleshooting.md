@@ -5,7 +5,7 @@ different layers.
 
 1. Run `doctor`, then `scripts/check.sh`.
 2. HTTP 503: inspect the selected backend's admission pool; retry or lower fan-out. GPU defaults to
-   2 weighted units and CPU to 1. Raise only the relevant pool after reading Ollama parallel/KV
+   2 weighted units per `OLLAMA_NUM_PARALLEL` slot (fallback 2) and CPU to 1. Raise only the relevant pool after reading Ollama parallel/KV
    constraints.
 3. Low-confidence refusal: add policy plus functional evidence, lower the requested floor, or use
    fastest with an explicit acknowledgment of low evidence.

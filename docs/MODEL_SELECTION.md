@@ -5,6 +5,11 @@ Apple M4 Pro machine with 48 GB unified memory and are not compiled into routing
 `npx @octocodeai/freellama doctor`, `models`, `bench-all`, and your quality suite on the target hardware.
 `doctor.machine.memory_bytes` is host RAM; a discrete GPU's usable VRAM must be observed separately.
 
+For supported features and sourced publisher use-case guidance, inspect
+`models {view:"installed", includeLibrary:true}` through MCP. The
+[Ollama metadata reference](MODEL_METADATA.md) explains digest matching, variant capabilities,
+custom-model fallbacks, and how to read family claims without treating them as quality measurements.
+
 ```mermaid
 flowchart TD
     T{"What must the task do?"}

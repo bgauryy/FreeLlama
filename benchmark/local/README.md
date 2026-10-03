@@ -25,6 +25,10 @@ This self-contained benchmark reuses the scoring and aggregation engine in this 
 Everything needed to understand or re-run this — for a human or another agent — lives under this
 directory. Start here, then read `docs/` in order.
 
+For control-plane admission and context measurements, see the separate
+[bounded mixed-workload probe](docs/mixed-workload.md). It records cold-load execution, correctness,
+resource guards, and baseline/candidate evidence without pulling models or running a local judge.
+
 ## Directory map
 
 ```

@@ -5,7 +5,7 @@ use std::{
     io::Write,
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex as StdMutex},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -22,7 +22,7 @@ use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tempfile::NamedTempFile;
-use tokio::sync::{Mutex, Notify, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock, Semaphore};
+use tokio::sync::{Mutex, RwLock, Semaphore};
 use tokio::task::JoinSet;
 
 use crate::{
@@ -34,16 +34,48 @@ use crate::{
     },
 };
 
+mod admission;
+mod context;
+mod device_activity;
 mod discovery;
+mod error;
+mod execution;
+mod footprint;
 mod intent;
+mod jobs;
+mod monitor;
+mod ollama_env;
+mod readiness;
+mod residency;
+pub mod resources;
 mod routing;
+mod runtime;
+mod scopes;
+mod telemetry;
+mod warming;
 
-pub use discovery::{MachineProfile, machine_profile};
+pub use discovery::{
+    MachineProfile, host_has_unified_memory, host_total_memory_bytes, machine_profile,
+};
 pub use intent::{RouteIntent, intent_schema, normalize_route_intent, parse_route_intent};
 pub use routing::{
     CatalogModel, ExecutionPreference, Objective, PlacementEvidence, RouteDecision, RouteEvidence,
     RouteInput, SessionAffinity, TaskKind, TaskPriority, select_route,
 };
+pub use runtime::{AdaptiveMode, ContextMode, RuntimeFile};
+pub use scopes::ScopePolicy;
+pub use telemetry::Telemetry;
+pub use warming::WarmingPolicy;
+
+use admission::{AdmissionPool, MAX_CAPACITY_BYPASSES, PRIORITY_WEIGHTS, priority_index};
+use error::{ApiError, resource_error};
+pub use execution::runtime_metrics;
+use execution::{
+    admit, apply_execution_options, execution_target, intent_memory_requirement,
+    physical_placement_observation, run_task, select_managed_route, transition_timeout,
+};
+#[cfg(test)]
+use execution::{feedback_work_unit_ns, memory_kv_preflight_with_memory, upstream_is_loopback};
 
 // Private helpers the server plane reuses from the pure routing/intent/discovery modules.
 use discovery::{load_benchmark, load_policies, parse_capability};
@@ -55,6 +87,8 @@ type CatalogCache = Arc<RwLock<Option<(Instant, Vec<CatalogModel>)>>>;
 
 #[derive(Debug, Clone)]
 pub struct PlatformConfig {
+    /// Shared host pressure policy; clones coordinate CPU/GPU/raw reservations.
+    pub resource_governor: resources::ResourceGovernor,
     pub listen: String,
     /// Primary Ollama instance. The byte-preserving fallback proxy always targets this backend.
     pub upstream: String,
@@ -73,21 +107,37 @@ pub struct PlatformConfig {
     /// Weighted admission budget for the optional CPU backend. `None` falls back to
     /// `FREELLAMA_CPU_MAX_CONCURRENT_TASKS`, then to 1.
     pub cpu_max_concurrent_tasks: Option<usize>,
-    /// Longest a task may queue for an admission slot before being refused with 503. `None` falls
+    /// Longest a task may wait for admission and a transition lock together before 503. `None` falls
     /// back to `FREELLAMA_MAX_QUEUE_WAIT_SECONDS`, then to 120s.
     pub max_queue_wait: Option<Duration>,
+    /// Maximum managed requests waiting for the primary/GPU pool. Active requests are counted
+    /// separately. `None` falls back to `FREELLAMA_MAX_QUEUED_TASKS`, then to 16.
+    pub max_queued_tasks: Option<usize>,
+    /// Maximum managed requests waiting for the optional CPU pool. `None` falls back to
+    /// `FREELLAMA_CPU_MAX_QUEUED_TASKS`, then to 8.
+    pub cpu_max_queued_tasks: Option<usize>,
     /// Maximum live affinity handles. Sessions hold metadata only, never prompt text or Ollama KV.
     pub max_sessions: Option<usize>,
     /// Idle lifetime for affinity handles. Successful route/task use refreshes the TTL.
     pub session_ttl: Option<Duration>,
-    /// Optional generic cap for byte-preserving raw proxy traffic; managed tasks have weighted caps.
+    /// Generic cap for byte-preserving raw proxy traffic. `None` resolves to one streaming request
+    /// in `serve`; the standalone `proxy` command remains opt-in for compatibility.
     pub raw_proxy_max_concurrent_requests: Option<usize>,
+    /// How long a raw generation may wait for a slot or for managed execution before 429/503.
+    /// `None` falls back to `FREELLAMA_RAW_QUEUE_WAIT_SECONDS`, the runtime file, then 10s.
+    pub raw_queue_wait: Option<Duration>,
     /// Optional versioned, atomically replaced adaptive-feedback snapshot.
     pub feedback_file: Option<PathBuf>,
     /// Optional bearer token protecting both control and Ollama-compatible routes.
     pub auth_token: Option<String>,
     /// Explicit opt-in for a non-loopback listener. Requires `auth_token`.
     pub allow_remote: bool,
+    /// Optional runtime config file (TOML), re-read when it changes. `None` falls back to
+    /// `FREELLAMA_RUNTIME_CONFIG`.
+    pub runtime_config: Option<PathBuf>,
+    /// Optional JSON-lines usage ledger. `None` falls back to `FREELLAMA_USAGE_FILE`; without
+    /// either, usage totals are kept in memory only.
+    pub usage_file: Option<PathBuf>,
 }
 
 impl PlatformConfig {
@@ -100,6 +150,7 @@ impl PlatformConfig {
         intent_model: impl Into<String>,
     ) -> Self {
         Self {
+            resource_governor: resources::ResourceGovernor::default(),
             listen: listen.into(),
             upstream: upstream.into(),
             cpu_upstream: None,
@@ -111,13 +162,32 @@ impl PlatformConfig {
             max_concurrent_tasks: None,
             cpu_max_concurrent_tasks: None,
             max_queue_wait: None,
+            max_queued_tasks: None,
+            cpu_max_queued_tasks: None,
             max_sessions: None,
             session_ttl: None,
             raw_proxy_max_concurrent_requests: None,
+            raw_queue_wait: None,
             feedback_file: None,
             auth_token: None,
             allow_remote: false,
+            runtime_config: None,
+            usage_file: None,
         }
+    }
+
+    /// Read live-tunable settings from `path`; edits are applied without a restart.
+    #[must_use]
+    pub fn with_runtime_config(mut self, path: impl Into<PathBuf>) -> Self {
+        self.runtime_config = Some(path.into());
+        self
+    }
+
+    /// Append one JSON line per finished managed task to `path` and replay it at startup.
+    #[must_use]
+    pub fn with_usage_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.usage_file = Some(path.into());
+        self
     }
 
     /// Cap how long a task may queue for admission before being refused.
@@ -127,6 +197,20 @@ impl PlatformConfig {
     #[must_use]
     pub fn with_max_queue_wait(mut self, wait: Duration) -> Self {
         self.max_queue_wait = Some(wait);
+        self
+    }
+
+    /// Bound retained managed requests while the primary/GPU pool is saturated.
+    #[must_use]
+    pub fn with_max_queued_tasks(mut self, max: usize) -> Self {
+        self.max_queued_tasks = Some(max.max(1));
+        self
+    }
+
+    /// Bound retained managed requests while the CPU pool is saturated.
+    #[must_use]
+    pub fn with_cpu_max_queued_tasks(mut self, max: usize) -> Self {
+        self.cpu_max_queued_tasks = Some(max.max(1));
         self
     }
 
@@ -148,6 +232,20 @@ impl PlatformConfig {
     pub fn with_raw_proxy_max_concurrent_requests(mut self, max: usize) -> Self {
         self.raw_proxy_max_concurrent_requests = Some(max.max(1));
         self
+    }
+
+    /// Bound how long raw passthrough generations wait before being refused (0 = refuse at once).
+    #[must_use]
+    pub fn with_raw_queue_wait(mut self, wait: Duration) -> Self {
+        self.raw_queue_wait = Some(wait);
+        self
+    }
+
+    #[must_use]
+    pub fn resolved_raw_proxy_max_concurrent_requests(&self) -> usize {
+        self.raw_proxy_max_concurrent_requests
+            .unwrap_or(1)
+            .clamp(1, Semaphore::MAX_PERMITS)
     }
 
     /// Bound weighted work admitted to the primary/GPU Ollama backend.
@@ -191,6 +289,20 @@ impl PlatformConfig {
         self.cpu_max_concurrent_tasks
             .unwrap_or_else(cpu_max_concurrent_tasks)
             .clamp(1, Semaphore::MAX_PERMITS)
+    }
+
+    #[must_use]
+    pub fn resolved_max_queued_tasks(&self) -> usize {
+        self.max_queued_tasks
+            .unwrap_or_else(max_queued_tasks)
+            .max(1)
+    }
+
+    #[must_use]
+    pub fn resolved_cpu_max_queued_tasks(&self) -> usize {
+        self.cpu_max_queued_tasks
+            .unwrap_or_else(cpu_max_queued_tasks)
+            .max(1)
     }
 
     #[must_use]
@@ -321,6 +433,12 @@ fn is_loopback_host(host: &str) -> bool {
 
 #[derive(Clone)]
 struct PlatformState {
+    resources: resources::ResourceGovernor,
+    footprints: Arc<Mutex<footprint::FootprintHistory>>,
+    /// Per-model demand and load history for eviction planning.
+    activity: residency::ModelActivity,
+    /// The most recent eviction plan, for `status` and the UI.
+    last_eviction: Arc<std::sync::Mutex<Option<Value>>>,
     client: Client,
     upstream: String,
     cpu_upstream: Option<String>,
@@ -329,6 +447,7 @@ struct PlatformState {
     policies: Arc<BTreeMap<TaskKind, Vec<String>>>,
     recommendations: Arc<RecommendationCatalog>,
     sessions: Arc<RwLock<SessionAffinity>>,
+    scopes: scopes::ScopeStore,
     catalog_cache: CatalogCache,
     catalog_refresh: Arc<Mutex<()>>,
     intent_model: String,
@@ -341,182 +460,89 @@ struct PlatformState {
     feedback_persistence_error: Arc<RwLock<Option<String>>>,
     auth_required: bool,
     remote_access: bool,
-    queue_wait: Duration,
     max_sessions: usize,
     session_ttl: Duration,
+    /// Live-tunable limits, waits, eviction, context and breaker settings.
+    runtime: runtime::RuntimeSettings,
+    telemetry: Telemetry,
+    breakers: runtime::Breakers,
+    adaptive_gpu: runtime::AdaptiveLimiter,
+    adaptive_cpu: runtime::AdaptiveLimiter,
+    /// Cached process observations, refreshed before discovery and monitoring.
+    ollama: Arc<RwLock<ollama_env::OllamaSettings>>,
+    cpu_ollama: Option<Arc<RwLock<ollama_env::OllamaSettings>>>,
+    ollama_refresh: Arc<Mutex<Instant>>,
+    raw_admission: proxy::RawAdmission,
+    jobs: Arc<std::sync::Mutex<jobs::JobRegistry>>,
 }
 
-#[derive(Clone)]
-struct AdmissionPool {
-    state: Arc<StdMutex<AdmissionState>>,
-    changed: Arc<Notify>,
-    total: usize,
-}
-
-#[derive(Debug)]
-struct AdmissionState {
-    available: usize,
-    next_ticket: u64,
-    waiting: Vec<AdmissionWaiter>,
-    /// Weighted round-robin credits, ordered interactive, normal, background.
-    credits: [u8; 3],
-    /// A selected waiter owns the next charge until it wakes and claims it. Reserving the choice
-    /// prevents a thundering herd from letting a later task steal a higher-priority grant.
-    granted: Option<u64>,
-}
-
-#[derive(Debug)]
-struct AdmissionWaiter {
-    ticket: u64,
-    cost: usize,
-    priority: TaskPriority,
-}
-
-/// Held admission charge. Releasing is synchronous and wakes every waiter so the next weighted
-/// choice is made against the real current capacity, including mixed task costs.
-struct AdmissionPermit {
-    pool: AdmissionPool,
-    cost: usize,
-}
-
-impl Drop for AdmissionPermit {
-    fn drop(&mut self) {
-        let mut state = self.pool.state.lock().expect("admission state poisoned");
-        state.available = state
-            .available
-            .saturating_add(self.cost)
-            .min(self.pool.total);
-        drop(state);
-        self.pool.changed.notify_waiters();
+impl PlatformState {
+    async fn refresh_ollama_settings(&self) {
+        let mut refreshed = self.ollama_refresh.lock().await;
+        if refreshed.elapsed() < Duration::from_secs(5) {
+            return;
+        }
+        let gpu = self.upstream.clone();
+        let cpu = self.cpu_upstream.clone();
+        // Process inspection is bounded blocking work; it must not block Tokio's control threads.
+        if let Ok((gpu, cpu)) = tokio::task::spawn_blocking(move || {
+            (
+                ollama_env::probe(&gpu),
+                cpu.as_deref().map(ollama_env::probe),
+            )
+        })
+        .await
+        {
+            let mut footprints = self.footprints.lock().await;
+            footprints.set_backend_hints(
+                self.upstream.clone(),
+                footprint::RuntimeHints::from_lookup(|name| gpu.lookup(name)),
+            );
+            if let (Some(endpoint), Some(settings)) = (&self.cpu_upstream, &cpu) {
+                footprints.set_backend_hints(
+                    endpoint.clone(),
+                    footprint::RuntimeHints::from_lookup(|name| settings.lookup(name)),
+                );
+            }
+            *self.ollama.write().await = gpu;
+            if let (Some(target), Some(settings)) = (&self.cpu_ollama, cpu) {
+                *target.write().await = settings;
+            }
+        }
+        *refreshed = Instant::now();
     }
-}
 
-const PRIORITY_WEIGHTS: [u8; 3] = [3, 2, 1];
-
-const fn priority_index(priority: TaskPriority) -> usize {
-    match priority {
-        TaskPriority::Interactive => 0,
-        TaskPriority::Normal => 1,
-        TaskPriority::Background => 2,
+    fn tunables(&self) -> runtime::Tunables {
+        self.runtime.get()
     }
-}
 
-impl AdmissionPool {
-    fn new(total: usize) -> Self {
-        Self {
-            state: Arc::new(StdMutex::new(AdmissionState {
-                available: total,
-                next_ticket: 0,
-                waiting: Vec::new(),
-                credits: PRIORITY_WEIGHTS,
-                granted: None,
-            })),
-            changed: Arc::new(Notify::new()),
-            total,
+    fn average_task_ms(&self, placement: &str) -> Option<u64> {
+        self.telemetry.average_task_ms(placement)
+    }
+
+    fn adaptive_for(&self, placement: &str) -> &runtime::AdaptiveLimiter {
+        if placement == "cpu" {
+            &self.adaptive_cpu
+        } else {
+            &self.adaptive_gpu
         }
     }
 
-    fn available(&self) -> usize {
-        self.state
-            .lock()
-            .expect("admission state poisoned")
-            .available
-    }
-
-    /// Select a feasible waiter using 3:2:1 weighted round robin. FIFO is retained inside each
-    /// class. A costly task is skipped only while it cannot fit; it remains next in its class once
-    /// capacity is released, avoiding head-of-line deadlock behind a smaller request.
-    fn selected_waiter(state: &mut AdmissionState) -> Option<usize> {
-        for pass in 0..2 {
-            for class in 0..PRIORITY_WEIGHTS.len() {
-                if state.credits[class] == 0 {
-                    continue;
-                }
-                if let Some((index, _)) = state.waiting.iter().enumerate().find(|(_, waiter)| {
-                    priority_index(waiter.priority) == class && waiter.cost <= state.available
-                }) {
-                    state.credits[class] -= 1;
-                    return Some(index);
-                }
-            }
-            if pass == 0 {
-                state.credits = PRIORITY_WEIGHTS;
-            }
-        }
-        None
-    }
-
-    async fn acquire(
-        &self,
-        cost: usize,
-        priority: TaskPriority,
-        wait: Duration,
-    ) -> Result<(AdmissionPermit, u128), ApiError> {
-        let queued = Instant::now();
-        let ticket = {
-            let mut state = self.state.lock().expect("admission state poisoned");
-            let ticket = state.next_ticket;
-            state.next_ticket = state.next_ticket.wrapping_add(1);
-            state.waiting.push(AdmissionWaiter {
-                ticket,
-                cost,
-                priority,
-            });
-            ticket
-        };
-        self.changed.notify_waiters();
-        let deadline = tokio::time::Instant::now() + wait;
-        loop {
-            let changed = self.changed.notified();
-            let (acquired, selected) = {
-                let mut state = self.state.lock().expect("admission state poisoned");
-                let mut selected = false;
-                if state.granted.is_none() {
-                    if let Some(index) = Self::selected_waiter(&mut state) {
-                        state.granted = Some(state.waiting[index].ticket);
-                        selected = true;
-                    }
-                }
-                if state.granted == Some(ticket) {
-                    let index = state
-                        .waiting
-                        .iter()
-                        .position(|waiter| waiter.ticket == ticket)
-                        .expect("granted admission waiter must remain queued");
-                    let waiter = state.waiting.remove(index);
-                    state.available -= waiter.cost;
-                    state.granted = None;
-                    (true, selected)
-                } else {
-                    (false, selected)
-                }
-            };
-            if acquired {
-                return Ok((
-                    AdmissionPermit {
-                        pool: self.clone(),
-                        cost,
-                    },
-                    queued.elapsed().as_millis(),
-                ));
-            }
-            if selected {
-                self.changed.notify_waiters();
-            }
-            if tokio::time::timeout_at(deadline, changed).await.is_err() {
-                let mut state = self.state.lock().expect("admission state poisoned");
-                state.waiting.retain(|waiter| waiter.ticket != ticket);
-                if state.granted == Some(ticket) {
-                    state.granted = None;
-                }
-                drop(state);
-                self.changed.notify_waiters();
-                return Err(ApiError {
-                    status: StatusCode::SERVICE_UNAVAILABLE,
-                    message: "task admission timed out".to_owned(),
-                });
-            }
-        }
+    /// Push the current tunables into the admission pools and raw admission.
+    fn apply_tunables(&self) {
+        let tunables = self.tunables();
+        self.gpu_admission
+            .set_ceiling(tunables.max_concurrent_tasks);
+        self.gpu_admission
+            .set_max_waiters(tunables.max_queued_tasks);
+        self.cpu_admission
+            .set_ceiling(tunables.cpu_max_concurrent_tasks);
+        self.cpu_admission
+            .set_max_waiters(tunables.cpu_max_queued_tasks);
+        self.raw_admission.set(
+            tunables.raw_max_concurrent_requests,
+            tunables.raw_queue_wait(),
+        );
     }
 }
 
@@ -528,6 +554,12 @@ struct FeedbackStats {
     total_work_unit_ns: u128,
     total_queue_wait_ms: u128,
     last_work_unit_ns: Option<u64>,
+    #[serde(default)]
+    profile: Option<runtime::ExecutionProfile>,
+    #[serde(default)]
+    profile_duration_samples: u64,
+    #[serde(default)]
+    profile_total_work_unit_ns: u128,
 }
 
 impl FeedbackStats {
@@ -554,10 +586,23 @@ impl FeedbackStats {
             .then(|| self.total_work_unit_ns / u128::from(self.duration_samples))
     }
 
-    fn average_for_model(&self, model: &str) -> Option<u128> {
-        (self.model.as_deref() == Some(model))
-            .then(|| self.average_work_unit_ns())
-            .flatten()
+    fn record_profile(&mut self, profile: &runtime::ExecutionProfile, duration: u64) {
+        if self.profile.as_ref() != Some(profile) {
+            self.profile = Some(profile.clone());
+            self.profile_duration_samples = 0;
+            self.profile_total_work_unit_ns = 0;
+        }
+        self.profile_duration_samples = self.profile_duration_samples.saturating_add(1);
+        self.profile_total_work_unit_ns = self
+            .profile_total_work_unit_ns
+            .saturating_add(u128::from(duration));
+    }
+
+    fn average_for_profile(&self, profile: &runtime::ExecutionProfile) -> Option<u128> {
+        (self.profile.as_ref() == Some(profile)
+            && self.profile_duration_samples >= MIN_FEEDBACK_SAMPLES
+            && self.profile_total_work_unit_ns > 0)
+            .then(|| self.profile_total_work_unit_ns / u128::from(self.profile_duration_samples))
     }
 
     fn receipt(&self) -> Value {
@@ -565,7 +610,10 @@ impl FeedbackStats {
             "model": self.model,
             "completed": self.completed,
             "duration_samples": self.duration_samples,
-            "decision_ready": self.duration_samples >= MIN_FEEDBACK_SAMPLES && self.total_work_unit_ns > 0,
+            "decision_ready": self.profile.as_ref().and_then(|profile| self.average_for_profile(profile)).is_some(),
+            "learning_profile": self.profile,
+            "profile_duration_samples": self.profile_duration_samples,
+            "profile_policy": "one_current_profile_per_task_serial_only",
             "decision_metric": "nanoseconds_per_work_unit",
             "average_work_unit_ns": self.average_work_unit_ns(),
             "average_queue_wait_ms": (self.completed > 0)
@@ -596,16 +644,28 @@ struct PlacementSignals {
     cpu_work_unit_ns: Option<u128>,
     gpu_slots_available: usize,
     cpu_slots_available: usize,
+    gpu_task_cost: usize,
+    cpu_task_cost: usize,
     cpu_configured: bool,
 }
 
 fn desired_placement(signals: PlacementSignals) -> Option<(&'static str, &'static str)> {
+    let gpu_ready = signals.gpu_slots_available >= signals.gpu_task_cost;
+    let cpu_ready = signals.cpu_configured && signals.cpu_slots_available >= signals.cpu_task_cost;
     match signals.execution_preference {
         ExecutionPreference::PreferCpu => {
-            return Some(("cpu", "preferred_backend_eligible"));
+            return Some(if cpu_ready || !gpu_ready {
+                ("cpu", "preferred_backend_eligible")
+            } else {
+                ("gpu", "backend_capacity_available")
+            });
         }
         ExecutionPreference::PreferGpu => {
-            return Some(("gpu", "preferred_backend_eligible"));
+            return Some(if gpu_ready || !cpu_ready {
+                ("gpu", "preferred_backend_eligible")
+            } else {
+                ("cpu", "backend_capacity_available")
+            });
         }
         ExecutionPreference::Auto => {}
     }
@@ -614,19 +674,25 @@ fn desired_placement(signals: PlacementSignals) -> Option<(&'static str, &'stati
     }
     match (signals.gpu_work_unit_ns, signals.cpu_work_unit_ns) {
         (Some(gpu), Some(cpu)) if meaningfully_faster(cpu, gpu) => {
-            return Some(("cpu", "measured_backend_faster"));
+            return Some(if cpu_ready || !gpu_ready {
+                ("cpu", "measured_backend_faster")
+            } else {
+                ("gpu", "backend_capacity_available")
+            });
         }
         (Some(gpu), Some(cpu)) if meaningfully_faster(gpu, cpu) => {
-            return Some(("gpu", "measured_backend_faster"));
+            return Some(if gpu_ready || !cpu_ready {
+                ("gpu", "measured_backend_faster")
+            } else {
+                ("cpu", "backend_capacity_available")
+            });
         }
         _ => {}
     }
-    if signals.cpu_configured && signals.gpu_slots_available == 0 && signals.cpu_slots_available > 0
-    {
+    if !gpu_ready && cpu_ready {
         return Some(("cpu", "backend_capacity_available"));
     }
-    if signals.cpu_configured && signals.cpu_slots_available == 0 && signals.gpu_slots_available > 0
-    {
+    if !cpu_ready && gpu_ready {
         return Some(("gpu", "backend_capacity_available"));
     }
     None
@@ -739,329 +805,53 @@ const fn task_key(task: TaskKind) -> &'static str {
     }
 }
 
-#[derive(Clone)]
-struct ExecutionTarget {
-    placement: &'static str,
-    upstream: String,
-    transition: Arc<RwLock<()>>,
-    admission: AdmissionPool,
-}
-
-enum TransitionPermit {
-    Shared(OwnedRwLockReadGuard<()>),
-    Exclusive(OwnedRwLockWriteGuard<()>),
-}
-
-impl TransitionPermit {
-    fn admission_mode(&self) -> &'static str {
-        match self {
-            Self::Shared(_guard) => "resident_shared",
-            Self::Exclusive(_guard) => "nonresident_transition_exclusive",
-        }
-    }
-}
-
-fn execution_target(state: &PlatformState, model: &str) -> ExecutionTarget {
-    if state.cpu_models.contains(model)
-        && let Some(upstream) = &state.cpu_upstream
-    {
-        return ExecutionTarget {
-            placement: "cpu",
-            upstream: upstream.clone(),
-            transition: Arc::clone(&state.cpu_managed_execution),
-            admission: state.cpu_admission.clone(),
-        };
-    }
-    ExecutionTarget {
-        placement: "gpu",
-        upstream: state.upstream.clone(),
-        transition: Arc::clone(&state.managed_execution),
-        admission: state.gpu_admission.clone(),
-    }
-}
-
-struct ManagedDecision {
-    route: RouteDecision,
-    model: CatalogModel,
-    execution: ExecutionTarget,
-    preference: ExecutionPreference,
-    preference_satisfied: bool,
-    reason: &'static str,
-    placement_evidence: PlacementEvidence,
-}
-
-impl ManagedDecision {
-    fn execution_receipt(&self, task_cost: u32) -> Value {
-        let task_cost = task_cost
-            .min(u32::try_from(self.execution.admission.total).unwrap_or(u32::MAX))
-            .max(1);
-        let slots_available = self.execution.admission.available();
-        // This is deliberately advisory: another request can acquire a permit before the caller
-        // acts. It gives an orchestrating agent a truthful snapshot for deciding whether to
-        // launch an independent local task, while `admit` remains the only authority that can
-        // reserve capacity or return success.
-        let task_cost_usize = usize::try_from(task_cost).unwrap_or(usize::MAX);
-        // `slots_available` is observed before *this* proposed task is admitted. The old
-        // calculation reported every task that could start from that snapshot as "additional",
-        // which double-counted the proposed task and invited an agent to over-fan-out. Keep the
-        // two facts separate: whether this request may start now, and how many same-cost sibling
-        // requests could fit after it. Both remain advisory snapshots, never reservations.
-        let tasks_admissible_now = slots_available / task_cost_usize;
-        let additional_parallel_tasks =
-            slots_available.saturating_sub(task_cost_usize) / task_cost_usize;
-        let dispatch_readiness = if slots_available >= task_cost_usize {
-            "runnable_now"
-        } else {
-            "queue_likely"
-        };
-        let keep_alive_guidance = match self.route.task {
-            TaskKind::Embedding => {
-                "use_keep_alive_0_for_one_off_embedding; keep_warm_only_for_a_related_batch"
-            }
-            _ if self.route.resident => {
-                "selected_runner_is_resident; preserve_prompt_prefix_and_keep_related_work_on_this_model"
-            }
-            _ => "selected_runner_is_cold; expect_a_load_transition_before_reusing_it",
-        };
-        json!({
-            // `placement` is retained for compatibility. `backend` names the configured Ollama
-            // process; neither field is physical proof. The task response replaces the pending
-            // observation below with Ollama's post-run `/api/ps` evidence.
-            "placement": self.execution.placement,
-            "backend": if self.execution.placement == "cpu" { "cpu" } else { "primary" },
-            "requested_processor": self.execution.placement,
-            "upstream": self.execution.upstream,
-            "preference": self.preference,
-            "preference_satisfied": self.preference_satisfied,
-            "reason": self.reason,
-            "min_placement_evidence": self.placement_evidence,
-            "observation": {
-                "processor": "unknown",
-                "status": "pending",
-                "source": "ollama_api_ps_after_execution"
-            },
-            "admission": {
-                "slots_total": self.execution.admission.total,
-                "slots_available": slots_available,
-            },
-            "agent_plan": {
-                "dispatch_readiness": dispatch_readiness,
-                "snapshot_only": true,
-                "task_cost_units": task_cost,
-                "independent_tasks_admissible_now": tasks_admissible_now,
-                "additional_independent_tasks_same_backend": additional_parallel_tasks,
-                "parallelism_rule": "the proposed task is included in admissible_now; launch only caller-declared independent siblings; execution admission remains authoritative",
-                "warm_runner_reuse_likely": self.route.resident,
-                "keep_alive_guidance": keep_alive_guidance,
-            },
-            "memory_kv_preflight": memory_kv_preflight(&self.model, &self.route, self.execution.placement),
-        })
-    }
-}
-
-fn route_candidate_for(
-    state: &PlatformState,
-    input: &RouteInput,
-    models: &[CatalogModel],
-    sessions: &SessionAffinity,
-    placement: &str,
-) -> Option<RouteDecision> {
-    let candidates = models
-        .iter()
-        .filter(|model| execution_target(state, &model.name).placement == placement)
-        .cloned()
-        .collect::<Vec<_>>();
-    (!candidates.is_empty())
-        .then(|| select_route(input, &candidates, sessions).ok())
-        .flatten()
-}
-
-fn require_observed_placement(
-    input: &RouteInput,
-    models: &[CatalogModel],
-    route: &RouteDecision,
-    execution: &ExecutionTarget,
-) -> Result<(), ApiError> {
-    if !matches!(input.min_placement_evidence, PlacementEvidence::Observed) {
-        return Ok(());
-    }
-    let selected = models
-        .iter()
-        .find(|model| model.name == route.selected_model)
-        .expect("selected route comes from the supplied catalog");
-    let observation = physical_placement_observation(
-        execution.placement,
-        selected.resident.then_some(selected.size),
-        selected.resident_vram,
-    );
-    if observation["status"] == "verified" {
-        return Ok(());
-    }
-    Err(ApiError::bad_request(format!(
-        "physical placement is not verified for {}: configured={}, observed={}. Run one bounded task with min_placement_evidence=configured, inspect execution.observation, then retry with observed",
-        route.selected_model,
-        execution.placement,
-        observation["processor"].as_str().unwrap_or("unknown")
-    )))
-}
-
-async fn select_managed_route(
-    state: &PlatformState,
-    input: &RouteInput,
-    models: &[CatalogModel],
-    sessions: &SessionAffinity,
-) -> Result<ManagedDecision, ApiError> {
-    let has_session_affinity = input
-        .session_id
-        .as_deref()
-        .and_then(|id| sessions.assigned(id))
-        .is_some();
-    let route_is_pinned = input.model.is_some() || has_session_affinity;
-    let gpu_candidate = route_candidate_for(state, input, models, sessions, "gpu");
-    let cpu_candidate = route_candidate_for(state, input, models, sessions, "cpu");
-    let (gpu_work_unit_ns, cpu_work_unit_ns) = {
-        let feedback = state.feedback.read().await;
-        (
-            gpu_candidate.as_ref().and_then(|route| {
-                feedback
-                    .gpu
-                    .get(&input.task)
-                    .and_then(|stats| stats.average_for_model(&route.selected_model))
-            }),
-            cpu_candidate.as_ref().and_then(|route| {
-                feedback
-                    .cpu
-                    .get(&input.task)
-                    .and_then(|stats| stats.average_for_model(&route.selected_model))
-            }),
-        )
-    };
-    let desired = desired_placement(PlacementSignals {
-        route_is_pinned,
-        objective: input.objective,
-        execution_preference: input.execution_preference,
-        gpu_work_unit_ns,
-        cpu_work_unit_ns,
-        gpu_slots_available: state.gpu_admission.available(),
-        cpu_slots_available: state.cpu_admission.available(),
-        cpu_configured: state.cpu_upstream.is_some(),
-    });
-
-    let preferred = desired.and_then(|(placement, reason)| {
-        if route_is_pinned {
-            return None;
-        }
-        (if placement == "cpu" {
-            cpu_candidate.clone()
-        } else {
-            gpu_candidate.clone()
-        })
-        .map(|route| (route, reason))
-    });
-    let (route, mut reason) = if let Some(preferred) = preferred {
-        preferred
-    } else {
-        (
-            select_route(input, models, sessions).map_err(ApiError::bad_request)?,
-            if desired.is_some() {
-                "preferred_backend_unavailable_or_ineligible"
-            } else {
-                "router_default"
-            },
-        )
-    };
-    if input.model.is_some() {
-        reason = "explicit_model";
-    } else if has_session_affinity {
-        reason = "session_affinity";
-    }
-    let execution = execution_target(state, &route.selected_model);
-    require_observed_placement(input, models, &route, &execution)?;
-    let preference_satisfied = match input.execution_preference {
-        ExecutionPreference::Auto => true,
-        ExecutionPreference::PreferCpu => execution.placement == "cpu",
-        ExecutionPreference::PreferGpu => execution.placement == "gpu",
-    };
-    let model = models
-        .iter()
-        .find(|model| model.name == route.selected_model)
-        .expect("selected route comes from the supplied catalog")
-        .clone();
-    Ok(ManagedDecision {
-        route,
-        model,
-        execution,
-        preference: input.execution_preference,
-        preference_satisfied,
-        reason,
-        placement_evidence: input.min_placement_evidence,
-    })
-}
-
-fn normalize_keep_alive(value: Option<String>) -> Value {
-    match value {
-        // Ollama's API accepts a numeric negative value for infinite residency. Its duration-string
-        // parser rejects the superficially equivalent `"-1"` because that string has no unit.
-        Some(value) if value == "-1" => json!(-1),
-        Some(value) => json!(value),
-        None => json!("5m"),
-    }
-}
-
-fn requests_immediate_unload(value: Option<&str>) -> bool {
-    matches!(value.map(str::trim), Some("0" | "0s" | "0m" | "0h"))
-}
-
-fn apply_execution_options(body: &mut Value, target: &ExecutionTarget) {
-    if target.placement == "cpu" {
-        // The process-level CPU library override is ignored by some Metal builds. Ollama's
-        // request contract treats num_gpu as a runner load option; pinning zero here makes the
-        // explicit CPU assignment real while the second process prevents GPU-runner churn on the
-        // primary backend.
-        body["options"]["num_gpu"] = json!(0);
-    }
-}
-
-#[derive(Debug)]
-struct ApiError {
-    status: StatusCode,
-    message: String,
-}
-
-impl ApiError {
-    fn bad_request(error: impl std::fmt::Display) -> Self {
-        Self {
-            status: StatusCode::UNPROCESSABLE_ENTITY,
-            message: error.to_string(),
-        }
-    }
-
-    fn upstream(error: impl std::fmt::Display) -> Self {
-        Self {
-            status: StatusCode::BAD_GATEWAY,
-            message: error.to_string(),
-        }
-    }
-}
-
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
-        (self.status, Json(json!({"error": self.message}))).into_response()
-    }
-}
-
 /// Build the localhost platform and its Ollama-compatible fallback.
 ///
 /// # Errors
 ///
 /// Returns an error for unsafe configuration, unreadable benchmark evidence, or HTTP setup.
 pub fn app(config: &PlatformConfig) -> Result<Router> {
+    build(config).map(|(router, _)| router)
+}
+
+#[allow(clippy::too_many_lines)] // One linear assembly of state, proxy and routes.
+fn build(config: &PlatformConfig) -> Result<(Router, PlatformState)> {
     config.validate()?;
     let benchmark = load_benchmark(config.benchmark_report.as_ref())?;
     let policies = load_policies(config.policy_file.as_ref())?;
     let recommendation_catalog = load_catalog(config.recommendation_catalog.as_ref())?;
-    let gpu_slots_total = config.resolved_max_concurrent_tasks();
-    let cpu_slots_total = config.resolved_cpu_max_concurrent_tasks();
+    let ollama = ollama_env::probe(&config.upstream);
+    let cpu_ollama = config.cpu_upstream.as_deref().map(ollama_env::probe);
+    let runtime_file = config.runtime_config.clone().or_else(|| {
+        std::env::var_os("FREELLAMA_RUNTIME_CONFIG")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    });
+    let runtime = runtime::RuntimeSettings::new(
+        runtime::PinnedTunables {
+            max_concurrent_tasks: config.max_concurrent_tasks,
+            cpu_max_concurrent_tasks: config.cpu_max_concurrent_tasks,
+            max_queued_tasks: config.max_queued_tasks,
+            cpu_max_queued_tasks: config.cpu_max_queued_tasks,
+            max_queue_wait: config.max_queue_wait,
+            raw_max_concurrent_requests: config.raw_proxy_max_concurrent_requests,
+            raw_queue_wait: config.raw_queue_wait,
+        },
+        runtime_file,
+        ollama.num_parallel(),
+    )?;
+    let tunables = runtime.get();
+    let usage_file = config.usage_file.clone().or_else(|| {
+        std::env::var_os("FREELLAMA_USAGE_FILE")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    });
+    let telemetry =
+        Telemetry::with_ledger_capacity(usage_file.clone(), tunables.usage_queue_capacity);
+    let raw_admission = proxy::RawAdmission::new(
+        tunables.raw_max_concurrent_requests,
+        tunables.raw_queue_wait(),
+    );
     let feedback = config
         .feedback_file
         .as_deref()
@@ -1069,6 +859,25 @@ pub fn app(config: &PlatformConfig) -> Result<Router> {
         .transpose()?
         .unwrap_or_default();
     let state = PlatformState {
+        resources: config.resource_governor.clone(),
+        footprints: Arc::new(Mutex::new({
+            let mut history = footprint::FootprintHistory::with_hints(
+                footprint::RuntimeHints::from_lookup(|name| ollama.lookup(name)),
+            );
+            if let (Some(upstream), Some(settings)) = (&config.cpu_upstream, &cpu_ollama) {
+                history = history.with_backend_hints(
+                    upstream.clone(),
+                    footprint::RuntimeHints::from_lookup(|name| settings.lookup(name)),
+                );
+            }
+            // Measured runner sizes live next to the usage ledger, so a restart keeps them.
+            match &usage_file {
+                Some(ledger) => history.with_file(ledger.with_file_name("footprints.json")),
+                None => history,
+            }
+        })),
+        activity: residency::ModelActivity::default(),
+        last_eviction: Arc::default(),
         // A client-level backstop, not a nicety. `forward_managed_task` holds the
         // `managed_execution` write lock across its upstream call, so an untimed request against
         // a wedged Ollama would hold that exclusive lock forever and block every subsequent
@@ -1086,22 +895,40 @@ pub fn app(config: &PlatformConfig) -> Result<Router> {
         policies: Arc::new(policies),
         recommendations: Arc::new(recommendation_catalog),
         sessions: Arc::new(RwLock::new(SessionAffinity::default())),
+        scopes: scopes::ScopeStore::default(),
         catalog_cache: Arc::new(RwLock::new(None)),
         catalog_refresh: Arc::new(Mutex::new(())),
         intent_model: config.intent_model.clone(),
         managed_execution: Arc::new(RwLock::new(())),
         cpu_managed_execution: Arc::new(RwLock::new(())),
-        gpu_admission: AdmissionPool::new(gpu_slots_total),
-        cpu_admission: AdmissionPool::new(cpu_slots_total),
+        gpu_admission: AdmissionPool::new(tunables.max_concurrent_tasks, tunables.max_queued_tasks),
+        cpu_admission: AdmissionPool::new(
+            tunables.cpu_max_concurrent_tasks,
+            tunables.cpu_max_queued_tasks,
+        ),
         feedback: Arc::new(RwLock::new(feedback)),
         feedback_file: config.feedback_file.clone().map(Arc::new),
         feedback_persistence_error: Arc::new(RwLock::new(None)),
         auth_required: config.auth_token.is_some(),
         remote_access: config.allow_remote,
-        queue_wait: config.max_queue_wait.unwrap_or_else(max_queue_wait),
         max_sessions: config.max_sessions.unwrap_or(1024),
         session_ttl: config.session_ttl.unwrap_or(Duration::from_secs(3600)),
+        runtime,
+        telemetry: telemetry.clone(),
+        breakers: runtime::Breakers::default(),
+        adaptive_gpu: runtime::AdaptiveLimiter::default(),
+        adaptive_cpu: runtime::AdaptiveLimiter::default(),
+        ollama: Arc::new(RwLock::new(ollama)),
+        cpu_ollama: cpu_ollama.map(|settings| Arc::new(RwLock::new(settings))),
+        ollama_refresh: Arc::new(Mutex::new(Instant::now())),
+        raw_admission: raw_admission.clone(),
+        jobs: Arc::default(),
     };
+    let fallback_config = ProxyConfig::new(&config.listen, &config.upstream, config.allow_remote)
+        .with_raw_admission(raw_admission)
+        .with_telemetry(telemetry)
+        .with_execution_lock(Arc::clone(&state.managed_execution))
+        .with_resource_governor(state.resources.clone());
     let platform = Router::new()
         .route(&format!("{API_ROOT}/health"), get(health))
         .route(&format!("{API_ROOT}/machine"), get(machine))
@@ -1114,20 +941,46 @@ pub fn app(config: &PlatformConfig) -> Result<Router> {
         .route(&format!("{API_ROOT}/natural-routes"), post(natural_route))
         .route(&format!("{API_ROOT}/sessions"), post(create_session))
         .route(
+            &format!("{API_ROOT}/sessions/{{session_id}}/kill"),
+            post(kill_session),
+        )
+        .route(
             &format!("{API_ROOT}/sessions/{{session_id}}"),
             delete(delete_session),
         )
+        .route(&format!("{API_ROOT}/scopes"), post(scopes::create))
+        .route(
+            &format!("{API_ROOT}/scopes/{{id}}"),
+            get(scopes::get).delete(scopes::delete),
+        )
+        .route(
+            &format!("{API_ROOT}/scopes/{{id}}/fork"),
+            post(scopes::fork),
+        )
+        .route(&format!("{API_ROOT}/warm"), post(warming::warm))
         .route(&format!("{API_ROOT}/tasks"), post(run_task))
+        .route(&format!("{API_ROOT}/jobs"), get(jobs::list))
+        .route(
+            &format!("{API_ROOT}/jobs/{{id}}"),
+            get(jobs::get).delete(jobs::remove),
+        )
+        .route(
+            &format!("{API_ROOT}/jobs/{{id}}/cancel"),
+            post(jobs::cancel),
+        )
         .route(&format!("{API_ROOT}/task-batches"), post(run_task_batch))
-        .with_state(state);
-    let mut fallback_config =
-        ProxyConfig::new(&config.listen, &config.upstream, config.allow_remote);
-    if let Some(max) = config.raw_proxy_max_concurrent_requests {
-        fallback_config = fallback_config.with_max_concurrent_requests(max);
-    }
+        .route(&format!("{API_ROOT}/metrics"), get(monitor::metrics))
+        .route(&format!("{API_ROOT}/status"), get(monitor::status))
+        .route(&format!("{API_ROOT}/usage"), get(monitor::usage))
+        .route(&format!("{API_ROOT}/config"), get(monitor::config))
+        .route(
+            &format!("{API_ROOT}/config/reload"),
+            post(monitor::reload_config),
+        )
+        .with_state(state.clone());
     let fallback = proxy::app(fallback_config)?;
     let app = platform.merge(fallback);
-    Ok(if let Some(token) = config.auth_token.as_deref() {
+    let router = if let Some(token) = config.auth_token.as_deref() {
         app.layer(middleware::from_fn_with_state(
             AuthState {
                 token: Arc::from(token),
@@ -1136,7 +989,11 @@ pub fn app(config: &PlatformConfig) -> Result<Router> {
         ))
     } else {
         app
-    })
+    };
+    // The status page is a static shell with no data in it, so it is served outside the bearer
+    // check; its requests to `/status` carry the token the viewer enters.
+    let router = router.route("/_freellama/ui", get(monitor::ui));
+    Ok((router, state))
 }
 
 /// Serve the localhost model platform until Ctrl-C.
@@ -1148,14 +1005,38 @@ pub async fn serve(config: PlatformConfig) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&config.listen)
         .await
         .with_context(|| format!("bind platform at {}", config.listen))?;
-    let app = app(&config)?;
+    let (app, state) = build(&config)?;
+    if state.runtime.file().is_some() {
+        // Poll the runtime config's modification time; a changed file is re-resolved and pushed
+        // into admission without a restart. A bad edit keeps the last good values.
+        let watched = state.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(2));
+            loop {
+                ticker.tick().await;
+                match watched.runtime.reload(false) {
+                    Ok(Some(_)) => {
+                        watched.apply_tunables();
+                        eprintln!("runtime config reloaded");
+                    }
+                    Ok(None) => {}
+                    Err(error) => eprintln!("runtime config not applied: {error}"),
+                }
+            }
+        });
+    }
     println!("FreeLlama platform listening on http://{}", config.listen);
+    println!("Status page: http://{}/_freellama/ui", config.listen);
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
         })
         .await
-        .context("serve platform")
+        .context("serve platform")?;
+    if !state.telemetry.flush_ledger(Duration::from_secs(2)).await {
+        eprintln!("usage ledger flush did not finish within shutdown deadline");
+    }
+    Ok(())
 }
 
 /// Liveness plus a load-shedding signal.
@@ -1167,6 +1048,7 @@ pub async fn serve(config: PlatformConfig) -> Result<()> {
 /// input a caller needs. Standard readiness-endpoint practice, kept on `/health` rather than a new
 /// tool so the surface does not grow.
 async fn health(State(state): State<PlatformState>) -> Json<Value> {
+    let resource_snapshot = state.resources.snapshot().await;
     let feedback = state.feedback.read().await;
     let persistence_error = state.feedback_persistence_error.read().await.clone();
     let active_sessions = {
@@ -1174,6 +1056,8 @@ async fn health(State(state): State<PlatformState>) -> Json<Value> {
         sessions.prune_expired(state.session_ttl);
         sessions.len()
     };
+    let gpu_admission = state.gpu_admission.receipt();
+    let cpu_admission = state.cpu_admission.receipt();
     let feedback_for = |placement: &str| {
         let values = if placement == "cpu" {
             &feedback.cpu
@@ -1208,33 +1092,32 @@ async fn health(State(state): State<PlatformState>) -> Json<Value> {
             "authentication": "optional_bearer_all_routes",
             "immediate_unload_observation": "observe_then_unload",
             "task_batches": "independent_only_bounded_priority_fair",
-            "memory_kv_preflight": "metadata_lower_bound_ollama_final_authority",
+            "memory_kv_preflight": "metadata_f16_estimate_ollama_final_authority",
+            "raw_passthrough_admission": "stream_lifetime_bounded",
         },
         "backends": {
             "gpu": {
                 "upstream": state.upstream,
-                "admission": {
-                    "slots_total": state.gpu_admission.total,
-                    "slots_available": state.gpu_admission.available(),
-                }
+                "admission": gpu_admission,
             },
             "cpu": state.cpu_upstream.as_ref().map(|upstream| json!({
                 "upstream": upstream,
                 "models": state.cpu_models.as_ref(),
-                "admission": {
-                    "slots_total": state.cpu_admission.total,
-                    "slots_available": state.cpu_admission.available(),
-                }
+                "admission": cpu_admission,
             })),
         },
         "admission": {
             "scope": "per_backend_weighted_units",
-            "slots_total": state.gpu_admission.total + state.cpu_upstream.as_ref().map_or(0, |_| state.cpu_admission.total),
+            "slots_total": state.gpu_admission.total() + state.cpu_upstream.as_ref().map_or(0, |_| state.cpu_admission.total()),
             "slots_available": state.gpu_admission.available()
                 + state.cpu_upstream.as_ref().map_or(0, |_| state.cpu_admission.available()),
-            "max_queue_wait_seconds": state.queue_wait.as_secs(),
-            "costs": {"embedding": "ceil(input_items/4)", "chat": 2, "vision": 4},
-            "priority_fairness": {"policy": "weighted_fair_round_robin", "weights": {"interactive": 3, "normal": 2, "background": 1}},
+            "max_queue_wait_seconds": state.tunables().max_queue_wait().as_secs(),
+            "raw_proxy_max_concurrent_requests": state.tunables().raw_max_concurrent_requests,
+            "raw_proxy": state.raw_admission.receipt(),
+            "costs": state.tunables().admission_costs(),
+            "priority_fairness": {"policy": "weighted_fair_round_robin", "weights": {"interactive": 3, "normal": 2, "background": 1}, "starvation_prevention": "oldest_capacity_reservation", "max_capacity_bypasses": MAX_CAPACITY_BYPASSES},
+            "queue_deadline_scope": "admission_resources_and_transition",
+            "resources": resource_snapshot,
         },
         "sessions": {
             "scope": "in_memory_affinity_metadata_only",
@@ -1274,7 +1157,7 @@ async fn models(State(state): State<PlatformState>) -> Result<Json<Value>, ApiEr
             let model_type = ModelType::from_capabilities(model.capabilities.iter().copied());
             let mut observation = physical_placement_observation(
                 execution.placement,
-                model.resident.then_some(model.size),
+                model.resident_size,
                 model.resident_vram,
             );
             observation["source"] = json!("ollama_api_ps_catalog");
@@ -1309,10 +1192,45 @@ async fn require_active_session(
     {
         Ok(())
     } else {
-        Err(ApiError {
-            status: StatusCode::NOT_FOUND,
-            message: "session does not exist or has expired".to_owned(),
-        })
+        Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "session does not exist or has expired",
+        ))
+    }
+}
+
+/// One cancellation boundary for every session-scoped model operation, including interpretation.
+async fn with_session_cancellation<T>(
+    state: &PlatformState,
+    session_id: Option<&str>,
+    work: impl std::future::Future<Output = Result<T, ApiError>>,
+) -> Result<T, ApiError> {
+    let cancellation = if let Some(id) = session_id {
+        // Register under the same lock as validation: kill cannot slip between them.
+        let mut sessions = state.sessions.write().await;
+        if !sessions.touch(id, state.session_ttl) {
+            return Err(ApiError::new(
+                StatusCode::NOT_FOUND,
+                "session does not exist or has expired",
+            ));
+        }
+        sessions.cancellation(id)
+    } else {
+        None
+    };
+    if let Some(mut cancellation) = cancellation {
+        tokio::select! {
+            biased;
+            () = async {
+                if cancellation.wait_for(|killed| *killed).await.is_err() {
+                    // Ordinary delete/idle expiry releases affinity only, retaining its contract.
+                    std::future::pending::<()>().await;
+                }
+            } => Err(ApiError::session_killed()),
+            result = work => result,
+        }
+    } else {
+        work.await
     }
 }
 
@@ -1338,13 +1256,15 @@ async fn recommendations(
     require_active_session(&state, input.session_id.as_deref()).await?;
     let models = discover_models(&state).await?;
     let sessions = state.sessions.read().await;
-    let route_result = select_managed_route(&state, &input, &models, &sessions).await;
+    let requested_cost = state.tunables().task_cost(input.task);
+    let route_result =
+        select_managed_route(&state, &input, &models, &sessions, requested_cost, None).await;
     let (installed_route, installed_execution, installed_route_error) = match route_result {
         Ok(managed) => {
-            let execution = managed.execution_receipt(task_cost(managed.route.task));
+            let execution = managed.execution_receipt(requested_cost, &state).await;
             (Some(managed.route), Some(execution), None)
         }
-        Err(error) => (None, None, Some(error.message)),
+        Err(error) => (None, None, Some(error.body.error)),
     };
     drop(sessions);
     let machine = machine_profile(&state.upstream);
@@ -1388,10 +1308,12 @@ async fn route(
     require_active_session(&state, input.session_id.as_deref()).await?;
     let models = discover_models(&state).await?;
     let sessions = state.sessions.read().await;
-    let managed = select_managed_route(&state, &input, &models, &sessions).await?;
+    let requested_cost = state.tunables().task_cost(input.task);
+    let managed =
+        select_managed_route(&state, &input, &models, &sessions, requested_cost, None).await?;
     drop(sessions);
     let mut value = serde_json::to_value(&managed.route).expect("RouteDecision serializes");
-    value["execution"] = managed.execution_receipt(task_cost(managed.route.task));
+    value["execution"] = managed.execution_receipt(requested_cost, &state).await;
     Ok(Json(value))
 }
 
@@ -1416,10 +1338,34 @@ async fn natural_route(
     State(state): State<PlatformState>,
     Json(input): Json<NaturalRouteInput>,
 ) -> Result<Json<NaturalRouteResponse>, ApiError> {
+    let session_id = input.session_id.clone();
+    with_session_cancellation(
+        &state,
+        session_id.as_deref(),
+        interpret_natural_route(State(state.clone()), Json(input)),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_lines)] // Keep the admission/guard lifetimes visible in one request flow.
+async fn interpret_natural_route(
+    State(state): State<PlatformState>,
+    Json(input): Json<NaturalRouteInput>,
+) -> Result<Json<NaturalRouteResponse>, ApiError> {
     let text = input.text.trim();
     if text.is_empty() || text.len() > 16_384 {
         return Err(ApiError::bad_request(
             "text must contain between 1 and 16384 bytes",
+        ));
+    }
+    if context::estimated_text_tokens(text)
+        + context::estimated_text_tokens(intent_system_prompt())
+        + 96
+        + 512
+        > 2048
+    {
+        return Err(ApiError::bad_request(
+            "intent text exceeds the interpreter context budget; shorten the routing description",
         ));
     }
     require_active_session(&state, input.session_id.as_deref()).await?;
@@ -1433,6 +1379,8 @@ async fn natural_route(
         ],
         "stream": false,
         "think": false,
+        "truncate": false,
+        "shift": false,
         "format": intent_schema(),
         "keep_alive": "2m",
         "options": {"temperature": 0, "seed": 42, "num_predict": 96, "num_ctx": 2048}
@@ -1443,15 +1391,35 @@ async fn natural_route(
         // the transition lock so it cannot bypass the same capacity/model-load boundary enforced
         // for managed tasks. Use the write side conservatively because residency has not yet been
         // discovered and a cold interpreter call may replace the active runner.
+        let queue_deadline = tokio::time::Instant::now() + state.tunables().max_queue_wait();
         let (intent_slot, _, _) = admit(
             &state,
             &intent_target,
-            TaskKind::Completion,
+            state.tunables().task_cost(TaskKind::Completion),
             TaskPriority::Interactive,
-            1,
+            queue_deadline,
+            None,
         )
         .await?;
-        let intent_transition = intent_target.transition.write().await;
+        let intent_bytes = tokio::time::timeout_at(
+            queue_deadline,
+            intent_memory_requirement(&state, &intent_target),
+        )
+        .await
+        .map_err(|_| transition_timeout(&intent_target))?;
+        let intent_resource = state
+            .resources
+            .wait_for_capacity(
+                &intent_target.upstream,
+                intent_bytes,
+                queue_deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .map_err(resource_error)?;
+        let intent_transition =
+            tokio::time::timeout_at(queue_deadline, intent_target.transition.write())
+                .await
+                .map_err(|_| transition_timeout(&intent_target))?;
         let response = state
             .client
             .post(format!(
@@ -1469,6 +1437,7 @@ async fn natural_route(
             .await
             .map_err(ApiError::upstream)?;
         drop(intent_transition);
+        drop(intent_resource);
         drop(intent_slot);
         response
     };
@@ -1482,14 +1451,23 @@ async fn natural_route(
     let route_input = intent.clone().into_route_input(input.session_id);
     let models = discover_models(&state).await?;
     let sessions = state.sessions.read().await;
-    let managed = select_managed_route(&state, &route_input, &models, &sessions).await?;
+    let requested_cost = state.tunables().task_cost(route_input.task);
+    let managed = select_managed_route(
+        &state,
+        &route_input,
+        &models,
+        &sessions,
+        requested_cost,
+        None,
+    )
+    .await?;
     drop(sessions);
     Ok(Json(NaturalRouteResponse {
-        interpreter_model: state.intent_model,
+        interpreter_model: state.intent_model.clone(),
         interpreter_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         intent,
         guard_adjustments,
-        execution: managed.execution_receipt(task_cost(managed.route.task)),
+        execution: managed.execution_receipt(requested_cost, &state).await,
         route: managed.route,
     }))
 }
@@ -1498,10 +1476,10 @@ async fn create_session(State(state): State<PlatformState>) -> Result<Json<Value
     let mut sessions = state.sessions.write().await;
     sessions.prune_expired(state.session_ttl);
     if sessions.len() >= state.max_sessions {
-        return Err(ApiError {
-            status: StatusCode::TOO_MANY_REQUESTS,
-            message: format!("session limit reached ({})", state.max_sessions),
-        });
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            format!("session limit reached ({})", state.max_sessions),
+        ));
     }
     let id = sessions.create();
     Ok(Json(json!({
@@ -1521,18 +1499,45 @@ async fn delete_session(
     if sessions.remove(&session_id) {
         Ok(StatusCode::NO_CONTENT)
     } else {
-        Err(ApiError {
-            status: StatusCode::NOT_FOUND,
-            message: "session does not exist or has expired".to_owned(),
-        })
+        Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "session does not exist or has expired",
+        ))
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+async fn kill_session(
+    State(state): State<PlatformState>,
+    AxumPath(session_id): AxumPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    let mut sessions = state.sessions.write().await;
+    sessions.prune_expired(state.session_ttl);
+    if !sessions.kill(&session_id) {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "session does not exist or has expired",
+        ));
+    }
+    Ok(Json(json!({
+        "session_id": session_id,
+        "killed": true,
+        "cancellation": "requested",
+        "runner_stop_confirmed": false,
+        "model_unloaded": false,
+    })))
+}
+
+#[derive(Debug, Clone, Serialize)]
 #[serde(deny_unknown_fields)]
 struct TaskInput {
     #[serde(flatten)]
     route: RouteInput,
+    scope_id: Option<String>,
+    scope_revision: Option<u64>,
+    #[serde(skip)]
+    route_fields: BTreeSet<String>,
+    #[serde(skip)]
+    operation: warming::ManagedOperation,
     #[serde(default)]
     messages: Vec<Value>,
     prompt: Option<String>,
@@ -1547,17 +1552,78 @@ struct TaskInput {
     #[serde(default)]
     priority: TaskPriority,
     tools: Option<Value>,
-    /// Overrides the default `keep_alive` sent to Ollama. `"-1"` is normalized to Ollama's
-    /// numeric `-1` infinite-residency form; durations such as `"5m"` and `"0"` pass through. Defaults to
-    /// `"5m"` when omitted, matching prior behavior exactly — callers that never set this see no
-    /// change. A one-off embedding call is the clearest case for `"0"`: no reason to keep a model
-    /// resident after a single vector is computed.
+    /// Explicit caller residency override; omission uses the finite adaptive policy.
     keep_alive: Option<String>,
     /// Advanced Ollama controls which do not belong to routing. `num_ctx` stays owned by
     /// `context_tokens`, and backend placement owns `num_gpu`, so the route receipt always matches
     /// what is sent upstream.
     #[serde(default)]
     request_options: OllamaRequestOptions,
+    /// Per-request admission wait in seconds, capped by the server's `max_queue_wait_seconds`.
+    #[serde(default)]
+    max_wait_seconds: Option<u64>,
+    #[serde(default)]
+    defer: bool,
+    /// Total time including discovery, queueing, loading and generation; capped by the server.
+    timeout_seconds: Option<u64>,
+    #[serde(skip)]
+    job_progress: Option<jobs::JobProgress>,
+}
+
+#[derive(Deserialize)]
+#[serde(remote = "TaskInput", deny_unknown_fields)]
+struct TaskInputWire {
+    #[serde(flatten)]
+    route: RouteInput,
+    scope_id: Option<String>,
+    scope_revision: Option<u64>,
+    #[serde(skip)]
+    route_fields: BTreeSet<String>,
+    #[serde(skip)]
+    operation: warming::ManagedOperation,
+    #[serde(default)]
+    messages: Vec<Value>,
+    prompt: Option<String>,
+    /// Base64-encoded images (Ollama's own `images` format — no data URI prefix) attached to the
+    /// single message built from `prompt`. For multi-turn `messages`, put `images` directly on
+    /// the relevant message object instead; this field only applies to the `prompt` convenience
+    /// path.
+    images: Option<Vec<String>>,
+    input: Option<Value>,
+    /// Service class affects admission only; it never changes model selection or bypasses a
+    /// backend's weighted capacity.
+    #[serde(default)]
+    priority: TaskPriority,
+    tools: Option<Value>,
+    /// Explicit caller residency override; omission uses the finite adaptive policy.
+    keep_alive: Option<String>,
+    /// Advanced Ollama controls which do not belong to routing. `num_ctx` stays owned by
+    /// `context_tokens`, and backend placement owns `num_gpu`, so the route receipt always matches
+    /// what is sent upstream.
+    #[serde(default)]
+    request_options: OllamaRequestOptions,
+    /// Per-request admission wait in seconds, capped by the server's `max_queue_wait_seconds`.
+    #[serde(default)]
+    max_wait_seconds: Option<u64>,
+    #[serde(default)]
+    defer: bool,
+    /// Total time including discovery, queueing, loading and generation; capped by the server.
+    timeout_seconds: Option<u64>,
+    #[serde(skip)]
+    job_progress: Option<jobs::JobProgress>,
+}
+
+impl<'de> Deserialize<'de> for TaskInput {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = Value::deserialize(deserializer)?;
+        let fields = value
+            .as_object()
+            .map(|object| object.keys().cloned().collect())
+            .unwrap_or_default();
+        let mut input = TaskInputWire::deserialize(value).map_err(serde::de::Error::custom)?;
+        input.route_fields = fields;
+        Ok(input)
+    }
 }
 
 /// Explicitly independent managed work. Dependencies are intentionally not accepted: a batch is
@@ -1610,8 +1676,9 @@ fn next_batch_task(
 
 async fn run_task_batch(
     State(state): State<PlatformState>,
-    Json(input): Json<TaskBatchInput>,
+    input: Result<Json<TaskBatchInput>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<Value>, ApiError> {
+    let Json(input) = input.map_err(|error| ApiError::invalid_task_request(&error))?;
     if input.tasks.is_empty() || input.tasks.len() > MAX_BATCH_TASKS {
         return Err(ApiError::bad_request(format!(
             "tasks must contain 1 to {MAX_BATCH_TASKS} items"
@@ -1622,6 +1689,11 @@ async fn run_task_batch(
         if item.id.trim().is_empty() || !ids.insert(item.id.clone()) {
             return Err(ApiError::bad_request(
                 "every batch item needs a distinct, non-empty id",
+            ));
+        }
+        if item.task.defer {
+            return Err(ApiError::bad_request(
+                "batch tasks cannot defer; submit individual jobs instead",
             ));
         }
         if !item.independent {
@@ -1642,31 +1714,38 @@ async fn run_task_batch(
         .take(input.tasks.len())
         .collect::<Vec<Option<Value>>>();
     let mut running = JoinSet::new();
+    // A panicking worker must fail only its own item: keep completed answers instead of
+    // discarding the whole batch, which is what `?` on the JoinError used to do.
+    let mut in_flight = BTreeMap::new();
 
     while !pending.is_empty() || !running.is_empty() {
         while running.len() < max_parallelism && !pending.is_empty() {
             let index = next_batch_task(&mut pending, &input.tasks, &mut credits);
-            let id = input.tasks[index].id.clone();
             let task = input.tasks[index].task.clone();
             let task_state = state.clone();
-            running.spawn(async move {
-                let result = run_task(State(task_state), Json(task)).await;
-                (index, id, result)
-            });
+            let handle = running.spawn(Box::pin(execution::execute_task(
+                State(task_state),
+                Json(task),
+            )));
+            in_flight.insert(handle.id(), index);
         }
-        if let Some(joined) = running.join_next().await {
-            let (index, id, result) = joined.map_err(|error| ApiError {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                message: format!("batch worker failed: {error}"),
-            })?;
-            results[index] = Some(match result {
-                Ok(Json(response)) => json!({ "id": id, "ok": true, "response": response }),
-                Err(error) => json!({
-                    "id": id,
-                    "ok": false,
-                    "status": error.status.as_u16(),
-                    "error": error.message,
-                }),
+        if let Some(joined) = running.join_next_with_id().await {
+            let (task_id, outcome) = match joined {
+                Ok((task_id, result)) => (task_id, Ok(result)),
+                Err(error) => (error.id(), Err(error)),
+            };
+            let Some(index) = in_flight.remove(&task_id) else {
+                continue;
+            };
+            let id = input.tasks[index].id.clone();
+            results[index] = Some(match outcome {
+                Ok(Ok(Json(response))) => json!({ "id": id, "ok": true, "response": response }),
+                Ok(Err(error)) => error.into_batch_result(id),
+                Err(error) => ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("batch worker failed: {error}"),
+                )
+                .into_batch_result(id),
             });
         }
     }
@@ -1683,7 +1762,7 @@ async fn run_task_batch(
     })))
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct OllamaRequestOptions {
     format: Option<Value>,
@@ -1693,588 +1772,8 @@ struct OllamaRequestOptions {
     top_logprobs: Option<u32>,
 }
 
-fn apply_request_options(
-    task: TaskKind,
-    decision: &mut RouteDecision,
-    request: &OllamaRequestOptions,
-) -> Result<(), ApiError> {
-    for reserved in ["num_ctx", "num_gpu"] {
-        if request
-            .options
-            .as_ref()
-            .is_some_and(|options| options.contains_key(reserved))
-        {
-            return Err(ApiError::bad_request(anyhow::anyhow!(
-                "request_options.options.{reserved} is routing-owned; use context_tokens for num_ctx and execution_preference/operator backend assignment for num_gpu"
-            )));
-        }
-    }
-    if let Some(format) = &request.format
-        && !matches!(format, Value::Object(_))
-        && format.as_str() != Some("json")
-    {
-        return Err(ApiError::bad_request(anyhow::anyhow!(
-            "request_options.format must be \"json\" or a JSON schema object"
-        )));
-    }
-    if let Some(think) = &request.think
-        && !think.is_boolean()
-        && !matches!(think.as_str(), Some("low" | "medium" | "high"))
-    {
-        return Err(ApiError::bad_request(anyhow::anyhow!(
-            "request_options.think must be a boolean or one of low, medium, high"
-        )));
-    }
-    if request.top_logprobs.is_some() && request.logprobs != Some(true) {
-        return Err(ApiError::bad_request(anyhow::anyhow!(
-            "request_options.top_logprobs requires logprobs=true"
-        )));
-    }
-    if matches!(task, TaskKind::Embedding)
-        && (request.format.is_some()
-            || request.think.is_some()
-            || request.logprobs.is_some()
-            || request.top_logprobs.is_some())
-    {
-        return Err(ApiError::bad_request(anyhow::anyhow!(
-            "embedding tasks accept request_options.options only; format, think, and logprobs are chat controls"
-        )));
-    }
-    let options = decision
-        .options
-        .as_object_mut()
-        .expect("route options are always an object");
-    options.extend(request.options.clone().unwrap_or_default());
-    if let Some(think) = &request.think {
-        decision.think = think.clone();
-    }
-    Ok(())
-}
-
-fn build_managed_request(
-    input: &mut TaskInput,
-    decision: &RouteDecision,
-    keep_alive: &Value,
-) -> Result<(&'static str, Value), ApiError> {
-    if matches!(input.route.task, TaskKind::Embedding) {
-        let value = input
-            .input
-            .take()
-            .context("embedding task requires input")
-            .map_err(ApiError::bad_request)?;
-        return Ok((
-            "/api/embed",
-            json!({
-                "model": decision.selected_model,
-                "input": value,
-                "keep_alive": keep_alive,
-                "options": decision.options,
-            }),
-        ));
-    }
-
-    let messages = if input.messages.is_empty() {
-        let mut message = json!({
-            "role": "user",
-            "content": input.prompt.take().context("task requires prompt or messages").map_err(ApiError::bad_request)?
-        });
-        if let Some(images) = input.images.take() {
-            message["images"] = json!(images);
-        }
-        vec![message]
-    } else {
-        std::mem::take(&mut input.messages)
-    };
-    let mut body = json!({
-        "model": decision.selected_model,
-        "messages": messages,
-        "stream": false,
-        "keep_alive": keep_alive,
-        "options": decision.options,
-    });
-    if !decision.think.is_null() {
-        body["think"] = decision.think.clone();
-    }
-    if let Some(tools) = input.tools.take() {
-        body["tools"] = tools;
-    }
-    if let Some(format) = input.request_options.format.take() {
-        body["format"] = format;
-    }
-    if let Some(logprobs) = input.request_options.logprobs {
-        body["logprobs"] = json!(logprobs);
-    }
-    if let Some(top_logprobs) = input.request_options.top_logprobs {
-        body["top_logprobs"] = json!(top_logprobs);
-    }
-    Ok(("/api/chat", body))
-}
-
-/// Wait for an admission slot sized to the task, or refuse.
-///
-/// Returns the held permit, the cost charged, and how long the caller queued.
-async fn admit(
-    state: &PlatformState,
-    execution: &ExecutionTarget,
-    task: TaskKind,
-    priority: TaskPriority,
-    batch_items: usize,
-) -> Result<(AdmissionPermit, u32, u128), ApiError> {
-    let budget = u32::try_from(execution.admission.total)
-        .unwrap_or(u32::MAX)
-        .max(1);
-    let cost = task_cost_for(task, batch_items).min(budget).max(1);
-    let wait = state.queue_wait;
-    match execution
-        .admission
-        .acquire(cost as usize, priority, wait)
-        .await
-    {
-        Ok((permit, queued)) => Ok((permit, cost, queued)),
-        Err(_) => Err(ApiError {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            message: format!(
-                "server busy: no admission slot within {}s (task cost {cost} of {budget} \
-                 units; priority {:?} on the {} backend). Retry, or raise {}.",
-                wait.as_secs(),
-                priority,
-                execution.placement,
-                if execution.placement == "cpu" {
-                    "--cpu-max-concurrent-tasks"
-                } else {
-                    "--max-concurrent-tasks"
-                }
-            ),
-        }),
-    }
-}
-
-async fn run_task(
-    State(state): State<PlatformState>,
-    Json(mut input): Json<TaskInput>,
-) -> Result<Json<Value>, ApiError> {
-    // Function definitions are an execution requirement, not merely an optional payload field.
-    // Derive the capability at the server boundary so direct HTTP/NAPI callers cannot accidentally
-    // route tool work to a completion-only model.
-    if input.tools.is_some() {
-        input.route.required_capabilities.insert(Capability::Tools);
-    }
-    require_active_session(&state, input.route.session_id.as_deref()).await?;
-    let models = discover_models(&state).await?;
-    let sessions = state.sessions.read().await;
-    let managed = select_managed_route(&state, &input.route, &models, &sessions).await?;
-    drop(sessions);
-
-    let preflight =
-        memory_kv_preflight(&managed.model, &managed.route, managed.execution.placement);
-    if preflight["status"] == "refuse_known_floor_exceeds_host_headroom" {
-        return Err(ApiError::bad_request(
-            "known model weights plus F16 KV-cache lower bound exceed 80% of this CPU/unified host; reduce context_tokens, select a smaller model, or let Ollama run this on a separate verified accelerator",
-        ));
-    }
-
-    let batch_items = input_batch_items(&input);
-    let execution_receipt = managed.execution_receipt(task_cost_for(input.route.task, batch_items));
-    let mut decision = managed.route;
-    let execution = managed.execution;
-    let immediate_unload = requests_immediate_unload(input.keep_alive.as_deref());
-    // `keep_alive:0` makes Ollama unload before its response reaches FreeLlama, so `/api/ps`
-    // cannot prove where the work ran. Hold the runner briefly, observe it, then issue and verify
-    // an explicit unload before returning. The caller still receives immediate-unload semantics.
-    let keep_alive = if immediate_unload {
-        json!("30s")
-    } else {
-        normalize_keep_alive(input.keep_alive.take())
-    };
-    apply_request_options(input.route.task, &mut decision, &input.request_options)?;
-    let (path, mut body) = build_managed_request(&mut input, &decision, &keep_alive)?;
-    apply_execution_options(&mut body, &execution);
-    // Slot first, THEN the transition lock — in both branches. The order matters: if the
-    // non-resident path took the write lock before its slot while resident tasks held slots and
-    // waited on the read lock, the two would deadlock. One consistent order removes that entirely.
-    let (slot, cost, queue_wait_ms) = admit(
-        &state,
-        &execution,
-        decision.task,
-        input.priority,
-        batch_items,
-    )
-    .await?;
-
-    // Residency was discovered before admission and can be stale by the time this request reaches
-    // the transition lock. Recheck while holding the read side: if the selected runner is still
-    // resident, that lock prevents a managed writer from transitioning it during execution. A
-    // stale or unavailable snapshot falls back to the exclusive side before the request is sent.
-    let transition = if decision.resident {
-        let shared = Arc::clone(&execution.transition).read_owned().await;
-        if model_is_resident(&state.client, &execution.upstream, &decision.selected_model).await {
-            TransitionPermit::Shared(shared)
-        } else {
-            drop(shared);
-            TransitionPermit::Exclusive(Arc::clone(&execution.transition).write_owned().await)
-        }
-    } else {
-        TransitionPermit::Exclusive(Arc::clone(&execution.transition).write_owned().await)
-    };
-    let admission_mode = transition.admission_mode();
-    let selected_model = decision.selected_model.clone();
-    let session_id = input.route.session_id.clone();
-    let result = forward_managed_task(
-        &state,
-        decision,
-        &execution,
-        execution_receipt,
-        path,
-        body,
-        admission_mode,
-        slot,
-        queue_wait_ms,
-        cost,
-        immediate_unload,
-    )
-    .await;
-    drop(transition);
-
-    // Affinity means the last model that successfully executed for the session. An upstream error
-    // must not pin a model the caller never received a successful result from.
-    if result.is_ok()
-        && let Some(id) = session_id.as_deref()
-    {
-        state.sessions.write().await.bind(id, &selected_model);
-    }
-    result
-}
-
-/// Retry 500/502/504 (load-model blips) but not 503 busy. Same rule as the passthrough proxy.
-/// Retrying 503 while holding an admission slot — and on a cold load, the exclusive write lock —
-/// amplifies the saturation the semaphore exists to shed.
-fn retryable_managed_status(status: StatusCode) -> bool {
-    proxy::retryable_upstream_status(status)
-}
-
-/// POST JSON upstream, retrying transient failures on the same backoff schedule the passthrough
-/// proxy uses (`proxy::retry_delay`).
-///
-/// The managed-task path was the one retry-capable caller that had no retries: an Ollama 500 —
-/// which it returns under load-model contention, the exact condition managed routing creates —
-/// failed the whole task, while the byte-identical request through the passthrough proxy would
-/// have survived it. The asymmetry was worse than it looks, because the caller holds the
-/// `managed_execution` admission permit across this call: failing bare also threw away an
-/// exclusive slot it had already queued for, so the retry it needed was the expensive one to skip.
-async fn post_json_with_retries(
-    state: &PlatformState,
-    upstream: &str,
-    path: &str,
-    body: &Value,
-) -> Result<(StatusCode, Value), ApiError> {
-    let url = format!("{}{path}", upstream.trim_end_matches('/'));
-    let mut attempt = 0u32;
-    loop {
-        attempt += 1;
-        let more_attempts = attempt < proxy::MAX_ATTEMPTS;
-        match state.client.post(&url).json(body).send().await {
-            Ok(response) if retryable_managed_status(response.status()) && more_attempts => {
-                eprintln!(
-                    "managed task retry attempt={attempt} status={} path={path}",
-                    response.status()
-                );
-                tokio::time::sleep(proxy::retry_delay(attempt)).await;
-            }
-            Ok(response) => {
-                let status = response.status();
-                let bytes = response.bytes().await.map_err(ApiError::upstream)?;
-                // A failing Ollama does not always answer in JSON (a wedged runner can return a
-                // plain-text or HTML body). Parsing strictly here used to convert a truthful 500
-                // into a misleading "decode error", hiding the real upstream status from the
-                // caller — so fall back to carrying the body through as text.
-                let value = serde_json::from_slice::<Value>(&bytes).unwrap_or_else(
-                    |_| json!({ "error": String::from_utf8_lossy(&bytes).trim().to_owned() }),
-                );
-                return Ok((status, value));
-            }
-            // A timeout is NOT a transient hiccup here. This client's per-attempt budget is
-            // `platform_task_timeout()` (900s by default), and the caller holds both an admission
-            // slot and — on the non-resident path — the exclusive `managed_execution` write lock
-            // across every attempt. Retrying a timeout would therefore hold the whole managed
-            // plane for up to 3 x 900s, which is exactly the "one hung request deadlocks every
-            // subsequent managed task" failure the client timeout was added to prevent. Connection
-            // errors are still retried: those fail fast and cost nothing to re-pay.
-            Err(error) if more_attempts && !error.is_timeout() => {
-                eprintln!("managed task retry attempt={attempt} error={error:#} path={path}");
-                tokio::time::sleep(proxy::retry_delay(attempt)).await;
-            }
-            Err(error) => return Err(ApiError::upstream(error)),
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn forward_managed_task(
-    state: &PlatformState,
-    decision: RouteDecision,
-    execution: &ExecutionTarget,
-    mut execution_receipt: Value,
-    path: &str,
-    body: Value,
-    admission_mode: &str,
-    // Held for the duration of the upstream call, then dropped. Taking it by value rather than by
-    // reference makes the lifetime the compiler's problem instead of a comment's.
-    slot: AdmissionPermit,
-    queue_wait_ms: u128,
-    cost: u32,
-    immediate_unload: bool,
-) -> Result<Json<Value>, ApiError> {
-    let (status, value) = post_json_with_retries(state, &execution.upstream, path, &body).await?;
-    if !status.is_success() {
-        return Err(ApiError {
-            status,
-            message: value.to_string(),
-        });
-    }
-    let metrics = runtime_metrics(&value);
-    let placement = observe_physical_placement(state, execution, &decision.selected_model).await;
-    let feedback_accepted = placement["status"] == "verified";
-    execution_receipt["observation"] = placement;
-    let slots_total = execution.admission.total;
-    // Report throttling rather than hiding it. A caller that fans out embeddings needs to know it
-    // is queueing here — otherwise the only symptom is latency it cannot attribute.
-    let slots_available = execution.admission.available();
-    let feedback_receipt = {
-        let mut feedback = state.feedback.write().await;
-        let by_task = if execution.placement == "cpu" {
-            &mut feedback.cpu
-        } else {
-            &mut feedback.gpu
-        };
-        let observation = by_task.entry(decision.task).or_default();
-        if feedback_accepted {
-            let warm_score = if admission_mode == "resident_shared" {
-                feedback_work_unit_ns(decision.task, &value)
-            } else {
-                None
-            };
-            observation.record(&decision.selected_model, warm_score, queue_wait_ms);
-        }
-        let mut receipt = observation.receipt();
-        receipt["accepted"] = json!(feedback_accepted);
-        receipt["reason"] = json!(if feedback_accepted {
-            "physical_placement_verified"
-        } else {
-            "physical_placement_unverified_or_mismatched"
-        });
-        let snapshot = feedback.clone();
-        drop(feedback);
-        let persistence = if feedback_accepted {
-            if let Some(path) = state.feedback_file.as_deref() {
-                match persist_feedback(path, &snapshot) {
-                    Ok(()) => {
-                        *state.feedback_persistence_error.write().await = None;
-                        json!({"enabled": true, "persisted": true, "schema_version": FEEDBACK_SCHEMA_VERSION})
-                    }
-                    Err(error) => {
-                        let message = error.to_string();
-                        *state.feedback_persistence_error.write().await = Some(message.clone());
-                        json!({"enabled": true, "persisted": false, "error": message})
-                    }
-                }
-            } else {
-                json!({"enabled": false, "persisted": false})
-            }
-        } else {
-            json!({"enabled": state.feedback_file.is_some(), "persisted": false, "reason": "sample_not_accepted"})
-        };
-        receipt["persistence"] = persistence;
-        receipt
-    };
-    if immediate_unload {
-        execution_receipt["lifecycle"] =
-            unload_after_observation(state, execution, &decision.selected_model).await;
-    }
-    drop(slot);
-    Ok(Json(json!({
-        "route": decision,
-        "execution": execution_receipt,
-        "admission": {
-            "mode": admission_mode,
-            "queue_wait_ms": queue_wait_ms,
-            "slots_total": slots_total,
-            "slots_available_during_call": slots_available,
-            "cost": cost,
-        },
-        "metrics": metrics,
-        "feedback": feedback_receipt,
-        "response": value
-    })))
-}
-
-async fn unload_after_observation(
-    state: &PlatformState,
-    execution: &ExecutionTarget,
-    model: &str,
-) -> Value {
-    let body = json!({"model": model, "keep_alive": 0, "stream": false});
-    match post_json_with_retries(state, &execution.upstream, "/api/generate", &body).await {
-        Ok((status, _)) if status.is_success() => {
-            let observation = observe_physical_placement(state, execution, model).await;
-            let unloaded = observation["status"] == "not_resident";
-            json!({
-                "requested": "immediate_unload",
-                "status": if unloaded { "verified" } else { "failed" },
-                "post_unload_observation": observation,
-            })
-        }
-        Ok((status, body)) => json!({
-            "requested": "immediate_unload",
-            "status": "failed",
-            "upstream_status": status.as_u16(),
-            "error": body,
-        }),
-        Err(error) => json!({
-            "requested": "immediate_unload",
-            "status": "failed",
-            "error": error.message,
-        }),
-    }
-}
-
-/// Observe the processor that Ollama actually loaded after a managed request. An assignment to
-/// the CPU daemon plus `num_gpu:0` is a request, not proof: Metal/MLX builds may still put every
-/// byte in VRAM. Unknown/mixed/mismatched observations are returned to the caller and excluded
-/// from adaptive feedback so the scheduler cannot learn from a false device label.
-async fn observe_physical_placement(
-    state: &PlatformState,
-    execution: &ExecutionTarget,
-    model: &str,
-) -> Value {
-    let Ok(ps) = get_json(&state.client, &execution.upstream, "/api/ps").await else {
-        return json!({
-            "processor": "unknown",
-            "status": "unavailable",
-            "source": "ollama_api_ps_after_execution"
-        });
-    };
-    let running = ps
-        .get("models")
-        .and_then(Value::as_array)
-        .and_then(|models| {
-            models.iter().find(|entry| {
-                entry
-                    .get("name")
-                    .or_else(|| entry.get("model"))
-                    .and_then(Value::as_str)
-                    == Some(model)
-            })
-        });
-    let Some(running) = running else {
-        return json!({
-            "processor": "unknown",
-            "status": "not_resident",
-            "source": "ollama_api_ps_after_execution"
-        });
-    };
-    physical_placement_observation(
-        execution.placement,
-        running.get("size").and_then(Value::as_u64),
-        running.get("size_vram").and_then(Value::as_u64),
-    )
-}
-
-async fn model_is_resident(client: &Client, upstream: &str, model: &str) -> bool {
-    get_json(client, upstream, "/api/ps")
-        .await
-        .ok()
-        .and_then(|ps| ps.get("models").and_then(Value::as_array).cloned())
-        .is_some_and(|models| {
-            models.iter().any(|entry| {
-                entry
-                    .get("name")
-                    .or_else(|| entry.get("model"))
-                    .and_then(Value::as_str)
-                    == Some(model)
-            })
-        })
-}
-
-fn physical_placement_observation(
-    requested: &str,
-    size: Option<u64>,
-    size_vram: Option<u64>,
-) -> Value {
-    let processor = match (size, size_vram) {
-        (_, Some(0)) => "cpu",
-        (Some(size), Some(vram)) if size > 0 && vram >= size => "gpu",
-        (Some(size), Some(vram)) if size > 0 && vram > 0 => "mixed",
-        (None, Some(vram)) if vram > 0 => "gpu",
-        _ => "unknown",
-    };
-    let status = if processor == "unknown" {
-        "unavailable"
-    } else if processor == requested {
-        "verified"
-    } else {
-        "mismatch"
-    };
-    json!({
-        "processor": processor,
-        "status": status,
-        "source": "ollama_api_ps_after_execution",
-        "size": size,
-        "size_vram": size_vram,
-    })
-}
-
-/// Normalize unlike prompt sizes before backend feedback compares them. Generation speed uses
-/// decode nanoseconds per output token; embeddings use total nanoseconds per input token because
-/// Ollama does not report a separate embedding-evaluation duration.
-fn feedback_work_unit_ns(task: TaskKind, response: &Value) -> Option<u64> {
-    let (duration, units) = if matches!(task, TaskKind::Embedding) {
-        (
-            response.get("total_duration").and_then(Value::as_u64),
-            response.get("prompt_eval_count").and_then(Value::as_u64),
-        )
-    } else {
-        (
-            response.get("eval_duration").and_then(Value::as_u64),
-            response.get("eval_count").and_then(Value::as_u64),
-        )
-    };
-    match (duration, units) {
-        (Some(duration), Some(units)) if duration > 0 && units > 0 => Some(duration / units),
-        _ => None,
-    }
-}
-
-/// Extract prompt-free performance fields from an Ollama response.
-#[must_use]
-pub fn runtime_metrics(response: &Value) -> Value {
-    let prompt_count = response.get("prompt_eval_count").and_then(Value::as_u64);
-    let prompt_duration = response.get("prompt_eval_duration").and_then(Value::as_u64);
-    let output_count = response.get("eval_count").and_then(Value::as_u64);
-    let output_duration = response.get("eval_duration").and_then(Value::as_u64);
-    json!({
-        "total_duration_ns": response.get("total_duration").and_then(Value::as_u64),
-        "load_duration_ns": response.get("load_duration").and_then(Value::as_u64),
-        "prompt_tokens": prompt_count,
-        "prompt_duration_ns": prompt_duration,
-        "prompt_tokens_per_second": tokens_per_second(prompt_count, prompt_duration),
-        "output_tokens": output_count,
-        "output_duration_ns": output_duration,
-        "output_tokens_per_second": tokens_per_second(output_count, output_duration),
-    })
-}
-
-fn tokens_per_second(count: Option<u64>, duration_ns: Option<u64>) -> Option<f64> {
-    let (Some(count), Some(duration_ns)) = (count, duration_ns) else {
-        return None;
-    };
-    if duration_ns == 0 {
-        return None;
-    }
-    #[allow(clippy::cast_precision_loss)]
-    Some(count as f64 * 1_000_000_000.0 / duration_ns as f64)
-}
-
 async fn discover_models(state: &PlatformState) -> Result<Vec<CatalogModel>, ApiError> {
+    state.refresh_ollama_settings().await;
     if let Some(mut models) = snapshot_catalog(&state.catalog_cache).await {
         refresh_residency(state, &mut models).await?;
         return Ok(models);
@@ -2305,10 +1804,16 @@ async fn fill_catalog(state: &PlatformState) -> Result<Vec<CatalogModel>, ApiErr
 }
 
 async fn fetch_catalog(state: &PlatformState) -> Result<Vec<CatalogModel>, ApiError> {
-    let mut models = fetch_catalog_from(state, &state.upstream).await?;
+    let (gpu, cpu) = tokio::join!(fetch_catalog_from(state, &state.upstream), async {
+        match &state.cpu_upstream {
+            Some(upstream) => Some(fetch_catalog_from(state, upstream).await),
+            None => None,
+        }
+    });
+    let mut models = gpu?;
     models.retain(|model| !state.cpu_models.contains(&model.name));
-    if let Some(cpu_upstream) = &state.cpu_upstream {
-        let mut cpu_models = fetch_catalog_from(state, cpu_upstream).await?;
+    if let Some(cpu) = cpu {
+        let mut cpu_models = cpu?;
         cpu_models.retain(|model| state.cpu_models.contains(&model.name));
         models.extend(cpu_models);
     }
@@ -2320,8 +1825,12 @@ async fn fetch_catalog_from(
     state: &PlatformState,
     upstream: &str,
 ) -> Result<Vec<CatalogModel>, ApiError> {
-    let tags = get_json(&state.client, upstream, "/api/tags").await?;
-    let ps = get_json(&state.client, upstream, "/api/ps").await?;
+    let (tags, ps) = tokio::join!(
+        get_json(&state.client, upstream, "/api/tags"),
+        get_json(&state.client, upstream, "/api/ps")
+    );
+    let tags = tags?;
+    let ps = ps?;
     let resident = ps
         .get("models")
         .and_then(Value::as_array)
@@ -2332,15 +1841,21 @@ async fn fetch_catalog_from(
         .and_then(Value::as_array)
         .context("Ollama tags response has no models")
         .map_err(ApiError::upstream)?;
+    let names = entries
+        .iter()
+        .map(|entry| {
+            entry
+                .get("name")
+                .or_else(|| entry.get("model"))
+                .and_then(Value::as_str)
+                .context("Ollama model has no name")
+                .map_err(ApiError::upstream)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut shows = show_models(state, upstream, &names).await?;
     let mut models = Vec::with_capacity(entries.len());
-    for entry in entries {
-        let name = entry
-            .get("name")
-            .or_else(|| entry.get("model"))
-            .and_then(Value::as_str)
-            .context("Ollama model has no name")
-            .map_err(ApiError::upstream)?;
-        let Some(show) = show_model(state, upstream, name).await? else {
+    for (index, (entry, name)) in entries.iter().zip(names).enumerate() {
+        let Some(show) = shows[index].take() else {
             continue;
         };
         let capabilities = show
@@ -2351,15 +1866,9 @@ async fn fetch_catalog_from(
             .filter_map(Value::as_str)
             .filter_map(parse_capability)
             .collect();
-        let advertised_context =
-            show.get("model_info")
-                .and_then(Value::as_object)
-                .and_then(|info| {
-                    info.iter()
-                        .find(|(key, _)| key.ends_with(".context_length"))
-                        .and_then(|(_, value)| value.as_u64())
-                });
+        let advertised_context = advertised_context_from_show(&show);
         let kv_cache_bytes_per_token_f16 = estimate_kv_cache_bytes_per_token_f16(&show);
+        let modelfile_num_ctx = ollama_env::modelfile_num_ctx(&show);
         let running = resident.iter().find(|running| {
             running
                 .get("name")
@@ -2368,12 +1877,20 @@ async fn fetch_catalog_from(
                 == Some(name)
         });
         models.push(CatalogModel {
+            digest: entry
+                .get("digest")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
             name: name.to_owned(),
             size: entry.get("size").and_then(Value::as_u64).unwrap_or(0),
             capabilities,
             advertised_context,
             kv_cache_bytes_per_token_f16,
+            modelfile_num_ctx,
             resident: running.is_some(),
+            resident_size: running
+                .and_then(|value| value.get("size"))
+                .and_then(Value::as_u64),
             resident_vram: running
                 .and_then(|value| value.get("size_vram"))
                 .and_then(Value::as_u64),
@@ -2393,27 +1910,111 @@ async fn fetch_catalog_from(
     Ok(models)
 }
 
-/// Derive the exact F16 K+V cache bytes per token from the architecture fields Ollama exposes.
-/// A missing or malformed field returns `None`: unlike a benchmark heuristic, memory admission
-/// must never manufacture a model shape it did not observe.
+/// Text context belongs to the declared architecture, not an auxiliary vision encoder. Legacy
+/// metadata without an architecture is usable only when there is one unambiguous context field.
+fn advertised_context_from_show(show: &Value) -> Option<u64> {
+    let info = show.get("model_info")?.as_object()?;
+    let value = if let Some(architecture) = info.get("general.architecture") {
+        info.get(&format!("{}.context_length", architecture.as_str()?))?
+    } else {
+        let mut values = info
+            .iter()
+            .filter(|(key, _)| key.ends_with(".context_length"));
+        let (_, value) = values.next()?;
+        if values.next().is_some() {
+            return None;
+        }
+        value
+    };
+    value.as_u64().filter(|context| *context > 0)
+}
+
+/// Estimate unpadded F16 K+V bytes per token for known, uniform full-attention layouts.
+/// This is not live allocation or a lower bound across cache precisions. Ollama additionally
+/// handles padding, parallel slots, recurrent state, sliding windows and architecture-specific
+/// caches. Return `None` for those layouts rather than pretending the dense formula is exact.
 fn estimate_kv_cache_bytes_per_token_f16(show: &Value) -> Option<u64> {
     let info = show.get("model_info")?.as_object()?;
-    let field = |suffix: &str| {
-        info.iter()
-            .find(|(key, _)| key.ends_with(suffix))
-            .and_then(|(_, value)| value.as_u64())
+    let architecture = info.get("general.architecture")?.as_str()?;
+    if !matches!(
+        architecture,
+        "llama"
+            | "qwen2"
+            | "qwen3"
+            | "qwen3moe"
+            | "gemma"
+            | "phi2"
+            | "phi3"
+            | "stablelm"
+            | "command-r"
+            | "glmocr"
+    ) {
+        return None;
+    }
+    let prefix = format!("{architecture}.");
+    if info
+        .keys()
+        .filter_map(|key| key.strip_prefix(&prefix))
+        .any(|key| {
+            key.starts_with("ssm.")
+                || key.contains("sliding_window")
+                || key.contains("shared_kv")
+                || key.contains("cross_attention")
+        })
+    {
+        return None;
+    }
+    // Scope every field to the declared text architecture; multimodal metadata can also contain
+    // clip.block_count or other matching suffixes which describe a different network.
+    let field = |name: &str| info.get(&format!("{prefix}{name}"));
+    let positive = |value: &Value| value.as_u64().filter(|value| *value > 0);
+    let blocks = positive(field("block_count")?)?;
+    let heads = positive(field("attention.head_count")?)?;
+    let kv_heads = positive(field("attention.head_count_kv")?)?;
+    let dimension = |name: &str| {
+        if let Some(value) = field(name) {
+            positive(value)
+        } else {
+            let embedding = positive(field("embedding_length")?)?;
+            (embedding % heads == 0).then_some(embedding / heads)
+        }
     };
-    let blocks = field(".block_count")?;
-    let heads = field(".attention.head_count")?;
-    let kv_heads = field(".attention.head_count_kv").unwrap_or(heads);
-    let embedding = field(".embedding_length")?;
-    let head_dimension = embedding.checked_div(heads)?;
-    (embedding % heads == 0)
-        .then_some(())
-        .and_then(|()| blocks.checked_mul(kv_heads))
-        .and_then(|value| value.checked_mul(head_dimension))
-        // K and V, then two bytes for each F16 value.
-        .and_then(|value| value.checked_mul(4))
+    let key = dimension("attention.key_length")?;
+    let value = dimension("attention.value_length")?;
+    blocks
+        .checked_mul(kv_heads)?
+        .checked_mul(key.checked_add(value)?)?
+        .checked_mul(2)
+}
+
+/// Concurrent `/api/show` lookups for a whole catalog. Sequential lookups made a cold catalog cost
+/// one control round trip per installed model; a small bound keeps a large library from flooding
+/// Ollama. Results keep the order of `names`.
+const SHOW_CONCURRENCY: usize = 4;
+
+async fn show_models(
+    state: &PlatformState,
+    upstream: &str,
+    names: &[&str],
+) -> Result<Vec<Option<Value>>, ApiError> {
+    let permits = Arc::new(tokio::sync::Semaphore::new(SHOW_CONCURRENCY));
+    let mut lookups = tokio::task::JoinSet::new();
+    for (index, name) in names.iter().enumerate() {
+        let (state, upstream, name) = (state.clone(), upstream.to_owned(), (*name).to_owned());
+        let permits = Arc::clone(&permits);
+        lookups.spawn(async move {
+            let _permit = permits.acquire_owned().await;
+            (index, show_model(&state, &upstream, &name).await)
+        });
+    }
+    let mut shows = vec![None; names.len()];
+    while let Some(joined) = lookups.join_next().await {
+        let (index, show) = joined
+            .context("model metadata lookup panicked")
+            .map_err(ApiError::upstream)?;
+        shows[index] = show?;
+    }
+    Ok(shows)
 }
 
 /// `None` means skip this tag — a single corrupt `/api/show` must not 502 the whole catalog.
@@ -2451,16 +2052,15 @@ async fn refresh_residency(
     state: &PlatformState,
     models: &mut [CatalogModel],
 ) -> Result<(), ApiError> {
-    let gpu = get_json(&state.client, &state.upstream, "/api/ps").await?;
+    let (gpu, cpu) = backend_residency(state).await;
+    let gpu = gpu?;
     let gpu_running = gpu
         .get("models")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let cpu_running = if let Some(cpu_upstream) = &state.cpu_upstream {
-        get_json(&state.client, cpu_upstream, "/api/ps")
-            .await?
-            .get("models")
+    let cpu_running = if let Some(cpu) = cpu {
+        cpu?.get("models")
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default()
@@ -2481,6 +2081,9 @@ async fn refresh_residency(
                 == Some(model.name.as_str())
         });
         model.resident = resident.is_some();
+        model.resident_size = resident
+            .and_then(|value| value.get("size"))
+            .and_then(Value::as_u64);
         model.resident_vram = resident
             .and_then(|value| value.get("size_vram"))
             .and_then(Value::as_u64);
@@ -2488,109 +2091,16 @@ async fn refresh_residency(
     Ok(())
 }
 
-/// Upper bound on a managed generation forwarded to Ollama. Overridable via
-/// `FREELLAMA_TASK_TIMEOUT_SECONDS` — the same name the CLI and the NAPI layer read, so one
-/// setting covers every path that can make a model generate.
-/// Admission cost of a task, in slot units.
-///
-/// A flat per-request count is the wrong unit for local inference: embedding, text generation, and
-/// image-prefill work are not interchangeable. `FreeLlama` can apply coarse task weights because it
-/// knows the task class; Ollama receives an opaque HTTP request and sees memory only after it starts
-/// scheduling the runner.
-///
-/// Deliberately coarse. These are relative costs, not a memory model; Ollama owns the real
-/// memory-fit decision (`server/sched.go` evicts when a load is predicted to exceed 80% of free
-/// memory) and duplicating that here would mean maintaining a worse copy of it.
-fn task_cost(task: TaskKind) -> u32 {
-    match task {
-        // No autoregressive decode; batching remains the preferred throughput path.
-        TaskKind::Embedding => 1,
-        // Image payload and multimodal prefill in addition to generation.
-        TaskKind::Vision => 4,
-        _ => 2,
-    }
-}
-
-/// Charge an embedding batch for its actual cardinality. Ollama executes a batched `/api/embed`
-/// request as more work than a single string even though it remains materially cheaper than N
-/// independent HTTP calls. The cap prevents an input array from reserving more than the backend
-/// can ever supply; `admit` applies the final backend-specific cap.
-fn task_cost_for(task: TaskKind, batch_items: usize) -> u32 {
-    if !matches!(task, TaskKind::Embedding) {
-        return task_cost(task);
-    }
-    let items = u32::try_from(batch_items.max(1)).unwrap_or(u32::MAX);
-    // One unit covers up to four compact embedding inputs; each additional group of four adds a
-    // unit. This is an intentionally transparent queueing weight, not an invented VRAM estimate.
-    items.saturating_add(3) / 4
-}
-
-fn input_batch_items(input: &TaskInput) -> usize {
-    input
-        .input
-        .as_ref()
-        .and_then(Value::as_array)
-        .map_or(1, Vec::len)
-        .max(1)
-}
-
-/// A lower-bound preflight, not a replacement for Ollama's live loader check. Ollama exposes
-/// enough model metadata to calculate F16 K+V cache size for common llama-family models, but its
-/// HTTP API does not expose current free accelerator memory or every runner allocation. We refuse
-/// only when known weights plus the calculated cache already exceed 80% of host memory on a CPU
-/// or unified-memory path; every other case remains explicitly delegated to Ollama's scheduler.
-fn memory_kv_preflight(model: &CatalogModel, route: &RouteDecision, placement: &str) -> Value {
-    let requested_context = route
-        .options
-        .get("num_ctx")
-        .and_then(Value::as_u64)
-        .or(model.advertised_context);
-    let kv_cache_bytes = model
-        .kv_cache_bytes_per_token_f16
-        .zip(requested_context)
-        .and_then(|(per_token, context)| per_token.checked_mul(context));
-    let known_runtime_floor_bytes = kv_cache_bytes.and_then(|kv| model.size.checked_add(kv));
-    let machine = machine_profile("");
-    let host_relevant = placement == "cpu" || machine.memory_kind == "unified";
-    let refuses = host_relevant
-        && known_runtime_floor_bytes
-            .zip(machine.memory_bytes)
-            .is_some_and(|(needed, total)| needed > total.saturating_mul(80) / 100);
-    let status = if refuses {
-        "refuse_known_floor_exceeds_host_headroom"
-    } else if kv_cache_bytes.is_some() {
-        "estimated_lower_bound"
-    } else {
-        "unknown_model_metadata"
-    };
-    json!({
-        "status": status,
-        "known_model_bytes": model.size,
-        "requested_context_tokens": requested_context,
-        "kv_cache_bytes_f16_estimate": kv_cache_bytes,
-        "known_runtime_floor_bytes": known_runtime_floor_bytes,
-        "host_memory_bytes": machine.memory_bytes,
-        "host_memory_relevant": host_relevant,
-        "threshold": "80_percent_of_total_host_memory_only_when_cpu_or_unified",
-        "assumptions": "F16 K+V cache, one Ollama parallel request; model metadata only",
-        "authority": "Ollama owns live free-memory, runner graph, cache-type, and final load admission",
+/// Independent runner observations share a deadline window rather than adding backend delays.
+async fn backend_residency(
+    state: &PlatformState,
+) -> (Result<Value, ApiError>, Option<Result<Value, ApiError>>) {
+    tokio::join!(get_json(&state.client, &state.upstream, "/api/ps"), async {
+        match state.cpu_upstream.as_deref() {
+            Some(upstream) => Some(get_json(&state.client, upstream, "/api/ps").await),
+            None => None,
+        }
     })
-}
-
-/// Longest a task may wait for an admission slot before being refused.
-///
-/// Ollama does not block when saturated: `getRunner` does a non-blocking send onto its pending
-/// channel and returns `ErrMaxQueue` ("server busy, please try again") the instant it is full.
-/// An unbounded wait here would convert that honest, actionable signal into an invisible pile-up,
-/// where the only symptom is latency the caller cannot attribute. Match the upstream contract.
-fn max_queue_wait() -> Duration {
-    Duration::from_secs(
-        std::env::var("FREELLAMA_MAX_QUEUE_WAIT_SECONDS")
-            .ok()
-            .and_then(|raw| raw.parse::<u64>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(120),
-    )
 }
 
 /// Primary-backend admission budget in weighted units. Default 2 — one ordinary chat generation
@@ -2616,6 +2126,25 @@ fn cpu_max_concurrent_tasks() -> usize {
         .unwrap_or(1)
 }
 
+fn max_queued_tasks() -> usize {
+    std::env::var("FREELLAMA_MAX_QUEUED_TASKS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(16)
+}
+
+fn cpu_max_queued_tasks() -> usize {
+    std::env::var("FREELLAMA_CPU_MAX_QUEUED_TASKS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(8)
+}
+
+/// Upper bound on a managed generation forwarded to Ollama. Overridable via
+/// `FREELLAMA_TASK_TIMEOUT_SECONDS` — the same name the CLI and the NAPI layer read, so one
+/// setting covers every path that can make a model generate.
 fn platform_task_timeout() -> Duration {
     crate::timeout_from_env(
         "FREELLAMA_TASK_TIMEOUT_SECONDS",
@@ -2644,6 +2173,163 @@ async fn get_json(client: &Client, upstream: &str, path: &str) -> Result<Value, 
         .json()
         .await
         .map_err(ApiError::upstream)
+}
+
+#[cfg(test)]
+mod kv_estimate_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn process_settings_refresh_after_cache_expiry_and_preserve_fresh_cache() {
+        let mut config = PlatformConfig::new(
+            "127.0.0.1:11435",
+            "http://127.0.0.1:11439",
+            None,
+            None,
+            "helper:latest",
+        );
+        config.cpu_upstream = Some("http://127.0.0.1:11438".into());
+        config.cpu_models.insert("cpu-helper:latest".into());
+        let (_, state) = build(&config).unwrap();
+        let old = ollama_env::resolve(
+            Some(&BTreeMap::from([(
+                "OLLAMA_NUM_PARALLEL".into(),
+                "99".into(),
+            )])),
+            |_| None,
+            |_| None,
+            "test".into(),
+        );
+        *state.ollama.write().await = old.clone();
+        *state.cpu_ollama.as_ref().unwrap().write().await = old;
+        state.refresh_ollama_settings().await;
+        assert_eq!(
+            state.ollama.read().await.num_parallel(),
+            99,
+            "fresh observations must be reused"
+        );
+        *state.ollama_refresh.lock().await =
+            Instant::now().checked_sub(Duration::from_secs(6)).unwrap();
+        state.refresh_ollama_settings().await;
+        assert_ne!(state.ollama.read().await.num_parallel(), 99);
+        assert_ne!(
+            state
+                .cpu_ollama
+                .as_ref()
+                .unwrap()
+                .read()
+                .await
+                .num_parallel(),
+            99
+        );
+        assert!(state.ollama_refresh.lock().await.elapsed() < Duration::from_secs(5));
+    }
+
+    fn llama_shape() -> Value {
+        json!({"model_info": {
+            "general.architecture": "llama",
+            "llama.block_count": 16,
+            "llama.attention.head_count": 16,
+            "llama.attention.head_count_kv": 8,
+            "llama.embedding_length": 1536,
+        }})
+    }
+
+    #[test]
+    fn kv_estimate_respects_explicit_key_and_value_dimensions() {
+        let mut show = llama_shape();
+        show["model_info"]["llama.attention.key_length"] = json!(128);
+        show["model_info"]["llama.attention.value_length"] = json!(64);
+        assert_eq!(estimate_kv_cache_bytes_per_token_f16(&show), Some(49_152));
+        show["model_info"]["llama.attention.value_length"] = json!(128);
+        assert_eq!(estimate_kv_cache_bytes_per_token_f16(&show), Some(65_536));
+        // Explicit dimensions do not require a divisible embedding width.
+        show["model_info"]["llama.embedding_length"] = json!(1537);
+        assert_eq!(estimate_kv_cache_bytes_per_token_f16(&show), Some(65_536));
+    }
+
+    #[test]
+    fn kv_estimate_never_borrows_another_architectures_fields() {
+        let mut show = llama_shape();
+        show["model_info"]["clip.block_count"] = json!(999);
+        assert_eq!(estimate_kv_cache_bytes_per_token_f16(&show), Some(49_152));
+        show["model_info"]
+            .as_object_mut()
+            .unwrap()
+            .remove("llama.block_count");
+        assert_eq!(estimate_kv_cache_bytes_per_token_f16(&show), None);
+    }
+
+    #[test]
+    fn kv_estimate_declares_nonuniform_or_invalid_shapes_unknown() {
+        for (key, value) in [
+            ("llama.attention.sliding_window", json!(512)),
+            ("llama.attention.shared_kv_layers", json!(18)),
+            ("llama.ssm.state_size", json!(16)),
+            ("llama.attention.head_count_kv", json!([8, 0])),
+            ("llama.attention.key_length", json!("128")),
+            ("llama.attention.key_length", json!(0)),
+            ("llama.block_count", json!(0)),
+            ("llama.block_count", json!(u64::MAX)),
+            ("general.architecture", json!("new_unknown_family")),
+        ] {
+            let mut show = llama_shape();
+            show["model_info"][key] = value;
+            assert_eq!(estimate_kv_cache_bytes_per_token_f16(&show), None, "{key}");
+        }
+    }
+
+    #[test]
+    fn kv_preflight_does_not_call_f16_a_known_runtime_floor() {
+        let model = CatalogModel {
+            digest: None,
+            name: "test".into(),
+            size: 600,
+            capabilities: BTreeSet::new(),
+            advertised_context: None,
+            kv_cache_bytes_per_token_f16: Some(10),
+            modelfile_num_ctx: None,
+            resident: false,
+            resident_size: None,
+            resident_vram: None,
+            benchmark: BTreeMap::new(),
+            policy_rank: BTreeMap::new(),
+        };
+        let report = memory_kv_preflight_with_memory(&model, Some(30), true, Some(1000));
+        assert_eq!(report["refuses"], false);
+        assert_eq!(report["status"], "f16_estimate_exceeds_host_budget");
+        assert_eq!(report["model_plus_kv_bytes_f16_estimate"], 900);
+        assert!(report.get("known_runtime_floor_bytes").is_none());
+        let mut large = model.clone();
+        large.size = 900;
+        large.kv_cache_bytes_per_token_f16 = None;
+        assert_eq!(
+            memory_kv_preflight_with_memory(&large, Some(30), true, Some(1000))["refuses"],
+            true
+        );
+        assert_eq!(
+            memory_kv_preflight_with_memory(&large, Some(30), false, Some(1000))["refuses"],
+            false
+        );
+    }
+
+    #[test]
+    fn kv_preflight_only_compares_loopback_backends_with_local_host_ram() {
+        for upstream in [
+            "http://127.0.0.1:11434",
+            "http://localhost:11434",
+            "http://[::1]:11434",
+        ] {
+            assert!(upstream_is_loopback(upstream), "{upstream}");
+        }
+        for upstream in [
+            "https://ollama.example.org",
+            "http://192.168.1.10:11434",
+            "bad-url",
+        ] {
+            assert!(!upstream_is_loopback(upstream), "{upstream}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2678,26 +2364,32 @@ mod feedback_tests {
                 for execution_preference in preferences {
                     for gpu_work_unit_ns in gpu_scores {
                         for cpu_work_unit_ns in cpu_scores {
-                            for gpu_slots_available in [0, 1] {
-                                for cpu_slots_available in [0, 1] {
-                                    for cpu_configured in [false, true] {
-                                        let signals = PlacementSignals {
-                                            route_is_pinned,
-                                            objective,
-                                            execution_preference,
-                                            gpu_work_unit_ns,
-                                            cpu_work_unit_ns,
-                                            gpu_slots_available,
-                                            cpu_slots_available,
-                                            cpu_configured,
-                                        };
-                                        let expected = placement_oracle(signals);
-                                        assert_eq!(
-                                            desired_placement(signals),
-                                            expected,
-                                            "placement mismatch for {signals:?}"
-                                        );
-                                        checked += 1;
+                            for gpu_slots_available in [0, 1, 4] {
+                                for cpu_slots_available in [0, 1, 4] {
+                                    for gpu_task_cost in [1, 2, 4] {
+                                        for cpu_task_cost in [1, 2, 4] {
+                                            for cpu_configured in [false, true] {
+                                                let signals = PlacementSignals {
+                                                    route_is_pinned,
+                                                    objective,
+                                                    execution_preference,
+                                                    gpu_work_unit_ns,
+                                                    cpu_work_unit_ns,
+                                                    gpu_slots_available,
+                                                    cpu_slots_available,
+                                                    gpu_task_cost,
+                                                    cpu_task_cost,
+                                                    cpu_configured,
+                                                };
+                                                let expected = placement_oracle(signals);
+                                                assert_eq!(
+                                                    desired_placement(signals),
+                                                    expected,
+                                                    "placement mismatch for {signals:?}"
+                                                );
+                                                checked += 1;
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -2707,16 +2399,27 @@ mod feedback_tests {
             }
         }
 
-        assert_eq!(checked, 2 * 3 * 3 * 2 * 6 * 2 * 2 * 2);
+        assert_eq!(checked, 2 * 3 * 3 * 2 * 6 * 3 * 3 * 3 * 3 * 2);
     }
 
     fn placement_oracle(signals: PlacementSignals) -> Option<(&'static str, &'static str)> {
+        let gpu_ready = signals.gpu_slots_available >= signals.gpu_task_cost;
+        let cpu_ready =
+            signals.cpu_configured && signals.cpu_slots_available >= signals.cpu_task_cost;
         match signals.execution_preference {
             ExecutionPreference::PreferCpu => {
-                return Some(("cpu", "preferred_backend_eligible"));
+                return Some(if cpu_ready || !gpu_ready {
+                    ("cpu", "preferred_backend_eligible")
+                } else {
+                    ("gpu", "backend_capacity_available")
+                });
             }
             ExecutionPreference::PreferGpu => {
-                return Some(("gpu", "preferred_backend_eligible"));
+                return Some(if gpu_ready || !cpu_ready {
+                    ("gpu", "preferred_backend_eligible")
+                } else {
+                    ("cpu", "backend_capacity_available")
+                });
             }
             ExecutionPreference::Auto => {}
         }
@@ -2725,23 +2428,25 @@ mod feedback_tests {
         }
         match (signals.gpu_work_unit_ns, signals.cpu_work_unit_ns) {
             (Some(gpu), Some(cpu)) if meaningfully_faster(cpu, gpu) => {
-                return Some(("cpu", "measured_backend_faster"));
+                return Some(if cpu_ready || !gpu_ready {
+                    ("cpu", "measured_backend_faster")
+                } else {
+                    ("gpu", "backend_capacity_available")
+                });
             }
             (Some(gpu), Some(cpu)) if meaningfully_faster(gpu, cpu) => {
-                return Some(("gpu", "measured_backend_faster"));
+                return Some(if gpu_ready || !cpu_ready {
+                    ("gpu", "measured_backend_faster")
+                } else {
+                    ("cpu", "backend_capacity_available")
+                });
             }
             _ => {}
         }
-        if signals.cpu_configured
-            && signals.gpu_slots_available == 0
-            && signals.cpu_slots_available > 0
-        {
+        if !gpu_ready && cpu_ready {
             return Some(("cpu", "backend_capacity_available"));
         }
-        if signals.cpu_configured
-            && signals.cpu_slots_available == 0
-            && signals.gpu_slots_available > 0
-        {
+        if !cpu_ready && gpu_ready {
             return Some(("gpu", "backend_capacity_available"));
         }
         None
@@ -2772,14 +2477,51 @@ mod feedback_tests {
         for _ in 0..3 {
             stats.record("model-a", Some(100), 4);
         }
-        assert_eq!(stats.average_for_model("model-a"), Some(100));
-        assert_eq!(stats.average_for_model("model-b"), None);
+        assert_eq!(stats.average_work_unit_ns(), Some(100));
+        assert_eq!(stats.profile, None);
 
         stats.record("model-b", Some(50), 2);
         assert_eq!(stats.model.as_deref(), Some("model-b"));
         assert_eq!(stats.completed, 1);
         assert_eq!(stats.duration_samples, 1);
-        assert_eq!(stats.average_for_model("model-a"), None);
+        assert_eq!(stats.profile, None);
+    }
+
+    #[test]
+    fn legacy_feedback_is_retained_as_diagnostics_without_becoming_profile_evidence() {
+        let legacy = json!({"model":"model-a","completed":7,"duration_samples":5,
+            "total_work_unit_ns":500,"total_queue_wait_ms":14,"last_work_unit_ns":100});
+        let mut stats: FeedbackStats = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(stats.average_work_unit_ns(), Some(100));
+        assert_eq!(stats.receipt()["decision_ready"], false);
+        let profile = super::runtime::ExecutionProfile {
+            id: "profile-a".into(),
+            task: TaskKind::Completion,
+            model: "model-a".into(),
+            digest: "revision-a".into(),
+            context_tokens: 4096,
+            processor: "gpu".into(),
+            metric_kind: super::runtime::ThroughputMetricKind::OutputTokensPerSecond,
+        };
+        for _ in 0..3 {
+            stats.record_profile(&profile, 50);
+        }
+        assert_eq!(stats.average_for_profile(&profile), Some(50));
+        let stored = serde_json::to_value(&stats).unwrap();
+        for field in legacy.as_object().unwrap().keys() {
+            assert_eq!(
+                stored[field], legacy[field],
+                "legacy aggregate must survive additive profile learning"
+            );
+        }
+        let restarted: FeedbackStats = serde_json::from_value(stored).unwrap();
+        assert_eq!(restarted.average_for_profile(&profile), Some(50));
+        let mut changed = profile.clone();
+        changed.id = "profile-b".into();
+        stats.record_profile(&changed, 10);
+        assert_eq!(stats.average_for_profile(&profile), None);
+        assert_eq!(stats.average_for_profile(&changed), None);
+        assert_eq!(stats.profile_duration_samples, 1);
     }
 
     #[test]

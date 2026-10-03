@@ -54,9 +54,9 @@ clients that opt into the managed API receive routing and policy behavior.
 
 ## Know the remaining limits
 
-Native passthrough traffic remains under Ollama's scheduler and does not participate in FreeLlama's
-transition locks. The managed sidecar also does not enforce live memory-pressure or thermal
-admission. A configured but unreachable CPU backend makes managed catalog discovery fail closed;
+In `serve`, mutating passthrough traffic shares the primary transition lock and receives host-pressure
+gating, while managed tasks also reserve forecast memory. Direct Ollama callers bypass these
+controls. FreeLlama cannot preempt inference or constrain other processes. A configured but unreachable CPU backend makes managed catalog discovery fail closed;
 raw primary passthrough remains usable.
 
 Runtime feedback is task-specific, token-normalized, and warm-only. It can steer
@@ -67,7 +67,7 @@ Ollama residency.
 
 Read [Architecture](ARCHITECTURE.md) for all managed flows,
 [CPU and GPU model routing](CPU_GPU_ROUTING.md) for the two-process procedure, and
-[Ollama and FreeLlama optimization](OLLAMA_SYSTEM_OPTIMIZATION.md) for the full tuning boundary.
+[Ollama and FreeLlama optimization](dev/OLLAMA_SYSTEM_OPTIMIZATION.md) for the full tuning boundary.
 
 ## Sources
 

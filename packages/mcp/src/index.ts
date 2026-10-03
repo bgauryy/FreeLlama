@@ -29,12 +29,12 @@ import {
   DEFAULT_DELEGATE_TIMEOUT_SECONDS,
   DEFAULT_PULL_TIMEOUT_SECONDS,
   DEFAULT_TOKEN_CALIBRATION_DIR,
-  DEFAULT_OLLAMA_FETCH_TIMEOUT_SECONDS,
   assertAllowedWorkspace,
+  delegateEnvironment,
 } from "./config.js";
-import {
-  doctor, machine, health, createSession, deleteSession, listModels, route, runTaskRequest, runTaskBatchRequest, SERVER_VERSION,
-} from "./native.js";
+import * as native from "./native.js";
+import { doctor, machine, health, status, usage, SERVER_VERSION } from "./native.js";
+import { ensureServe, withServe, stopAutostartedServe } from "./serve.js";
 import {
   ollamaFetch,
   ollamaPull,
@@ -42,6 +42,10 @@ import {
   endpointParam,
   ollamaEndpointParam,
   taskParam,
+  systemPromptParam,
+  messagesParam,
+  localToolsParam,
+  taskMessages,
   batchItemParam,
   canonicalTaskKind,
   objectiveParam,
@@ -52,6 +56,10 @@ import {
   requiredCapabilitiesParam,
   clipText,
   structuredResult,
+  isStructuredSuccess,
+  taskAnswerText,
+  batchAnswerText,
+  ANSWER_TEXT_MAX_CHARS,
   parsedResult,
   errorResult,
   summarizeEmbeddings,
@@ -69,17 +77,33 @@ import {
   configuredExternalCost,
   costTelemetry,
 } from "./helpers.js";
-import { parseModelSearch, parseModelTags } from "./model-search.js";
-import { MODEL_EVIDENCE, assessDelegatedAnswer } from "./delegate.js";
+import { libraryTrialCandidate } from "./model-search.js";
+import { enrichInstalledModels, libraryReference, modelKnowledge, OllamaLibraryClient, publicModelGuidance } from "./model-knowledge.js";
+import { MODEL_EVIDENCE, assessDelegatedAnswer, researchErrorResult } from "./delegate.js";
+
+import { registerContextTools } from "./context-tools.js";
 
 const execFileAsync = promisify(execFile);
+
+const createSession = withServe(native.createSession);
+const deleteSession = withServe(native.deleteSession);
+const killSession = withServe(native.killSession);
+const listModels = withServe(native.listModels);
+const ollamaLibrary = new OllamaLibraryClient();
+const route = withServe(native.route);
+const runTaskRequest = withServe(native.runTaskRequest);
+const runTaskBatchRequest = withServe(native.runTaskBatchRequest);
+const listTaskJobs = withServe(native.listTaskJobs);
+const getTaskJob = withServe(native.getTaskJob);
+const cancelTaskJob = withServe(native.cancelTaskJob);
+const removeTaskJob = withServe(native.removeTaskJob);
 
 type Page<T> = { items: T[]; returned: number; total: number; next_cursor: string | null };
 const EXTERNAL_COST = configuredExternalCost();
 
 /** Attach accounting after a successful managed response; the Rust layer remains provider-neutral. */
 function withTaskTelemetry(result: ReturnType<typeof parsedResult>) {
-  if (!("structuredContent" in result)) return result;
+  if (!isStructuredSuccess(result)) return result;
   const payload = result.structuredContent as Record<string, unknown>;
   const metrics = payload.metrics as Record<string, unknown> | undefined;
   return structuredResult({
@@ -89,11 +113,11 @@ function withTaskTelemetry(result: ReturnType<typeof parsedResult>) {
       outputTokens: typeof metrics?.output_tokens === "number" ? metrics.output_tokens : null,
       totalDurationNs: typeof metrics?.total_duration_ns === "number" ? metrics.total_duration_ns : null,
     }, EXTERNAL_COST),
-  });
+  }, { text: taskAnswerText(payload) });
 }
 
 function withBatchTelemetry(result: ReturnType<typeof parsedResult>) {
-  if (!("structuredContent" in result)) return result;
+  if (!isStructuredSuccess(result)) return result;
   const payload = result.structuredContent as Record<string, unknown>;
   const rows = Array.isArray(payload.results) ? payload.results : [];
   let inputTokens = 0;
@@ -120,7 +144,7 @@ function withBatchTelemetry(result: ReturnType<typeof parsedResult>) {
     telemetry: complete === rows.filter((row) => (row as Record<string, unknown>)?.ok === true).length
       ? costTelemetry({ inputTokens, outputTokens }, EXTERNAL_COST)
       : { local: null, externalEquivalent: null, note: "Batch aggregate unavailable because one or more successful items omitted token counts." },
-  });
+  }, { text: batchAnswerText(payload) });
 }
 
 /** Page a live list with an opaque cursor that refuses to continue after list drift. */
@@ -180,7 +204,51 @@ for (const stream of [process.stdout, process.stderr] as const) {
   });
 }
 
-process.on("exit", killLiveDelegates);
+process.on("exit", () => {
+  killLiveDelegates();
+  stopAutostartedServe();
+});
+// A client that closes stdin without a signal (most MCP hosts on shutdown) left this process
+// alive until every running delegate finished, holding a model loaded for nobody.
+process.stdin.on("close", () => {
+  killLiveDelegates();
+  stopAutostartedServe();
+  process.exit(0);
+});
+
+type ToolExtra = {
+  signal: AbortSignal;
+  _meta?: { progressToken?: string | number };
+  sendNotification: (notification: {
+    method: "notifications/progress";
+    params: { progressToken: string | number; progress: number; total?: number; message?: string };
+  }) => Promise<void>;
+};
+
+/** MCP progress for a pull: clients that sent a progressToken see bytes instead of a silent wait. */
+function pullProgressReporter(extra: ToolExtra): ((event: Record<string, unknown>) => void) | undefined {
+  const token = extra._meta?.progressToken;
+  if (token === undefined) return undefined;
+  let lastSent = 0;
+  let step = 0;
+  return (event) => {
+    const now = Date.now();
+    if (now - lastSent < 500 && event.status !== "success") return;
+    lastSent = now;
+    step += 1;
+    const completed = typeof event.completed === "number" ? event.completed : undefined;
+    const total = typeof event.total === "number" ? event.total : undefined;
+    void extra.sendNotification({
+      method: "notifications/progress",
+      params: {
+        progressToken: token,
+        progress: completed ?? step,
+        ...(completed !== undefined && total !== undefined ? { total } : {}),
+        message: String(event.status ?? "pulling"),
+      },
+    }).catch(() => undefined);
+  };
+}
 for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
   process.on(signal, () => {
     killLiveDelegates();
@@ -189,14 +257,14 @@ for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
 }
 
 
-const INSTRUCTIONS = `caller owns task decomposition; operator owns endpoints, exact --cpu-model assignments, lifecycle.
-Ollama plus the OS/driver run physical CPU/GPU.
-Efficient loop: models{view:"installed"}, then models{view:"resident"}; doctor only for runtime diagnosis. Preview consequential work before executing.
-delegate_research is only for narrow allowed-workspace research. Keep full diagnostics, raw embeddings, and long evidence out of active context; read freellama://docs/index on demand.
-ask approval for one exact tag and reported size before ollama_manage; search or recommendation is never download permission.
-run_task preview never executes; code_review aliases coding.
-Use requiredCapabilities:["tools"] to preview tool eligibility; omit preview and supply the payload to execute.
-Docs: freellama://docs/index.`;
+const INSTRUCTIONS = `models{view:"installed"}; models{view:"resident"} for residency.
+run_task preview never executes; code_review aliases coding. Preview routing only; requiredCapabilities:["tools"] previews tools; omit preview and supply the payload. Caller executes tools.
+quality needs policy/model; medium needs policy+benchmark; observed needs /api/ps proof.
+Scoped run_task needs scopeId+scopeRevision. Scopes store history; sessions affinity, not messages/KV. defer:true: job.id→task_jobs.jobId unchanged. Restart loses scopes/sessions/jobs.
+Check isError first; prefer structuredContent, else content[].text. page.next_cursor→cursor unchanged.
+caller owns task decomposition/prompts/format/verification; findings are candidates, not accepted defects. operator owns endpoints, exact --cpu-model assignments/lifecycle. Ollama plus the OS/driver run physical CPU/GPU.
+ask approval for one exact tag and reported size before ollama_manage pull; search or recommendation is never download permission. Stop/delete need exact-tag approval.
+serve :11435; default-endpoint autostart optional. Docs: freellama://docs/index.`;
 
 const server = new McpServer(
   { name: "freellama", version: SERVER_VERSION },
@@ -236,19 +304,24 @@ for (const name of packagedDocs) {
 server.registerTool(
   "doctor",
   {
-    description: "Use when: runtime/config diagnosis. Do not use when: model selection. Returns: compact summary by default; config/full are opt-in.",
-    inputSchema: {
+    description: "Use when: diagnosis/status/usage. Do not use when: choosing models. Returns: summary; opt into detail.",
+    inputSchema: z.object({
       endpoint: ollamaEndpointParam,
       serveEndpoint: endpointParam,
-      view: z.enum(["summary", "scheduler", "config", "full"]).optional().describe("summary default; scheduler/config/full are verbose"),
-    },
+      view: z.enum(["summary", "scheduler", "config", "full", "status", "usage"]).optional(),
+      days: z.number().int().min(1).max(366).optional(),
+    }).strict(),
     outputSchema: doctorResultSchema,
     annotations: { readOnlyHint: true },
   },
-  async ({ endpoint, serveEndpoint, view }) => {
+  async ({ endpoint, serveEndpoint, view, days }) => {
     try {
+      if (days !== undefined && view !== "usage") return errorResult(new Error("days is only valid with view: usage."));
+      // Live views come from serve alone; they do not need the Ollama half of the diagnostic.
+      if (view === "status") return parsedResult(await status(serveEndpoint));
+      if (view === "usage") return parsedResult(await usage(serveEndpoint, days));
       const report = parsedResult(await doctor(endpoint));
-      if (!("structuredContent" in report)) return report;
+      if (!isStructuredSuccess(report)) return report;
       // Absorbed the former `machine` tool. Attempted, not required: `doctor` must keep working
       // with no `freellama serve` running, because the Ollama half of the diagnostic is exactly
       // the half you need when things are broken. A failure degrades to a stated reason.
@@ -320,23 +393,23 @@ server.registerTool(
   "session",
   {
     description:
-      "Use when: retaining model affinity. Do not use when: storing history or KV. " +
-      "Inputs: action, sessionId for delete. Returns: affinity handle or confirmation.",
-    inputSchema: {
-      action: z.enum(["create", "delete"]).describe("create | release"),
-      sessionId: z.string().uuid().optional().describe("delete only"),
+      "Use when: affinity/session kill. Do not use when: job cancel/history/unload. Returns: receipt.",
+    inputSchema: z.object({
+      action: z.enum(["create", "delete", "kill"]),
+      sessionId: z.string().uuid().optional(),
       endpoint: endpointParam,
-    },
+    }).strict(),
     outputSchema: sessionResultSchema,
-    annotations: { destructiveHint: false },
+    annotations: { destructiveHint: true },
   },
   async ({ action, sessionId, endpoint }) => {
     try {
       if (action === "create") {
-        if (sessionId !== undefined) return errorResult(new Error("sessionId is only valid for action: delete."));
+        if (sessionId !== undefined) return errorResult(new Error("sessionId is only valid for action: delete or kill."));
         return structuredResult(JSON.parse(await createSession(endpoint)));
       }
-      if (sessionId === undefined) return errorResult(new Error("action: delete requires sessionId."));
+      if (sessionId === undefined) return errorResult(new Error(`action: ${action} requires sessionId.`));
+      if (action === "kill") return parsedResult(await killSession(endpoint, sessionId));
       await deleteSession(endpoint, sessionId);
       return structuredResult({ session_id: sessionId, deleted: true });
     } catch (error) {
@@ -349,41 +422,48 @@ server.registerTool(
   "models",
   {
     description:
-      "Use when: inspecting models. Do not use when: executing or changing state; search never " +
-      "permits a pull. Inputs: one view and its fields. Returns: inventory/detail, placement, or candidates. " +
-      "Next: library family, then model:\"<family>\" for tags/fit.",
-    inputSchema: {
+      "Use when: inventory/library. Do not use when: execution/mutation. " +
+      "Returns: models; library finds families, then one family's tags.",
+    inputSchema: z.object({
       view: z
         .enum(["installed", "resident", "detail", "raw", "library"])
         .optional()
-        .describe('installed (default, needs serve) | resident (needs serve) | detail | raw | library'),
-      model: z.string().min(1).optional().describe('required for view "detail"; for "library", step 2 family name'),
+        ,
+      model: z.string().min(1).optional(),
       includeVerbose: z
         .boolean()
         .optional()
-        .describe('"detail" only. Adds license/modelfile — the bulk of that payload, never routing-relevant'),
-      query: z.string().min(1).optional().describe('"library" step 1: free text, e.g. "qwen", "embed"'),
+        ,
+      includeLibrary: z.boolean().optional(),
+      includeReadme: z.boolean().optional(),
+      query: z.string().min(1).optional(),
       capabilities: z
         .array(z.enum(["vision", "tools", "thinking", "embedding", "cloud"]))
         .min(1)
         .max(5)
         .optional()
-        .describe('"library" step 1: filter chips; combined as AND by the site'),
+        ,
       order: z
         .enum(["popular", "newest"])
         .optional()
-        .describe('"library" step 1. default "popular" — prefer it'),
-      limit: z.number().int().positive().max(50).optional().describe('"library" search or raw/tag page size; raw default 20'),
-      cursor: z.string().min(1).optional().describe('opaque continuation cursor for raw models or library tags'),
+        ,
+      limit: z.number().int().positive().max(50).optional(),
+      cursor: z.string().min(1).optional(),
       endpoint: endpointParam,
       ollamaEndpoint: ollamaEndpointParam,
-    },
+    }).strict(),
     outputSchema: modelsResultSchema,
     annotations: { readOnlyHint: true },
   },
-  async ({ view, model, includeVerbose, query, capabilities, order, limit, cursor, endpoint, ollamaEndpoint }) => {
+  async ({ view, model, includeVerbose, includeLibrary, includeReadme, query, capabilities, order, limit, cursor, endpoint, ollamaEndpoint }) => {
     try {
       const selectedView = view ?? "installed";
+      if (includeLibrary !== undefined && selectedView !== "installed" && selectedView !== "detail") {
+        return errorResult(new Error('`includeLibrary` is valid only for views "installed" and "detail".'));
+      }
+      if (includeReadme !== undefined && !(selectedView === "library" && model || selectedView === "detail" && includeLibrary === true)) {
+        return errorResult(new Error('`includeReadme` needs library step 2, or view "detail" with `includeLibrary:true`.'));
+      }
       if (selectedView !== "library" && [query, capabilities, order].some((value) => value !== undefined)) {
         return errorResult(new Error(`view "${selectedView}" does not accept library search fields.`));
       }
@@ -416,14 +496,14 @@ server.registerTool(
 
         case "resident": {
           const managed = parsedResult(await listModels(endpoint));
-          if (!("structuredContent" in managed)) return managed;
+          if (!isStructuredSuccess(managed)) return managed;
           const data = managed.structuredContent as {
             models?: Array<Record<string, unknown>>;
           };
           // Ollama's own docs say to check the GPU/CPU split, but /api/ps exposes only the raw
           // `size`/`size_vram` bytes it is derived from. The CLI computes it; the API doesn't.
           const models = (data.models ?? []).filter((entry) => entry.resident === true).map((entry) => {
-            const size = typeof entry.size === "number" ? entry.size : null;
+            const size = typeof entry.resident_size === "number" ? entry.resident_size : null;
             const vram = typeof entry.resident_vram === "number" ? entry.resident_vram : null;
             if (size === null || vram === null || size === 0) return entry;
             const gpuPercent = Math.round((vram / size) * 100);
@@ -480,6 +560,18 @@ server.registerTool(
             method: "POST",
             body: { model },
           })) as Record<string, unknown>;
+          let local = data;
+          if (includeLibrary && !data.remote_host && !data.remote_model && !/-cloud$/i.test(model)) {
+            // /show does not guarantee a manifest digest. Use the exact /tags entry, never a name guess.
+            try {
+              const inventory = await ollamaFetch(ollamaEndpoint, "/api/tags") as { models?: Array<Record<string, unknown>> };
+              const canonical = libraryReference(model)?.tag;
+              const entry = canonical && inventory.models?.find((entry) => libraryReference(String(entry.name ?? entry.model))?.tag === canonical);
+              if (entry) local = { ...entry, ...data, digest: entry.digest };
+            } catch { /* Without a digest, enrichment reports unverified and withholds public guidance. */ }
+          }
+          const library = includeLibrary && !local.remote_host && !local.remote_model && !/-cloud$/i.test(model)
+            ? await ollamaLibrary.lookup(model) : undefined;
           const { license, modelfile, ...rest } = data;
           // The real ceiling hides under a per-architecture key (`qwen3_5.context_length`,
           // `llama.context_length`, ...), so it cannot be read by a fixed path.
@@ -490,15 +582,21 @@ server.registerTool(
           return structuredResult({
             ...rest,
             max_context_length: (contextEntry?.[1] as number) ?? null,
+            knowledge: modelKnowledge(model, local, library, includeReadme),
             ...(includeVerbose ? { license, modelfile } : {}),
           });
         }
 
         case "library":
-          return await libraryLookup({ model, query, capabilities, order, limit, cursor, endpoint, ollamaEndpoint });
+          return await libraryLookup({ model, query, capabilities, order, limit, cursor, includeReadme, endpoint, ollamaEndpoint });
 
-        default:
-          return parsedResult(await listModels(endpoint));
+        default: {
+          const result = parsedResult(await listModels(endpoint));
+          if (!isStructuredSuccess(result)) return result;
+          const data = result.structuredContent as { models?: Array<Record<string, unknown>> };
+          return structuredResult({ ...data, models: await enrichInstalledModels(data.models ?? [], ollamaLibrary, includeLibrary ?? false,
+            async (upstream) => (await ollamaFetch(upstream ?? ollamaEndpoint, "/api/tags") as { models?: Array<Record<string, unknown>> }).models ?? []) });
+        }
       }
     } catch (error) {
       return errorResult(error);
@@ -515,6 +613,7 @@ async function libraryLookup({
   order,
   limit,
   cursor,
+  includeReadme,
   endpoint,
   ollamaEndpoint,
 }: {
@@ -524,20 +623,10 @@ async function libraryLookup({
   order?: "popular" | "newest";
   limit?: number;
   cursor?: string;
+  includeReadme?: boolean;
   endpoint?: string;
   ollamaEndpoint?: string;
 }) {
-    const fetchPage = async (url: string) => {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), DEFAULT_OLLAMA_FETCH_TIMEOUT_SECONDS * 1000);
-      try {
-        const response = await fetch(url, { signal: controller.signal });
-        if (!response.ok) throw new Error(`ollama.com returned HTTP ${response.status}`);
-        return await response.text();
-      } finally {
-        clearTimeout(timer);
-      }
-    };
     const localState = async () => {
       let installed = new Set<string>();
       let memoryBytes: number | null = null;
@@ -558,9 +647,13 @@ async function libraryLookup({
 
     try {
       if (model) {
-        const family = model.split(":")[0];
-        const familyPage = await fetchPage(`https://ollama.com/library/${encodeURIComponent(family)}`);
-        const { tags } = parseModelTags(familyPage, family);
+        const ref = libraryReference(model);
+        if (!ref) throw new Error("Use an exact Ollama family or namespace/model name, not a URL or path.");
+        const { family } = ref;
+        const library = await ollamaLibrary.lookup(model);
+        if (library.status !== "available") return structuredResult({ family, sourcePage: ref.url, tags: [],
+          tagsUnavailable: library.message, library, recommendation: null });
+        const tags = library.tags!;
         const { installed, memoryBytes } = await localState();
         const budget = memoryBytes ? memoryBytes * 0.6 : null;
         const annotated = tags.map((t) => ({
@@ -569,9 +662,8 @@ async function libraryLookup({
           fitsInMemory: budget && t.sizeBytes ? t.sizeBytes <= budget : null,
           fitScope: "host_memory_budget_only",
         }));
-        const runnable = annotated.filter((t) => t.fitsInMemory === true && !/cloud/.test(t.tag));
-        const embeddingMentions = (familyPage.match(/embedding/gi) ?? []).length;
-        const isEmbeddingFamily = embeddingMentions >= 3 || /embed/i.test(family);
+        const runnable = annotated.filter((t) => t.fitsInMemory === true && !t.cloud);
+        const isEmbeddingFamily = library.card!.capabilities.includes("embedding");
         const sized = runnable.filter((t) => t.sizeBytes);
         const best = budget
           ? isEmbeddingFamily
@@ -581,7 +673,10 @@ async function libraryLookup({
         const tagPage = pageLiveList(annotated, limit, cursor, (tag) => tag.tag);
         return structuredResult({
           family,
-          sourcePage: `https://ollama.com/library/${encodeURIComponent(family)}`,
+          sourcePage: ref.url,
+          library: { status: library.status, sourceUrl: library.sourceUrl, tagsSourceUrl: library.tagsSourceUrl,
+            fetchedAt: library.fetchedAt, expiresAt: library.expiresAt, cached: library.cached,
+            ...publicModelGuidance(library, undefined, includeReadme) },
           ...(tags.length === 0
             ? {
                 tagsUnavailable:
@@ -597,43 +692,7 @@ async function libraryLookup({
           recommendationUnavailable: budget
             ? undefined
             : "No machine profile (freellama serve unreachable), so memory fit could not be checked and no tag is recommended. Start serve, or read the sizes yourself.",
-          recommendation: best
-            ? isEmbeddingFamily
-              ? {
-                  tag: best.tag,
-                  why:
-                    "Smallest tag that fits — this is an embedding family, where bigger is NOT " +
-                    "better. Measured on real retrieval over this repo: nomic-embed-text (274MB) " +
-                    "scored 5/6 recall@3 in 4.2s, while qwen3-embedding:0.6b (2.3x the size) " +
-                    "scored 4/6 at 3.5x the indexing cost. Embeddings do no sampling, so there is " +
-                    "no accuracy cliff for size to buy you past.",
-                  configure:
-                    'Batch your inputs in one `run_task` call and use keepAlive:"0" — an embedding ' +
-                    "model has no reason to hold memory after the vectors are computed. Leave " +
-                    "returnEmbeddings off unless you are storing the vectors yourself.",
-                  caution:
-                    "Index once, query many times, and own the staleness: FreeLlama stores no " +
-                    "vectors, and a stale index fails silently by returning confidently wrong " +
-                    "files. Also, if you know the keyword, grep beat embedding search here on " +
-                    "accuracy, latency and cost at the same time — reach for embeddings when " +
-                    "there is no keyword to search for.",
-                }
-              : {
-                  tag: best.tag,
-                  why:
-                    `Largest tag inside the conservative ~60% host-memory preflight${memoryBytes ? ` of ${Math.round(memoryBytes / 1e9)}GB` : ""}. ` +
-                    "This proves neither accelerator fit nor task quality; preview and benchmark before pulling.",
-                  configure:
-                    "Send an explicit num_ctx rather than inheriting Ollama's default, which is " +
-                    '4096 tokens by default unless the Ollama service or request sets num_ctx. Use keepAlive:"0" for one-off ' +
-                    "calls so it does not hold memory after.",
-                  caution:
-                    "Do not co-resident large models until their combined runner sizes, contexts, " +
-                    "KV caches, and OS headroom fit this host. Check `models{view:\"resident\"}` and " +
-                    "accelerator telemetry first; benchmark packaging rather than inferring quality " +
-                    "or speed from a model suffix.",
-                }
-            : null,
+          recommendation: best ? libraryTrialCandidate(best.tag, isEmbeddingFamily) : null,
         });
       }
 
@@ -641,12 +700,15 @@ async function libraryLookup({
       for (const c of capabilities ?? []) params.append("c", c);
       if (query) params.set("q", query);
       if (order === "newest") params.set("o", "newest");
-      const url = `https://ollama.com/search?${params.toString()}`;
-      const parsed = parseModelSearch(await fetchPage(url)).slice(0, limit ?? 10);
+      const search = await ollamaLibrary.search(params);
+      const url = search.url;
+      const parsed = search.models.slice(0, limit ?? 10);
       const { installed } = await localState();
       const installedFamilies = new Set([...installed].map((n) => n.split(":")[0]));
       return structuredResult({
         query: url,
+        fetchedAt: search.fetchedAt,
+        ...(parsed.length === 0 ? { searchUnavailable: "No result cards were recognized. The query may have no matches or Ollama's markup may have changed; inspect the source URL." } : {}),
         order: order ?? "popular",
         count: parsed.length,
         nextStep: 'Not pullable yet. Call again with view:"library", model:"<name>" to get tags, sizes and memory fit.',
@@ -657,69 +719,67 @@ async function libraryLookup({
     }
 }
 
+registerContextTools(server);
+
 server.registerTool(
   "run_task",
   {
     description:
-      "Use when: routing or executing supplied content. Do not use when: workspace files must be read; use delegate_research. " +
-      "Preview consequential work first; it never generates. Returns: decision or response with receipts. Next: inspect structured observation and verification.",
-    inputSchema: {
+      "Use when: supplied chat/tools/embeddings. Do not use when: files. Returns: response/receipts.",
+    inputSchema: z.object({
       endpoint: endpointParam,
-      task: taskParam,
+      task: taskParam.removeDefault().optional().describe("caller owns prompts and output format."),
       objective: objectiveParam,
-      model: z.string().min(1).optional().describe("Force this exact installed model name."),
-      sessionId: z.string().min(1).optional().describe("Session id for model affinity across calls."),
-      contextTokens: z.number().int().positive().optional().describe("Total Ollama context window (num_ctx), including input and output."),
+      model: z.string().min(1).optional(),
+      sessionId: z.string().uuid().optional(),
+      scopeId: z.string().uuid().optional(),
+      scopeRevision: z.number().int().nonnegative().optional(),
+      contextTokens: z.number().int().positive().optional().describe("Total input + output window (num_ctx)."),
       executionPreference: executionPreferenceParam,
       minPlacementEvidence: minPlacementEvidenceParam,
       requiredCapabilities: requiredCapabilitiesParam,
-      prompt: z.string().min(1).optional().describe("Chat input when messages is omitted."),
+      prompt: z.string().min(1).optional(),
+      systemPrompt: systemPromptParam,
       images: z
         .array(z.string().min(1))
         .min(1)
         .optional()
         .describe("base64, no data-URI prefix; prompt mode only; requires an explicit tested vision model"),
-      messages: z
-        .array(
-          z
-            .object({ role: z.enum(["system", "user", "assistant", "tool"]), content: z.string() })
-            .passthrough(),
-        )
-        .min(1)
-        .optional()
-        .describe(
-          "wins over prompt; preserves Ollama images, thinking, tool_calls, tool_name, and other message fields",
+      messages: messagesParam.describe(
+          "Caller system prompts; no injected task instructions. Overrides prompt; extra fields preserved.",
         ),
       input: z
         .union([z.string().min(1), z.array(z.string().min(1)).min(1)])
         .optional()
-        .describe('embedding only; batch strings because one call is far cheaper than one call per item'),
-      tools: z.array(z.record(z.unknown())).min(1).optional().describe("Ollama function definitions for chat tasks."),
-      keepAlive: z.string().min(1).optional().describe('"0" unloads now, "-1" pins, default 5m'),
+        ,
+      tools: localToolsParam,
+      keepAlive: z.string().min(1).optional().describe('"0" unloads now, "-1" pins; omitted = adaptive finite TTL'),
       format: z
         .union([z.literal("json"), z.record(z.unknown())])
         .optional()
-        .describe('Ollama structured output: "json" or a JSON schema object'),
+        ,
       think: z
         .union([z.boolean(), z.enum(["low", "medium", "high"])])
-        .optional()
-        .describe("Override the task profile for thinking-capable models"),
+        .optional(),
       options: z
         .record(z.unknown())
         .optional()
-        .describe("Advanced Ollama options; num_ctx/contextTokens and num_gpu/placement are routing-owned. num_predict caps output."),
+        .describe("num_ctx/contextTokens and num_gpu/placement are routing-owned; num_predict caps output."),
       logprobs: z.boolean().optional(),
-      topLogprobs: z.number().int().nonnegative().optional().describe("Requires logprobs:true"),
+      topLogprobs: z.number().int().nonnegative().optional(),
       minConfidence: minConfidenceParam,
-      priority: z.enum(["interactive", "normal", "background"]).optional().describe("Admission class only; normal default. Fair scheduling prevents background starvation."),
-      returnEmbeddings: z.boolean().optional().describe("false (default) withholds the raw vectors; they are large and unreadable to a model"),
+      priority: z.enum(["interactive", "normal", "background"]).optional(),
+      maxWaitSeconds: z.number().int().positive().optional(),
+      timeoutSeconds: z.number().int().positive().optional(),
+      defer: z.boolean().optional(),
+      returnEmbeddings: z.boolean().optional(),
       preview: z
         .boolean()
         .optional()
         .describe(
           "true = routing fields only; rejects payloads and runtime controls; never executes",
         ),
-    },
+    }).strict(),
     outputSchema: taskResultSchema,
     annotations: { destructiveHint: false },
   },
@@ -729,11 +789,14 @@ server.registerTool(
     objective,
     model,
     sessionId,
+    scopeId,
+    scopeRevision,
     contextTokens,
     executionPreference,
     minPlacementEvidence,
     requiredCapabilities,
     prompt,
+    systemPrompt,
     images,
     messages,
     input,
@@ -746,14 +809,23 @@ server.registerTool(
     topLogprobs,
     minConfidence,
     priority,
+    maxWaitSeconds,
+    timeoutSeconds,
+    defer,
     returnEmbeddings,
     preview,
   }) => {
     try {
-      const canonicalTask = canonicalTaskKind(task);
+      const canonicalTask = canonicalTaskKind(task ?? "completion");
+      if ((scopeId === undefined) !== (scopeRevision === undefined)) {
+        return errorResult(new Error("scopeId and scopeRevision must be supplied together."));
+      }
       if (preview) {
         const executionOnlyFields = ([
+          ["scopeId", scopeId],
+          ["scopeRevision", scopeRevision],
           ["prompt", prompt],
+          ["systemPrompt", systemPrompt],
           ["images", images],
           ["messages", messages],
           ["input", input],
@@ -765,6 +837,10 @@ server.registerTool(
           ["logprobs", logprobs],
           ["topLogprobs", topLogprobs],
           ["returnEmbeddings", returnEmbeddings],
+          ["maxWaitSeconds", maxWaitSeconds],
+          ["priority", priority],
+          ["timeoutSeconds", timeoutSeconds],
+          ["defer", defer],
         ] satisfies Array<[string, unknown]>)
           .filter(([, value]) => value !== undefined)
           .map(([name]) => `\`${name}\``);
@@ -788,7 +864,7 @@ server.registerTool(
       if (!preview && task === "embedding") {
         if (input === undefined) return errorResult(new Error('task "embedding" requires `input`.'));
         if (
-          [prompt, images, messages, tools, format, think, logprobs, topLogprobs].some(
+          [prompt, systemPrompt, images, messages, tools, format, think, logprobs, topLogprobs].some(
             (value) => value !== undefined,
           )
         ) {
@@ -801,10 +877,10 @@ server.registerTool(
         if (input !== undefined || returnEmbeddings !== undefined) {
           return errorResult(new Error('`input` and `returnEmbeddings` are valid only for task "embedding".'));
         }
-        if (prompt === undefined && (messages === undefined || messages.length === 0)) {
-          return errorResult(new Error(`task "${task}" requires \`prompt\` or \`messages\`.`));
+        if (prompt === undefined && systemPrompt === undefined && (messages === undefined || messages.length === 0)) {
+          return errorResult(new Error(`task "${task}" requires \`prompt\`, \`systemPrompt\`, or \`messages\`.`));
         }
-        if (images !== undefined && messages !== undefined) {
+        if (images !== undefined && (messages !== undefined || prompt === undefined)) {
           return errorResult(
             new Error("Top-level `images` is valid only with `prompt`; put images inside messages instead."),
           );
@@ -817,7 +893,7 @@ server.registerTool(
         const result = parsedResult(
           await route(endpoint, canonicalTask, objective, model, sessionId, contextTokens, effectiveRequiredCapabilities, minConfidence, executionPreference, minPlacementEvidence),
         );
-        if ("structuredContent" in result) {
+        if (isStructuredSuccess(result)) {
           const refusal = belowConfidence(result.structuredContent, minConfidence);
           if (refusal) return refusal;
         }
@@ -827,36 +903,40 @@ server.registerTool(
       // are spent. So when the caller sets a floor, preview the decision with a `route` call
       // first — free, no generation — and refuse before anything runs. Only costs the extra round
       // trip when the option is actually used.
-      if (minConfidence) {
+      if (minConfidence && scopeId === undefined) {
         const decision = parsedResult(
           // minConfidence is forwarded so the CORE gate refuses, with its actionable message naming
         // the two commands that raise the grade. The belowConfidence() check below stays only as a
           // fallback for servers older than the core gate.
         await route(endpoint, canonicalTask, objective, model, sessionId, contextTokens, effectiveRequiredCapabilities, minConfidence, executionPreference, minPlacementEvidence),
         );
-        if ("structuredContent" in decision) {
-          const refusal = belowConfidence(decision.structuredContent, minConfidence);
-          if (refusal) return refusal;
-        }
+        if (!isStructuredSuccess(decision)) return decision;
+        const refusal = belowConfidence(decision.structuredContent, minConfidence);
+        if (refusal) return refusal;
       }
       const result = parsedResult(
         await runTaskRequest(endpoint ?? DEFAULT_SERVE_ENDPOINT, {
-          task: canonicalTask,
-          objective: objective ?? "balanced",
+          task: scopeId !== undefined && task === undefined ? undefined : canonicalTask,
+          objective: objective ?? (scopeId === undefined ? "balanced" : undefined),
           model,
           session_id: sessionId,
+          scope_id: scopeId,
+          scope_revision: scopeRevision,
           context_tokens: contextTokens,
-          required_capabilities: effectiveRequiredCapabilities ?? [],
+          required_capabilities: effectiveRequiredCapabilities,
           prompt,
           images,
-          messages: messages ?? [],
+          messages: taskMessages({ systemPrompt, messages, prompt, images }),
           input,
           tools,
           keep_alive: keepAlive,
           min_confidence: minConfidence,
           priority: priority ?? "normal",
-          execution_preference: executionPreference ?? "auto",
-          min_placement_evidence: minPlacementEvidence ?? "configured",
+          max_wait_seconds: maxWaitSeconds,
+          timeout_seconds: timeoutSeconds,
+          defer: defer ?? false,
+          execution_preference: executionPreference,
+          min_placement_evidence: minPlacementEvidence,
           request_options: {
             format,
             think,
@@ -866,7 +946,8 @@ server.registerTool(
           },
         }),
       );
-      if (!returnEmbeddings && "structuredContent" in result) {
+      if (isStructuredSuccess(result) && result.structuredContent.deferred === true) return result;
+      if (!returnEmbeddings && isStructuredSuccess(result)) {
         const trimmed = summarizeEmbeddings(result.structuredContent);
         if (trimmed) return withTaskTelemetry(structuredResult(trimmed));
       }
@@ -878,16 +959,60 @@ server.registerTool(
 );
 
 server.registerTool(
+  "task_jobs",
+  {
+    description:
+      "Use when: task jobs. Do not use when: new work/session kill. " +
+      "Returns: status/result; remove cancels first.",
+    inputSchema: z.object({
+      endpoint: endpointParam,
+      action: z.enum(["list", "get", "cancel", "remove"]),
+      jobId: z.string().uuid().optional(),
+      returnEmbeddings: z.boolean().optional(),
+    }).strict(),
+    outputSchema: objectResultSchema,
+    annotations: { destructiveHint: true },
+  },
+  async ({ endpoint, action, jobId, returnEmbeddings }) => {
+    try {
+      if (action === "list" ? jobId !== undefined : jobId === undefined) {
+        return errorResult(new Error("Use jobId only with get/cancel/remove; all require a jobId."));
+      }
+      if (returnEmbeddings !== undefined && action !== "get") {
+        return errorResult(new Error("returnEmbeddings is valid only with get."));
+      }
+      const result = parsedResult(action === "list"
+        ? await listTaskJobs(endpoint)
+        : action === "get"
+          ? await getTaskJob(endpoint, jobId!)
+          : action === "cancel"
+            ? await cancelTaskJob(endpoint, jobId!)
+            : await removeTaskJob(endpoint, jobId!));
+      if (!returnEmbeddings && isStructuredSuccess(result)) {
+        const job = result.structuredContent.job as Record<string, unknown> | undefined;
+        if (job?.result && typeof job.result === "object") {
+          const trimmed = summarizeEmbeddings(job.result as Record<string, unknown>);
+          if (trimmed) return structuredResult({ ...result.structuredContent, job: { ...job, result: trimmed } });
+        }
+      }
+      return result;
+    } catch (error) {
+      return errorResult(error);
+    }
+  },
+);
+
+server.registerTool(
   "run_task_batch",
   {
     description:
-      "Use when: independent work. Do not use when: dependencies. " +
-      "Inputs: [{id, independent:true, task}]; maxParallelism caps dispatch. Returns: ordered receipts.",
-    inputSchema: {
+      "Use when: independent:true work. Do not use when: dependencies. " +
+      "Returns: ordered receipts; maxParallelism caps dispatch.",
+    inputSchema: z.object({
       tasks: z.array(batchItemParam).min(1).max(64),
       maxParallelism: z.number().int().positive().max(64).optional(),
       endpoint: endpointParam,
-    },
+    }).strict(),
     outputSchema: batchResultSchema,
     annotations: { destructiveHint: false },
   },
@@ -895,12 +1020,18 @@ server.registerTool(
     try {
       for (const item of tasks) {
         const task = item.task as Record<string, unknown>;
+        if ((task.scopeId === undefined) !== (task.scopeRevision === undefined)) {
+          return errorResult(new Error(`batch item ${item.id}: scopeId and scopeRevision must be supplied together.`));
+        }
         if (task.task === "embedding") {
-          if (task.input === undefined || task.prompt !== undefined || task.messages !== undefined || task.tools !== undefined) {
+          if (task.input === undefined || task.prompt !== undefined || task.systemPrompt !== undefined || task.messages !== undefined || task.tools !== undefined) {
             return errorResult(new Error(`batch item ${item.id}: embedding requires input and accepts no chat payload.`));
           }
-        } else if (task.input !== undefined || (task.prompt === undefined && task.messages === undefined)) {
-          return errorResult(new Error(`batch item ${item.id}: chat work requires prompt or messages and accepts no input.`));
+        } else if (task.input !== undefined || (task.prompt === undefined && task.systemPrompt === undefined && task.messages === undefined)) {
+          return errorResult(new Error(`batch item ${item.id}: chat work requires prompt, systemPrompt, or messages and accepts no input.`));
+        }
+        if (task.images !== undefined && (task.messages !== undefined || task.prompt === undefined)) {
+          return errorResult(new Error(`batch item ${item.id}: top-level images requires prompt without messages; put images inside messages instead.`));
         }
         if (task.images !== undefined && task.model === undefined) {
           return errorResult(new Error(`batch item ${item.id}: images require an explicit tested vision model.`));
@@ -908,23 +1039,27 @@ server.registerTool(
       }
       return withBatchTelemetry(parsedResult(await runTaskBatchRequest(endpoint ?? DEFAULT_SERVE_ENDPOINT, {
         tasks: tasks.map((item) => {
-          const task = item.task as Record<string, unknown>;
+          const task = item.task;
           return ({
           id: item.id,
           independent: item.independent,
           task: {
-            task: task.task === "code_review" ? "coding" : task.task,
-            objective: (task as Record<string, unknown>).objective ?? "balanced",
+            task: task.task === "code_review" ? "coding" : (task.task ?? (task.scopeId === undefined ? "completion" : undefined)),
+            objective: task.objective ?? (task.scopeId === undefined ? "balanced" : undefined),
             model: task.model,
-            session_id: (task as Record<string, unknown>).sessionId,
+            session_id: task.sessionId,
+            scope_id: task.scopeId,
+            scope_revision: task.scopeRevision,
             context_tokens: (task as Record<string, unknown>).contextTokens,
-            execution_preference: (task as Record<string, unknown>).executionPreference ?? "auto",
-            min_placement_evidence: (task as Record<string, unknown>).minPlacementEvidence ?? "configured",
-            required_capabilities: (task as Record<string, unknown>).requiredCapabilities ?? [],
+            execution_preference: task.executionPreference,
+            min_placement_evidence: task.minPlacementEvidence,
+            required_capabilities: task.requiredCapabilities,
             priority: task.priority ?? "normal",
+            max_wait_seconds: task.maxWaitSeconds,
+            timeout_seconds: task.timeoutSeconds,
             prompt: task.prompt,
             images: task.images,
-            messages: task.messages ?? [],
+            messages: taskMessages(task),
             input: task.input,
             tools: (task as Record<string, unknown>).tools,
             keep_alive: (task as Record<string, unknown>).keepAlive,
@@ -954,10 +1089,10 @@ server.registerTool(
   "ollama_manage",
   {
     description:
-      "Use when: pulling an approved tag or stopping a loaded model. Do not use when: deleting/recommending. " +
-      "Inputs: action/model; timeoutSeconds is pull-only. Returns: lifecycle result. Next: inspect models.",
-    inputSchema: {
-      action: z.enum(["pull", "stop"]).describe('"pull" = disk, "stop" = memory'),
+      "Use when: approved pull/stop. Do not use when: delete/discovery. " +
+      "Returns: receipt; timeoutSeconds is pull-only.",
+    inputSchema: z.object({
+      action: z.enum(["pull", "stop"]),
       model: z.string().min(1),
       ollamaEndpoint: ollamaEndpointParam,
       timeoutSeconds: z
@@ -965,22 +1100,26 @@ server.registerTool(
         .int()
         .positive()
         .optional()
-        .describe(`"pull" only. Defaults to ${DEFAULT_PULL_TIMEOUT_SECONDS}s.`),
-    },
+        ,
+    }).strict(),
     outputSchema: manageResultSchema,
     annotations: { destructiveHint: false },
   },
-  async ({ action, model, ollamaEndpoint, timeoutSeconds }) => {
+  async ({ action, model, ollamaEndpoint, timeoutSeconds }, extra) => {
     try {
       if (action === "stop" && timeoutSeconds !== undefined) {
         return errorResult(new Error('`timeoutSeconds` is valid only for action "pull".'));
       }
       const data =
         action === "pull"
-          ? await ollamaPull(ollamaEndpoint, model, timeoutSeconds)
+          ? await ollamaPull(ollamaEndpoint, model, timeoutSeconds, {
+              signal: extra.signal,
+              onProgress: pullProgressReporter(extra),
+            })
           : await ollamaFetch(ollamaEndpoint, "/api/generate", {
               method: "POST",
               body: { model, keep_alive: 0 },
+              signal: extra.signal,
             });
       const payload = data as Record<string, unknown>;
       // Pull failures arrive as an {"error": ...} event on an HTTP 200 stream, so the fetch
@@ -1000,12 +1139,11 @@ server.registerTool(
   "ollama_delete",
   {
     description:
-      "DESTRUCTIVE AND IRREVERSIBLE. Use when: a human requests one exact tag. Do not use when: freeing memory, " +
-      "cleaning by age, or inferring a tag. Inputs: exact tag. Returns: deleted tag. Next: refresh models.",
-    inputSchema: {
+      "DESTRUCTIVE AND IRREVERSIBLE. Use when: human names exact tag. Do not use when: inferred cleanup. Returns: deleted tag.",
+    inputSchema: z.object({
       model: z.string().min(1),
       ollamaEndpoint: ollamaEndpointParam,
-    },
+    }).strict(),
     outputSchema: deleteResultSchema,
     annotations: { destructiveHint: true },
   },
@@ -1013,7 +1151,7 @@ server.registerTool(
     try {
       await ollamaFetch(ollamaEndpoint, "/api/delete", {
         method: "DELETE",
-        body: { name: model },
+        body: { model },
       });
       return structuredResult({ deleted: model });
     } catch (error) {
@@ -1026,74 +1164,77 @@ server.registerTool(
  * Verdicts in `assessDelegatedAnswer` are per-model, from on-disk evidence — never a global
  * base rate. Grades live in benchmark/evidence/model-evidence.json.
  */
+/** With no explicit or configured model, ask the router for an installed coding model. */
+async function routedResearchModel(
+  endpoint: string | undefined,
+  executionPreference: string | undefined,
+  minPlacementEvidence: string | undefined,
+): Promise<string> {
+  const decision = JSON.parse(
+    await route(endpoint, "coding", "balanced", undefined, undefined, undefined, [], undefined, executionPreference, minPlacementEvidence),
+  ) as { selected_model?: unknown };
+  if (typeof decision.selected_model !== "string" || !decision.selected_model) {
+    throw new Error(
+      "No research model: pass `model`, set FREELLAMA_MCP_DEFAULT_MODEL, or install a coding model " +
+        "(models{view:'installed'} shows what routing can use).",
+    );
+  }
+  return decision.selected_model;
+}
+
 server.registerTool(
   "delegate_research",
   {
     description:
-      "Use when: a narrow lookup needs an allowed workspace. Do not use when: mutation, broad judgment, or outside-workspace facts are needed. " +
-      "Pages tool evidence instead of flooding caller context. Returns: answer, citations, evidence, verdict. Next: verify or escalate yourself.",
-    inputSchema: {
-      question: z.string().min(1).describe("narrow and self-contained, answerable by reading files"),
+      "Use when: workspace lookup. Do not use when: mutation/external facts. " +
+      "Returns: citations/answer; discard verification.recommendation=escalate, otherwise verify citations.",
+    inputSchema: z.object({
+      question: z.string().min(1),
       workspacePath: z
         .string()
         .min(1)
-        .describe("directory inside FREELLAMA_MCP_ALLOWED_ROOTS (absolute preferred; relative is resolved)"),
+        ,
       adapter: z
         .enum(["bash", "octocode"])
         .optional()
-        .describe('"bash" (default) beat "octocode" on every model measured, and is faster'),
+        ,
       model: z
         .string()
         .min(1)
         .optional()
-        .describe("omit to use FREELLAMA_MCP_DEFAULT_MODEL; research accuracy collapses below ~12B"),
+        ,
       endpoint: endpointParam,
       executionPreference: executionPreferenceParam,
       minPlacementEvidence: minPlacementEvidenceParam,
-      legacyText: z.boolean().optional().describe("false default: compact text cue; true: legacy serialized JSON text"),
+      legacyText: z.boolean().optional(),
       agent: z
         .object({
           maxTurns: z.number().int().positive().optional(),
-          contextTokens: z.number().int().positive().optional().describe("Total agent context; input reserves outputTokens and safety margin."),
-          outputTokens: z.number().int().positive().optional().describe("Maximum generated tokens per model call; reserved from context."),
+          contextTokens: z.number().int().positive().optional(),
+          outputTokens: z.number().int().positive().optional(),
           temperature: z.number().nonnegative().optional(),
           seed: z.number().int().nonnegative().optional(),
           think: z.boolean().optional(),
-          keepAlive: z.string().min(1).optional().describe('Ollama duration such as "5m", "0", or "-1"'),
+          keepAlive: z.string().min(1).optional(),
           requestTimeoutSeconds: z.number().positive().optional(),
           toolTimeoutSeconds: z.number().positive().optional(),
-          retryAttempts: z.number().int().positive().optional(),
-          retryBackoffSeconds: z.number().nonnegative().optional(),
-          maxParseRepairs: z.number().int().nonnegative().optional(),
-          parseRepairEchoChars: z.number().int().positive().optional(),
-          context: z
-            .object({
-              charsPerToken: z.number().positive().optional(),
-              safetyMarginTokens: z.number().int().nonnegative().optional(),
-              imageTokenEstimate: z.number().int().nonnegative().optional(),
-              keepRecent: z.number().int().nonnegative().optional(),
-              compactPreviewChars: z.number().int().positive().optional(),
-              compactRetainRatio: z.number().positive().lt(1).optional(),
-              clipHeadRatio: z.number().positive().lt(1).optional(),
-              observationPageChars: z.number().int().positive().optional(),
-              pinnedOverflow: z.enum(["error", "clip"]).optional(),
-            })
-            .optional(),
         })
+        .strict()
         .optional()
-        .describe("Per-call agent budget, recovery, and compaction controls."),
-    },
+        ,
+    }).strict(),
     outputSchema: researchResultSchema,
     annotations: { destructiveHint: false },
   },
-  async ({ question, workspacePath, adapter, model, endpoint, executionPreference, minPlacementEvidence, legacyText, agent }) => {
+  async ({ question, workspacePath, adapter, model, endpoint, executionPreference, minPlacementEvidence, legacyText, agent }, extra) => {
     const chosenAdapter: ResearchAdapter = adapter ?? DEFAULT_RESEARCH_ADAPTER;
-    const chosenModel = model ?? DEFAULT_DELEGATE_MODEL;
     let resolvedWorkspace: string;
+    let chosenModel: string;
     try {
       resolvedWorkspace = await assertAllowedWorkspace(workspacePath);
+      chosenModel = model ?? DEFAULT_DELEGATE_MODEL ?? await routedResearchModel(endpoint, executionPreference, minPlacementEvidence);
     } catch (error) {
-      return errorResult(error);
+      return researchErrorResult(error);
     }
     // Pre-flight, not post-hoc: a model this repo measured at 0-38% will not become right by
     // running it, so refuse before spending a model load and 10-40s of wall time on it.
@@ -1119,7 +1260,7 @@ server.registerTool(
       await writeFile(promptFile, `${question}\n`, "utf8");
       const adapter = RESEARCH_ADAPTERS[chosenAdapter];
       if (!existsSync(adapter)) {
-        return errorResult(
+        return researchErrorResult(
           new Error(
             `research adapter not found at ${adapter}. In a published install it should be bundled ` +
               "under <package>/adapters; in-repo it comes from benchmark/local/scripts. Reinstall, " +
@@ -1128,8 +1269,9 @@ server.registerTool(
         );
       }
       const running = execFileAsync("python3", [adapter], {
+        signal: extra.signal,
         env: {
-          ...process.env,
+          ...delegateEnvironment(),
           FREELLAMA_TARGET_MODEL: chosenModel,
           FREELLAMA_AGENT_MANAGED_ENDPOINT: endpoint ?? DEFAULT_SERVE_ENDPOINT,
           FREELLAMA_AGENT_EXECUTION_PREFERENCE: executionPreference ?? "auto",
@@ -1147,19 +1289,6 @@ server.registerTool(
           ...(agent?.keepAlive !== undefined ? { FREELLAMA_AGENT_KEEP_ALIVE: agent.keepAlive } : {}),
           ...(agent?.requestTimeoutSeconds !== undefined ? { FREELLAMA_AGENT_REQUEST_TIMEOUT_SECONDS: String(agent.requestTimeoutSeconds) } : {}),
           ...(agent?.toolTimeoutSeconds !== undefined ? { FREELLAMA_AGENT_TOOL_TIMEOUT_SECONDS: String(agent.toolTimeoutSeconds) } : {}),
-          ...(agent?.retryAttempts !== undefined ? { FREELLAMA_AGENT_RETRY_ATTEMPTS: String(agent.retryAttempts) } : {}),
-          ...(agent?.retryBackoffSeconds !== undefined ? { FREELLAMA_AGENT_RETRY_BACKOFF_SECONDS: String(agent.retryBackoffSeconds) } : {}),
-          ...(agent?.maxParseRepairs !== undefined ? { FREELLAMA_AGENT_MAX_PARSE_REPAIRS: String(agent.maxParseRepairs) } : {}),
-          ...(agent?.parseRepairEchoChars !== undefined ? { FREELLAMA_AGENT_PARSE_REPAIR_ECHO_CHARS: String(agent.parseRepairEchoChars) } : {}),
-          ...(agent?.context?.charsPerToken !== undefined ? { FREELLAMA_AGENT_CHARS_PER_TOKEN: String(agent.context.charsPerToken) } : {}),
-          ...(agent?.context?.safetyMarginTokens !== undefined ? { FREELLAMA_AGENT_SAFETY_MARGIN_TOKENS: String(agent.context.safetyMarginTokens) } : {}),
-          ...(agent?.context?.imageTokenEstimate !== undefined ? { FREELLAMA_AGENT_IMAGE_TOKEN_ESTIMATE: String(agent.context.imageTokenEstimate) } : {}),
-          ...(agent?.context?.keepRecent !== undefined ? { FREELLAMA_AGENT_KEEP_RECENT: String(agent.context.keepRecent) } : {}),
-          ...(agent?.context?.compactPreviewChars !== undefined ? { FREELLAMA_AGENT_COMPACT_PREVIEW_CHARS: String(agent.context.compactPreviewChars) } : {}),
-          ...(agent?.context?.compactRetainRatio !== undefined ? { FREELLAMA_AGENT_COMPACT_RETAIN_RATIO: String(agent.context.compactRetainRatio) } : {}),
-          ...(agent?.context?.clipHeadRatio !== undefined ? { FREELLAMA_AGENT_CLIP_HEAD_RATIO: String(agent.context.clipHeadRatio) } : {}),
-          ...(agent?.context?.observationPageChars !== undefined ? { FREELLAMA_AGENT_OBSERVATION_PAGE_CHARS: String(agent.context.observationPageChars) } : {}),
-          ...(agent?.context?.pinnedOverflow !== undefined ? { FREELLAMA_AGENT_PINNED_OVERFLOW: agent.context.pinnedOverflow } : {}),
         },
         timeout: DEFAULT_DELEGATE_TIMEOUT_SECONDS * 1000,
         // The answer is read from `resultFile`, never from stdout — but execFile's default 1 MB
@@ -1197,7 +1326,7 @@ server.registerTool(
       } catch {
         // No usable result file: a hard kill (the SIGKILL timeout above) or a crash before the
         // adapter could finish writing. Here the exec error genuinely is the best account.
-        return errorResult(
+        return researchErrorResult(
           adapterError ??
             new Error(
               "research adapter exited without writing a readable result file — it was killed " +
@@ -1249,20 +1378,17 @@ server.registerTool(
       // The compact machine-readable half. Two independent small-model callers asked for exactly
       // this shape — recommendation, why, citations — rather than parsing it back out of the prose.
       // Successful steps only: a failed command is not a citation for anything.
-      const citations = succeeded.map((step) => ({
-        step: step.step,
-        tool: step.tool,
-        path: step.path,
-        command: step.detail,
-        command_truncated: step.detail_truncated,
-      }));
+      // Citations point into `evidence` by step instead of repeating each command a second time.
+      const citations = succeeded.map((step) => ({ step: step.step, tool: step.tool, path: step.path }));
       if (adapterError) {
-        return errorResult(
-          new Error(
-            `research adapter failed: ${result.final_answer}` +
-              (evidenceText ? `\nEvidence collected before the failure:\n${evidenceText}` : ""),
-          ),
-        );
+        const diagnostic = `research adapter failed: ${result.final_answer}` +
+          (evidenceText ? `\nEvidence collected before the failure:\n${evidenceText}` : "");
+        const refusal = z.object({ receipt: z.object({ error: z.string() }).passthrough() })
+          .safeParse(result.model_metadata?.transport_error);
+        if (refusal.success) {
+          return researchErrorResult(new Error(JSON.stringify(refusal.data.receipt)), diagnostic);
+        }
+        return researchErrorResult(new Error(diagnostic));
       }
       // Grade on what actually read something. A run of failed commands is ungrounded no matter
       // how many of them there were.
@@ -1298,9 +1424,17 @@ server.registerTool(
           evidence,
           summary,
         };
-      return structuredResult(payload, { legacyJson: legacyText === true });
+      // The answer itself goes in TextContent: clients that forward only text to the model
+      // otherwise received a pointer to structuredContent and never the answer.
+      const cited = [...new Set(citations.map((citation) => citation.path).filter(Boolean))];
+      const answerText =
+        `${clipText(result.final_answer, ANSWER_TEXT_MAX_CHARS)}\n\n` +
+        `verification: ${verification.recommendation}` +
+        (cited.length ? `\ncited: ${cited.slice(0, 20).join(", ")}` : "") +
+        `\n(${chosenModel}, ${result.tool_calls.length} tool call(s))`;
+      return structuredResult(payload, legacyText === true ? { legacyJson: true } : { text: answerText });
     } catch (error) {
-      return errorResult(error);
+      return researchErrorResult(error);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

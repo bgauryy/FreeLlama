@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  workflow_call:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: rust ${{ matrix.os }} (fmt · clippy · test)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      # Several code paths are cfg-gated per OS, so clippy must run on every OS: the
+      # Sep 1 failures lived in cfg(not(macos)) blocks that a macOS-only check never compiles.
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --workspace
+
+  js:
+    name: js ${{ matrix.os }} (native build · typecheck · unit tests)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      # Corepack must run before any yarn command: the runner's global yarn is 1.x, while
+      # .yarnrc.yml pins Yarn 4. setup-node's yarn cache probe ran the 1.x binary and failed.
+      - run: corepack enable
+      - run: yarn install --immutable
+      - run: yarn npm audit --all --recursive --environment production
+      - run: yarn build:native
+      - run: yarn workspace @octocodeai/freellama-mcp-server build
+      - run: yarn typecheck
+      - run: yarn test
+      - run: yarn test:release
+      - run: yarn release:verify
+
+  python:
+    name: python adapters
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Hardware harness contract tests
+        run: python3 -m unittest discover -s benchmark/hardware -p 'test_*.py'
+      - name: Adapter contract tests
+        run: |
+          for t in benchmark/local/scripts/test_*.py; do
+            echo "::group::$t"; python3 "$t"; echo "::endgroup::"
+          done

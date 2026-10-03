@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "goal": "Measure correct useful completions during bounded mixed local inference while preserving host responsiveness.",
+  "primary": "successful_correct_tasks_per_second",
+  "direction": "higher",
+  "baseline": "Required separate measured report with identical fixture, grader, model digests, host identity and workload budget.",
+  "target_relative_improvement": 0.1,
+  "minimum_trials": 3,
+  "default_budget": {"trials": 3, "max_wall_seconds": 180, "request_timeout_seconds": 45, "max_output_tokens": 96, "max_parallel": 2, "context_tokens": 4096},
+  "guardrails": {"minimum_correct_fraction": 1.0, "maximum_p95_latency_ratio": 1.1, "maximum_health_p95_ratio": 1.25, "maximum_wake_jitter_p95_ratio": 1.25, "minimum_available_memory_bytes": 2147483648, "maximum_swap_out_growth_pages": 0, "maximum_load_per_cpu": 1.5},
+  "held_out": "None: these public synthetic fixtures are development probes, not a held-out semantic or release evaluation.",
+  "decision_rule": "Never emit ACCEPT from this public probe. Emit MEASURED_IMPROVEMENT only for comparable complete non-smoke reports with at least three trials, improved primary KPI and all measured guards passing; otherwise INSUFFICIENT_EVIDENCE, NOT_COMPARABLE, or NO_MEASURED_IMPROVEMENT. Independent held-out validation is required for promotion.",
+  "limitations": ["health latency measures the control plane, not desktop responsiveness", "process wake jitter is a local scheduling proxy, not UI latency", "exact and JSON grading do not establish general semantic quality", "three trials improve repeatability but do not prove statistical significance", "keep_alive=0 includes loading and unloading cost and does not model warm interactive sessions"]
+}

@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FreeLlama status</title>
+<style>
+:root {
+  --bg: #f7f7f5; --panel: #ffffff; --ink: #1d1d1b; --muted: #6b6b66; --line: #e3e2dd;
+  --ok: #1f7a4d; --warn: #a15c00; --bad: #b3261e; --bar: #3b6fd8; --bar-bg: #e8ecf5;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #141413; --panel: #1d1d1b; --ink: #ecebe6; --muted: #9b9a93; --line: #33322e;
+    --ok: #5cc18c; --warn: #e3a44a; --bad: #f2877e; --bar: #7aa2f7; --bar-bg: #2a2f3d;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink);
+  font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+header { display: flex; align-items: center; gap: 12px; padding: 16px 20px;
+  border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+h1 { font-size: 17px; margin: 0; }
+h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted);
+  margin: 0 0 10px; font-weight: 600; }
+main { padding: 16px 16px 40px; display: grid; gap: 16px; max-width: 1200px; margin: 0 auto; }
+.grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(min(260px, 100%), 1fr)); }
+main > *, .grid > * { min-width: 0; }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+.pill { padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 600;
+  border: 1px solid currentColor; }
+.ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); }
+.muted { color: var(--muted); }
+.row { display: flex; justify-content: space-between; gap: 12px; padding: 3px 0; }
+.row span:last-child { font-variant-numeric: tabular-nums; text-align: right; overflow-wrap: anywhere; }
+.source { color: var(--muted); font-size: 12px; }
+.bar { height: 8px; background: var(--bar-bg); border-radius: 4px; overflow: hidden; margin: 4px 0 8px; }
+.bar > div { height: 100%; background: var(--bar); }
+table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+th { color: var(--muted); font-weight: 600; font-size: 12px; }
+.scroll { overflow-x: auto; }
+#auth { display: none; gap: 8px; align-items: center; }
+input { font: inherit; padding: 4px 8px; border: 1px solid var(--line); border-radius: 6px;
+  background: var(--bg); color: var(--ink); min-width: 0; }
+button { font: inherit; padding: 4px 12px; border-radius: 6px; border: 1px solid var(--line);
+  background: var(--panel); color: var(--ink); cursor: pointer; }
+.spacer { flex: 1; }
+</style>
+</head>
+<body>
+<header>
+  <h1>FreeLlama</h1>
+  <span id="overall" class="pill muted">loading</span>
+  <span class="spacer"></span>
+  <span id="updated" class="muted"></span>
+  <form id="auth">
+    <label for="token" class="muted">Bearer token</label>
+    <input id="token" type="password" autocomplete="off">
+    <button type="submit">Use</button>
+  </form>
+</header>
+<main>
+  <p id="error" class="bad" hidden></p>
+  <section class="grid" id="backends"></section>
+  <section class="grid">
+    <div class="panel"><h2>Host</h2><div id="host"></div></div>
+    <div class="panel"><h2>Today</h2><div id="usage"></div></div>
+    <div class="panel"><h2>Ollama</h2><div id="ollama"></div></div>
+  </section>
+  <section class="panel">
+    <h2>Loaded models</h2>
+    <div class="scroll"><table>
+      <thead><tr><th>Model</th><th>Backend</th><th>Size</th><th>On GPU</th><th>Context</th>
+        <th>Tasks now</th><th>Recent uses</th><th>Load time</th><th>Idle</th><th>Pinned</th></tr></thead>
+      <tbody id="models"></tbody>
+    </table></div>
+  </section>
+  <section class="panel"><h2>Last eviction</h2><div id="eviction"></div></section>
+</main>
+<script>
+"use strict";
+const API = "/_freellama/v1/status";
+const $ = (id) => document.getElementById(id);
+let token = "";
+try { token = sessionStorage.getItem("freellama-token") || ""; } catch (_) { /* storage blocked */ }
+
+function el(tag, text, cls) {
+  const node = document.createElement(tag);
+  if (text !== undefined && text !== null) node.textContent = String(text);
+  if (cls) node.className = cls;
+  return node;
+}
+function bytes(value) {
+  if (value === null || value === undefined) return "–";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let n = Number(value), i = 0;
+  while (n >= 1024 && i < units.length - 1) { n /= 1024; i += 1; }
+  return `${n.toFixed(n >= 10 || i === 0 ? 0 : 1)} ${units[i]}`;
+}
+function seconds(value) {
+  if (value === null || value === undefined) return "–";
+  const s = Number(value);
+  if (s < 90) return `${Math.round(s)}s`;
+  if (s < 5400) return `${Math.round(s / 60)}m`;
+  return `${(s / 3600).toFixed(1)}h`;
+}
+function row(label, value, cls) {
+  const line = el("div", null, "row");
+  line.append(el("span", label, "muted"), el("span", value, cls));
+  return line;
+}
+function bar(used, total) {
+  const outer = el("div", null, "bar"), inner = el("div");
+  const share = total > 0 ? Math.min(100, Math.max(0, (used / total) * 100)) : 0;
+  inner.style.width = `${share}%`;
+  outer.append(inner);
+  return outer;
+}
+function fill(id, nodes) { $(id).replaceChildren(...nodes); }
+
+function renderBackend(name, view) {
+  const a = view.admission || {}, ad = view.adaptive || {}, circuit = view.circuit || {};
+  const panel = el("div", null, "panel");
+  panel.append(el("h2", `${name.toUpperCase()} backend`));
+  const used = Number(a.active_units || 0), limit = Number(a.slots_total || 0);
+  panel.append(row("Units in use", `${used} / ${limit}`), bar(used, limit));
+  panel.append(row("Queued", `${a.queue_depth ?? 0} / ${a.queue_limit ?? "–"}`, a.queue_depth > 0 ? "warn" : ""));
+  panel.append(row("Oldest wait", a.oldest_wait_ms == null ? "–" : `${(a.oldest_wait_ms / 1000).toFixed(1)}s`));
+  if (ad.enabled) panel.append(row("Adaptive limit", `${ad.limit} of ${ad.ceiling}`, ad.limit < ad.ceiling ? "warn" : ""));
+  const state = circuit.state || "closed";
+  panel.append(row("Circuit", state === "open" ? `open, retry in ${circuit.retry_after_seconds ?? "?"}s` : state,
+    state === "closed" ? "ok" : state === "open" ? "bad" : "warn"));
+  panel.append(row("Refused (queue full / timeout)", `${a.queue_full_rejections ?? 0} / ${a.queue_timeouts ?? 0}`));
+  panel.append(el("div", view.upstream, "muted"));
+  return panel;
+}
+
+function render(data) {
+  const holding = data.status === "holding";
+  const openCircuit = Object.values(data.backends || {}).some((b) => (b.circuit || {}).state === "open");
+  const overall = $("overall");
+  overall.textContent = openCircuit ? "circuit open" : holding ? "holding for memory" : "ok";
+  overall.className = `pill ${openCircuit ? "bad" : holding ? "warn" : "ok"}`;
+
+  const backends = Object.entries(data.backends || {}).map(([name, view]) => renderBackend(name, view));
+  const raw = data.raw_proxy || {};
+  const rawPanel = el("div", null, "panel");
+  rawPanel.append(el("h2", "Raw Ollama traffic"),
+    row("Streams", `${raw.active ?? 0} / ${raw.limit ?? "–"}`), bar(raw.active || 0, raw.limit || 0),
+    row("Waiting", raw.waiting ?? 0, raw.waiting > 0 ? "warn" : ""),
+    row("Refused", raw.rejected ?? 0));
+  fill("backends", [...backends, rawPanel]);
+
+  const h = data.host || {};
+  const hostNodes = [];
+  if (h.total_memory_bytes) {
+    const usedRam = h.total_memory_bytes - (h.available_memory_bytes || 0);
+    hostNodes.push(row("RAM used", `${bytes(usedRam)} of ${bytes(h.total_memory_bytes)}`), bar(usedRam, h.total_memory_bytes));
+  }
+  if (h.gpu_memory_total_bytes) {
+    const usedVram = h.gpu_memory_total_bytes - (h.gpu_memory_free_bytes || 0);
+    hostNodes.push(row("VRAM used", `${bytes(usedVram)} of ${bytes(h.gpu_memory_total_bytes)}`), bar(usedVram, h.gpu_memory_total_bytes));
+  }
+  hostNodes.push(row("Reserved for loads", bytes(h.reserved_bytes)));
+  hostNodes.push(row("Memory gate", h.holding ? "holding" : "open", h.holding ? "warn" : "ok"));
+  if (h.load_average_one_minute != null) hostNodes.push(row("Load (1 min)", `${h.load_average_one_minute.toFixed(2)} on ${h.logical_cpus ?? "?"} CPUs`));
+  if (h.thermal_throttled) hostNodes.push(row("Thermal", "throttled", "bad"));
+  fill("host", hostNodes);
+
+  const u = data.usage_today || {};
+  fill("usage", [
+    row("Tasks", u.tasks ?? 0), row("Errors", u.errors ?? 0, u.errors > 0 ? "warn" : ""),
+    row("Prompt tokens", (u.prompt_tokens ?? 0).toLocaleString()),
+    row("Output tokens", (u.output_tokens ?? 0).toLocaleString()),
+    row("Busy time", seconds((u.busy_ms ?? 0) / 1000)),
+    row("Queue wait", seconds((u.queue_wait_ms ?? 0) / 1000)),
+  ]);
+
+  const o = data.ollama || {}, settings = ((o.config || {}).settings) || {};
+  const ollamaNodes = [];
+  for (const name of ["OLLAMA_NUM_PARALLEL", "OLLAMA_MAX_LOADED_MODELS", "OLLAMA_CONTEXT_LENGTH", "OLLAMA_KV_CACHE_TYPE", "OLLAMA_FLASH_ATTENTION"]) {
+    const setting = settings[name];
+    if (!setting) continue;
+    const line = row(name.replace("OLLAMA_", ""), setting.value ?? "Ollama default");
+    if (setting.value != null) line.lastChild.append(" ", el("span", setting.source.replaceAll("_", " "), "source"));
+    ollamaNodes.push(line);
+  }
+  if (o.default_context) ollamaNodes.push(row("Default context", `${o.default_context.tokens} (${o.default_context.source})`));
+  ollamaNodes.push(el("div", (o.config || {}).process_inspection || "", "muted"));
+  fill("ollama", ollamaNodes);
+
+  const models = (data.loaded_models || []).map((m) => {
+    const tr = el("tr");
+    if (m.error) { tr.append(el("td", `${m.backend}: ${m.error}`, "bad")); return tr; }
+    tr.append(el("td", m.name), el("td", m.backend), el("td", bytes(m.size_bytes)), el("td", `${m.gpu_percent}%`),
+      el("td", m.context_length ?? "–"), el("td", m.active_tasks ?? 0, m.active_tasks > 0 ? "ok" : ""),
+      el("td", m.recent_uses ?? 0), el("td", m.measured_load_seconds == null ? "–" : `${m.measured_load_seconds}s`),
+      el("td", seconds(m.idle_seconds)), el("td", m.pinned ? "yes" : ""));
+    return tr;
+  });
+  if (!models.length) { const tr = el("tr"); const td = el("td", "No models loaded", "muted"); td.colSpan = 10; tr.append(td); models.push(tr); }
+  fill("models", models);
+
+  const ev = (data.scheduling || {}).last_eviction;
+  if (!ev) {
+    fill("eviction", [el("div", "None yet. When a load needs room, the cheapest idle runners to reload are unloaded first.", "muted")]);
+  } else {
+    const nodes = [row("For", `${ev.for_model} (${ev.backend}, ${ev.memory})`),
+      row("Needed", bytes(ev.shortfall_bytes), ev.covers_shortfall ? "" : "warn")];
+    for (const v of ev.unloaded || []) nodes.push(row(`Unloaded ${v.model}`, `${bytes(v.freed_bytes)}, reload ~${v.reload_seconds}s`));
+    for (const k of ev.kept || []) nodes.push(row(`Kept ${k.model}`, k.reason.replaceAll("_", " "), "muted"));
+    fill("eviction", nodes);
+  }
+  $("updated").textContent = `updated ${new Date().toLocaleTimeString()}`;
+}
+
+async function refresh() {
+  try {
+    const response = await fetch(API, { headers: token ? { Authorization: `Bearer ${token}` } : {}, cache: "no-store" });
+    if (response.status === 401) { $("auth").style.display = "flex"; throw new Error("This server needs its bearer token."); }
+    if (!response.ok) throw new Error(`status request failed: HTTP ${response.status}`);
+    $("auth").style.display = "none";
+    $("error").hidden = true;
+    render(await response.json());
+  } catch (error) {
+    $("error").textContent = error.message;
+    $("error").hidden = false;
+    $("overall").textContent = "unreachable";
+    $("overall").className = "pill bad";
+  }
+}
+$("auth").addEventListener("submit", (event) => {
+  event.preventDefault();
+  token = $("token").value.trim();
+  try { sessionStorage.setItem("freellama-token", token); } catch (_) { /* storage blocked */ }
+  refresh();
+});
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

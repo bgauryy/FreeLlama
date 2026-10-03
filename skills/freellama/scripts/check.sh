@@ -191,7 +191,7 @@ if freellama_curl "$FREELLAMA_ENDPOINT/api/version" >/dev/null 2>&1; then
   ok "reachable at $FREELLAMA_ENDPOINT (passthrough works)"
   if health_json=$(freellama_curl "$FREELLAMA_ENDPOINT/_freellama/v1/health" 2>/dev/null); then
     ok "control-plane routes present — this is 'freellama serve' (full platform)"
-    if python3 - "$health_json" <<'PYEOF'
+    python3 - "$health_json" <<'PYEOF'
 import json, sys
 health = json.loads(sys.argv[1])
 contracts = health.get("contracts", {})
@@ -219,16 +219,46 @@ ok = (
     and contracts.get("immediate_unload_observation") == "observe_then_unload"
     and bool(gpu.get("upstream"))
     and bool(gpu.get("admission", {}).get("slots_total"))
-    and feedback.get("persistence", {}).get("enabled") is True
-    and security.get("remote_access") is False
 )
-sys.exit(0 if ok else 1)
+if not ok:
+    sys.exit(1)
+remote = security.get("remote_access")
+authentication = security.get("authentication")
+if not isinstance(remote, bool) or authentication not in ("none", "bearer") or (remote is True and authentication != "bearer"):
+    sys.exit(3)
+warned = False
+resources = health.get("admission", {}).get("resources", {})
+if resources.get("holding") is True:
+    print(f"  WARN  managed task execution is held: {','.join(resources.get('reasons', [])) or 'host resource policy'}")
+    warned = True
+persistence = feedback.get("persistence", {})
+if persistence.get("enabled") is False:
+    print("  WARN  feedback is intentionally ephemeral; learned placement feedback will not survive restart")
+    warned = True
+elif persistence.get("enabled") is not True:
+    print("  WARN  feedback persistence state is unavailable; persistence is not verified")
+    warned = True
+elif persistence.get("last_error"):
+    print("  WARN  feedback persistence reports an error; inspect doctor for details")
+    warned = True
+if remote is True:
+    print("  WARN  remote access uses bearer authentication; require TLS-protected ingress before exposing the service")
+    warned = True
+sys.exit(2 if warned else 0)
 PYEOF
-    then
-      ok "serve contracts are current (auth, persisted feedback, observation, evidence gate, unload)"
-    else
-      fail "serve is stale or incomplete — rebuild and restart; health lacks the current hardware/backend contracts"
-    fi
+    health_status=$?
+    case "$health_status" in
+      0|2)
+        ok "serve contracts are current (auth, feedback persistence policy, observation, evidence gate, unload)"
+        if [ "$health_status" -eq 2 ]; then WARNED=1; fi
+        ;;
+      3)
+        fail "remote access is unauthenticated or security configuration is unavailable — require bearer authentication before exposing the service"
+        ;;
+      *)
+        fail "serve is stale or incomplete — rebuild and restart; health lacks the current hardware/backend contracts"
+        ;;
+    esac
   else
     ok "no control-plane routes — this is 'freellama proxy' (passthrough + retry only, by design)"
   fi
@@ -240,24 +270,22 @@ fi
 echo
 echo "== Installed models (informational — never auto-deleted) =="
 if command -v ollama >/dev/null 2>&1; then
-  stale_count=0
+  old_metadata_count=0
   while IFS= read -r line; do
     [ -z "$line" ] && continue
-    if echo "$line" | grep -qE '[0-9]+ (month|year)s? ago'; then
-      echo "  INFO  stale candidate: $line"
-      stale_count=$((stale_count + 1))
+    if echo "$line" | awk '{for (i = 1; i <= NF - 2; i++) if ($i ~ /^[0-9]+$/ && $(i+2) == "ago" && (($(i+1) ~ /^months?$/ && $i >= 3) || ($(i+1) ~ /^years?$/ && $i >= 1))) found=1} END {exit !found}'; then
+      echo "  INFO  old model metadata: $line"
+      old_metadata_count=$((old_metadata_count + 1))
     fi
   done < <(ollama list 2>/dev/null | tail -n +2)
-  if [ "$stale_count" -gt 0 ]; then
-    echo "  INFO  $stale_count model(s) not modified in 3+ months — review with 'ollama list', remove"
-    echo "        with 'ollama rm <name>' if unused. Never delete files under ~/.ollama/models"
-    echo "        directly — the blob store is content-addressed and manifest-tracked; only"
-    echo "        'ollama rm' updates the manifest safely. See references/disk-cleanup.md."
+  if [ "$old_metadata_count" -gt 0 ]; then
+    echo "  INFO  $old_metadata_count model(s) have metadata timestamps at least 3 months old."
+    echo "        Metadata age does not establish when a model was last used."
   else
-    echo "  OK    no models older than 3 months"
+    echo "  OK    no model metadata timestamps at least 3 months old"
   fi
 else
-  warn "ollama CLI not on PATH — skipping stale-model report"
+  warn "ollama CLI not on PATH — skipping model metadata-age report"
 fi
 
 echo
@@ -279,7 +307,7 @@ echo
 if [ "$FAILED" -ne 0 ]; then
   echo "One or more required checks FAILED — see above."
 elif [ "$WARNED" -ne 0 ]; then
-  echo "All required checks passed, but see WARN lines above — nothing blocking, something worth fixing."
+  echo "Required service checks passed; review WARN lines before task execution."
 else
   echo "All checks passed cleanly, no warnings."
 fi

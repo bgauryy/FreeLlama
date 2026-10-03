@@ -1,0 +1,86 @@
+# FreeLlama runtime settings. Pass with `freellama serve --runtime-config <file>` (or
+# FREELLAMA_RUNTIME_CONFIG). `serve` re-reads the file when it changes; `freellama config --reload`
+# forces a re-read. A value set by a CLI flag or FREELLAMA_* environment variable wins over this
+# file; `freellama config` shows every effective value and its source. Every key is optional, and
+# an unknown key is a reload error rather than a silently ignored setting.
+
+# --- Admission (workload units: embedding 1, chat 2, vision 4) ---
+# Default: 2 units per OLLAMA_NUM_PARALLEL slot of the primary Ollama server.
+# max_concurrent_tasks = 2
+# cpu_max_concurrent_tasks = 1
+# max_queued_tasks = 16
+# cpu_max_queued_tasks = 8
+# Longest a managed task waits for admission, host memory, and model transitions together.
+# max_queue_wait_seconds = 120
+
+# --- Raw Ollama-compatible passthrough ---
+# raw_max_concurrent_requests = 1
+# How long a raw request waits for a slot before 429 + Retry-After (0 refuses at once).
+# raw_queue_wait_seconds = 10
+
+# --- Model residency ---
+# Never unload these, even when another model needs the memory.
+# pinned_models = ["qwen3:8b"]
+# When a load needs room, unload the cheapest idle models first (keep_alive: 0). Models with
+# tasks queued or running are never unloaded; among the rest, the cost of unloading one is its
+# measured reload time x (1 + recent uses) x its weight below.
+# evict_idle_models = true
+# Per-model weight on that cost (default 1): higher keeps a model loaded longer.
+# eviction_costs = { "qwen3:8b" = 3.0, "nomic-embed-text" = 0.2 }
+
+# --- Throttling ---
+# Adaptive concurrency halves a pool's limit on errors, memory pressure, or a throughput drop and
+# grows it back one unit after sustained healthy completions: "off", "cpu" (default), or "all".
+# adaptive_concurrency = "cpu"
+# Consecutive upstream failures that open a backend's circuit, and how long it stays open.
+# breaker_failures = 3
+# breaker_cooldown_seconds = 15
+
+# --- Context sizing ---
+# "ollama_default" (default) leaves num_ctx to Ollama when its default for the model (Modelfile,
+# OLLAMA_CONTEXT_LENGTH, or its VRAM tier) covers the request, so the runner stays shared with raw
+# clients and keeps Ollama's out-of-memory retry. "explicit" always sends the sized num_ctx.
+# context_mode = "ollama_default"
+# Never rely on an Ollama default above this many tokens (a large default costs KV-cache memory).
+# auto_context_max = 32768
+# Override the probed Ollama default when the server's environment is not visible (remote or
+# another user's process).
+# ollama_default_context = 4096
+
+# --- Usage ledger queue (startup only) ---
+# Positive bounded queue; use FREELLAMA_USAGE_QUEUE_CAPACITY to override. A changed value is
+# rejected on reload because the writer queue is created at startup. Shutdown flush waits 2s.
+# usage_queue_capacity = 128
+
+# --- Opt-in process-local history scopes ---
+# Explicit POST /scopes creates storage. Histories never persist by default. Every append requires
+# the current revision; overflow fails without truncation. Delete/expiry invalidates in-flight commits.
+# Individual FREELLAMA_SCOPE_* environment settings override these fields.
+# [scopes]
+# max_count = 128
+# max_messages = 256
+# max_bytes = 1048576
+# max_estimated_tokens = 32768
+# total_max_bytes = 16777216
+# ttl_seconds = 3600
+
+# --- Managed model warming and omitted keep_alive ---
+# Explicit caller keep_alive wins. Otherwise finite residency uses recent per-model reuse,
+# observed cold-load time and live host pressure. Admission and memory safety remain enforced.
+# Individual FREELLAMA_KEEP_ALIVE_* environment settings override these fields.
+# [warming]
+# min_seconds = 15
+# max_seconds = 900
+# base_seconds = 60
+# reuse_gain_seconds = 30
+# load_multiplier = 2.0
+# pressure_factor = 0.25
+
+# --- Task admission costs ---
+# Optional per-kind positive u32 base weights. Unspecified kinds keep their defaults:
+# embedding 1, vision 4, all other kinds 2. Embeddings multiply the base by ceil(input_items/4).
+# Reload affects new task executions; already queued/active work keeps its captured cost.
+# Lower a weight only after a matched workload shows useful parallelism and memory remains safe.
+# For example, qualified light OCR can use two slots within a four-unit budget:
+# [task_costs]
+# vision = 2

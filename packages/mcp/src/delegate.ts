@@ -3,6 +3,27 @@
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { REPO_ROOT } from "./config.js";
+import { errorResult } from "./helpers.js";
+
+/** Research errors keep the declared result shape without claiming a usable answer. */
+export function researchErrorResult(error: unknown, diagnostic?: string) {
+  const result = errorResult(error);
+  const summary = diagnostic ?? result.content[0].text;
+  return {
+    ...result,
+    content: [{ type: "text" as const, text: summary }],
+    structuredContent: {
+      ...(result.structuredContent ?? { error: summary }),
+      answer: "",
+      summary,
+      verification: {
+        recommendation: "escalate",
+        grounded: false,
+        why: "The research request failed; no usable answer was produced.",
+      },
+    },
+  };
+}
 
 /**
  * Per-model research grades, loaded from disk — never compiled in.

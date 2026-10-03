@@ -6,13 +6,17 @@
 // Runs against a live Ollama but needs no `freellama serve`: whichever half of the contract is
 // checkable is asserted (probed once at collection time via top-level await).
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { createServer } from "node:http";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { connectClient, serveAuthHeaders, serveIsUp, SERVE_ENDPOINT } from "../setup/client.js";
+import { connectClient, REPO_ROOT, serveAuthHeaders, serveIsUp, SERVE_ENDPOINT } from "../setup/client.js";
 
 type Tool = { name: string; description?: string; annotations?: any; outputSchema?: any; inputSchema?: any; title?: string };
 type ToolResult = { isError?: boolean; content: { text: string }[]; structuredContent?: any };
 
-const EXPECTED_TOOLS = ["doctor", "models", "run_task", "run_task_batch", "session", "ollama_manage", "ollama_delete", "delegate_research"];
+const EXPECTED_TOOLS = ["doctor", "models", "run_task", "task_jobs", "run_task_batch", "session", "ollama_manage", "ollama_delete", "delegate_research", "scope", "warm_model"];
 
 // Whether `freellama serve` is up decides which half of the contract is checkable.
 const serveUp = await serveIsUp();
@@ -56,8 +60,17 @@ describe("tool contract", () => {
     expect(instructions).toMatch(/ask approval.*for one exact tag and reported size before ollama_manage/s);
     expect(instructions).toMatch(/search or recommendation\s+is never download permission/i);
     expect(instructions).toMatch(/run_task preview never executes; code_review aliases coding/);
+    expect(instructions).toMatch(/findings are candidates, not accepted defects/);
     expect(instructions).toMatch(/requiredCapabilities:\["tools"\].*omit preview and supply the payload/s);
     expect(instructions).toContain("Docs: freellama://docs/index");
+    expect(instructions).toContain("Scoped run_task needs scopeId+scopeRevision");
+    const requiredTaskFields = byName.get("run_task")!.inputSchema.required ?? [];
+    expect(requiredTaskFields).not.toContain("scopeId");
+    expect(requiredTaskFields).not.toContain("scopeRevision");
+    expect(instructions).toContain("Check isError first; prefer structuredContent, else content[].text");
+    expect(instructions).toContain("page.next_cursor→cursor unchanged");
+    expect(instructions).toContain("default-endpoint autostart optional");
+    expect(byName.get("delegate_research")!.description).toContain("discard verification.recommendation=escalate");
   });
 
   it("exposes a bounded placement preference instead of an unsafe backend override", () => {
@@ -85,6 +98,8 @@ describe("tool contract", () => {
     expect(schema.properties.minPlacementEvidence.enum).toEqual(["configured", "observed"]);
     expect(schema.properties).not.toHaveProperty("upstream");
     expect(schema.properties).not.toHaveProperty("numGpu");
+    expect(schema.properties.task.description).toMatch(/caller owns prompts and output format/);
+    expect(schema.properties.messages.description).toMatch(/system prompts; no injected task instructions/);
   });
 
   it("makes batch independence and the dispatch cap machine-readable", () => {
@@ -223,10 +238,13 @@ describe("tool contract", () => {
     }
   });
 
-  it("marks ollama_delete — and only ollama_delete — machine-readably destructive", () => {
+  it("marks model deletion, session termination, and scope history deletion machine-readably destructive", () => {
     expect(byName.get("ollama_delete")!.annotations.destructiveHint).toBe(true);
-    expect(tools.filter((tool) => tool.annotations?.destructiveHint === true).map((tool) => tool.name)).toEqual([
+    expect(tools.filter((tool) => tool.annotations?.destructiveHint === true).map((tool) => tool.name).sort()).toEqual([
       "ollama_delete",
+      "scope",
+      "session",
+      "task_jobs",
     ]);
     // Belt and braces: the prose warning must survive too.
     expect(byName.get("ollama_delete")!.description).toMatch(/DESTRUCTIVE AND IRREVERSIBLE/);
@@ -260,7 +278,8 @@ describe("tool contract", () => {
     expect(doctor.structuredContent.machine?.memory_bytes).toBeGreaterThan(0);
     expect(doctor.structuredContent.machine_unavailable).toBeUndefined();
 
-    const route = await call("run_task", { task: "completion", preview: true });
+    // An explicit unavailable endpoint tests refusal without triggering default-endpoint autostart.
+    const route = await call("run_task", { endpoint: "http://127.0.0.1:1", task: "completion", preview: true });
     expect(route.isError).toBe(true);
     // Error results must not carry structuredContent.
     expect(route.structuredContent).toBeUndefined();
@@ -300,19 +319,30 @@ describe("tool contract", () => {
     }
   });
 
-  it.runIf(serveUp)("withholds embedding vectors by default and returns them on opt-in", async () => {
+  it.runIf(serveUp)("withholds embedding vectors by default and returns them on opt-in", async ({ skip }) => {
+    let cursor: string | undefined;
+    let installed = false;
+    do {
+      const raw = await call("models", { view: "raw", limit: 50, ...(cursor ? { cursor } : {}) });
+      expect(raw.isError ?? false, raw.content[0].text).toBe(false);
+      installed = raw.structuredContent.models.some((entry: { name: string }) => entry.name === "nomic-embed-text:latest");
+      cursor = raw.structuredContent.page?.next_cursor ?? undefined;
+    } while (!installed && cursor);
+    if (!installed) skip("nomic-embed-text:latest is not installed");
+    const preview = await call("run_task", { task: "embedding", model: "nomic-embed-text:latest", preview: true });
+    expect(preview.isError ?? false, preview.content[0].text).toBe(false);
+    if (preview.structuredContent.agent_plan?.dispatch_readiness !== "runnable_now")
+      skip(`embedding needs available capacity: ${JSON.stringify(preview.structuredContent.agent_plan)}`);
     const embed = await call("run_task", {
       task: "embedding",
       objective: "fastest",
       model: "nomic-embed-text:latest",
       input: "protocol smoke test",
       keepAlive: "0",
+      timeoutSeconds: 30,
+      maxWaitSeconds: 5,
     });
-    if (embed.isError) {
-      // nomic-embed-text not installed on this machine — the e2e tier covers execution.
-      console.warn(`embedding check skipped: ${embed.content[0].text.slice(0, 80)}`);
-      return;
-    }
+    expect(embed.isError ?? false, embed.content[0].text).toBe(false);
     const withheld = embed.structuredContent.response.embeddings_omitted;
     expect(withheld).toBeTruthy();
     expect(embed.structuredContent.response.embeddings).toBeUndefined();
@@ -435,7 +465,7 @@ describe("tool contract", () => {
     expect([...adapterTool.inputSchema.properties.adapter.enum].sort()).toEqual(["bash", "octocode"]);
   });
 
-  it("delegate_research exposes typed runtime and fail-closed context policy", () => {
+  it("delegate_research exposes typed budgets and keeps deployment tuning out of requests", () => {
     const delegate = byName.get("delegate_research")!;
     expect(delegate.inputSchema.properties.minPlacementEvidence.enum).toEqual(["configured", "observed"]);
     expect(delegate.inputSchema.properties.endpoint).toBeTruthy();
@@ -443,10 +473,23 @@ describe("tool contract", () => {
     const agent = delegate.inputSchema.properties.agent;
     const properties = agent.anyOf?.[0]?.properties ?? agent.properties;
     expect(properties.contextTokens.type).toBe("integer");
-    expect(properties.retryAttempts.exclusiveMinimum).toBe(0);
-    const context = properties.context.anyOf?.[0] ?? properties.context;
-    expect(context.properties.pinnedOverflow.enum).toEqual(["error", "clip"]);
-    expect(context.properties.compactRetainRatio.exclusiveMaximum).toBe(1);
+    expect(properties.maxTurns.exclusiveMinimum).toBe(0);
+    expect(properties.outputTokens.exclusiveMinimum).toBe(0);
+    expect(properties.requestTimeoutSeconds.exclusiveMinimum).toBe(0);
+    expect(properties.toolTimeoutSeconds.exclusiveMinimum).toBe(0);
+    expect(properties.retryAttempts).toBeUndefined();
+    expect(properties.context).toBeUndefined();
+    expect((agent.anyOf?.[0] ?? agent).additionalProperties).toBe(false);
+  });
+
+  it("refuses unsupported per-call compaction tuning before research starts", async () => {
+    const result = await call("delegate_research", {
+      question: "Find the task router.",
+      workspacePath: REPO_ROOT,
+      agent: { context: { pinnedOverflow: "clip" } },
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toMatch(/context|unrecognized/i);
   });
 
   it("keeps the schema surface within the token budget", () => {
@@ -459,48 +502,89 @@ describe("tool contract", () => {
   });
 
   it("models{view:library} defaults to popular, flags cloud, cross-references installed", async () => {
-    const search = await call("models", { view: "library", capabilities: ["vision"], limit: 6 }).catch(() => null);
-    if (!search || search.isError) return console.warn("skipped: ollama.com unreachable");
+    const local = createServer((request, response) => {
+      response.setHeader("Content-Type", "application/json");
+      if (request.url === "/api/tags") response.end(JSON.stringify({ models: [{ name: "qwen3-vl:4b" }] }));
+      else if (request.url === "/_freellama/v1/machine") response.end(JSON.stringify({ memory_bytes: 16e9 }));
+      else { response.statusCode = 503; response.end("{}"); }
+    });
+    await new Promise<void>((resolve) => local.listen(0, "127.0.0.1", resolve));
+    const address = local.address();
+    if (!address || typeof address === "string") throw new Error("No fixture port");
+    const endpoint = `http://127.0.0.1:${address.port}`;
+    let libraryClient: Client | undefined;
+    try {
+      const preload = new URL("../fixtures/library-fetch.mjs", import.meta.url).href;
+      libraryClient = await connectClient({
+        NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --import=${preload}`.trim(),
+        FREELLAMA_MCP_AUTOSTART_SERVE: "0",
+      });
+      const libraryCall = (args: Record<string, unknown>) => libraryClient!.callTool({ name: "models", arguments: args }) as Promise<ToolResult>;
+      const search = await libraryCall({ view: "library", capabilities: ["vision"], limit: 6, endpoint, ollamaEndpoint: endpoint });
+      expect(search.isError ?? false, search.content[0]?.text).toBe(false);
+      const data = search.structuredContent;
+      expect(data.order).toBe("popular");
+      expect(data.query).not.toMatch(/o=newest/);
+      expect(data.models).toHaveLength(1);
+      expect(data.models[0]).toMatchObject({ name: "qwen3-vl", cloudAvailable: true, cloudOnly: null, installed: true });
+      expect(data.nextStep).toMatch(/model:/);
 
-    const data = search.structuredContent;
-    expect(data.order).toBe("popular");
-    expect(data.query).not.toMatch(/o=newest/);
-    expect(data.models.length).toBeGreaterThan(0);
-    for (const model of data.models) {
-      expect(typeof model.name).toBe("string");
-      expect(typeof model.cloudOnly).toBe("boolean");
-      expect(typeof model.installed).toBe("boolean");
+      const detail = await libraryCall({ view: "library", model: "qwen3-vl", endpoint, ollamaEndpoint: endpoint });
+      expect(detail.isError ?? false, detail.content[0]?.text).toBe(false);
+      const tags = detail.structuredContent;
+      expect(tags.library.status).toBe("available");
+      expect(tags.tags).toHaveLength(2);
+      expect(tags.tags.every((entry: any) => entry.tag.includes(":"))).toBe(true);
+      expect(tags.tags.every((entry: any) => entry.fitScope === "host_memory_budget_only")).toBe(true);
+      expect(tags.tags.find((entry: any) => entry.tag === "qwen3-vl:4b")).toMatchObject({ installed: true, fitsInMemory: true });
+      expect(tags.tags.find((entry: any) => entry.tag === "qwen3-vl:235b")?.fitsInMemory).toBe(false);
+      expect(tags.recommendation.tag).toBe("qwen3-vl:4b");
+
+      const noLocalState = await libraryCall({
+        view: "library", model: "qwen3-vl", endpoint: `${endpoint}/unavailable`, ollamaEndpoint: `${endpoint}/unavailable`,
+      });
+      expect(noLocalState.isError ?? false, noLocalState.content[0]?.text).toBe(false);
+      expect(noLocalState.structuredContent.machineMemoryBytes).toBeNull();
+      expect(noLocalState.structuredContent.fitBudgetBytes).toBeNull();
+      expect(noLocalState.structuredContent.recommendation).toBeNull();
+      expect(noLocalState.structuredContent.recommendationUnavailable).toMatch(/could not be checked/);
+    } finally {
+      local.closeAllConnections();
+      await Promise.all([
+        libraryClient?.close(),
+        new Promise<void>((resolve) => local.close(() => resolve())),
+      ]);
     }
-    expect(data.nextStep).toMatch(/model:/);
+  });
 
-    // Step 2 is what makes the result actionable: only a tag is pullable, and only the tag
-    // carries the size that decides whether it fits.
-    const detail = await call("models", { view: "library", model: "qwen3-vl" }).catch(() => null);
-    if (!detail || detail.isError) return console.warn("step 2 skipped: ollama.com unreachable");
-    const tags = detail.structuredContent;
-    expect(tags.tags.length).toBeGreaterThan(0);
-    expect(tags.tags.every((entry: any) => entry.tag.includes(":"))).toBe(true);
-    expect(tags.tags.every((entry: any) => entry.fitScope === "host_memory_budget_only")).toBe(true);
-    const huge = tags.tags.find((entry: any) => (entry.sizeBytes ?? 0) > 100e9);
-    if (huge && tags.fitBudgetBytes) expect(huge.fitsInMemory).toBe(false);
-    if (!tags.fitBudgetBytes) {
-      // Fail CLOSED: with no machine profile the fit is unknowable — no budget, no recommendation.
-      expect(tags.recommendation).toBeNull();
-      expect(tags.recommendationUnavailable ?? "").toMatch(/could not be checked/);
-    } else {
-      expect(tags.recommendation.tag).toContain(":");
-      expect(tags.tags.find((entry: any) => entry.tag === tags.recommendation.tag)?.fitsInMemory).toBe(true);
+  it.skipIf(process.platform === "win32")("keeps the MCP connection usable after a serve spawn failure", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "freellama-mcp-startup-"));
+    const binary = join(directory, "freellama");
+    await writeFile(binary, "Not executable\n", { mode: 0o600 });
+    const reserve = createServer();
+    await new Promise<void>((resolve) => reserve.listen(0, "127.0.0.1", resolve));
+    const address = reserve.address();
+    if (!address || typeof address === "string") throw new Error("No fixture port");
+    await new Promise<void>((resolve) => reserve.close(() => resolve()));
+    let startupClient: Client | undefined;
+    try {
+      startupClient = await connectClient({
+        FREELLAMA_SERVE_BINARY: binary,
+        FREELLAMA_SERVE_ENDPOINT: `http://127.0.0.1:${address.port}`,
+        FREELLAMA_MCP_AUTOSTART_SERVE: "1",
+      });
+      const failure = await startupClient.callTool({ name: "models", arguments: { view: "installed" } }) as ToolResult;
+      expect(failure.isError).toBe(true);
+      expect(failure.content[0]?.text).toMatch(/Could not start freellama serve.*EACCES/);
+      expect((await startupClient.listTools()).tools.map((tool) => tool.name).sort()).toEqual([...EXPECTED_TOOLS].sort());
+      const retry = await startupClient.callTool({ name: "models", arguments: { view: "installed" } }) as ToolResult;
+      expect(retry.isError).toBe(true);
+      expect(retry.content[0]?.text).toMatch(/Could not start freellama serve.*EACCES/);
+    } finally {
+      await Promise.all([
+        startupClient?.close(),
+        rm(directory, { recursive: true, force: true }),
+      ]);
     }
-
-    const noLocalState = await call("models", {
-      view: "library",
-      model: "qwen3-vl",
-      endpoint: "http://127.0.0.1:1",
-      ollamaEndpoint: "http://127.0.0.1:1",
-    }).catch(() => null);
-    if (!noLocalState || noLocalState.isError) return console.warn("endpoint override check skipped");
-    expect(noLocalState.structuredContent.machineMemoryBytes).toBeNull();
-    expect(noLocalState.structuredContent.fitBudgetBytes).toBeNull();
-    expect(noLocalState.structuredContent.recommendation).toBeNull();
   });
 });

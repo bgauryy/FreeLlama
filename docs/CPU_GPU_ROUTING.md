@@ -110,7 +110,10 @@ unsafe or ambiguous configurations:
 - A CPU model assignment without `--cpu-upstream`
 - Empty model names
 - The same socket expressed through aliases such as `localhost:11434` and `127.0.0.1:11434`
-- A non-loopback listener or upstream
+- A nonloopback upstream
+
+A nonloopback FreeLlama listener requires `--allow-remote` and bearer-token authentication.
+See the [production runbook](PRODUCTION.md) for remote ingress requirements.
 
 Set independent admission budgets when the defaults do not fit the workload:
 
@@ -120,13 +123,18 @@ Set independent admission budgets when the defaults do not fit the workload:
     --cpu-upstream http://127.0.0.1:11436 \
     --cpu-model nomic-embed-text:latest \
     --max-concurrent-tasks 2 \
-    --cpu-max-concurrent-tasks 1
+    --cpu-max-concurrent-tasks 1 \
+    --max-queued-tasks 16 \
+    --cpu-max-queued-tasks 8
 ```
 
 The defaults above admit one ordinary primary-backend chat (cost 2) and one CPU embedding (cost 1)
 at the same time. They are conservative workload units for the common `OLLAMA_NUM_PARALLEL=1`
 layout, not a profile of the development Mac. Increase them only after measuring queue wait,
 resident memory, and Ollama's own parallel setting on the target host.
+Queue cardinality and wait time are separate bounds: excess waiters are refused immediately, while
+an admitted waiter may remain until `--max-queue-wait-seconds`. Automatic backend selection checks
+that the actual task cost fits the current slot snapshot before following historical speed.
 
 ## Let an agent express placement intent
 
@@ -194,12 +202,14 @@ The `execution` object separates the configured `backend`, requested compatibili
 post-run `observation`. The source is Ollama `/api/ps`; direct inspection remains useful:
 
 ```bash
-curl --silent http://127.0.0.1:11434/api/ps | jq '.models[] | {name, size_vram}'
-curl --silent http://127.0.0.1:11436/api/ps | jq '.models[] | {name, size_vram}'
+curl --silent http://127.0.0.1:11434/api/ps | jq '.models[] | {name, size, size_vram}'
+curl --silent http://127.0.0.1:11436/api/ps | jq '.models[] | {name, size, size_vram}'
 ```
 
-A fully CPU-loaded model reports `size_vram:0`; a fully GPU-loaded model reports positive resident
-VRAM. `observation.status` is `verified`, `mismatch`, or unavailable. Unknown, mixed, and mismatched
+A fully CPU-loaded model reports `size_vram:0`; a fully GPU-loaded model reports positive VRAM
+covering its resident `size`. Compare both values from the same `/api/ps` entry. Installed `/api/tags`
+file bytes can differ from resident memory and cannot prove a mixed placement. Positive VRAM without
+total resident size stays unknown. `observation.status` is `verified`, `mismatch`, or unavailable. Unknown, mixed, and mismatched
 samples are reported but excluded from adaptive feedback.
 
 ## Understand concurrency
@@ -208,10 +218,16 @@ Each backend has its own weighted admission pool and its own resident/shared and
 transition/exclusive lock. CPU and GPU model transitions therefore do not block each other, and a
 GPU burst cannot spend the CPU helper's permit:
 
+Both pools also share local host-pressure sampling and forecast-memory reservations. Independent
+queues do not imply independent RAM on a unified-memory machine. A request can wait for available
+headroom even when its backend has a free weighted permit. Inspect `admission.resources` in health
+and `execution.resource_admission` in task receipts. Unknown thermal or GPU measurements are not
+reported as healthy readings. See [the execution architecture](ARCHITECTURE.md) for the complete gate.
+
 ```mermaid
 flowchart TD
     T["Managed task"] --> B{"Selected backend"}
-    B -->|"GPU"| GA["GPU admission pool<br/>default 2 units"]
+    B -->|"GPU"| GA["GPU admission pool<br/>default 2 units per Ollama slot"]
     B -->|"CPU"| CA["CPU admission pool<br/>default 1 unit"]
     GA --> GL{"Resident?"}
     CA --> CL{"Resident?"}
@@ -229,16 +245,28 @@ FreeLlama can overlap requests across the two servers even when each Ollama proc
 `OLLAMA_NUM_PARALLEL=1`. Raising `OLLAMA_NUM_PARALLEL` affects parallel requests within one server
 and multiplies K/V-cache memory; it is a separate tuning decision. `OLLAMA_MAX_QUEUE` likewise
 bounds each Ollama process after FreeLlama admission. It does not replace either backend's weighted
-FreeLlama budget or queue-wait deadline.
+FreeLlama budget, bounded waiter count, or queue-wait deadline. Raw passthrough uses a separate
+one-stream default cap in `serve`; its permit is held until the streamed response ends or is dropped.
+
+The runtime file's `[task_costs]` table can tune individual task-kind weights without increasing
+the entire pool's ceiling. Default vision weight four can serialize two vision requests under a
+four-unit budget even when Ollama has two slots. A lower weight requires a qualified workload;
+it does not add engine slots or relax memory checks. See
+[monitoring controls](MONITORING.md#adaptive-concurrency).
+Mutating raw requests also require exclusive access to the primary backend's managed transition
+lock and receive 503 while it is busy. Metadata GET/HEAD calls remain available. This prevents raw
+inference or model lifecycle calls from overlapping a managed generation on that backend.
 
 ## Understand automatic feedback
 
 With `executionPreference: "auto"`, unpinned `fastest` and `balanced` work can select a backend from
-observed warm task duration. The loop is deliberately bounded:
+comparable observed warm task duration. Learned hints require two eligible backends, explicit
+context, and a known execution payload-control projection. A decision-only preview cannot supply
+that payload projection and uses capacity and policy signals. The loop is bounded:
 
 ```mermaid
 flowchart LR
-    X["Successful resident task"] --> O["Record duration by<br/>task + backend"]
+    X["Comparable warm serial task"] --> O["Record duration by<br/>task + backend + profile"]
     O --> N{"At least 3 samples<br/>on both backends?"}
     N -->|"No"| D["Keep deterministic default"]
     N -->|"Yes"| C{"More than 10% faster<br/>per work unit?"}
@@ -248,13 +276,25 @@ flowchart LR
 ```
 
 Generation compares decode nanoseconds per output token; embeddings compare total nanoseconds per
-input token. Buckets are model-specific and reset when the selected model changes. Only physically
-verified placement contributes; cold transitions and assignment mismatches do not. A difference
+input token. Each task/backend has one current profile window, reset when identity changes.
+Identity includes installed/resident digest, rate metric kind, explicit observed context, effective controls,
+endpoint-attributed process settings, and serial admission class. Unknown or changed evidence,
+cold transitions, and overlapping managed work supply no speed sample. A difference
 of 10% or less is treated as noise. Feedback never overrides an explicit model, session affinity,
 capability or policy guards, or the `quality` objective. The CLI persists the bounded, versioned,
-prompt-free aggregate snapshot atomically by default; `--ephemeral-feedback` opts into reset-on-
-restart behavior. `GET /_freellama/v1/health` exposes persistence status, sample counts, readiness,
-and per-backend admission capacity so an agent can inspect the loop instead of guessing.
+prompt-free snapshot atomically by default; `--ephemeral-feedback` opts into reset-on-restart
+behavior. Legacy aggregate fields survive loading but do not qualify learned hints. Health's
+`decision_ready` describes the stored profile window; the current request must independently
+match it before routing can use its speed. `GET /_freellama/v1/health` exposes profile identity,
+profile sample counts, persistence status, and per-backend admission capacity. Physically verified
+warm completions still contribute legacy duration diagnostics even when their interval cannot
+qualify a speed-learning sample.
+
+Configured processor intent, verified placement, and speed-learning eligibility remain separate
+receipt fields. Missing endpoint-attributed process inspection disables learned hints and recovery,
+including remote backends; ordinary routing, admission, and pressure/error safeguards still work.
+Fresh process probes run for candidate serial learning or an eligible learned-route lookup, not
+for pinned, quality-only, preview-only, or single-backend route selection.
 
 ## Interpret the measured Mac result
 
@@ -337,7 +377,7 @@ can also be unavailable until the secondary server returns. Raw passthrough to t
 continues to work because it does not depend on catalog discovery.
 
 For the surrounding runtime settings, see
-[Ollama and FreeLlama optimization](OLLAMA_SYSTEM_OPTIMIZATION.md). For all `serve` flags, see the
+[Ollama and FreeLlama optimization](dev/OLLAMA_SYSTEM_OPTIMIZATION.md). For all `serve` flags, see the
 [CLI reference](CLI.md).
 
 ## Upstream sources

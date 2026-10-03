@@ -4,7 +4,15 @@ Load before changing `delegate_research.agent`, any `FREELLAMA_AGENT_*` context 
 interpreting `contextManagement`. Why: an unsafe estimate lets Ollama silently truncate the
 system contract, while over-compaction destroys useful evidence and prefix-cache reuse.
 
-The first call uses `charsPerToken` (default 4) because Ollama has no stable preflight tokenizer
+For supplied-content conversations, `scope` retains bounded process-local messages with expected
+revisions. Use `scopeId` plus `scopeRevision` with only new input; successful execution returns
+the next revision. Fork before parallel branches, and read full history only when requested.
+Session affinity and Ollama KV remain separate. `warm_model` uses the ordinary managed admission
+path; compatible prefix reuse is opportunistic. See
+[Scope history and model warming](../../../docs/SCOPES_AND_WARMING.md) for limits and API shapes;
+installed MCP clients can read `freellama://docs/SCOPES_AND_WARMING` on demand.
+
+The research adapter has its own context budget. Its first call uses `charsPerToken` (default 4) because Ollama has no stable preflight tokenizer
 API. Every successful call calibrates the estimate upward from Ollama's real
 `prompt_eval_count`; calibration never lowers the estimate. Calibration is persisted per model
 template in `FREELLAMA_AGENT_TOKEN_CALIBRATION_DIR`, contains no prompt text, and is reused by later
@@ -23,7 +31,7 @@ is safer.
 
 Tune per call with `delegate_research.agent`; use `FREELLAMA_AGENT_*` for deployment defaults.
 Every value is typed and validated. Keep confinement, JSON-only actions, and read-only behavior
-fixed: those are safety invariants, not knobs. Re-run the 65 context contracts and held-out
+fixed: those are safety invariants, not knobs. Re-run the context contracts and held-out
 research smoke after changing defaults.
 
 Upstream API status, local boundary results, and reproduction commands:

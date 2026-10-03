@@ -9,6 +9,7 @@ node_modules
 *.node
 .napi-generated.d.ts
 packages/mcp/dist/
+packages/view/dist/
 
 # Local agent workspaces — not part of the repo
 .octocode/
@@ -37,3 +38,8 @@ release/
 
 # Cloned upstream repos used as held-out eval corpora — never part of this repo
 .clones/
+
+# License copies assembled from the two canonical root license texts.
+packages/cli/LICENSE-*
+packages/mcp/LICENSE-*
+packages/native/*/LICENSE-*

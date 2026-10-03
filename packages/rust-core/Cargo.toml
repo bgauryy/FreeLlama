@@ -27,10 +27,12 @@ default = []
 napi = ["dep:napi", "dep:napi-derive", "dep:napi-build"]
 
 [dependencies]
+libc.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 base64.workspace = true
 clap.workspace = true
+http-body.workspace = true
 napi = { workspace = true, optional = true }
 napi-derive = { workspace = true, optional = true }
 reqwest.workspace = true

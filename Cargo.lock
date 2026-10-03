@@ -410,7 +410,7 @@ dependencies = [
 
 [[package]]
 name = "freellama-cli"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -424,12 +424,14 @@ dependencies = [
 
 [[package]]
 name = "freellama-core"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "axum",
  "base64",
  "clap",
+ "http-body",
+ "libc",
  "napi",
  "napi-build",
  "napi-derive",

@@ -1,0 +1,428 @@
+{
+  "status": {
+    "status": "ok",
+    "backends": {
+      "gpu": {
+        "upstream": "http://127.0.0.1:11434",
+        "admission": {
+          "slots_total": 4,
+          "slots_ceiling": 4,
+          "slots_available": 2,
+          "active_units": 2,
+          "in_flight": 1,
+          "queue_depth": 1,
+          "queue_limit": 16,
+          "slot_waiters": 0,
+          "resource_waiters": 1,
+          "oldest_wait_ms": 2300,
+          "admitted": 42,
+          "released": 41,
+          "queue_full_rejections": 0,
+          "queue_timeouts": 1
+        },
+        "adaptive": {
+          "enabled": false,
+          "limit": 4,
+          "ceiling": 4,
+          "healthy_streak": 2,
+          "last_decrease_reason": null
+        },
+        "circuit": {
+          "state": "closed"
+        }
+      },
+      "cpu": {
+        "upstream": "http://127.0.0.1:11436",
+        "admission": {
+          "slots_total": 1,
+          "slots_ceiling": 2,
+          "slots_available": 0,
+          "active_units": 1,
+          "in_flight": 1,
+          "queue_depth": 0,
+          "queue_limit": 8,
+          "slot_waiters": 0,
+          "resource_waiters": 0,
+          "oldest_wait_ms": null,
+          "admitted": 31,
+          "released": 30,
+          "queue_full_rejections": 0,
+          "queue_timeouts": 0
+        },
+        "adaptive": {
+          "enabled": true,
+          "limit": 1,
+          "ceiling": 2,
+          "healthy_streak": 2,
+          "last_decrease_reason": "host_pressure"
+        },
+        "circuit": {
+          "state": "closed"
+        }
+      }
+    },
+    "raw_proxy": {
+      "limit": 1,
+      "active": 0,
+      "waiting": 0,
+      "queue_wait_seconds": 120,
+      "admitted": 20,
+      "rejected": 0
+    },
+    "loaded_models": [
+      {
+        "backend": "gpu",
+        "name": "fixture-chat:27b",
+        "size_bytes": 19175677668,
+        "size_vram_bytes": 19175677668,
+        "gpu_percent": 100,
+        "context_length": 8192,
+        "expires_at": null,
+        "pinned": true,
+        "active_tasks": 2,
+        "recent_uses": 12.4,
+        "idle_seconds": 0,
+        "measured_load_seconds": 8.2
+      },
+      {
+        "backend": "cpu",
+        "name": "fixture-embed:latest",
+        "size_bytes": 274000000,
+        "size_vram_bytes": 0,
+        "gpu_percent": 0,
+        "context_length": 2048,
+        "expires_at": null,
+        "pinned": false,
+        "active_tasks": 1,
+        "recent_uses": 3.8,
+        "idle_seconds": 0,
+        "measured_load_seconds": 0.62
+      }
+    ],
+    "host": {
+      "status": "ready",
+      "holding": false,
+      "reasons": [],
+      "total_memory_bytes": 51539607552,
+      "available_memory_bytes": 24696061952,
+      "effective_available_bytes": 22548578304,
+      "reserved_bytes": 2147483648,
+      "memory_pressure": "normal",
+      "memory_psi_some_avg10": null,
+      "cgroup_memory_limit_bytes": null,
+      "load_average_one_minute": 2.6,
+      "logical_cpus": 12,
+      "thermal_throttled": false,
+      "gpu_memory_total_bytes": null,
+      "gpu_memory_free_bytes": null,
+      "gpu_telemetry_source": null,
+      "sample_age_ms": 132
+    },
+    "ollama": {
+      "config": {
+        "settings": {
+          "OLLAMA_NUM_PARALLEL": {
+            "value": "2",
+            "source": "process_env"
+          },
+          "OLLAMA_CONTEXT_LENGTH": {
+            "value": null,
+            "source": "ollama_default"
+          },
+          "OLLAMA_KV_CACHE_TYPE": {
+            "value": "q8_0",
+            "source": "process_env"
+          }
+        },
+        "process_inspection": "Synthetic test fixture: no live Ollama observation.",
+        "effective": {
+          "num_parallel": 2,
+          "context_length": null
+        }
+      },
+      "cpu_config": {
+        "settings": {
+          "OLLAMA_NUM_PARALLEL": {
+            "value": "1",
+            "source": "process_env"
+          }
+        },
+        "process_inspection": "Synthetic CPU fixture."
+      },
+      "default_context": null,
+      "context_mode": "ollama_default"
+    },
+    "scheduling": {
+      "last_eviction": {
+        "for_model": "fixture-chat:27b",
+        "backend": "gpu",
+        "memory": "host",
+        "shortfall_bytes": 1073741824,
+        "covers_shortfall": true,
+        "unloaded": [
+          {
+            "model": "fixture-idle:7b",
+            "freed_bytes": 4294967296,
+            "reload_seconds": 2.5
+          }
+        ],
+        "kept": [
+          {
+            "model": "fixture-embed:latest",
+            "reason": "active_tasks"
+          }
+        ]
+      },
+      "measured_footprints": 3,
+      "evict_idle_models": true,
+      "division_of_work": {
+        "freellama": "admission and idle eviction",
+        "ollama": "runner loading and final fit"
+      }
+    },
+    "usage_today": {
+      "tasks": 73,
+      "errors": 1,
+      "prompt_tokens": 43800,
+      "output_tokens": 5840,
+      "busy_ms": 876000,
+      "queue_wait_ms": 2920
+    },
+    "usage_ledger": {
+      "enabled": true,
+      "path": "/synthetic/usage.jsonl",
+      "records": 218,
+      "last_error": null
+    },
+    "runtime_config": {
+      "file": "/synthetic/runtime.toml",
+      "reload": {
+        "reloads": 2,
+        "last_error": null,
+        "last_reload_unix": 1790928000
+      }
+    },
+    "task_jobs": {
+      "scope": "process_memory",
+      "jobs": [
+        {
+          "id": "fixture-job-001",
+          "status": "waiting_for_resources",
+          "task": "completion",
+          "priority": "normal",
+          "requested_model": "fixture-chat:27b",
+          "selected_model": "fixture-chat:27b",
+          "backend": "gpu",
+          "reason": "memory_wait",
+          "detail": null,
+          "created_at": 1790928000,
+          "deadline_at": 1790928120,
+          "timeout_seconds": 120
+        }
+      ]
+    }
+  },
+  "health": {
+    "status": "ok",
+    "version": "0.2.0-test-fixture",
+    "contracts": {
+      "placement_observation": "ollama_api_ps_after_execution"
+    },
+    "sessions": {
+      "active": 2,
+      "max_sessions": 128,
+      "idle_ttl_seconds": 300
+    },
+    "security": {
+      "authentication": "bearer",
+      "remote_access": false
+    },
+    "feedback": {
+      "persistence": {
+        "enabled": true,
+        "last_error": null
+      }
+    }
+  },
+  "machine": {
+    "os": "macos",
+    "architecture": "aarch64",
+    "chip": "Synthetic test host",
+    "logical_cpus": 12,
+    "memory_bytes": 51539607552,
+    "memory_kind": "unified",
+    "unified_memory_bytes": 51539607552,
+    "available_disk_bytes": 536870912000,
+    "ollama_endpoint": "http://127.0.0.1:11434"
+  },
+  "models": {
+    "models": [
+      {
+        "name": "fixture-chat:27b",
+        "size": 17179869184,
+        "capabilities": ["completion", "tools"],
+        "advertised_context": 32768,
+        "resident": true,
+        "resident_vram": 19175677668,
+        "model_type": "generative",
+        "execution": {
+          "placement": "gpu",
+          "backend": "primary",
+          "upstream": "http://127.0.0.1:11434",
+          "observation": {
+            "source": "ollama_api_ps_catalog",
+            "processor": "gpu"
+          }
+        },
+        "benchmark": {},
+        "policy_rank": {}
+      },
+      {
+        "name": "fixture-embed:latest",
+        "size": 274000000,
+        "capabilities": ["embedding"],
+        "advertised_context": 2048,
+        "resident": true,
+        "resident_vram": 0,
+        "model_type": "embedding_only",
+        "execution": {
+          "placement": "cpu",
+          "backend": "cpu",
+          "upstream": "http://127.0.0.1:11436",
+          "observation": {
+            "source": "ollama_api_ps_catalog",
+            "processor": "cpu"
+          }
+        },
+        "benchmark": {},
+        "policy_rank": {}
+      },
+      {
+        "name": "fixture-idle:7b",
+        "size": 17179869184,
+        "capabilities": ["completion", "tools"],
+        "advertised_context": 32768,
+        "resident": false,
+        "resident_vram": null,
+        "model_type": "generative",
+        "execution": {
+          "placement": "gpu",
+          "backend": "primary",
+          "upstream": "http://127.0.0.1:11434",
+          "observation": {
+            "source": "ollama_api_ps_catalog",
+            "processor": "gpu"
+          }
+        },
+        "benchmark": {},
+        "policy_rank": {}
+      }
+    ]
+  },
+  "usage": {
+    "window_days": 7,
+    "totals": {
+      "tasks": 218,
+      "errors": 3,
+      "prompt_tokens": 130800,
+      "output_tokens": 17440,
+      "busy_ms": 2616000,
+      "queue_wait_ms": 8720
+    },
+    "by_model": {
+      "fixture-chat:27b": {
+        "tasks": 138,
+        "errors": 3,
+        "prompt_tokens": 82800,
+        "output_tokens": 11040,
+        "busy_ms": 1656000,
+        "queue_wait_ms": 5520
+      },
+      "fixture-embed:latest": {
+        "tasks": 80,
+        "errors": 0,
+        "prompt_tokens": 48000,
+        "output_tokens": 6400,
+        "busy_ms": 960000,
+        "queue_wait_ms": 3200
+      }
+    },
+    "by_day": [
+      {
+        "day": "2026-10-02",
+        "models": {
+          "fixture-chat:27b": {
+            "tasks": 73,
+            "errors": 0,
+            "prompt_tokens": 43800,
+            "output_tokens": 5840,
+            "busy_ms": 876000,
+            "queue_wait_ms": 2920
+          }
+        }
+      },
+      {
+        "day": "2026-10-01",
+        "models": {
+          "fixture-chat:27b": {
+            "tasks": 61,
+            "errors": 0,
+            "prompt_tokens": 36600,
+            "output_tokens": 4880,
+            "busy_ms": 732000,
+            "queue_wait_ms": 2440
+          }
+        }
+      },
+      {
+        "day": "2026-09-30",
+        "models": {
+          "fixture-chat:27b": {
+            "tasks": 84,
+            "errors": 0,
+            "prompt_tokens": 50400,
+            "output_tokens": 6720,
+            "busy_ms": 1008000,
+            "queue_wait_ms": 3360
+          }
+        }
+      }
+    ],
+    "ledger": {
+      "path": "/synthetic/usage.jsonl",
+      "records": 218,
+      "last_error": null
+    }
+  },
+  "config": {
+    "file": "/synthetic/runtime.toml",
+    "precedence": ["cli", "env", "file", "default"],
+    "reload": {
+      "reloads": 2,
+      "last_error": null,
+      "last_reload_unix": 1790928000
+    },
+    "settings": {
+      "gpu_admission_units": {
+        "value": 4,
+        "source": "file"
+      },
+      "cpu_admission_units": {
+        "value": 2,
+        "source": "env"
+      },
+      "adaptive_concurrency": {
+        "value": "cpu",
+        "source": "default"
+      },
+      "pinned_models": {
+        "value": ["fixture-chat:27b"],
+        "source": "file"
+      },
+      "context_mode": {
+        "value": "ollama_default",
+        "source": "default"
+      }
+    }
+  }
+}
