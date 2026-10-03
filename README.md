@@ -1,731 +1,240 @@
 # FreeLlama
 
-**The local agentic traffic controller for Ollama.**
-
-Meet the agentic tool:
-
 ![A cartoon llama with a full halo and small wings holds a glowing wrench beneath an open golden gate.](assets/logo.jpg)
 
 FreeLlama helps AI agents choose local Ollama models, control task execution within resource limits, and retain scoped task history.
 It queues or refuses work when constraints fail and returns evidence about routing, timing, and observed model placement.
 
-> Ollama runs local models. FreeLlama helps agents offload work deliberately.
-
-FreeLlama preserves Ollama's native API. It does not replace Ollama's runners, scheduler, model
-storage, accelerator support, or token generation.
-
-## See the control plane
-
-MCP, the CLI, and an embedded application share one routing core. Raw `/api` and `/v1` clients
-stay on the primary Ollama process. A managed call uses one backend:
+**Main strength:** one managed task contract connects model eligibility, resource admission, task history, and execution evidence.
+Your agent owns the prompt and task dependencies. FreeLlama checks whether the work can run. Ollama runs the model.
 
 ```mermaid
-flowchart TD
-    CALL["MCP, CLI, or application"] --> KIND{"Managed contract"}
-    RAW["Raw Ollama client"] --> PROXY["Pass /api and /v1 through unchanged"]
-
-    KIND -->|"Preview"| PLAN["Qualify, then return the plan"]
-    KIND -->|"Task"| ROUTE["Qualify one installed model"]
-    KIND -->|"Research"| ADAPT["Read allowlisted files"]
-    ADAPT -->|"Each coding turn"| ROUTE
-
-    ROUTE --> OK{"Eligible?"}
-    OK -->|"No"| STOP["Refuse before inference"]
-    OK -->|"Yes"| TAG{"Exact CPU tag?"}
-    TAG -->|"Yes"| CPU["Secondary Ollama, num_gpu 0"]
-    TAG -->|"No"| PRI["Primary Ollama"]
-    PROXY --> UP["Primary Ollama response"]
-
-    CPU --> REC["Receipt with /api/ps"]
-    PRI --> REC
+flowchart LR
+    Agent["Agent: task and controls"] --> Check["FreeLlama: qualify and admit"]
+    Check -->|"admitted"| Ollama["Ollama: load and execute"]
+    Check -->|"held"| Wait["Bounded queue or refusal"]
+    Wait -->|"resources recover"| Check
+    Ollama --> Receipt["Response, timing, and placement receipt"]
 ```
 
-Managed work follows a decision contract. Raw Ollama traffic follows a compatibility contract:
+[Quick start](#quick-start) · [Features](#features) · [MCP setup](#connect-your-agent) · [Comparison](#how-it-differs) · [Guides](#documentation)
 
-- **Managed tasks** enter routing, refusal, queuing, eligible-backend assignment, and measurement.
-- **Route previews** return a snapshot-only `agent_plan`; previews never reserve capacity or infer
-  dependencies. For actual independent work, `run_task_batch` supplies bounded fair dispatch.
-- **Raw `/api/*` and `/v1/*` requests** pass through unchanged to the primary Ollama server.
-- **Grounded research** runs in a read-only sandboxed adapter (allowlisted tools, restricted shell,
-  scrubbed environment, OS sandbox where available) whose model turns re-enter managed `coding`
-  tasks, so file confinement does not bypass routing, admission, or placement evidence.
+## Quick start
 
-Read [Product positioning](docs/PRODUCT_POSITIONING.md) for the audience and category decision, or
-[Architecture](docs/ARCHITECTURE.md) for the complete ownership and request flows.
-Read [Findings and open-source comparison](docs/dev/FINDINGS_AND_POSITIONING.md) for the reviewed evidence,
-current rating, and remaining qualification work.
-
-For a live Vite + React localhost dashboard, run `yarn dev:view` with the control plane running.
-The [runtime view package](packages/view/README.md) covers backend queues, memory, model residency,
-usage, and effective settings through a typed read-only local backend.
-
-## Understand why it exists
-
-Calling Ollama directly is the right choice when the caller already knows the exact model and
-request. Agent delegation adds decisions that a raw inference API does not own:
-
-- Does an installed model satisfy the task, capability, context, policy, and confidence constraints?
-- Can the workload fit the detected host and coexist with resident models?
-- Can a small helper run on CPU while a large model remains on GPU?
-- Did repository research read the relevant files, or did the model answer from recall?
-- Which backend ran the request, how long did it wait, and what did Ollama report?
-- Can large vectors, files, images, and intermediate tool output remain outside the orchestrator's
-  context?
-
-FreeLlama turns those questions into inspectable contracts. It can refuse before inference instead
-of allowing an unqualified model to produce a confident answer.
-
-### What it adds over direct Ollama—and what it costs
-
-Direct Ollama is often the better choice. Ollama already provides local inference, model lifecycle,
-tool calling, structured outputs, vision, request options, and `keep_alive`. Use it directly when
-the application already knows the exact model and request, or needs streaming with the smallest
-possible hop.
-
-| Need | Direct Ollama | FreeLlama managed task | Critical caveat |
-|---|---|---|---|
-| Exact known model and prompt | One request to the runtime | Adds routing, admission, and a receipt | FreeLlama is extra latency and complexity; do not insert it by default. |
-| Agent must choose safely | Application must implement its own rules | Typed capability, context, policy, confidence, and placement-evidence checks can preview or refuse | The rules are only as good as the configured policy and benchmark evidence. |
-| Avoid local overload | Ollama owns its runtime queue | Weighted-fair per-backend admission with bounded queue cardinality and wait time; independent batches get a bounded dispatcher | Raw compatibility traffic bypasses managed routing; `serve` applies a separate one-stream default cap that is generic, not device-aware. |
-| Retain related-task history | Caller replays messages | Opt-in bounded scopes replay history with revision-protected appends | Process-local history survives neither restart nor expiry; KV reuse remains backend-owned. |
-| Keep related tasks on one model | Caller names the model each time | In-memory affinity handle binds only after successful execution | A session is not chat memory or Ollama KV, expires when idle, and disappears on restart. |
-| CPU/GPU separation | Ollama selects runner placement | Exact operator-assigned models can use a second CPU Ollama process | This is manual process topology, not automatic GPU scheduling or live VRAM management. |
-| Ground repository answers | Caller supplies tools, prompts, and verification | Confined research adapters return citations and a verification verdict | The adapter is deliberately narrow and is not a general autonomous coding system. |
-
-FreeLlama's managed API is non-streaming. Its machine profile exposes portable host RAM,
-CPU, disk, and diagnostic thermal-pressure signals, while physical placement is observed from
-Ollama after execution. Local admission uses available-RAM estimates, load, and reported pressure
-or thermal throttling. On a discrete GPU it reads free VRAM before load (`nvidia-smi` or amdgpu
-sysfs) and charges host RAM only for the part expected to spill. It does not consume vendor GPU
-utilization or power limits; FreeLlama also does not provide multi-tenant RBAC,
-durable conversation state, or cluster scheduling. Those are product gaps, not hidden features.
-
-Route preview returns an advisory `execution.agent_plan` with separate queue and resource readiness.
-It uses the same model-footprint estimate as execution, subtracts existing reservations, and reports
-missing required telemetry or insufficient headroom instead of calling that model `runnable_now`.
-It also reports conservative sibling capacity, warm-runner reuse, and keep-alive guidance. It never
-reserves capacity or promises parallel completion; execution rechecks admission and residency.
-The model-metadata K/V preflight is an advisory single-sequence F16 estimate, not a lower bound.
-Ollama remains authoritative for cache format, runner graph allocation, and final loading.
-
-Local inference requires available-RAM telemetry by default. `serve` and `proxy` accept
-`--resource-telemetry-policy require-memory|require-all|best-effort`; best-effort explicitly permits
-unknown RAM. See [resource policy](docs/CLI.md#bound-admission) and the
-[mixed-workload benchmark](benchmark/local/docs/mixed-workload.md) before tuning concurrency.
-
-## Understand what is agentic and what is deterministic
-
-FreeLlama is a bounded agentic system around a deterministic control core. The agent proposes work;
-the core decides whether that proposal is eligible and executable. This split prevents a model from
-turning a natural-language preference into hardware authority or a destructive side effect.
-
-| Layer | Behavior | Why it belongs there |
-|---|---|---|
-| Calling agent | Chooses whether to inspect, preview, execute, or delegate research | The caller owns the requested outcome and task decomposition |
-| Operator | Configures endpoints, exact CPU-model assignments, runtime settings, and lifecycle approval | Hardware and disk authority must remain explicit human-owned configuration |
-| Intent interpreter | Converts natural language into typed task signals | A model can interpret wording, but it cannot select the final model or backend |
-| Research adapter | Iteratively searches or reads allowlisted files and returns evidence | Repository investigation benefits from an agent loop with bounded tools and turns |
-| Router | Applies capability, policy, context, confidence, explicit-model, and session rules | Eligibility must be repeatable and testable rather than prompt-dependent |
-| Placement and admission | Applies exact operator assignments, backend capacity, and weighted permits | Models must not invent topology, bypass queues, or move themselves between devices |
-| Runtime feedback | Suggests a backend after comparable warm samples show a meaningful advantage | Measurement can adapt routing, but only inside operator-owned eligible choices |
-| Lifecycle tools | Separates inspection, installation, unloading, and permanent deletion | Side effects stay explicit and destructive actions remain distinguishable |
-| Ollama | Loads model runners, manages its internal queue and parallel decoding, and performs inference | FreeLlama preserves Ollama rather than replacing its runtime or scheduler |
-| OS and accelerator runtime | Schedule physical CPU/GPU kernels and memory | A routing receipt is not direct control over device execution |
-
-The system therefore is not an autonomous scheduler. It is agentic where interpretation and
-investigation help, deterministic where trust, safety, hardware ownership, and compatibility
-matter.
-
-The agent owns **what can be offloaded and what can run concurrently**; the operator owns
-**which Ollama processes and exact model tags may use CPU**; FreeLlama owns **qualification,
-admission, and the managed routing decision**; Ollama and the operating system own **the actual
-model runner and physical CPU/GPU execution**.
-
-### Audit the fixed boundaries
-
-Some contracts are intentionally strict:
-
-- The service defaults to loopback. A nonloopback listener requires explicit remote opt-in and a
-  bearer token loaded from a permission-restricted file; authentication covers managed and raw
-  passthrough routes.
-- CPU assignment requires an exact operator-configured tag and pins `num_gpu: 0`; physical CPU
-  proof still requires post-run `size_vram:0` because some MLX runners ignore the request.
-- An explicit model or an existing session affinity wins over adaptive placement.
-- The schema represents managed task types and objectives as enums rather than free-form prompts.
-- The MCP surface separates model work, history, residency, and lifecycle operations; permanent
-  deletion remains a destructive tool.
-- Quality-sensitive routes fail closed when policy or benchmark evidence is missing.
-
-Workload policy remains configurable: endpoints, CPU model assignments, policies, benchmark
-reports, admission totals, queue timeout, context window, decoding options, keep-alive, research
-turn limits, tool timeouts, retry behavior, pagination, clipping, compaction, and pinned-overflow
-handling all have operator or per-call controls.
-
-Default admission costs are embedding `ceil(input_items / 4)`, chat 2, and vision 4, capped to the
-backend's current capacity. Operators can override each task kind's base cost in the runtime file's
-`[task_costs]` table; embeddings multiply that base by their input groups. See
-[monitoring controls](docs/MONITORING.md#adaptive-concurrency) before tuning these weights.
-Backend feedback still needs three comparable warm samples and more than a 10% advantage.
-The CLI persists bounded aggregate feedback by default. Callers can create concurrency between
-independent tasks, including work assigned to different backends. Qualify changed weights with
-workload measurements; they do not detect hardware capacity or relax memory admission.
-
-## Evidence and limits
-
-FreeLlama is intentionally narrow: it manages local Ollama delegation; it is not a chat UI, a
-replacement inference runtime, a multi-provider gateway, or a cluster scheduler. Use direct Ollama
-when the caller already knows the model and request and does not need admission or execution
-evidence.
-
-The repository proves contracts through its test and release gates, not a self-assigned score:
-
-```bash
-yarn verify:production
-```
-
-That command builds the public packages, checks formatting and Clippy, runs TypeScript, Rust,
-adapter, hardware-harness, release-packaging, MCP integration, and end-to-end tests, then verifies
-publishable artifacts. Registry availability is a separate `yarn release:verify:registry` check.
-See [testing](docs/TESTING.md) for prerequisites and individual commands, and the
-[release procedure](RELEASE.md) for version preparation and registry preflight.
-
-Those checks do not prove that a local model is accurate, fast, or a good code reviewer for your
-workload. Treat a model response as a candidate unless you have a representative evaluation and
-policy for that exact model, prompt, and machine. FreeLlama can verify routing, admission,
-placement, and response receipts; it cannot turn those operational facts into a quality claim.
-
-## Meet the prerequisites
-
-FreeLlama requires Ollama for model storage and inference. It does not bundle, install, start, or
-replace Ollama. Install Ollama from the [official download page](https://ollama.com/download), then
-start the Ollama app or `ollama serve`. The default endpoint is `127.0.0.1:11434`.
-
-If Ollama is missing or unreachable:
-
-- the source build and non-live tests can still run;
-- `doctor` returns a connection error because it queries Ollama directly, although it does not need
-  `freellama serve`;
-- installed-model discovery, pulls, routing, proxying, and generation cannot run;
-- online-library search can describe model families, but it is not proof that a model runs or fits
-  this machine.
-
-Verify the prerequisite before selecting a model:
+Install and start [Ollama](https://ollama.com/download) first. FreeLlama uses its installed models and inference runtime.
+For this checkout, use Node.js 20.19+ or 22.12+, Rust 1.85+, and Yarn.
+Run these commands from the repository root:
 
 ```bash
 ollama list
+yarn install
+yarn build
+./target/release/freellama doctor
+./target/release/freellama serve
 ```
 
-An empty list is valid: diagnostics and model discovery can start before you pull the first model.
-Every pull remains an explicit operator action after you review the exact tag, download size, task
-fit, and machine fit.
+The control plane listens on `http://127.0.0.1:11435`; Ollama defaults to `http://127.0.0.1:11434`.
+Keep `serve` running. In another terminal, inspect the inventory and choose an installed completion model:
 
-Building FreeLlama from source also requires Rust 1.85 or later and Node.js 20 or later.
+```bash
+./target/release/freellama models
+./target/release/freellama route --task completion --model INSTALLED_MODEL --context-tokens 2048
+./target/release/freellama task --task completion --model INSTALLED_MODEL --context-tokens 2048 \
+  "Reply with exactly OK."
+```
 
-## Install from npm on a supported platform
+Replace `INSTALLED_MODEL` with an exact installed tag supporting completion and a context window of at least 2,048 tokens.
+`route` previews the choice without inference. `task` checks resources again, then executes or returns a reason it cannot proceed.
+A preview does not reserve capacity. Read the task's response and execution receipt before accepting the result.
+If work waits or refuses, run `./target/release/freellama status` for queues, resource holds, and breaker state.
 
-After the matching release is published, run the CLI directly:
+An empty model inventory is valid. Inspect [model selection](docs/MODEL_SELECTION.md) before installing a model.
+Search and recommendations never download models. Approve one exact tag and its reported size before a pull.
+
+For published versions, the CLI and MCP server also run through npm:
 
 ```bash
 npx @octocodeai/freellama doctor
+npx @octocodeai/freellama-mcp-server
 ```
 
-Add the MCP server to your AI client:
+npm runs the latest published release, which can differ from this checkout.
+The MCP server uses stdio; configure it in your agent host rather than running it interactively.
+Keep npm optional dependencies enabled: they provide the matching native CLI and addon.
+Prebuilt targets cover macOS arm64/x64, Linux arm64/x64 with glibc or musl, and Windows arm64/x64.
+See the [CLI package](packages/cli/README.md) and [release procedure](RELEASE.md) for installation details.
+
+## Features
+
+| Feature | What you control or receive | Entry point |
+|---|---|---|
+| Model discovery | Installed and resident models, capabilities, exact library tags, download sizes, and host diagnostics | `models`, `doctor` |
+| Task qualification | Model, capability, context, policy, confidence, and placement requirements; preview or refusal before inference | `run_task`, CLI `route` |
+| Natural-language routing | A local model converts wording into typed intent; the core still owns model selection | CLI `natural-route` |
+| Managed inference | Chat, coding, tools, vision/OCR, embeddings, and long-context requests with caller-owned prompts and runtime options | `run_task`, CLI `task` |
+| Resource queues | Weighted fair admission, host pressure holds, finite queues, priorities, wait budgets, deadlines, and cancellation | [Admission controls](docs/CLI.md#bound-admission) |
+| Independent batches | Bounded concurrent dispatch, stable task IDs, fair priorities, and separate results or errors for each task | `run_task_batch` |
+| Deferred tasks | Submit now; inspect status, retrieve a result, cancel, or remove the retained record | `task_jobs`, CLI `jobs` |
+| Task context | Bounded message history, routing defaults, revision checks, and independent history forks | `scope` |
+| Affinity and warming | Prefer the same model for related work; warm installed models through managed resource checks | `session`, `warm_model` |
+| CPU/GPU routing | Assign exact models to a second CPU Ollama process and inspect observed residency after execution | [CPU/GPU setup](docs/CPU_GPU_ROUTING.md) |
+| Adaptive feedback | Prefer an eligible backend only when comparable observed samples justify the choice; explicit controls retain authority | [Feedback rules](docs/CPU_GPU_ROUTING.md#understand-automatic-feedback) |
+| Grounded research | Bounded read-only repository lookup with citations, paged observations, context fitting, and a verification verdict | `delegate_research` |
+| Monitoring and tuning | Queue state, usage, metrics, memory, model residency, circuit breakers, adaptive limits, eviction evidence, and runtime config reload | CLI `status`, `usage`, `config`; [monitoring](docs/MONITORING.md) |
+| Cost visibility | Observed local token counts and an optional equivalent API-cost estimate using operator-configured rates | [MCP telemetry](packages/mcp/README.md#measure-avoided-external-cost) |
+| Model evaluation | Frozen suites, correctness checks, benchmark reports, and policy generated from evaluation results | CLI `bench-all`, `run`, `eval`, `policy-from-eval` |
+| Explicit lifecycle | Pull or unload exact models; keep permanent deletion separate from ordinary task execution | `ollama_manage`, `ollama_delete` |
+| Ollama compatibility | Pass native `/api/*` and `/v1/*` traffic to the primary Ollama backend | CLI `serve` or `proxy` |
+
+MCP, the CLI, and embedded Rust applications share the routing core.
+Raw compatibility requests use a separate passthrough path; managed qualification and CPU assignments apply to managed tasks.
+
+### Keep context and residency separate
+
+- **Scope:** message history and routing defaults. A revision protects each append; forks create independent histories.
+- **Session:** model affinity for related tasks. It stores no messages or engine cache.
+- **Warm model:** a loaded Ollama runner retained through residency controls. It can still be evicted.
+
+Scopes and deferred jobs are process-local and disappear on service restart.
+Reusing history does not transfer KV tensors or reserve a runner. Ollama owns engine cache reuse.
+Use [Scopes and warming](docs/SCOPES_AND_WARMING.md) for limits, failures, and examples.
+
+### Keep the calling agent's context small
+
+Model inventory and diagnostics offer compact views and paged details.
+Embedding vectors stay out of MCP responses by default; request them explicitly when storing values.
+Delegated research returns an answer, citations, and a verdict instead of the full intermediate tool transcript.
+The local worker still consumes model tokens. This reduces the caller's context burden, not the computation needed for the task.
+
+### Inspect the runtime
+
+The built-in status page is available at `http://127.0.0.1:11435/_freellama/ui` while `serve` runs.
+For the separate React dashboard, run the following command from this checkout:
+
+```bash
+yarn dev:view
+```
+
+Open `http://127.0.0.1:5173` for queues, models, usage, configuration, and diagnostics.
+The dashboard is read-only and requires Node.js 20.19+ or 22.12+.
+See the [runtime view](packages/view/README.md) for setup and telemetry meanings.
+
+## Connect your agent
+
+After building this checkout, add the MCP server to your host's configuration:
 
 ```json
 {
   "mcpServers": {
     "freellama": {
-      "command": "npx",
-      "args": ["@octocodeai/freellama-mcp-server"]
+      "command": "node",
+      "args": ["/ABSOLUTE/PATH/FreeLlama/packages/mcp/dist/index.js"],
+      "env": {
+        "FREELLAMA_MCP_ALLOWED_ROOTS": "/ABSOLUTE/PATH/your-project"
+      }
     }
   }
 }
 ```
 
-The portable JavaScript package installs exactly one matching `@octocodeai/freellama-native-*` optional
-dependency containing the Rust CLI and N-API addon. Do not install with `--omit=optional`.
+Replace both paths with your checkout and the project the research adapter can read.
+For a published release, use `"command":"npx"` and `"args":["@octocodeai/freellama-mcp-server"]` instead.
+The MCP server can start an owned control-plane child when the default local service is unavailable.
+It does not install or start Ollama.
+Research delegation additionally requires Python 3 available as `python3`.
+See [MCP setup](packages/mcp/README.md) for endpoint overrides, authentication, schemas, and allowed roots.
 
-Prebuilt targets are macOS arm64/x64, Linux arm64/x64 for glibc and musl, and Windows arm64/x64.
-The release gate publishes no Cargo crates: `freellama-core` and `freellama-cli` are internal Rust
-implementation crates, while the public npm packages bundle their compiled artifacts.
+### Preview, then execute
 
-## Build and run from source
-
-Build the Rust CLI, native Node addon, MCP bundle, and workspace packages:
-
-```bash
-yarn install
-yarn build
-```
-
-Start with diagnostics, then run the control plane:
-
-```bash
-./target/release/freellama init       # read-only prerequisite, inventory, and next-step receipt
-./target/release/freellama doctor
-./target/release/freellama serve
-```
-
-In another terminal, inspect the models. Then preview and execute one route:
-
-```bash
-./target/release/freellama models
-./target/release/freellama route --task coding --objective fastest
-./target/release/freellama task --task completion --objective fastest \
-  "Reply with exactly OK."
-```
-
-The control plane listens on `127.0.0.1:11435` by default. Point your MCP client at
-`npx @octocodeai/freellama-mcp-server` or, from a source checkout, `node packages/mcp/dist/index.js`.
-Before publishing, run the local release checks in the [production runbook](docs/PRODUCTION.md),
-assemble checksummed artifacts for every claimed target, and publish the CLI and MCP packages
-explicitly. See the [MCP build and client guidance](packages/mcp/README.md).
-
-## Control FreeLlama through MCP
-
-The MCP server exposes focused tools to compatible AI-agent hosts:
-
-| MCP tool | Control | Important behavior |
-|---|---|---|
-| `doctor` | Diagnose Ollama, host, versions, and memory settings | `summary` is compact by default; use `scheduler`, `config`, or `full` only for diagnosis |
-| `models` | Inspect installed, resident, detailed, raw, or online-library models | Raw inventory and library tags are paged; reports managed CPU/GPU placement where available |
-| `run_task` | Preview or execute chat, vision, and embedding work | Applies routing, confidence, admission, and response trimming |
-| `task_jobs` | List states, retrieve results, cancel, or remove deferred work by ID | Removal stops active work and discards its retained record after local permits are released |
-| `run_task_batch` | Execute caller-declared independent work | Requires stable IDs and `independent:true`; bounds dispatch and returns each sibling result/error |
-| `session` | Create or release bounded model affinity for related tasks | Stores neither prompt history nor Ollama KV; expires when idle |
-| `scope` | Create, inspect, fork, or delete bounded message history | Revision protects successful appends; history reads are explicit and state is process-local |
-| `warm_model` | Warm an exact installed model through managed admission | Retains routing, memory-fit, placement, deadline, and deferred-job controls |
-| `ollama_manage` | Pull or unload an exact model | Keeps lifecycle work explicit |
-| `ollama_delete` | Permanently delete an exact model | Isolated as a destructive tool |
-| `delegate_research` | Answer a narrow question from allowlisted files | Runs managed coding-agent turns and returns citations, placement receipts, and an independent verdict |
-
-Use [Scope history and model warming](docs/SCOPES_AND_WARMING.md) for opt-in conversation history,
-parallel forks, governed prewarming, and bounded adaptive keep-alive.
-
-For ordinary chat, call `run_task {prompt:"Hello"}`. Task profiles and stricter evidence gates
-are optional; your messages, system prompts, and output format remain yours. See
-[managed task inputs](packages/mcp/README.md#preview-and-execution) for defaults and controls.
-
-An agent can preview a consequential route without generating:
+Start with `models {view:"installed"}`. For a consequential task, call `run_task` with routing fields only:
 
 ```json
 {
-  "task": "embedding",
-  "objective": "fastest",
-  "executionPreference": "prefer_cpu",
-  "minPlacementEvidence": "observed",
+  "task": "completion",
+  "model": "INSTALLED_MODEL",
+  "contextTokens": 2048,
   "preview": true
 }
 ```
 
-`minPlacementEvidence:"observed"` intentionally refuses a cold model. Warm once with
-`"configured"`, inspect `execution.observation`, then require observed proof. The preview reports
-whether FreeLlama satisfied the preference, the selected backend/upstream, admission, and reason. A preference does not grant an agent
-authority to assign arbitrary models: exact CPU tags remain operator-owned, and explicit model,
-session, capability, policy, context, and confidence constraints win.
-Route previews honor existing session affinity but never create or change it. Only a successfully
-admitted task execution binds an eligible session to the selected model.
-Preview input contains routing constraints only. Supply prompts, embedding input, images, and tool
-payloads when executing the accepted route.
+Review the decision. Submit the payload in a separate `run_task` call:
 
-Start with `models {view:"installed"}`, then `models {view:"resident"}`. Call `doctor` only when
-you need to diagnose the runtime or configuration; its default `summary` is deliberately small,
-while `scheduler` adds configuration/snapshot evidence, `config` returns categorized settings, and
-`full` returns the remaining non-duplicated diagnostic. Every tool returns canonical
-`structuredContent` under a declared MCP output schema; ordinary text is a compact cue.
-
-`run_task` withholds embedding vectors by default so they do not consume agent context. Set
-`returnEmbeddings: true` only when the caller needs to store the values. Use `delegate_research`
-instead of `run_task` when the model must read workspace files.
-
-### Review code with a local model
-
-`task:"code_review"` is an alias for `coding`, not a server-owned prompt template. Supply your
-own `prompt` or `messages`, including `role:"system"` instructions. FreeLlama forwards message
-content unchanged; it does not wrap the prompt, inject review instructions, force a review schema,
-or impose a review-specific minimum output budget. Choose `format`, `think`, and
-`options.num_predict` when needed, as for other chat tasks.
-
-Include source and relevant tests or contracts in your request. Treat model findings as candidates
-to verify, not a merge decision. For the caller-owned prompt contract, see
-[managed task inputs](packages/mcp/README.md#preview-and-execution).
-
-### Keep an agent's context small
-
-FreeLlama saves **orchestrator context**, not model-compute tokens. It prevents a client from
-needlessly carrying full diagnostics, raw embedding vectors, and every intermediate research-tool
-result in its own conversation. The local delegate still consumes local Ollama tokens to do the
-work; its value is that the calling agent receives an answer, citations, verification verdict, and
-compact receipt instead of a long tool transcript.
-
-Use this decision order:
-
-1. Call `models {view:"installed"}`. Call `models {view:"resident"}` only if residency affects
-   the next decision.
-2. For consequential generation, call `run_task {preview:true, ...}` with routing constraints.
-   It performs no generation and cannot reserve capacity.
-3. Execute only the selected task. Set `contextTokens` deliberately for long work, and set
-   `options.num_predict` to bound the generated output.
-4. Use `delegate_research` only for a narrow question that requires reading an allowed workspace.
-   Give it a self-contained question and a bounded `agent.maxTurns`, `agent.contextTokens`, and
-   `agent.outputTokens`.
-5. Read `structuredContent` for the canonical receipt. Keep the ordinary text cue in the active
-   conversation; request pages or detailed evidence only when the decision requires it.
-
-For delegated research, the usable input estimate is `contextTokens − outputTokens − safety margin`
-(256 tokens by default). The adapter pins its system contract and original question, preserves the
-two newest observations, compacts older observations to breadcrumbs, and fails closed rather than
-letting Ollama silently remove the front of the prompt. `FREELLAMA_AGENT_PINNED_OVERFLOW=clip` is an explicit
-quality-risk escape hatch, not a normal optimization. The first estimate is conservative and is
-calibrated from later Ollama prompt counts.
-
-The control receipt is evidence about routing and execution, not a quality grade. A successful
-short completion proves that exact response only. Treat `confidence:"low"`, missing policy
-evidence, or missing benchmark evidence as a reason to verify the result or retain the task in the
-calling agent.
-
-### Use FreeLlama for images and OCR
-
-Use `run_task` for supplied images; it has no workspace-file access. First preview a vision route
-with `task:"vision"` and `requiredCapabilities:["vision"]`. Then make a separate execution call
-with the selected installed model, a clear prompt, and `images` containing base64 image bytes
-without a data-URI prefix. Inspect the execution receipt for admission and physical placement; use
-`keepAlive:"0"` for a one-off image task when the next task does not use that model.
-
-Do not treat a model name, advertised vision capability, GPU use, or a successful single image as
-OCR-quality proof. Image quality depends on the exact **installed model build**, prompt and decoding
-settings, requested context/output budget, and the host's available memory and accelerator
-performance. Run representative held-out images on the target machine, then create policy and
-benchmark evidence before accepting quality-sensitive OCR or visual judgment automatically. See
-[model selection](docs/MODEL_SELECTION.md) and [production validation](docs/PRODUCTION.md).
-
-Use `run_task_batch` only when no result is needed to construct another task. Each item has the typed
-shape `{id, independent:true, task}`; the nested task uses the same routing and payload controls as
-`run_task`. Set
-`maxParallelism` to the smallest useful dispatch cap (1–64); omission never grants an unbounded
-fan-out. Its `interactive`,
-`normal` (default), and `background` priorities use a 3:2:1 weighted-fair policy at both local
-dispatch and managed admission. Priority changes neither model eligibility nor capacity; a task can
-still queue or receive 503. For one embedding request, pass an input array to `run_task`; its
-admission cost scales in transparent groups of four inputs rather than pretending every batch costs one.
-
-The MCP package, schemas, environment variables, allowed-root rules, and client setup live in the
-[MCP server reference](packages/mcp/README.md).
-
-## Control FreeLlama through the CLI
-
-The CLI is the operator and automation surface. It starts the service, diagnoses the host, previews
-and executes work, measures models, and generates routing evidence. Pick the command for the action
-you need:
-
-```mermaid
-flowchart TD
-    GOAL{"Next action"}
-    GOAL -->|"Inspect the host or catalog"| DOC["doctor, machine, models"]
-    GOAL -->|"Choose a model"| PRE["route, recommend, or natural-route"]
-    GOAL -->|"Execute managed work"| TASK["task"]
-    GOAL -->|"Measure installed models"| EV["bench-all, run, or eval"]
-    PRE --> PLAN["Decision only. The selected task does not run"]
-    EV --> POL["policy-from-eval"]
-    POL -.->|"Optional input to a later choice"| PRE
-    TASK --> REC["Runs after admission"]
+```json
+{
+  "task": "completion",
+  "model": "INSTALLED_MODEL",
+  "contextTokens": 2048,
+  "prompt": "Reply with exactly OK.",
+  "options": { "num_predict": 32 }
+}
 ```
 
-| CLI control | Purpose |
-|---|---|
-| `init`, `doctor`, `machine`, `models` | Guide first-run prerequisites, then inspect runtime, host, catalog, residency, and drift |
-| `route`, `recommend` | Make a side-effect-free model decision or installation recommendation |
-| `task`, `session` | Execute managed work or create a session; successful admitted tasks preserve eligible affinity |
-| `scope`, `warm` | Manage bounded message history or warm an installed model through ordinary admission |
-| `natural-route` | Infer typed intent and return a route decision without executing the selected task or changing session affinity |
-| `serve` | Run managed control routes and the Ollama-compatible proxy |
-| `proxy` | Run only passthrough, retry, and telemetry behavior |
-| `bench-all`, `run`, `eval` | Measure installed models or compare frozen suites |
-| `policy-from-eval` | Convert correctness evidence into task policy |
-| `tools` | Print the maintained CLI-to-MCP parity map |
+Use the exact installed tag from the quick start.
+Preview requests reject prompts, messages, images, embedding inputs, tools, and runtime options.
+Execution rechecks eligibility and admission. An explicit model choice does not establish answer quality.
+Read `structuredContent` for the canonical result, errors, and execution evidence.
 
-Run `npx @octocodeai/freellama <command> --help` for the authoritative flags and enum values. Read the
-[CLI reference](docs/CLI.md) for the full command map and policy workflow.
+For longer work, add `defer:true`, then use the returned job ID with `task_jobs`.
+For parallel work, use `run_task_batch` only when tasks do not consume each other's results.
+For file-backed questions, use `delegate_research` with a self-contained question and an allowed `workspacePath`.
+Your agent retains decomposition, judgment, and final verification; discard an `escalate` result.
 
-## Use CPU and GPU in parallel
+## How it differs
 
-FreeLlama can keep large models on a primary GPU-capable Ollama process while explicitly assigned
-helper models run on a second CPU Ollama process. The two backends have independent admission pools
-and transition locks, so eligible requests can overlap across models. One managed task still selects
-one backend:
+FreeLlama's distinction is the combination of agent-facing task controls around a local Ollama runtime.
+The individual mechanisms have counterparts elsewhere: warming, queues, routing, and cache reuse are established features.
+FreeLlama connects qualification, fair admission, scoped history, bounded research, and inspectable receipts in one managed workflow.
 
-```mermaid
-flowchart TD
-    IN["Managed task"] --> PIN{"Explicit model or session?"}
-    PIN -->|"Yes"| KEEP["Keep that model"]
-    PIN -->|"No"| HINT{"Preference or auto hint<br/>has an eligible model?"}
-    HINT -->|"Yes"| USE["Stay inside that hint"]
-    HINT -->|"No"| DEF["Deterministic default"]
-    KEEP --> TAG{"Exact CPU-model tag?"}
-    USE --> TAG
-    DEF --> TAG
-    TAG -->|"Yes"| CPU["Secondary Ollama, num_gpu 0"]
-    TAG -->|"No"| PRI["Primary Ollama"]
-    CPU --> OBS["Read that process /api/ps"]
-    PRI --> OBS
-    OBS -->|"Verified warm sample"| LEARN["Record latency"]
-    OBS -->|"Unknown, mixed, or mismatch"| SKIP["Report only"]
-    LEARN -.->|"Later auto fastest or balanced only"| HINT
-```
-
-This is **parallelism across separate model backends**, not a promise that one model decodes several
-requests concurrently. Parallel requests within one Ollama process remain controlled by
-`OLLAMA_NUM_PARALLEL`, which also multiplies K/V-cache memory. FreeLlama admission cannot remove
-that Ollama limit.
-
-The useful pattern is usually a large GPU generation model plus small CPU helpers such as embedders
-or intent models. A second enormous CPU generation model can contend for RAM and memory bandwidth
-and make the combined workload slower.
-
-Choose the backend from workload evidence, not from parameter count alone:
-
-| Workload | Default backend | Reason |
+| Project | Main emphasis | FreeLlama's difference |
 |---|---|---|
-| Embeddings with `nomic-embed-text:latest` | CPU | Small, batchable helper work can overlap large GPU generation; vectors stay local and are withheld by default |
-| Intent classification or short extraction | CPU after measurement | Useful only when latency and shared-memory contention beat the GPU alternative on the target host |
-| OCR or vision with `glm-ocr:latest` | GPU | The tested 1.1B vision model uses accelerator execution; text recognition passed 3/3 held-out images and 6/6 configured repeat trials |
-| Coding and grounded research with `qwen3.8:27b-mlx` | GPU | The measured 27B model is useful for bounded file-backed retrieval; measured host behavior makes CPU generation substantially slower |
-| Long-context or quality-sensitive generation | GPU | Context and decode workloads benefit from accelerator residency; do not make them compete with an unmeasured large CPU model |
+| [Ollama](https://docs.ollama.com/faq) | Model loading, residency, request queues, and inference | Adds task eligibility, host admission policy, scoped history, and managed execution receipts around Ollama. |
+| [llama.cpp](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md) | Engine controls, continuous batching, parallel slots, and prompt-cache save/restore | Manages application history and task policy through Ollama; scopes are distinct from engine-cache snapshots. |
+| [vLLM](https://github.com/vllm-project/vllm) | PagedAttention, continuous batching, prefix caching, and distributed inference | Focuses on local agent delegation; engine scheduling remains with Ollama and its runners. |
+| [SGLang](https://github.com/sgl-project/sglang) | Multimodal inference; ecosystem includes KV caching and deployment gateways | Targets local Ollama task control rather than implementing those inference and deployment mechanisms. |
+| [LiteLLM](https://docs.litellm.ai/docs/routing) | Multiple deployment-routing strategies, affinity, retries, fallbacks, and usage limits | Focuses on installed-model eligibility, host resources, task scopes, and observed CPU/GPU placement. |
+| [RouteLLM](https://github.com/lm-sys/RouteLLM) | Trained prompt routing between stronger and weaker models | Uses explicit qualification and bounded backend feedback; it does not learn prompt-specific answer quality. |
 
-Run CPU and GPU work concurrently only when the requests are independent. For example, an agent can
-start an embedding batch while a separate coding or OCR task runs. If one task consumes the other
-task's output, keep them sequential. FreeLlama permits cross-backend overlap, but the MCP host or
-application must issue the independent calls concurrently; FreeLlama does not infer a dependency
-graph from two unrelated requests.
+Choose FreeLlama when your agent needs controlled local delegation with reasons, task history, and execution evidence.
+Use Ollama directly when your application already owns these decisions and needs its native inference API.
+Direct integrations with llama.cpp, vLLM, and SGLang are outside FreeLlama's current backend contract.
+Read the [feature and logic comparison](docs/dev/FINDINGS_AND_POSITIONING.md#feature-and-logic-assessment) for the detailed assessment.
 
-### Start the two backends
+## Boundaries
 
-Start the primary Ollama server with a conservative local-only baseline:
+Managed tasks are non-streaming. Raw Ollama passthrough retains upstream streaming behavior.
+CPU assignment is operator-owned; verify returned placement rather than assuming `num_gpu:0` controls every runner.
+A scope ID is a history handle, not a tenant credential. Model capability labels and successful execution do not establish answer correctness.
 
-```bash
-OLLAMA_HOST=127.0.0.1:11434 OLLAMA_NO_CLOUD=1 \
-  OLLAMA_MAX_LOADED_MODELS=1 OLLAMA_NUM_PARALLEL=1 ollama serve
-```
+The service defaults to loopback. Remote access requires explicit opt-in and bearer authentication; use an external ingress for TLS and tenant isolation.
+FreeLlama is designed for one operator or a trusted team. Local inference uses your hardware, memory, power, and time.
+The name refers to reducing reliance on metered inference; supported models are not limited to the Meta Llama family.
+See [Production](docs/PRODUCTION.md) for authentication, persistence, deployment, and recovery.
 
-For every operating system, run `freellama doctor` after startup. Its
-`local_conservative_config_posture` is a portable, non-mutating starter profile: it distinguishes
-an observed process setting from a FreeLlama/launchd hint, recommends a finite internal queue, and
-never turns a recommendation into a restart or configuration write. It intentionally leaves
-global context unset because current Ollama documentation has VRAM-tiered defaults and the FAQ
-still describes 4096; verify the loaded runner's context through `/api/ps`. It leaves K/V cache at
-`f16` until the target workload is measured. `host_runtime_signals` reports the source and permission boundary of available host
-signals; unsupported telemetry is an explicit result, never an invented reading.
+## Development and verification
 
-Start a separate CPU-oriented Ollama process on loopback:
+The production gate builds packages and checks Rust, TypeScript, adapters, benchmark contracts, integration, and release artifacts:
 
 ```bash
-OLLAMA_HOST=127.0.0.1:11436 OLLAMA_NO_CLOUD=1 \
-  OLLAMA_MAX_LOADED_MODELS=1 OLLAMA_NUM_PARALLEL=1 \
-  OLLAMA_LLM_LIBRARY=cpu ollama serve
+yarn verify:production
 ```
 
-`OLLAMA_LLM_LIBRARY=cpu` is process-level guidance and is not sufficient on every backend. For
-managed tasks assigned to the CPU process, FreeLlama also pins Ollama's per-request
-`options.num_gpu` value to `0`.
+This gate needs the prerequisites and native artifacts described in [Testing](docs/TESTING.md) and [Release](RELEASE.md).
+Physical throughput, CPU/GPU activity, and thermal behavior require separate [local measurements](docs/dev/LOCAL_PERFORMANCE_TESTING.md).
+Historical results and their limits live in the [findings report](docs/dev/FINDINGS_AND_POSITIONING.md) and [benchmarks](benchmark/README.md).
 
-Start FreeLlama with exact CPU-eligible model tags:
+## Documentation
 
-```bash
-./target/release/freellama serve \
-  --upstream http://127.0.0.1:11434 \
-  --cpu-upstream http://127.0.0.1:11436 \
-  --cpu-model nomic-embed-text:latest
-```
-
-All other managed models and every raw Ollama-compatible request remain on the primary upstream.
-Repeat `--cpu-model` to assign more exact tags. FreeLlama rejects missing, ambiguous, same-socket,
-and nonloopback backend configurations.
-
-### Let the agent express intent without owning topology
-
-MCP `run_task` and the CLI accept `auto`, `prefer_cpu`, or `prefer_gpu`. FreeLlama applies the
-preference only after installation, capability, policy, context, confidence, explicit-model, and
-session-affinity checks.
-
-For eligible `auto` work, normalized warm feedback can refine `fastest` and `balanced` routing only
-after three successful samples for the same task on each backend and a measured advantage greater
-than 10%. Feedback never steers the `quality` objective or overrides an explicit constraint. The
-CLI persists its bounded, versioned snapshot atomically by default; `--ephemeral-feedback` is an
-explicit disposable-test mode.
-
-### Verify physical placement
-
-FreeLlama receipts separate `execution.backend` (configured process), compatibility field
-`execution.placement` (requested processor), and `execution.observation` (post-run `/api/ps`
-evidence). A fully CPU-loaded model reports `size_vram:0`; a GPU-loaded model reports positive
-resident VRAM. Only `observation.status:"verified"` enters adaptive feedback. For `keep_alive:0`,
-FreeLlama keeps the runner briefly, observes placement, explicitly unloads it, and verifies the
-post-unload `not_resident` state before returning.
-
-Read [CPU and GPU routing](docs/CPU_GPU_ROUTING.md) for platform-specific device controls, complete
-setup, health-contract checks, placement verification, feedback rules, and troubleshooting.
-
-## Adapt to each machine
-
-The development measurements are not routing defaults. FreeLlama discovers the host operating
-system, architecture, logical CPU count, total physical memory, and available disk on macOS, Linux,
-and Windows. It distinguishes known unified memory from general host memory and uses Ollama's
-resident-runner report as accelerator-placement evidence. Those facts feed admission. Model
-choice uses capability, policy, context, and evidence.
-
-Each managed call either previews a route or executes it:
-
-```mermaid
-flowchart TD
-    CALL["Managed call"] --> MODE{"Preview or execute?"}
-    MODE -->|"Preview"| PLAN["Check eligibility and headroom"]
-    PLAN --> ADVICE["Return agent_plan. Reserve nothing"]
-    MODE -->|"Execute"| RECHECK["Recheck eligibility and residency"]
-    RECHECK --> FIT{"Still eligible?"}
-    FIT -->|"No"| STOP["Refuse before inference"]
-    FIT -->|"Yes"| ADM{"Admission result"}
-    ADM -->|"Queue is full"| FULL["429 admission_queue_full"]
-    ADM -->|"No slot before the deadline"| TIME["503 admission_timeout"]
-    ADM -->|"Resources stay held until the deadline"| HOLD["503 resource_admission_unavailable"]
-    ADM -->|"Permit acquired"| RUN["Selected Ollama, then the receipt"]
-```
-
-Route preview reports a point-in-time capacity signal and does not reserve capacity. Execution
-rechecks admission. A full managed queue returns `429` with `admission_queue_full`. A wait past
-the deadline returns `503` with `admission_timeout`. Host resources that remain held until that
-deadline return `503` with `resource_admission_unavailable`. The default bounds are 16 primary
-waiters and 8 CPU waiters. Cancelled clients leave the queue. See
-[back-pressure](docs/MONITORING.md#back-pressure) for the status table. The health endpoint
-reports active units, queue age, releases, and cancellations.
-
-Admission defaults are conservative workload units rather than values inferred from a hardware
-name. FreeLlama's admission wait happens before Ollama's independent internal queue. Tune
-`--max-concurrent-tasks`, `--cpu-max-concurrent-tasks`, `--max-queued-tasks`,
-`--cpu-max-queued-tasks`, `--max-queue-wait-seconds`,
-`OLLAMA_MAX_QUEUE`, Ollama parallelism, context size, and K/V-cache type from observations on the
-target machine. Start with one loaded model and one parallel stream per Ollama process.
-
-### Choose a model from the task
-
-Do not start with a leaderboard or model name. First establish the workload: text generation,
-grounded code research, tools, vision, audio, embeddings, or long context. Also establish the
-quality target, latency tolerance, context requirement, privacy boundary, and acceptable download
-and resident-memory budget.
-
-Then use this order:
-
-1. Inspect installed and resident models before considering a download.
-2. Run `doctor` only for runtime diagnosis. Its default summary keeps the routing context small;
-   request `scheduler` or `full` only when configuration detail is needed. On macOS for a loopback
-   endpoint, distinguish its allow-listed same-user process snapshot from inherited configuration
-   hints; neither establishes a remote service's settings.
-3. Filter by additive capabilities. FreeLlama reports generative, multimodal, and embedding-only
-   inventory types, but routing continues to use the complete capability set.
-4. If no installed model fits, search the online library for families and inspect one family again
-   for exact tags, sizes, context windows, and the host-memory preflight.
-5. Preview quality-sensitive work and benchmark unmeasured tags. A capability label or memory fit
-   is not correctness evidence; vision requires a real image trial.
-6. Present the evidence and ask for approval of one exact tag before pulling it.
-
-Model discovery and recommendation are side-effect-free. FreeLlama never interprets a search,
-ranking, or recommendation as permission to download a model.
-
-## Review measured evidence
-
-The following results demonstrate behavior on one Apple M4 Pro with 48 GB unified memory. They do
-not predict another host:
-
-### Delegated code and documentation research
-
-The evidence validates FreeLlama for selective, bounded delegation. It does not validate FreeLlama
-as a general frontier-model replacement.
-
-| Model and adapter | Deterministic result | Interpretation |
-|---|---:|---|
-| Qwen 27B grounded lookup | 8/8 | Passed the focused single-file research evaluation |
-| Qwen 27B with Bash | 26/30 (86.7%) | Useful, but below a 90% broad-research target |
-| Muse 30B with Bash | 29/30 (96.7%) | Best broad result measured |
-| Gemma 12B with Bash | 2/30 (6.7%) | Fast responses did not make it a viable research worker |
-| Qwen 27B fresh code/docs smoke | 9/9 valid trials | Passed three trials on each of three bounded tasks |
-| GLM-OCR 1.1B vision | 3/3 held-out images; 6/6 configured repeats; production gate 1/1 | Exact OCR passed; the production gate correctly rejected plain-text repetition, then passed with a one-line newline stop and verified GPU placement |
-
-On both measured large-model families, the confined Bash adapter matched or exceeded the Octocode
-adapter while using 2.1–2.9 times less context and 2.6–3.2 times less time. Bash is therefore the
-default; select Octocode only when the task specifically needs its structured operations and a new
-measurement justifies the overhead.
-
-The fresh valid smoke used 22,184 local input tokens and returned 100 answer tokens, a 99.55%
-answer-token isolation proxy. This ratio excludes the MCP evidence envelope and is not a billing or
-universal savings claim. There is no direct frontier-only versus frontier-plus-FreeLlama A/B yet.
-
-The coding adapters also protect their operating contract under context pressure. All 65 context
-tests pass for model-calibrated budgeting, configurable pagination/compaction, byte-preserved
-system prompts and questions, fail-closed pinned overflow, typed tool history, repeat suppression,
-compaction breadcrumbs, recent-observation preservation, and byte-identical page reassembly.
-Ollama exposes the exact prompt count only after a call, so a genuinely new model/template starts
-from a configurable conservative estimate. Managed coding agents persist model-specific
-calibration, allowing later processes to start from prior `prompt_eval_count` evidence without
-sharing estimates across model templates.
-
-These results support 27–30B local workers for narrow, grounded retrieval with citations, and a
-verdict. They do not support routing broad research to the measured models at or below 12B, or
-delegating architecture judgment and autonomous review without independent verification. See the
-[benchmark entry points](benchmark/README.md), [agent context contract](AGENTS.md), and
-[token-economics limits](docs/ECONOMICS.md).
-
-### CPU and GPU execution
-
-- Three warmed GPU-completion plus CPU-embedding trials reduced median combined wall time from
-  37.997 seconds sequentially to 28.233 seconds concurrently: 1.346 times faster, or 25.70% lower.
-- One of those three parallel trials was slower than sequential because CPU and Metal shared memory
-  bandwidth.
-- Ollama reported 19,175,677,668 GPU-resident bytes for `qwen3.8:27b-mlx` and `size_vram: 0` for
-  `nomic-embed-text:latest` on the CPU process.
-- A fresh post-deployment smoke trial completed the same classes of work in 9.151 seconds
-  sequentially and 6.289 seconds concurrently, a 1.455-times speedup with zero FreeLlama queue wait.
-  Treat this single trial as a regression check, not a replacement for the three-trial result.
-
-The durable claims are that suitable CPU and GPU work can overlap, physical placement is
-observable, and bounded local research can keep intermediate context out of the orchestrator. Read
-[CPU/GPU measurements](docs/CPU_GPU_ROUTING.md#interpret-the-measured-mac-result) and
-[Token economics](docs/ECONOMICS.md) for the receipts and limitations.
-
-## Know the boundaries
-
-- FreeLlama is a single-operator or trusted-team control plane rather than a hosted, multi-tenant
-  inference service.
-- It does not make one model decode faster.
-- CPU/GPU overlap can improve or worsen wall time. Performance depends on the machine and workload.
-- It does not let an agent invent hardware topology or move arbitrary models to CPU.
-- It does not treat throughput benchmarks as correctness evidence.
-- It supports bearer authentication on all routes and refuses unauthenticated nonloopback
-  listeners. Use an external ingress for TLS, tenant authorization, and tenant-specific limits.
-- “Free” refers to reducing reliance on metered frontier inference, not zero-cost computing.
-- “Llama” is the product name; qualifying models are not limited to the Meta Llama family.
-
-## Explore the documentation
-
-| Document | Purpose |
+| Goal | Guide |
 |---|---|
-| [Product positioning](docs/PRODUCT_POSITIONING.md) | Definition, audiences, messaging, and claim guardrails |
-| [Architecture](docs/ARCHITECTURE.md) | Ownership, request classification, routing, admission, research, and backend flows |
-| [Monitoring and live tuning](docs/MONITORING.md) | Status page, usage ledger, Prometheus metrics, runtime config reload, 429 back-pressure, circuit breaker, adaptive limits, cost-aware eviction |
-| [Production runbook](docs/PRODUCTION.md) | Auth, persisted feedback, explicit Ollama settings, releases, hardware gates, and promotion |
-| [MCP server](packages/mcp/README.md) | Tools, schemas, configuration, allowed roots, build, and security |
-| [Scope history and model warming](docs/SCOPES_AND_WARMING.md) | Revision-safe history, parallel forks, managed warming, and residency policy |
-| [CLI reference](docs/CLI.md) | Commands, flags, objectives, managed execution, and policy workflow |
-| [CLI package](packages/cli/README.md) | npm launcher, binary selection, packaging, and CLI/MCP differences |
-| [Rust core](packages/rust-core/README.md) | Embeddable routing, admission, recommendation, evaluation, and NAPI boundary |
-| [CPU and GPU routing](docs/CPU_GPU_ROUTING.md) | Portable two-process setup, placement proof, concurrency, and feedback |
-| [Resource-routing decision](docs/dev/ADR_RESOURCE_AWARE_BACKEND_ROUTING.md) | Design alternatives and bounded agent authority |
-| [Model selection](docs/MODEL_SELECTION.md) | Evidence, qualification, recommendations, and CPU-helper selection |
-| [Ollama model metadata](docs/MODEL_METADATA.md) | Supported features, sourced use-case guidance, exact-tag matching, and optional README enrichment |
-| [Ollama sidecar](docs/OLLAMA_SIDECAR.md) | Compatibility and responsibility boundary with Ollama |
-| [System optimization](docs/dev/OLLAMA_SYSTEM_OPTIMIZATION.md) | Ollama settings, K/V cache, parallelism, and measured tradeoffs |
-| [Token economics](docs/ECONOMICS.md) | Context isolation, measurements, and cost limits |
-| [Testing](docs/TESTING.md) | Rust, unit, integration, end-to-end, and live-runtime verification |
-| [Benchmarks](benchmark/README.md) | Benchmark entry points and evidence ownership |
-| [Agent adapters](AGENTS.md) | Local research-agent lifecycle and context management |
-| [Agent skill](skills/freellama/README.md) | Delegation playbook for agents using the MCP server or CLI |
+| Choose a model and set evidence requirements | [Model selection](docs/MODEL_SELECTION.md), [model metadata](docs/MODEL_METADATA.md) |
+| Understand ownership and request flows | [Architecture](docs/ARCHITECTURE.md), [Ollama compatibility](docs/OLLAMA_SIDECAR.md) |
+| Configure commands and per-task controls | [CLI](docs/CLI.md), [MCP](packages/mcp/README.md), [agent skill](skills/freellama/README.md) |
+| Retain context or warm related work | [Scopes and warming](docs/SCOPES_AND_WARMING.md) |
+| Configure CPU/GPU backends and feedback | [CPU/GPU routing](docs/CPU_GPU_ROUTING.md), [system optimization](docs/dev/OLLAMA_SYSTEM_OPTIMIZATION.md) |
+| Monitor queues, usage, and live configuration | [Monitoring](docs/MONITORING.md), [runtime dashboard](packages/view/README.md) |
+| Deploy or publish a release | [Production](docs/PRODUCTION.md), [Release](RELEASE.md) |
+| Embed the routing core | [Rust core](packages/rust-core/README.md) |
+| Evaluate models and investigate adapters | [Benchmarks](benchmark/README.md), [adapter contracts](AGENTS.md), [token economics](docs/ECONOMICS.md) |
+| Review positioning and design decisions | [Product positioning](docs/PRODUCT_POSITIONING.md), [findings](docs/dev/FINDINGS_AND_POSITIONING.md), [resource-routing decision](docs/dev/ADR_RESOURCE_AWARE_BACKEND_ROUTING.md) |
 
-FreeLlama uses the [Apache-2.0](LICENSE-APACHE) OR [MIT](LICENSE-MIT) license.
+Licensed under [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT).

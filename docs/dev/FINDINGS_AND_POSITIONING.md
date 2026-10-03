@@ -14,7 +14,9 @@ flowchart LR
 
 The diagram describes managed tasks. Raw Ollama API requests retain the primary-backend compatibility path.
 
-**Assessment: 8/10 for the bounded local control plane.**
+**Feature and logic assessment: 8.5/10 for local Ollama agent workflows.**
+The [feature assessment](#feature-and-logic-assessment) excludes speed, utilization, thermal measurements, packaging, and release readiness.
+The earlier evidence-based control-plane assessment remains 8/10 under its broader rubric.
 Real inference throughput, hardware efficiency, and sustained thermal behavior remain unqualified for this candidate on the latest Mac.
 This review combines repository contracts, retained local receipts, an independent SOL examination, and primary project documentation.
 It does not establish a speed ranking among projects.
@@ -193,10 +195,10 @@ The categories describe emphasis, not exclusive feature ownership.
 | Project | Documented role and mechanisms | FreeLlama's position |
 |---|---|---|
 | [Ollama](https://docs.ollama.com/faq) | Local model runtime with residency controls, parallel requests, memory-dependent loading, and request queueing. | FreeLlama adds agent qualification, host admission, task scopes, and receipts around managed Ollama calls. |
-| [llama.cpp server](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md) | Inference server with parallel slots, continuous batching, GPU offload, and cache controls. | Engine execution and cache optimization belong below FreeLlama's current Ollama contract. Direct llama.cpp integration requires separate engineering and qualification. |
+| [llama.cpp server](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md) | Inference server with parallel slots, continuous batching, GPU offload, and slot prompt-cache save/restore. | FreeLlama scopes store application history with revisions and forks; engine prompt-cache snapshots store a different kind of state. Direct llama.cpp integration requires separate engineering and qualification. |
 | [vLLM](https://github.com/vllm-project/vllm) | Inference serving with PagedAttention, continuous batching, prefix caching, and distributed parallelism. | FreeLlama `0.2.1` targets Ollama; it does not implement these engine mechanisms or qualify a direct vLLM backend. |
 | [SGLang](https://github.com/sgl-project/sglang) | Inference serving for language and multimodal models. Its ecosystem includes hierarchical KV caching and deployment gateways. | FreeLlama focuses on bounded local delegation over Ollama. SGLang illustrates engine and deployment capabilities beyond that current integration. |
-| [LiteLLM Router](https://docs.litellm.ai/docs/routing) | Routing across deployments with retries, fallbacks, cooldowns, timeouts, and usage limits. | FreeLlama focuses on installed Ollama eligibility, host admission, scoped history, and observed placement. Broad provider governance is outside its current purpose. |
+| [LiteLLM Router](https://docs.litellm.ai/docs/routing) | Deployment routing supports weighted selection, least-busy, latency and cost strategies, session affinity, retries, fallbacks, and usage limits. | Both projects have routing and affinity concepts. FreeLlama focuses on installed Ollama eligibility, host admission, scoped history, and observed placement. |
 | [RouteLLM](https://github.com/lm-sys/RouteLLM) | Trained prompt routers select stronger or weaker models using calibrated quality-cost thresholds. | FreeLlama uses explicit policy and available evidence for local eligibility. Adding learned prompt routing requires a separate quality dataset and evaluation. |
 
 **Positioning judgment:** FreeLlama is a specialized control plane for developer agents operating local Ollama workloads.
@@ -209,7 +211,49 @@ FreeLlama must demonstrate additional workload value rather than claim these mec
 Engine-level batching, cache reuse, and device execution should remain engine responsibilities unless a measured integration justifies a change.
 See [Product positioning](../PRODUCT_POSITIONING.md) for the audience and product boundaries.
 
-## Assessment and remaining work
+## Feature and logic assessment
+
+This assessment answers the feature-only comparison requested after the broader audit.
+It uses reviewed contracts and documented mechanisms, excluding performance, hardware measurements, packaging, and publication readiness.
+Scores are subjective design judgments for developer agents using local Ollama workloads.
+They do not rank the other projects by a purpose they were not designed to serve.
+
+| Dimension | Score | Reason and limit |
+|---|---:|---|
+| Agent workflow and authority | 9/10 | Preview, qualification, explicit controls, bounded delegation, and error handling form a clear contract. The caller still owns task dependencies and judgment. |
+| Admission and execution logic | 8.5/10 | Weighted fairness, resource holds, deadlines, cancellation, and execution revalidation compose coherently. Operator policy and memory estimates remain part of admission. |
+| Task context and residency | 8.5/10 | Revisions, forks, finite history, affinity, and warming have separate ownership. Scopes and deferred jobs do not survive a service restart. |
+| Adaptive decisions | 7.5/10 | Comparable observed feedback can influence eligible backend choices without overriding explicit controls. It is not a learned prompt-quality router or general hardware scheduler. |
+| Explanation and evidence | 9/10 | Receipts distinguish eligibility, configured placement, observed placement, and feedback acceptance. Engine cache state remains outside scope ownership. |
+
+Each dimension carries equal weight: the average is **8.5/10**.
+A score of 10 requires complete, coherent behavior within this stated purpose, including lifecycle and recovery semantics.
+Additional features count only when they improve that purpose; engine responsibilities need not move into FreeLlama.
+
+### Decision logic compared directly
+
+| Decision | FreeLlama's mechanism | Related project mechanism |
+|---|---|---|
+| Which model or deployment? | Qualify installed candidates against task, capability, context, policy, and evidence requirements. | [RouteLLM](https://github.com/lm-sys/RouteLLM) uses trained prompt routers and calibrated strong/weak thresholds. [LiteLLM](https://docs.litellm.ai/docs/routing) offers multiple deployment-selection strategies. |
+| Can work start? | Check weighted capacity and host resources; queue, refuse, or execute within bounded deadlines. | [Ollama](https://docs.ollama.com/faq) manages runtime loading and queues requests when models cannot load. Its runtime checks complement FreeLlama's admission checks. |
+| What context survives a switch? | Replay bounded application history through scope IDs; fork histories and reject stale writes. | [llama.cpp](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md) can save and restore slot prompt caches. Application history and engine cache snapshots are different contracts. |
+| How are active requests scheduled inside a model? | Submit admitted requests through Ollama and leave engine scheduling to the runner. | [vLLM](https://github.com/vllm-project/vllm) implements continuous batching, PagedAttention, and prefix caching. [SGLang's ecosystem](https://github.com/sgl-project/sglang) includes hierarchical KV caching and deployment gateways. |
+| When can adaptation override a preference? | Only comparable eligible feedback can influence automatic choices; explicit model, affinity, and policy retain authority. | [LiteLLM](https://docs.litellm.ai/docs/routing) supports latency, cost, load, and custom routing strategies. [RouteLLM](https://github.com/lm-sys/RouteLLM) calibrates query-level quality-cost tradeoffs. |
+
+**Judgment:** FreeLlama offers a strong combination of local agent controls, context ownership, and evidence semantics.
+Its current specialization is narrower than provider gateways and separate from inference-engine optimization.
+The comparison establishes feature differences; it does not establish exclusive capabilities or global superiority.
+
+Three feature gaps limit the score:
+
+1. **Restart recovery:** scopes and deferred jobs are process-local. Optional durable storage needs explicit privacy, expiry, and recovery contracts.
+2. **Task-quality adaptation:** backend timing feedback does not learn prompt-specific answer quality across models.
+3. **Backend breadth:** direct llama.cpp, vLLM, and SGLang integrations need adapters that preserve controls, cancellation, and evidence semantics.
+
+These are potential extensions, not confirmed correctness defects or authorization to implement them.
+The strongest priority depends on whether users need long-lived tasks, quality-based selection, or additional inference backends.
+
+## Historical assessment and remaining qualification work
 
 The independent SOL judge retained the overall **8/10** rating after inspecting the latest receipts.
 This is a judgment of the bounded control plane, not a weighted average or a hardware-performance score.
