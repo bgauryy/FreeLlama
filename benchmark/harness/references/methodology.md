@@ -1,4 +1,4 @@
-# Measurement Method
+# Measurement method
 
 Load when aggregating or comparing runs. Why: correctness, reliability, and cost need separate denominators.
 
@@ -17,4 +17,3 @@ Aggregate by task first, then macro-average categories and tiers. Compare only c
 Composite score is null when no calibrated judge exists. Deterministic pass rate remains the promotion gate.
 
 Next: load `reporting.md` before presenting a winner.
-

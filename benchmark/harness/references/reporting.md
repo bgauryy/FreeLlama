@@ -1,4 +1,4 @@
-# Reporting Results
+# Result reporting
 
 Load when producing or reading the dashboard. Why: one headline score can hide coverage and reliability failures.
 
@@ -13,4 +13,3 @@ Use Pareto language when quality and speed disagree: name the quality leader, ef
 The report is rebuildable: edit neither aggregate JSON nor HTML by hand; regenerate them from raw trials.
 
 This step ends after `scripts/validate.py` accepts the raw and aggregate artifacts.
-

@@ -1,4 +1,4 @@
-# Distilled Judging
+# Distilled judging
 
 Load when enabling a local LLM judge. Why: qualitative scores need calibration and bias controls.
 
@@ -14,4 +14,4 @@ Close or contested comparisons require answer-order swapping or a second judge. 
 
 `scripts/distilled_judge.py` is an Ollama adapter. Pass its matching, unexpired calibration to `run.py --judge-calibration`; otherwise scores stay advisory.
 
-Next: aggregate with the AGGREGATE route in `SKILL.md`.
+For aggregation and promotion, use the [harness workflow](../README.md).

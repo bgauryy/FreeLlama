@@ -1,8 +1,9 @@
 # FreeLlama runtime view
 
 `@octocodeai/freellama-view` is a private workspace package: a Vite + React dashboard and a small
-Node.js backend on localhost. It observes the existing FreeLlama control API without running
-inference, pulling models, or changing configuration.
+Node.js backend on localhost. It shows how FreeLlama manages delegated tasks: model residency,
+queues, admission, resource pressure, and usage. The dashboard reads the control API; it does not
+run inference, pull models, or change configuration.
 
 ## Run
 
@@ -33,7 +34,7 @@ yarn start:view
 | `FREELLAMA_SERVE_ENDPOINT`      | `http://127.0.0.1:11435` | Existing FreeLlama control API loopback origin           |
 | `FREELLAMA_AUTH_TOKEN_FILE`     | unset                    | File containing the control API's bearer token           |
 
-The upstream must be a loopback HTTP(S) origin, without a path, query, or embedded credentials.
+The upstream must be a loopback HTTP or HTTPS origin, without a path, query, or embedded credentials.
 The bearer token is read at view-server startup and never sent to the browser. Restart the view
 after changing the token file. Use the same token file as `freellama serve` when auth is enabled.
 Do not put credentials in `VITE_*` variables or client code.

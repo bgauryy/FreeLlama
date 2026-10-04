@@ -1,8 +1,13 @@
 # Run models on CPU and GPU
 
-Use two Ollama processes when a large model should remain on the GPU while smaller helper models run
-on the CPU. FreeLlama assigns exact model tags to the secondary process, pins those managed requests
-with `num_gpu: 0`, and reports the selected backend in catalog and task responses.
+To separate GPU work from CPU helpers, configure two Ollama processes and assign exact helper-model
+tags to the secondary process. FreeLlama routes managed tasks within those assignments, applies
+`num_gpu: 0` to CPU requests, and reports both the selected backend and observed processor placement.
+
+The calling agent submits tasks and placement preferences. FreeLlama coordinates admission,
+memory checks, and model transitions for each backend; the operator configures the processes and
+eligible tags. A configured CPU backend is intent: inspect the placement observation before
+treating it as proof of CPU execution.
 
 This configuration is useful for embeddings, intent interpretation, and other small helper models.
 Benchmark large CPU workloads before adopting them. Apple silicon shares memory bandwidth; systems

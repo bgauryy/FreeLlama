@@ -1,21 +1,21 @@
 # Local benchmark: Octocode tool vs. raw shell
 
-**One-line summary:** the same local Ollama model (`qwen3.8:27b-mlx`) answers the same 30 code-research
-questions across three pinned repos — [`click`](https://github.com/pallets/click) (Python CLI
+This benchmark compares two read-only research adapters using the same exact installed Ollama model
+and 30 code-research questions across three pinned repositories: [`click`](https://github.com/pallets/click) (Python CLI
 framework), [`zustand`](https://github.com/pmndrs/zustand) (TypeScript state management), and
-[`openui`](https://github.com/thesysdev/openui) (TypeScript generative-UI monorepo) — twice: once
-with the `octocode` CLI as its only research tool, once restricted to raw Linux/bash commands only.
+[`openui`](https://github.com/thesysdev/openui) (TypeScript generative-UI monorepo). One adapter uses
+the Octocode CLI; the other uses a confined read-only Bash tool surface.
 The benchmark records tokens, tool calls, wall time, and deterministic correctness for each
 condition. An optional, non-local judge pass is separate from `run_all.sh`.
 
 This self-contained benchmark reuses the scoring and aggregation engine in this repository
 (`benchmark/harness/scripts/{run.py,run_matrix.py,aggregate.py,render_html.py}`) and adds:
 
-- two new agent adapters (`scripts/octocode_agent.py`, `scripts/bash_agent.py`), sharing
-  `scripts/agent_context.py` for context budgeting, output clipping and JSON-repair — contracts in
-  `scripts/test_agent_context.py` (`python3 scripts/test_agent_context.py`). Bash denylist:
+- two agent adapters (`scripts/octocode_agent.py`, `scripts/bash_agent.py`), sharing
+  `scripts/agent_context.py` for context budgeting, paged observations, and JSON repair — contracts in
+  `scripts/test_agent_context.py` (`python3 scripts/test_agent_context.py`). Bash confinement:
   `scripts/test_bash_confine.py`.
-- one new 30-question task suite spanning 3 repos (`tasks/octocode-vs-bash-30.json`)
+- one 30-question task suite spanning three repositories (`tasks/octocode-vs-bash-30.json`)
 - a matrix **template** pairing both adapters against one model
   (`tasks/octocode-vs-bash-matrix.template.json`; `run_all.sh` fills `__MODEL__` and writes
   `tasks/.generated/`)
@@ -37,11 +37,12 @@ benchmark/local/
 ├── .gitignore                     <- ignores .context/ and results/
 ├── docs/
 │   ├── 01-flow.md                 <- end-to-end run flow, step by step
-│   ├── 02-agent-a-octocode.md     <- Agent A spec: the octocode tool prompt (verbatim)
-│   ├── 03-agent-b-bash.md         <- Agent B spec: the bash-only prompt (verbatim)
+│   ├── 02-agent-a-octocode.md     <- Octocode tool surface and invocation contract
+│   ├── 03-agent-b-bash.md         <- Bash allowlist and confinement contract
 │   ├── 04-questions.md            <- index of all 30 questions, linking to per-question files
 │   ├── 05-grading-and-judge.md    <- deterministic checks + LLM-judge methodology
 │   ├── 06-results.md              <- where numbers live (gitignored dashboards + skill notes)
+│   ├── 07-adapter-contracts.md     <- shared loop, runtime defaults, and measured caveats
 │   └── questions/
 │       ├── click/Q1.md .. Q10.md      <- one file per question, prompt only, no answers/checks
 │       ├── zustand/Q1.md .. Q10.md
@@ -54,7 +55,7 @@ benchmark/local/
 │   ├── restart_ollama.sh           <- restarts the local Ollama server
 │   ├── agent_context.py            <- shared: context budget, head+tail clipping, repeat + JSON repair
 │   ├── test_agent_context.py       <- contracts for the above (no model needed)
-│   ├── test_bash_confine.py        <- denylist contracts for bash_agent.py
+│   ├── test_bash_confine.py        <- read-only confinement contracts
 │   ├── octocode_agent.py           <- Agent A adapter (Ollama + octocode CLI)
 │   ├── bash_agent.py               <- Agent B adapter (Ollama + raw shell only)
 │   └── run_all.sh                  <- runs everything for one model: matrix -> aggregate -> render
@@ -69,8 +70,9 @@ benchmark/local/
 whoever operates this benchmark (a human or the orchestrating harness), before any model runs. It is
 gitignored because it's regenerable, large, and not part of the benchmark's source of truth.
 
-Neither Agent A nor Agent B ever runs `git clone`, has network access, or sees `.context/` directly —
-each trial gets its own disposable copy of `.context/` (via `run.py`'s fixture-copy mechanism) as its
+The model's research tools do not expose cloning or network requests. The Octocode adapter invokes
+a pinned npm package through `npx`; prepare that dependency before timed trials. Each trial gets
+its own disposable copy of `.context/` (via `run.py`'s fixture-copy mechanism) as its
 `FREELLAMA_BENCH_WORKSPACE`. The local model only ever sees a plain directory of already-present
 files; it cannot fetch anything itself.
 
@@ -83,6 +85,10 @@ and accurately it can answer questions about real codebases, compared to giving 
 shell? It reuses the same scoring engine so the two studies are numerically comparable.
 
 ## Quickstart (re-running this later)
+
+Install and inspect the exact model before running the benchmark. The following example uses
+`qwen3.8:27b-mlx`; replace it with your qualified installed tag. The restart script changes local
+service state, so coordinate it with other work before running it.
 
 ```bash
 cd benchmark/local
@@ -127,7 +133,9 @@ The adapter prompts also scope searches away from `node_modules`/`target`/`.venv
 `.context/` corpora, adapter changes must be graded on [`benchmark/holdout/`](../holdout/README.md)
 instead — fresh upstream repos the prompts were never fitted to.
 
-See `AGENTS.md` for the full description of each.
+Use the [Octocode](docs/02-agent-a-octocode.md) and [Bash](docs/03-agent-b-bash.md) guides for their
+tool surfaces. Exact generated prompts live in the adapter source files.
 
 Every runtime and compaction knob is validated through `FREELLAMA_AGENT_*`; the complete schema,
-defaults, per-call MCP mapping, and result metadata are documented in [`AGENTS.md`](../../AGENTS.md).
+defaults, per-call MCP mapping, and result metadata live in the
+[shared adapter reference](docs/07-adapter-contracts.md).

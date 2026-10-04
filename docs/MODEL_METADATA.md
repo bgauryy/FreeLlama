@@ -1,6 +1,10 @@
 # Ollama model metadata
 
-The MCP `models` tool reports supported features from your Ollama instance and can enrich them with descriptions from Ollama's public model library. Metadata explains which workflows a model supports and which uses its publisher advertises. Exact-model benchmarks and policy evidence establish task suitability; website descriptions do not change routing confidence.
+The MCP `models` tool gives an agent the inventory and capability metadata it needs before
+offloading work. It reads your Ollama instance and can enrich results with descriptions from
+Ollama's public model library. Supported features and advertised use cases are metadata;
+exact-model benchmarks and policy supply quality evidence. Public descriptions do not change
+routing confidence, and a successful response still needs task-specific verification.
 
 ## Requests
 

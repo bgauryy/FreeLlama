@@ -59,7 +59,7 @@ contract is visible without archaeology.
 Installed/detail views accept `includeLibrary:true` for cached public guidance after exact-tag and
 digest-prefix matching. Local supported features filter family claims; public use cases remain
 unmeasured and do not change routing confidence. Request `includeReadme:true` in enriched detail or
-library step 2 for bounded README text. The [metadata reference](../../../../docs/MODEL_METADATA.md)
+library step 2 for bounded README text. The [metadata reference](https://github.com/bgauryy/FreeLlama/blob/main/docs/MODEL_METADATA.md)
 owns the response fields, cache policy, and failure states.
 
 Pulling from step 1 alone means guessing the size, which is how a 143GB tag looked like a candidate

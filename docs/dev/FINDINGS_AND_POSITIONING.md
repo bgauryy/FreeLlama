@@ -152,7 +152,7 @@ They establish feasibility within their measured limits, not a fresh performance
 | Code retrieval and judgment | Historical fixtures reported imperfect semantic-search recall and about 67% code-review accuracy. | Similarity and generated review findings require verification; they cannot authorize deletion or approve changes. |
 
 See [the measured CPU/GPU result](../CPU_GPU_ROUTING.md#interpret-the-measured-mac-result),
-[token economics](../ECONOMICS.md), [adapter caveats](../../AGENTS.md), and
+[token economics](../ECONOMICS.md), [adapter caveats](../../benchmark/local/docs/07-adapter-contracts.md), and
 [historical delegation evidence](../../skills/freellama/assets/evidence/task-delegation.md).
 This review did not rerun those workloads or independently regrade their quality results.
 

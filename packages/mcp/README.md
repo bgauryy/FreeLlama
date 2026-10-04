@@ -1,18 +1,22 @@
 # FreeLlama MCP server
 
-Meet the agentic tool:
+![A brown cartoon llama stands on a pastel cloud background.](assets/logo.jpg)
 
-![A cartoon llama with a full halo and small wings holds a glowing wrench beneath an open golden gate.](assets/logo.jpg)
+This package exposes FreeLlama's management layer as Model Context Protocol (MCP) tools.
+Agents offload bounded tasks to local Ollama models; FreeLlama handles model selection, resource
+admission, memory checks, and routing to configured CPU/GPU backends. Results include execution
+evidence for the calling agent to inspect.
 
-Exposes FreeLlama's local-LLM control plane, and Ollama's lifecycle, as
-[MCP](https://modelcontextprotocol.io) tools, built on the official
-[TypeScript SDK](https://github.com/modelcontextprotocol/typescript-sdk).
+The agent owns prompts, task dependencies, and answer verification. The operator configures
+Ollama and model lifecycle permissions; Ollama performs inference. See
+[architecture](../../docs/ARCHITECTURE.md) for the full ownership boundary.
+The server uses the official [TypeScript SDK](https://github.com/modelcontextprotocol/typescript-sdk).
 
 ## Understand the tools
 
 - `doctor`, `models`, `run_task`, `task_jobs`, `run_task_batch` — thin wrappers over the native NAPI bindings into the
   Rust core (`../rust-core/src/napi.rs`); no CLI subprocess, no reimplemented routing logic.
-  `run_task { preview: true }` is the free decision-only form (the former `route` tool).
+  `run_task { preview: true }` is the decision-only form and does not run inference.
   Preview and execution are separate calls: preview accepts routing fields only and rejects task
   payloads or runtime controls instead of silently ignoring them.
   `models { view: "library" }` queries the public `ollama.com` library (the former `search_models` tool).
@@ -23,7 +27,8 @@ Exposes FreeLlama's local-LLM control plane, and Ollama's lifecycle, as
 - `ollama_manage`, `ollama_delete` — Ollama's HTTP API for lifecycle operations the routing layer
   doesn't cover.
 - `delegate_research` — offloads a grounded code-research question to a local model and returns a
-  verdict computed from what the run did.
+  verdict computed from model evidence, successful tool calls, and question-shape heuristics.
+  The verdict guides verification; it does not certify answer correctness.
 
 Use the smallest tool that owns the operation:
 
@@ -441,7 +446,7 @@ inspect or modify that separate server. Read
 
 ## Configuration
 
-Every default is overridable through an environment variable — set them in the MCP client's
+The following settings have environment-variable overrides. Set them in the MCP client's
 server-launch config (for example `.mcp.json`'s `env` block) or the launching shell.
 
 | Variable | Default | Affects |

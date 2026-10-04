@@ -1,6 +1,7 @@
 # FreeLlama coding-agent benchmark
 
-
+This guide owns the generic scoring workflow for model-agent comparisons. Use the
+[benchmark index](../README.md) to choose model research, adapter holdout, or hardware validation.
 Flow: `PREFLIGHT → RUN → GRADE → AGGREGATE → REPORT → VERIFY`
 
 ## Hard rules
@@ -14,11 +15,10 @@ Flow: `PREFLIGHT → RUN → GRADE → AGGREGATE → REPORT → VERIFY`
 - Preserve raw trial JSON. Aggregates and HTML are rebuildable views, not sources of truth.
 - Refuse publishable runs after `review_due_at`; review the suite and advance its dates, or use an explicit smoke-only stale override.
 
-These rules were previously duplicated in a `skills/run-benchmark/SKILL.md` workflow map. That file said of itself that it was "the workflow map, not a copy of the mechanics" — so it has been folded in here, next to the mechanics it describes, rather than kept as a second place to look.
+## Benchmark scope
 
-## Three benchmark surfaces, different questions
-
-See [`benchmark/README.md`](../README.md) for the harness / local / holdout split. This file is the scoring workflow for `harness/` only.
+The harness supplies scoring infrastructure. Model-specific research adapters live under
+`benchmark/local/`; their prompts and runtime contracts are owned there.
 
 This benchmark compares local models running through coding agents. It answers a practical question: which model-agent combination can complete repository work correctly, repeatedly, and efficiently?
 

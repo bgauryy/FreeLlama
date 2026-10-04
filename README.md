@@ -1,23 +1,38 @@
 # FreeLlama
 
-![A cartoon llama with a full halo and small wings holds a glowing wrench beneath an open golden gate.](assets/logo.jpg)
+![A brown cartoon llama stands on a pastel cloud background.](assets/logo.jpg)
 
-FreeLlama helps AI agents choose local Ollama models, control task execution within resource limits, and retain scoped task history.
-It queues or refuses work when constraints fail and returns evidence about routing, timing, and observed model placement.
+FreeLlama gives AI agents a managed way to offload tasks to local models through Ollama.
+Agents submit work through MCP; FreeLlama handles model selection, queues, memory checks, and routing to configured CPU/GPU backends.
+It returns the result with evidence about execution, resource use, and observed model placement.
 
-**Main strength:** one managed task contract connects model eligibility, resource admission, task history, and execution evidence.
-Your agent owns the prompt and task dependencies. FreeLlama checks whether the work can run. Ollama runs the model.
+Use it for bounded repository research, embeddings, image/OCR tasks, and supplied-content transforms.
+The calling agent decides what to delegate, supplies the task, and verifies the answer.
+FreeLlama coordinates the local resources; Ollama loads models and runs inference.
 
 ```mermaid
 flowchart LR
-    Agent["Agent: task and controls"] --> Check["FreeLlama: qualify and admit"]
+    Agent["Agent: delegate a bounded task"] --> Check["FreeLlama: select model and manage resources"]
     Check -->|"admitted"| Ollama["Ollama: load and execute"]
     Check -->|"held"| Wait["Bounded queue or refusal"]
     Wait -->|"resources recover"| Check
     Ollama --> Receipt["Response, timing, and placement receipt"]
 ```
 
-[Quick start](#quick-start) · [Features](#features) · [MCP setup](#connect-your-agent) · [Comparison](#how-it-differs) · [Guides](#documentation)
+[Quick start](#quick-start) · [Features](#features) · [MCP setup](#connect-your-agent) · [Ownership](#what-each-layer-handles) · [Guides](#documentation)
+
+## What each layer handles
+
+| Layer | Responsibility |
+|---|---|
+| Calling agent | Decide what to offload, split dependent work, supply prompts, and verify results |
+| FreeLlama | Discover eligible models, apply policy, bound queues and concurrency, check memory, coordinate residency, and report execution evidence |
+| Operator | Install Ollama, approve model lifecycle changes, and configure endpoints and exact CPU model assignments |
+| Ollama and the host | Load runners, execute inference, and schedule physical CPU/GPU work |
+
+You can start with one Ollama process. A second process is optional for explicitly assigned CPU helpers.
+FreeLlama manages requests within that configured topology; processor placement is verified from observations.
+See [architecture](docs/ARCHITECTURE.md) for ownership and [CPU/GPU routing](docs/CPU_GPU_ROUTING.md) for setup.
 
 ## Quick start
 
@@ -181,22 +196,20 @@ Your agent retains decomposition, judgment, and final verification; discard an `
 
 ## How it differs
 
-FreeLlama's distinction is the combination of agent-facing task controls around a local Ollama runtime.
-The individual mechanisms have counterparts elsewhere: warming, queues, routing, and cache reuse are established features.
-FreeLlama connects qualification, fair admission, scoped history, bounded research, and inspectable receipts in one managed workflow.
+FreeLlama exposes the local runtime as task-oriented tools that an agent can inspect and use.
+One managed workflow connects model qualification, resource admission, task history, bounded research, and execution evidence.
 
-| Project | Main emphasis | FreeLlama's difference |
-|---|---|---|
-| [Ollama](https://docs.ollama.com/faq) | Model loading, residency, request queues, and inference | Adds task eligibility, host admission policy, scoped history, and managed execution receipts around Ollama. |
-| [llama.cpp](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md) | Engine controls, continuous batching, parallel slots, and prompt-cache save/restore | Manages application history and task policy through Ollama; scopes are distinct from engine-cache snapshots. |
-| [vLLM](https://github.com/vllm-project/vllm) | PagedAttention, continuous batching, prefix caching, and distributed inference | Focuses on local agent delegation; engine scheduling remains with Ollama and its runners. |
-| [SGLang](https://github.com/sgl-project/sglang) | Multimodal inference; ecosystem includes KV caching and deployment gateways | Targets local Ollama task control rather than implementing those inference and deployment mechanisms. |
-| [LiteLLM](https://docs.litellm.ai/docs/routing) | Multiple deployment-routing strategies, affinity, retries, fallbacks, and usage limits | Focuses on installed-model eligibility, host resources, task scopes, and observed CPU/GPU placement. |
-| [RouteLLM](https://github.com/lm-sys/RouteLLM) | Trained prompt routing between stronger and weaker models | Uses explicit qualification and bounded backend feedback; it does not learn prompt-specific answer quality. |
+| Agent need | FreeLlama behavior |
+|---|---|
+| Choose a model | Filter installed models by task capability, context, policy, and confidence |
+| Bound resource use | Admit, queue, or refuse work using per-backend budgets and host pressure checks |
+| Use CPU helpers alongside GPU work | Route exact operator-assigned tags to a separate backend and return placement observations |
+| Read repository files locally | Run a bounded read-only research adapter and return an answer, citations, and a verification verdict |
+| Inspect what happened | Return queue, routing, timing, lifecycle, and placement evidence |
 
 Choose FreeLlama when your agent needs controlled local delegation with reasons, task history, and execution evidence.
 Use Ollama directly when your application already owns these decisions and needs its native inference API.
-Direct integrations with llama.cpp, vLLM, and SGLang are outside FreeLlama's current backend contract.
+Ollama is the supported inference backend.
 Read the [feature and logic comparison](docs/dev/FINDINGS_AND_POSITIONING.md#feature-and-logic-assessment) for the detailed assessment.
 
 ## Boundaries
@@ -224,6 +237,8 @@ Historical results and their limits live in the [findings report](docs/dev/FINDI
 
 ## Documentation
 
+Use the [documentation index](docs/README.md) for the full guide and evidence map.
+
 | Goal | Guide |
 |---|---|
 | Choose a model and set evidence requirements | [Model selection](docs/MODEL_SELECTION.md), [model metadata](docs/MODEL_METADATA.md) |
@@ -234,7 +249,7 @@ Historical results and their limits live in the [findings report](docs/dev/FINDI
 | Monitor queues, usage, and live configuration | [Monitoring](docs/MONITORING.md), [runtime dashboard](packages/view/README.md) |
 | Deploy or publish a release | [Production](docs/PRODUCTION.md), [Release](RELEASE.md) |
 | Embed the routing core | [Rust core](packages/rust-core/README.md) |
-| Evaluate models and investigate adapters | [Benchmarks](benchmark/README.md), [adapter contracts](AGENTS.md), [token economics](docs/ECONOMICS.md) |
+| Evaluate models and investigate adapters | [Benchmarks](benchmark/README.md), [adapter contracts](benchmark/local/docs/07-adapter-contracts.md), [token economics](docs/ECONOMICS.md) |
 | Review positioning and design decisions | [Product positioning](docs/PRODUCT_POSITIONING.md), [findings](docs/dev/FINDINGS_AND_POSITIONING.md), [resource-routing decision](docs/dev/ADR_RESOURCE_AWARE_BACKEND_ROUTING.md) |
 
 Licensed under [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT).

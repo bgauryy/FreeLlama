@@ -1,8 +1,9 @@
 # CLI reference
 
-The `freellama` command exposes local diagnostics, deterministic model routing, managed task
-execution, benchmarking, and the Ollama-compatible proxy. The front page covers the shortest path;
-this page is the complete command map.
+The `freellama` command starts and inspects the local management layer that agents use to offload
+work. It exposes diagnostics, model routing, managed execution, resource controls, benchmarking,
+and Ollama-compatible passthrough. Use the [README quick start](../README.md#quick-start) for first
+use and this reference to look up commands and controls.
 
 ## Choose a command
 

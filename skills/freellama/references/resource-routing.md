@@ -44,7 +44,7 @@ helper's permit. The primary default is 2 units per observed `OLLAMA_NUM_PARALLE
 to 2; CPU defaults to 1. Default base costs are embedding 1, chat 2, and vision 4. Embeddings
 multiply their base by `ceil(input_items/4)`; the acquired charge is capped to the pool. Tune capacity
 with `--max-concurrent-tasks` and `--cpu-max-concurrent-tasks`, and base costs through `[task_costs]`.
-See [monitoring controls](../../../docs/MONITORING.md#adaptive-concurrency). Ollama still owns within-process decode
+See [monitoring controls](https://github.com/bgauryy/FreeLlama/blob/main/docs/MONITORING.md#adaptive-concurrency). Ollama still owns within-process decode
 parallelism through `OLLAMA_NUM_PARALLEL`, which multiplies KV memory.
 Run `doctor` on the target host. `machine.memory_bytes` is total physical RAM on macOS, Linux, and
 Windows; `unified_memory_bytes` is non-null only when system and accelerator memory are known to be
