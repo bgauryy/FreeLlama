@@ -18,11 +18,20 @@ if (!existsSync(source)) {
 rmSync(destination, { recursive: true, force: true });
 mkdirSync(destination, { recursive: true });
 
-const names = readdirSync(source, { withFileTypes: true })
-  .filter((entry) => entry.isFile() && entry.name.endsWith(".md"))
-  .map((entry) => entry.name)
-  .sort();
+// Top-level guides plus docs/dev/, copied with the same layout so `dev/...` links keep resolving.
+const markdownIn = (dir) =>
+  existsSync(dir)
+    ? readdirSync(dir, { withFileTypes: true })
+        .filter((entry) => entry.isFile() && entry.name.endsWith(".md"))
+        .map((entry) => entry.name)
+        .sort()
+    : [];
+const names = [
+  ...markdownIn(source),
+  ...markdownIn(path.join(source, "dev")).map((name) => `dev/${name}`),
+];
 
+mkdirSync(path.join(destination, "dev"), { recursive: true });
 for (const name of names) copyFileSync(path.join(source, name), path.join(destination, name));
 
 const index = names.map((name) => {

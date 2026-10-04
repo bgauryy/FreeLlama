@@ -81,7 +81,8 @@ terminal status; subsequent lookup returns `404`. It does not unload a shared Ol
 prove that physical computation has stopped. Receipts are bounded and lost on server restart;
 see [retention and task states](../../docs/MONITORING.md#read-the-live-status).
 
-The server sends this workflow to every MCP client in its initialization instructions:
+Follow this workflow. The server's initialization instructions carry a compressed form of the
+same contract (inventory first, preview semantics, evidence levels, ownership, and pull approval):
 
 1. Start with `models {view:"installed"}`, then `models {view:"resident"}`. This gives a routing
    agent the smallest current inventory first.

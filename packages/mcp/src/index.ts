@@ -278,16 +278,27 @@ const PACKAGED_DOCS_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.ur
 if (!existsSync(PACKAGED_DOCS_DIR)) {
   throw new Error(`FreeLlama MCP documentation is missing at ${PACKAGED_DOCS_DIR}; run the package build.`);
 }
-const packagedDocs = readdirSync(PACKAGED_DOCS_DIR)
-  .filter((name) => name.endsWith(".md"))
-  .sort();
+// Developer guides are bundled under docs/dev/ so their relative links resolve; their resource
+// URIs stay flat (freellama://docs/<NAME>) because clients already reference them that way.
+const PACKAGED_DEV_DOCS_DIR = path.join(PACKAGED_DOCS_DIR, "dev");
+const packagedDocs = [
+  ...readdirSync(PACKAGED_DOCS_DIR).filter((name) => name.endsWith(".md")).sort(),
+  ...(existsSync(PACKAGED_DEV_DOCS_DIR)
+    ? readdirSync(PACKAGED_DEV_DOCS_DIR).filter((name) => name.endsWith(".md")).sort().map((name) => `dev/${name}`)
+    : []),
+];
+const packagedDocNames = packagedDocs.map((name) => path.basename(name));
+if (new Set(packagedDocNames).size !== packagedDocNames.length) {
+  throw new Error(`FreeLlama MCP documentation has duplicate names across docs/ and docs/dev/: ${packagedDocs.join(", ")}`);
+}
 if (!packagedDocs.includes("INDEX.md")) {
   throw new Error(`FreeLlama MCP documentation index is missing at ${PACKAGED_DOCS_DIR}/INDEX.md; run the package build.`);
 }
 for (const name of packagedDocs) {
-  const uri = `freellama://docs/${name === "INDEX.md" ? "index" : name.replace(/\.md$/, "")}`;
+  const base = path.basename(name);
+  const uri = `freellama://docs/${base === "INDEX.md" ? "index" : base.replace(/\.md$/, "")}`;
   server.registerResource(
-    `freellama-docs-${name.toLowerCase().replace(/\.md$/, "")}`,
+    `freellama-docs-${base.toLowerCase().replace(/\.md$/, "")}`,
     uri,
     {
       mimeType: "text/markdown",

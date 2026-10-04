@@ -363,7 +363,7 @@ Benchmark these assignments before adopting them:
 
 The local measurement receipt is written to
 `.octocode/evals/cpu-gpu-concurrency-benchmark.md`. Git intentionally ignores that path, so the
-trial table in "Interpret the measured result" carries the durable result while the local artifact
+trial table in ["Interpret the measured Mac result"](#interpret-the-measured-mac-result) carries the durable result while the local artifact
 retains the full run detail.
 
 ## Troubleshoot the secondary backend
