@@ -1,7 +1,8 @@
 # Ollama sidecar boundary
 
-FreeLlama integrates with Ollama as a loopback HTTP sidecar, not an in-process inference plugin.
-Ollama owns model execution; FreeLlama owns policy and coordination around it.
+FreeLlama exposes task-oriented controls to agents and communicates with Ollama over HTTP.
+It defaults to a loopback sidecar: FreeLlama manages delegation policy and resources around each
+managed request, while Ollama loads the runner and performs inference.
 
 ```mermaid
 flowchart LR
@@ -26,6 +27,7 @@ second, process-isolated CPU backend possible without changing arbitrary client 
 | Capability and memory filtering | FreeLlama managed routes |
 | Evidence policy, confidence, and route receipts | FreeLlama managed routes |
 | Session affinity, per-backend bounded admission, and warm runtime feedback | FreeLlama managed routes |
+| Forecast memory reservations and requests to evict idle unpinned runners | FreeLlama managed routes |
 | Exact model assignment to an optional CPU process | FreeLlama configuration |
 | Guarded CPU/GPU preference within assigned eligible models | FreeLlama managed routes |
 | Authentication and remote exposure | FreeLlama bearer middleware; external ingress owns TLS and tenant authorization |

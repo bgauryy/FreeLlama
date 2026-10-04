@@ -1,10 +1,12 @@
 # `freellama` CLI package
 
-Meet the agentic tool:
+![A brown cartoon llama stands on a pastel cloud background.](assets/logo.jpg)
 
-![A cartoon llama with a full halo and small wings holds a glowing wrench beneath an open golden gate.](assets/logo.jpg)
+This package provides the `freellama` command through npm. Use it to start and inspect the
+management layer that lets agents offload work to local models, configure resource controls, and
+submit managed tasks. Ollama supplies model loading and inference.
 
-This package provides the `freellama` command through npm. Its JavaScript launcher locates the
+The JavaScript launcher locates the
 compiled Rust CLI in the matching optional native package and forwards arguments, signals, and exit
 status. In a source checkout, it uses `target/release/freellama` after a build. Routing and execution
 logic remain in [`freellama-core`](../rust-core/README.md).

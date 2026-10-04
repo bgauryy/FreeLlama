@@ -1,80 +1,58 @@
-# Flow
+# Local benchmark run flow
 
-```
- 1. prepare_repo.sh   RUNNER-only: clone+pin click, zustand, openui into .context/ (gitignored)
- 2. restart_ollama.sh kill + relaunch Ollama, then keep 127.0.0.1:11435 in front of it
-                        (existing `freellama serve`, or a passthrough `freellama proxy`). Both
-                        agents talk to 11435, not raw Ollama. The sidecar retries 500/502/504
-                        load blips, not 503 busy (`packages/rust-core/src/proxy.rs`) — that
-                        cut a real ~8% infra-flakiness rate on 500s (see
-                        docs/05-grading-and-judge.md)
- 3. run_matrix.py      runs the 2 agents SEQUENTIALLY (never in parallel), each fully working
-                        through all 30 questions one at a time before the next agent starts:
-                          - copy .context/ into a fresh disposable workspace (agents never clone)
-                          - write the question to prompt.md
-                          - spawn the agent adapter as a subprocess (own process group, timeout,
-                            RSS sampling)
-                          - adapter drives its own chat loop against Ollama's /api/chat
-                          - adapter writes agent-result.json (answer, tool_calls, token usage)
-                          - run.py deterministically grades the answer (response_contains,
-                            evidence_paths_exist, no_changes) — no LLM judge runs during this step
-                          - one trial-N.json is written and one status line is printed THE MOMENT
-                            each question finishes — results are durable per-question, not batched
- 4. aggregate.py       scans every trial-*.json, computes per-question and per-agent medians
-                        (tokens, tool calls, wall time) and pass rates
- 5. judge pass          orchestrator-only, non-local (see docs/05-grading-and-judge.md): once BOTH
-                        agents have finished all 30 questions, Claude/Codex independently scores
-                        every answer against the verified reference, blind to which agent produced
-                        it — never a local model, never run.py/distilled_judge.py
- 6. render_html.py     turns aggregate.json (+ judge scores) into results/index.html
-```
+The local benchmark compares bounded research adapters that FreeLlama also exposes through
+`delegate_research`. Keep the model, corpus, runtime controls, and grading fixed while comparing
+tool surfaces. Start with the [local benchmark guide](../README.md) for prerequisites and commands.
 
-`run_all.sh` runs steps 3-4. Steps 1-2 are separate because you normally only need to redo them once
-per machine / once per repo-revision change. Step 5 is deliberately NOT part of `run_all.sh` — it is
-performed by the orchestrator after inspecting that both agents finished cleanly, per
-`docs/05-grading-and-judge.md`.
+## Prepare and run
 
-## Why an existing harness, not a new one
+1. `prepare_repo.sh` clones and pins `click`, `zustand`, and `openui` into `.context/`. The operator
+   prepares this corpus; the research models receive copied files rather than clone access.
+2. `restart_ollama.sh` restarts Ollama and prepares port 11435, reusing a running FreeLlama `serve`
+   or starting a passthrough `proxy`. This changes local service state; inspect the script and
+   coordinate with other work before running it.
+3. `run_all.sh` generates the model-specific matrix and invokes the generic `run_matrix.py`.
+   The two adapters run sequentially, one question at a time, with a disposable workspace per
+   task/trial and matched runtime settings.
+4. `run.py` records each result and applies deterministic checks for required facts, evidence paths,
+   and workspace changes. Completed question receipts are written individually. `run_all.sh`
+   discards workspace copies by default while retaining trial artifacts.
+5. The matrix runner aggregates trials and renders the HTML dashboard. `run_all.sh` appends the
+   invocation and results paths to the generated local `runs/index.jsonl` ledger.
+6. An optional non-local post-hoc judge reviews completed answers separately. It does not run
+   automatically through `run_all.sh` or determine the deterministic pass rate. Use the
+   [grading guide](05-grading-and-judge.md) for this separate review.
 
-`benchmark/harness/scripts/{run.py,run_matrix.py,aggregate.py,render_html.py,distilled_judge.py}`
-are suite-and-agent-agnostic: they consume a suite JSON (questions + grading checks), a matrix JSON
-(which agent-command to run per model id), and any adapter that reads four env vars and writes one
-JSON result file. Nothing in this benchmark modifies those scripts — it only adds a new suite, a new
-matrix, and two new adapters. See `benchmark/harness/references/adapters.md` for the exact
-adapter contract both `octocode_agent.py` and `bash_agent.py` implement:
+The generic [harness](../../harness/README.md) owns execution, grading, aggregation, and reports.
+The local directory owns adapters, the pinned corpus, and the comparison suite.
 
-- Read `FREELLAMA_BENCH_MODEL`, `FREELLAMA_BENCH_PROMPT` (path to the question text),
-  `FREELLAMA_BENCH_WORKSPACE` (path to the disposable repo copy), `FREELLAMA_AGENT_RESULT`
-  (path to write the result JSON to). Both matrix entries also set `FREELLAMA_TARGET_MODEL` (via
-  `env FREELLAMA_TARGET_MODEL=... python3 ...` in `agent_command`, filled in by `run_all.sh --model`)
-  — the actual Ollama model name to call, since `FREELLAMA_BENCH_MODEL` is fixed to the matrix
-  entry's `id` (`<model-slug>-octocode` / `<model-slug>-bash`), which must stay unique per entry so
-  results don't collide, but isn't itself a valid `ollama` tag.
-- Drive a chat loop against `FREELLAMA_OLLAMA_ENDPOINT` (default `http://127.0.0.1:11434`, but
-  `run_all.sh` sets it to `http://127.0.0.1:11435` through the serve or proxy step), using
-  `/api/chat`, `format:"json"`, with shared validated defaults: temperature 0, seed 42,
-  `num_ctx 8192`, `num_predict 512`, max 10 turns. Every operational setting has a
-  `FREELLAMA_AGENT_*` override, but matched comparisons must give both adapters the same overrides
-  so the only variable being measured is the tool surface.
-- Normalize every tool invocation into `tool_calls[]` (`name`, `arguments`, `status`, `duration_ms`,
-  `result`) and token counts into `usage{input_tokens,output_tokens}`.
-- Exit 0 on success, 1 on failure; never edit files outside the workspace copy.
+## Distinguish benchmark and MCP transport
 
-## Change the benchmark
+| Invocation | Model transport | Management boundary |
+|---|---|---|
+| Local benchmark matrix | `FREELLAMA_OLLAMA_ENDPOINT`, normally the prepared serve/proxy at port 11435 | Raw `/api/chat` compatibility path; not a managed task |
+| MCP `delegate_research` | `FREELLAMA_AGENT_MANAGED_ENDPOINT` | Every model turn is a managed coding task with admission and placement receipts |
 
-- **Different model:** `./scripts/run_all.sh --model <ollama-tag>` — one flag, no file edits.
-  `run_all.sh` fills `tasks/octocode-vs-bash-matrix.template.json`'s `__MODEL__`/`__MODEL_SLUG__`
-  placeholders and writes the concrete matrix to `tasks/.generated/matrix-<slug>.json` (gitignored,
-  regenerated every run). Each model's results land in its own `results/<slug>/`, and the script
-  appends the run ID, model, date, pass rate, and results path to `runs/index.jsonl`. Git does not
-  track this generated ledger unless you add it intentionally.
-- **More trials:** `./scripts/run_all.sh --trials 3` (default 1; use three trials for publishable
-  reliability — see `benchmark/harness/references/methodology.md`).
-- **Different/more questions:** edit `tasks/octocode-vs-bash-30.json` and add a matching
-  `docs/questions/<repo>/QN.md`; keep `checks[]` tool-name-agnostic (no `tool_required_any`/
-  `tool_forbidden`) so the two agents are graded on outcome, not on which tool family they used —
-  see `docs/05-grading-and-judge.md` for why. Question files hold only the prompt (no answer keys,
-  no grading hints) — the answer key lives solely in the suite JSON's `response_contains` values.
-- **Different/more target repos:** add a `clone_pinned` call to `scripts/prepare_repo.sh` (clone URL
-  + pinned SHA) — every fact in the suite was verified against the exact pinned revisions by reading
-  the real source, so a repo/revision change invalidates the answer keys until re-verified.
+Both adapters read `FREELLAMA_TARGET_MODEL`, falling back to `FREELLAMA_BENCH_MODEL`. The generated
+matrix supplies the target Ollama tag separately from its unique benchmark entry ID. Workspace,
+prompt, and result paths use the [generic adapter contract](../../harness/references/adapters.md).
+
+Proxy retries and adapter retries cover distinct failures. Read
+[`agent_transport.py`](../scripts/agent_transport.py) and the
+[shared adapter contract](07-adapter-contracts.md) before interpreting infrastructure errors as
+model failures or changing retry settings.
+
+## Change the comparison
+
+| Change | Action |
+|---|---|
+| Installed model | Pass one exact tag to `./scripts/run_all.sh --model <tag>`; this does not pull it |
+| Reliability trials | Pass `--trials 3`; one trial is a smoke result |
+| Runtime budget | Set matched `FREELLAMA_AGENT_*` overrides for both adapters and record them |
+| Questions | Update the suite and prompt-only question files before freezing a comparison |
+| Corpus revision | Change `prepare_repo.sh`, then re-verify answer keys against every pinned source revision |
+| Adapter behavior | Use the [held-out evaluation](../../holdout/README.md) for acceptance evidence |
+
+Keep suites, fixtures, answer keys, graders, and schemas frozen during a comparison. Preserve raw
+trial JSON; aggregate JSON and HTML are rebuilt views. Results from different model, transport,
+context-policy, or adapter revisions require those differences to be disclosed.

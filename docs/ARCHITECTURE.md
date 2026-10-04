@@ -1,8 +1,13 @@
 # FreeLlama architecture
 
-FreeLlama is a localhost control plane in front of Ollama. Ollama owns model storage, model loading,
-scheduling, inference engines, and token generation. FreeLlama owns model-aware policy around those
-operations.
+FreeLlama is the management layer between an AI agent and local Ollama models. Agents offload
+bounded tasks through MCP, the CLI, or the control API. FreeLlama selects eligible models,
+coordinates resources, and returns results with execution evidence.
+
+The calling agent owns task decomposition, prompts, and answer verification. FreeLlama owns managed
+admission, memory checks, residency coordination, and routing within operator-configured CPU/GPU
+backends. Ollama owns model storage, runner loading, inference engines, and token generation;
+the operating system and drivers schedule physical work.
 
 ## Responsibility boundary
 
@@ -15,6 +20,7 @@ The following table defines the ownership boundary:
 | Installed-model discovery and capability normalization | FreeLlama |
 | Task routing, advertised-context compatibility, advisory K/V estimates, evidence policy, and model rejection reasons | FreeLlama |
 | Managed admission, session affinity, bounded scope history, and model-transition coordination | FreeLlama |
+| Forecast memory reservations, host-pressure holds, and requests to unload idle unpinned models | FreeLlama managed execution |
 | Explicit per-model CPU/GPU backend assignment | FreeLlama and separate Ollama processes |
 | Grounded research adapters, citations, and verification verdicts | FreeLlama MCP server |
 
@@ -493,7 +499,8 @@ Adapter cache totals remain null if any turn is unreported, with partial-report 
 See [Ollama usage](https://docs.ollama.com/api/usage) and
 [the pinned prefix-cache implementation](https://github.com/ggml-org/llama.cpp/blob/74a7c897f049c17e7080423aa2111776eff6ebbf/tools/server/server-context.cpp#L3201).
 
-For the benchmark implementation of this loop, see [`AGENTS.md`](../AGENTS.md).
+For adapter implementation, defaults, and measured caveats, see the
+[local adapter reference](../benchmark/local/docs/07-adapter-contracts.md).
 
 ## Context and token boundary
 

@@ -9,7 +9,7 @@ revisions. Use `scopeId` plus `scopeRevision` with only new input; successful ex
 the next revision. Fork before parallel branches, and read full history only when requested.
 Session affinity and Ollama KV remain separate. `warm_model` uses the ordinary managed admission
 path; compatible prefix reuse is opportunistic. See
-[Scope history and model warming](../../../docs/SCOPES_AND_WARMING.md) for limits and API shapes;
+[Scope history and model warming](https://github.com/bgauryy/FreeLlama/blob/main/docs/SCOPES_AND_WARMING.md) for limits and API shapes;
 installed MCP clients can read `freellama://docs/SCOPES_AND_WARMING` on demand.
 
 The research adapter has its own context budget. Its first call uses `charsPerToken` (default 4) because Ollama has no stable preflight tokenizer

@@ -9,6 +9,7 @@ import { PLATFORM_PACKAGES, addonName, executableName } from "./release-platform
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const heroImage = readFileSync(path.join(repo, "assets/logo.jpg"));
+const untouchedBinary = `binary ${JSON.parse(readFileSync(path.join(repo, "package.json"), "utf8")).version}\n`;
 const scratch = path.join(repo, ".octocode/tmp/prepublish/packaging");
 mkdirSync(scratch, { recursive: true });
 const adapters = ["agent_context.py", "agent_transport.py", "shell_sandbox.py", "bash_agent.py", "octocode_agent.py"];
@@ -21,6 +22,7 @@ function fixture() {
     writeFileSync(destination, content);
   };
   put("package.json", readFileSync(path.join(repo, "package.json")));
+  const version = JSON.parse(readFileSync(path.join(directory, "package.json"))).version;
   for (const pkg of ["cli", "mcp", ...PLATFORM_PACKAGES.map(({ id }) => `native/${id}`)]) {
     put(`packages/${pkg}/package.json`, readFileSync(path.join(repo, `packages/${pkg}/package.json`)));
     for (const file of ["LICENSE-APACHE", "LICENSE-MIT"]) put(`packages/${pkg}/${file}`, readFileSync(path.join(repo, file)));
@@ -28,8 +30,8 @@ function fixture() {
   }
   for (const file of ["packages/cli/bin/freellama.js", "packages/mcp/dist/index.js", "packages/mcp/native/index.js", "packages/mcp/native/index.d.ts", "packages/mcp/native/package.json", ...adapters.map((name) => `packages/mcp/adapters/${name}`)]) put(file);
   for (const { id } of PLATFORM_PACKAGES) {
-    put(`packages/native/${id}/${addonName(id)}`);
-    put(`packages/native/${id}/${executableName(id)}`);
+    put(`packages/native/${id}/${addonName(id)}`, `addon ${version}\n`);
+    put(`packages/native/${id}/${executableName(id)}`, `binary ${version}\n`);
   }
   const toolDirectory = path.join(directory, "tools");
   put("tools/package.json", '{"type":"commonjs"}');
@@ -37,7 +39,6 @@ function fixture() {
   put("tools/cargo", `#!${process.execPath}\nconst fs = require('node:fs'); process.stdout.write(fs.readFileSync(${JSON.stringify(path.join(directory, "cargo-metadata.json"))},'utf8'));\n`);
   chmodSync(path.join(toolDirectory, "npm"), 0o755);
   chmodSync(path.join(toolDirectory, "cargo"), 0o755);
-  const version = JSON.parse(readFileSync(path.join(directory, "package.json"))).version;
   const metadata = { packages: ["freellama-core", "freellama-cli"].map((name) => ({ name, version, publish: [] })) };
   put("cargo-metadata.json", JSON.stringify(metadata));
   return {
@@ -83,6 +84,16 @@ test("runtime file present on disk but excluded from tarball is refused", () => 
   } finally { f.cleanup(); }
 });
 
+test("native artifact built at another version is refused", () => {
+  const f = fixture();
+  try {
+    f.put("packages/native/linux-x64-gnu/freellama", "binary 9.8.7\n");
+    const result = f.run();
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /linux-x64-gnu\/freellama: does not embed version/);
+  } finally { f.cleanup(); }
+});
+
 test("Rust artifact version must match npm release version", () => {
   const f = fixture();
   try {
@@ -117,7 +128,7 @@ for (const output of [".", "release-artifacts", "packages/native", "release-arti
       assert.match(result.stderr, /unsafe release output/);
       assert.equal(readFileSync(path.join(f.directory, "release/previous-release"), "utf8"), "preserve until inputs validated\n");
       assert.equal(readFileSync(path.join(f.directory, "release-artifacts/darwin-arm64/freellama"), "utf8"), "binary darwin-arm64\n");
-      assert.equal(readFileSync(path.join(f.directory, "packages/native/darwin-arm64/freellama"), "utf8"), "fixture\n");
+      assert.equal(readFileSync(path.join(f.directory, "packages/native/darwin-arm64/freellama"), "utf8"), untouchedBinary);
     } finally { f.cleanup(); }
   });
 }
@@ -141,7 +152,7 @@ test("assembly refuses a late missing artifact before replacing output or platfo
     assert.notEqual(result.status, 0);
     assert.match(result.stderr, new RegExp(`${id}: expected`));
     assert.equal(readFileSync(path.join(f.directory, "release/previous-release"), "utf8"), "preserve until inputs validated\n");
-    assert.equal(readFileSync(path.join(f.directory, "packages/native/darwin-arm64/freellama"), "utf8"), "fixture\n");
+    assert.equal(readFileSync(path.join(f.directory, "packages/native/darwin-arm64/freellama"), "utf8"), untouchedBinary);
   } finally { f.cleanup(); }
 });
 

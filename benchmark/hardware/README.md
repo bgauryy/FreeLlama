@@ -1,7 +1,8 @@
 # Validate FreeLlama on real hardware
 
-The physical validation matrix requires prepared Ollama and FreeLlama services on the named
-hardware. The separate synthetic load mode below measures gateway lifecycle behavior only.
+Use this procedure to measure how FreeLlama's management layer admits and executes offloaded
+tasks on declared hardware. The physical validation matrix requires prepared Ollama and FreeLlama
+services with exact installed tags. Synthetic load mode measures gateway lifecycle behavior only.
 
 ```bash
 python3 benchmark/hardware/run_validation.py \

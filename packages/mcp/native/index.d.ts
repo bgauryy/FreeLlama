@@ -3,6 +3,9 @@
 // exactly — keep the two in sync if you change one. `npm run build` no longer overwrites this
 // file (it previously did, silently emptying it — see package.json's build script comment).
 
+/** Crate version this native addon was compiled from. */
+export function version(): string;
+
 /**
  * Runs `freellama doctor` against Ollama directly — no running `freellama serve` required.
  * Cross-checks the Ollama CLI and server versions and confirms the endpoint is reachable.

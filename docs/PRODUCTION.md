@@ -1,9 +1,12 @@
 # Prepare FreeLlama for production
 
-This runbook prepares a single-operator or trusted-team FreeLlama deployment. FreeLlama now
-supports authenticated nonloopback listeners, but it is not a multi-tenant authorization or
-billing service. Put TLS and tenant-specific rate limits at an external ingress when traffic
-crosses a machine boundary.
+This runbook prepares the FreeLlama management layer for agents using local models in a
+single-operator or trusted-team deployment. Configure the Ollama backends, model evidence,
+authentication, and resource limits before agents submit work.
+
+FreeLlama supports authenticated nonloopback listeners. Put TLS and tenant-specific rate limits
+at an external ingress when traffic crosses a machine boundary; FreeLlama's bearer token does
+not provide tenant isolation or billing.
 
 ## Meet the prerequisites
 

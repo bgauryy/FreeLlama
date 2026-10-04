@@ -1,12 +1,14 @@
 # freellama skill
 
-The orchestration playbook for any agent driving the
-[FreeLlama](https://github.com/bgauryy/FreeLlama) MCP server or its `npx @octocodeai/freellama` CLI.
+The operating guide for agents offloading tasks through
+[FreeLlama](https://github.com/bgauryy/FreeLlama), using MCP or its `npx @octocodeai/freellama` CLI.
+FreeLlama manages model selection and resources around each managed request; Ollama runs inference.
 
-**Use it when you want to offload computation to free local models** — vision/OCR, grounded code
-research over real files, embeddings, bulk transforms — instead of spending frontier-model context.
+Use it for bounded repository research, vision/OCR, embeddings, and supplied-content transforms.
+Local work consumes hardware, memory, power, and time. The calling agent keeps task decomposition,
+judgment, and answer verification.
 
-Start at [SKILL.md](SKILL.md). The flow line, the five flows (A-E), and the three-tier table are the
+Start at [SKILL.md](SKILL.md). The flow line, the six flows (A–F), and the verification table are the
 operating core; each flow ends in a signal you must read. Everything under `references/` is
 evidence-dense detail loaded on demand:
 

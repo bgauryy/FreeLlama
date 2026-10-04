@@ -1,10 +1,12 @@
-# Agent Adapters
+# Agent adapters
 
-Load when connecting a CLI or agent harness. Why: normalization makes unlike agents comparable.
+Use this contract when connecting an agent to the generic harness. Normalized results make
+model-agent combinations comparable. For FreeLlama's bounded research adapters, use the
+[local adapter reference](../../local/docs/07-adapter-contracts.md).
 
 `run.py` expands `{model}`, `{prompt_file}`, `{workspace}`, and `{result_file}` in `--agent-command`, and replaces `__REPO_ROOT__` with this checkout (needed because the adapter's cwd is the disposable workspace, not the repo). It also exports those values as `FREELLAMA_BENCH_MODEL`, `FREELLAMA_BENCH_PROMPT`, `FREELLAMA_BENCH_WORKSPACE`, and `FREELLAMA_AGENT_RESULT`.
 
-An adapter may write this JSON to `{result_file}`:
+An adapter can write this JSON to `{result_file}`:
 
 ```json
 {
@@ -19,5 +21,4 @@ Normalize tool names to capabilities: `search`, `read`, `edit`, `shell`, `test`,
 
 The command must be non-interactive and exit nonzero on agent failure. Put provider-specific prompting, authentication, and MCP configuration in the adapter, not the suite.
 
-Next: run the suite using the RUN route in `SKILL.md`.
-
+For execution and promotion, use the [harness workflow](../README.md).

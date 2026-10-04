@@ -6,6 +6,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import { PLATFORM_PACKAGES, addonName, executableName, nativePackageName } from "./release-platforms.mjs";
+import { requireEmbeddedVersion } from "./release-version.mjs";
 
 const requireAllPlatforms = process.env.FREELLAMA_REQUIRE_ALL_PLATFORMS === "1";
 const root = JSON.parse(readFileSync("package.json", "utf8"));
@@ -116,13 +117,10 @@ for (const target of PLATFORM_PACKAGES) {
   }
   const paths = pack(directory);
   requireLicenses(directory, paths);
-  const required = [addonName(target.id), executableName(target.id)];
   if (requireAllPlatforms) {
-    for (const file of required) {
-      const artifact = path.join(directory, file);
-      if (!existsSync(artifact) || statSync(artifact).size === 0 || !paths.has(file)) {
-        throw new Error(`${directory}: ${file} is missing, empty, or excluded from npm pack`);
-      }
+    for (const file of [addonName(target.id), executableName(target.id)]) {
+      requirePackedFile(directory, paths, file);
+      requireEmbeddedVersion(path.join(directory, file), version);
     }
   }
   console.log(`${directory}: ${requireAllPlatforms ? "publishable artifacts verified" : "manifest verified"}`);

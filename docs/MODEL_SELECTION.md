@@ -1,7 +1,11 @@
 # Choose local models
 
-Choose models from local evidence, not model-card popularity. The measurements below come from one
-Apple M4 Pro machine with 48 GB unified memory and are not compiled into routing. Re-run
+To offload a task, select an installed model with the required capabilities and measured quality,
+then check its memory fit under the intended concurrency. FreeLlama applies model eligibility
+and admission; the calling agent still verifies the output.
+
+The measurements in this guide come from one Apple M4 Pro machine with 48 GB unified memory and
+are not compiled into routing. Re-run
 `npx @octocodeai/freellama doctor`, `models`, `bench-all`, and your quality suite on the target hardware.
 `doctor.machine.memory_bytes` is host RAM; a discrete GPU's usable VRAM must be observed separately.
 
@@ -28,6 +32,10 @@ flowchart TD
 `qwen3.8:27b-mlx` was the strongest general model in the local evaluations. It handled coding,
 grounded research, image description, OCR, and summarization. Using one large multimodal model also
 avoided contention between separate heavy text and vision runners.
+
+Read the [retained model profile](../skills/freellama/references/model-profile-qwen3.8-27b-mlx.md)
+and [delegation measurements](../skills/freellama/references/task-delegation.md) for scope and limits.
+These examples do not establish that a tag is installed or suitable on your host.
 
 `muse-glimmer:30b-mlx` was a credible alternative and answered 29 of 30 questions correctly
 (96.7%) with the Bash adapter, but it was slower and did not add a required capability in this

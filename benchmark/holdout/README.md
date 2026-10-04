@@ -1,7 +1,8 @@
 # Held-out delegation eval
 
-The rest of `benchmark/` measures **models**. This measures the **adapter** — the agent loop that
-`delegate_research` runs — against repositories it was never tuned on.
+This evaluation measures the research adapter loop that `delegate_research` runs, using
+repositories outside its tuning corpus. Use the [benchmark index](../README.md) for model scoring
+and hardware validation. Adapter generalization and model quality are separate claims.
 
 ## Why this exists separately
 

@@ -1,7 +1,8 @@
 # Test throughput, CPU/GPU activity, and thermal behavior on macOS
 
-Use this procedure to measure FreeLlama on your Mac with real Ollama inference.
-It compares useful output, request latency, device activity, and thermal behavior under a declared workload.
+Use this procedure to measure the resource-management cost and benefit of offloading tasks
+through FreeLlama on your Mac. It compares direct and managed Ollama execution for useful output,
+request latency, device activity, and thermal behavior under a declared workload.
 Run every command from the repository root.
 
 ```mermaid

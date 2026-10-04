@@ -1,8 +1,11 @@
 # Token economics
 
-This reference keeps benchmark detail out of the README's "what, why, and run it" path. The
-per-call rows come from one machine (M4 Pro, 48 GB unified memory); values marked with `~` and the
-session projection are estimates derived from those calls.
+Offloading can keep source material and intermediate tool output out of the calling agent's
+context. FreeLlama returns compact results while the local model performs the work. This shifts
+computation to local hardware; it does not eliminate model tokens, power use, or waiting time.
+
+The per-call rows come from one machine (M4 Pro, 48 GB unified memory). Values marked with `~`
+and the session projection are estimates derived from those calls.
 
 ## Per-call, measured
 
@@ -13,13 +16,13 @@ session projection are estimates derived from those calls.
 | 1 image, OCR, byte-exact | 1,970 | 37 | **98.1%** |
 | Historical tool-schema surface, per turn | <3.2k | 0 | **100%** |
 
-## Current MCP-envelope audit (2026-09-03)
+## MCP-envelope audit (2026-09-03)
 
-The earlier table describes a historical workload on an M4 Pro. This audit measures the current
-eight-tool MCP build on the current host. JSON tokenization varies by client and model, so it records
+The earlier table describes a historical workload on an M4 Pro. This dated audit measured the
+eight-tool MCP build available on September 3, 2026. JSON tokenization varies by client and model, so it records
 bytes first and gives `characters / 4` only as a deliberately rough token estimate.
 
-| Current result | Canonical structured chars | Compact text chars | Duplicate chars avoided | Rough duplicate-token estimate |
+| Audited result | Canonical structured chars | Compact text chars | Duplicate chars avoided | Rough duplicate-token estimate |
 |---|---:|---:|---:|---:|
 | `doctor {view:"summary"}` | 3,099 | 35 | 3,064 | ~766 |
 | `doctor {view:"scheduler"}` | 3,933 | 35 | 3,898 | ~975 |
@@ -66,11 +69,11 @@ because prompt caching makes cached input far cheaper,
 and because the rent only accrues at all if a *separate* small model holds the tool schemas. The
 first two rows are the uncontestable part: that data physically never reaches the orchestrator.
 
-**Do not lead with this number.** Providers, caching strategies, context windows, and pricing all
-move, and a token count moves with them. The durable benefit is **context isolation** — the
-orchestrator never receives whole files, raw vectors, OCR output, intermediate research, or
-repetitive schemas. That improves context *quality* as well as cost, and it does not depend on
-anyone's price list.
+**Do not lead with this number.** Providers, caching strategies, context windows, and pricing
+change. The durable benefit is context isolation: delegated research returns an answer and
+citations in place of its full local transcript, and embedding responses omit vectors by default.
+Caller-requested output and exposed tool schemas still enter the client's context. Measure that
+client's actual transcript before claiming a token or billing reduction.
 
 ## The cost side
 

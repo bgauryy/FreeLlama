@@ -1135,14 +1135,14 @@ __metadata:
   resolution: "@octocodeai/freellama-mcp-server@workspace:packages/mcp"
   dependencies:
     "@modelcontextprotocol/sdk": "npm:^1.30.0"
-    "@octocodeai/freellama-native-darwin-arm64": "npm:0.2.1"
-    "@octocodeai/freellama-native-darwin-x64": "npm:0.2.1"
-    "@octocodeai/freellama-native-linux-arm64-gnu": "npm:0.2.1"
-    "@octocodeai/freellama-native-linux-arm64-musl": "npm:0.2.1"
-    "@octocodeai/freellama-native-linux-x64-gnu": "npm:0.2.1"
-    "@octocodeai/freellama-native-linux-x64-musl": "npm:0.2.1"
-    "@octocodeai/freellama-native-win32-arm64-msvc": "npm:0.2.1"
-    "@octocodeai/freellama-native-win32-x64-msvc": "npm:0.2.1"
+    "@octocodeai/freellama-native-darwin-arm64": "npm:0.5.0"
+    "@octocodeai/freellama-native-darwin-x64": "npm:0.5.0"
+    "@octocodeai/freellama-native-linux-arm64-gnu": "npm:0.5.0"
+    "@octocodeai/freellama-native-linux-arm64-musl": "npm:0.5.0"
+    "@octocodeai/freellama-native-linux-x64-gnu": "npm:0.5.0"
+    "@octocodeai/freellama-native-linux-x64-musl": "npm:0.5.0"
+    "@octocodeai/freellama-native-win32-arm64-msvc": "npm:0.5.0"
+    "@octocodeai/freellama-native-win32-x64-msvc": "npm:0.5.0"
     "@types/node": "npm:^22.10.0"
     esbuild: "npm:^0.28.2"
     typescript: "npm:^5.7.2"
@@ -1170,49 +1170,49 @@ __metadata:
   languageName: unknown
   linkType: soft
 
-"@octocodeai/freellama-native-darwin-arm64@npm:0.2.1, @octocodeai/freellama-native-darwin-arm64@workspace:packages/native/darwin-arm64":
+"@octocodeai/freellama-native-darwin-arm64@npm:0.5.0, @octocodeai/freellama-native-darwin-arm64@workspace:packages/native/darwin-arm64":
   version: 0.0.0-use.local
   resolution: "@octocodeai/freellama-native-darwin-arm64@workspace:packages/native/darwin-arm64"
   languageName: unknown
   linkType: soft
 
-"@octocodeai/freellama-native-darwin-x64@npm:0.2.1, @octocodeai/freellama-native-darwin-x64@workspace:packages/native/darwin-x64":
+"@octocodeai/freellama-native-darwin-x64@npm:0.5.0, @octocodeai/freellama-native-darwin-x64@workspace:packages/native/darwin-x64":
   version: 0.0.0-use.local
   resolution: "@octocodeai/freellama-native-darwin-x64@workspace:packages/native/darwin-x64"
   languageName: unknown
   linkType: soft
 
-"@octocodeai/freellama-native-linux-arm64-gnu@npm:0.2.1, @octocodeai/freellama-native-linux-arm64-gnu@workspace:packages/native/linux-arm64-gnu":
+"@octocodeai/freellama-native-linux-arm64-gnu@npm:0.5.0, @octocodeai/freellama-native-linux-arm64-gnu@workspace:packages/native/linux-arm64-gnu":
   version: 0.0.0-use.local
   resolution: "@octocodeai/freellama-native-linux-arm64-gnu@workspace:packages/native/linux-arm64-gnu"
   languageName: unknown
   linkType: soft
 
-"@octocodeai/freellama-native-linux-arm64-musl@npm:0.2.1, @octocodeai/freellama-native-linux-arm64-musl@workspace:packages/native/linux-arm64-musl":
+"@octocodeai/freellama-native-linux-arm64-musl@npm:0.5.0, @octocodeai/freellama-native-linux-arm64-musl@workspace:packages/native/linux-arm64-musl":
   version: 0.0.0-use.local
   resolution: "@octocodeai/freellama-native-linux-arm64-musl@workspace:packages/native/linux-arm64-musl"
   languageName: unknown
   linkType: soft
 
-"@octocodeai/freellama-native-linux-x64-gnu@npm:0.2.1, @octocodeai/freellama-native-linux-x64-gnu@workspace:packages/native/linux-x64-gnu":
+"@octocodeai/freellama-native-linux-x64-gnu@npm:0.5.0, @octocodeai/freellama-native-linux-x64-gnu@workspace:packages/native/linux-x64-gnu":
   version: 0.0.0-use.local
   resolution: "@octocodeai/freellama-native-linux-x64-gnu@workspace:packages/native/linux-x64-gnu"
   languageName: unknown
   linkType: soft
 
-"@octocodeai/freellama-native-linux-x64-musl@npm:0.2.1, @octocodeai/freellama-native-linux-x64-musl@workspace:packages/native/linux-x64-musl":
+"@octocodeai/freellama-native-linux-x64-musl@npm:0.5.0, @octocodeai/freellama-native-linux-x64-musl@workspace:packages/native/linux-x64-musl":
   version: 0.0.0-use.local
   resolution: "@octocodeai/freellama-native-linux-x64-musl@workspace:packages/native/linux-x64-musl"
   languageName: unknown
   linkType: soft
 
-"@octocodeai/freellama-native-win32-arm64-msvc@npm:0.2.1, @octocodeai/freellama-native-win32-arm64-msvc@workspace:packages/native/win32-arm64-msvc":
+"@octocodeai/freellama-native-win32-arm64-msvc@npm:0.5.0, @octocodeai/freellama-native-win32-arm64-msvc@workspace:packages/native/win32-arm64-msvc":
   version: 0.0.0-use.local
   resolution: "@octocodeai/freellama-native-win32-arm64-msvc@workspace:packages/native/win32-arm64-msvc"
   languageName: unknown
   linkType: soft
 
-"@octocodeai/freellama-native-win32-x64-msvc@npm:0.2.1, @octocodeai/freellama-native-win32-x64-msvc@workspace:packages/native/win32-x64-msvc":
+"@octocodeai/freellama-native-win32-x64-msvc@npm:0.5.0, @octocodeai/freellama-native-win32-x64-msvc@workspace:packages/native/win32-x64-msvc":
   version: 0.0.0-use.local
   resolution: "@octocodeai/freellama-native-win32-x64-msvc@workspace:packages/native/win32-x64-msvc"
   languageName: unknown
@@ -1241,14 +1241,14 @@ __metadata:
   version: 0.0.0-use.local
   resolution: "@octocodeai/freellama@workspace:packages/cli"
   dependencies:
-    "@octocodeai/freellama-native-darwin-arm64": "npm:0.2.1"
-    "@octocodeai/freellama-native-darwin-x64": "npm:0.2.1"
-    "@octocodeai/freellama-native-linux-arm64-gnu": "npm:0.2.1"
-    "@octocodeai/freellama-native-linux-arm64-musl": "npm:0.2.1"
-    "@octocodeai/freellama-native-linux-x64-gnu": "npm:0.2.1"
-    "@octocodeai/freellama-native-linux-x64-musl": "npm:0.2.1"
-    "@octocodeai/freellama-native-win32-arm64-msvc": "npm:0.2.1"
-    "@octocodeai/freellama-native-win32-x64-msvc": "npm:0.2.1"
+    "@octocodeai/freellama-native-darwin-arm64": "npm:0.5.0"
+    "@octocodeai/freellama-native-darwin-x64": "npm:0.5.0"
+    "@octocodeai/freellama-native-linux-arm64-gnu": "npm:0.5.0"
+    "@octocodeai/freellama-native-linux-arm64-musl": "npm:0.5.0"
+    "@octocodeai/freellama-native-linux-x64-gnu": "npm:0.5.0"
+    "@octocodeai/freellama-native-linux-x64-musl": "npm:0.5.0"
+    "@octocodeai/freellama-native-win32-arm64-msvc": "npm:0.5.0"
+    "@octocodeai/freellama-native-win32-x64-msvc": "npm:0.5.0"
     "@types/node": "npm:^22.10.0"
     typescript: "npm:^5.7.2"
     vitest: "npm:^4.1.11"

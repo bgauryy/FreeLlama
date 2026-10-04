@@ -1,8 +1,12 @@
 # Runtime status and live tuning
 
-`freellama serve` reports what it is doing, records what it did, and accepts new limits without a
-restart. Everything on this page is served under `/_freellama/v1/` and needs the same bearer token
-as the rest of the control API when auth is enabled.
+Use runtime status to inspect how FreeLlama manages delegated work: per-backend queues and
+admission, memory pressure, resident models, execution usage, and resource holds. The operator can
+reload supported limits without a restart; the calling agent can use these observations to decide
+whether to wait, narrow a task, or handle it itself.
+
+The API endpoints in this reference are served under `/_freellama/v1/` and use the same bearer
+token as the rest of the control API when authentication is enabled.
 
 Open **`http://127.0.0.1:11435/_freellama/ui`** (the address `serve` prints at startup) for a live
 page of the same data, refreshed every two seconds: backends and queues, raw traffic, host RAM and

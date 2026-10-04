@@ -1,8 +1,8 @@
 # Ollama and FreeLlama optimization boundary
 
-Ollama already owns inference optimization. FreeLlama can improve completed
-work per hour by choosing an eligible model and avoiding unnecessary model
-changes, but it does not make an individual model decode faster.
+FreeLlama manages model selection and resources for tasks offloaded by agents. Ollama owns
+inference optimization. FreeLlama can improve completed work per hour by avoiding unsuitable
+routes and unnecessary model transitions; measure that effect for the target workload.
 
 This page explains the active request flow, the settings Ollama owns, the
 current machine audit, and the optimization work that remains.
@@ -19,8 +19,9 @@ control plane for evidence-qualified routing, bounded request profiles, session
 affinity, and policy enforcement.
 
 Do not advertise FreeLlama as an accelerator or an Ollama inference plugin. It does not tune
-kernels, split one model's layers across CPU and GPU, manage macOS memory pressure, or improve that
-model's tokens per second. It can assign different models to isolated CPU and GPU-capable Ollama
+kernels or split one model's layers across CPU and GPU. It responds to observed host pressure by
+holding managed work; the operating system manages physical memory. FreeLlama can assign different
+models to isolated CPU and GPU-capable Ollama
 processes, allowing independent workloads to overlap.
 
 ## Request flow
@@ -86,10 +87,10 @@ request-specific `num_ctx` from the selected task profile. The coding adapters f
 conversation inside `FREELLAMA_AGENT_NUM_CTX`: by default, they preserve the system prompt and
 original question, compact the oldest observations first, retain recent evidence, and fail before
 the Ollama call if pinned content cannot fit. Raising the Ollama server's global context does not
-disable adapter compaction or increase its configured budget. See [Agent adapters](../../AGENTS.md)
+disable adapter compaction or increase its configured budget. See [adapter contracts](../../benchmark/local/docs/07-adapter-contracts.md)
 for the complete pagination and compaction contract.
 
-## Current Mac audit
+## Mac audit (2026-09-01)
 
 This audit captures the following snapshot from September 1, 2026. Treat it as machine
 evidence, not a portable default.

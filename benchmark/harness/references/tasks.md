@@ -1,4 +1,4 @@
-# Task Suite
+# Task suite
 
 Load when selecting cases or interpreting skipped tasks. Why: capability groups must not be mixed silently.
 

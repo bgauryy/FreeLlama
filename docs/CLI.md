@@ -1,8 +1,9 @@
 # CLI reference
 
-The `freellama` command exposes local diagnostics, deterministic model routing, managed task
-execution, benchmarking, and the Ollama-compatible proxy. The front page covers the shortest path;
-this page is the complete command map.
+The `freellama` command starts and inspects the local management layer that agents use to offload
+work. It exposes diagnostics, model routing, managed execution, resource controls, benchmarking,
+and Ollama-compatible passthrough. Use the [README quick start](../README.md#quick-start) for first
+use and this reference to look up commands and controls.
 
 ## Choose a command
 
@@ -137,6 +138,14 @@ after two healthy samples; minimum reserves are 1 GiB and 2 GiB, respectively. T
 with `--resource-hold-available-percent` and `--resource-resume-available-percent`; the hold value
 must be lower than the resume value, and neither can exceed 100. Health reports the policy, sampled
 signals, unknown measurements, and reserved memory. These flags do not change Ollama or OS settings.
+
+The reserve applies to every new managed load, not only to the pressure gate: a task is admitted
+when effective available RAM covers already-reserved bytes, the task's estimated bytes, and the
+reserve (the hold reserve normally; the larger resume reserve while capacity is recovering).
+Effective available RAM is free memory plus a bounded reclaimable estimate, so it can be far lower
+than the OS "free" percentage. A refusal reports `assessment.status: "held_insufficient_capacity"`
+with `required_with_reserve_bytes` and `effective_available_bytes`; free memory, choose a smaller
+model, or lower the percentages deliberately.
 Both `serve` and `proxy` accept `--resource-telemetry-policy`:
 
 - `require-memory` (default): wait or refuse local inference when available RAM is unknown, including

@@ -1,6 +1,7 @@
 # `freellama-core`
 
-`freellama-core` is the embeddable Rust implementation behind the CLI and MCP server. It owns model
+`freellama-core` implements the management layer between calling agents and local Ollama models.
+The CLI and MCP server share this core for task offloading and resource coordination. It owns model
 discovery, deterministic routing, session affinity, scope history, admission control, managed execution,
 benchmarking, recommendation planning, and policy generation.
 
@@ -48,9 +49,7 @@ costs 4 (capped to the pool size).
   waiter immediately and health reports the queue/in-flight counters.
 
 The primary/GPU pool derives its default weighted budget from observed Ollama parallelism;
-the optional CPU pool defaults to one. Inspect resolved values with `config`. An
-embedding batch costs `ceil(input_items / 4)`, ordinary chat costs 2, and vision costs 4 capped to
-the pool size. Runtime
+the optional CPU pool defaults to one. Inspect resolved values with `config`. Runtime
 feedback records successful resident-task work-unit latency by task and backend: decode
 nanoseconds/output token for generation and total nanoseconds/input token for embeddings. Only
 after three samples exist on each backend and one is more than 10% faster may `auto` steer; it never

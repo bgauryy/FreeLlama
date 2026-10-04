@@ -1,8 +1,9 @@
 # Scope history and model warming
 
-Scopes retain message history for managed chat tasks. Warming controls runner residency through
-the same managed execution boundary. Both are opt-in controls; the caller owns the conversation
-instructions, task dependencies, and verification.
+Use scopes when delegated chat tasks need retained message history, and warming when an installed
+model needs preparation before related work. FreeLlama manages these controls through the same
+admission and memory checks as task execution. The calling agent owns conversation instructions,
+task dependencies, and verification.
 
 ## Ownership
 

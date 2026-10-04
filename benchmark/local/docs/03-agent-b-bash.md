@@ -1,49 +1,53 @@
-# Agent B — Ollama + raw Linux shell only
+# Bash research adapter
 
-Adapter: `scripts/bash_agent.py`. Same model (`FREELLAMA_TARGET_MODEL`), same decoding settings, same
-turn budget, and same retry-protected proxy endpoint (`FREELLAMA_OLLAMA_ENDPOINT`) as Agent A — the
-only difference under test is the tool surface.
+The Bash adapter lets a local Ollama model answer repository questions through confined read-only
+shell tools. It is the default adapter for FreeLlama's `delegate_research` and the baseline for the
+[Octocode comparison](02-agent-a-octocode.md).
 
-Agent B gets no structured tool schema at all. It must solve every question by emitting one raw
-POSIX shell command per turn (`ls`, `find`, `grep`, `cat`, `sed -n`, `awk`, `wc`, `head`, `tail`,
-etc. — whatever is on `$PATH`), executed with `cwd` set to the disposable workspace copy (which
-contains all three pinned repos: `click/`, `zustand/`, `openui/`).
+The exact prompt and task loop live in [`bash_agent.py`](../scripts/bash_agent.py). Confinement
+lives in [`shell_sandbox.py`](../scripts/shell_sandbox.py); shared runtime and context behavior live
+in the [adapter contract](07-adapter-contracts.md).
 
-## Exact system prompt used by the adapter
+## Read-only tool surface
 
-```
-You are a local coding agent in an isolated benchmark workspace containing a pinned `click/`
-repository, rooted at the current directory. You solve tasks using ONLY raw POSIX shell commands —
-no editors, no special tools, no network access. Return exactly one JSON object per turn:
+The model emits one JSON action per turn: `shell`, `page`, or `finish`. A shell action contains one
+command string. The sandbox validates each command and path before executing it in the workspace.
 
-{"action":"shell","command":"one shell command, e.g. grep -n \"class Group\" click/src/click/core.py"}
-{"action":"finish","answer":"concise final answer with repository-relative evidence"}
+| Control | Behavior |
+|---|---|
+| Tool allowlist | Read-only utilities such as `rg`, `grep`, `cat`, `find`, `jq`, bounded `sed`, and read-only Git subcommands |
+| Composition | Pipes, `&&`, and `;` join validated commands |
+| Writing and execution flags | Refuses output redirection, `find -exec/-delete`, `sort -o`, `rg --pre`, and Git configuration/execution overrides |
+| Hidden execution | Refuses command substitution, backticks, variable expansion, loops, and subshells |
+| Path confinement | Refuses paths or symlinks outside the workspace and recursive symlink-following options |
+| Indirect file access | Refuses script files and filesystem-reading `xargs` targets; output-only targets are allowed |
+| General executors | Does not allow `awk`, Python, or network tools |
 
-Use standard Unix utilities: ls, find, cat, grep, sed, awk, head, tail, wc, tree (if present). Chain
-with pipes if needed, but keep each turn to a single shell invocation. Never edit files. Be decisive:
-most tasks need 2-6 commands. Call finish as soon as the requested facts are established.
-```
+Execution uses restricted Bash, a path containing only allowlisted tools, and a scrubbed
+environment. An OS sandbox adds confinement when available: `bwrap` on Linux or `sandbox-exec` on
+macOS. `FREELLAMA_AGENT_OS_SANDBOX=off` disables that OS layer while keeping command validation and
+the restricted shell. Results record the selected sandbox in `model_metadata.sandbox`.
 
-## How a command is executed
+These controls apply even when MCP delegation reads the caller's real workspace. A disposable
+benchmark copy is not the safety boundary. The former regex denylist is not the implemented contract.
 
-The adapter runs the model's `command` via `subprocess.run(["/bin/bash", "-c", command], cwd=workspace,
-timeout=30, capture_output=True, text=True)` and feeds back combined stdout+stderr (truncated), same
-as Agent A's tool observations. Every invocation is recorded in `tool_calls[]` with `name` normalized
-to `"shell"` (the exact capability name `adapters.md` reserves for this) and the literal command kept
-under `arguments.command`.
+## Observations and failures
 
-A short denylist blocks destructive patterns before execution (`sudo`, `rm -rf /`,
-fork-bombs, `curl`/`wget`/`nc` for outbound network, redirection to device files) — not because the
-model is expected to try these, but because an unconstrained shell has no other safety net. Contracts:
-`scripts/test_bash_confine.py`. The workspace itself is a disposable per-trial copy, so anything the
-command does to files inside it (including deleting them) is a legitimate, gradable outcome
-(`no_changes` / `max_changed_files` checks fail that trial), not a safety incident.
+Full command output is retained in the audit trail and served to the model in pages. A `page`
+action recovers stored evidence without rerunning a command. Exact repeats return the prior step;
+invalid actions receive bounded JSON repair. Context fitting preserves the system prompt and
+original question by default and compacts observations before the window overflows.
 
-## Why this is the fair baseline
+A refused command consumes a turn. A successful command does not establish that the answer is
+correct; the calling agent must check citations and the returned verification verdict. In MCP
+use, every model turn runs as a managed coding task. Benchmark calls use the configured benchmark
+serve/proxy transport. See [run flow](01-flow.md) for that distinction.
 
-This is deliberately the most widely available research tool: it is what any generic
-shell-capable agent has access to with zero setup, and it is the natural point of comparison for
-"does a purpose-built code-research tool (`octocode`) help a local model do code research
-faster or more accurately, or does grep-and-cat perform as well?" Both agents share everything else (model,
-decoding params, turn budget, workspace, questions, grading) so any measured difference in tokens,
-tool-call count, wall time, or pass rate is attributable to the tool surface alone.
+## Compare the adapters
+
+Use the same exact model, decoding controls, context/turn budgets, fixture revisions, transport,
+and grading rules. Record tool timeouts and package/index warm-up because the tool surfaces have
+different overhead. Measure correctness, tokens, calls, and time separately; passing faster does
+not establish better answers, and a structured tool does not imply fewer calls.
+
+Run the confinement and action contracts through `yarn test:agents` from the repository root.

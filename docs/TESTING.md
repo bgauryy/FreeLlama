@@ -3,6 +3,10 @@
 FreeLlama separates fast deterministic checks from live-system tests. Run the narrowest relevant
 tier during development, then run the full matrix before release.
 
+The checks cover the management layer agents use to offload tasks: model eligibility, admission,
+context and runtime controls, resource receipts, and adapter behavior. Physical CPU/GPU activity
+and throughput require the separate hardware procedures linked in this guide.
+
 ```mermaid
 flowchart LR
     U["Unit and Rust contracts"] --> A["Local-agent context<br/>and action contracts"]
