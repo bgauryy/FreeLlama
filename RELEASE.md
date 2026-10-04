@@ -72,18 +72,15 @@ Cross-compilation from macOS (the primary build host) requires:
 
 ## Prepare the release version
 
-Complete the [version bump checklist](#version-bump-checklist) before building artifacts.
-The current release candidate is `0.5.0`; use `v0.5.0` for its release tag.
-Refresh both lockfiles after updating the manifests:
-
 ```bash
-yarn install
-cargo update --workspace
+yarn release:version <X.Y.Z>
 ```
 
-Review `yarn.lock` and `Cargo.lock` with the version changes. Rebuild all eight platform artifact
-pairs after a version bump; a manifest change does not update the version embedded in an existing
-CLI binary. Then assemble the rebuilt artifacts and run the package gate below.
+This sets the version in every workspace `package.json`, the native `optionalDependencies` pins of
+the CLI and MCP packages, and `[workspace.package]` in `Cargo.toml` (inherited by both crates), then
+refreshes `yarn.lock` and `Cargo.lock`. Review the lockfile diff. Use `vX.Y.Z` as the release tag.
+
+A manifest bump does not change compiled artifacts: rebuild every platform (Step 1) afterwards.
 
 Check production dependencies before publication:
 
@@ -95,68 +92,17 @@ Review any findings, update compatible dependencies, and rerun the production ga
 
 ## Step 1 — Cross-compile all platforms
 
-For each of the eight targets, produce two artifacts and stage them under
-`release-artifacts/<id>/`:
-
 ```bash
-mkdir -p release-artifacts/{darwin-arm64,darwin-x64,linux-arm64-gnu,linux-arm64-musl,linux-x64-gnu,linux-x64-musl,win32-arm64-msvc,win32-x64-msvc}
+yarn release:build            # all eight targets
+yarn release:build linux-x64-gnu darwin-arm64   # or selected ids
 ```
 
-**macOS targets** — Apple Clang cross-compiles x64 from arm64 natively:
-
-```bash
-# darwin-arm64
-npx napi build --platform --target aarch64-apple-darwin --release \
-  --manifest-path packages/rust-core/Cargo.toml --features napi \
-  --no-js --no-dts-header -o release-artifacts/darwin-arm64/
-cargo build --release --target aarch64-apple-darwin -p freellama-cli
-cp target/aarch64-apple-darwin/release/freellama release-artifacts/darwin-arm64/
-
-# darwin-x64
-npx napi build --platform --target x86_64-apple-darwin --release \
-  --manifest-path packages/rust-core/Cargo.toml --features napi \
-  --no-js --no-dts-header -o release-artifacts/darwin-x64/
-cargo build --release --target x86_64-apple-darwin -p freellama-cli
-cp target/x86_64-apple-darwin/release/freellama release-artifacts/darwin-x64/
-```
-
-**Linux targets** — via cargo-zigbuild (zig handles both glibc and musl):
-
-```bash
-for TARGET in \
-  x86_64-unknown-linux-gnu:linux-x64-gnu \
-  aarch64-unknown-linux-gnu:linux-arm64-gnu \
-  x86_64-unknown-linux-musl:linux-x64-musl \
-  aarch64-unknown-linux-musl:linux-arm64-musl
-do
-  RUST="${TARGET%%:*}" ; ID="${TARGET##*:}"
-  npx napi build --platform --cross-compile --target "$RUST" --release \
-    --manifest-path packages/rust-core/Cargo.toml --features napi \
-    --no-js --no-dts-header -o "release-artifacts/$ID/"
-  cargo zigbuild --release --target "$RUST" -p freellama-cli
-  cp "target/$RUST/release/freellama" "release-artifacts/$ID/"
-done
-```
-
-**Windows targets** — via cargo-xwin (downloads the Windows SDK on first use, ~1.5 GB cached):
-
-```bash
-for TARGET in \
-  x86_64-pc-windows-msvc:win32-x64-msvc \
-  aarch64-pc-windows-msvc:win32-arm64-msvc
-do
-  RUST="${TARGET%%:*}" ; ID="${TARGET##*:}"
-  npx napi build --platform --cross-compile --target "$RUST" --release \
-    --manifest-path packages/rust-core/Cargo.toml --features napi \
-    --no-js --no-dts-header -o "release-artifacts/$ID/"
-  cargo xwin build --release --target "$RUST" -p freellama-cli
-  cp "target/$RUST/release/freellama.exe" "release-artifacts/$ID/"
-done
-```
-
-Each `release-artifacts/<id>/` directory must contain exactly:
-- `freellama.<id>.node` (N-API addon, built by napi with `--features napi`)
-- `freellama` or `freellama.exe` (CLI binary, built without `--features napi`)
+[`scripts/build-release.mjs`](scripts/build-release.mjs) walks the platform matrix and writes
+`freellama.<id>.node` (napi, `--features napi`) and `freellama[.exe]` (CLI) into
+`release-artifacts/<id>/`. darwin builds natively; linux uses cargo-zigbuild and win32 uses
+cargo-xwin (the Windows SDK download is ~1.5 GB, cached after first use). Each artifact must
+embed the workspace version; on the host target the script also loads the addon and runs
+`freellama --version`.
 
 ---
 
@@ -164,7 +110,6 @@ Each `release-artifacts/<id>/` directory must contain exactly:
 
 ```bash
 yarn release:assemble
-# node scripts/assemble-release.mjs
 ```
 
 This script reads every `release-artifacts/<id>/` directory and copies artifacts to two places:
@@ -199,7 +144,8 @@ yarn release:verify:publish                       # strict artifact check (see b
 
 The strict artifact check (`FREELLAMA_REQUIRE_ALL_PLATFORMS=1`) calls `npm pack --dry-run` on all
 10 packages and verifies that every required file exists, is non-empty, and appears in the
-dry-run tarball listing. Every tarball must include `assets/logo.jpg`. The check also confirms both
+dry-run tarball listing. Every native artifact must embed the workspace version, so a stale build
+is refused. Every tarball must include `assets/logo.jpg`. The check also confirms both
 Rust crates declare `publish = false`. `yarn build:licenses` copies that image from
 `assets/logo.jpg` into the CLI package, the MCP package, and all eight native packages.
 
@@ -209,13 +155,12 @@ must pass before continuing.
 After the package gate passes, check the registry before publishing any package:
 
 ```bash
-yarn release:verify:publish
 yarn release:verify:registry
 ```
 
 The registry preflight checks all ten package names at the candidate workspace version.
 The check fails if any exact version already exists or the registry response
-cannot establish absence. For `0.5.0`, all ten versions must be absent before the first publish.
+cannot establish absence; all ten versions must be absent before the first publish.
 This check does not prove that your npm account can publish, that registry credentials work,
 or that a later publication cannot race with another publisher. Obtain release authorization and
 verify the publishing account separately. Repeat the preflight immediately before publication.
@@ -288,35 +233,14 @@ release/SHA256SUMS
 ```
 
 The release tag must match the `version` field in the root `package.json` and `Cargo.toml`
-(for example, `v0.5.0`). `scripts/install.sh` constructs the download URL from the tag:
+(`vX.Y.Z`). `scripts/install.sh` constructs the download URL from the tag:
 
 ```bash
 scripts/install.sh --version vX.Y.Z --bin-dir ~/.local/bin
 ```
 
-Replace `vX.Y.Z` with the published release tag.
-
 It detects the host platform and architecture, downloads the matching binary, verifies its
 SHA-256 against `SHA256SUMS`, and installs it.
-
----
-
-## Version bump checklist
-
-All version fields are kept in sync manually before cutting a release:
-
-- `version` in root `package.json`
-- `version` under `[workspace.package]` in root `Cargo.toml` (inherited by both Rust crates)
-- `version` in all `packages/native/*/package.json` (8 files)
-- `version` in `packages/mcp/package.json`
-- `version` in `packages/cli/package.json`
-- `"<version>"` in the `optionalDependencies` of `packages/mcp/package.json` and
-  `packages/cli/package.json` (must match the new version exactly)
-
-The `verify:production` gate checks that every optional dependency in both portable packages
-points to the current workspace version and errors if any diverge.
-Refresh both lockfiles and rebuild the versioned artifacts before running that gate.
-Run `yarn release:verify:registry` before any publication; never reuse an already published version.
 
 ---
 

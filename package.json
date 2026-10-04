@@ -39,6 +39,8 @@
     "test:agents": "python3 -m unittest discover -s benchmark/local/scripts -p 'test_*.py'",
     "test:all": "yarn typecheck && yarn test && yarn test:rust && yarn test:agents && yarn test:hardware && yarn test:release && yarn test:integration && yarn test:e2e",
     "verify:production": "yarn build && cargo fmt --all --check && cargo clippy --workspace --all-targets --all-features -- -D warnings && yarn test:all && yarn release:verify:publish",
+    "release:version": "node scripts/set-version.mjs",
+    "release:build": "node scripts/build-release.mjs",
     "release:assemble": "node scripts/assemble-release.mjs",
     "release:verify": "node scripts/verify-release-packages.mjs",
     "release:verify:publish": "FREELLAMA_REQUIRE_ALL_PLATFORMS=1 node scripts/verify-release-packages.mjs",

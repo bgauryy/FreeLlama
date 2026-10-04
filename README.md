@@ -95,22 +95,130 @@ While `serve` runs, a status page is available at `http://127.0.0.1:11435/_freel
 
 ## Features
 
-- **Model selection:** filters installed models by capability, context window, policy, and confidence.
-- **Resource admission:** weighted per-backend slots, finite queues, priorities, wait budgets, and
-  host memory checks. Refusals include a reason and `retry_after_seconds`.
-  See [monitoring and tuning](docs/MONITORING.md).
-- **CPU + GPU backends:** optionally run a second, CPU-only Ollama for exact helper models, such as
-  embeddings, next to GPU work. Each result reports the backend and the placement observed after
-  execution. See [CPU/GPU routing](docs/CPU_GPU_ROUTING.md).
-- **Deferred tasks and batches:** submit now and collect later, or fan out independent tasks.
-- **Context and warming:** scopes, sessions, and warm models.
-  See [Scopes and warming](docs/SCOPES_AND_WARMING.md).
-- **Grounded research:** bounded read-only repository lookup with citations.
-- **Small agent context:** compact views, paged details, and embedding vectors omitted unless requested.
-- **Monitoring:** live status, usage, metrics, circuit breakers, and runtime config reload.
+| | Feature | What you get |
+|---|---|---|
+| 🧭 | [Smart model selection](#smart-model-selection) | The right installed model for the task, with a confidence level |
+| 🚦 | [Resource admission](#resource-admission) | No out-of-memory surprises: tasks run, wait, or are refused with a reason |
+| 🖥️ | [CPU + GPU backends](#cpu--gpu-backends) | Small helper models on CPU next to big GPU work, with proof of where they ran |
+| ⚡ | [Batches, jobs, and history](#batches-jobs-and-history) | Fan-out, submit-now-collect-later, and multi-turn chat without resending history |
+| 🔎 | [Grounded research](#grounded-research) | Read-only repository answers with file/line citations and a verdict |
+| 🧳 | [Small agent context](#small-agent-context) | Compact results, paged details, receipts instead of raw dumps |
+| 📊 | [Observe and evaluate](#observe-and-evaluate) | Live status, usage, benchmarks, routing policies, Ollama-compatible passthrough |
+
+### What to offload
+
+FreeLlama is for **bounded** work whose result your agent can check. Keep judgment with the agent.
+
+```mermaid
+flowchart TD
+    T{"Task for a local model?"}
+    T -->|"Embed, OCR/vision, bulk rewrite,<br/>summarize many files"| Fit["Offload"]
+    T -->|"Question about workspace files"| R["delegate_research"]
+    T -->|"Small lookup, high-stakes decision,<br/>final verification"| Keep["Keep in your agent"]
+    Fit --> N{"How many items?"}
+    N -->|"one"| RT["run_task"]
+    N -->|"many, independent"| B["run_task_batch"]
+    N -->|"long-running"| D["run_task {defer:true}<br/>then task_jobs"]
+```
+
+### One task, end to end
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as Agent
+    participant F as FreeLlama
+    participant O as Ollama (GPU/CPU)
+    A->>F: models {view:"installed"}
+    F-->>A: exact tags, capabilities, context sizes
+    A->>F: run_task {task, preview:true}
+    F-->>A: chosen model + confidence (nothing runs, nothing reserved)
+    A->>F: run_task {task, prompt}
+    F->>F: check memory, queue for a slot
+    F->>O: chat / generate / embed
+    O-->>F: output
+    F-->>A: output + receipt (model, backend, placement, timing, tokens)
+    A->>A: verify the answer
+```
+
+The same flow as MCP calls:
+
+```jsonc
+// 1. Inventory
+{ "tool": "models", "arguments": { "view": "installed" } }
+// 2. Preview: routing fields only
+{ "tool": "run_task", "arguments": { "task": "coding", "objective": "balanced", "preview": true } }
+// 3. Execute: same routing fields plus the payload
+{ "tool": "run_task", "arguments": { "task": "coding", "prompt": "Rename foo to bar in: ...", "options": { "num_predict": 512 } } }
+```
+
+### Smart model selection
+
+Routing filters installed models by task, capabilities (`tools`, `vision`, `embedding`, ...),
+context window, routing policy, and memory fit. Every decision reports a confidence level.
+Set `minConfidence:"medium"` to refuse weakly evidenced routes, `objective:"quality"` to require a
+policy-backed model, or pin `model` yourself. See [model selection](docs/MODEL_SELECTION.md).
+
+### Resource admission
+
+```mermaid
+flowchart LR
+    Req["Task"] --> Cap{"Backend slot and safe<br/>host memory available?"}
+    Cap -->|yes| Run["Run on Ollama"]
+    Cap -->|no| Queue["Bounded fair queue<br/>interactive / normal / background"]
+    Queue -->|"capacity frees within wait budget"| Run
+    Queue -->|"queue full or budget expires"| Refuse["Refused: reason +<br/>retry_after_seconds"]
+```
+
+Weighted per-backend slots, finite queues, priority classes, wait budgets (`maxWaitSeconds`),
+total deadlines (`timeoutSeconds`), and circuit breakers. See [monitoring and tuning](docs/MONITORING.md).
+
+### CPU + GPU backends
+
+```mermaid
+flowchart LR
+    F["FreeLlama"] -->|"main models"| G["Ollama: GPU"]
+    F -->|"operator-assigned helpers<br/>(e.g. embeddings)"| C["Ollama: CPU-only"]
+    G --> P["Receipt: configured backend<br/>+ observed placement"]
+    C --> P
+```
+
+Optionally run a second, CPU-only Ollama for exact helper models so they never compete with GPU
+work. The operator assigns models; agents may only express `executionPreference`. Ask for
+`minPlacementEvidence:"observed"` when placement matters. See [CPU/GPU routing](docs/CPU_GPU_ROUTING.md).
+
+### Batches, jobs, and history
+
+| Need | Use |
+|---|---|
+| Many independent items | `run_task_batch` with up to 64 `{id, independent:true, task}` items and `maxParallelism` |
+| Submit now, collect later | `run_task {defer:true}` returns `job.id`, then `task_jobs {action:"get", jobId}` |
+| Multi-turn chat without resending history | `scope {action:"create"}`, then `run_task {scopeId, scopeRevision, prompt}` |
+| Keep related calls on one model | `session {action:"create"}`, then `run_task {sessionId}` |
+| Hot model before latency-sensitive work | `warm_model {model, contextTokens}` |
+
+See [Scopes and warming](docs/SCOPES_AND_WARMING.md).
+
+### Grounded research
+
+`delegate_research {question, workspacePath}` gives a local model bounded, read-only search and
+read tools over an allowed workspace. It returns an answer, file/line citations, and an independently
+computed verification verdict. Discard `escalate` results; verify citations on the rest.
+
+### Small agent context
+
+Compact default views, cursor-paged details, embedding vectors omitted unless requested
+(`returnEmbeddings:true`), and full adapter transcripts kept on disk instead of in your context.
+Optional `telemetry.externalEquivalent` estimates avoided API cost from a rate card you configure.
+See [token economics](docs/ECONOMICS.md).
+
+### Observe and evaluate
+
+- **Live status:** queues, memory holds, loaded models, circuit breakers, usage per day and model
+  (`doctor {view:"status"}`, `freellama status`, or the `/_freellama/ui` page).
 - **Evaluation:** benchmark installed models and build a routing policy from the results.
-  See [model selection](docs/MODEL_SELECTION.md).
-- **Ollama compatible:** `/api/*` and `/v1/*` pass through to Ollama unchanged.
+  See [model selection](docs/MODEL_SELECTION.md) and [benchmarks](benchmark/README.md).
+- **Ollama compatible:** `/api/*` and `/v1/*` pass through to Ollama unchanged, including streaming.
   See [Ollama compatibility](docs/OLLAMA_SIDECAR.md).
 
 ## Good to know

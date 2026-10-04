@@ -163,6 +163,19 @@ fn pretty(value: &Value) -> Result<String> {
     serde_json::to_string_pretty(value).map_err(to_napi_err)
 }
 
+/// Crate version this addon was compiled from; release verification requires it to match the
+/// npm package version.
+#[napi]
+#[must_use]
+pub fn version() -> String {
+    env!("CARGO_PKG_VERSION").to_owned()
+}
+
+/// Keeps the version bytes in the compiled addon (the optimizer may inline the literal above), so
+/// `scripts/release-version.mjs` can reject an addon built at another version without loading it.
+#[used]
+static EMBEDDED_VERSION: &str = concat!("freellama-version:", env!("CARGO_PKG_VERSION"));
+
 /// Runs `freellama doctor` against Ollama directly — no running `freellama serve` required.
 /// Cross-checks the Ollama CLI and server versions and confirms the endpoint is reachable.
 ///
