@@ -73,7 +73,7 @@ Cross-compilation from macOS (the primary build host) requires:
 ## Prepare the release version
 
 Complete the [version bump checklist](#version-bump-checklist) before building artifacts.
-The current release candidate is `0.2.1`; use `v0.2.1` for its release tag.
+The current release candidate is `0.5.0`; use `v0.5.0` for its release tag.
 Refresh both lockfiles after updating the manifests:
 
 ```bash
@@ -215,7 +215,7 @@ yarn release:verify:registry
 
 The registry preflight checks all ten package names at the candidate workspace version.
 The check fails if any exact version already exists or the registry response
-cannot establish absence. For `0.2.1`, all ten versions must be absent before the first publish.
+cannot establish absence. For `0.5.0`, all ten versions must be absent before the first publish.
 This check does not prove that your npm account can publish, that registry credentials work,
 or that a later publication cannot race with another publisher. Obtain release authorization and
 verify the publishing account separately. Repeat the preflight immediately before publication.
@@ -288,7 +288,7 @@ release/SHA256SUMS
 ```
 
 The release tag must match the `version` field in the root `package.json` and `Cargo.toml`
-(for example, `v0.2.1`). `scripts/install.sh` constructs the download URL from the tag:
+(for example, `v0.5.0`). `scripts/install.sh` constructs the download URL from the tag:
 
 ```bash
 scripts/install.sh --version vX.Y.Z --bin-dir ~/.local/bin

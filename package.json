@@ -1,6 +1,6 @@
 {
   "name": "freellama-workspace",
-  "version": "0.2.1",
+  "version": "0.5.0",
   "private": true,
   "type": "module",
   "description": "Workspace root for FreeLlama's internal Rust core, portable JavaScript entry points, and per-platform native artifact packages.",
