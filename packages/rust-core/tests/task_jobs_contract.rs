@@ -291,7 +291,7 @@ async fn removing_a_completed_job_discards_its_result_without_new_inference() {
         json!({"id":id,"removed":true,"status":"completed","scope":"process_memory"})
     );
     let (_, listed) = request(&platform, "GET", "jobs", Value::Null).await;
-    assert!(listed["jobs"].as_array().unwrap().is_empty());
+    assert_eq!(listed["jobs"], json!([]));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     server.abort();
 }
@@ -361,7 +361,7 @@ async fn deferred_inputs_are_bounded_and_cannot_be_nested_in_batches() {
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{refusal}");
     assert_eq!(refusal["code"], "task_job_input_too_large");
     let (_, listed) = request(&platform, "GET", "jobs", Value::Null).await;
-    assert!(listed["jobs"].as_array().unwrap().is_empty());
+    assert_eq!(listed["jobs"], json!([]));
     let (status, refusal) = request(
         &platform,
         "POST",
