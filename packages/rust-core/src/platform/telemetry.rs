@@ -189,8 +189,8 @@ impl Telemetry {
         self.inner.lock().expect("telemetry state poisoned")
     }
 
-    #[allow(clippy::unused_async)] // Preserve the caller's async interface without awaiting I/O.
-    pub(super) async fn record_task(&self, record: TaskRecord) {
+    // Synchronous: task completion never waits for disk or for room in the ledger queue.
+    pub(super) fn record_task(&self, record: TaskRecord) {
         {
             let mut inner = self.lock();
             let counters = inner
@@ -764,12 +764,10 @@ mod tests {
     async fn usage_totals_group_by_day_and_model_and_count_errors() {
         let telemetry = Telemetry::default();
         let now = now_seconds();
-        telemetry.record_task(record("a", now, "ok")).await;
-        telemetry.record_task(record("a", now, "error")).await;
-        telemetry.record_task(record("b", now, "ok")).await;
-        telemetry
-            .record_task(record("b", now - 10 * 86_400, "ok"))
-            .await;
+        telemetry.record_task(record("a", now, "ok"));
+        telemetry.record_task(record("a", now, "error"));
+        telemetry.record_task(record("b", now, "ok"));
+        telemetry.record_task(record("b", now - 10 * 86_400, "ok"));
         let usage = telemetry.usage(7);
         assert_eq!(usage["totals"]["tasks"], 3);
         assert_eq!(usage["totals"]["errors"], 1);
@@ -783,9 +781,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("usage.jsonl");
         let telemetry = Telemetry::new(Some(path.clone()));
-        telemetry
-            .record_task(record("a", now_seconds(), "ok"))
-            .await;
+        telemetry.record_task(record("a", now_seconds(), "ok"));
         assert!(telemetry.flush_ledger(Duration::from_secs(1)).await);
         std::fs::OpenOptions::new()
             .append(true)
@@ -811,12 +807,7 @@ mod tests {
             started: Instant::now(),
         };
         for _ in 0..3 {
-            tokio::time::timeout(
-                Duration::from_millis(50),
-                telemetry.record_task(record("a", now_seconds(), "ok")),
-            )
-            .await
-            .unwrap();
+            telemetry.record_task(record("a", now_seconds(), "ok"));
         }
         let receipt = telemetry.ledger_receipt();
         assert_eq!(receipt["records"], 0);
@@ -832,9 +823,7 @@ mod tests {
         assert_eq!(telemetry.usage(1)["totals"]["tasks"], 3);
         assert!(!telemetry.flush_ledger(Duration::from_millis(10)).await);
         drop(receiver);
-        telemetry
-            .record_task(record("a", now_seconds(), "ok"))
-            .await;
+        telemetry.record_task(record("a", now_seconds(), "ok"));
         assert_eq!(telemetry.ledger_receipt()["dropped"], 3);
         assert!(
             telemetry.ledger_receipt()["last_error"]
@@ -850,9 +839,7 @@ mod tests {
         let path = directory.path().join("usage.jsonl");
         let telemetry = Telemetry::new(Some(path.clone()));
         for index in 0..100 {
-            telemetry
-                .record_task(record(&format!("model-{index}"), now_seconds(), "ok"))
-                .await;
+            telemetry.record_task(record(&format!("model-{index}"), now_seconds(), "ok"));
         }
         assert!(telemetry.flush_ledger(Duration::from_secs(1)).await);
         let receipt = telemetry.ledger_receipt();
@@ -903,12 +890,7 @@ mod tests {
                 .kind(),
             std::io::ErrorKind::InvalidInput
         );
-        tokio::time::timeout(
-            Duration::from_millis(100),
-            telemetry.record_task(record("a", now_seconds(), "ok")),
-        )
-        .await
-        .unwrap();
+        telemetry.record_task(record("a", now_seconds(), "ok"));
         assert!(telemetry.flush_ledger(Duration::from_secs(1)).await);
         let receipt = telemetry.ledger_receipt();
         assert_eq!(receipt["failed"], 1);
@@ -928,9 +910,7 @@ mod tests {
                 .contains("regular file")
         );
         std::fs::remove_file(&path).unwrap();
-        telemetry
-            .record_task(record("a", now_seconds(), "ok"))
-            .await;
+        telemetry.record_task(record("a", now_seconds(), "ok"));
         assert!(telemetry.flush_ledger(Duration::from_secs(1)).await);
         let recovered = telemetry.ledger_receipt();
         assert_eq!(recovered["records"], 1);
@@ -947,9 +927,7 @@ mod tests {
     #[tokio::test]
     async fn prometheus_text_has_typed_families_and_escaped_labels() {
         let telemetry = Telemetry::default();
-        telemetry
-            .record_task(record("we\"ird", now_seconds(), "ok"))
-            .await;
+        telemetry.record_task(record("we\"ird", now_seconds(), "ok"));
         telemetry.record_raw("generation", "rejected_limit");
         let text = telemetry.render_prometheus(&[
             Gauge::new("freellama_queue_depth", "Waiting tasks.", 2.0).label("backend", "gpu"),

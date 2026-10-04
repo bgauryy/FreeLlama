@@ -697,17 +697,27 @@ impl ResourceGovernor {
         if available.is_none() && self.policy.telemetry_policy != TelemetryPolicy::BestEffort {
             return false;
         }
-        self.reservations
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |occupied| {
-                let next = occupied.checked_add(bytes)?;
-                let required = next.checked_add(reserve)?;
-                if available.is_some_and(|available| available < required) {
-                    None
-                } else {
-                    Some(next)
-                }
-            })
-            .is_ok()
+        let mut occupied = self.reservations.load(Ordering::Acquire);
+        loop {
+            let Some(next) = occupied.checked_add(bytes) else {
+                return false;
+            };
+            let Some(required) = next.checked_add(reserve) else {
+                return false;
+            };
+            if available.is_some_and(|available| available < required) {
+                return false;
+            }
+            match self.reservations.compare_exchange_weak(
+                occupied,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(current) => occupied = current,
+            }
+        }
     }
 }
 
@@ -1651,7 +1661,10 @@ mod tests {
         );
         assert_eq!(sample.available_memory_bytes, Some(16_000_000 * 1024));
         assert_eq!(sample.compressor_bytes, Some(123 * 1024));
-        assert!(pressure_reasons(&sample, Some(&sample), &ResourcePolicy::default()).is_empty());
+        assert_eq!(
+            pressure_reasons(&sample, Some(&sample), &ResourcePolicy::default()),
+            Vec::<PressureReason>::new()
+        );
         assert_eq!(
             parse_linux("MemFree: 1 kB", "NaN", "", None).available_memory_bytes,
             None

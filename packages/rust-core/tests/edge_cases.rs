@@ -543,7 +543,7 @@ fn memory_fit_boundary_is_inclusive_and_unknown_when_unmeasured() {
 
     let exact = installation_plans(&catalog, &plan_request(&installed, &required, Some(2_000)));
     assert_eq!(exact[0].memory_fit, FitStatus::Fits);
-    assert!(exact[0].warnings.is_empty());
+    assert_eq!(exact[0].warnings, Vec::<String>::new());
 
     let short = installation_plans(&catalog, &plan_request(&installed, &required, Some(1_999)));
     assert_eq!(short[0].memory_fit, FitStatus::DoesNotFit);

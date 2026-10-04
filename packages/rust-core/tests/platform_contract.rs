@@ -2397,7 +2397,7 @@ fn explicit_natural_language_constraints_override_a_weak_interpreter() {
     assert_eq!(intent.objective, Objective::Fastest);
     assert!(intent.requires_tools);
     assert!(intent.requires_vision);
-    assert!(!adjustments.is_empty());
+    assert_ne!(adjustments, Vec::<String>::new());
 }
 
 #[test]

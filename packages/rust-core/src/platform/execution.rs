@@ -688,7 +688,7 @@ pub(super) async fn execute_task(
             result = Err(error);
         }
     }
-    record_completion(&state, record, started).await;
+    record_completion(&state, record, started);
     if matches!(operation, super::warming::ManagedOperation::Warm)
         && let Ok(Json(value)) = &mut result
     {
@@ -697,7 +697,7 @@ pub(super) async fn execute_task(
     result
 }
 
-async fn record_completion(
+fn record_completion(
     state: &PlatformState,
     mut record: super::telemetry::TaskRecord,
     started: Instant,
@@ -708,7 +708,7 @@ async fn record_completion(
             .activity
             .completed(&record.backend, &record.model, record.load_ms);
     }
-    state.telemetry.record_task(record).await;
+    state.telemetry.record_task(record);
 }
 
 async fn commit_scoped_completion(
