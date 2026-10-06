@@ -27,7 +27,6 @@ flowchart LR
 npx @octocodeai/freellama doctor
 npx @octocodeai/freellama auth-token --out ~/.local/share/freellama/auth.token
 npx @octocodeai/freellama serve \
-  --recommendation-catalog recommendations.example.toml \
   --auth-token-file ~/.local/share/freellama/auth.token \
   --feedback-file ~/.local/share/freellama/feedback.json
 ```
@@ -66,7 +65,7 @@ for the process setup, verification steps, and measured concurrency result.
 
 The primary admission pool derives its default weighted budget from observed Ollama parallelism;
 the independent CPU pool defaults to one unit. Inspect the effective values with `config`. Override
-them with `--max-concurrent-tasks` and `--cpu-max-concurrent-tasks`. `route`, `recommend`, and
+them with `--max-concurrent-tasks` and `--cpu-max-concurrent-tasks`. `route` and
 `task` also accept `--execution-preference auto|prefer-cpu|prefer-gpu`; this only chooses among
 models already eligible on the requested backend and reports any fallback in the execution receipt.
 `--min-placement-evidence observed` fails closed unless resident `/api/ps` evidence matches; use
@@ -118,13 +117,9 @@ errors, and the files included in the package. Core CLI contracts live in
 
 ## Understand CLI and MCP differences
 
-```bash
-npx @octocodeai/freellama tools
-```
-
-The output is contract-tested against the MCP server source. `delegate_research` and the online
-model-library view are MCP-only. Control-plane startup, proxy startup, recommendation,
-benchmarks, policy generation, and frozen-suite comparison are CLI-only.
+`delegate_research` and the online model-library view are MCP-only. Control-plane startup, proxy
+startup, auth-token creation, and benchmarks are CLI-only. Generate a routing policy with
+`python3 benchmark/harness/scripts/policy_from_eval.py` (see [CLI reference](../../docs/CLI.md#earn-medium-routing-confidence)).
 
 Use the surfaces together: the CLI starts and verifies the local services; MCP lets an agent inspect
 that state and submit bounded work. An installed MCP client can read `freellama://docs/index` and

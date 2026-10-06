@@ -11,30 +11,6 @@ use tokio::sync::Mutex;
 use tower::ServiceExt;
 
 #[tokio::test]
-async fn oversized_intent_is_refused_before_contacting_the_backend() {
-    let platform = app(&common::platform_config(
-        "127.0.0.1:11435",
-        "http://127.0.0.1:1",
-        None,
-        None,
-        "test",
-    ))
-    .unwrap();
-    let response = platform
-        .oneshot(
-            Request::post("/_freellama/v1/natural-routes")
-                .header("content-type", "application/json")
-                .body(Body::from(json!({"text":"語".repeat(4000)}).to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    assert!(String::from_utf8_lossy(&bytes).contains("interpreter context budget"));
-}
-
-#[tokio::test]
 async fn raw_inference_cannot_overlap_managed_work_but_metadata_remains_available() {
     let started = Arc::new(tokio::sync::Notify::new());
     let finish = Arc::new(tokio::sync::Notify::new());
@@ -51,12 +27,11 @@ async fn raw_inference_cannot_overlap_managed_work_but_metadata_remains_availabl
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
-    let platform = app(&common::platform_config(
+    let platform = app(&crate::support::platform_config(
         "127.0.0.1:11435",
         format!("http://{address}"),
         None,
         None,
-        "test:latest",
     )
     .with_raw_queue_wait(std::time::Duration::ZERO))
     .unwrap();
@@ -127,12 +102,11 @@ async fn managed_text_sizes_context_and_refuses_oversize_before_inference() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
-    let platform = app(&common::platform_config(
+    let platform = app(&crate::support::platform_config(
         "127.0.0.1:11435",
         format!("http://{address}"),
         None,
         None,
-        "test:latest",
     ))
     .unwrap();
     for (prompt, output, status) in [
@@ -226,12 +200,11 @@ async fn managed_requests_preserve_caller_messages_without_injecting_system_inst
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
-    let platform = app(&common::platform_config(
+    let platform = app(&crate::support::platform_config(
         "127.0.0.1:11435",
         endpoint,
         None,
         None,
-        "test:latest",
     ))
     .unwrap();
     for messages in [
@@ -267,5 +240,3 @@ async fn managed_requests_preserve_caller_messages_without_injecting_system_inst
     );
     server.abort();
 }
-
-mod common;

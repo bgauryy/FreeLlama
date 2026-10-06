@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, VecDeque},
     path::PathBuf,
+    sync::{Arc, Mutex},
 };
 
 /// Measured runner sizes, newest last, plus the settings that scale an estimate. With a file,
@@ -15,6 +16,61 @@ pub(super) struct FootprintHistory {
     hints: RuntimeHints,
     backend_hints: BTreeMap<String, RuntimeHints>,
     file: Option<PathBuf>,
+    /// Incremented per snapshot; `persisted` holds the newest generation written, so a slow
+    /// write of an older snapshot never replaces a newer file.
+    generation: u64,
+    persisted: Arc<Mutex<u64>>,
+}
+
+/// A serialized history waiting to be written. Taken under the history lock and written after
+/// it is released, so a slow disk never blocks routing or other observers.
+#[must_use = "a footprint snapshot does nothing until it is written"]
+pub(super) struct FootprintSave {
+    path: PathBuf,
+    bytes: Vec<u8>,
+    generation: u64,
+    persisted: Arc<Mutex<u64>>,
+}
+
+impl FootprintSave {
+    /// Write off the async runtime. Failures are reported once per process, as before.
+    pub(super) async fn persist(self) {
+        // A panic in the writer loses one cache write; the next measurement rewrites the file.
+        let _ = tokio::task::spawn_blocking(move || self.write()).await;
+    }
+
+    fn write(self) {
+        static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static SAVE_FAILURE_REPORTED: std::sync::Once = std::sync::Once::new();
+        let mut persisted = self
+            .persisted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *persisted >= self.generation {
+            return;
+        }
+        let path = &self.path;
+        // Unique per process and write: two servers sharing a data directory must not rename
+        // each other's half-written file into place.
+        let write = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let temporary = path.with_extension(format!("json.{}.{write}.tmp", std::process::id()));
+        if let Some(parent) = path.parent() {
+            // A failure here surfaces as the write error below.
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let result = std::fs::write(&temporary, &self.bytes)
+            .and_then(|()| std::fs::rename(&temporary, path));
+        match result {
+            Ok(()) => *persisted = self.generation,
+            Err(error) => {
+                // Best-effort cleanup; the temporary may not exist when the write itself failed.
+                let _ = std::fs::remove_file(&temporary);
+                SAVE_FAILURE_REPORTED.call_once(|| {
+                    eprintln!("footprint history not saved to {}: {error}", path.display());
+                });
+            }
+        }
+    }
 }
 
 /// Ollama settings that scale a runner's memory beyond file size + one F16 KV sequence.
@@ -69,8 +125,8 @@ const HISTORY_LIMIT: usize = 64;
 
 /// One measurement. The Ollama settings it was taken under are part of its identity: a size
 /// measured with one parallel slot or an F16 cache says nothing safe about four slots or `q8_0`,
-/// and samples now outlive the process that measured them. Files written before these fields
-/// existed deserialize them as 0, which matches no live setting, so those samples are ignored.
+/// and samples outlive the process that measured them. A sample without these fields
+/// deserializes them as 0, which matches no live setting, so it is ignored.
 #[derive(Serialize, Deserialize)]
 struct Sample {
     backend: String,
@@ -131,28 +187,23 @@ impl FootprintHistory {
         self
     }
 
-    fn save(&self) {
-        static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let Some(path) = &self.file else { return };
-        // A few kilobytes at most, written only when a measurement changes.
-        let Ok(bytes) = serde_json::to_vec(&self.samples) else {
-            return;
-        };
-        // Unique per process and write: two servers sharing a data directory must not rename
-        // each other's half-written file into place.
-        let write = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let temporary = path.with_extension(format!("json.{}.{write}.tmp", std::process::id()));
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if std::fs::write(&temporary, bytes).is_ok() {
-            let _ = std::fs::rename(&temporary, path);
-        }
+    /// Serialize the samples for writing after the caller releases the history lock.
+    fn snapshot(&mut self) -> Option<FootprintSave> {
+        let path = self.file.clone()?;
+        // A few kilobytes at most, taken only when a measurement changes.
+        let bytes = serde_json::to_vec(&self.samples).ok()?;
+        self.generation += 1;
+        Some(FootprintSave {
+            path,
+            bytes,
+            generation: self.generation,
+            persisted: Arc::clone(&self.persisted),
+        })
     }
 
     /// Learn from every runner Ollama reports as resident (`/api/ps`), including ones loaded by
     /// raw clients, so `FreeLlama`'s estimates converge on Ollama's measured sizes.
-    pub(super) fn observe_resident(&mut self, backend: &str, ps: &Value) {
+    pub(super) fn observe_resident(&mut self, backend: &str, ps: &Value) -> Option<FootprintSave> {
         let mut changed = false;
         for entry in ps["models"].as_array().into_iter().flatten() {
             let digest = entry["digest"].as_str();
@@ -160,14 +211,20 @@ impl FootprintHistory {
             observation["status"] = json!("verified");
             changed |= self.record(backend, digest, &observation);
         }
-        if changed {
-            self.save();
-        }
+        if changed { self.snapshot() } else { None }
     }
 
-    pub(super) fn observe(&mut self, backend: &str, digest: Option<&str>, observation: &Value) {
+    /// Record one verified observation; a changed history returns a snapshot to persist.
+    pub(super) fn observe(
+        &mut self,
+        backend: &str,
+        digest: Option<&str>,
+        observation: &Value,
+    ) -> Option<FootprintSave> {
         if self.record(backend, digest, observation) {
-            self.save();
+            self.snapshot()
+        } else {
+            None
         }
     }
 
@@ -303,17 +360,23 @@ impl FootprintHistory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn persist(save: Option<FootprintSave>) {
+        if let Some(save) = save {
+            save.write();
+        }
+    }
     fn model() -> CatalogModel {
         serde_json::from_value(json!({"name":"m","digest":"a","size":1000,"capabilities":[],"advertised_context":32768,"resident":false,"benchmark":{},"policy_rank":{}})).unwrap()
     }
     #[test]
     fn observed_footprints_never_cross_revisions_or_extrapolate_upward() {
         let mut history = FootprintHistory::default();
-        history.observe(
+        persist(history.observe(
             "cpu",
             Some("a"),
             &json!({"status":"verified","digest":"a","size":2000,"context_length":8192}),
-        );
+        ));
         assert_eq!(
             history.requirement("cpu", &model(), 4096, None, true)["required_available_bytes"],
             2000
@@ -396,19 +459,19 @@ mod tests {
             history.requirement("cpu", &shaped, 100, None, true)["required_available_bytes"],
             3100
         );
-        history.observe(
+        persist(history.observe(
             "cpu",
             Some("a"),
             &json!({"status":"verified","digest":"a","size":5000,"context_length":100}),
-        );
+        ));
         assert_eq!(
             history.requirement("cpu", &shaped, 100, None, true)["required_available_bytes"],
             5000
         );
         assert_eq!(history.samples.back().unwrap().num_parallel, 4);
         assert_eq!(history.samples.back().unwrap().kv_cache_percent, 50);
-        // A restarted process may change parallelism. Measurements made under the previous
-        // settings must no longer provide a too-small exact-fit estimate.
+        // A restarted process may change parallelism. Measurements made under other
+        // settings must not provide a too-small exact-fit estimate.
         history.set_backend_hints(
             "cpu".into(),
             RuntimeHints {
@@ -431,11 +494,11 @@ mod tests {
         let mut shaped = model();
         shaped.kv_cache_bytes_per_token_f16 = Some(10);
         let mut history = FootprintHistory::default();
-        history.observe(
+        persist(history.observe(
             "cpu",
             Some("a"),
             &json!({"status":"verified","digest":"a","size":5000,"context_length":100}),
-        );
+        ));
         let larger = history.requirement("cpu", &shaped, 300, None, true);
         // Measured 5000 at 100 tokens + 10 bytes * 200 more tokens.
         assert_eq!(larger["required_available_bytes"], 7000);
@@ -451,11 +514,37 @@ mod tests {
             {"name":"m","digest":"a","size":4321,"context_length":8192},
             {"name":"no-digest","size":1,"context_length":1},
         ]});
-        history.observe_resident("cpu", &ps);
+        persist(history.observe_resident("cpu", &ps));
         let saved = std::fs::metadata(&path).unwrap().modified().unwrap();
         // The same measurement again changes nothing and is not rewritten.
-        history.observe_resident("cpu", &ps);
+        persist(history.observe_resident("cpu", &ps));
         assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), saved);
+        let restored = FootprintHistory::default().with_file(path);
+        assert_eq!(
+            restored.requirement("cpu", &model(), 4096, None, true)["required_available_bytes"],
+            4321
+        );
+    }
+
+    #[test]
+    fn a_late_older_snapshot_never_replaces_a_newer_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("footprints.json");
+        let mut history = FootprintHistory::default().with_file(path.clone());
+        let older = history
+            .observe_resident(
+                "cpu",
+                &json!({"models":[{"name":"m","digest":"a","size":1111,"context_length":8192}]}),
+            )
+            .unwrap();
+        let newer = history
+            .observe_resident(
+                "cpu",
+                &json!({"models":[{"name":"m","digest":"a","size":4321,"context_length":8192}]}),
+            )
+            .unwrap();
+        newer.write();
+        older.write();
         let restored = FootprintHistory::default().with_file(path);
         assert_eq!(
             restored.requirement("cpu", &model(), 4096, None, true)["required_available_bytes"],
@@ -468,10 +557,10 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("footprints.json");
         let mut history = FootprintHistory::default().with_file(path.clone());
-        history.observe_resident(
+        persist(history.observe_resident(
             "cpu",
             &json!({"models":[{"name":"m","digest":"a","size":4321,"context_length":8192}]}),
-        );
+        ));
         // OLLAMA_NUM_PARALLEL went from 1 to 4: the one-slot size must not size a four-slot load.
         let four_slots = RuntimeHints {
             num_parallel: 4,
@@ -498,18 +587,18 @@ mod tests {
     #[test]
     fn history_is_bounded_and_rejects_unverified_samples() {
         let mut history = FootprintHistory::default();
-        history.observe(
+        persist(history.observe(
             "cpu",
             Some("a"),
             &json!({"status":"mismatch","size":1000,"context_length":1}),
-        );
+        ));
         assert!(history.samples.is_empty());
         for context in 1..=100 {
-            history.observe(
+            persist(history.observe(
                 "cpu",
                 Some("a"),
                 &json!({"status":"verified","digest":"a","size":1000,"context_length":context}),
-            );
+            ));
         }
         assert_eq!(history.samples.len(), 64);
     }

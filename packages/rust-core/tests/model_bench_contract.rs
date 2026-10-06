@@ -52,8 +52,8 @@ fn benchmark_selects_cases_by_capability() {
 
 #[test]
 fn score_is_quality_guarded() {
-    assert!((score_cases(3, 4, 2_000) - 5_400.0).abs() < f64::EPSILON);
-    assert!(score_cases(0, 4, 2_000).abs() < f64::EPSILON);
+    assert!((score_cases(3, 2_000) - 5_400.0).abs() < f64::EPSILON);
+    assert!(score_cases(0, 2_000).abs() < f64::EPSILON);
 }
 
 #[test]

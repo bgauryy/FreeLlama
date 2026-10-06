@@ -10,6 +10,16 @@ schema_version = 1
 [policies.code_repair]
 qualified_models = ["qwen3.8:27b-mlx"]
 
+# Optional request defaults for one exact model tag on this task: think and
+# num_predict (at least 1). Unset keys keep the generic task profile; caller
+# request_options win. Context size is routing-owned, so num_ctx is rejected;
+# use the caller's context_tokens instead. think = true applies only to models
+# with the thinking capability. These values were measured for Qwen 3.8 on the
+# code-repair smoke suite.
+[policies.code_repair.model_options."qwen3.8:27b-mlx"]
+think = false
+num_predict = 512
+
 # Add browser and broader tool policies only after their held-out suites qualify
 # them. The exploratory browser smoke test is not sufficient evidence.
 # [policies.browser]

@@ -14,6 +14,14 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 HARNESS="$(cd "$HERE/../harness/scripts" && pwd)"
+# The adapters are the MCP package's compiled research agents (packages/mcp/src/research).
+ADAPTERS="$HERE/../../packages/mcp/dist/research"
+for adapter in bash-agent.js octocode-agent.js; do
+  if [ ! -f "$ADAPTERS/$adapter" ]; then
+    echo "missing $ADAPTERS/$adapter; run 'yarn build' first" >&2
+    exit 1
+  fi
+done
 
 MODEL="qwen3.8:27b-mlx"
 TRIALS=1

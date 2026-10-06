@@ -8,6 +8,8 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use reqwest::Client;
+
+use crate::ollama_http::{millis, resident, unload};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -124,7 +126,7 @@ enum CaseKind {
 /// Build a fixed, capability-specific case plan using conservative model-size tiers.
 ///
 /// These tiers make benchmark cases comparable across machines. They are not a hardware profile
-/// or a claim that a model fits; recommendation and task routing perform that separate check
+/// or a claim that a model fits; task routing and admission perform that separate check
 /// against the discovered host-memory budget and the context actually sent.
 #[must_use]
 pub fn benchmark_plan(model: &ModelMetadata) -> Vec<BenchCase> {
@@ -197,7 +199,7 @@ pub fn benchmark_plan(model: &ModelMetadata) -> Vec<BenchCase> {
 
 /// Quality-guarded useful cases completed per hour.
 #[must_use]
-pub fn score_cases(passed: usize, _attempted: usize, elapsed_ms: u64) -> f64 {
+pub fn score_cases(passed: usize, elapsed_ms: u64) -> f64 {
     if elapsed_ms == 0 {
         return 0.0;
     }
@@ -257,6 +259,9 @@ pub struct ModelBenchResult {
     pub cases: Vec<ModelCaseResult>,
     pub resident_size: Option<u64>,
     pub resident_vram: Option<u64>,
+    /// Failed unload requests; a failure before the cold start means that timing may be warm.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unload_errors: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -305,7 +310,7 @@ pub async fn benchmark_all(config: &BenchConfig) -> Result<AllModelsReport> {
         .context("build benchmark HTTP client")?;
     let server_version = get_json(
         &client,
-        &format!("{}/api/version", config.endpoint.trim_end_matches('/')),
+        &crate::ollama_http::url(&config.endpoint, "/api/version"),
     )
     .await?
     .get("version")
@@ -332,7 +337,10 @@ pub async fn benchmark_all(config: &BenchConfig) -> Result<AllModelsReport> {
             model.name, model.capabilities
         );
         let plan = benchmark_plan(&model);
-        let _ = unload(&client, &config.endpoint, &model.name).await;
+        let mut unload_errors = Vec::new();
+        if let Err(error) = unload(&client, &config.endpoint, &model.name).await {
+            unload_errors.push(format!("before cold start: {error:#}"));
+        }
         let cold_start = if let Some(case) = plan.first() {
             Some(run_case(&client, &config.endpoint, &model, case).await)
         } else {
@@ -350,13 +358,16 @@ pub async fn benchmark_all(config: &BenchConfig) -> Result<AllModelsReport> {
             }
         }
         let (resident_size, resident_vram) = resident(&client, &config.endpoint, &model.name).await;
-        let _ = unload(&client, &config.endpoint, &model.name).await;
+        if let Err(error) = unload(&client, &config.endpoint, &model.name).await {
+            unload_errors.push(format!("after trials: {error:#}"));
+        }
         results.push(ModelBenchResult {
             metadata: model,
             cold_start,
             cases,
             resident_size,
             resident_vram,
+            unload_errors,
         });
     }
     let rankings = build_rankings(&results);
@@ -383,11 +394,7 @@ pub async fn benchmark_all(config: &BenchConfig) -> Result<AllModelsReport> {
 }
 
 async fn discover_models(client: &Client, endpoint: &str) -> Result<Vec<ModelMetadata>> {
-    let tags = get_json(
-        client,
-        &format!("{}/api/tags", endpoint.trim_end_matches('/')),
-    )
-    .await?;
+    let tags = get_json(client, &crate::ollama_http::url(endpoint, "/api/tags")).await?;
     let entries = tags
         .get("models")
         .and_then(Value::as_array)
@@ -400,7 +407,7 @@ async fn discover_models(client: &Client, endpoint: &str) -> Result<Vec<ModelMet
             .context("model has no name")?;
         let size = entry.get("size").and_then(Value::as_u64).unwrap_or(0);
         let show = client
-            .post(format!("{}/api/show", endpoint.trim_end_matches('/')))
+            .post(crate::ollama_http::url(endpoint, "/api/show"))
             .json(&json!({"model": name}))
             .send()
             .await?
@@ -459,9 +466,9 @@ async fn run_case(
 ) -> ModelCaseResult {
     let started = Instant::now();
     let response = match case.kind {
-        CaseKind::Embedding => client.post(format!("{}/api/embed", endpoint.trim_end_matches('/')))
+        CaseKind::Embedding => client.post(crate::ollama_http::url(endpoint, "/api/embed"))
             .json(&json!({"model": model.name, "input": ["local model benchmark", "local model benchmark"], "keep_alive": "5m"})).send().await,
-        _ => client.post(format!("{}/api/chat", endpoint.trim_end_matches('/')))
+        _ => client.post(crate::ollama_http::url(endpoint, "/api/chat"))
             .json(&chat_request(model, case)).send().await,
     };
     let client_ms = millis(started.elapsed());
@@ -640,7 +647,7 @@ fn build_rankings(results: &[ModelBenchResult]) -> BTreeMap<Capability, Vec<Rank
                     passed,
                     attempted: cases.len(),
                     quality_rate: f64_count(passed) / f64_count(cases.len()),
-                    useful_cases_per_hour: score_cases(passed, cases.len(), elapsed),
+                    useful_cases_per_hour: score_cases(passed, elapsed),
                     mean_decode_tokens_per_second: (!rates.is_empty())
                         .then(|| rates.iter().sum::<f64>() / f64_count(rates.len())),
                     prompt_tokens,
@@ -673,42 +680,6 @@ async fn get_json(client: &Client, url: &str) -> Result<Value> {
         .context("decode Ollama JSON")
 }
 
-async fn unload(client: &Client, endpoint: &str, model: &str) -> Result<()> {
-    client
-        .post(format!("{}/api/generate", endpoint.trim_end_matches('/')))
-        .json(&json!({"model": model, "prompt": "", "stream": false, "keep_alive": 0}))
-        .send()
-        .await?
-        .error_for_status()?;
-    Ok(())
-}
-
-async fn resident(client: &Client, endpoint: &str, model: &str) -> (Option<u64>, Option<u64>) {
-    let Ok(value) = get_json(
-        client,
-        &format!("{}/api/ps", endpoint.trim_end_matches('/')),
-    )
-    .await
-    else {
-        return (None, None);
-    };
-    value
-        .get("models")
-        .and_then(Value::as_array)
-        .and_then(|models| {
-            models.iter().find(|entry| {
-                entry.get("name").and_then(Value::as_str) == Some(model)
-                    || entry.get("model").and_then(Value::as_str) == Some(model)
-            })
-        })
-        .map_or((None, None), |entry| {
-            (
-                entry.get("size").and_then(Value::as_u64),
-                entry.get("size_vram").and_then(Value::as_u64),
-            )
-        })
-}
-
 fn rate(value: &Value, count: &str, duration: &str) -> Option<f64> {
     let mut count_value = value.get(count)?.as_u64()?;
     if count == "prompt_eval_count" {
@@ -722,9 +693,6 @@ fn rate(value: &Value, count: &str, duration: &str) -> Option<f64> {
 
 fn ns_ms(value: Option<u64>) -> Option<f64> {
     value.map(|ns| Duration::from_nanos(ns).as_secs_f64() * 1_000.0)
-}
-fn millis(duration: Duration) -> u64 {
-    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn needle_prompt() -> String {

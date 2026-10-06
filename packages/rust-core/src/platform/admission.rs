@@ -436,11 +436,11 @@ impl AdmissionPool {
                     return Err(AdmissionFailure::TimedOut);
                 }
                 let mut selected = false;
-                if state.granted.is_none() {
-                    if let Some(index) = Self::selected_waiter(&mut state) {
-                        state.granted = Some(state.waiting[index].ticket);
-                        selected = true;
-                    }
+                if state.granted.is_none()
+                    && let Some(index) = Self::selected_waiter(&mut state)
+                {
+                    state.granted = Some(state.waiting[index].ticket);
+                    selected = true;
                 }
                 let granted_index = if state.granted == Some(ticket) {
                     Some(

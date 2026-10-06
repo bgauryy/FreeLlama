@@ -38,7 +38,7 @@ describe("assessDelegatedAnswer", () => {
     expect(verdict.recommendation).toBe("verify");
   });
 
-  it("returns verify for judgment-shaped questions (the ~67% bucket)", () => {
+  it("returns verify for judgment-shaped questions (the low-accuracy bucket)", () => {
     const verdict = assessDelegatedAnswer("should we refactor the proxy retry logic?", 2, STRONG);
     expect(verdict.recommendation).toBe("verify");
     expect(verdict.measuredBaseRate).toMatch(/judgment/);
@@ -67,5 +67,15 @@ describe("assessDelegatedAnswer", () => {
     );
     expect(verdict.recommendation).toBe("accept");
     expect(verdict.grounded).toBe(true);
+  });
+
+  it("quotes each strong model's own measured note, never another model's base rate", () => {
+    const strong = Object.keys(MODEL_EVIDENCE).filter((name) => MODEL_EVIDENCE[name].grade === "strong");
+    expect(strong.length).toBeGreaterThan(0);
+    for (const model of strong) {
+      const verdict = assessDelegatedAnswer("where is DEFAULT_SERVE_ENDPOINT defined?", 2, model);
+      expect(verdict.measuredBaseRate).toBe(`${model}: ${MODEL_EVIDENCE[model].note}`);
+      expect(verdict.why).not.toMatch(/27B|see README/);
+    }
   });
 });

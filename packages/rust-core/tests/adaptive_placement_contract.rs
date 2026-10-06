@@ -6,7 +6,7 @@ use axum::{
 };
 use freellama::platform::{
     app,
-    resources::{HostResources, MemoryPressure, ResourceGovernor, ResourcePolicy},
+    resources::{HostResources, LowMemoryMode, MemoryPressure, ResourceGovernor, ResourcePolicy},
 };
 use serde_json::{Value, json};
 use std::sync::{
@@ -15,8 +15,6 @@ use std::sync::{
 };
 use tokio::sync::Mutex;
 use tower::ServiceExt;
-
-mod common;
 
 const MODEL: &str = "adaptive:latest";
 
@@ -49,8 +47,12 @@ async fn fixture() -> Fixture {
     let pressure = Arc::new(AtomicBool::new(false));
     let calls = Arc::new(AtomicUsize::new(0));
     let observed_pressure = Arc::clone(&pressure);
-    let governor =
-        ResourceGovernor::with_sampler(ResourcePolicy::default(), move || HostResources {
+    let governor = ResourceGovernor::with_sampler(
+        ResourcePolicy {
+            low_memory: LowMemoryMode::Advisory,
+            ..ResourcePolicy::default()
+        },
+        move || HostResources {
             source: "adaptive_placement_fixture".into(),
             total_memory_bytes: Some(1 << 50),
             available_memory_bytes: Some(1 << 49),
@@ -60,8 +62,9 @@ async fn fixture() -> Fixture {
                 MemoryPressure::Normal
             }),
             ..HostResources::default()
-        })
-        .unwrap();
+        },
+    )
+    .unwrap();
     let entries = Arc::clone(&resident);
     let duration = Arc::clone(&decode_ns);
     let failure = Arc::clone(&fail);
@@ -108,7 +111,7 @@ async fn fixture() -> Fixture {
     let runtime = tempfile::tempdir().unwrap();
     let file = runtime.path().join("runtime.toml");
     std::fs::write(&file, "adaptive_concurrency = \"all\"\n").unwrap();
-    let mut config = common::platform_config("127.0.0.1:11435", endpoint, None, None, MODEL)
+    let mut config = crate::support::platform_config("127.0.0.1:11435", endpoint, None, None)
         .with_max_concurrent_tasks(4)
         .with_runtime_config(file);
     config.resource_governor = governor;

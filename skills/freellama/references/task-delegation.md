@@ -20,7 +20,7 @@ Measured ranking: embeddings are strongest and cheapest; grounded questions pay 
 does runtime delegation, not training-time knowledge distillation.
 
 Full measurements, negative RAG results, result-field contract, and external cost sources:
-`assets/evidence/task-delegation.md`.
+`docs/dev/evidence/task-delegation.md`.
 
 Next: model-specific evidence → `references/model-profile-qwen3.8-27b-mlx.md`; model choice →
 `references/model-selection.md`.

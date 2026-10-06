@@ -1,4 +1,5 @@
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 
 const fixture = vi.hoisted(() => ({
   handlers: new Map<string, (...args: any[]) => Promise<any>>(),
@@ -11,31 +12,12 @@ const fixture = vi.hoisted(() => ({
   adapterExists: true,
 }));
 
-vi.mock("@modelcontextprotocol/sdk/server/mcp.js", () => ({
-  McpServer: class {
-    registerTool(name: string, config: { outputSchema: { parse: (value: unknown) => unknown } }, handler: (...args: any[]) => Promise<any>) {
-      fixture.handlers.set(name, handler);
-      fixture.outputs.set(name, config.outputSchema);
-    }
-    registerResource() {}
-    async connect() {}
-  },
-}));
-vi.mock("@modelcontextprotocol/sdk/server/stdio.js", () => ({ StdioServerTransport: class {} }));
-vi.mock("../../src/context-tools.js", () => ({ registerContextTools: vi.fn() }));
-vi.mock("../../src/serve.js", () => ({
-  withServe: (call: unknown) => call,
-  ensureServe: vi.fn(),
-  stopAutostartedServe: vi.fn(),
-}));
-vi.mock("../../src/native.js", () => ({ SERVER_VERSION: "fixture", ...Object.fromEntries([
-  "doctor", "machine", "health", "status", "usage", "createSession", "deleteSession", "killSession",
-  "listModels", "route", "runTaskRequest", "runTaskBatchRequest", "listTaskJobs", "getTaskJob",
-  "cancelTaskJob", "removeTaskJob",
-].map((name) => [name, vi.fn(() => { throw new Error("native calls are forbidden in this fixture"); })])), route: fixture.route }));
+// Only the delegate tool's own dependencies are replaced: the managed route call and the
+// subprocess/filesystem surface. The tool registers on a minimal recording server.
+vi.mock("../../src/serve-client.js", () => ({ route: fixture.route }));
 vi.mock("node:fs", async (importOriginal) => {
   const original = await importOriginal<typeof import("node:fs")>();
-  return { ...original, existsSync: (file: string) => /(?:bash|octocode)_agent\.py$/.test(file) ? fixture.adapterExists : original.existsSync(file) };
+  return { ...original, existsSync: (file: string) => /(?:bash|octocode)-agent\.js$/.test(file) ? fixture.adapterExists : original.existsSync(file) };
 });
 vi.mock("node:fs/promises", async (importOriginal) => ({
   ...await importOriginal<typeof import("node:fs/promises")>(),
@@ -44,21 +26,26 @@ vi.mock("node:fs/promises", async (importOriginal) => ({
   readFile: vi.fn(async () => JSON.stringify(fixture.result)),
   rm: fixture.removed,
 }));
-vi.mock("node:child_process", () => ({
-  execFile: Object.assign(vi.fn(), {
-    [Symbol.for("nodejs.util.promisify.custom")]: fixture.exec,
-  }),
+vi.mock("../../src/lifecycle.js", () => ({
+  liveDelegates: new Set(),
+  killDelegateTree: vi.fn(),
+  runDelegate: (...args: unknown[]) => {
+    const running = fixture.exec(...args);
+    return { child: running.child, done: running };
+  },
 }));
 
 describe("delegate_research refusal forwarding", () => {
   beforeAll(async () => {
-    vi.spyOn(process, "on").mockReturnValue(process);
-    vi.spyOn(process.stdin, "on").mockReturnValue(process.stdin);
-    vi.spyOn(process.stdout, "on").mockReturnValue(process.stdout);
-    vi.spyOn(process.stderr, "on").mockReturnValue(process.stderr);
-    await import("../../src/index.js");
+    const { registerDelegateResearchTool } = await import("../../src/tools/delegate-research.js");
+    const recorder = {
+      registerTool(name: string, config: { outputSchema: { parse: (value: unknown) => unknown } }, handler: (...args: any[]) => Promise<any>) {
+        fixture.handlers.set(name, handler);
+        fixture.outputs.set(name, config.outputSchema);
+      },
+    };
+    registerDelegateResearchTool(recorder as unknown as McpServer);
   });
-  afterAll(() => vi.restoreAllMocks());
   beforeEach(() => {
     fixture.adapterExists = true;
     fixture.result = {};
@@ -72,7 +59,7 @@ describe("delegate_research refusal forwarding", () => {
     const receipt = { error: "observed placement required", code: "placement_unverified", placement: { status: "unverified" } };
     fixture.route.mockRejectedValue(new Error(JSON.stringify(receipt)));
     const result = await fixture.handlers.get("delegate_research")!({
-      question: "Find a fact", workspacePath: process.cwd(), minPlacementEvidence: "observed",
+      question: "Find a fact", workspacePath: process.cwd(),
     }, { signal: new AbortController().signal });
     expect(result.isError).toBe(true);
     expect(fixture.outputs.get("delegate_research")!.parse(result.structuredContent)).toEqual(result.structuredContent);
@@ -125,7 +112,6 @@ describe("delegate_research refusal forwarding", () => {
     const handler = fixture.handlers.get("delegate_research")!;
     const result = await handler({
       question: "Find a fact", workspacePath: process.cwd(), model: "unmeasured-fixture:latest",
-      minPlacementEvidence: "observed",
     }, { signal: new AbortController().signal });
     expect(result.isError).toBe(true);
     expect(fixture.outputs.get("delegate_research")!.parse(result.structuredContent)).toEqual(result.structuredContent);

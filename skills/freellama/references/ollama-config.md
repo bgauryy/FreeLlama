@@ -23,7 +23,7 @@ Apply variables to the environment of the Ollama process or service only with hu
 restart it. macOS Ollama.app commonly uses `launchctl`; Linux services and Windows use their own
 service configuration. Full setting table, upstream resolution evidence, measured prefix-cache
 reuse, and dual-backend trials:
-`assets/evidence/ollama-config.md`.
+`docs/dev/evidence/ollama-config.md`.
 
 Next: backend decision loop → `references/resource-routing.md`; symptom diagnosis →
 `references/troubleshooting.md`.

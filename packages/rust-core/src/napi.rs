@@ -6,9 +6,11 @@
 //! `#[allow(unsafe_code)]` on its `pub mod napi;` declaration in `lib.rs`) — `napi-derive`'s
 //! generated FFI glue requires it. Every exported function here is a thin async wrapper: it either
 //! calls a plain library function directly (`doctor`) or makes one HTTP call to an already-running
-//! `freellama serve` instance, exactly mirroring how `packages/cli/src/main.rs`'s CLI subcommands work
-//! (`print_get`/`print_post`/`request_route` etc.) — this crate does not duplicate routing,
-//! recommendation, or model-discovery logic a second time; the running server stays the single
+//! `freellama serve` instance, exactly mirroring how the CLI subcommands work
+//! (`print_get`/`print_post` in `packages/cli/src/http.rs`, `request_route` etc. in
+//! `packages/cli/src/requests.rs`), sharing their client, timeouts and authentication through
+//! [`crate::serve_client`] — this crate does not duplicate routing
+//! or model-discovery logic a second time; the running server stays the single
 //! source of truth for all of it.
 //!
 //! `doctor` is the one exception: it's a standalone library function (`crate::doctor`) that talks
@@ -18,46 +20,20 @@ use std::time::Duration;
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
-use reqwest::Client;
 use serde_json::{Value, json};
 
-/// Default for functions that need a running `freellama serve` (proxy + control plane).
-/// Overridable via `FREELLAMA_SERVE_ENDPOINT` so a non-default port/host doesn't need a recompile.
-const DEFAULT_SERVE_ENDPOINT: &str = "http://127.0.0.1:11435";
-/// Default for `doctor`, which talks to Ollama directly and needs no `freellama serve` at all —
-/// kept distinct from `DEFAULT_SERVE_ENDPOINT` so its documented "no serve required" behavior
-/// actually matches its default (previously both shared the proxy port, which only worked by
-/// accident because the proxy transparently forwards `/api/version`/`/api/ps`). Overridable via
-/// `FREELLAMA_OLLAMA_ENDPOINT` — the same env var name the benchmark adapters already use.
-const DEFAULT_OLLAMA_ENDPOINT: &str = "http://127.0.0.1:11434";
+use crate::{DEFAULT_OLLAMA_ENDPOINT, DEFAULT_SERVE_ENDPOINT};
 
-/// Timeout for the decision-only control-plane calls (machine/models/routes/recommendations).
-/// These are pure computation on an in-memory model list; anything past a few seconds means the
-/// server is wedged, not busy. Overridable via `FREELLAMA_CONTROL_TIMEOUT_SECONDS`.
-fn control_timeout() -> Duration {
-    crate::timeout_from_env(
-        "FREELLAMA_CONTROL_TIMEOUT_SECONDS",
-        crate::DEFAULT_CONTROL_TIMEOUT_SECS,
-    )
-}
-
-/// Timeout for managed inference and model loading. A cold load of a large model can
-/// legitimately take minutes — Ollama's own `OLLAMA_LOAD_TIMEOUT` is 5m before it even gives up on
-/// the load — so this has to be generous or it would abort work that was going to succeed.
-/// Overridable via `FREELLAMA_TASK_TIMEOUT_SECONDS`.
-fn task_timeout() -> Duration {
-    crate::timeout_from_env(
-        "FREELLAMA_TASK_TIMEOUT_SECONDS",
-        crate::DEFAULT_TASK_TIMEOUT_SECS,
-    )
-}
-
+/// Functions that need a running `freellama serve` default to [`DEFAULT_SERVE_ENDPOINT`],
+/// overridable via `FREELLAMA_SERVE_ENDPOINT`.
 fn endpoint_or_default(endpoint: Option<String>) -> String {
     endpoint
         .or_else(|| std::env::var("FREELLAMA_SERVE_ENDPOINT").ok())
         .unwrap_or_else(|| DEFAULT_SERVE_ENDPOINT.to_owned())
 }
 
+/// `doctor` talks to Ollama directly without `freellama serve`, so it defaults to
+/// [`DEFAULT_OLLAMA_ENDPOINT`], overridable via `FREELLAMA_OLLAMA_ENDPOINT`.
 fn ollama_endpoint_or_default(endpoint: Option<String>) -> String {
     endpoint
         .or_else(|| std::env::var("FREELLAMA_OLLAMA_ENDPOINT").ok())
@@ -68,43 +44,15 @@ fn to_napi_err(error: impl std::fmt::Display) -> Error {
     Error::from_reason(error.to_string())
 }
 
-/// One process-wide HTTP client, built on first use.
-///
-/// Note that `reqwest::Client` has **no request timeout by default** — only connect-refused fails
-/// fast. Against an endpoint that accepts the TCP connection and then never answers, every tool
-/// here used to hang forever (verified: `machine` against a black-hole listener was still pending
-/// at 45s), contradicting this crate's own documented promise that these calls "return a clear
-/// connection error, they won't hang". Timeouts are therefore applied per request rather than on
-/// the shared client, because the control-plane calls and the generation calls need very
-/// different ones.
-///
-/// `reqwest::Client` owns a connection pool, a DNS resolver, and background driver tasks; building
-/// a fresh one per call (which this module used to do) throws all of that away on every tool
-/// invocation and reconnects from scratch each time. The server side already holds a single client
-/// in `PlatformState` — this makes the NAPI side match. Cloning is cheap and is the documented way
-/// to share one: the clone is a handle onto the same pool, not a second pool.
-fn client() -> Client {
-    static CLIENT: std::sync::OnceLock<Client> = std::sync::OnceLock::new();
-    CLIENT.get_or_init(Client::new).clone()
-}
-
+/// [`crate::serve_client::authenticate`], with the error named for the JavaScript caller.
 fn authenticated(request: reqwest::RequestBuilder) -> Result<reqwest::RequestBuilder> {
-    let Some(path) = std::env::var_os("FREELLAMA_AUTH_TOKEN_FILE") else {
-        return Ok(request);
-    };
-    let token = std::fs::read_to_string(&path).map_err(to_napi_err)?;
-    let token = token.trim();
-    if token.len() < 32 || token.chars().any(char::is_whitespace) {
-        return Err(Error::from_reason(
-            "FREELLAMA_AUTH_TOKEN_FILE must contain one token of at least 32 bytes",
-        ));
-    }
-    Ok(request.bearer_auth(token))
+    crate::serve_client::authenticate(request)
+        .map_err(|error| Error::from_reason(format!("FREELLAMA_AUTH_TOKEN_FILE: {error:#}")))
 }
 
 async fn get_json(endpoint: &str, path: &str, timeout: Duration) -> Result<Value> {
     request_json(
-        client().get(format!("{}{path}", endpoint.trim_end_matches('/'))),
+        crate::serve_client::client().get(crate::ollama_http::url(endpoint, path)),
         timeout,
     )
     .await
@@ -112,8 +60,8 @@ async fn get_json(endpoint: &str, path: &str, timeout: Duration) -> Result<Value
 
 async fn post_json(endpoint: &str, path: &str, body: &Value, timeout: Duration) -> Result<Value> {
     request_json(
-        client()
-            .post(format!("{}{path}", endpoint.trim_end_matches('/')))
+        crate::serve_client::client()
+            .post(crate::ollama_http::url(endpoint, path))
             .json(body),
         timeout,
     )
@@ -152,7 +100,7 @@ async fn request_json(request: reqwest::RequestBuilder, timeout: Duration) -> Re
 
 async fn delete_json(endpoint: &str, path: &str, timeout: Duration) -> Result<()> {
     checked_response(
-        client().delete(format!("{}{path}", endpoint.trim_end_matches('/'))),
+        crate::serve_client::client().delete(crate::ollama_http::url(endpoint, path)),
         timeout,
     )
     .await?;
@@ -198,7 +146,12 @@ pub async fn doctor(endpoint: Option<String>) -> Result<String> {
 #[napi]
 pub async fn machine(endpoint: Option<String>) -> Result<String> {
     let endpoint = endpoint_or_default(endpoint);
-    let value = get_json(&endpoint, "/_freellama/v1/machine", control_timeout()).await?;
+    let value = get_json(
+        &endpoint,
+        "/_freellama/v1/machine",
+        crate::serve_client::control_timeout(),
+    )
+    .await?;
     pretty(&value)
 }
 
@@ -210,7 +163,12 @@ pub async fn machine(endpoint: Option<String>) -> Result<String> {
 #[napi]
 pub async fn health(endpoint: Option<String>) -> Result<String> {
     let endpoint = endpoint_or_default(endpoint);
-    let value = get_json(&endpoint, "/_freellama/v1/health", control_timeout()).await?;
+    let value = get_json(
+        &endpoint,
+        "/_freellama/v1/health",
+        crate::serve_client::control_timeout(),
+    )
+    .await?;
     pretty(&value)
 }
 
@@ -223,7 +181,12 @@ pub async fn health(endpoint: Option<String>) -> Result<String> {
 #[napi]
 pub async fn status(endpoint: Option<String>) -> Result<String> {
     let endpoint = endpoint_or_default(endpoint);
-    let value = get_json(&endpoint, "/_freellama/v1/status", control_timeout()).await?;
+    let value = get_json(
+        &endpoint,
+        "/_freellama/v1/status",
+        crate::serve_client::control_timeout(),
+    )
+    .await?;
     pretty(&value)
 }
 
@@ -236,7 +199,7 @@ pub async fn status(endpoint: Option<String>) -> Result<String> {
 pub async fn usage(endpoint: Option<String>, days: Option<u32>) -> Result<String> {
     let endpoint = endpoint_or_default(endpoint);
     let path = format!("/_freellama/v1/usage?days={}", days.unwrap_or(7));
-    let value = get_json(&endpoint, &path, control_timeout()).await?;
+    let value = get_json(&endpoint, &path, crate::serve_client::control_timeout()).await?;
     pretty(&value)
 }
 
@@ -252,7 +215,7 @@ pub async fn create_session(endpoint: Option<String>) -> Result<String> {
         &endpoint,
         "/_freellama/v1/sessions",
         &json!({}),
-        control_timeout(),
+        crate::serve_client::control_timeout(),
     )
     .await?;
     pretty(&value)
@@ -269,7 +232,7 @@ pub async fn delete_session(endpoint: Option<String>, session_id: String) -> Res
     delete_json(
         &endpoint,
         &format!("/_freellama/v1/sessions/{session_id}"),
-        control_timeout(),
+        crate::serve_client::control_timeout(),
     )
     .await
 }
@@ -287,7 +250,7 @@ pub async fn kill_session(endpoint: Option<String>, session_id: String) -> Resul
         &endpoint,
         &format!("/_freellama/v1/sessions/{session_id}/kill"),
         &json!({}),
-        control_timeout(),
+        crate::serve_client::control_timeout(),
     )
     .await?;
     pretty(&value)
@@ -303,7 +266,12 @@ pub async fn kill_session(endpoint: Option<String>, session_id: String) -> Resul
 #[napi]
 pub async fn list_models(endpoint: Option<String>) -> Result<String> {
     let endpoint = endpoint_or_default(endpoint);
-    let value = get_json(&endpoint, "/_freellama/v1/models", control_timeout()).await?;
+    let value = get_json(
+        &endpoint,
+        "/_freellama/v1/models",
+        crate::serve_client::control_timeout(),
+    )
+    .await?;
     pretty(&value)
 }
 
@@ -317,7 +285,10 @@ pub async fn list_models(endpoint: Option<String>) -> Result<String> {
 /// Returns an error if `freellama serve` isn't reachable at `endpoint`, or rejects the request
 /// (e.g. an unknown task/objective, or no eligible model).
 #[napi]
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors the positional JS signature; `expect` cannot work because the napi macro splits the fn"
+)]
 pub async fn route(
     endpoint: Option<String>,
     task: String,
@@ -331,9 +302,7 @@ pub async fn route(
     min_placement_evidence: Option<String>,
 ) -> Result<String> {
     let endpoint = endpoint_or_default(endpoint);
-    // Forwarded so the CORE gate does the refusing. The MCP layer used to gate client-side with
-    // its own rank map, where an unknown grade defaulted to rank 1 and silently passed — the same
-    // fail-open bug the core gate was built to close. One gate, in the router, for every caller.
+    // Forwarded unchanged so the router's confidence gate does the refusing for every caller.
     let body = json!({
         "task": task,
         "objective": objective.unwrap_or_else(|| "balanced".to_owned()),
@@ -342,113 +311,16 @@ pub async fn route(
         "context_tokens": context_tokens,
         "required_capabilities": required_capabilities.unwrap_or_default(),
         "min_confidence": min_confidence,
-        "execution_preference": execution_preference.unwrap_or_else(|| "auto".to_owned()),
-        "min_placement_evidence": min_placement_evidence.unwrap_or_else(|| "configured".to_owned()),
-    });
-    let value = post_json(&endpoint, "/_freellama/v1/routes", &body, control_timeout()).await?;
-    pretty(&value)
-}
-
-/// Side-effect-free install recommendation for a task, via `POST /_freellama/v1/recommendations`.
-/// Never runs `ollama pull` itself — only proposes a plan.
-///
-/// # Errors
-///
-/// Returns an error if `freellama serve` isn't reachable at `endpoint`, or rejects the request.
-#[napi]
-// This is a stable JavaScript FFI boundary: keeping the optional routing controls as separate
-// arguments preserves the generated TypeScript API and matches `route`/`run_task`. Internal Rust
-// callers use typed request structs, so the usual maintainability concern does not apply here.
-#[allow(clippy::too_many_arguments)]
-pub async fn recommend(
-    endpoint: Option<String>,
-    task: String,
-    objective: Option<String>,
-    model: Option<String>,
-    context_tokens: Option<i64>,
-    required_capabilities: Option<Vec<String>>,
-    execution_preference: Option<String>,
-    min_placement_evidence: Option<String>,
-) -> Result<String> {
-    let endpoint = endpoint_or_default(endpoint);
-    let body = json!({
-        "task": task,
-        "objective": objective.unwrap_or_else(|| "balanced".to_owned()),
-        "model": model,
-        "session_id": Value::Null,
-        "context_tokens": context_tokens,
-        "required_capabilities": required_capabilities.unwrap_or_default(),
         "execution_preference": execution_preference.unwrap_or_else(|| "auto".to_owned()),
         "min_placement_evidence": min_placement_evidence.unwrap_or_else(|| "configured".to_owned()),
     });
     let value = post_json(
         &endpoint,
-        "/_freellama/v1/recommendations",
+        "/_freellama/v1/routes",
         &body,
-        control_timeout(),
+        crate::serve_client::control_timeout(),
     )
     .await?;
-    pretty(&value)
-}
-
-/// Routes AND executes a chat/generate/embed call in one shot, via `POST /_freellama/v1/tasks` on
-/// a running `freellama serve`. Unlike `route`/`recommend` (which only ever return a decision,
-/// never do work), this is `FreeLlama`'s actual "run something smart" entry point: it picks a model
-/// exactly like `route` does, then immediately forwards the call to Ollama with the resulting
-/// options (context window, thinking mode, `keep_alive`, etc.) applied.
-///
-/// Provide `prompt` for a single-turn message, or `messages` (a JSON array of
-/// `{"role":...,"content":...}` objects) for multi-turn history — `messages` wins if both are set.
-/// For a vision task, attach `images` (base64-encoded strings, no data-URI prefix) alongside
-/// `prompt` — pair with `required_capabilities: ["vision"]` to ensure a vision-capable model gets
-/// picked. For `task: "embedding"`, set `input` instead (a string or array of strings). `tools` is
-/// an optional JSON array of tool/function definitions for function-calling tasks. `keep_alive`
-/// overrides Ollama's default model residency window (e.g. `"0"` to unload immediately after this
-/// call, `"-1"` for infinite) — omit it to keep the server's own default.
-/// # Errors
-///
-/// Returns an error if `freellama serve` isn't reachable at `endpoint`, or rejects the request
-/// (e.g. an unknown task/objective, no eligible model, or neither `prompt`/`messages`/`input`
-/// provided for a task that requires one).
-#[napi]
-#[allow(clippy::too_many_arguments)]
-pub async fn run_task(
-    endpoint: Option<String>,
-    task: String,
-    objective: Option<String>,
-    model: Option<String>,
-    session_id: Option<String>,
-    context_tokens: Option<i64>,
-    required_capabilities: Option<Vec<String>>,
-    prompt: Option<String>,
-    images: Option<Vec<String>>,
-    messages: Option<Value>,
-    input: Option<Value>,
-    tools: Option<Value>,
-    keep_alive: Option<String>,
-    min_confidence: Option<String>,
-    execution_preference: Option<String>,
-    min_placement_evidence: Option<String>,
-) -> Result<String> {
-    let endpoint = endpoint_or_default(endpoint);
-    let body = json!({
-        "min_confidence": min_confidence,
-        "task": task,
-        "objective": objective.unwrap_or_else(|| "balanced".to_owned()),
-        "model": model,
-        "session_id": session_id,
-        "context_tokens": context_tokens,
-        "required_capabilities": required_capabilities.unwrap_or_default(),
-        "prompt": prompt,
-        "images": images,
-        "messages": messages.unwrap_or_else(|| Value::Array(Vec::new())),
-        "input": input,
-        "tools": tools,
-        "keep_alive": keep_alive,
-        "execution_preference": execution_preference.unwrap_or_else(|| "auto".to_owned()),
-        "min_placement_evidence": min_placement_evidence.unwrap_or_else(|| "configured".to_owned()),
-    });
-    let value = post_json(&endpoint, "/_freellama/v1/tasks", &body, task_timeout()).await?;
     pretty(&value)
 }
 
@@ -459,24 +331,30 @@ pub async fn run_task(
 /// # Errors
 ///
 /// Returns an error if `freellama serve` is unreachable or rejects the request.
-#[napi]
+#[napi(ts_args_type = "endpoint: string | undefined | null, request: unknown")]
 pub async fn run_task_request(endpoint: Option<String>, request: Value) -> Result<String> {
     let endpoint = endpoint_or_default(endpoint);
-    let value = post_json(&endpoint, "/_freellama/v1/tasks", &request, task_timeout()).await?;
+    let value = post_json(
+        &endpoint,
+        "/_freellama/v1/tasks",
+        &request,
+        crate::serve_client::task_timeout(),
+    )
+    .await?;
     pretty(&value)
 }
 
 /// Creates opt-in, bounded process-local conversation history.
 /// # Errors
 /// Returns an error if the server is unavailable or rejects the scope limits or messages.
-#[napi]
+#[napi(ts_args_type = "endpoint: string | undefined | null, request: unknown")]
 pub async fn create_scope(endpoint: Option<String>, request: Value) -> Result<String> {
     pretty(
         &post_json(
             &endpoint_or_default(endpoint),
             "/_freellama/v1/scopes",
             &request,
-            control_timeout(),
+            crate::serve_client::control_timeout(),
         )
         .await?,
     )
@@ -499,7 +377,7 @@ pub async fn get_scope(
                 "/_freellama/v1/scopes/{id}?include_messages={}",
                 include_messages.unwrap_or(false)
             ),
-            control_timeout(),
+            crate::serve_client::control_timeout(),
         )
         .await?,
     )
@@ -508,7 +386,7 @@ pub async fn get_scope(
 /// Copies a specified revision into an independent scope.
 /// # Errors
 /// Returns an error for an invalid ID, stale revision, or rejected limits.
-#[napi]
+#[napi(ts_args_type = "endpoint: string | undefined | null, scopeId: string, request: unknown")]
 pub async fn fork_scope(
     endpoint: Option<String>,
     scope_id: String,
@@ -520,7 +398,7 @@ pub async fn fork_scope(
             &endpoint_or_default(endpoint),
             &format!("/_freellama/v1/scopes/{id}/fork"),
             &request,
-            control_timeout(),
+            crate::serve_client::control_timeout(),
         )
         .await?,
     )
@@ -535,7 +413,7 @@ pub async fn delete_scope(endpoint: Option<String>, scope_id: String) -> Result<
     delete_json(
         &endpoint_or_default(endpoint),
         &format!("/_freellama/v1/scopes/{id}"),
-        control_timeout(),
+        crate::serve_client::control_timeout(),
     )
     .await
 }
@@ -543,14 +421,14 @@ pub async fn delete_scope(endpoint: Option<String>, scope_id: String) -> Result<
 /// Preloads an exact installed model through managed admission and deadlines.
 /// # Errors
 /// Returns an error if the server refuses placement, capacity, or the request.
-#[napi]
+#[napi(ts_args_type = "endpoint: string | undefined | null, request: unknown")]
 pub async fn warm_model_request(endpoint: Option<String>, request: Value) -> Result<String> {
     pretty(
         &post_json(
             &endpoint_or_default(endpoint),
             "/_freellama/v1/warm",
             &request,
-            task_timeout(),
+            crate::serve_client::task_timeout(),
         )
         .await?,
     )
@@ -563,14 +441,14 @@ pub async fn warm_model_request(endpoint: Option<String>, request: Value) -> Res
 /// Returns an error if `freellama serve` is unreachable or rejects the batch envelope. Individual
 /// task failures remain explicit entries in the successful batch response so sibling work is not
 /// discarded.
-#[napi]
+#[napi(ts_args_type = "endpoint: string | undefined | null, request: unknown")]
 pub async fn run_task_batch_request(endpoint: Option<String>, request: Value) -> Result<String> {
     let endpoint = endpoint_or_default(endpoint);
     let value = post_json(
         &endpoint,
         "/_freellama/v1/task-batches",
         &request,
-        task_timeout(),
+        crate::serve_client::task_timeout(),
     )
     .await?;
     pretty(&value)
@@ -586,7 +464,7 @@ pub async fn list_task_jobs(endpoint: Option<String>) -> Result<String> {
         &get_json(
             &endpoint_or_default(endpoint),
             "/_freellama/v1/jobs",
-            control_timeout(),
+            crate::serve_client::control_timeout(),
         )
         .await?,
     )
@@ -604,7 +482,7 @@ pub async fn get_task_job(endpoint: Option<String>, job_id: String) -> Result<St
         &get_json(
             &endpoint_or_default(endpoint),
             &format!("/_freellama/v1/jobs/{id}"),
-            control_timeout(),
+            crate::serve_client::control_timeout(),
         )
         .await?,
     )
@@ -623,7 +501,7 @@ pub async fn cancel_task_job(endpoint: Option<String>, job_id: String) -> Result
             &endpoint_or_default(endpoint),
             &format!("/_freellama/v1/jobs/{id}/cancel"),
             &Value::Null,
-            task_timeout(),
+            crate::serve_client::task_timeout(),
         )
         .await?,
     )
@@ -639,39 +517,12 @@ pub async fn remove_task_job(endpoint: Option<String>, job_id: String) -> Result
     let endpoint = endpoint_or_default(endpoint);
     pretty(
         &request_json(
-            client().delete(format!(
-                "{}/_freellama/v1/jobs/{id}",
-                endpoint.trim_end_matches('/')
+            crate::serve_client::client().delete(crate::ollama_http::url(
+                &endpoint,
+                &format!("/_freellama/v1/jobs/{id}"),
             )),
-            task_timeout(),
+            crate::serve_client::task_timeout(),
         )
         .await?,
     )
-}
-
-/// Converts a free-text natural-language intent into a route, via
-/// `POST /_freellama/v1/natural-routes`.
-///
-/// # Errors
-///
-/// Returns an error if `freellama serve` isn't reachable at `endpoint`, or rejects the request.
-#[napi]
-pub async fn natural_route(
-    endpoint: Option<String>,
-    text: String,
-    session_id: Option<String>,
-) -> Result<String> {
-    let endpoint = endpoint_or_default(endpoint);
-    let mut body = json!({ "text": text });
-    if let Some(session_id) = session_id {
-        body["session_id"] = Value::String(session_id);
-    }
-    let value = post_json(
-        &endpoint,
-        "/_freellama/v1/natural-routes",
-        &body,
-        task_timeout(),
-    )
-    .await?;
-    pretty(&value)
 }

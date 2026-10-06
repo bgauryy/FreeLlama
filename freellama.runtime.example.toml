@@ -1,7 +1,8 @@
 # FreeLlama runtime settings. Pass with `freellama serve --runtime-config <file>` (or
 # FREELLAMA_RUNTIME_CONFIG). `serve` re-reads the file when it changes; `freellama config --reload`
-# forces a re-read. A value set by a CLI flag or FREELLAMA_* environment variable wins over this
-# file; `freellama config` shows every effective value and its source. Every key is optional, and
+# forces a re-read. A value set by a CLI flag, or by one of the few documented FREELLAMA_*
+# environment variables (queue wait, idle eviction, usage queue capacity, scope and keep-alive
+# limits), wins over this file; `freellama config` shows every effective value and its source. Every key is optional, and
 # an unknown key is a reload error rather than a silently ignored setting.
 
 # --- Admission (workload units: embedding 1, chat 2, vision 4) ---

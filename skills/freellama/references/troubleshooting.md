@@ -4,9 +4,9 @@ Load when a request fails, slows down, or reaches the wrong route. Why: similar 
 different layers.
 
 1. Run `doctor`, then `scripts/check.sh`.
-2. HTTP 503: inspect the selected backend's admission pool; retry or lower fan-out. GPU defaults to
-   2 weighted units per `OLLAMA_NUM_PARALLEL` slot (fallback 2) and CPU to 1. Raise only the relevant pool after reading Ollama parallel/KV
-   constraints.
+2. HTTP 503: inspect the selected backend's admission pool; retry or lower fan-out. Pool defaults are
+   in the [resource contract](resource-routing.md#resource-contract). Raise only the relevant pool after
+   reading Ollama parallel/KV constraints.
 3. Low-confidence refusal: add policy plus functional evidence, lower the requested floor, or use
    fastest with an explicit acknowledgment of low evidence.
 4. Slow but successful: inspect `execution.observation`, not assignment alone. Partial offload is
@@ -20,7 +20,7 @@ different layers.
 9. Shared-output corruption: stop straggler runs before starting another writer.
 
 Observed incidents, exact remedies, and error-specific timing evidence:
-`assets/evidence/troubleshooting.md`.
+`docs/dev/evidence/troubleshooting.md`.
 
 Next: retry mechanics → `references/reliability.md`; backend decisions →
 `references/resource-routing.md`.

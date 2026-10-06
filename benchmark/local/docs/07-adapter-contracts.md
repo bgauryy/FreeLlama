@@ -16,9 +16,10 @@ verification verdicts, use the [MCP reference](../../../packages/mcp/README.md).
 
 **What it is:** An Ollama model with access to the Octocode CLI through a pinned `npx` package.
 Its five local tools cover file structure, file discovery, code search, exact content reads, and
-LSP queries. See the [Octocode adapter guide](02-agent-a-octocode.md) for invocation and limits.
+LSP queries. See the [Octocode adapter guide](guide.md#octocode-adapter) for invocation and limits.
 
-**Location:** `benchmark/local/scripts/octocode_agent.py`
+**Location:** `packages/mcp/src/research/octocode-agent.ts` (run as
+`node packages/mcp/dist/research/octocode-agent.js`)
 
 **Tool set:**
 - `localViewStructure` — View repository directory tree or file structure
@@ -66,9 +67,10 @@ The tool returns paths and evidence for deterministic grading and caller verific
 **What it is:** An Ollama model restricted to allowlisted read-only shell tools such as `rg`,
 `grep`, `cat`, and bounded `sed`. General executors such as `awk` and Python are refused.
 
-**Location:** `benchmark/local/scripts/bash_agent.py`
+**Location:** `packages/mcp/src/research/bash-agent.ts` (run as
+`node packages/mcp/dist/research/bash-agent.js`)
 
-**Command restrictions** (`benchmark/local/scripts/shell_sandbox.py`): the adapter runs against the
+**Command restrictions** (`packages/mcp/src/research/sandbox-validate.ts` and `sandbox.ts`): the adapter runs against the
 caller's real workspace under `delegate_research`, so commands are confined in layers, not by a
 denylist (the old regex denylist let `echo x > file`, `git checkout -- .` and `$(...)` path tricks
 through):
@@ -128,7 +130,7 @@ When the benchmark harness (`benchmark/harness/scripts/run.py`) runs an agent:
 2. **Task loop** — For each question/task:
    - Agent receives the task prompt and a disposable copy of the fixture repos
    - Agent makes tool calls (octocode) or shell commands (bash)
-   - Results are captured and clipped **head-and-tail** by `agent_context.clip` — the head is the
+   - Results are captured and clipped **head-and-tail** by `clip` in `fit.ts` — the head is the
      half that identifies a directory listing, a grep hit list or a file read, and the adapters
      used to keep only the tail (`observation[-3000:]`), discarding it
    - An exact repeat of an earlier call is not re-executed: it is answered from the prior step and
@@ -144,7 +146,7 @@ When the benchmark harness (`benchmark/harness/scripts/run.py`) runs an agent:
      (see `skills/freellama/references/disk-cleanup.md` and `task-delegation.md`) is why: a local
      judge model co-resident with the agent model under test crashed Ollama and corrupted a run.
      Quality judging here is a separate, deliberate, non-local, post-hoc step — see
-     `benchmark/local/docs/05-grading-and-judge.md`.
+     [grading](guide.md#grading).
 
 4. **Cleanup** — Agent process stops; the disposable workspace copy is discarded (or, with
    `run_all.sh`'s default `--discard-workspaces`, never even fully persisted)
@@ -188,7 +190,7 @@ flowchart TD
 model's context, so shortening it only ever destroyed the audit trail. Only what the model sees is
 paginated.
 
-## Context management (`benchmark/local/scripts/agent_context.py`)
+## Context management (`packages/mcp/src/research/fit.ts`, `context-manager.ts`)
 
 Both adapters run at `num_ctx=8192` and append an observation of up to 3000 characters every turn.
 At `max_turns=10` the conversation reaches roughly 9-10k tokens — past the window. **Ollama does
@@ -198,7 +200,7 @@ returns prose instead of JSON. The run is recorded as `model did not return a JS
 parsing failure that reads like model weakness but is really a harness bug. Any benchmark number
 gathered from a long run before this was fixed understates the model.
 
-`fit_to_context` runs before the first call and after every turn. It:
+`fitToContext` runs before the first call and after every turn. It:
 
 - **byte-preserves** the system prompt and original question by default — the two messages Ollama
   deletes first during truncation; if they cannot fit, the adapter errors before calling Ollama;
@@ -233,15 +235,17 @@ the loop/model fields and the two timeouts in camelCase; retry, repair and compa
 deployment settings only, which keeps them out of every `tools/list` payload. Defaults and validation live once in `AgentRuntimeConfig` and
 `ContextPolicy`; both adapters consume those shared schemas.
 
-Contracts: `benchmark/local/scripts/test_agent_context.py` (context and pagination contracts) and
-`test_agent_actions.py` (strict Bash and Octocode action shapes).
+Contracts live in `packages/mcp/test/unit/`: `research-context.test.ts` (context and pagination),
+`research-actions.test.ts` (strict Bash and Octocode action shapes), `research-transport.test.ts`,
+`research-identity.test.ts`, `research-confine.test.ts`, and `sandbox-corpus.test.ts` (a frozen
+differential corpus of confinement verdicts).
 
 ## Add a new agent
 
-1. **Create an adapter** — a Python script that:
+1. **Create an adapter** — a command that:
    - Reads `FREELLAMA_TARGET_MODEL`, `FREELLAMA_OLLAMA_ENDPOINT`, `FREELLAMA_BENCH_WORKSPACE`,
-     `FREELLAMA_BENCH_PROMPT`, `FREELLAMA_AGENT_RESULT` (see `octocode_agent.py`/`bash_agent.py`
-     for the exact contract — copy one of them as a starting point)
+     `FREELLAMA_BENCH_PROMPT`, `FREELLAMA_AGENT_RESULT` (see `octocode-agent.ts`/`bash-agent.ts` in
+     `packages/mcp/src/research/` for the exact contract; both build on `agent-loop.ts`)
    - Implements the tool-call loop (receives task, makes calls, gets results, loops)
    - Writes the result JSON to the path in `FREELLAMA_AGENT_RESULT`
 2. **Add it to a matrix** — `benchmark/local/tasks/octocode-vs-bash-matrix.template.json` is
@@ -255,5 +259,5 @@ Contracts: `benchmark/local/scripts/test_agent_context.py` (context and paginati
 - **This benchmark (the actual example)**: [`benchmark/local/README.md`](../../../benchmark/local/README.md)
 - **Ollama/model operations skill**: [`skills/freellama/SKILL.md`](../../../skills/freellama/SKILL.md)
 - **Agent implementation**:
-  - Octocode adapter: `benchmark/local/scripts/octocode_agent.py`
-  - Bash adapter: `benchmark/local/scripts/bash_agent.py`
+  - Octocode adapter: `packages/mcp/src/research/octocode-agent.ts`
+  - Bash adapter: `packages/mcp/src/research/bash-agent.ts`

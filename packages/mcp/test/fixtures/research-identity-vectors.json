@@ -1,0 +1,105 @@
+{
+  "identity": [
+    {
+      "endpoint": "http://127.0.0.1:11434/",
+      "model": "qwen3:8b",
+      "prompt_kind": "bash",
+      "catalog": {
+        "models": [
+          {
+            "name": "qwen3:8b",
+            "digest": "sha256:AbCdEf0000000000000000000000000000000000000000000000000000000000"
+          }
+        ]
+      },
+      "url": "http://127.0.0.1:11434/api/tags",
+      "result": {
+        "identity": "65d218ba16b736e3c94892b909ee32ff83210f040a481f8313f5c06db01ab4a7",
+        "verified": true,
+        "scope": "manifest_digest_and_system_prompt",
+        "digest": "abcdef0000000000000000000000000000000000000000000000000000000000"
+      }
+    },
+    {
+      "endpoint": "http://127.0.0.1:11435/_freellama/v1/tasks",
+      "model": "gemma4",
+      "prompt_kind": "octocode",
+      "catalog": {
+        "models": [
+          {
+            "model": "gemma4:latest",
+            "digest": "AbCdEf0000000000000000000000000000000000000000000000000000000000"
+          }
+        ]
+      },
+      "url": "http://127.0.0.1:11435/_freellama/v1/models",
+      "result": {
+        "identity": "26d86ebcf9993fd02af596311fa96c1fc20f3eb334555dc940a9ec5cb5cb11f2",
+        "verified": true,
+        "scope": "manifest_digest_and_system_prompt",
+        "digest": "abcdef0000000000000000000000000000000000000000000000000000000000"
+      }
+    },
+    {
+      "endpoint": "http://hé:1",
+      "model": "mü/x",
+      "prompt_kind": "custom",
+      "catalog": {
+        "models": [
+          {
+            "name": "mü/x:latest",
+            "digest": "abcdef0000000000000000000000000000000000000000000000000000000000"
+          }
+        ]
+      },
+      "url": "http://hé:1/api/tags",
+      "result": {
+        "identity": "1ab972dbaa0954292c4f2da971df69fbd59e69ae053553ed32af4ed7d7a6c2e4",
+        "verified": true,
+        "scope": "manifest_digest_and_system_prompt",
+        "digest": "abcdef0000000000000000000000000000000000000000000000000000000000"
+      }
+    }
+  ],
+  "model_key": [
+    {
+      "env": {},
+      "model": "model-a",
+      "identity": "",
+      "contract": "{\"chars_per_token\": 4, \"estimator_version\": 1, \"identity\": \"\", \"image_token_estimate\": 1024, \"model\": \"model-a\", \"schema_version\": 2}",
+      "key": "2b23149395b16f0d9461a865"
+    },
+    {
+      "env": {
+        "FREELLAMA_AGENT_CHARS_PER_TOKEN": "8"
+      },
+      "model": "model-a",
+      "identity": "",
+      "contract": "{\"chars_per_token\": 8.0, \"estimator_version\": 1, \"identity\": \"\", \"image_token_estimate\": 1024, \"model\": \"model-a\", \"schema_version\": 2}",
+      "key": "1d4eb0539affb4d2bc49abe9"
+    },
+    {
+      "env": {
+        "FREELLAMA_AGENT_CHARS_PER_TOKEN": "3.5",
+        "FREELLAMA_AGENT_IMAGE_TOKEN_ESTIMATE": "900"
+      },
+      "model": "model-a",
+      "identity": "digest-a/template-a",
+      "contract": "{\"chars_per_token\": 3.5, \"estimator_version\": 1, \"identity\": \"digest-a/template-a\", \"image_token_estimate\": 900, \"model\": \"model-a\", \"schema_version\": 2}",
+      "key": "840dbac36c2093617095b98e"
+    },
+    {
+      "env": {},
+      "model": "mü🦙",
+      "identity": "idé",
+      "contract": "{\"chars_per_token\": 4, \"estimator_version\": 1, \"identity\": \"id\\u00e9\", \"image_token_estimate\": 1024, \"model\": \"m\\u00fc\\ud83e\\udd99\", \"schema_version\": 2}",
+      "key": "756c6c237bdcdc1fe99033f3"
+    }
+  ],
+  "record": [
+    "{\"chars_per_token\": 4, \"estimator_version\": 1, \"identity\": \"\", \"image_token_estimate\": 1024, \"model\": \"model-a\", \"samples\": 3, \"scale\": 2.5, \"schema_version\": 2}\n",
+    "{\"chars_per_token\": 8.0, \"estimator_version\": 1, \"identity\": \"\", \"image_token_estimate\": 1024, \"model\": \"model-a\", \"samples\": 3, \"scale\": 2.5, \"schema_version\": 2}\n",
+    "{\"chars_per_token\": 3.5, \"estimator_version\": 1, \"identity\": \"digest-a/template-a\", \"image_token_estimate\": 900, \"model\": \"model-a\", \"samples\": 3, \"scale\": 2.5, \"schema_version\": 2}\n",
+    "{\"chars_per_token\": 4, \"estimator_version\": 1, \"identity\": \"id\\u00e9\", \"image_token_estimate\": 1024, \"model\": \"m\\u00fc\\ud83e\\udd99\", \"samples\": 3, \"scale\": 2.5, \"schema_version\": 2}\n"
+  ]
+}

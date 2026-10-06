@@ -1,7 +1,7 @@
 // Parsers for Ollama's public HTML library. Website claims are not routing evidence.
 import { clipText } from "./helpers.js";
 
-export function decodeHtml(text: string): string {
+function decodeHtml(text: string): string {
   const entities: Record<string, string> = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ", middot: "·", bull: "•" };
   return text.replace(/&(#x[\da-f]+|#\d+|[a-z]+);/gi, (raw, entity: string) => {
     if (!entity.startsWith("#")) return entities[entity.toLowerCase()] ?? raw;
@@ -82,15 +82,10 @@ export function parseModelSearch(html: string) {
     const name = link?.[1] ?? link?.[2];
     if (!name) continue;
     if (!/<p\b[^>]*class="max-w-lg/.test(block)) continue;
-    const description =
-      block
-        .match(/<p class="max-w-lg[^"]*">([\s\S]*?)<\/p>/)?.[1]
-        ?.replace(/<[^>]+>/g, "")
-        .replace(/&#39;/g, "'")
-        .replace(/&amp;/g, "&")
-        .replace(/&quot;/g, '"')
-        .replace(/\s+/g, " ")
-        .trim() ?? "";
+    const rawDescription = block.match(/<p class="max-w-lg[^"]*">([\s\S]*?)<\/p>/)?.[1];
+    const description = rawDescription === undefined
+      ? ""
+      : decodeHtml(rawDescription.replace(/<[^>]+>/g, "")).replace(/\s+/g, " ").trim();
     // Family chips advertise features. A cloud chip does not prove the absence of local tags.
     const capabilities = [...block.matchAll(/text-(?:indigo-600|cyan-500)[^>]*>([a-z]+)<\/span>/g)].map(
       (m) => m[1],
@@ -106,7 +101,6 @@ export function parseModelSearch(html: string) {
       pulls: stat("Pulls"),
       tags: stat("Tag"),
       cloudAvailable: capabilities.includes("cloud"),
-      cloudOnly: null,
     });
   }
   return results;

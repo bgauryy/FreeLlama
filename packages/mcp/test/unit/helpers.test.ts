@@ -1,24 +1,21 @@
 import { describe, expect, it } from "vitest";
 import {
-  belowConfidence,
   canonicalTaskKind,
   clipText,
   configuredExternalCost,
   costTelemetry,
   errorResult,
-  parseAdapterResult,
   parsedResult,
-  serialize,
   structuredResult,
   taskAnswerText,
   batchAnswerText,
   ANSWER_TEXT_MAX_CHARS,
   summarizeEmbeddings,
-  summarizeOllamaPullStream,
-  extractExistingWorkspacePath,
   withRequiredCapability,
 } from "../../src/helpers.js";
 import { REPO_ROOT } from "../../src/config.js";
+import { extractExistingWorkspacePath, parseAdapterResult } from "../../src/delegate.js";
+import { summarizeOllamaPullStream } from "../../src/tools/ollama-lifecycle.js";
 
 describe("extractExistingWorkspacePath", () => {
   it("extracts an existing workspace-relative file from a Bash command", () => {
@@ -199,17 +196,6 @@ describe("clipText", () => {
   });
 });
 
-describe("serialize", () => {
-  it("pretty-prints small payloads", () => {
-    expect(serialize({ a: 1 })).toBe('{\n  "a": 1\n}');
-  });
-
-  it("goes compact once the payload is large", () => {
-    const big = { xs: Array.from({ length: 3000 }, (_, i) => i) };
-    expect(serialize(big)).not.toContain("\n");
-  });
-});
-
 describe("result shapes", () => {
   it("structuredResult keeps the object canonical and emits a compact text cue", () => {
     const result = structuredResult({ hello: "world" });
@@ -248,35 +234,10 @@ describe("result shapes", () => {
       "FreeLlama managed serve",
     );
   });
-});
 
-describe("belowConfidence", () => {
-  const lowDecision = {
-    confidence: "low",
-    evidence: "capability_metadata_only",
-    selected_model: "some-model",
-    reasons: ["only_candidate"],
-  };
-
-  it("passes when no minimum is requested", () => {
-    expect(belowConfidence(lowDecision, undefined)).toBeNull();
-  });
-
-  it("passes when the decision meets the minimum", () => {
-    expect(belowConfidence(lowDecision, "low")).toBeNull();
-    expect(belowConfidence({ ...lowDecision, confidence: "medium" }, "medium")).toBeNull();
-  });
-
-  it("fails closed below the minimum, naming the rejected model", () => {
-    const refusal = belowConfidence(lowDecision, "medium");
-    expect(refusal?.isError).toBe(true);
-    expect(refusal?.content[0].text).toMatch(/some-model/);
-    expect(refusal?.content[0].text).toMatch(/fail-closed refusal/);
-  });
-
-  it("ranks an unknown grade below 'low' rather than failing open", () => {
-    const refusal = belowConfidence({ ...lowDecision, confidence: "banana" }, "low");
-    expect(refusal?.isError).toBe(true);
+  it("recognizes the configured serve address even without the managed API path", () => {
+    const unavailable = errorResult(new Error("tcp connect error: 127.0.0.1:11435: connection refused"));
+    expect(unavailable.content[0].text).toContain("Start it with `freellama serve`");
   });
 });
 
@@ -315,6 +276,16 @@ describe("task answer text", () => {
     expect(calls).toContain('tool_calls: [{"function":{"name":"f"}}]');
     const long = taskAnswerText({ response: { message: { content: "x".repeat(ANSWER_TEXT_MAX_CHARS * 2) } } });
     expect(long!.length).toBeLessThanOrEqual(ANSWER_TEXT_MAX_CHARS);
+  });
+
+  it("shows one copy of a looped answer and keeps the full text out of the answer only", () => {
+    const content = "Total: $1.00\n```" + "\n```".repeat(50);
+    const text = taskAnswerText({
+      response: { message: { content } },
+      output_check: { repetition_loop: true, unique_prefix_chars: 16 },
+    });
+    expect(text).toMatch(/^Total: \$1\.00\n```\n\[freellama: trimmed \d+ repeated characters/);
+    expect(taskAnswerText({ response: { message: { content } } })).toBe(content.trim());
   });
 
   it("describes withheld embeddings instead of dumping vectors", () => {

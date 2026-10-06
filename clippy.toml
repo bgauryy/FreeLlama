@@ -1,0 +1,2 @@
+# Tests may unwrap; production code may not (workspace lint `clippy::unwrap_used`).
+allow-unwrap-in-tests = true

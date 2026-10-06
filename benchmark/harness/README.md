@@ -1,7 +1,7 @@
 # FreeLlama coding-agent benchmark
 
 This guide owns the generic scoring workflow for model-agent comparisons. Use the
-[benchmark index](../README.md) to choose model research, adapter holdout, or hardware validation.
+[benchmark index](../README.md) to choose model research or hardware validation.
 Flow: `PREFLIGHT → RUN → GRADE → AGGREGATE → REPORT → VERIFY`
 
 ## Hard rules
@@ -43,8 +43,8 @@ See [`references/tasks.md`](references/tasks.md) for suite coverage and [`refere
 
 - Harness acceptance test: **passed on 2026-08-24**.
 - Golden-reference smoke run: **20 of 20 tasks passed on 2026-08-24**; all 42 generated JSON artifacts validated.
-- Public suite content review: **2026-08-23**.
-- Next required suite review: **2026-09-22**. The runner rejects stale publishable runs.
+- Public suite content review: **2026-10-06**.
+- Next required suite review: **2026-11-05**. The runner rejects stale publishable runs.
 
 The golden reference proves that the harness, tasks, graders, aggregation, and report work together. Never report its score as candidate-model performance.
 

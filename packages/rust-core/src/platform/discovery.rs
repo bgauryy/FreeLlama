@@ -2,14 +2,14 @@
 //! introspection, benchmark/policy file loaders, capability parsing) that the server plane in
 //! `mod.rs` calls but that carry no request state of their own.
 
-use std::{collections::BTreeMap, path::PathBuf, process::Command, sync::OnceLock};
+use std::{collections::BTreeMap, path::PathBuf, sync::OnceLock, time::Duration};
 
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
 use crate::model_bench::{AllModelsReport, Capability};
 
-use super::TaskKind;
+use super::{ModelRequestDefaults, TaskKind};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct MachineProfile {
@@ -18,7 +18,7 @@ pub struct MachineProfile {
     pub chip: Option<String>,
     pub logical_cpus: usize,
     /// Total physical system memory. This is the portable capacity input used for model-fit
-    /// recommendations; it does not imply that a discrete GPU can address all of it.
+    /// checks; it does not imply that a discrete GPU can address all of it.
     pub memory_bytes: Option<u64>,
     /// `unified` only when the host memory is known to be shared with the accelerator. Other
     /// systems report `system`; GPU VRAM remains Ollama's responsibility and is observed through
@@ -60,7 +60,7 @@ pub(super) fn load_benchmark(
 #[serde(deny_unknown_fields)]
 struct PolicyFile {
     schema_version: u32,
-    /// Set by `policy-from-eval --allow-smoke`. A smoke file must not unlock `medium` at runtime.
+    /// Set by `policy_from_eval.py --allow-smoke`. A smoke file must not unlock `medium` at runtime.
     #[serde(default)]
     smoke: bool,
     #[serde(default)]
@@ -71,11 +71,23 @@ struct PolicyFile {
 #[serde(deny_unknown_fields)]
 struct TaskPolicy {
     qualified_models: Vec<String>,
+    /// Request defaults per exact model tag, applied when routing picks that model for the task.
+    #[serde(default)]
+    model_options: BTreeMap<String, ModelRequestDefaults>,
 }
 
-pub(super) fn load_policies(path: Option<&PathBuf>) -> Result<BTreeMap<TaskKind, Vec<String>>> {
+/// Task policies loaded from the policy file.
+#[derive(Debug, Default)]
+pub(super) struct Policies {
+    /// Quality-qualified models per task, best first.
+    pub(super) qualified: BTreeMap<TaskKind, Vec<String>>,
+    /// Request defaults per task and exact model tag.
+    pub(super) model_options: BTreeMap<TaskKind, BTreeMap<String, ModelRequestDefaults>>,
+}
+
+pub(super) fn load_policies(path: Option<&PathBuf>) -> Result<Policies> {
     let Some(path) = path else {
-        return Ok(BTreeMap::new());
+        return Ok(Policies::default());
     };
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("read policy file {}", path.display()))?;
@@ -102,12 +114,29 @@ pub(super) fn load_policies(path: Option<&PathBuf>) -> Result<BTreeMap<TaskKind,
                 .all(|model| !model.trim().is_empty()),
             "policy {task:?} contains an empty model"
         );
+        ensure!(
+            policy
+                .model_options
+                .keys()
+                .all(|model| !model.trim().is_empty()),
+            "policy {task:?} has model_options for an empty model"
+        );
+        for (model, options) in &policy.model_options {
+            ensure!(
+                options.num_predict != Some(0),
+                "policy {} model_options for {model:?}: num_predict must be at least 1",
+                task.as_str()
+            );
+        }
     }
-    Ok(file
-        .policies
-        .into_iter()
-        .map(|(task, policy)| (task, policy.qualified_models))
-        .collect())
+    let mut policies = Policies::default();
+    for (task, policy) in file.policies {
+        policies.qualified.insert(task, policy.qualified_models);
+        if !policy.model_options.is_empty() {
+            policies.model_options.insert(task, policy.model_options);
+        }
+    }
+    Ok(policies)
 }
 
 pub(super) fn parse_capability(value: &str) -> Option<Capability> {
@@ -139,8 +168,29 @@ pub fn machine_profile(upstream: &str) -> MachineProfile {
     }
 }
 
+/// [`machine_profile`] off the async runtime: it may spawn `df`, `sysctl` or `PowerShell`.
+pub(crate) async fn machine_profile_off_runtime(upstream: &str) -> MachineProfile {
+    let owned = upstream.to_owned();
+    tokio::task::spawn_blocking(move || machine_profile(&owned))
+        .await
+        .unwrap_or_else(|_| {
+            let (memory_kind, _) = memory_semantics(std::env::consts::OS, std::env::consts::ARCH);
+            MachineProfile {
+                os: std::env::consts::OS.to_owned(),
+                architecture: std::env::consts::ARCH.to_owned(),
+                chip: None,
+                logical_cpus: std::thread::available_parallelism().map_or(1, usize::from),
+                memory_bytes: None,
+                memory_kind,
+                unified_memory_bytes: None,
+                available_disk_bytes: None,
+                ollama_endpoint: upstream.to_owned(),
+            }
+        })
+}
+
 /// Physical RAM does not change while serve runs, and reading it spawns `sysctl` (macOS) or
-/// `PowerShell` (Windows); the managed hot path used to do that several times per task.
+/// `PowerShell` (Windows), so the value is read once and cached.
 pub fn host_total_memory_bytes() -> Option<u64> {
     static TOTAL: OnceLock<Option<u64>> = OnceLock::new();
     *TOTAL.get_or_init(total_memory_bytes)
@@ -273,12 +323,13 @@ fn parse_linux_cpuinfo(text: &str) -> Option<String> {
         })
 }
 
+/// Deadline for one machine-discovery command; `PowerShell` can take seconds to start.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+
 fn command_output(command: &str, args: &[&str]) -> Option<String> {
-    let output = Command::new(command).args(args).output().ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    let (success, text) = super::resources::bounded_output(command, args, COMMAND_TIMEOUT)?;
+    success
+        .then(|| text.trim().to_owned())
         .filter(|value| !value.is_empty())
 }
 

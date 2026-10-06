@@ -16,7 +16,7 @@ import { connectClient, REPO_ROOT, serveAuthHeaders, serveIsUp, SERVE_ENDPOINT }
 type Tool = { name: string; description?: string; annotations?: any; outputSchema?: any; inputSchema?: any; title?: string };
 type ToolResult = { isError?: boolean; content: { text: string }[]; structuredContent?: any };
 
-const EXPECTED_TOOLS = ["doctor", "models", "run_task", "task_jobs", "run_task_batch", "session", "ollama_manage", "ollama_delete", "delegate_research", "scope", "warm_model"];
+const EXPECTED_TOOLS = ["doctor", "models", "run_task", "task_jobs", "session", "ollama_manage", "ollama_delete", "delegate_research", "scope"];
 
 // Whether `freellama serve` is up decides which half of the contract is checkable.
 const serveUp = await serveIsUp();
@@ -103,12 +103,13 @@ describe("tool contract", () => {
   });
 
   it("makes batch independence and the dispatch cap machine-readable", () => {
-    const schema = byName.get("run_task_batch")!.inputSchema;
+    const schema = byName.get("run_task")!.inputSchema;
     expect(schema.properties.tasks.maxItems).toBe(64);
+    expect(schema.properties.tasks.items.properties.independent.const).toBe(true);
     expect(schema.properties.maxParallelism.maximum).toBe(64);
     expect(schema.properties.maxParallelism.exclusiveMinimum).toBe(0);
-    expect(byName.get("run_task_batch")!.description).toMatch(/independent:true/);
-    expect(byName.get("run_task_batch")!.description).toMatch(/maxParallelism caps dispatch/);
+    expect(byName.get("run_task")!.description).toMatch(/independent items/);
+    expect(byName.get("run_task")!.description).toMatch(/`maxParallelism` caps dispatch/);
   });
 
   it("types owned output fields and exposes bounded model-list pagination", async () => {
@@ -177,13 +178,15 @@ describe("tool contract", () => {
     expect(invalidLogprobs.isError).toBe(true);
     expect(invalidLogprobs.content[0].text).toMatch(/requires `logprobs:true`/);
 
-    const implicitVisionModel = await call("run_task", {
+    // Images without `model` reach the core, which accepts a [policies.vision]-qualified model or
+    // refuses with guidance; the wrapper no longer duplicates that rule.
+    const misplacedImages = await call("run_task", {
       task: "vision",
-      prompt: "describe",
+      messages: [{ role: "user", content: "describe" }],
       images: ["aW1hZ2U="],
     });
-    expect(implicitVisionModel.isError).toBe(true);
-    expect(implicitVisionModel.content[0].text).toMatch(/explicit tested vision-capable `model`/);
+    expect(misplacedImages.isError).toBe(true);
+    expect(misplacedImages.content[0].text).toMatch(/valid only with `prompt`/);
   });
 
   it("rejects execution-only fields in preview mode instead of silently ignoring them", async () => {
@@ -272,17 +275,25 @@ describe("tool contract", () => {
     expect(result.content[0].text.length).toBeLessThan(500);
   });
 
-  it.runIf(!serveUp)("serve down: doctor keeps local host evidence, run_task errors cleanly", async () => {
-    const doctor = await call("doctor", { view: "full" });
-    expect(doctor.isError ?? false).toBe(false);
-    expect(doctor.structuredContent.machine?.memory_bytes).toBeGreaterThan(0);
-    expect(doctor.structuredContent.machine_unavailable).toBeUndefined();
+  it("serve down: doctor keeps local host evidence, run_task errors cleanly", async () => {
+    // A dedicated server whose serve endpoint is unreachable makes this case independent of
+    // whatever serve happens to run locally; a non-default endpoint never autostarts.
+    const downClient = await connectClient({ FREELLAMA_SERVE_ENDPOINT: "http://127.0.0.1:1", FREELLAMA_MCP_AUTOSTART_SERVE: "0" });
+    try {
+      const callDown = (name: string, args: Record<string, unknown>) =>
+        downClient.callTool({ name, arguments: args }, undefined, { timeout: 60_000 }) as Promise<ToolResult>;
+      const doctor = await callDown("doctor", { view: "full" });
+      expect(doctor.isError ?? false).toBe(false);
+      expect(doctor.structuredContent.machine?.memory_bytes).toBeGreaterThan(0);
+      expect(doctor.structuredContent.machine_unavailable).toBeUndefined();
 
-    // An explicit unavailable endpoint tests refusal without triggering default-endpoint autostart.
-    const route = await call("run_task", { endpoint: "http://127.0.0.1:1", task: "completion", preview: true });
-    expect(route.isError).toBe(true);
-    // Error results must not carry structuredContent.
-    expect(route.structuredContent).toBeUndefined();
+      const route = await callDown("run_task", { task: "completion", preview: true });
+      expect(route.isError).toBe(true);
+      // Error results must not carry structuredContent.
+      expect(route.structuredContent).toBeUndefined();
+    } finally {
+      await downClient.close();
+    }
   });
 
   it.runIf(serveUp)("serve up: every serve-backed result keeps canonical structured content", async () => {
@@ -467,7 +478,8 @@ describe("tool contract", () => {
 
   it("delegate_research exposes typed budgets and keeps deployment tuning out of requests", () => {
     const delegate = byName.get("delegate_research")!;
-    expect(delegate.inputSchema.properties.minPlacementEvidence.enum).toEqual(["configured", "observed"]);
+    expect(delegate.inputSchema.properties.minPlacementEvidence).toBeUndefined();
+    expect(delegate.inputSchema.properties.executionPreference).toBeUndefined();
     expect(delegate.inputSchema.properties.endpoint).toBeTruthy();
     expect(delegate.inputSchema.properties.ollamaEndpoint).toBeUndefined();
     const agent = delegate.inputSchema.properties.agent;
@@ -475,8 +487,7 @@ describe("tool contract", () => {
     expect(properties.contextTokens.type).toBe("integer");
     expect(properties.maxTurns.exclusiveMinimum).toBe(0);
     expect(properties.outputTokens.exclusiveMinimum).toBe(0);
-    expect(properties.requestTimeoutSeconds.exclusiveMinimum).toBe(0);
-    expect(properties.toolTimeoutSeconds.exclusiveMinimum).toBe(0);
+    expect(Object.keys(properties).sort()).toEqual(["contextTokens", "maxTurns", "outputTokens"]);
     expect(properties.retryAttempts).toBeUndefined();
     expect(properties.context).toBeUndefined();
     expect((agent.anyOf?.[0] ?? agent).additionalProperties).toBe(false);
@@ -499,6 +510,11 @@ describe("tool contract", () => {
       (JSON.stringify(tools).length + (client.getInstructions() ?? "").length) / 4,
     );
     expect(surfaceTokens, `schema surface grew to ~${surfaceTokens} tokens`).toBeLessThan(4500);
+  });
+
+  it("lists self-contained schemas with no $ref and no $schema dialect key", () => {
+    expect(JSON.stringify(tools)).not.toContain('"$ref"');
+    expect(JSON.stringify(tools)).not.toContain('"$schema"');
   });
 
   it("models{view:library} defaults to popular, flags cloud, cross-references installed", async () => {
@@ -526,7 +542,7 @@ describe("tool contract", () => {
       expect(data.order).toBe("popular");
       expect(data.query).not.toMatch(/o=newest/);
       expect(data.models).toHaveLength(1);
-      expect(data.models[0]).toMatchObject({ name: "qwen3-vl", cloudAvailable: true, cloudOnly: null, installed: true });
+      expect(data.models[0]).toMatchObject({ name: "qwen3-vl", cloudAvailable: true, installed: true });
       expect(data.nextStep).toMatch(/model:/);
 
       const detail = await libraryCall({ view: "library", model: "qwen3-vl", endpoint, ollamaEndpoint: endpoint });

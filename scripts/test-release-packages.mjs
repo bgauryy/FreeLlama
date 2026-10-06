@@ -12,7 +12,7 @@ const heroImage = readFileSync(path.join(repo, "assets/logo.jpg"));
 const untouchedBinary = `binary ${JSON.parse(readFileSync(path.join(repo, "package.json"), "utf8")).version}\n`;
 const scratch = path.join(repo, ".octocode/tmp/prepublish/packaging");
 mkdirSync(scratch, { recursive: true });
-const adapters = ["agent_context.py", "agent_transport.py", "shell_sandbox.py", "bash_agent.py", "octocode_agent.py"];
+const adapters = ["bash-agent.js", "octocode-agent.js"];
 
 function fixture() {
   const directory = mkdtempSync(path.join(scratch, "verify-"));
@@ -28,7 +28,7 @@ function fixture() {
     for (const file of ["LICENSE-APACHE", "LICENSE-MIT"]) put(`packages/${pkg}/${file}`, readFileSync(path.join(repo, file)));
     put(`packages/${pkg}/assets/logo.jpg`, heroImage);
   }
-  for (const file of ["packages/cli/bin/freellama.js", "packages/mcp/dist/index.js", "packages/mcp/native/index.js", "packages/mcp/native/index.d.ts", "packages/mcp/native/package.json", ...adapters.map((name) => `packages/mcp/adapters/${name}`)]) put(file);
+  for (const file of ["packages/cli/bin/freellama.js", "packages/mcp/dist/index.js", "packages/mcp/native/index.js", "packages/mcp/native/index.d.ts", "packages/mcp/native/package.json", ...adapters.map((name) => `packages/mcp/dist/research/${name}`)]) put(file);
   for (const { id } of PLATFORM_PACKAGES) {
     put(`packages/native/${id}/${addonName(id)}`, `addon ${version}\n`);
     put(`packages/native/${id}/${executableName(id)}`, `binary ${version}\n`);
@@ -53,7 +53,7 @@ test("complete release package fixture passes", () => {
   try { const result = f.run(); assert.equal(result.status, 0, result.stderr); } finally { f.cleanup(); }
 });
 
-for (const file of ["packages/cli/bin/freellama.js", "packages/mcp/dist/index.js", ...adapters.map((name) => `packages/mcp/adapters/${name}`)]) {
+for (const file of ["packages/cli/bin/freellama.js", "packages/mcp/dist/index.js", ...adapters.map((name) => `packages/mcp/dist/research/${name}`)]) {
   test(`missing runtime file is refused: ${file}`, () => {
     const f = fixture();
     try {

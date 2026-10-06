@@ -7,7 +7,7 @@ use axum::{
 };
 use freellama::platform::{
     PlatformConfig, app,
-    resources::{HostResources, ResourceGovernor, ResourcePolicy},
+    resources::{HostResources, LowMemoryMode, MemoryPressure, ResourceGovernor, ResourcePolicy},
 };
 use serde_json::{Value, json};
 use std::{
@@ -18,7 +18,6 @@ use std::{
     time::Duration,
 };
 use tower::ServiceExt;
-mod common;
 
 /// The runner loaded, but the connection failed while reading its response.
 struct BrokenRunnerBody(bool);
@@ -43,7 +42,10 @@ impl http_body::Body for BrokenRunnerBody {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)] // One lifecycle fixture checks HTTP, body failure and retained runners.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one lifecycle fixture checks HTTP, body failure and retained runners"
+)]
 async fn incomplete_or_failed_upstream_responses_never_train_feedback_and_unload_owned_requests() {
     for (status, payload, keep_alive) in [
         (
@@ -100,12 +102,11 @@ async fn incomplete_or_failed_upstream_responses_never_train_feedback_and_unload
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, backend).await.unwrap() });
-        let platform = app(&common::platform_config(
+        let platform = app(&crate::support::platform_config(
             "127.0.0.1:11435",
             endpoint,
             None,
             None,
-            "test:latest",
         ))
         .unwrap();
         let response=platform.clone().oneshot(Request::post("/_freellama/v1/tasks")
@@ -171,14 +172,22 @@ async fn managed_and_batch_resource_errors_are_structured_without_executing() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, backend).await.unwrap() });
-    let governor = ResourceGovernor::with_sampler(ResourcePolicy::default(), || HostResources {
-        source: "structured_error_fixture".into(),
-        total_memory_bytes: Some(10_000),
-        available_memory_bytes: Some(1),
-        ..HostResources::default()
-    })
+    let governor = ResourceGovernor::with_sampler(
+        ResourcePolicy {
+            low_memory: LowMemoryMode::Advisory,
+            ..ResourcePolicy::default()
+        },
+        || HostResources {
+            source: "structured_error_fixture".into(),
+            total_memory_bytes: Some(10_000),
+            available_memory_bytes: Some(1),
+            // Low available memory alone only warns; the OS must report pressure to refuse.
+            memory_pressure: Some(MemoryPressure::Warning),
+            ..HostResources::default()
+        },
+    )
     .unwrap();
-    let mut config = PlatformConfig::new("127.0.0.1:11435", endpoint, None, None, "test:latest")
+    let mut config = PlatformConfig::new("127.0.0.1:11435", endpoint, None, None)
         .with_max_queue_wait(Duration::from_millis(30));
     config.resource_governor = governor.clone();
     let platform = app(&config).unwrap();
@@ -186,11 +195,6 @@ async fn managed_and_batch_resource_errors_are_structured_without_executing() {
         json!({"task":"completion","objective":"fastest","model":"test:latest","prompt":"hello"});
     for (path, body, batch) in [
         ("/_freellama/v1/tasks", task.clone(), false),
-        (
-            "/_freellama/v1/natural-routes",
-            json!({"text":"answer a short question"}),
-            false,
-        ),
         (
             "/_freellama/v1/task-batches",
             json!({"tasks":[{"id":"a","independent":true,"task":task}]}),

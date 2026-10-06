@@ -106,8 +106,7 @@ impl ModelActivity {
         entry.uses += 1.0;
         entry.last_used = Some(now);
         if load_ms >= MIN_LEARNED_LOAD_MS {
-            #[allow(clippy::cast_precision_loss)] // Milliseconds, far below 2^52.
-            let sample = load_ms as f64;
+            let sample = super::float(load_ms);
             entry.load_ms = Some(
                 entry
                     .load_ms
@@ -198,7 +197,7 @@ impl Plan {
     }
 }
 
-fn round(value: f64) -> f64 {
+pub(super) fn round(value: f64) -> f64 {
     (value * 100.0).round() / 100.0
 }
 
@@ -226,11 +225,7 @@ pub(super) fn plan(ps: &Value, activity: &ModelActivity, inputs: &PlanInputs<'_>
     let mut candidates = Vec::new();
     let mut skipped = Vec::new();
     for entry in ps["models"].as_array().into_iter().flatten() {
-        let Some(name) = entry
-            .get("name")
-            .or_else(|| entry.get("model"))
-            .and_then(Value::as_str)
-        else {
+        let Some(name) = crate::ollama_http::ps_entry_name(entry) else {
             continue;
         };
         let expires_at = entry
@@ -269,9 +264,13 @@ pub(super) fn plan(ps: &Value, activity: &ModelActivity, inputs: &PlanInputs<'_>
             skipped.push((name.to_owned(), "frees_nothing_needed"));
             continue;
         }
-        #[allow(clippy::cast_precision_loss)] // Byte counts; precision loss is irrelevant here.
         let (reload_seconds, reload_source) = usage.load_ms.map_or_else(
-            || (size as f64 / ASSUMED_LOAD_BYTES_PER_SECOND, "size_estimate"),
+            || {
+                (
+                    super::float(size) / ASSUMED_LOAD_BYTES_PER_SECOND,
+                    "size_estimate",
+                )
+            },
             |ms| (ms / 1000.0, "measured_load_duration"),
         );
         candidates.push(Candidate {
@@ -349,9 +348,9 @@ fn cheapest_covering_set(candidates: &[Candidate], shortfall: u64) -> Vec<Candid
 
 fn greedy_covering_set(candidates: &[Candidate], shortfall: u64) -> Vec<Candidate> {
     let mut sorted = candidates.to_vec();
-    #[allow(clippy::cast_precision_loss)]
     sorted.sort_by(|left, right| {
-        (left.cost() / left.bytes as f64).total_cmp(&(right.cost() / right.bytes as f64))
+        (left.cost() / super::float(left.bytes))
+            .total_cmp(&(right.cost() / super::float(right.bytes)))
     });
     let mut freed = 0_u64;
     sorted
@@ -366,7 +365,7 @@ fn greedy_covering_set(candidates: &[Candidate], shortfall: u64) -> Vec<Candidat
 
 /// `keep_alive: -1` shows up in `/api/ps` as an expiry centuries away; treat anything more than
 /// a year out as pinned by its owner.
-pub(super) fn pinned_expiry(expires_at: &str) -> bool {
+fn pinned_expiry(expires_at: &str) -> bool {
     let Some(year) = expires_at
         .get(..4)
         .and_then(|year| year.parse::<u64>().ok())

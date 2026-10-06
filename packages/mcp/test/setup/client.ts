@@ -85,8 +85,6 @@ export async function startIsolatedServe(): Promise<IsolatedServe> {
       `127.0.0.1:${address.port}`,
       "--upstream",
       process.env.FREELLAMA_OLLAMA_ENDPOINT ?? "http://127.0.0.1:11434",
-      "--recommendation-catalog",
-      "recommendations.example.toml",
       "--ephemeral-feedback",
       "--ephemeral-usage",
     ],

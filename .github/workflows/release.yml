@@ -33,9 +33,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+      # rust-toolchain.toml pins the compiler; add this job's target to that toolchain.
+      - run: rustup toolchain install && rustup target add ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
@@ -102,7 +101,7 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-node@v5
         with:

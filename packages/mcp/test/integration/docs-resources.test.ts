@@ -13,13 +13,14 @@ describe("packaged documentation resources", () => {
     await client.close();
   });
 
-  it("lists a compact index and every root documentation page", async () => {
+  it("lists one index and every root documentation page, but no developer notes", async () => {
     const listed = await client.listResources();
     const uris = listed.resources.map((resource) => resource.uri);
     expect(uris).toContain("freellama://docs/index");
     expect(uris).toContain("freellama://docs/PRODUCTION");
     expect(uris).toContain("freellama://docs/CLI");
-    expect(uris).toContain("freellama://docs/OLLAMA_SYSTEM_OPTIMIZATION");
+    expect(uris).not.toContain("freellama://docs/README");
+    expect(uris).not.toContain("freellama://docs/OLLAMA_SYSTEM_OPTIMIZATION");
   });
 
   it("serves documentation lazily through the MCP resource protocol", async () => {
@@ -28,7 +29,7 @@ describe("packaged documentation resources", () => {
     expect(index.contents[0].mimeType).toBe("text/markdown");
     expect("text" in index.contents[0]).toBe(true);
     if (!("text" in index.contents[0])) throw new Error("documentation index was not text");
-    expect(index.contents[0].text).toContain("FreeLlama packaged documentation");
+    expect(index.contents[0].text).toContain("# FreeLlama documentation");
 
     const production = await client.readResource({ uri: "freellama://docs/PRODUCTION" });
     expect("text" in production.contents[0]).toBe(true);

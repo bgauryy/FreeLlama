@@ -1,8 +1,7 @@
 // Start `freellama serve` on demand so the shortest path is one tool call.
 //
-// Every generating tool talks to serve, and the MCP server used to assume someone had started it
-// in another terminal; the first run_task on a fresh install failed with a connection error. When
-// the caller uses the default loopback endpoint and nothing answers there, start the bundled
+// Every generating tool talks to serve. When the caller uses the default loopback endpoint and
+// nothing answers there, start the bundled
 // binary as a child of this server (so it stops with it) and wait for its health route.
 import { type ChildProcess, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
@@ -51,7 +50,7 @@ async function answers(endpoint: string, timeoutMs: number): Promise<boolean> {
   }
 }
 
-export function serveBinaryCandidates(): string[] {
+function serveBinaryCandidates(): string[] {
   const exe = process.platform === "win32" ? "freellama.exe" : "freellama";
   const candidates = [
     path.join(REPO_ROOT, "target", "release", exe),

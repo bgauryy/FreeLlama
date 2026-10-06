@@ -439,7 +439,6 @@ mod tests {
             "http://127.0.0.1:11434",
             None,
             None,
-            "helper:latest",
         );
         let (_, state) = super::super::build(&config).unwrap();
         let mut current = job(None);

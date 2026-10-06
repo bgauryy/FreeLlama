@@ -11,10 +11,13 @@ condition. An optional, non-local judge pass is separate from `run_all.sh`.
 This self-contained benchmark reuses the scoring and aggregation engine in this repository
 (`benchmark/harness/scripts/{run.py,run_matrix.py,aggregate.py,render_html.py}`) and adds:
 
-- two agent adapters (`scripts/octocode_agent.py`, `scripts/bash_agent.py`), sharing
-  `scripts/agent_context.py` for context budgeting, paged observations, and JSON repair — contracts in
-  `scripts/test_agent_context.py` (`python3 scripts/test_agent_context.py`). Bash confinement:
-  `scripts/test_bash_confine.py`.
+- two agent adapters, run by command from the MCP package: `packages/mcp/src/research/` is their
+  only implementation, compiled by `yarn build` to
+  `packages/mcp/dist/research/{octocode-agent,bash-agent}.js`. Both share `context-policy.ts`,
+  `fit.ts` and `context-manager.ts` for context budgeting, `observations.ts` for paged
+  observations and `actions.ts` for JSON repair, and the Bash adapter confines commands with
+  `sandbox.ts` and `sandbox-validate.ts`. Contracts are the `research-*` and `sandbox-corpus` Vitest suites in
+  `packages/mcp/test/unit/` (`yarn test`).
 - one 30-question task suite spanning three repositories (`tasks/octocode-vs-bash-30.json`)
 - a matrix **template** pairing both adapters against one model
   (`tasks/octocode-vs-bash-matrix.template.json`; `run_all.sh` fills `__MODEL__` and writes
@@ -23,7 +26,7 @@ This self-contained benchmark reuses the scoring and aggregation engine in this 
   themselves (`.context/`, gitignored — see "Who clones what" below)
 
 Everything needed to understand or re-run this — for a human or another agent — lives under this
-directory. Start here, then read `docs/` in order.
+directory. Start here, then read the [benchmark guide](docs/guide.md).
 
 For control-plane admission and context measurements, see the separate
 [bounded mixed-workload probe](docs/mixed-workload.md). It records cold-load execution, correctness,
@@ -36,13 +39,9 @@ benchmark/local/
 ├── README.md                      <- you are here
 ├── .gitignore                     <- ignores .context/ and results/
 ├── docs/
-│   ├── 01-flow.md                 <- end-to-end run flow, step by step
-│   ├── 02-agent-a-octocode.md     <- Octocode tool surface and invocation contract
-│   ├── 03-agent-b-bash.md         <- Bash allowlist and confinement contract
-│   ├── 04-questions.md            <- index of all 30 questions, linking to per-question files
-│   ├── 05-grading-and-judge.md    <- deterministic checks + LLM-judge methodology
-│   ├── 06-results.md              <- where numbers live (gitignored dashboards + skill notes)
-│   ├── 07-adapter-contracts.md     <- shared loop, runtime defaults, and measured caveats
+│   ├── guide.md                   <- run flow, adapter tool surfaces, question index, grading, results
+│   ├── 07-adapter-contracts.md    <- shared loop, runtime defaults, and measured caveats
+│   ├── mixed-workload.md          <- bounded mixed-workload admission probe
 │   └── questions/
 │       ├── click/Q1.md .. Q10.md      <- one file per question, prompt only, no answers/checks
 │       ├── zustand/Q1.md .. Q10.md
@@ -53,11 +52,8 @@ benchmark/local/
 ├── scripts/
 │   ├── prepare_repo.sh             <- RUNNER-only: clones/pins all 3 repos into .context/
 │   ├── restart_ollama.sh           <- restarts the local Ollama server
-│   ├── agent_context.py            <- shared: context budget, head+tail clipping, repeat + JSON repair
-│   ├── test_agent_context.py       <- contracts for the above (no model needed)
-│   ├── test_bash_confine.py        <- read-only confinement contracts
-│   ├── octocode_agent.py           <- Agent A adapter (Ollama + octocode CLI)
-│   ├── bash_agent.py               <- Agent B adapter (Ollama + raw shell only)
+│   ├── mixed-workload.mjs          <- bounded mixed-workload admission probe (docs/mixed-workload.md)
+│   ├── test-mixed-workload.mjs     <- mock-server contracts for the probe (no model needed)
 │   └── run_all.sh                  <- runs everything for one model: matrix -> aggregate -> render
 ├── runs/index.jsonl                <- generated local ledger: one line per run_all.sh call
 ├── .context/                       <- gitignored; created by prepare_repo.sh (click/zustand/openui)
@@ -103,12 +99,13 @@ nothing to hand-edit. Each model gets its own `results/<model-slug>/`, and every
 one line to `runs/index.jsonl` recording the run IDs, model, date, pass rate, and data location.
 The script creates this local ledger; Git does not track it unless you add it intentionally.
 
-See `docs/01-flow.md` for what each step does, and `docs/05-grading-and-judge.md` for how
-the (non-local, post-hoc) LLM judge pass works.
+See the [run flow](docs/guide.md#run-flow) for what each step does, and
+[grading](docs/guide.md#grading) for how the (non-local, post-hoc) LLM judge pass works.
 
 ## Adapter loop behaviour these numbers depend on
 
-Both adapters share `scripts/agent_context.py`. Four of its behaviours change results materially,
+Both adapters share the context modules in `packages/mcp/src/research/` (`fit.ts`,
+`context-manager.ts`, `observations.ts`, `actions.ts`). Four of their behaviours change results materially,
 so a run recorded before they existed is not comparable to one after:
 
 - **Context budgeting.** At `num_ctx=8192` a 10-turn conversation overflows the window, and Ollama
@@ -130,11 +127,11 @@ so a run recorded before they existed is not comparable to one after:
 
 The adapter prompts also scope searches away from `node_modules`/`target`/`.venv` and treat
 `fixtures/` and `mocks/` as scaffolding. Because those prompts were tuned against this repo and the
-`.context/` corpora, adapter changes must be graded on [`benchmark/holdout/`](../holdout/README.md)
-instead — fresh upstream repos the prompts were never fitted to.
+`.context/` corpora, results on this suite overstate generalization; evaluate adapter changes on
+repositories outside `.context/` before claiming they generalize.
 
-Use the [Octocode](docs/02-agent-a-octocode.md) and [Bash](docs/03-agent-b-bash.md) guides for their
-tool surfaces. Exact generated prompts live in the adapter source files.
+Use the [Octocode](docs/guide.md#octocode-adapter) and [Bash](docs/guide.md#bash-adapter) guide
+sections for their tool surfaces. Exact generated prompts live in the adapter source files.
 
 Every runtime and compaction knob is validated through `FREELLAMA_AGENT_*`; the complete schema,
 defaults, per-call MCP mapping, and result metadata live in the

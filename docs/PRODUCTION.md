@@ -12,7 +12,7 @@ not provide tenant isolation or billing.
 
 - Install one Ollama CLI and server version. Run `freellama doctor` and resolve any mismatch.
 - Install Node.js 20 or later for MCP and npm distribution use.
-- Use the release artifacts for your operating system, or build with Rust 1.85 or later.
+- Use the release artifacts for your operating system, or build with Rust 1.88 or later.
 - Preinstall and benchmark exact model tags. Discovery never authorizes a pull.
 - Keep the primary and optional CPU Ollama processes on distinct loopback sockets.
 
@@ -31,9 +31,9 @@ published tag:
 powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Version VERSION
 ```
 
-The [release workflow](../.github/workflows/release.yml) builds CLI and native artifacts for eight
+The [release workflow](https://github.com/bgauryy/FreeLlama/blob/main/.github/workflows/release.yml) builds CLI and native artifacts for eight
 targets, assembles packages, verifies package contents, and publishes on version tags. The
-[CI workflow](../.github/workflows/ci.yml) runs Rust checks on macOS, Linux, and Windows, plus
+[CI workflow](https://github.com/bgauryy/FreeLlama/blob/main/.github/workflows/ci.yml) runs Rust checks on macOS, Linux, and Windows, plus
 JavaScript/native checks on macOS and Linux. These workflows do not prove driver compatibility or
 complete the hardware promotion checklist below. Release artifact builds depend on the reusable CI checks.
 The publish step also verifies that a version tag matches the workspace version.
@@ -41,7 +41,7 @@ Live E2E and hardware qualification remain separate operator checks; verify thos
 
 For manual assembly, build and test every claimed target in a clean
 environment, place each executable and matching addon under `release-artifacts/<target>/`, run
-`yarn release:assemble release-artifacts release` and `yarn release:verify:publish`, then attach
+`node scripts/assemble-release.mjs release-artifacts release` and `yarn release:verify:publish`, then attach
 `release/SHA256SUMS` and binaries to the release. Publish the eight `@octocodeai/freellama-native-*` packages
 first, followed by the exact-version `@octocodeai/freellama` and `@octocodeai/freellama-mcp-server` packages. Configure
 registry credentials in the release environment; never store them in the repository.

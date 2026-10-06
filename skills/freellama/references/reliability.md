@@ -16,7 +16,7 @@ amplify overload or turn one slow failure into a task timeout.
   evidence. Keep this separate from transport retries.
 
 Every behavior change needs a red proxy or platform contract first. Exact constants, incident data,
-process-recovery flow, and test names: `assets/evidence/reliability.md`.
+process-recovery flow, and test names: `docs/dev/evidence/reliability.md`.
 
 Next: symptom diagnosis → `references/troubleshooting.md`; mode boundary →
 `references/proxy-vs-serve.md`.

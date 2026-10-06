@@ -53,4 +53,4 @@ for (const target of targets) {
   }
 }
 
-console.log(`\nbuilt ${targets.length} target(s) at ${version} into release-artifacts/; next: yarn release:assemble`);
+console.log(`\nbuilt ${targets.length} target(s) at ${version} into release-artifacts/; next: node scripts/assemble-release.mjs`);

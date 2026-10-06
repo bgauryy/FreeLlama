@@ -20,10 +20,13 @@ probe, including loading/unloading costs, rather than a warm interactive-session
 Do not run alongside unrelated callers using the same selected model; residency can change
 after the initial observation and the benchmark has no exclusive ownership of the backend.
 
+The runner imports the compiled context fitter from `packages/mcp/dist/research/benchmark.js`, so
+run `yarn build` (or `yarn workspace @octocodeai/freellama-mcp-server build`) once first.
+
 From the repository root, first run a smoke check:
 
 ```sh
-python3 benchmark/local/scripts/mixed_workload.py run \
+node benchmark/local/scripts/mixed-workload.mjs run \
   --endpoint http://127.0.0.1:11435 --model EXACT_INSTALLED_TAG \
   --smoke --output .octocode/octocode-eval-benchmark/mixed-smoke.json
 ```
@@ -31,16 +34,16 @@ python3 benchmark/local/scripts/mixed_workload.py run \
 For repeatability, capture baseline and candidate under the same workload and host conditions:
 
 ```sh
-python3 benchmark/local/scripts/mixed_workload.py run \
+node benchmark/local/scripts/mixed-workload.mjs run \
   --endpoint http://127.0.0.1:11435 --model EXACT_INSTALLED_TAG \
   --include-compacted --output .octocode/octocode-eval-benchmark/mixed-baseline.json
 
 # After the independently reviewed subject change, repeat with the same flags:
-python3 benchmark/local/scripts/mixed_workload.py run \
+node benchmark/local/scripts/mixed-workload.mjs run \
   --endpoint http://127.0.0.1:11435 --model EXACT_INSTALLED_TAG \
   --include-compacted --output .octocode/octocode-eval-benchmark/mixed-candidate.json
 
-python3 benchmark/local/scripts/mixed_workload.py compare \
+node benchmark/local/scripts/mixed-workload.mjs compare \
   --baseline .octocode/octocode-eval-benchmark/mixed-baseline.json \
   --candidate .octocode/octocode-eval-benchmark/mixed-candidate.json \
   --output .octocode/octocode-eval-benchmark/mixed-comparison.json
@@ -102,11 +105,11 @@ Outputs use exclusive creation and never overwrite an earlier report.
 
 Raw JSON includes every request and bounded full response (maximum 1 MiB per response), task
 identity and trial, grade and HTTP status, model catalog/digests, health snapshots, wake samples,
-budget, fixture/contract hashes, and the runner plus context-fitter source hash. Hashes freeze
+budget, fixture/contract hashes, and the runner plus compiled context-fitter hash. Hashes freeze
 the benchmark contract during comparisons. Keep source, fixtures, graders, parameters, models,
 and host conditions fixed between baseline and candidate. Do not edit cases to improve a score.
 
-The report contains task latency p50/p95, control-plane health latency p95, local Python process
+The report contains task latency p50/p95, control-plane health latency p95, local Node.js process
 wake jitter p95, minimum observed available RAM, swap-out growth, load, and thermal observations.
 Health latency measures the control plane, not desktop responsiveness. Wake jitter measures this
 process's scheduling delay, not an application's event loop, rendering, input latency, or UI.
@@ -132,7 +135,7 @@ comparison reports `NO_MEASURED_IMPROVEMENT` when a comparable result misses the
 Validate the runner without live inference:
 
 ```sh
-python3 benchmark/local/scripts/test_mixed_workload.py
+yarn test:agents:node
 ```
 
 Fixture and mock-server tests cover payload limits, context compaction, strict JSON grading,

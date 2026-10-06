@@ -31,7 +31,7 @@ impl http_body::Body for IncompleteRequestBody {
 async fn incomplete_upload_times_out_and_releases_execution_before_any_upstream_request() {
     let (upstream, calls) = spawn_flaky_upstream(0).await;
     let execution = Arc::new(RwLock::new(()));
-    let proxy = app(common::proxy_config("127.0.0.1:0", upstream, false)
+    let proxy = app(crate::support::proxy_config("127.0.0.1:0", upstream, false)
         .with_request_timeout(std::time::Duration::from_millis(40))
         .with_max_concurrent_requests(1)
         .with_execution_lock(execution.clone()))
@@ -79,7 +79,7 @@ fn counting_restart_action(calls: Arc<AtomicUsize>) -> freellama::proxy::Restart
 
 #[test]
 fn proxy_is_loopback_only_by_default() {
-    let config = common::proxy_config("0.0.0.0:11435", "http://127.0.0.1:11434", false);
+    let config = crate::support::proxy_config("0.0.0.0:11435", "http://127.0.0.1:11434", false);
     assert!(config.validate().is_err());
 }
 
@@ -94,7 +94,7 @@ fn proxy_preserves_path_and_query() {
 
 #[test]
 fn proxy_rejects_a_recursive_upstream() {
-    let config = common::proxy_config("127.0.0.1:11435", "http://127.0.0.1:11435", false);
+    let config = crate::support::proxy_config("127.0.0.1:11435", "http://127.0.0.1:11435", false);
     assert!(config.validate().is_err());
 }
 
@@ -128,7 +128,7 @@ async fn spawn_flaky_upstream(fail_count: usize) -> (String, Arc<AtomicUsize>) {
 #[tokio::test]
 async fn proxy_retries_transient_upstream_errors_and_eventually_succeeds() {
     let (upstream, calls) = spawn_flaky_upstream(2).await;
-    let config = common::proxy_config("127.0.0.1:0", upstream, false);
+    let config = crate::support::proxy_config("127.0.0.1:0", upstream, false);
     let router = app(config).unwrap();
 
     let request = Request::builder()
@@ -164,7 +164,7 @@ async fn proxy_does_not_retry_upstream_503() {
     tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
-    let config = common::proxy_config("127.0.0.1:0", format!("http://{addr}"), false);
+    let config = crate::support::proxy_config("127.0.0.1:0", format!("http://{addr}"), false);
     let proxy = app(config).unwrap();
 
     let request = Request::builder()
@@ -200,7 +200,7 @@ async fn proxy_does_not_retry_an_unlisted_5xx_status() {
     tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
-    let proxy = app(common::proxy_config(
+    let proxy = app(crate::support::proxy_config(
         "127.0.0.1:0",
         format!("http://{addr}"),
         false,
@@ -238,7 +238,7 @@ async fn proxy_does_not_retry_upstream_504() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-    let proxy = app(common::proxy_config(
+    let proxy = app(crate::support::proxy_config(
         "127.0.0.1:0",
         format!("http://{addr}"),
         false,
@@ -270,7 +270,7 @@ async fn proxy_does_not_replay_after_upstream_accepts_then_disconnects() {
             drop(socket);
         }
     });
-    let proxy = app(common::proxy_config("127.0.0.1:0", upstream, false)).unwrap();
+    let proxy = app(crate::support::proxy_config("127.0.0.1:0", upstream, false)).unwrap();
     let response = proxy
         .oneshot(Request::post("/api/chat").body(Body::from("{}")).unwrap())
         .await
@@ -305,7 +305,7 @@ async fn spawn_hanging_upstream(hang_for: std::time::Duration) -> (String, Arc<A
 async fn proxy_times_out_a_hung_upstream_instead_of_blocking_forever() {
     let (upstream, calls) = spawn_hanging_upstream(std::time::Duration::from_secs(30)).await;
     let execution = Arc::new(RwLock::new(()));
-    let config = common::proxy_config("127.0.0.1:0", upstream, false)
+    let config = crate::support::proxy_config("127.0.0.1:0", upstream, false)
         .with_request_timeout(std::time::Duration::from_millis(200))
         .with_execution_lock(execution.clone());
     let router = app(config).unwrap();
@@ -370,7 +370,7 @@ async fn raw_proxy_cap_is_held_for_the_stream_lifetime() {
     });
     let execution = Arc::new(RwLock::new(()));
     let proxy = app(
-        common::proxy_config("127.0.0.1:0", format!("http://{addr}"), false)
+        crate::support::proxy_config("127.0.0.1:0", format!("http://{addr}"), false)
             .with_max_concurrent_requests(1)
             .with_execution_lock(execution.clone()),
     )
@@ -407,7 +407,7 @@ async fn raw_proxy_cap_is_held_for_the_stream_lifetime() {
 async fn raw_mutations_share_managed_execution_but_metadata_remains_available() {
     let (upstream, calls) = spawn_flaky_upstream(0).await;
     let execution = Arc::new(RwLock::new(()));
-    let proxy = app(common::proxy_config("127.0.0.1:0", upstream, false)
+    let proxy = app(crate::support::proxy_config("127.0.0.1:0", upstream, false)
         .with_max_concurrent_requests(1)
         .with_execution_lock(execution.clone()))
     .unwrap();
@@ -471,7 +471,7 @@ async fn raw_mutations_share_managed_execution_but_metadata_remains_available() 
 #[tokio::test]
 async fn proxy_gives_up_after_max_attempts_on_persistent_failure() {
     let (upstream, calls) = spawn_flaky_upstream(usize::MAX).await;
-    let config = common::proxy_config("127.0.0.1:0", upstream, false);
+    let config = crate::support::proxy_config("127.0.0.1:0", upstream, false);
     let router = app(config).unwrap();
 
     let request = Request::builder()
@@ -503,7 +503,7 @@ async fn closed_port_upstream() -> String {
 async fn proxy_restarts_ollama_once_after_a_connection_refused_failure() {
     let upstream = closed_port_upstream().await;
     let restart_calls = Arc::new(AtomicUsize::new(0));
-    let config = common::proxy_config("127.0.0.1:0", upstream, false)
+    let config = crate::support::proxy_config("127.0.0.1:0", upstream, false)
         .with_auto_restart_ollama(true)
         .with_restart_action(counting_restart_action(restart_calls.clone()));
     let router = app(config).unwrap();
@@ -531,7 +531,7 @@ async fn proxy_does_not_restart_ollama_when_auto_restart_is_disabled() {
     let upstream = closed_port_upstream().await;
     let restart_calls = Arc::new(AtomicUsize::new(0));
     // auto_restart_ollama defaults to false — the restart action is wired up but must never fire.
-    let config = common::proxy_config("127.0.0.1:0", upstream, false)
+    let config = crate::support::proxy_config("127.0.0.1:0", upstream, false)
         .with_restart_action(counting_restart_action(restart_calls.clone()));
     let router = app(config).unwrap();
 
@@ -554,7 +554,7 @@ async fn proxy_does_not_restart_ollama_when_auto_restart_is_disabled() {
 async fn proxy_does_not_restart_ollama_for_an_ordinary_5xx_not_a_dead_process() {
     let (upstream, calls) = spawn_flaky_upstream(usize::MAX).await;
     let restart_calls = Arc::new(AtomicUsize::new(0));
-    let config = common::proxy_config("127.0.0.1:0", upstream, false)
+    let config = crate::support::proxy_config("127.0.0.1:0", upstream, false)
         .with_auto_restart_ollama(true)
         .with_restart_action(counting_restart_action(restart_calls.clone()));
     let router = app(config).unwrap();
@@ -578,13 +578,12 @@ async fn proxy_does_not_restart_ollama_for_an_ordinary_5xx_not_a_dead_process() 
         "a real HTTP 500 is not a dead process — restarting Ollama would not help and must not happen"
     );
 }
-mod common;
 
 #[tokio::test]
 async fn model_file_work_and_unloads_bypass_the_execution_lock() {
     let (upstream, calls) = spawn_flaky_upstream(0).await;
     let execution = Arc::new(RwLock::new(()));
-    let proxy = app(common::proxy_config("127.0.0.1:0", upstream, false)
+    let proxy = app(crate::support::proxy_config("127.0.0.1:0", upstream, false)
         .with_max_concurrent_requests(1)
         .with_execution_lock(execution.clone()))
     .unwrap();
@@ -643,7 +642,7 @@ async fn request_timeout_bounds_silence_not_a_stream_that_keeps_producing() {
         socket.write_all(b"0\r\n\r\n").await.unwrap();
     });
     let proxy = app(
-        common::proxy_config("127.0.0.1:0", format!("http://{addr}"), false)
+        crate::support::proxy_config("127.0.0.1:0", format!("http://{addr}"), false)
             .with_request_timeout(std::time::Duration::from_millis(150)),
     )
     .unwrap();
@@ -681,7 +680,7 @@ async fn raw_queue_wait_admits_a_waiter_when_the_stream_ends() {
         }
     });
     let proxy = app(
-        common::proxy_config("127.0.0.1:0", format!("http://{addr}"), false)
+        crate::support::proxy_config("127.0.0.1:0", format!("http://{addr}"), false)
             .with_max_concurrent_requests(1)
             .with_raw_queue_wait(Duration::from_secs(2)),
     )

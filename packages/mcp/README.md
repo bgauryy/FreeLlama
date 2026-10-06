@@ -9,58 +9,22 @@ evidence for the calling agent to inspect.
 
 The agent owns prompts, task dependencies, and answer verification. The operator configures
 Ollama and model lifecycle permissions; Ollama performs inference. See
-[architecture](../../docs/ARCHITECTURE.md) for the full ownership boundary.
+[architecture](https://github.com/bgauryy/FreeLlama/blob/main/docs/ARCHITECTURE.md) for the full ownership boundary.
 The server uses the official [TypeScript SDK](https://github.com/modelcontextprotocol/typescript-sdk).
 
 ## Understand the tools
 
-- `doctor`, `models`, `run_task`, `task_jobs`, `run_task_batch` — thin wrappers over the native NAPI bindings into the
-  Rust core (`../rust-core/src/napi.rs`); no CLI subprocess, no reimplemented routing logic.
-  `run_task { preview: true }` is the decision-only form and does not run inference.
-  Preview and execution are separate calls: preview accepts routing fields only and rejects task
-  payloads or runtime controls instead of silently ignoring them.
-  `models { view: "library" }` queries the public `ollama.com` library (the former `search_models` tool).
-- `scope` — creates, inspects, forks, or deletes bounded process-local message history.
-- `warm_model` — warms an exact installed model through ordinary managed admission and placement.
-- `session` — creates and releases a bounded, idle-expiring model-affinity handle for related
-  route/task calls. It does not store messages, prompt history, or Ollama's runner KV cache.
-- `ollama_manage`, `ollama_delete` — Ollama's HTTP API for lifecycle operations the routing layer
-  doesn't cover.
-- `delegate_research` — offloads a grounded code-research question to a local model and returns a
-  verdict computed from model evidence, successful tool calls, and question-shape heuristics.
-  The verdict guides verification; it does not certify answer correctness.
+`doctor`, `models`, `run_task`, and `task_jobs` call the Rust core through native NAPI bindings
+(`packages/rust-core/src/napi.rs`), with no CLI subprocess and no routing decisions in TypeScript; the
+TypeScript layer validates request shapes and derives presentation fields (see
+[what the MCP layer computes](#what-the-mcp-layer-computes)). `run_task` has four modes: one task,
+`tasks[]` (independent batch), `preview: true` (decision only, no inference), and `warm: true`
+(load an exact installed model, no generation). Preview and execution are separate calls: preview
+accepts routing fields only and rejects task payloads or runtime controls instead of silently
+ignoring them. `ollama_manage` and `ollama_delete` call Ollama's HTTP API directly for lifecycle
+operations the routing layer does not perform.
 
-Use the smallest tool that owns the operation:
-
-```mermaid
-flowchart TD
-    Q{"What does the client need?"}
-    Q -->|"Diagnose the local runtime"| D["doctor"]
-    Q -->|"Inspect installed, resident, detailed, raw, or online models"| M["models"]
-    Q -->|"Choose or execute one task"| R["run_task"]
-    Q -->|"Inspect or cancel deferred work"| J["task_jobs"]
-    Q -->|"Fan out independent tasks"| B["run_task_batch"]
-    Q -->|"Keep/release related-task model affinity"| S["session"]
-    Q -->|"Retain or fork message history"| H["scope"]
-    Q -->|"Prepare runner residency"| W["warm_model"]
-    Q -->|"Pull or stop a model"| O["ollama_manage"]
-    Q -->|"Permanently remove a named model"| X["ollama_delete"]
-    Q -->|"Ground an answer in workspace files"| G["delegate_research"]
-```
-
-| Tool | Why it exists |
-|---|---|
-| `doctor` | Makes runtime, version, memory, and configuration drift visible before work starts. |
-| `models` | Separates installed, resident, detailed, raw, and public-library questions instead of guessing from model names. |
-| `run_task` | Applies the same deterministic routing, confidence, admission, and execution contract as the Rust control plane. |
-| `task_jobs` | Lists, retrieves, cancels, or removes a bounded process-local task submitted with `defer:true`. Removal stops active work first. |
-| `run_task_batch` | Executes only caller-declared independent tasks. Stable IDs, a bounded dispatcher, 3:2:1 fair priority classes, and per-item errors make fan-out inspectable rather than implicit. |
-| `session` | Lets an agent explicitly own the lifetime of a bounded affinity handle without misrepresenting it as conversation or KV storage. |
-| `scope` | Retains bounded message history with expected revisions and explicit history reads. |
-| `warm_model` | Loads an installed runner profile using the same memory, admission, placement, and job controls as task execution. |
-| `ollama_manage` | Exposes additive lifecycle operations that FreeLlama routing intentionally does not perform. |
-| `ollama_delete` | Keeps irreversible deletion separate and explicit so a client can guard it. |
-| `delegate_research` | Gives a local model bounded read-only tools and returns citations plus an independently computed verification verdict. |
+Use the smallest tool that owns the operation; the canonical per-tool table is [Tools](#tools).
 
 ## Follow the agent workflow
 
@@ -79,7 +43,7 @@ submitted task; pass that UUID as `jobId` for every subsequent operation.
 Removal waits for local permits to be released before deleting the record. It returns the ID and
 terminal status; subsequent lookup returns `404`. It does not unload a shared Ollama model or
 prove that physical computation has stopped. Receipts are bounded and lost on server restart;
-see [retention and task states](../../docs/MONITORING.md#read-the-live-status).
+see [retention and task states](https://github.com/bgauryy/FreeLlama/blob/main/docs/MONITORING.md#read-the-live-status).
 
 Follow this workflow. The server's initialization instructions carry a compressed form of the
 same contract (inventory first, preview semantics, evidence levels, ownership, and pull approval):
@@ -87,8 +51,7 @@ same contract (inventory first, preview semantics, evidence levels, ownership, a
 1. Start with `models {view:"installed"}`, then `models {view:"resident"}`. This gives a routing
    agent the smallest current inventory first.
 2. Call `doctor` only for runtime or configuration diagnosis. It returns `summary` by default;
-   use `view:"scheduler"` for configured/snapshot scheduling evidence or `view:"full"` for the
-   complete diagnostic. If Ollama is missing or unreachable, ask the operator to install or start it.
+   use `view:"status"` for live queues and limits or `view:"full"` for the complete diagnostic. If Ollama is missing or unreachable, ask the operator to install or start it.
 3. Classify the task. Offload embeddings, OCR/vision, bulk transforms, and sufficiently large
    grounded lookups; retain small lookups and high-stakes judgment in the calling agent.
 4. Prefer a qualified installed model and preview consequential work.
@@ -132,7 +95,41 @@ counts, placement, or unloading. It cannot prove research correctness, coding ju
 throughput, or fairness from one run. Check the returned confidence, policy evidence, and benchmark
 evidence before accepting a consequential answer.
 
-### Measure avoided external cost
+### Token economics
+
+Offloading keeps source material and intermediate tool output out of the calling agent's context;
+the local model still spends tokens, power, and time. Per-call rows below come from one machine
+(M4 Pro, 48 GB unified memory); `~` values are estimates.
+
+| Work | Source tokens | Returned tokens | Preserved |
+|---|---:|---:|---:|
+| 6 grounded code questions | 59,208 | 1,742 | **97.1%** |
+| 4 text embeddings (307 ms) | 17,600 | ~200 | **98.9%** |
+| 1 image, OCR, byte-exact | 1,970 | 37 | **98.1%** |
+
+A dated MCP-envelope audit (2026-09-03, `characters / 4` as a rough token estimate) measured the
+duplicate text copy FreeLlama does not emit beside `structuredContent`: `doctor {view:"summary"}`
+avoids ~3,064 chars, `doctor {view:"full"}` ~10,651, `models {view:"raw", limit:1}` ~404. These
+are **not billed-token savings** unless the host would otherwise feed both representations to a
+model. The tool schema itself is per-turn rent, bounded by the
+[protocol context-budget test](https://github.com/bgauryy/FreeLlama/blob/main/packages/mcp/test/integration/protocol.test.ts);
+read documentation resources on demand and filter unneeded tools where the client supports it.
+
+| Cost side | Measured |
+|---|---|
+| Grounded question latency | **7–62 s** vs ~1 s for a frontier model that already holds the file |
+| Scaling | turn-dominated: `seconds ≈ 9.8 × tool_calls`, correlation 0.811 over 60 runs |
+| Break-even | past ~1k tokens of source the token maths wins; below that, read the file directly |
+| Judgment ceiling | ~67% accurate, in the same confident tone as the ~99% case |
+
+Ollama prefix-cache reuse works on this path (a warm 2,462-token prefix re-prefilled in ~281 ms
+versus ~18.6 s cold, and survived an interleaved conversation), so per-turn cost is new-token
+prefill plus generation. Context compaction rewrites old observations and invalidates the cache
+from that point; leave headroom (for example `OLLAMA_KV_CACHE_TYPE=q8_0`) so compaction stays rare.
+Session-scale projections depend on provider, caching, and pricing; measure the client's actual
+transcript before claiming a token or billing reduction.
+
+#### Avoided external cost
 
 Every successful `run_task`, batch item, and `delegate_research` result includes `telemetry.local`
 when Ollama reports input/output token counts. To add `telemetry.externalEquivalent`, configure one
@@ -155,8 +152,18 @@ configuration stops the MCP server at startup instead of emitting a misleading e
 Use `run_task` for supplied image bytes, not `delegate_research`. Preview
 `{task:"vision", requiredCapabilities:["vision"], preview:true}` before a consequential image
 task. Execute separately with a prompt and base64 `images` values without data-URI prefixes. The
-`images` field requires an explicitly trialed vision model; inspect the execution receipt for
-admission and observed placement.
+`images` field needs an explicit trialed vision `model`, or an operator `[policies.vision]` entry in
+the serve policy file; without either the core refuses rather than trusting a `vision` capability
+tag. Inspect the execution receipt for admission and observed placement.
+
+OCR models answer best to their native prompts (glm-ocr: `Text Recognition:`, `Table Recognition:`,
+`Formula Recognition:`). For a `glmocr`-architecture model, vision routes default
+`options.stop:["```"]` because Ollama >= 0.30 builds repeat the answer behind a Markdown fence;
+pass your own `stop` (even `[]`) to override. Any length-capped answer that ends in a repetition
+loop gets `output_check: {repetition_loop: true, unique_prefix_chars, period_chars}` in the result;
+the MCP answer text shows one copy and the untrimmed output stays in `structuredContent.response`.
+With no policy, single-purpose OCR architectures are a last resort for non-vision tasks, so a
+resident OCR model does not answer general chat.
 
 FreeLlama can prove that it routed and ran a request. It cannot infer OCR or visual-reasoning
 quality from a capability tag, a model name, or GPU placement. Quality depends on the exact
@@ -164,9 +171,8 @@ installed model build, prompt and decoding settings, context/output budget, and 
 memory and accelerator performance. Validate representative held-out images on the target machine
 and supply policy/benchmark evidence before automatically accepting a quality-sensitive result.
 
-The caller owns task decomposition and concurrent submission. The operator owns endpoints, exact
-CPU assignments, runtime settings, and lifecycle approval. FreeLlama owns qualification, managed
-placement and admission. Ollama and the OS/driver own runner loading and physical CPU/GPU execution.
+Ownership of decomposition, CPU assignments, placement, and physical execution follows the
+[responsibility boundary](https://github.com/bgauryy/FreeLlama/blob/main/docs/ARCHITECTURE.md#responsibility-boundary).
 
 ## Follow the architecture
 
@@ -188,50 +194,34 @@ flowchart TD
 `doctor`, the installed/resident model views, and `run_task` use the NAPI binding instead of a CLI
 subprocess. Direct lifecycle and no-serve model views use Ollama HTTP. `delegate_research` starts a
 bounded adapter against an allowlisted workspace; each adapter model turn re-enters managed
-`run_task` as `coding`, so it shares routing, admission, and placement evidence. Routing logic is
-not duplicated in TypeScript.
+`run_task` as `coding`, so it shares routing, admission, and placement evidence. The adapters are
+TypeScript in `src/research/`, compiled to `dist/research/{bash-agent,octocode-agent}.js`, and run as
+`node <file>` in their own process group with the server's Node.js; no Python is required.
+
+### What the MCP layer computes
+
+Model selection, confidence floors, admission, and placement are decided only in the Rust core.
+The TypeScript server adds a small set of derived fields on top of core results:
+
+- request-shape validation (preview-only fields, embedding versus chat payloads, scope pairs);
+- answer text, embedding summaries, and optional avoided-cost telemetry for `run_task`;
+- `models {view:"resident"}` placement labels: `gpu_percent` from `resident_vram / resident_size`,
+  a processor label (core-observed processor first, otherwise derived from that ratio), and
+  mismatch or partial-offload warnings;
+- library-tag `fitsInMemory` against a conservative host-memory budget and a trial candidate;
+- the `delegate_research` verification verdict from per-model evidence and tool-call facts.
 
 ## Read packaged documentation through MCP
 
-The published MCP package includes every Markdown file from the repository `docs/` directory. The
-repository directory remains the source of truth; the package build copies it into `docs/` and
-creates `docs/INDEX.md`.
+The published MCP package includes the top-level Markdown guides from the repository `docs/`
+directory (developer notes under `docs/dev/` are not packaged). The repository directory remains the
+source of truth; the package build copies it into `docs/`.
 
-MCP clients can list resources and read `freellama://docs/index`, then fetch exactly one relevant
-guide such as `freellama://docs/PRODUCTION`, `freellama://docs/CLI`, or
-`freellama://docs/OLLAMA_SYSTEM_OPTIMIZATION`. Resources are deliberately lazy: do not load every
-guide into an agent context. The server fails on startup if the generated index is absent, and the
-release verifier checks that the packed documents match the root `docs/` set.
+MCP clients can list resources and read `freellama://docs/index` (the repository `docs/README.md`),
+then fetch exactly one relevant guide such as `freellama://docs/PRODUCTION` or
+`freellama://docs/CLI`. Resources are deliberately lazy: do not load every guide into an agent
+context. The server fails on startup if the index is absent.
 
-## Build
-
-Build the native addon from the repository root and this package in place.
-
-```bash
-# From the repository root (yarn workspaces — one install for every package)
-yarn install
-yarn build
-```
-
-`yarn build` writes **one** MCP file, `packages/mcp/dist/index.js` (shebang, executable). During
-checkout development it loads `native/freellama.<triple>.node`. Published installs resolve the
-matching `@octocodeai/freellama-native-<target>` optional package instead, so the base MCP package remains
-portable. Research adapters are copied into `adapters/` for packed installs.
-
-Piecewise, if you are iterating on one layer:
-
-```bash
-# 1. Native addon → packages/mcp/native/freellama.<triple>.node
-yarn build:native
-
-# 2. This server → dist/index.js via esbuild (then copies the research adapters into adapters/)
-yarn workspace @octocodeai/freellama-mcp-server build
-```
-
-`yarn start` needs `dist/index.js` and the compiled `.node` addon — `yarn build` from the repository
-root produces both in a checkout. `dist/index.js` loads `native/index.js`, which loads a local addon
-first and then a matching optional platform package. The `.node` binary is gitignored (a build
-artifact); `native/index.js` and `native/index.d.ts` are hand-written and checked in.
 
 ## Run
 
@@ -264,37 +254,17 @@ The server speaks MCP over stdio — configure it in your MCP client, do not run
 
 **Cursor / other clients** — use the same `command`/`args` shape in their MCP server config.
 
-## Test
-
-Vitest, in three tiers (all TypeScript, under `test/`):
-
-| Tier | Command (from this package) | Checks | Needs |
-|---|---|---|---|
-| `test/unit/` | `yarn test` (watch: `yarn test:watch`) | pure functions straight from `src/*.ts` — no build step, this is the TDD loop | nothing, ~0.5s |
-| `test/integration/` | `yarn test:integration` | the built server over the real MCP protocol: tool contract, structured content, guardrails; rebuilds `dist/` itself | Ollama at `FREELLAMA_OLLAMA_ENDPOINT` (default :11434) |
-| `test/e2e/` | `yarn test:e2e` | every tool against the live system: real routing/execution, pull → delete round trip (net-zero), a real delegated research run | serve + Ollama + models, ~40s |
-
-The same commands work from the repository root (`yarn test` there also runs the CLI package's tests).
-The integration/e2e tiers fail fast with a readable message when Ollama is down, and the lifecycle
-test refuses to delete a model already installed on the test system.
-
-For default-endpoint autostart, a spawn failure, early exit, or readiness timeout rejects the
-request while leaving the MCP transport available for diagnosis or retry. Autostart does not apply
-to an explicit non-default endpoint; see `FREELLAMA_MCP_AUTOSTART_SERVE` below.
-
 ## Tools
 
 | Tool | Needs `freellama serve`? | What it does |
 |---|---|---|
-| `doctor` | No | Runtime/configuration diagnostic. `summary` (default) returns endpoint, version, resident count, host/profile signals, and next step; `scheduler` adds configured/snapshot admission data; `config` returns categorized settings; `full` adds all non-duplicated diagnostics; `status` returns serve's live view (per-backend queues, current and adaptive limits, circuit breakers, loaded models, host memory, Ollama's effective settings, today's usage); `usage` returns task and token totals per day and model (`days`, default 7). The report distinguishes an observed same-user macOS process from configuration hints and never claims remote process visibility. |
+| `doctor` | No (except `status`/`usage`) | Runtime/configuration diagnostic. Target another Ollama with `ollamaEndpoint` and serve with `serveEndpoint`. `summary` (default) returns endpoint, version, resident count, host/profile signals, and next step; `full` adds all non-duplicated diagnostics, including admission and categorized Ollama settings; `status` returns serve's live view (per-backend queues, current and adaptive limits, circuit breakers, loaded models, host memory, Ollama's effective settings, today's usage); `usage` returns task and token totals per day and model (`days`, default 7). The report distinguishes an observed same-user macOS process from configuration hints and never claims remote process visibility. |
 | `models` | `installed` (default) and `resident` do; `detail`/`raw`/`library` don't | Views: `installed` (capabilities, use explanations, derived `model_type`, VRAM, context, policy_rank), `resident` (loaded now + managed GPU/CPU split), `detail` (one model, maximum context), paged `raw` (`GET /api/tags`), `library` (two-step ollama.com search: omit `model` for families, pass `model:"<family>"` for all tags/`fitsInMemory`). `includeLibrary:true` enriches installed/detail views with sourced public guidance; `includeReadme:true` returns bounded README text in library step 2 or enriched detail. |
-| `run_task` | Yes | **Routes or executes** a chat/generate/embed call. `preview: true` accepts routing fields only and returns a decision without generation. Execution omits preview and supplies the payload. Embedding results withhold raw vectors by default (`returnEmbeddings: true` to get them) |
+| `run_task` | Yes | **Routes or executes** a chat/generate/embed call. `preview: true` accepts routing fields only and returns a decision without generation. Execution omits preview and supplies the payload. Embedding results withhold raw vectors by default (`returnEmbeddings: true` to get them). `tasks: [{id, independent:true, task}]` (max 64, `maxParallelism` bounds fan-out) runs a batch whose nested `task` takes the same fields; it is not a dependency scheduler. `warm: true` warms an exact installed `model` through managed admission with residency/profile controls and optional `defer:true`. |
 | `scope` | Yes | Creates, inspects, forks, or deletes process-local message history; history inclusion requires `includeMessages:true`. |
-| `warm_model` | Yes | Warms an exact installed model through managed admission; accepts residency/profile controls and optional `defer:true`. |
-| `session` | Yes | Creates or releases model affinity without storing messages or KV. |
+| `session` | Yes | Creates, deletes, or kills model affinity without storing messages or KV; `kill` cancels the session's in-flight work. |
 | `task_jobs` | Yes | Inspects, cancels, or removes a deferred task or warming operation. |
-| `run_task_batch` | Yes | Executes only typed `{id, independent:true, task}` items. The nested `task` exposes the same task, routing, payload, and runtime controls as `run_task`; `maxParallelism` bounds fan-out. It is not a dependency graph scheduler. |
-| `ollama_manage` | No (direct to Ollama) | `action: "pull"` downloads a model; `action: "stop"` force-unloads it. Both additive and idempotent |
+| `ollama_manage` | No (direct to Ollama) | `action: "pull"` downloads a model (additive); `action: "stop"` force-unloads it. Both are idempotent |
 | `ollama_delete` | No (direct to Ollama) | **Destructive**: permanently removes a model. Call only on an explicit human instruction naming the exact model |
 | `delegate_research` | Yes (and spawns the adapter) | Answers a grounded question from files under `workspacePath`; managed coding turns return placement receipts, citations, and an independent verification verdict |
 
@@ -305,21 +275,22 @@ Use `models {view:"installed", includeLibrary:true}` to enrich each installed mo
 Website access is optional for installed/detail views. Public guidance requires a matching exact tag
 and digest prefix; local capabilities remain authoritative and benchmark/policy evidence stays separate.
 Family claims have source excerpts and fetch dates, and lookup failures retain local inventory.
-Search reports `cloudAvailable` and `cloudOnly:null`; inspect exact tags to establish local availability.
-See [Ollama model metadata](../../docs/MODEL_METADATA.md) for response fields, lookup states, cache bounds,
+Search reports `cloudAvailable` (a cloud variant exists), not whether a family is cloud-only; inspect
+exact tags to establish local availability.
+See [Model metadata](https://github.com/bgauryy/FreeLlama/blob/main/docs/MODEL_SELECTION.md#model-metadata) for response fields, lookup states, cache bounds,
 custom models, and variant limitations.
 
 ### Preserve Ollama request controls
 
 The tools declare an MCP object `outputSchema`. Schemas type the stable fields FreeLlama owns
 (such as route decision, page, answer, and session identifiers) while leaving Ollama-owned nested
-payloads forward-compatible. `structuredContent` is canonical; normal text is a concise cue. For
-the narrow `delegate_research` legacy case, set `legacyText:true` to receive serialized JSON text.
+payloads forward-compatible. `structuredContent` is canonical; normal text is a concise cue
+(`run_task` and `delegate_research` return the answer text).
 
 Use `models {view:"raw", limit:20}` and continue with its opaque `page.next_cursor`; a cursor
 refuses continuation if the live model list changed. Library tag responses use the same paging
-shape. Do not request `doctor {view:"full"}` in an agent loop: use `summary`, `scheduler`, or
-`config` for the smallest diagnostic that answers the question.
+shape. Do not request `doctor {view:"full"}` in an agent loop: use `summary`, `status`, or `usage` for
+the smallest diagnostic that answers the question.
 
 ### Preview and execution
 
@@ -363,7 +334,7 @@ Set `defer:true` on `run_task` to return a job ID immediately. Use `task_jobs {a
 metadata, `{action:"get", jobId}` for a retained result, and `{action:"cancel", jobId}` to cancel
 that task and wait for local permits to be released. `get` summarizes embedding vectors by default;
 set `returnEmbeddings:true` to include them. Cancellation does not unload a shared model or confirm
-physical runner shutdown. Jobs expire on restart; see [CLI controls](../../docs/CLI.md#execute-tasks)
+physical runner shutdown. Jobs expire on restart; see [CLI controls](https://github.com/bgauryy/FreeLlama/blob/main/docs/CLI.md#execute-tasks)
 for input, result, registry, and retention limits. Batch items cannot defer.
 
 Set `timeoutSeconds` on a task or batch item for a total deadline covering discovery, queueing,
@@ -375,11 +346,10 @@ You own the task instructions. Pass system prompts as `messages` entries with `r
 or use `systemPrompt` to prepend one caller-supplied system message. FreeLlama preserves existing
 messages and adds no task instructions of its own. A plain `prompt` becomes one user message,
 and a supplied `messages` array takes precedence over `prompt`. This also applies to
-`task:"code_review"` (an alias for `coding`) and `run_task_batch`: no review wrapper, mandatory
+`task:"code_review"` (an alias for `coding`) and `run_task {tasks}` batches: no review wrapper, mandatory
 JSON review format, or review-specific output-token minimum is added.
 
-The separate `delegate_research` adapter and natural-language routing interpreter retain internal
-protocol prompts for their own bounded jobs. Those prompts are not injected into `run_task`
+The separate `delegate_research` adapter retains internal protocol prompts for its own bounded job. Those prompts are not injected into `run_task`
 conversations. Ollama can still apply the selected model's own template or Modelfile defaults.
 
 `model_type` is a display-oriented value derived from Ollama's additive capabilities:
@@ -394,10 +364,10 @@ revision as `scopeId` and `scopeRevision` with only the new input to `run_task`;
 returns the next scope revision. Fork a snapshot before parallel branches. `sessionId` continues to
 mean model affinity only.
 
-Use `warm_model {model,contextTokens,keepAlive?}` for a matching runner profile. It accepts no task
+Use `run_task {warm:true,model,contextTokens,keepAlive?}` for a matching runner profile. It accepts no task
 payload and does not pull a model. Add `defer:true` to inspect its progress through `task_jobs`.
 Explicit `keepAlive` wins over finite adaptive retention. See the canonical
-[Scope history and model warming reference](../../docs/SCOPES_AND_WARMING.md) for schemas, limits,
+[Scope history and model warming reference](https://github.com/bgauryy/FreeLlama/blob/main/docs/SCOPES_AND_WARMING.md) for schemas, limits,
 concurrency, privacy, and cache boundaries.
 
 ### Use CPU assignments through MCP
@@ -414,7 +384,7 @@ comparable warm serial samples on both backends with a 10% advantage. It matches
 explicit observed context, effective controls, endpoint-attributed process settings, and managed
 admission class. Unknown identity, parallel intervals, and decision-only payload-free previews
 use capacity and policy signals. Stored legacy totals do not qualify speed hints. Feedback does
-not steer the `quality` objective. See [automatic feedback](../../docs/CPU_GPU_ROUTING.md#understand-automatic-feedback).
+not steer the `quality` objective. See [automatic feedback](https://github.com/bgauryy/FreeLlama/blob/main/docs/CPU_GPU_ROUTING.md#understand-automatic-feedback).
 `minPlacementEvidence:"observed"` fails closed unless resident
 `/api/ps` evidence matches the configured processor; warm cold models once with `"configured"`.
 `keepAlive:"0"` uses an observe-then-unload transaction: FreeLlama retains the runner long enough
@@ -423,7 +393,9 @@ then reports the unload verification in `execution.lifecycle`.
 
 Preview `execution.agent_plan` separates `queue_readiness`, `resource_readiness`, and combined
 `dispatch_readiness`. Inspect `execution.resource_assessment` for required bytes and missing telemetry;
-the preview shares execution's footprint estimate but never reserves memory. Local inference requires
+the preview shares execution's footprint estimate but never reserves memory. Low available RAM alone
+never refuses work: previews report `runnable_low_memory_estimate`, and execution dispatches with
+`resource_admission.status: "admitted_low_memory_estimate"`. Local inference requires
 RAM telemetry by default; configure an explicit alternative on `serve`, not in a model prompt.
 Resource errors retain a human-readable `error` plus machine-readable `code` and `resource_admission`
 fields in the HTTP response. MCP preserves JSON refusals in both error text and `structuredContent`,
@@ -432,7 +404,9 @@ Agents can use those fields to back off or explain a capacity hold without parsi
 
 `models {view: "resident"}` uses the managed catalog, so it includes resident models from both
 Ollama processes and labels explicitly assigned CPU models instead of querying only the primary
-server.
+server. The per-model `placement` object is derived in the MCP layer from the catalog's
+`resident_size`/`resident_vram` bytes and the core's placement observation; it is a display summary,
+not new placement evidence.
 
 Before relying on that placement, query `/_freellama/v1/health` and require
 `contracts.placement_observation:"ollama_api_ps_after_execution"` and
@@ -443,154 +417,11 @@ The direct Ollama tools do not infer that assignment. `ollama_manage`, `ollama_d
 no-serve model views target their explicit `ollamaEndpoint` or `FREELLAMA_OLLAMA_ENDPOINT`, which
 defaults to the primary Ollama server. Point them at the CPU endpoint only when you intend to
 inspect or modify that separate server. Read
-[CPU and GPU model routing](docs/CPU_GPU_ROUTING.md) for the complete contract.
+[CPU and GPU model routing](https://github.com/bgauryy/FreeLlama/blob/main/docs/CPU_GPU_ROUTING.md) for the complete contract.
 
-## Configuration
+## More
 
-The following settings have environment-variable overrides. Set them in the MCP client's
-server-launch config (for example `.mcp.json`'s `env` block) or the launching shell.
-
-| Variable | Default | Affects |
-|---|---|---|
-| `FREELLAMA_OLLAMA_ENDPOINT` | `http://127.0.0.1:11434` | `doctor` and all `ollama_*` tools' default Ollama endpoint |
-| `FREELLAMA_SERVE_ENDPOINT` | `http://127.0.0.1:11435` | Default `endpoint` for serve-backed tools and `delegate_research` |
-| `FREELLAMA_MCP_DEFAULT_MODEL` | unset (routes to an installed coding model) | `delegate_research`'s default `model` |
-| `FREELLAMA_MCP_DEFAULT_ADAPTER` | `bash` | `delegate_research`'s adapter (`octocode` to switch) |
-| `FREELLAMA_MCP_MAX_TURNS` | `8` | Max agent turns for `delegate_research` |
-| `FREELLAMA_MCP_DELEGATE_TIMEOUT_SECONDS` | `180` | Whole-subprocess timeout for `delegate_research` |
-| `FREELLAMA_MCP_PULL_TIMEOUT_SECONDS` | `1200` | Default `ollama_manage` `"pull"` timeout |
-| `FREELLAMA_MCP_FETCH_TIMEOUT_SECONDS` | `30` | Timeout for other direct Ollama HTTP calls |
-| `FREELLAMA_MCP_ALLOWED_ROOTS` | checkout: this repository; published: must be set | Platform-separated allowlist of directories `delegate_research` may read (`:` on macOS/Linux, `;` on Windows) |
-| `FREELLAMA_MCP_MODEL_EVIDENCE` | checkout: `benchmark/evidence/model-evidence.json`; published: unset | Path to per-model research grades (see "Runtime evidence") |
-| `FREELLAMA_EXTERNAL_COST_MODEL` | unset | External-model label in estimated avoided-cost telemetry; set all three cost variables or none |
-| `FREELLAMA_EXTERNAL_COST_INPUT_USD_PER_M` | unset | External input USD per million tokens |
-| `FREELLAMA_EXTERNAL_COST_OUTPUT_USD_PER_M` | unset | External output USD per million tokens |
-| `FREELLAMA_CONTROL_TIMEOUT_SECONDS` | `30` | Decision-only serve calls; read by `../rust-core/src/napi.rs` |
-| `FREELLAMA_TASK_TIMEOUT_SECONDS` | `900` | Generation calls; read by `../rust-core/src/napi.rs` |
-| `FREELLAMA_AUTH_TOKEN_FILE` | unset | Bearer-token file used by the native client and research adapters for all serve routes |
-| `FREELLAMA_AGENT_TOKEN_CALIBRATION_DIR` | platform data directory | Prompt-free, model-specific token-estimator calibration shared across adapter processes |
-| `FREELLAMA_MCP_AUTOSTART_SERVE` | `1` | When the default loopback serve endpoint does not answer, start `freellama serve` as a child of the MCP server (stopped with it). `0` disables |
-| `FREELLAMA_SERVE_BINARY` | checkout `target/release`/`debug`, then the platform package | Binary used for serve autostart |
-| `FREELLAMA_AGENT_OS_SANDBOX` | `auto` | Bash adapter OS confinement: `bwrap` on Linux, `sandbox-exec` on macOS, when present. `off` keeps only the restricted shell |
-| `FREELLAMA_AGENT_OCTOCODE_PACKAGE` | `octocode@19.1.0` | Pinned npm spec the Octocode adapter runs through `npx` |
-
-Serve-side placement settings (read by `freellama serve`, not the MCP process):
-
-| Variable | Default | Affects |
-|---|---|---|
-| `FREELLAMA_EVICT_IDLE_MODELS` | on | Unload idle, unpinned models using reuse and load costs when a cold load needs room. `0` turns eviction off |
-| `FREELLAMA_CPU_NUM_THREAD` | half the logical cores (not set on macOS) | `num_thread` for CPU-placed tasks only; GPU tasks leave it to Ollama |
-| `FREELLAMA_MAX_QUEUE_WAIT_SECONDS` | `120` | How long a managed task queues for a slot or memory |
-| `OLLAMA_NUM_PARALLEL`, `OLLAMA_KV_CACHE_TYPE`, `OLLAMA_FLASH_ATTENTION` | Ollama's | Read as hints for the memory estimate: parallel slots multiply the KV cache, and `q8_0`/`q4_0` shrink it only with flash attention. Set them for serve the same way as for Ollama |
-
-Research-adapter settings are deployment defaults. The optional `delegate_research.agent` object
-overrides the per-call budget (`maxTurns`, `contextTokens`, `outputTokens`, `temperature`, `seed`,
-`think`, `keepAlive`, `requestTimeoutSeconds`, `toolTimeoutSeconds`); explicit per-call fields win.
-The research subprocess receives only `FREELLAMA_*`, locale, temp, and proxy/CA variables from the
-server environment.
-
-| Variable | Default | Affects |
-|---|---:|---|
-| `FREELLAMA_AGENT_NUM_CTX` | `8192` | Ollama context window |
-| `FREELLAMA_AGENT_EXECUTION_PREFERENCE` | `auto` | Managed coding-agent backend hint |
-| `FREELLAMA_AGENT_MIN_PLACEMENT_EVIDENCE` | `configured` | Set `observed` to fail closed on cold/mismatched placement |
-| `FREELLAMA_AGENT_NUM_PREDICT` | `512` | Reserved output budget |
-| `FREELLAMA_AGENT_TEMPERATURE` / `FREELLAMA_AGENT_SEED` | `0` / `42` | Repeatable decoding |
-| `FREELLAMA_AGENT_THINK` / `FREELLAMA_AGENT_KEEP_ALIVE` | `false` / `5m` | Ollama reasoning and residency |
-| `FREELLAMA_AGENT_REQUEST_TIMEOUT_SECONDS` | `600` | Each Ollama chat attempt |
-| `FREELLAMA_AGENT_TOOL_TIMEOUT_SECONDS` | Bash `30`, Octocode `45` | Each local tool call |
-| `FREELLAMA_AGENT_RETRY_ATTEMPTS` / `FREELLAMA_AGENT_RETRY_BACKOFF_SECONDS` | `2` / `5` | Conversation-level retry |
-| `FREELLAMA_AGENT_MAX_PARSE_REPAIRS` / `FREELLAMA_AGENT_PARSE_REPAIR_ECHO_CHARS` | `2` / `500` | Invalid JSON correction limit and retained reply text |
-| `FREELLAMA_AGENT_CHARS_PER_TOKEN` | `4` | First-call token estimate; later calibrated from Ollama |
-| `FREELLAMA_AGENT_SAFETY_MARGIN_TOKENS` | `256` | Input headroom beyond `num_predict` |
-| `FREELLAMA_AGENT_IMAGE_TOKEN_ESTIMATE` | `1024` | Bounded charge per image |
-| `FREELLAMA_AGENT_KEEP_RECENT` | `2` | Recent observations preserved verbatim |
-| `FREELLAMA_AGENT_COMPACT_PREVIEW_CHARS` | `180` | Old-observation breadcrumb size |
-| `FREELLAMA_AGENT_COMPACT_RETAIN_RATIO` | `0.8` | Current payload retained per emergency pass |
-| `FREELLAMA_AGENT_CLIP_HEAD_RATIO` | `0.667` | Head share when an emergency clip preserves both ends |
-| `FREELLAMA_AGENT_OBSERVATION_PAGE_CHARS` | `3000` | Lossless observation page target |
-| `FREELLAMA_AGENT_PINNED_OVERFLOW` | `error` | Preserve system/task bytes; `clip` is explicit opt-in |
-
-Invalid values fail before an Ollama request. Each successful result returns
-`contextManagement` with the resolved policy, calibration source/scale, estimated input budget,
-and compaction count. Ollama has no stable preflight tokenizer endpoint, so “exact before the first
-call” is not claimed. Model-specific calibration persists after successful calls, so later
-processes start conservatively from prior `prompt_eval_count` evidence without sharing estimates
-between model templates.
-
-**Security:** `delegate_research` grants a local model read access to `workspacePath`. The path is
-confined to `FREELLAMA_MCP_ALLOWED_ROOTS` (default: this repository in a checkout; unset in a published
-install until you set it), resolved through symlinks so a link inside an allowed root can't escape
-it. The default `bash` adapter runs an allowlist of read-only tools in a restricted shell with a
-scrubbed environment and, where available, an OS sandbox; it also rejects command substitution,
-home-directory paths, `..`, and absolute paths outside that workspace. Production deployments should generate a permission-restricted token with
-`freellama auth-token`, start `serve` with `--auth-token-file`, and set
-`FREELLAMA_AUTH_TOKEN_FILE` for MCP. Authentication covers managed and raw passthrough routes; use
-an external TLS and authorization layer for untrusted or multi-tenant networks.
-
-### Runtime evidence
-
-Admission weights can be set by task kind in the server runtime file's `[task_costs]` table.
-Inspect `doctor {view:"full"}` at `platform_health.admission.costs.base_by_task` for effective
-weights and `run_task {preview:true}` for current cost and capacity advice. The table changes
-managed admission; it does not create Ollama
-slots or relax memory guards. Existing queued work keeps its captured cost. See
-[monitoring controls](../../docs/MONITORING.md#adaptive-concurrency).
-
-**No measurements are compiled in.** In a repository checkout, per-model research grades load from
-`benchmark/evidence/model-evidence.json`. A published package does not include that repository
-file, so its evidence table is empty unless you set `FREELLAMA_MCP_MODEL_EVIDENCE`. An unmeasured
-model yields a `verify` verdict. Tool descriptions state the rules; measurement details live in
-`skills/freellama/references/` and `.octocode/evals/`.
-
-## Platform support
-
-The native addon is named by target triple (`freellama.<platform>-<arch>[-<abi>].node`). The base
-package has eight npm optional dependencies, one each for macOS arm64/x64, Linux arm64/x64 with
-glibc or musl, and Windows arm64/x64 with MSVC. `native/index.js` tries the checkout artifact first,
-then the host's optional package. A release is supported only when all eight artifact packages pass
-the publish verifier; an installation made with `--omit=optional` cannot load the addon. `engines`
-requires Node >= 20.
-
-Machine discovery distinguishes total host memory (`memory_bytes`) from known unified memory
-(`unified_memory_bytes`). Library-tag `fitsInMemory` is a conservative host-memory preflight and
-includes `fitScope: "host_memory_budget_only"`; inspect `/api/ps` for actual accelerator placement.
-
-Start the serve-backed tools' dependency from the repository root:
-
-```bash
-cargo run --release -- serve --recommendation-catalog recommendations.example.toml
-```
-
-See `skills/freellama/references/proxy-vs-serve.md` for the `proxy` vs `serve` distinction (only
-`serve` has the `/_freellama/v1/*` routes these tools call).
-
-## Publish
-
-`packages/mcp/` is the portable JavaScript package. Its `package.json` lists the platform packages
-as exact-version optional dependencies; it intentionally does not embed a `.node` binary. Publish
-the eight `packages/native/*` packages first, then publish `@octocodeai/freellama` (`npx @octocodeai/freellama`) and `@octocodeai/freellama-mcp-server` (`npx @octocodeai/freellama-mcp-server`)
-at the same version. `yarn release:verify:publish` refuses a release if any of the ten packages
-omits `assets/logo.jpg`, or if any platform package has a missing, empty, or unpacked
-executable/addon pair.
-
-```bash
-cd packages/mcp
-npm pack --dry-run   # confirm exactly what a publish would ship
-```
-
-Treat `npm publish` as a public release action. Follow the repository
-[release procedure](../../RELEASE.md) and obtain the repository owner's release authorization first.
-
-## Why native bindings
-
-- **No reimplementation.** `run_task`, `route`/`preview`, and the installed-model list are HTTP
-  calls into a running `freellama serve`, matching `../cli/src/main.rs`. `doctor` talks to Ollama
-  and the host's portable machine-discovery layer directly. `ollama_manage` / `ollama_delete` hit Ollama's HTTP API. `delegate_research`
-  is a subprocess. Routing logic still lives in exactly one place — the Rust core.
-- **One connection pool.** `../rust-core/src/napi.rs` holds a single `reqwest::Client` in a
-  `OnceLock` and clones the handle per request, matching the server side.
-- **`unsafe_code` stays isolated.** The crate is `deny(unsafe_code)` except `napi.rs`, which
-  carries an explicit `#[allow(unsafe_code)]` for napi-derive's FFI glue.
-- **The napi build is off by default** (`cargo build` never touches it); the addon is built with
-  `napi build --features napi` from the repo root.
+- [Configuration](CONFIGURATION.md): environment variables, research-adapter settings, security,
+  and runtime evidence.
+- [Developing](DEVELOPING.md): build, test tiers, platform packages, publishing, and why the server
+  uses native bindings.

@@ -41,15 +41,15 @@ Create accepts the following optional fields:
 | HTTP field | MCP field | Meaning |
 |---|---|---|
 | `messages` | `messages` | Initial Ollama messages, preserving fields, content, and order. |
-| `route_defaults` | `routeDefaults` | Task-routing defaults for later scoped execution. |
-| `limits` | `limits` | Per-scope bounds within the server's configured limits. |
+| `route_defaults` | — | Task-routing defaults for later scoped execution (HTTP/CLI only). |
+| `limits` | — | Per-scope bounds within the server's configured limits (HTTP/CLI only). |
 
 Messages require a supported role and can omit content, including for assistant tool calls.
 When present, content must be a string.
 
 Routing defaults accept `task`, `objective`, `model`, `required_capabilities`, `context_tokens`,
-`execution_preference`, `min_placement_evidence`, and `min_confidence`. MCP uses the corresponding
-camelCase field names. Defaults do not grant admission or qualify a model. Explicit task fields
+`execution_preference`, `min_placement_evidence`, and `min_confidence`. MCP callers set routing per
+`run_task` call instead. Defaults do not grant admission or qualify a model. Explicit task fields
 take precedence, and execution checks current eligibility and resources.
 
 The metadata receipt contains `scope_id`, `revision`, `route_defaults`, `limits`, `message_count`,
@@ -59,7 +59,7 @@ Token estimates derive from the full serialized message bytes and count both med
 This storage-budget estimate can refuse media-heavy history before inference; it does not measure
 image token cost or determine the model context required to execute the history.
 
-Fork requires `revision` and accepts optional replacement routing defaults and limit overrides. It creates a
+Fork requires `revision`; HTTP/CLI forks also accept replacement routing defaults and limit overrides. It creates a
 separate history snapshot with revision `0`; later writes to either scope do not change the other.
 Fork independent branches before parallel execution instead of submitting concurrent writes to one
 scope.
@@ -138,15 +138,14 @@ precedence. Inspect effective values and their sources with
 | `total_max_bytes` | `FREELLAMA_SCOPE_TOTAL_MAX_BYTES` | `16777216` | Aggregate retained history-byte budget. |
 | `ttl_seconds` | `FREELLAMA_SCOPE_TTL_SECONDS` | `3600` | Idle expiry since create, fork, or successful append; reads do not renew it. |
 
-Per-scope `limits` accepts `max_messages`, `max_bytes`, `max_estimated_tokens`, and `ttl_seconds`;
-MCP uses `maxMessages`, `maxBytes`, `maxEstimatedTokens`, and `ttlSeconds`. A request can lower these
-bounds within server policy. Finite safety bounds remain operator-owned. Lowering runtime caps
+Per-scope HTTP/CLI `limits` accepts `max_messages`, `max_bytes`, `max_estimated_tokens`, and
+`ttl_seconds` and can only lower these bounds within server policy. Finite safety bounds remain operator-owned. Lowering runtime caps
 does not summarize or trim stored transcripts; subsequent writes must satisfy the active caps.
 Expired entries are removed during store operations.
 
 ## Warm API
 
-`POST /warm`, MCP `warm_model`, and CLI `warm` load an exact installed model with a matching
+`POST /warm`, MCP `run_task {warm:true}`, and CLI `warm` load an exact installed model with a matching
 non-embedding task profile. They do not accept prompts or messages, pull a model, or store conversation
 history. The default task profile is `completion`.
 

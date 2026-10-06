@@ -12,7 +12,8 @@ const tagsHtml = `<a class="md:hidden flex" href="/library/gemma3:1b">
 describe("Ollama library parsing", () => {
   it("does not equate cloud availability with cloud-only and supports public namespaces", () => {
     const result = parseModelSearch('<li class="result"><a href="/someone/model"><p class="max-w-lg">Coding model</p><span class="text-cyan-500">cloud</span><span class="text-indigo-600">tools</span></a></li>');
-    expect(result[0]).toMatchObject({ name: "someone/model", cloudAvailable: true, cloudOnly: null });
+    expect(result[0]).toMatchObject({ name: "someone/model", cloudAvailable: true, description: "Coding model" });
+    expect(result[0]).not.toHaveProperty("cloudOnly");
   });
   it("reads the complete tag page, deduplicates desktop links, and preserves variant identity", () => {
     const { tags } = parseModelTags(tagsHtml, "gemma3");

@@ -13,7 +13,6 @@ async fn invalid_task_requests_keep_structured_errors_before_execution() {
         "http://127.0.0.1:11434",
         None,
         None,
-        "helper:latest",
     ))
     .unwrap();
     for (path, body, content_type, expected) in [

@@ -1,5 +1,5 @@
-// One MCP artifact: dist/index.js. Native .node stays next door (cannot go in a JS bundle);
-// research adapters are copied after the JS build for packed installs.
+// MCP artifacts: dist/index.js (the server) and dist/research/{bash,octocode}-agent.js (the
+// research adapters it spawns). Native .node stays next door (cannot go in a JS bundle).
 import { build } from "esbuild";
 import { chmodSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
@@ -27,7 +27,24 @@ await build({
 const js = readFileSync(outfile, "utf8").replace(/^(?:#!.*\n)+/, "");
 writeFileSync(outfile, `#!/usr/bin/env node\n${js}`);
 chmodSync(outfile, 0o755);
-await import("./bundle-adapters.mjs");
+
+// Each research adapter is a standalone `node <file>` program with its own bundle. `benchmark`
+// is the context-management module imported by benchmark/local/scripts/mixed-workload.mjs.
+await build({
+  absWorkingDir: pkg,
+  entryPoints: {
+    "bash-agent": path.join(pkg, "src", "research", "bash-agent.ts"),
+    "octocode-agent": path.join(pkg, "src", "research", "octocode-agent.ts"),
+    benchmark: path.join(pkg, "src", "research", "benchmark.ts"),
+  },
+  outdir: path.join(distDir, "research"),
+  bundle: true,
+  format: "esm",
+  platform: "node",
+  target: "node20",
+  sourcemap: false,
+  logLevel: "info",
+});
 await import("./bundle-docs.mjs");
 
 await import("../../../scripts/bundle-licenses.mjs");

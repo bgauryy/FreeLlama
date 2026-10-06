@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 freellama = { package = "freellama-core", path = "../rust-core" }
 anyhow.workspace = true
+base64.workspace = true
 clap.workspace = true
 reqwest.workspace = true
 serde.workspace = true

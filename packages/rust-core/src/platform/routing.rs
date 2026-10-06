@@ -33,6 +33,23 @@ pub enum TaskKind {
     LongContext,
 }
 
+impl TaskKind {
+    /// Wire name, identical to the serde `snake_case` form.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Completion => "completion",
+            Self::Coding => "coding",
+            Self::CodeRepair => "code_repair",
+            Self::Tools => "tools",
+            Self::Browser => "browser",
+            Self::Vision => "vision",
+            Self::Embedding => "embedding",
+            Self::LongContext => "long_context",
+        }
+    }
+}
+
 /// Relative service class for managed work.
 ///
 /// This is deliberately an execution concern, rather than a routing preference: it never changes
@@ -70,6 +87,32 @@ pub enum ExecutionPreference {
     PreferGpu,
 }
 
+/// The configured Ollama backend a model executes on. Serializes as the `"cpu"`/`"gpu"` wire
+/// strings used in placement receipts.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum Backend {
+    Cpu,
+    Gpu,
+}
+
+impl Backend {
+    /// The wire string: `"cpu"` or `"gpu"`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::Gpu => "gpu",
+        }
+    }
+}
+
+impl std::fmt::Display for Backend {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// Minimum proof required before a route may be returned. `Observed` intentionally refuses a
 /// cold model: warm it once with configured evidence, inspect the receipt, then require physical
 /// evidence for subsequent work where CPU/GPU placement is a hard constraint.
@@ -96,10 +139,8 @@ pub struct RouteInput {
     pub min_placement_evidence: PlacementEvidence,
     /// Refuse the route rather than return one graded below this.
     ///
-    /// This gate used to live only in the TypeScript MCP wrapper, so the CLI, the HTTP API and
-    /// anyone embedding `freellama-core` as a library got a router with no fail-closed protection
-    /// at all — while the documentation described it as a property of the platform. It belongs
-    /// where the decision is made, not in one of three consumers.
+    /// The gate lives in the router so the CLI, the HTTP API, the MCP server and library
+    /// embedders all fail closed the same way.
     #[serde(default)]
     pub min_confidence: Option<String>,
 }
@@ -139,6 +180,10 @@ pub struct CatalogModel {
     /// automatic context for requests that leave `num_ctx` unset.
     #[serde(default)]
     pub modelfile_num_ctx: Option<u64>,
+    /// `general.architecture` from Ollama's model metadata (for example `glmocr`). Routing uses
+    /// it, never the tag name, to recognise single-purpose OCR networks.
+    #[serde(default)]
+    pub architecture: Option<String>,
     pub resident: bool,
     /// Loaded runner bytes reported by `/api/ps`, distinct from the installed file size.
     #[serde(default)]
@@ -146,6 +191,23 @@ pub struct CatalogModel {
     pub resident_vram: Option<u64>,
     pub benchmark: BTreeMap<Capability, f64>,
     pub policy_rank: BTreeMap<TaskKind, usize>,
+    /// Per-task request defaults a policy file sets for this model; routing applies the entry
+    /// for the requested task on top of the generic task profile.
+    #[serde(default)]
+    pub policy_options: BTreeMap<TaskKind, ModelRequestDefaults>,
+}
+
+/// Request defaults one task policy sets for one model
+/// (`[policies.<task>.model_options."<model>"]`). Unset fields keep the generic task profile.
+/// Context size is routing-owned (prompt estimate and `context_tokens`), so it is not a policy key.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelRequestDefaults {
+    #[serde(default)]
+    pub think: Option<bool>,
+    /// Must be at least 1; the policy loader rejects 0.
+    #[serde(default)]
+    pub num_predict: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -157,7 +219,6 @@ pub struct RouteDecision {
     pub required_capabilities: BTreeSet<Capability>,
     pub options: Value,
     pub think: Value,
-    pub stream: bool,
     pub strict_tool_validation: bool,
     pub resident: bool,
     pub session_id: Option<String>,
@@ -312,6 +373,7 @@ pub fn select_route(
         .as_deref()
         .and_then(|id| sessions.assigned(id))
         .and_then(|name| eligible.iter().find(|model| model.name == name).copied())
+        .filter(|model| general_fallback_fit(model, input.task))
     {
         affine
     } else {
@@ -322,15 +384,79 @@ pub fn select_route(
             .context("no installed model is eligible for the request")?
     };
 
-    let (profile, options, think, stream, strict_tool_validation) = profile(input, chosen);
+    let TaskProfile {
+        name: profile,
+        options,
+        think,
+        strict_tool_validation,
+        policy_model_options,
+        policy_think_dropped,
+    } = profile(input, chosen);
     let capability = ranking_capability(input.task);
     let has_benchmark = chosen.benchmark.contains_key(&capability);
     let policy_qualified = chosen.policy_rank.contains_key(&input.task);
     let mut reasons = vec!["installed".to_owned(), "capabilities_satisfied".to_owned()];
+    if input.model.is_none() && !general_fallback_fit(chosen, input.task) {
+        reasons.push("ocr_specialist_last_resort".to_owned());
+    }
+    if options.get("stop").is_some() {
+        reasons.push("architecture_default_stop".to_owned());
+    }
+    if policy_model_options {
+        reasons.push("policy_model_options".to_owned());
+    }
+    if policy_think_dropped {
+        reasons.push("policy_think_ignored_without_thinking_capability".to_owned());
+    }
     if input.model.is_none() && matches!(input.objective, Objective::Balanced) && !policy_qualified
     {
         reasons.push("balanced_without_quality_policy".to_owned());
     }
+    push_selection_reasons(
+        &mut reasons,
+        input,
+        chosen,
+        sessions,
+        policy_qualified,
+        has_benchmark,
+    );
+    let (fits, reasons) = sent_window_fit(input, chosen, &options, reasons);
+    let graded = route_evidence(policy_qualified, has_benchmark, fits);
+    enforce_min_confidence(input, graded.confidence, graded.evidence, &chosen.name)?;
+    // Why every other eligible candidate lost. Without this the router is a black box that names a
+    // winner; with it, a caller can see the comparison and disagree with it.
+    let rejected = rejected_candidates(&eligible, &chosen.name, input.task, capability);
+    Ok(RouteDecision {
+        selected_model: chosen.name.clone(),
+        task: input.task,
+        objective: input.objective,
+        profile,
+        required_capabilities: required,
+        options,
+        think,
+        strict_tool_validation,
+        resident: chosen.resident,
+        session_id: input.session_id.clone(),
+        confidence: graded.confidence.to_owned(),
+        evidence: graded.evidence.to_owned(),
+        quality_evidence: graded.quality_evidence.to_owned(),
+        task_evidence: graded.task_evidence.to_owned(),
+        context_window_fit: graded.context_window_fit.to_owned(),
+        hardware_fit: graded.hardware_fit.to_owned(),
+        rejected,
+        reasons,
+    })
+}
+
+/// Why `chosen` won: an explicit model, session affinity, or its evidence tier.
+fn push_selection_reasons(
+    reasons: &mut Vec<String>,
+    input: &RouteInput,
+    chosen: &CatalogModel,
+    sessions: &SessionAffinity,
+    policy_qualified: bool,
+    has_benchmark: bool,
+) {
     if input.model.is_some() {
         reasons.push("explicit_model".to_owned());
     } else if input
@@ -352,42 +478,15 @@ pub fn select_route(
             "capability_only_fallback".to_owned()
         });
     }
-    let (fits, reasons) = sent_window_fit(input, chosen, &options, reasons);
-    let graded = route_evidence(policy_qualified, has_benchmark, fits);
-    enforce_min_confidence(input, graded.confidence, graded.evidence, &chosen.name)?;
-    // Why every other eligible candidate lost. Without this the router is a black box that names a
-    // winner; with it, a caller can see the comparison and disagree with it.
-    let rejected = rejected_candidates(&eligible, &chosen.name, input.task, capability);
-    Ok(RouteDecision {
-        selected_model: chosen.name.clone(),
-        task: input.task,
-        objective: input.objective,
-        profile,
-        required_capabilities: required,
-        options,
-        think,
-        stream,
-        strict_tool_validation,
-        resident: chosen.resident,
-        session_id: input.session_id.clone(),
-        confidence: graded.confidence.to_owned(),
-        evidence: graded.evidence.to_owned(),
-        quality_evidence: graded.quality_evidence.to_owned(),
-        task_evidence: graded.task_evidence.to_owned(),
-        context_window_fit: graded.context_window_fit.to_owned(),
-        hardware_fit: graded.hardware_fit.to_owned(),
-        rejected,
-        reasons,
-    })
 }
 
 /// Grade the window we will actually send.
 ///
 /// The task profile default (16k for chat, 2k for embeddings) is often larger than a small
-/// model's advertised context; `profile()` already clamps `num_ctx` down. Comparing the
-/// *unclamped* default made a 370MB embed that ran at 2048 / 100% GPU report
-/// `insufficient_context` — a false alarm agents then ignore. Memory-budget fit lives in the
-/// machine profile / recommend path, not this field.
+/// model's advertised context; `profile()` already clamps `num_ctx` down, so the clamped value is
+/// graded. Grading the unclamped default would report `insufficient_context` for a small embed
+/// model that runs fine at its own window. Memory-budget fit lives in execution admission, not
+/// this field.
 fn sent_window_fit(
     input: &RouteInput,
     chosen: &CatalogModel,
@@ -438,7 +537,7 @@ fn enforce_min_confidence(
         "route refused: confidence is \"{confidence}\" (evidence: {evidence}), below the requested \
          minimum \"{minimum}\". Would have selected \"{would_select}\". This is a fail-closed \
          refusal, not a failure — the router cannot justify this pick. Lower `min_confidence`, or \
-         raise the evidence level with a policy file (`freellama policy-from-eval`) AND a \
+         raise the evidence level with a policy file (`benchmark/harness/scripts/policy_from_eval.py`) AND a \
          benchmark report (`freellama bench-all`) — note that naming an explicit `model` does NOT \
          raise the grade, because the grade measures the evidence, not who chose."
     );
@@ -487,11 +586,10 @@ fn rejected_candidates(
 ///
 /// `confidence: "medium"` on its own invites being read as a calibrated probability. It is not one:
 /// it means "a policy vouched for this model on this task" AND "a functional benchmark exists" —
-/// two different claims about two different kinds of evidence, collapsed into one word. Collapsing
-/// them is what makes routing uninspectable, so the dimensions are now first-class and `confidence`
-/// is *derived* from them rather than being the only thing reported.
-#[derive(Debug, Clone, Serialize)]
-pub struct RouteEvidence {
+/// two different claims about two different kinds of evidence. The dimensions are reported
+/// separately and `confidence` is derived from them.
+#[derive(Debug, Clone)]
+struct RouteEvidence {
     /// A policy file vouched for this model on this task.
     pub quality_evidence: &'static str,
     /// A functional benchmark measured this model on the ranking capability.
@@ -538,7 +636,7 @@ fn route_evidence(
     }
 }
 
-pub(super) fn requirements(input: &RouteInput) -> BTreeSet<Capability> {
+fn requirements(input: &RouteInput) -> BTreeSet<Capability> {
     let mut required = input.required_capabilities.clone();
     required.insert(ranking_capability(input.task));
     if matches!(
@@ -562,19 +660,39 @@ fn ranking_capability(task: TaskKind) -> Capability {
     }
 }
 
+/// Single-purpose OCR networks (architecture `glmocr`, `deepseekocr`, ...) advertise `completion`
+/// but loop or answer badly on general chat. Identified from model metadata, never the tag.
+fn is_ocr_specialist(model: &CatalogModel) -> bool {
+    model
+        .architecture
+        .as_deref()
+        .is_some_and(|architecture| architecture.to_ascii_lowercase().ends_with("ocr"))
+}
+
+/// Whether automatic selection (fallback ranking or session affinity) may use this model for the
+/// task. An operator policy naming the model for the task always qualifies it.
+fn general_fallback_fit(model: &CatalogModel, task: TaskKind) -> bool {
+    matches!(task, TaskKind::Vision)
+        || !is_ocr_specialist(model)
+        || model.policy_rank.contains_key(&task)
+}
+
 fn compare_candidates(left: &CatalogModel, right: &CatalogModel, input: &RouteInput) -> Ordering {
     let capability = ranking_capability(input.task);
     let left_score = left.benchmark.get(&capability).copied();
     let right_score = right.benchmark.get(&capability).copied();
+    let fit = general_fallback_fit(left, input.task).cmp(&general_fallback_fit(right, input.task));
     match input.objective {
-        Objective::Fastest => left_score
-            .unwrap_or(0.0)
-            .total_cmp(&right_score.unwrap_or(0.0))
+        Objective::Fastest => fit
+            .then_with(|| {
+                left_score
+                    .unwrap_or(0.0)
+                    .total_cmp(&right_score.unwrap_or(0.0))
+            })
             .then_with(|| right.size.cmp(&left.size))
             .then_with(|| right.name.cmp(&left.name)),
-        Objective::Balanced => left_score
-            .is_some()
-            .cmp(&right_score.is_some())
+        Objective::Balanced => fit
+            .then_with(|| left_score.is_some().cmp(&right_score.is_some()))
             .then_with(|| left.resident.cmp(&right.resident))
             .then_with(|| {
                 left_score
@@ -608,7 +726,7 @@ fn eligible_for_objective<'a>(
     }
     ensure!(
         !qualified.is_empty(),
-        "no quality-qualified model exists for this task; configure a task policy (`freellama policy-from-eval`), choose objective \"fastest\" (CLI: --objective fastest; MCP: objective:\"fastest\"), or name an explicit model. Run `freellama doctor` — unset OLLAMA_MAX_LOADED_MODELS / OLLAMA_KV_CACHE_TYPE is a machine-config gap, not a missing model"
+        "no quality-qualified model exists for this task; configure a task policy (`benchmark/harness/scripts/policy_from_eval.py`), choose objective \"fastest\" (CLI: --objective fastest; MCP: objective:\"fastest\"), or name an explicit model. Run `freellama doctor` — unset OLLAMA_MAX_LOADED_MODELS / OLLAMA_KV_CACHE_TYPE is a machine-config gap, not a missing model"
     );
     Ok(qualified)
 }
@@ -619,23 +737,27 @@ fn policy_preference(left: &CatalogModel, right: &CatalogModel, task: TaskKind) 
     right_rank.cmp(&left_rank)
 }
 
-fn profile(input: &RouteInput, model: &CatalogModel) -> (String, Value, Value, bool, bool) {
-    let qwen_repair_profile =
-        matches!(input.task, TaskKind::CodeRepair) && model.name == "qwen3.8:27b-mlx";
-    let requested_context = if qwen_repair_profile && input.context_tokens.is_none() {
-        8_192
-    } else {
-        requested_context(input)
-    };
+/// Request options and validation mode chosen for one routed model.
+struct TaskProfile {
+    name: String,
+    options: Value,
+    think: Value,
+    strict_tool_validation: bool,
+    /// True when a policy `model_options` entry changed the generic task profile.
+    policy_model_options: bool,
+    /// True when the policy asked for `think = true` on a model without the Thinking capability.
+    policy_think_dropped: bool,
+}
+
+fn profile(input: &RouteInput, model: &CatalogModel) -> TaskProfile {
+    let policy = model.policy_options.get(&input.task).copied();
+    let requested_context = requested_context(input);
     let num_ctx = requested_context
         .min(model.advertised_context.unwrap_or(requested_context))
         .min(u64::from(u32::MAX));
     let (name, num_predict, think, strict) = match input.task {
         TaskKind::Browser => ("browser_action", 64, Value::Bool(false), true),
         TaskKind::Tools => ("tools", 256, Value::Bool(false), true),
-        TaskKind::CodeRepair if qwen_repair_profile => {
-            ("qwen_code_repair", 512, Value::Bool(false), true)
-        }
         TaskKind::CodeRepair => ("code_repair", 2_048, thinking_or_off(model, "medium"), true),
         TaskKind::Coding => ("coding", 2_048, thinking_or_off(model, "medium"), false),
         TaskKind::LongContext => (
@@ -648,28 +770,71 @@ fn profile(input: &RouteInput, model: &CatalogModel) -> (String, Value, Value, b
         TaskKind::Embedding => ("embedding", 0, Value::Null, false),
         TaskKind::Completion => ("completion", 512, Value::Bool(false), false),
     };
+    let num_predict = policy
+        .and_then(|entry| entry.num_predict)
+        .unwrap_or(num_predict);
+    // `think = true` only reaches a model that can think; Ollama rejects it otherwise.
+    let policy_think = policy.and_then(|entry| entry.think);
+    let policy_think_dropped =
+        policy_think == Some(true) && !model.capabilities.contains(&Capability::Thinking);
+    let think = match policy_think {
+        Some(true) => thinking_or_off(model, true),
+        Some(false) => Value::Bool(false),
+        None => think,
+    };
     let mut options = json!({"num_ctx": num_ctx});
     if num_predict > 0 {
         options["num_predict"] = json!(num_predict);
     }
-    (name.to_owned(), options, think, false, strict)
+    // Ollama >= 0.30 glm-ocr never emits end-of-turn (ollama/ollama#16892): text recognition
+    // returns the exact text, then repeats it inside markdown fences until num_predict. The fence
+    // ends plain-text output cleanly. Callers override with request_options.options.stop
+    // (`[]` opts out); table output needs its own terminator and is caught by the loop check.
+    if matches!(input.task, TaskKind::Vision) && model.architecture.as_deref() == Some("glmocr") {
+        options["stop"] = json!(["```"]);
+    }
+    TaskProfile {
+        name: name.to_owned(),
+        options,
+        think,
+        strict_tool_validation: strict,
+        policy_model_options: policy.is_some_and(|entry| entry != ModelRequestDefaults::default()),
+        policy_think_dropped,
+    }
 }
 
-pub(super) fn requested_context(input: &RouteInput) -> u64 {
+fn requested_context(input: &RouteInput) -> u64 {
     input.context_tokens.unwrap_or(match input.task {
         TaskKind::Browser | TaskKind::Tools | TaskKind::CodeRepair => 8_192,
         TaskKind::LongContext => 32_768,
-        // Embeddings are not chat: nomic-embed-text advertises 2048. Using the 16k chat default
-        // made every embed look like a context miss even after clamp.
+        // Embeddings are not chat: nomic-embed-text advertises 2048, so the chat default would
+        // make every embed look like a context miss.
         TaskKind::Embedding => 2_048,
         _ => 16_384,
     })
 }
 
-fn thinking_or_off(model: &CatalogModel, effort: &str) -> Value {
+fn thinking_or_off(model: &CatalogModel, effort: impl Into<Value>) -> Value {
     if model.capabilities.contains(&Capability::Thinking) {
-        json!(effort)
+        effort.into()
     } else {
         Value::Bool(false)
+    }
+}
+
+#[cfg(test)]
+mod task_kind_tests {
+    use clap::ValueEnum;
+
+    use super::TaskKind;
+
+    #[test]
+    fn as_str_matches_the_serde_wire_name_for_every_task() {
+        for task in TaskKind::value_variants() {
+            assert_eq!(
+                serde_json::to_value(task).unwrap(),
+                serde_json::json!(task.as_str())
+            );
+        }
     }
 }

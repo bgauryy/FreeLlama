@@ -49,22 +49,15 @@ Claude Desktop, Cursor, and other hosts use the same command in their JSON confi
 ```
 
 The server starts its own FreeLlama service when none is running. It does not install or start
-Ollama. `FREELLAMA_MCP_ALLOWED_ROOTS` is needed only for `delegate_research`, which also requires
-`python3`.
+Ollama. `FREELLAMA_MCP_ALLOWED_ROOTS` is needed only for `delegate_research`, which runs its
+research adapter with the same Node.js that runs the server.
 
 ### MCP tools
 
-| Tool | Use it to |
-|---|---|
-| `models` | List installed or loaded models, or search the Ollama library |
-| `doctor` | Diagnose Ollama and FreeLlama, read live status and usage |
-| `run_task` | Preview a route (`preview:true`) or run one task: chat, coding, tools, vision, embeddings |
-| `run_task_batch` | Run independent tasks concurrently, with one result or error per task |
-| `task_jobs` | Follow deferred tasks (`defer:true`): list, get, cancel, remove |
-| `scope` / `session` | Keep bounded conversation history / keep related tasks on the same model |
-| `warm_model` | Preload an installed model through the same memory checks |
-| `delegate_research` | Read-only repository lookup that returns an answer with citations and a verdict |
-| `ollama_manage` / `ollama_delete` | Pull or unload, or delete, one exact approved tag |
+Nine tools cover inventory (`models`, `doctor`), execution (`run_task`, `task_jobs`), history and
+affinity (`scope`, `session`), read-only research (`delegate_research`), and approved model
+lifecycle (`ollama_manage`, `ollama_delete`). The canonical table is in the
+[MCP reference](packages/mcp/README.md#tools).
 
 Typical flow: `models` → `run_task {preview:true}` → `run_task` with the prompt → check the receipt.
 A preview runs nothing and reserves nothing. Full schemas and the agent workflow are in the
@@ -88,8 +81,7 @@ npx @octocodeai/freellama status      # queues, memory holds, loaded models
 ```
 
 Replace `MODEL_TAG` with an exact tag from `models`. Other commands: `jobs`, `usage`, `config`,
-`warm`, `scope`, `session`, `recommend`, `bench-all`, `proxy`, and `tools` (maps each MCP tool to
-its CLI command). Run `npx @octocodeai/freellama <command> --help`, or see the [CLI guide](docs/CLI.md).
+`warm`, `scope`, `session`, `bench-all`, and `proxy`. Run `npx @octocodeai/freellama <command> --help`, or see the [CLI guide](docs/CLI.md).
 
 While `serve` runs, a status page is available at `http://127.0.0.1:11435/_freellama/ui`.
 
@@ -117,7 +109,7 @@ flowchart TD
     T -->|"Small lookup, high-stakes decision,<br/>final verification"| Keep["Keep in your agent"]
     Fit --> N{"How many items?"}
     N -->|"one"| RT["run_task"]
-    N -->|"many, independent"| B["run_task_batch"]
+    N -->|"many, independent"| B["run_task {tasks}"]
     N -->|"long-running"| D["run_task {defer:true}<br/>then task_jobs"]
 ```
 
@@ -191,11 +183,11 @@ work. The operator assigns models; agents may only express `executionPreference`
 
 | Need | Use |
 |---|---|
-| Many independent items | `run_task_batch` with up to 64 `{id, independent:true, task}` items and `maxParallelism` |
+| Many independent items | `run_task {tasks, maxParallelism}` with up to 64 `{id, independent:true, task}` items |
 | Submit now, collect later | `run_task {defer:true}` returns `job.id`, then `task_jobs {action:"get", jobId}` |
 | Multi-turn chat without resending history | `scope {action:"create"}`, then `run_task {scopeId, scopeRevision, prompt}` |
 | Keep related calls on one model | `session {action:"create"}`, then `run_task {sessionId}` |
-| Hot model before latency-sensitive work | `warm_model {model, contextTokens}` |
+| Hot model before latency-sensitive work | `run_task {warm:true, model, contextTokens}` |
 
 See [Scopes and warming](docs/SCOPES_AND_WARMING.md).
 
@@ -210,19 +202,23 @@ computed verification verdict. Discard `escalate` results; verify citations on t
 Compact default views, cursor-paged details, embedding vectors omitted unless requested
 (`returnEmbeddings:true`), and full adapter transcripts kept on disk instead of in your context.
 Optional `telemetry.externalEquivalent` estimates avoided API cost from a rate card you configure.
-See [token economics](docs/ECONOMICS.md).
+See [token economics](packages/mcp/README.md#token-economics).
 
 ### Observe and evaluate
 
 - **Live status:** queues, memory holds, loaded models, circuit breakers, usage per day and model
   (`doctor {view:"status"}`, `freellama status`, or the `/_freellama/ui` page).
-- **Evaluation:** benchmark installed models and build a routing policy from the results.
-  See [model selection](docs/MODEL_SELECTION.md) and [benchmarks](benchmark/README.md).
+- **Evaluation:** benchmark installed models (`bench-all`) and turn benchmark results into a routing
+  policy. See [model selection](docs/MODEL_SELECTION.md) and [benchmarks](benchmark/README.md).
 - **Ollama compatible:** `/api/*` and `/v1/*` pass through to Ollama unchanged, including streaming.
-  See [Ollama compatibility](docs/OLLAMA_SIDECAR.md).
+  See [Ollama sidecar](docs/ARCHITECTURE.md#ollama-sidecar).
 
 ## Good to know
 
+- FreeLlama manages requests around Ollama; Ollama runs inference. Local inference still consumes
+  hardware, memory, power, and time; offloading reduces the calling agent's context, not total cost.
+- The name refers to reducing reliance on metered inference; any eligible Ollama model works, not
+  only the Meta Llama family. FreeLlama targets one operator or a trusted team.
 - Model searches and recommendations never download anything. Approve one exact tag and size before a pull.
 - Managed tasks are non-streaming. Raw Ollama passthrough keeps streaming.
 - CPU assignment is configured by the operator. Trust the returned placement evidence, not the configuration.
@@ -233,10 +229,10 @@ See [token economics](docs/ECONOMICS.md).
 
 ## Build from source
 
-Requires Rust 1.85+ and Yarn.
+Requires Rust 1.88+ (`rust-toolchain.toml` pins the exact compiler) and Node.js with Corepack (Yarn comes from `packageManager`).
 
 ```bash
-yarn install && yarn build
+corepack enable && yarn install && yarn build
 ./target/release/freellama serve
 node packages/mcp/dist/index.js        # MCP server from this checkout
 ```
@@ -249,14 +245,14 @@ gate is `yarn verify:production`.
 | Topic | Guide |
 |---|---|
 | All guides | [Documentation index](docs/README.md) |
-| MCP tools, schemas, agent workflow | [MCP reference](packages/mcp/README.md), [agent skill](skills/freellama/README.md) |
+| MCP tools, schemas, agent workflow | [MCP reference](packages/mcp/README.md), [MCP configuration](packages/mcp/CONFIGURATION.md), [agent skill](skills/freellama/SKILL.md) |
 | CLI commands and flags | [CLI](docs/CLI.md) |
 | How it works and who owns what | [Architecture](docs/ARCHITECTURE.md) |
 | CPU/GPU setup and placement | [CPU/GPU routing](docs/CPU_GPU_ROUTING.md) |
 | Queues, memory, live tuning | [Monitoring](docs/MONITORING.md) |
-| Choosing models | [Model selection](docs/MODEL_SELECTION.md), [model metadata](docs/MODEL_METADATA.md) |
+| Choosing models | [Model selection and metadata](docs/MODEL_SELECTION.md) |
 | Deployment and releases | [Production](docs/PRODUCTION.md), [Release](RELEASE.md) |
-| Benchmarks and economics | [Benchmarks](benchmark/README.md), [token economics](docs/ECONOMICS.md) |
+| Benchmarks and economics | [Benchmarks](benchmark/README.md), [token economics](packages/mcp/README.md#token-economics) |
 | Embedding the Rust core | [Rust core](packages/rust-core/README.md) |
 
 Licensed under [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT).

@@ -9,7 +9,7 @@ use axum::{
 };
 use freellama::platform::{
     PlatformConfig, app,
-    resources::{HostResources, MemoryPressure, ResourceGovernor, ResourcePolicy},
+    resources::{HostResources, LowMemoryMode, MemoryPressure, ResourceGovernor, ResourcePolicy},
 };
 use serde_json::{Value, json};
 use std::{
@@ -39,6 +39,7 @@ fn policy() -> ResourcePolicy {
         resume_available_percent: 2,
         hold_available_min_bytes: 100,
         resume_available_min_bytes: 200,
+        low_memory: LowMemoryMode::Advisory,
         ..ResourcePolicy::default()
     }
 }
@@ -130,7 +131,7 @@ async fn run(platform: Router, model: &str, prompt: &str) -> (StatusCode, Value)
 }
 
 fn config(upstream: String, governor: ResourceGovernor) -> PlatformConfig {
-    let mut config = PlatformConfig::new("127.0.0.1:11435", upstream, None, None, "idle:latest")
+    let mut config = PlatformConfig::new("127.0.0.1:11435", upstream, None, None)
         .with_max_queue_wait(Duration::from_millis(1500));
     config.resource_governor = governor;
     config

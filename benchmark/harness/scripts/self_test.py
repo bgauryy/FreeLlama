@@ -30,9 +30,19 @@ def main() -> int:
     suite, fixture = root / "tasks/suite.json", root / "fixtures/atlas"
     suite_value = json.loads(suite.read_text(encoding="utf-8"))
     require_valid(suite_value, json.loads((schemas / "suite.schema.json").read_text(encoding="utf-8")), "public suite")
-    run([sys.executable, str(scripts / "validate.py"), "--suite", str(suite)])
+    # The committed suite must validate as of its own review date (schema, fixture, date order).
+    # Freshness is a publication gate enforced by run.py and validate.py; it is reported here, while
+    # the mechanics below run on a copy dated today so they never depend on the calendar.
+    run([sys.executable, str(scripts / "validate.py"), "--suite", str(suite), "--as-of", suite_value["last_reviewed_at"]])
+    review_due = date.fromisoformat(suite_value["review_due_at"])
+    fresh = review_due >= date.today()
+    if not fresh:
+        print(f"warning: suite review expired on {review_due}; review the suite and advance its dates before publishable runs", file=sys.stderr)
     with tempfile.TemporaryDirectory(prefix="freellama-bench-selftest-") as temporary:
         temp = Path(temporary)
+        suite = temp / "suite.json"
+        dated = dict(suite_value); dated["fixture"] = str(fixture); dated["last_reviewed_at"] = date.today().isoformat(); dated["review_due_at"] = (date.today() + timedelta(days=30)).isoformat()
+        suite.write_text(json.dumps(dated), encoding="utf-8")
 
         private_suite = temp / "private" / "suite.json"
         run([sys.executable, str(scripts / "build_private_suite.py"), "--suite", str(suite), "--output", str(private_suite), "--seed", "self-test-seed"])
@@ -109,7 +119,7 @@ def main() -> int:
         run([sys.executable, str(scripts / "task_verifier.py"), "--task", "Q04", "--workspace", str(red)], expected=1)
         math_file = red / "src/atlas/math_utils.py"; math_file.write_text(math_file.read_text(encoding="utf-8").replace("range(start, end)", "range(start, end + 1)"), encoding="utf-8")
         run([sys.executable, str(scripts / "task_verifier.py"), "--task", "Q04", "--workspace", str(red)])
-    print(json.dumps({"self_test": "passed", "checks": ["schema enforcement", "review dates", "private 20-task execution", "judge calibration", "public 20-task golden x3", "common-task pairs", "geometric ratios", "HTML", "negative schema", "process-tree timeout", "red-green verifier"]}))
+    print(json.dumps({"self_test": "passed", "suite_review": {"review_due_at": review_due.isoformat(), "fresh": fresh}, "checks": ["schema enforcement", "review dates", "private 20-task execution", "judge calibration", "public 20-task golden x3", "common-task pairs", "geometric ratios", "HTML", "negative schema", "process-tree timeout", "red-green verifier"]}))
     return 0
 
 

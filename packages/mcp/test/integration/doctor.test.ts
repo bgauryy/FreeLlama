@@ -33,6 +33,16 @@ describe("doctor", () => {
     expect(result.structuredContent?.local_conservative_config_posture?.apply?.mutates_nothing).toBe(true);
     expect(result.structuredContent?.host_runtime_signals).toBeTruthy();
   });
+
+  it("targets ollamaEndpoint and rejects the removed endpoint alias", async () => {
+    const dead = "http://127.0.0.1:9999";
+    const result = (await client.callTool({ name: "doctor", arguments: { ollamaEndpoint: dead } })) as ToolResult;
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toMatch(/connect|unreachable/i);
+    const alias = (await client.callTool({ name: "doctor", arguments: { endpoint: dead } })) as ToolResult;
+    expect(alias.isError).toBe(true);
+    expect(alias.content[0].text).not.toMatch(/connect|unreachable/i);
+  });
 });
 
 describe("FREELLAMA_OLLAMA_ENDPOINT override", () => {

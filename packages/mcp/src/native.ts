@@ -7,7 +7,7 @@ import { createRequire } from "node:module";
 // is not reliably detectable by Node's CJS/ESM interop. Destructuring after a default import
 // sidesteps that entirely.
 import native from "../native/index.js";
-export const { createScope, getScope, forkScope, deleteScope, warmModelRequest, doctor, machine, health, status, usage, createSession, deleteSession, killSession, listModels, route, runTask, runTaskRequest, runTaskBatchRequest, listTaskJobs, getTaskJob, cancelTaskJob, removeTaskJob } = native as {
+export const { createScope, getScope, forkScope, deleteScope, warmModelRequest, doctor, machine, health, status, usage, createSession, deleteSession, killSession, listModels, route, runTaskRequest, runTaskBatchRequest, listTaskJobs, getTaskJob, cancelTaskJob, removeTaskJob } = native as {
   createScope: (endpoint: string | null | undefined, request: unknown) => Promise<string>;
   getScope: (endpoint: string | null | undefined, scopeId: string, includeMessages?: boolean) => Promise<string>;
   forkScope: (endpoint: string | null | undefined, scopeId: string, request: unknown) => Promise<string>;
@@ -30,24 +30,6 @@ export const { createScope, getScope, forkScope, deleteScope, warmModelRequest, 
     sessionId?: string | null,
     contextTokens?: number | null,
     requiredCapabilities?: string[] | null,
-    minConfidence?: string | null,
-    executionPreference?: string | null,
-    minPlacementEvidence?: string | null,
-  ) => Promise<string>;
-  runTask: (
-    endpoint: string | null | undefined,
-    task: string,
-    objective?: string | null,
-    model?: string | null,
-    sessionId?: string | null,
-    contextTokens?: number | null,
-    requiredCapabilities?: string[] | null,
-    prompt?: string | null,
-    images?: string[] | null,
-    messages?: unknown | null,
-    input?: unknown | null,
-    tools?: unknown | null,
-    keepAlive?: string | null,
     minConfidence?: string | null,
     executionPreference?: string | null,
     minPlacementEvidence?: string | null,

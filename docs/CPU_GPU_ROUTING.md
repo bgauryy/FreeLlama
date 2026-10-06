@@ -9,7 +9,7 @@ memory checks, and model transitions for each backend; the operator configures t
 eligible tags. A configured CPU backend is intent: inspect the placement observation before
 treating it as proof of CPU execution.
 
-This configuration is useful for embeddings, intent interpretation, and other small helper models.
+This configuration is useful for embeddings, short classification, and other small helper models.
 Benchmark large CPU workloads before adopting them. Apple silicon shares memory bandwidth; systems
 with discrete GPUs have different contention and transfer costs, so neither result transfers
 without measurement.
@@ -352,7 +352,6 @@ and `execution.lifecycle`; a failed unload is reported without discarding the co
 Prefer the following assignments:
 
 - Small embedding models
-- Lightweight intent models
 - Short extraction or classification helpers with measured CPU behavior
 
 Benchmark these assignments before adopting them:

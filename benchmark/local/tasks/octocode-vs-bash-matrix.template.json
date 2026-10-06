@@ -6,13 +6,13 @@
     {
       "id": "__MODEL_SLUG__-octocode",
       "agent": "octocode-cli-agent-v1",
-      "agent_command": "env FREELLAMA_TARGET_MODEL=__MODEL__ FREELLAMA_OLLAMA_ENDPOINT=http://127.0.0.1:11435 python3 __REPO_ROOT__/benchmark/local/scripts/octocode_agent.py",
+      "agent_command": "env FREELLAMA_TARGET_MODEL=__MODEL__ FREELLAMA_OLLAMA_ENDPOINT=http://127.0.0.1:11435 node __REPO_ROOT__/packages/mcp/dist/research/octocode-agent.js",
       "capabilities": ["filesystem", "shell", "tools"]
     },
     {
       "id": "__MODEL_SLUG__-bash",
       "agent": "bash-shell-agent-v1",
-      "agent_command": "env FREELLAMA_TARGET_MODEL=__MODEL__ FREELLAMA_OLLAMA_ENDPOINT=http://127.0.0.1:11435 python3 __REPO_ROOT__/benchmark/local/scripts/bash_agent.py",
+      "agent_command": "env FREELLAMA_TARGET_MODEL=__MODEL__ FREELLAMA_OLLAMA_ENDPOINT=http://127.0.0.1:11435 node __REPO_ROOT__/packages/mcp/dist/research/bash-agent.js",
       "capabilities": ["filesystem", "shell", "tools"]
     }
   ]
