@@ -60,7 +60,7 @@ pub(super) fn load_benchmark(
 #[serde(deny_unknown_fields)]
 struct PolicyFile {
     schema_version: u32,
-    /// Set by `policy_from_eval.py --allow-smoke`. A smoke file must not unlock `medium` at runtime.
+    /// Set by `freellama policy from-eval --allow-smoke`. A smoke file must not unlock `medium` at runtime.
     #[serde(default)]
     smoke: bool,
     #[serde(default)]

@@ -459,6 +459,46 @@ pub(crate) enum Command {
         )]
         endpoint: String,
     },
+    /// Generate routing policy files for `serve --policy-file`.
+    Policy {
+        #[command(subcommand)]
+        action: PolicyAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum PolicyAction {
+    /// Write a task policy from a harness quality aggregate (`pass_at_1`), never from throughput.
+    ///
+    /// Aggregate model ids are lossy slugs (`:` replaced with `-`), so qualification matches
+    /// forward from the tags installed on the Ollama endpoint (`/api/tags`).
+    FromEval(PolicyFromEvalArgs),
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct PolicyFromEvalArgs {
+    /// Harness aggregate.json.
+    #[arg(long)]
+    pub(crate) aggregate: PathBuf,
+    /// The task this suite measures; never inferred. Accepts `-` or `_` (`code-repair`).
+    #[arg(long, value_parser = freellama::platform::policy_eval::parse_task_kind)]
+    pub(crate) task: TaskKind,
+    /// Minimum `pass_at_1` to qualify.
+    #[arg(long, default_value_t = 0.8)]
+    pub(crate) min_pass: f64,
+    /// Write here instead of stdout.
+    #[arg(long)]
+    pub(crate) out: Option<PathBuf>,
+    /// Accept fewer than three trials; marks the output smoke-only, which `serve` refuses.
+    #[arg(long)]
+    pub(crate) allow_smoke: bool,
+    /// Endpoint used to list installed models (aggregate ids are lossy slugs).
+    #[arg(
+        long,
+        env = "FREELLAMA_OLLAMA_ENDPOINT",
+        default_value = freellama::DEFAULT_OLLAMA_ENDPOINT
+    )]
+    pub(crate) ollama_endpoint: String,
 }
 
 pub(crate) struct PlatformStartArgs {

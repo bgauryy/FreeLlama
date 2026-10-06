@@ -17,6 +17,7 @@ flowchart TD
     Q -->|"Run the control plane"| S["serve"]
     Q -->|"Preserve only Ollama APIs"| P["proxy"]
     Q -->|"Measure models"| B["bench-all"]
+    Q -->|"Write a routing policy"| PE["policy from-eval"]
 ```
 
 | Command | Purpose | Needs `freellama serve` |
@@ -37,6 +38,7 @@ flowchart TD
 | `jobs` | List, inspect, cancel, or remove deferred tasks and warming operations | Yes |
 | `proxy` | Run only the Ollama-compatible retry and telemetry sidecar | No |
 | `bench-all` | Measure installed models by capability group | No |
+| `policy from-eval` | Write a task policy (`platform.toml`) from a quality-evaluation aggregate and the installed tags | No |
 | `doctor` | Inspect Ollama, hardware, versions, and effective settings | No |
 
 Run `npx @octocodeai/freellama <command> --help` for every accepted flag and enum value. The executable's help
@@ -258,7 +260,7 @@ benchmark record for the selected model.
 
 ```mermaid
 flowchart LR
-    Q["Quality evaluation aggregate"] --> P["policy_from_eval.py"]
+    Q["Quality evaluation aggregate"] --> P["freellama policy from-eval"]
     P --> PF["platform.toml"]
     T["Local throughput benchmark"] --> BR["benchmark-report.json"]
     PF --> S["freellama serve"]
@@ -266,12 +268,12 @@ flowchart LR
     S --> C["Medium confidence for configured, measured routes"]
 ```
 
-Generate the policy from correctness data with the harness script (Python 3 standard library
-only) and the benchmark report from local runtime data:
+Generate the policy from correctness data with `policy from-eval` and the benchmark report from
+local runtime data:
 
 ```bash
-python3 benchmark/harness/scripts/policy_from_eval.py \
-  --aggregate benchmark/local/results/MODEL/aggregate.json \
+npx @octocodeai/freellama policy from-eval \
+  --aggregate aggregate.json \
   --task coding \
   --min-pass 0.8 \
   --out platform.toml
@@ -314,14 +316,16 @@ put a machine-wide policy in the config directory or set the variables in the MC
 
 Replace `MODEL` with the directory containing your completed quality-evaluation aggregate.
 
-`policy_from_eval.py` reads `pass_at_1`, not the throughput produced by `bench-all`. It refuses
+`policy from-eval` reads `pass_at_1`, not the throughput produced by `bench-all`. It refuses
 expired aggregates and fewer than three trials unless `--allow-smoke` is explicit, and it skips
 models that are not installed on `--ollama-endpoint` (default `FREELLAMA_OLLAMA_ENDPOINT`, then
 `http://127.0.0.1:11434`). This prevents speed data from being mislabeled as quality evidence.
+It accepts the task kinds `route` accepts, with `-` or `_` (`code-repair` or `code_repair`), writes
+to stdout unless `--out` is given, and reports a refusal as one `error: ...` line with exit status 1.
 
 ## Compare the CLI and MCP surfaces
 
 MCP-only operations are `delegate_research` and the online `models { view: "library" }` view.
-CLI-only operations include `serve`, `proxy`, `bench-all`, and `auth-token`.
+CLI-only operations include `serve`, `proxy`, `bench-all`, `policy from-eval`, and `auth-token`.
 
 For the MCP tool contracts, read the [MCP package reference](https://github.com/bgauryy/FreeLlama/blob/main/packages/mcp/README.md).

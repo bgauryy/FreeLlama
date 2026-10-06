@@ -31,12 +31,16 @@ dependency rather than compiling Rust during installation.
 
 ## Run the test tiers
 
+The root `yarn build`, `yarn lint`, and `yarn test` run across every package: the Rust crates
+(`rust-core`, `cli`) through Cargo and the JavaScript workspaces (`mcp`, `cli`, `native/*`) through
+Yarn. Use the `:js` or `:rust` variants to run one side only.
+
 | Tier | Command | External requirements |
 |---|---|---|
-| JavaScript unit | `yarn test` | None |
+| All package unit tests (JS + Rust) | `yarn test` | Rust toolchain |
+| JavaScript unit | `yarn test:js` | None |
 | Rust contracts | `yarn test:rust` | Rust toolchain |
-| Local-agent contracts | `yarn test:agents` | Python 3 standard library |
-| Hardware runner contracts | `python3 -m unittest discover -s benchmark/hardware -p 'test_*.py'` | Python 3 standard library; no inference |
+| Local-agent contracts | `yarn test:agents` | None after install; builds the MCP package |
 | TypeScript | `yarn typecheck` | None after install |
 | MCP integration | `yarn test:integration` | Ollama at `FREELLAMA_OLLAMA_ENDPOINT` (default `127.0.0.1:11434`) |
 | MCP end to end | `yarn test:e2e` | Ollama, `freellama serve`, and required models |
@@ -188,25 +192,12 @@ After rebuilding the release, a fresh concurrent smoke check completed both mana
 Qwen, one embedding from Nomic, positive Qwen VRAM, zero Nomic VRAM, and primary Ollama 0.33.2
 through raw passthrough.
 
-For promotion, use the portable [hardware acceptance runner](https://github.com/bgauryy/FreeLlama/blob/main/benchmark/hardware/README.md) and
-archive its JSON receipt with the release evidence. Compilation alone does not validate a driver,
-physical placement, shared-memory contention, or OCR quality.
-
-The runner measures separate sequential and parallel runs of identical workloads across at least
-three pairs, and checks every result before reporting successful-task throughput. It requires a
-configurable median gain (default 5%). Resident GPU bytes establish placement; they do not measure
-device busy percentage, bandwidth or energy efficiency. Sustained throughput and tail latency
-require a representative workload and separate device/thermal observations.
+The portable hardware acceptance, workload, comparison, and load runners were removed from the
+repository; they remain in git history. Compilation alone does not validate a driver, physical
+placement, shared-memory contention, or OCR quality.
 
 The historical CPU/GPU observations above predate the corrected paired-run acceptance gate.
-They remain records of those runs, and do not qualify a release under the current gate.
-
-For a GPU workload with independent expected answers, use
-`benchmark/hardware/run_workload.py --workload MANIFEST.json --output RECEIPT.json`. It accepts
-distinct generation or vision cases, runs at least three alternating pairs, retains every
-result, and rejects incomplete or incorrect workloads. Its client deadline also bounds a hung
-measurement worker. See the [hardware guide](https://github.com/bgauryy/FreeLlama/blob/main/benchmark/hardware/README.md) for the manifest
-contract.
+They remain records of those runs and do not qualify a release.
 
 ## Verify release packages
 

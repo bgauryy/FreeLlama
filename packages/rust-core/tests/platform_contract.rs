@@ -3061,7 +3061,7 @@ fn min_confidence_is_enforced_by_the_router_itself() {
         "the refusal must name the model it would have picked, got {text}"
     );
     assert!(
-        text.contains("bench-all") && text.contains("policy_from_eval.py"),
+        text.contains("bench-all") && text.contains("freellama policy from-eval"),
         "the refusal must name both inputs that raise the grade, got {text}"
     );
 }

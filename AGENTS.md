@@ -14,9 +14,6 @@ prompts, task dependencies, judgment, and verification. Ollama and the host exec
 | Ollama/model operation procedure | [FreeLlama skill](skills/freellama/SKILL.md) |
 | CPU/GPU topology and observed placement | [CPU/GPU routing](docs/CPU_GPU_ROUTING.md) |
 | Runtime resource limits and status | [Monitoring](docs/MONITORING.md) |
-| Generic benchmark execution and scoring | [Harness guide](benchmark/harness/README.md) |
-| Local adapter comparison | [Local benchmark](benchmark/local/README.md) |
-| Adapter behavior, configuration, and measured caveats | [Adapter contracts](benchmark/local/docs/07-adapter-contracts.md) |
 | Development checks | [Testing](docs/TESTING.md), root `package.json` |
 
 ## Agent-facing invariants
@@ -34,12 +31,8 @@ prompts, task dependencies, judgment, and verification. Ollama and the host exec
   mutation authority, and final verification. Discard an `escalate` result.
 - An empty LSP result is ambiguous. Retry or search instead; a cold zero does not prove a language
   is unsupported. Structural code search requires `pattern` or `rule`, not `keywords` alone.
-- Research adapter implementations live only in `packages/mcp/src/research/`. `benchmark/local/`
-  runs their compiled `dist/research/*.js` by command on the generic scoring infrastructure in
-  `benchmark/harness/`. Preserve full audit output; paginate what the model reads.
-- Keep comparison suites, fixtures, answer keys, schemas, and graders frozen during measurement.
-  Local benchmark judging is a separate non-local post-hoc step; do not co-resident a local judge
-  with the candidate model.
+- Research adapter implementations live only in `packages/mcp/src/research/`. Preserve full audit
+  output; paginate what the model reads.
 
 ## Package manager and checks
 

@@ -9,7 +9,7 @@ presentation, and exact-tag approval gate. This reference owns how to qualify th
 1. For quality-sensitive work, preview with `minConfidence:"medium"`.
 2. Make `medium` reachable with both a task policy from correctness evaluations and a local
    `bench-all` functional report. Neither input substitutes for the other.
-3. Generate policy with `benchmark/harness/scripts/policy_from_eval.py`; never manufacture it from throughput.
+3. Generate policy with `freellama policy from-eval`; never manufacture it from throughput.
 4. For library search, fetch families first, then inspect one family for pullable tags and
    `fitsInMemory`. With `serve` down, do not guess a tag.
 

@@ -537,7 +537,7 @@ fn enforce_min_confidence(
         "route refused: confidence is \"{confidence}\" (evidence: {evidence}), below the requested \
          minimum \"{minimum}\". Would have selected \"{would_select}\". This is a fail-closed \
          refusal, not a failure — the router cannot justify this pick. Lower `min_confidence`, or \
-         raise the evidence level with a policy file (`benchmark/harness/scripts/policy_from_eval.py`) AND a \
+         raise the evidence level with a policy file (`freellama policy from-eval`) AND a \
          benchmark report (`freellama bench-all`) — note that naming an explicit `model` does NOT \
          raise the grade, because the grade measures the evidence, not who chose."
     );
@@ -726,7 +726,7 @@ fn eligible_for_objective<'a>(
     }
     ensure!(
         !qualified.is_empty(),
-        "no quality-qualified model exists for this task; configure a task policy (`benchmark/harness/scripts/policy_from_eval.py`), choose objective \"fastest\" (CLI: --objective fastest; MCP: objective:\"fastest\"), or name an explicit model. Run `freellama doctor` — unset OLLAMA_MAX_LOADED_MODELS / OLLAMA_KV_CACHE_TYPE is a machine-config gap, not a missing model"
+        "no quality-qualified model exists for this task; configure a task policy (`freellama policy from-eval`), choose objective \"fastest\" (CLI: --objective fastest; MCP: objective:\"fastest\"), or name an explicit model. Run `freellama doctor` — unset OLLAMA_MAX_LOADED_MODELS / OLLAMA_KV_CACHE_TYPE is a machine-config gap, not a missing model"
     );
     Ok(qualified)
 }

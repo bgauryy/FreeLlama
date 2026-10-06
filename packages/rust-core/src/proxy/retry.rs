@@ -43,8 +43,7 @@ const RESTART_OUTPUT_CAP: u64 = 64 * 1024;
 /// system process — see `with_restart_action`.
 pub type RestartAction = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
-/// Quits and relaunches the macOS Ollama app with the same two commands as
-/// `benchmark/local/scripts/restart_ollama.sh`. Implemented only for macOS; on other platforms it
+/// Quits and relaunches the macOS Ollama app. Implemented only for macOS; on other platforms it
 /// logs that auto-restart is unsupported and does nothing.
 pub(crate) fn default_restart_ollama() -> Pin<Box<dyn Future<Output = ()> + Send>> {
     Box::pin(async {

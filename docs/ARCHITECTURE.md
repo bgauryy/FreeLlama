@@ -492,8 +492,8 @@ Adapter cache totals remain null if any turn is unreported, with partial-report 
 See [Ollama usage](https://docs.ollama.com/api/usage) and
 [the pinned prefix-cache implementation](https://github.com/ggml-org/llama.cpp/blob/74a7c897f049c17e7080423aa2111776eff6ebbf/tools/server/server-context.cpp#L3201).
 
-For adapter implementation, defaults, and measured caveats, see the
-[local adapter reference](https://github.com/bgauryy/FreeLlama/blob/main/benchmark/local/docs/07-adapter-contracts.md).
+Adapter implementations and defaults live in
+[`packages/mcp/src/research/`](../packages/mcp/src/research/).
 
 ## Context and token boundary
 

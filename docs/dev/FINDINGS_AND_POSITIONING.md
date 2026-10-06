@@ -152,7 +152,7 @@ They establish feasibility within their measured limits, not a fresh performance
 | Code retrieval and judgment | Historical fixtures reported imperfect semantic-search recall and about 67% code-review accuracy. | Similarity and generated review findings require verification; they cannot authorize deletion or approve changes. |
 
 See [the measured CPU/GPU result](../CPU_GPU_ROUTING.md#interpret-the-measured-mac-result),
-[token economics](../../packages/mcp/README.md#token-economics), [adapter caveats](../../benchmark/local/docs/07-adapter-contracts.md), and
+[token economics](../../packages/mcp/README.md#token-economics), adapter caveats (removed; see git history), and
 [historical delegation evidence](evidence/task-delegation.md).
 This review did not rerun those workloads or independently regrade their quality results.
 
@@ -284,7 +284,6 @@ The following evidence is needed before increasing the ratings:
 7. Rerun current release gates and fresh packed-consumer checks after all edits. Execute foreign native and installer checks on target runtimes.
 8. Evaluate research accuracy and context retention on held-out tasks. Use identical workloads before making competitor performance claims.
 
-Use [Local performance testing](LOCAL_PERFORMANCE_TESTING.md) and the
-[hardware benchmark contracts](../../benchmark/hardware/README.md) for measurement.
-Use the [local adapter benchmark](../../benchmark/local/README.md) for research quality.
+Use [Local performance testing](LOCAL_PERFORMANCE_TESTING.md) for measurement. The hardware
+benchmark contracts and local adapter benchmark were removed; see git history.
 The [release procedure](../../RELEASE.md) owns publication readiness.

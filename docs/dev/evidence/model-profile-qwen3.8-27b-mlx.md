@@ -71,7 +71,7 @@ inference from an incomplete snippet, three were legitimate with varying real-wo
 **A blind trust-the-review workflow would act on a fake bug about a third of the time.**
 
 ### 7. Structured JSON tool-calling & agentic tool use — ✅ Good, with real cost tradeoffs
-From the formal 30-question benchmark (see [`benchmark/local/`](https://github.com/bgauryy/FreeLlama/blob/main/benchmark/local)), comparing the same model with a
+From the formal 30-question benchmark (local adapter benchmark, removed; see git history), comparing the same model with a
 purpose-built tool (octocode) vs. raw bash:
 
 | Agent | Pass rate | Median tool calls | Median tokens in/out | Median time |
@@ -191,8 +191,8 @@ the reported relative path resolves to a real, unique file instead.
 
 All findings above are reproducible: challenges 1-6 were run live against `qwen3.8:27b-mlx` through
 `http://127.0.0.1:11435/api/chat` (the FreeLlama proxy) this session; challenge 7 and the tool-usage
-table are computed directly from the harness's per-trial JSON output — re-run
-`python3` over those files to reproduce the counts.
+table are computed directly from the harness's per-trial JSON output (removed with the benchmark;
+see git history).
 
 Next: see `skills/freellama/references/task-delegation.md` for how these findings translate into a delegate/verify
 decision.

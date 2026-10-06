@@ -204,7 +204,7 @@ npm publish ./packages/mcp --access public
 
 Publishes `@octocodeai/freellama-mcp-server@<version>`. The `prepublishOnly` hook runs
 `yarn typecheck && yarn build && yarn test` automatically. The package contains
-`dist/index.js`, the `native/` loader shim, bundled Python adapters, documentation, and
+`dist/index.js`, the `native/` loader shim, documentation, and
 `assets/logo.jpg`.
 The `.node` binary is not embedded — it arrives via `optionalDependencies` the same way.
 
@@ -261,29 +261,9 @@ MCP addon; omitting it leaves the JavaScript entry points without their runtime 
 
 ## Automated workflows
 
-[CI](.github/workflows/ci.yml) runs on pull requests and pushes to `main`. It checks Rust formatting,
-Clippy, and tests on Linux, macOS, and Windows. Separate jobs build the native addon, check TypeScript,
-run JavaScript tests and package verification, audit production dependencies, and test the Python adapters.
+The CI and release workflows were removed from the repository; they remain in git history. Run
+`yarn verify:production` and the production promotion conditions locally before creating a release tag.
 
-[Release](.github/workflows/release.yml) builds all eight platform targets on version tags or manual
-dispatch. Before uploading each target's artifacts, its build lane checks the CLI's reported version
-against the workspace version and loads the N-API addon. Non-musl addons load on the target host;
-musl addons load in the `node:22-alpine` container. Each load check requires the `machine` binding.
-These smoke checks require no model inference. Confirm successful remote receipts for the candidate
-revision; inspecting the workflow source alone does not prove target execution.
-
-Its publish job assembles artifacts, builds the MCP package, runs TypeScript and JavaScript
-checks, verifies all publish artifacts, and checks all ten candidate versions in the registry before
-any npm publication. Version-tag runs publish native packages before the CLI
-and MCP packages, then upload GitHub Release assets. Manual dispatch builds and verifies without
-publishing. npm publication requires the configured `NPM_TOKEN` secret and uses `--provenance`.
-
-These workflows do not run the full live integration and end-to-end matrix in `verify:production`.
-Complete that gate and the production promotion conditions before creating a release tag.
-
-
-The release workflow requires the reusable CI checks before building artifacts.
-CI includes the hardware harness and packaging contracts, in addition to Rust and JavaScript checks.
 The publish verifier rejects a version tag that differs from the workspace version.
 Live E2E and physical hardware promotion remain separate operator checks.
 Root `LICENSE-APACHE` and `LICENSE-MIT` are the canonical license texts.

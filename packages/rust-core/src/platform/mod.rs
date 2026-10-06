@@ -38,6 +38,7 @@ mod footprint;
 mod jobs;
 mod monitor;
 pub(crate) mod ollama_env;
+pub mod policy_eval;
 mod readiness;
 mod repetition;
 mod residency;

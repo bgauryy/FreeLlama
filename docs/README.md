@@ -31,8 +31,6 @@ Start with the [repository MCP setup](https://github.com/bgauryy/FreeLlama/blob/
 | Measure inference, device activity, and thermal behavior | [Local performance testing](dev/LOCAL_PERFORMANCE_TESTING.md) |
 | Separate management controls from inference tuning | [Ollama optimization boundary](dev/OLLAMA_SYSTEM_OPTIMIZATION.md) |
 | Understand backend selection decisions | [Resource-routing ADR](dev/ADR_RESOURCE_AWARE_BACKEND_ROUTING.md) |
-| Choose a model, adapter, or hardware benchmark | [Benchmark index](https://github.com/bgauryy/FreeLlama/blob/main/benchmark/README.md) |
-| Inspect research adapter contracts and caveats | [Adapter reference](https://github.com/bgauryy/FreeLlama/blob/main/benchmark/local/docs/07-adapter-contracts.md) |
 
 Historical measurements describe one model, machine, and workload. Inspect current state and
 repeat the relevant checks before using them to select models or set resource limits.

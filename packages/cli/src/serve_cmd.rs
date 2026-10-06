@@ -33,9 +33,8 @@ fn resolve_operator_files(
         eprintln!(
             "freellama: note — `minConfidence: \"medium\"` needs both a policy file and a \
              benchmark report; every route will grade `low` until both exist.\n\
-             freellama: generate a policy with `python3 \
-             benchmark/harness/scripts/policy_from_eval.py --aggregate <harness aggregate.json> \
-             --task <task> --out platform.toml`"
+             freellama: generate a policy with `freellama policy from-eval \
+             --aggregate <harness aggregate.json> --task <task> --out platform.toml`"
         );
     }
     (policy_file, benchmark_report)

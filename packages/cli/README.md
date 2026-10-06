@@ -119,7 +119,7 @@ errors, and the files included in the package. Core CLI contracts live in
 
 `delegate_research` and the online model-library view are MCP-only. Control-plane startup, proxy
 startup, auth-token creation, and benchmarks are CLI-only. Generate a routing policy with
-`python3 benchmark/harness/scripts/policy_from_eval.py` (see [CLI reference](../../docs/CLI.md#earn-medium-routing-confidence)).
+`freellama policy from-eval` (see [CLI reference](../../docs/CLI.md#earn-medium-routing-confidence)).
 
 Use the surfaces together: the CLI starts and verifies the local services; MCP lets an agent inspect
 that state and submit bounded work. An installed MCP client can read `freellama://docs/index` and

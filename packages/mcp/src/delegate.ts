@@ -32,7 +32,7 @@ export function researchErrorResult(error: unknown, diagnostic?: string) {
  * These are one machine's benchmark results. Baking them into a shipped server would make the
  * binary carry someone else's measurements as if they were universal, and they would rot silently
  * the moment models changed. The server carries the *mechanism*; the data lives in
- * `benchmark/evidence/model-evidence.json` (override with FREELLAMA_MCP_MODEL_EVIDENCE).
+ * `packages/mcp/evidence/model-evidence.json`, which is not published (override with FREELLAMA_MCP_MODEL_EVIDENCE).
  *
  * Empty by default. A model with no entry is treated as unmeasured, which yields a `verify`
  * verdict — the correct answer when nothing is known, and a safer default than assuming strength.
@@ -43,7 +43,7 @@ export const MODEL_EVIDENCE: Record<string, ModelGrade> = (() => {
   const configured = process.env.FREELLAMA_MCP_MODEL_EVIDENCE;
   const candidates = [
     configured,
-    path.join(REPO_ROOT, "benchmark/evidence/model-evidence.json"),
+    path.join(REPO_ROOT, "packages/mcp/evidence/model-evidence.json"),
   ].filter((x): x is string => Boolean(x));
   for (const file of candidates) {
     try {
@@ -65,7 +65,7 @@ export const MODEL_EVIDENCE: Record<string, ModelGrade> = (() => {
 
 /** Recovery hint for weak/unusable models; the evidence file, not this code, names which are strong. */
 export const STRONG_MODEL_HINT =
-  "Re-run with a model graded strong in benchmark/evidence/model-evidence.json";
+  "Re-run with a model graded strong in packages/mcp/evidence/model-evidence.json";
 
 /**
  * Classify how far a delegated answer should be trusted, from observable facts only.

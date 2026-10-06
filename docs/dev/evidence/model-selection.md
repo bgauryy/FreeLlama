@@ -32,14 +32,14 @@ measurement without a policy is throughput with nobody vouching for correctness.
 Generate the policy from **quality** data, never from `bench-all`:
 
 ```bash
-python3 benchmark/harness/scripts/policy_from_eval.py \
+freellama policy from-eval \
   --aggregate <harness aggregate.json> --task coding --min-pass 0.8 --out platform.toml
 npx @octocodeai/freellama serve --policy-file platform.toml --benchmark-report <bench-all output>.json
 ```
 
 `bench-all` measures `decode_tokens_per_second`. Generating a policy from it would relabel speed as
 a correctness contract and make `medium` reachable with no new quality evidence — worse than the
-gate refusing everything, because it would pass while meaning nothing. `policy_from_eval.py` reads
+gate refusing everything, because it would pass while meaning nothing. `freellama policy from-eval` reads
 harness aggregates instead, which carry `pass_at_1`, and refuses to manufacture evidence it lacks:
 fewer than 3 trials (one trial is a smoke result; `--allow-smoke` writes it with a banner), past
 `review_due_at`, nothing clearing the threshold, or a model not installed here. Provenance — source

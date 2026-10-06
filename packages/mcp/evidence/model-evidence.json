@@ -1,6 +1,6 @@
 {
   "_comment": "Per-model research grades measured by this repo's benchmarks. Loaded by the MCP server via FREELLAMA_MCP_MODEL_EVIDENCE. Not compiled in: this is machine- and benchmark-specific data, and a shipped server should carry the mechanism, not one machine's results. A model absent here is treated as unmeasured and its answers return a `verify` verdict.",
-  "_source": "reviewed benchmark/local aggregate results and grounded-lookup evaluations summarized in README.md",
+  "_source": "reviewed local benchmark aggregate results (benchmark suite since removed) and grounded-lookup evaluations summarized in README.md",
   "models": {
     "qwen3.8:27b-mlx": {
       "grade": "strong",

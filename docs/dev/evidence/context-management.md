@@ -15,12 +15,8 @@ in `FREELLAMA_AGENT_TOKEN_CALIBRATION_DIR`, reused by later adapter processes, a
 model templates. The records contain no prompt text. Default pinned overflow is `error`, which
 preserves the system prompt and original question byte-for-byte; `clip` is opt-in.
 
-Reproduce the deterministic boundary:
-
-```bash
-python3 benchmark/local/scripts/test_agent_context.py  # 65 contracts
-python3 benchmark/local/scripts/test_agent_actions.py  # both adapter action schemas
-```
+The scripts that reproduced the deterministic boundary (65 context contracts and both adapter
+action schemas) were removed; see git history.
 
 The MCP E2E behavior test sends non-default `charsPerToken` and `observationPageChars` through
 `delegate_research.agent`, performs a real model-backed lookup, and asserts the same values plus a

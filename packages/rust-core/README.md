@@ -3,8 +3,8 @@
 `freellama-core` implements the management layer between calling agents and local Ollama models.
 The CLI and MCP server share this core for task offloading and resource coordination. It owns model
 discovery, deterministic routing, session affinity, scope history, admission control, managed execution,
-and benchmarking. Routing policies are generated outside the crate by
-`benchmark/harness/scripts/policy_from_eval.py`.
+and benchmarking. `platform::policy_eval` renders routing policies from harness quality aggregates
+for `freellama policy from-eval`.
 
 The crate is named `freellama-core`; its library is named `freellama`, so consumers import
 `freellama::…`.

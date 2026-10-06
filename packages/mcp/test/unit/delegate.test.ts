@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { assessDelegatedAnswer, MODEL_EVIDENCE } from "../../src/delegate.js";
 
-// The evidence table is loaded from benchmark/evidence/model-evidence.json at import time; these
+// The evidence table is loaded from packages/mcp/evidence/model-evidence.json at import time; these
 // tests run inside the repo, so the real table is present. If a model named here is removed from
 // the evidence file, the first test fails loudly instead of the verdicts silently degrading.
 describe("MODEL_EVIDENCE", () => {

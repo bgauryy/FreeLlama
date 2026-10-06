@@ -63,7 +63,7 @@ flag. See `## Tests` below for its coverage.
 
 ## Two-layer defense: proxy + adapter
 
-Both research adapters ([`bash_agent.py`](https://github.com/bgauryy/FreeLlama/blob/main/benchmark/local/scripts/bash_agent.py), [`octocode_agent.py`](https://github.com/bgauryy/FreeLlama/blob/main/benchmark/local/scripts/octocode_agent.py)) add a *second*, slower retry layer (1
+Both research adapters (the former Python bash and octocode adapters, removed; see git history) add a *second*, slower retry layer (1
 extra retry, 5s backoff) around each chat call, on top of the proxy's own. This exists because a
 single sustained outage (~45s, longer than the proxy's 3-attempt budget) was observed to exhaust the
 proxy's retries and still fail the whole multi-turn conversation — losing 5-9 turns of accumulated

@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- **Removed `benchmark/`:** the harness, hardware runners and local adapter benchmark are gone,
+  and the repository no longer contains Python. Their history stays in git.
+- **New `freellama policy from-eval`:** this Rust command replaces `policy_from_eval.py`. It writes
+  a routing policy from a harness `aggregate.json`.
+- **Model evidence moved:** `delegate_research` now reads its grades from
+  `packages/mcp/evidence/model-evidence.json`. That file is not published, and
+  `FREELLAMA_MCP_MODEL_EVIDENCE` still overrides it.
+- **Root scripts:** `build`, `lint` and `test` now run every package (JS and Rust). `test:js`,
+  `lint:js` and `build:js` run the JS side only. `test:hardware` and `test:agents:node` are removed.
+
 ## 0.6.0
 
 Breaking cleanup release: fewer surfaces, stricter contracts, and safer admission.

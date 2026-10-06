@@ -209,7 +209,7 @@ See [token economics](packages/mcp/README.md#token-economics).
 - **Live status:** queues, memory holds, loaded models, circuit breakers, usage per day and model
   (`doctor {view:"status"}`, `freellama status`, or the `/_freellama/ui` page).
 - **Evaluation:** benchmark installed models (`bench-all`) and turn benchmark results into a routing
-  policy. See [model selection](docs/MODEL_SELECTION.md) and [benchmarks](benchmark/README.md).
+  policy. See [model selection](docs/MODEL_SELECTION.md).
 - **Ollama compatible:** `/api/*` and `/v1/*` pass through to Ollama unchanged, including streaming.
   See [Ollama sidecar](docs/ARCHITECTURE.md#ollama-sidecar).
 
@@ -252,7 +252,7 @@ gate is `yarn verify:production`.
 | Queues, memory, live tuning | [Monitoring](docs/MONITORING.md) |
 | Choosing models | [Model selection and metadata](docs/MODEL_SELECTION.md) |
 | Deployment and releases | [Production](docs/PRODUCTION.md), [Release](RELEASE.md) |
-| Benchmarks and economics | [Benchmarks](benchmark/README.md), [token economics](packages/mcp/README.md#token-economics) |
+| Token economics | [Token economics](packages/mcp/README.md#token-economics) |
 | Embedding the Rust core | [Rust core](packages/rust-core/README.md) |
 
 Licensed under [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT).

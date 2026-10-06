@@ -23,7 +23,6 @@
   "bin": "dist/index.js",
   "files": [
     "dist",
-    "!dist/research/benchmark.js",
     "native/index.js",
     "native/index.d.ts",
     "native/package.json",

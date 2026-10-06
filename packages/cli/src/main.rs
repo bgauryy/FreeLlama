@@ -3,6 +3,7 @@ mod bench_cmd;
 mod context_cli;
 mod http;
 mod init;
+mod policy_cmd;
 mod requests;
 mod serve_cmd;
 
@@ -17,7 +18,7 @@ use freellama::{
 };
 use serde_json::{Value, json};
 
-use args::{Cli, Command, PlatformStartArgs, TaskExecutionArgs};
+use args::{Cli, Command, PlatformStartArgs, PolicyAction, TaskExecutionArgs};
 use bench_cmd::benchmark;
 use freellama::serve_client;
 use http::{print_get, print_post, print_response};
@@ -32,11 +33,28 @@ pub(crate) fn emit(text: impl std::fmt::Display) -> Result<()> {
     Ok(())
 }
 
+/// A failure reported as a single `error: …` line instead of the debug chain, for commands whose
+/// stderr scripts read.
+#[derive(Debug)]
+pub(crate) struct PlainError(pub(crate) String);
+
+impl std::fmt::Display for PlainError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PlainError {}
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         // `freellama status | head` closing the pipe early is not a failure.
         Err(error) if is_broken_pipe(&error) => ExitCode::SUCCESS,
+        Err(error) if error.is::<PlainError>() => {
+            eprintln!("error: {error}");
+            ExitCode::FAILURE
+        }
         Err(error) => {
             eprintln!("Error: {error:?}");
             ExitCode::FAILURE
@@ -172,6 +190,9 @@ async fn run() -> Result<()> {
             output,
         } => benchmark(endpoint, include, timeout_seconds, trials, output).await?,
         Command::Doctor { endpoint } => print_doctor(&endpoint).await?,
+        Command::Policy {
+            action: PolicyAction::FromEval(args),
+        } => policy_cmd::from_eval(args).await?,
     }
     Ok(())
 }

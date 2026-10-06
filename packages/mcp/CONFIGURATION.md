@@ -18,7 +18,7 @@ server-launch config (for example `.mcp.json`'s `env` block) or the launching sh
 | `FREELLAMA_MCP_PULL_TIMEOUT_SECONDS` | `1200` | Default `ollama_manage` `"pull"` timeout |
 | `FREELLAMA_MCP_FETCH_TIMEOUT_SECONDS` | `30` | Timeout for other direct Ollama HTTP calls |
 | `FREELLAMA_MCP_ALLOWED_ROOTS` | checkout: this repository; published: must be set | Platform-separated allowlist of directories `delegate_research` may read (`:` on macOS/Linux, `;` on Windows) |
-| `FREELLAMA_MCP_MODEL_EVIDENCE` | checkout: `benchmark/evidence/model-evidence.json`; published: unset | Path to per-model research grades (see "Runtime evidence") |
+| `FREELLAMA_MCP_MODEL_EVIDENCE` | checkout: `packages/mcp/evidence/model-evidence.json`; published: unset | Path to per-model research grades (see "Runtime evidence") |
 | `FREELLAMA_EXTERNAL_COST_MODEL` | unset | External-model label in estimated avoided-cost telemetry; set all three cost variables or none |
 | `FREELLAMA_EXTERNAL_COST_INPUT_USD_PER_M` | unset | External input USD per million tokens |
 | `FREELLAMA_EXTERNAL_COST_OUTPUT_USD_PER_M` | unset | External output USD per million tokens |
@@ -100,7 +100,7 @@ slots or relax memory guards. Existing queued work keeps its captured cost. See
 [monitoring controls](https://github.com/bgauryy/FreeLlama/blob/main/docs/MONITORING.md#adaptive-concurrency).
 
 **No measurements are compiled in.** In a repository checkout, per-model research grades load from
-`benchmark/evidence/model-evidence.json`. A published package does not include that repository
+`packages/mcp/evidence/model-evidence.json`. A published package does not include that repository
 file, so its evidence table is empty unless you set `FREELLAMA_MCP_MODEL_EVIDENCE`. An unmeasured
 model yields a `verify` verdict, and an unreadable evidence file is reported on stderr and treated
 as empty. Tool descriptions state the rules; measurement details live in
