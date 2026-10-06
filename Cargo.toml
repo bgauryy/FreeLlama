@@ -23,6 +23,8 @@ pedantic = "warn"
 # Production code propagates errors or states the invariant with `expect`; tests may unwrap
 # (clippy.toml).
 unwrap_used = "warn"
+# Every lint suppression states why.
+allow_attributes_without_reason = "warn"
 
 [workspace.dependencies]
 libc = "0.2"
