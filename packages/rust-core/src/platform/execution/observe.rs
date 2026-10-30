@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use super::super::error::ApiError;
 use super::super::{Backend, PlatformState, get_json};
 use super::ExecutionTarget;
-use super::forward::post_json_with_retries;
+use super::upstream::post_json_with_retries;
 
 /// Ask Ollama to unload `model` from `upstream` now (`keep_alive: 0`).
 pub(crate) async fn request_unload(

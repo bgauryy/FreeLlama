@@ -21,7 +21,7 @@ use super::{
     requests_immediate_unload, reserve_task_resources, resident_entry, select_managed_route,
     task_cost_for, task_has_images, transition_timeout,
 };
-use crate::model_bench::Capability;
+use crate::capability::Capability;
 
 #[expect(
     clippy::too_many_lines,

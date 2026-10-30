@@ -24,7 +24,7 @@ describe("MCP schema parity with Rust routing types", () => {
   });
 
   it("advertises every routable capability and excludes the internal Other bucket", () => {
-    const capabilities = rustEnumMembers("packages/rust-core/src/model_bench.rs", "Capability").filter(
+    const capabilities = rustEnumMembers("packages/rust-core/src/capability.rs", "Capability").filter(
       (capability) => capability !== "other",
     );
     expect([...REQUIRED_CAPABILITIES]).toEqual(capabilities);

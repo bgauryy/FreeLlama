@@ -16,7 +16,7 @@ use axum::{
 };
 
 use freellama::{
-    model_bench::Capability,
+    capability::Capability,
     platform::{
         CatalogModel, ExecutionPreference, LoopRecord, ModelRequestDefaults, Objective, RouteInput,
         SessionAffinity, TaskKind, app, select_route,

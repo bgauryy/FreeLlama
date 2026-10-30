@@ -1,6 +1,6 @@
 // models: installed/resident/detail/raw lists and the two-step public library lookup.
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { z } from "zod";
+import * as z from "zod";
 import { machine } from "../native.js";
 import { listModels } from "../serve-client.js";
 import { pageLiveList } from "../paging.js";
@@ -15,9 +15,9 @@ import {
 } from "../model-knowledge.js";
 
 const modelsResultSchema = z.object({
-  models: z.array(z.record(z.unknown())).optional(), tags: z.array(z.record(z.unknown())).optional(), page: z.unknown().optional(),
+  models: z.array(z.record(z.string(), z.unknown())).optional(), tags: z.array(z.record(z.string(), z.unknown())).optional(), page: z.unknown().optional(),
   knowledge: z.unknown().optional(), library: z.unknown().optional(),
-}).passthrough();
+}).loose();
 
 const ollamaLibrary = new OllamaLibraryClient();
 const huggingFace = new HuggingFaceClient();

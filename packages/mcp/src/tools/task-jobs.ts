@@ -1,6 +1,6 @@
 // task_jobs: follow work submitted with run_task {defer:true}.
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { z } from "zod";
+import * as z from "zod";
 import { cancelTaskJob, getTaskJob, listTaskJobs, removeTaskJob } from "../serve-client.js";
 import {
   endpointParam, errorResult, isStructuredSuccess, objectResultSchema, parsedResult, structuredResult, summarizeEmbeddings,

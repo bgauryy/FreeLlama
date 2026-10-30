@@ -55,7 +55,7 @@ uuid.workspace = true
 napi-build = { workspace = true, optional = true }
 
 [dev-dependencies]
-tower = { version = "0.5", features = ["util"] }
+tower = { version = "0.5.3", features = ["util"] }
 
 [lints]
 workspace = true

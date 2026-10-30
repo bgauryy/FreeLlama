@@ -3,6 +3,7 @@
 use anyhow::Result;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::fmt::Write as _;
 
 use super::super::error::ApiError;
 use super::super::{
@@ -343,7 +344,12 @@ pub(crate) fn profile_from_observations(
     material.sort_all_objects();
     let bytes = serde_json::to_vec(&material).expect("profile material serializes");
     Ok(super::super::runtime::ExecutionProfile {
-        id: format!("{:x}", Sha256::digest(bytes)),
+        id: Sha256::digest(bytes)
+            .iter()
+            .fold(String::with_capacity(64), |mut hex, byte| {
+                let _ = write!(hex, "{byte:02x}");
+                hex
+            }),
         task: evidence.task,
         model: evidence.model.to_owned(),
         digest: digest.to_owned(),
@@ -375,10 +381,7 @@ async fn routing_profile(
     payload: &TaskInput,
 ) -> Option<super::super::runtime::ExecutionProfile> {
     input.context_tokens?;
-    if matches!(
-        payload.operation,
-        super::super::warming::ManagedOperation::Warm
-    ) {
+    if matches!(payload.operation, super::super::ManagedOperation::Warm) {
         return None;
     }
     let execution = execution_target(state, &route.selected_model);

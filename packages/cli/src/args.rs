@@ -608,8 +608,8 @@ pub(crate) struct TaskArgs {
     /// routed correctly but has nothing to look at, and says so.
     #[arg(long = "image")]
     pub(crate) images: Vec<PathBuf>,
-    /// Read embedding input from a file, one item per line, instead of the positional prompt.
-    /// Batching is far cheaper than one request per line.
+    /// Read the input from a file instead of the positional prompt: one item per line for
+    /// `--task embedding` (batched in one request), otherwise the whole file is the prompt.
     #[arg(long)]
     pub(crate) input_file: Option<PathBuf>,
     /// Refuse rather than run a route graded below this ("low" or "medium").

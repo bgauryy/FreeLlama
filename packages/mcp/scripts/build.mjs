@@ -18,7 +18,7 @@ await build({
   bundle: true,
   format: "esm",
   platform: "node",
-  target: "node20",
+  target: "node22",
   sourcemap: false,
   logLevel: "info",
   external: ["../native/index.js"],
@@ -39,7 +39,7 @@ await build({
   bundle: true,
   format: "esm",
   platform: "node",
-  target: "node20",
+  target: "node22",
   sourcemap: false,
   logLevel: "info",
 });

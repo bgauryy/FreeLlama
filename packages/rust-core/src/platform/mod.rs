@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::{
-    model_bench::{Capability, ModelType},
+    capability::{Capability, ModelType},
     proxy::{self, ProxyConfig},
 };
 
@@ -63,7 +63,7 @@ use feedback::{
 use sessions::{
     create_session, delete_session, kill_session, require_active_session, with_session_cancellation,
 };
-use tasks_api::{OllamaRequestOptions, TaskInput, run_task_batch};
+use tasks_api::{ManagedOperation, OllamaRequestOptions, TaskInput, run_task_batch};
 
 use discovery::MachineProfile;
 pub use discovery::machine_profile;

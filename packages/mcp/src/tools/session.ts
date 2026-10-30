@@ -1,13 +1,13 @@
 // session: managed affinity sessions (create/delete/kill).
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { z } from "zod";
+import * as z from "zod";
 import { createSession, deleteSession, killSession } from "../serve-client.js";
 import { endpointParam, errorResult, parsedResult, structuredResult } from "../helpers.js";
 
 const sessionResultSchema = z.object({
   session_id: z.string().optional(), deleted: z.boolean().optional(),
   killed: z.boolean().optional(), runner_stop_confirmed: z.boolean().optional(),
-}).passthrough();
+}).loose();
 
 export function registerSessionTool(server: McpServer): void {
   server.registerTool(

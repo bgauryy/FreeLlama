@@ -1,6 +1,5 @@
-use freellama::model_bench::{
-    BenchmarkConfiguration, Capability, ModelMetadata, ModelType, benchmark_plan, score_cases,
-};
+use freellama::capability::{Capability, ModelType};
+use freellama::model_bench::{BenchmarkConfiguration, ModelMetadata, benchmark_plan, score_cases};
 
 fn model(capabilities: &[Capability], size: u64) -> ModelMetadata {
     ModelMetadata {

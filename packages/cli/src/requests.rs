@@ -3,7 +3,7 @@
 use anyhow::{Context, Result, ensure};
 use base64::Engine as _;
 use freellama::{
-    model_bench::Capability,
+    capability::Capability,
     platform::{RouteInput, TaskKind},
 };
 use serde_json::{Value, json};
@@ -104,26 +104,49 @@ pub(crate) async fn request_task(args: TaskArgs) -> Result<()> {
         body["images"] = json!(encoded);
     }
 
-    // Embedding input from a file, one item per line. Batching is dramatically cheaper than one
-    // request per line, and this is what makes the CLI usable for indexing a corpus.
+    let embedding = matches!(task, Some(TaskKind::Embedding));
     if let Some(path) = &input_file {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("read input file {}", path.display()))?;
-        let items: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
-        ensure!(
-            !items.is_empty(),
-            "input file {} has no non-empty lines",
-            path.display()
-        );
-        body["input"] = json!(items);
-        return print_post(&endpoint, "/_freellama/v1/tasks", &body).await;
-    }
-
-    let field = if matches!(task, Some(TaskKind::Embedding)) {
-        "input"
+        let (field, value) = file_input(&text, embedding)
+            .with_context(|| format!("input file {}", path.display()))?;
+        body[field] = value;
     } else {
-        "prompt"
-    };
-    body[field] = Value::String(prompt.context("a prompt or --input-file is required")?);
+        let field = if embedding { "input" } else { "prompt" };
+        body[field] = Value::String(prompt.context("a prompt or --input-file is required")?);
+    }
     print_post(&endpoint, "/_freellama/v1/tasks", &body).await
+}
+
+/// The request field an `--input-file` fills: embedding input takes one item per non-empty line
+/// (one batched request is far cheaper than one per line); every other task takes the whole file
+/// as its prompt.
+fn file_input(text: &str, embedding: bool) -> Result<(&'static str, Value)> {
+    if embedding {
+        let items: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+        ensure!(!items.is_empty(), "has no non-empty lines");
+        return Ok(("input", json!(items)));
+    }
+    ensure!(!text.trim().is_empty(), "is empty");
+    Ok(("prompt", Value::String(text.to_owned())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::file_input;
+    use serde_json::json;
+
+    #[test]
+    fn an_input_file_is_embedding_items_or_one_prompt() {
+        assert_eq!(
+            file_input("a\n\n b \n", true).unwrap(),
+            ("input", json!(["a", " b "]))
+        );
+        assert_eq!(
+            file_input("line one\nline two\n", false).unwrap(),
+            ("prompt", json!("line one\nline two\n"))
+        );
+        assert!(file_input("\n \n", true).is_err());
+        assert!(file_input("  \n", false).is_err());
+    }
 }

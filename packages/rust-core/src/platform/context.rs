@@ -105,7 +105,7 @@ pub(super) fn size_context(
     decision: &mut RouteDecision,
     model: &CatalogModel,
 ) -> Result<Value, ApiError> {
-    if matches!(input.operation, super::warming::ManagedOperation::Warm) {
+    if matches!(input.operation, super::ManagedOperation::Warm) {
         return Ok(json!({"mode":"warm_profile","tokens":decision.options["num_ctx"]}));
     }
     let unestimated_modality = has_unestimated_modality(input);

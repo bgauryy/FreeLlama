@@ -3,7 +3,8 @@
 
 use std::collections::BTreeMap;
 
-use freellama::model_bench::{Capability, ModelMetadata, ModelType, benchmark_plan};
+use freellama::capability::{Capability, ModelType};
+use freellama::model_bench::{ModelMetadata, benchmark_plan};
 use freellama::parse_ollama_cli_version;
 use freellama::platform::{
     CatalogModel, Objective, RouteInput, SessionAffinity, TaskKind, runtime_metrics, select_route,

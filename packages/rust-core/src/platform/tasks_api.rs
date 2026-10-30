@@ -11,10 +11,18 @@ use tokio::task::JoinSet;
 use super::PlatformState;
 use super::admission::{PRIORITY_WEIGHTS, priority_index};
 use super::error::ApiError;
-use super::{RouteInput, TaskPriority, execution, jobs, warming};
+use super::{RouteInput, TaskPriority, execution, jobs};
 
 /// `remote = "Self"` makes the derives inherent functions; the trait impls below wrap them so
 /// deserialization can also record which top-level fields the caller sent (`route_fields`).
+/// What a managed task does with the selected runner: generate a response, or only load it (`warm`).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) enum ManagedOperation {
+    #[default]
+    Generate,
+    Warm,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(remote = "Self", deny_unknown_fields)]
 pub(crate) struct TaskInput {
@@ -25,7 +33,7 @@ pub(crate) struct TaskInput {
     #[serde(skip)]
     pub(crate) route_fields: BTreeSet<String>,
     #[serde(skip)]
-    pub(crate) operation: warming::ManagedOperation,
+    pub(crate) operation: ManagedOperation,
     #[serde(default)]
     pub(crate) messages: Vec<Value>,
     pub(crate) prompt: Option<String>,

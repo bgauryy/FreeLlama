@@ -11,8 +11,8 @@ not provide tenant isolation or billing.
 ## Meet the prerequisites
 
 - Install one Ollama CLI and server version. Run `freellama doctor` and resolve any mismatch.
-- Install Node.js 20 or later for MCP and npm distribution use.
-- Use the release artifacts for your operating system, or build with Rust 1.88 or later.
+- Install Node.js 22 or later for MCP and npm distribution use.
+- Use the release artifacts for your operating system, or build with Rust 1.89 or later.
 - Preinstall and benchmark exact model tags. Discovery never authorizes a pull.
 - Keep the primary and optional CPU Ollama processes on distinct loopback sockets.
 - In a slim or distroless container, install the CA bundle (`ca-certificates`) or set

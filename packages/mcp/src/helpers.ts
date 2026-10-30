@@ -1,5 +1,5 @@
 // Shared MCP result helpers, Zod parameter schemas, the confidence gate, and payload trimming.
-import { z } from "zod";
+import * as z from "zod";
 import { DEFAULT_OLLAMA_ENDPOINT, DEFAULT_OLLAMA_FETCH_TIMEOUT_SECONDS, DEFAULT_SERVE_ENDPOINT } from "./config.js";
 
 export async function ollamaFetch(
@@ -128,18 +128,20 @@ export const requiredCapabilitiesParam = z
 
 export const systemPromptParam = z.string().optional()
   .describe("Local model instructions; verbatim.");
-export const messagesParam = z.array(z.object({
+// One chat message; each array sets its own length bound (zod 4 accumulates `.min` checks).
+export const messageParam = z.object({
   role: z.enum(["system", "user", "assistant", "tool"]),
   content: z.string().optional(),
-}).passthrough()).min(1).optional();
+}).loose();
+export const messagesParam = z.array(messageParam).min(1).optional();
 export const localToolsParam = z.array(z.object({
   type: z.literal("function"),
   function: z.object({
     name: z.string().min(1),
     description: z.string().optional(),
-    parameters: z.record(z.unknown()).optional(),
-  }).passthrough(),
-}).passthrough()).min(1).optional();
+    parameters: z.record(z.string(), z.unknown()).optional(),
+  }).loose(),
+}).loose()).min(1).optional();
 
 /** Only explicitly supplied instructions become a system message; existing messages stay intact. */
 export function taskMessages({ systemPrompt, messages, prompt, images }: {
@@ -180,34 +182,13 @@ const batchTaskParam = z.object({
   input: z.union([z.string().min(1), z.array(z.string().min(1)).min(1)]).optional(),
   tools: localToolsParam,
   keepAlive: z.string().min(1).optional(),
-  format: z.union([z.literal("json"), z.record(z.unknown())]).optional(),
+  format: z.union([z.literal("json"), z.record(z.string(), z.unknown())]).optional(),
   think: z.union([z.boolean(), z.enum(["low", "medium", "high"])]).optional(),
-  options: z.record(z.unknown()).optional(),
+  options: z.record(z.string(), z.unknown()).optional(),
   logprobs: z.boolean().optional(),
   topLogprobs: z.number().int().nonnegative().optional(),
   minConfidence: minConfidenceParam,
 }).strict();
-
-/**
- * Deep-copy a zod v3 schema so no instance is shared with another field. The SDK converts input
- * schemas with zod-to-json-schema's default `$refStrategy: "root"`, which turns a reused instance
- * into `$ref: "#/properties/..."`; many MCP clients don't resolve those, so shared params must be
- * fresh where `run_task` nests them under `tasks[].task`.
- */
-function fresh<T extends z.ZodTypeAny>(schema: T): T {
-  const def: Record<string, unknown> = { ...schema._def };
-  for (const [key, value] of Object.entries(def)) {
-    if (value instanceof z.ZodType) def[key] = fresh(value);
-    else if (Array.isArray(value) && value.length > 0 && value.every((v) => v instanceof z.ZodType)) {
-      def[key] = value.map((v) => fresh(v as z.ZodTypeAny));
-    }
-  }
-  if (schema instanceof z.ZodObject) {
-    const shape = Object.fromEntries(Object.entries(schema.shape as z.ZodRawShape).map(([k, v]) => [k, fresh(v)]));
-    def.shape = () => shape;
-  }
-  return new (schema.constructor as new (def: unknown) => T)(def);
-}
 
 /** Field names a `tasks[].task` item accepts; derived from the schema so hints cannot drift. */
 export const BATCH_TASK_FIELDS: ReadonlySet<string> = new Set(Object.keys(batchTaskParam.shape));
@@ -215,14 +196,14 @@ export const BATCH_TASK_FIELDS: ReadonlySet<string> = new Set(Object.keys(batchT
 export const batchItemParam = z.object({
   id: z.string().min(1),
   independent: z.literal(true),
-  task: fresh(batchTaskParam),
+  task: batchTaskParam,
 }).strict();
 
 // Output schemas describe FreeLlama-owned decision envelopes while leaving Ollama-owned payloads
 // open. This gives a client useful validation without making a newly-added upstream response field
 // into a protocol failure: a strict schema once turned an undocumented /api/show `requires` field
 // into a hard McpError.
-export const objectResultSchema = z.object({}).passthrough();
+export const objectResultSchema = z.object({}).loose();
 
 type ExternalCost = { model: string; input: number; output: number };
 

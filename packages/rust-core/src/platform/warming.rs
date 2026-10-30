@@ -62,12 +62,6 @@ impl WarmingPolicy {
         Duration::try_from_secs_f64(seconds).map_or(self.max_seconds, |duration| duration.as_secs())
     }
 }
-#[derive(Debug, Clone, Copy, Default)]
-pub(super) enum ManagedOperation {
-    #[default]
-    Generate,
-    Warm,
-}
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct WarmInput {
@@ -95,7 +89,7 @@ impl WarmInput {
             .expect("object")
             .retain(|_, value| !value.is_null());
         let mut input: TaskInput = serde_json::from_value(value).map_err(ApiError::bad_request)?;
-        input.operation = ManagedOperation::Warm;
+        input.operation = super::ManagedOperation::Warm;
         Ok(input)
     }
 }

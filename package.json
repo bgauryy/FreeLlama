@@ -1,6 +1,6 @@
 {
   "name": "freellama-workspace",
-  "version": "0.6.2",
+  "version": "0.7.0",
   "private": true,
   "type": "module",
   "description": "Workspace root for FreeLlama's internal Rust core, portable JavaScript entry points, and per-platform native artifact packages.",
@@ -48,13 +48,14 @@
     "release:verify:registry": "node scripts/verify-release-registry.mjs"
   },
   "devDependencies": {
-    "@napi-rs/cli": "^3.8.6",
-    "@types/node": "^22.10.0",
+    "@napi-rs/cli": "^3.10.9",
+    "@types/node": "^22.20.5",
     "esbuild": "^0.28.2",
-    "typescript": "^5.7.2",
-    "vitest": "^4.1.11"
+    "typescript": "^7.0.2",
+    "vite": "^8.3.5",
+    "vitest": "^5.0.5"
   },
   "author": "Guy Bary",
   "license": "Apache-2.0 OR MIT",
-  "packageManager": "yarn@4.9.1"
+  "packageManager": "yarn@4.18.1+sha512.b2e1e7524f654f2749d32b4ebcb4622473cb5bcbc485df2007e12a154e50162a4d795526768bc5f5b8f81717bfd79deb2472813d86fb5ae2eb551fa9c872b08f"
 }
