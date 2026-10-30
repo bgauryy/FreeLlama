@@ -124,6 +124,6 @@ pub(crate) async fn request_task(args: TaskArgs) -> Result<()> {
     } else {
         "prompt"
     };
-    body[field] = Value::String(prompt);
+    body[field] = Value::String(prompt.context("a prompt or --input-file is required")?);
     print_post(&endpoint, "/_freellama/v1/tasks", &body).await
 }

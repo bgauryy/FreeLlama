@@ -118,8 +118,9 @@ The ledger lives next to the feedback file in the platform data directory. Choos
 `/metrics` exposes counters (`freellama_tasks_total`, `freellama_prompt_tokens_total`,
 `freellama_output_tokens_total`, `freellama_task_seconds_total`, `freellama_queue_wait_seconds_total`,
 `freellama_load_seconds_total`, `freellama_raw_requests_total`, `freellama_evictions_total`,
-`freellama_circuit_open_total`, `freellama_concurrency_limit_changes_total`) labelled by model,
-backend, task, and outcome, plus gauges for admission, queues, the raw proxy, host and GPU memory,
+`freellama_circuit_open_total`, `freellama_concurrency_limit_changes_total`); task counters are
+labelled by model, backend, task, and outcome, raw requests by kind and outcome, and the rest by
+backend. Gauges cover admission, queues, the raw proxy, host and GPU memory,
 loaded models, and `freellama_ollama_num_parallel`. Point Prometheus, Grafana Agent, or any
 OpenMetrics-compatible scraper at it.
 
@@ -132,7 +133,7 @@ FreeLlama waits for safe capacity within a deadline and bounds the retained back
 | Managed queue full | `429` | `admission_queue_full` |
 | Raw proxy over its cap after `raw_queue_wait_seconds` | `429` | |
 | Managed wait exceeded `max_queue_wait_seconds` (or the task's `max_wait_seconds`) | `503` | `admission_timeout` |
-| OS pressure, swapping, CPU, thermal, or required telemetry still holds when the waiting budget expires (low available RAM alone only warns; low RAM and swapping never hold an already-resident runner) | `503` | `resource_admission_unavailable` |
+| OS pressure, swapping, CPU, thermal, or required telemetry still holds when the waiting budget expires (low available RAM alone only warns on macOS; low RAM and swapping never hold an already-resident runner, and CPU load and thermal never hold one on the GPU) | `503` | `resource_admission_unavailable` |
 | Backend circuit open | `503` | `upstream_circuit_open` |
 
 These capacity refusals carry a `Retry-After` header and `retry_after_seconds` in the body. For a queue it
@@ -267,9 +268,10 @@ out-of-memory shrink-and-retry only applies when the context was not requested e
 
 With `context_mode = "ollama_default"` (the default), FreeLlama sizes the context as before but
 omits `num_ctx` when Ollama's own default for the model is known, covers the request, and is at most
-`auto_context_max` (32768). The default is resolved in Ollama's order: the Modelfile's `num_ctx`,
-then `OLLAMA_CONTEXT_LENGTH`, then (discrete GPU only) Ollama's VRAM tier — 4096 below 24 GiB, 32768
-below 48 GiB, 262144 above. Receipts show `context_sizing.num_ctx_sent` and the default used.
+`auto_context_max` (32768). The default is the Modelfile's `num_ctx`, then the
+runtime file's `ollama_default_context`, then `OLLAMA_CONTEXT_LENGTH`, then (primary backend
+on a discrete GPU only) Ollama's VRAM tier, from total VRAM minus `OLLAMA_GPU_OVERHEAD` — 4096 below
+23 GiB, 32768 below 47 GiB, 262144 from 47 GiB. Receipts show `context_sizing.num_ctx_sent` and the default used.
 Memory estimates always use the context Ollama can allocate. Use `"explicit"` to always
 send `num_ctx`.
 

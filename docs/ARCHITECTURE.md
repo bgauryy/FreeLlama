@@ -27,7 +27,7 @@ This is the canonical ownership rule; other guides link here.
 | Forecast memory reservations, host-pressure holds, and requests to unload idle unpinned models | FreeLlama managed execution |
 | Explicit per-model CPU/GPU backend assignment | FreeLlama and separate Ollama processes |
 | Grounded research adapters, citations, and verification verdicts | FreeLlama MCP server |
-| Bearer authentication of every route | FreeLlama; external ingress owns TLS and tenant authorization |
+| Bearer authentication of every route except the static `/_freellama/ui` shell | FreeLlama; external ingress owns TLS and tenant authorization |
 
 FreeLlama is a governed router, not an unrestricted hardware scheduler: a CPU preference cannot move
 an arbitrary tag, and one managed call contains one task. Only the calling agent knows which tasks
@@ -92,9 +92,10 @@ flowchart TB
     ADAPTER --> GPU
 ```
 
-The CLI and MCP server do not reimplement routing. The CLI calls the core directly. The MCP server
-uses the feature-gated NAPI boundary for native operations and the control API for serve-backed
-operations.
+The CLI and MCP server do not reimplement routing. CLI commands other than `serve`, `doctor`,
+`init`, and benchmarking are HTTP clients of a running `freellama serve`. The MCP server reaches the
+same control API through the feature-gated NAPI boundary, and unless `FREELLAMA_MCP_AUTOSTART_SERVE=0`
+it starts the bundled `serve` in the background at launch when nothing answers on the default endpoint.
 
 ## Request classification
 
@@ -124,16 +125,20 @@ The control API exposes these endpoints:
 | `POST /_freellama/v1/routes` | Deterministic route decision | No |
 | `POST /_freellama/v1/sessions` | New model-affinity session | No |
 | `DELETE /_freellama/v1/sessions/:session_id` | Release model-affinity session | No |
+| `POST /_freellama/v1/sessions/:session_id/kill` | Release a session and cancel its in-flight tasks; the runner stays loaded | No new inference |
 | `POST /_freellama/v1/scopes` | Create bounded message history | No |
 | `GET /_freellama/v1/scopes/:id` | Scope metadata; optional explicit history inclusion | No |
 | `POST /_freellama/v1/scopes/:id/fork` | Fork history at an expected revision | No |
 | `DELETE /_freellama/v1/scopes/:id` | Delete retained history | No |
 | `POST /_freellama/v1/warm` | Admitted load of an exact installed runner profile | Load only |
 | `POST /_freellama/v1/tasks` | Managed chat, vision, tools, or embedding task (body shape under [Request shapes](#request-shapes)) | Yes |
+| `POST /_freellama/v1/task-batches` | Caller-declared independent tasks with ordered per-item receipts | Yes |
 | `GET /_freellama/v1/jobs` | Deferred job metadata without prompts or results | No |
 | `GET /_freellama/v1/jobs/:id` | One deferred receipt and retained result | No |
 | `POST /_freellama/v1/jobs/:id/cancel` | Cancel one deferred task and release its local permits | No new inference |
 | `DELETE /_freellama/v1/jobs/:id` | Cancel active work, release local permits, and remove its retained record | No new inference |
+
+Status, usage, metrics, and runtime-config endpoints are listed in [monitoring](MONITORING.md).
 
 ### Request shapes
 
@@ -173,7 +178,7 @@ A batch nests whole task bodies:
 `POST /sessions` with an empty object returns `session_id`; `POST /warm` takes `{"model": "<tag>"}`.
 
 The machine profile is host-derived rather than model-name-derived. It reports total physical
-memory on macOS (`sysctl`), Linux (`/proc`), and Windows (system APIs), along with CPU, OS,
+memory on macOS (`sysctl`), Linux (`/proc`), and Windows (CIM through PowerShell), along with CPU, OS,
 architecture, and disk. `memory_bytes` is portable host RAM. `unified_memory_bytes` is populated
 only when host and accelerator memory are known to share a pool; it must not be treated as discrete
 GPU VRAM. Ollama's `/api/ps` remains the placement authority.
@@ -208,7 +213,7 @@ Every field comes from the model's own metadata and from what FreeLlama observed
 name. `GET /_freellama/v1/models` adds, per model:
 
 - `context_default`: the context Ollama gives a request that leaves `num_ctx` unset (`source` is
-  `modelfile`, `config`, `ollama_context_length`, `vram_tier`, or `resident_runner`). A managed
+  `modelfile`, `config`, `ollama_context_length`, `vram_tier`, `resident_runner`, or `unknown`). A managed
   task that sends a different `num_ctx` reloads the runner.
 - `resident_context`: the `context_length` of the loaded runner from `/api/ps`.
 - `observed_loops`: per task kind, managed runs since start and how many ended in a repetition
@@ -243,7 +248,7 @@ flowchart TD
     F --> X{"Explicit model?"}
     X -->|"Yes"| E["Use exact model or refuse"]
     X -->|"No"| O{"Objective"}
-    O -->|"fastest"| S["Rank local performance,<br/>residency, and deterministic ties"]
+    O -->|"fastest"| S["Rank local benchmark,<br/>smaller size, and deterministic ties"]
     O -->|"balanced"| B["Prefer policy-qualified candidates;<br/>otherwise use eligible models with low confidence"]
     O -->|"quality"| Q["Require policy-qualified candidates,<br/>then prefer policy order"]
     E --> H["Grade advertised-context compatibility and evidence"]
@@ -264,8 +269,9 @@ Routing never ranks by a model's name or architecture. Automatic selection (fall
 session affinity) ranks a model last for a task kind when it has looped on that kind at least twice
 in at most twice as many managed runs; the decision then carries
 `repeats_on_this_task_last_resort`. An operator policy naming the model for the task, or an explicit
-`model`, always wins. No request option is added because of which model was chosen: stop sequences
-and decoding settings belong to the caller.
+`model`, always wins. No request option is hard-coded for a model: apart from an operator policy's
+per-model `model_options` (`think`, `num_predict`), stop sequences and decoding settings belong to
+the caller.
 
 `context_window_fit` means only that requested `num_ctx` fits the model's advertised context
 window. It is not a live-memory, free-VRAM, K/V-cache, thermal, or runner-admission verdict.
@@ -306,7 +312,7 @@ flowchart TD
     T["POST /tasks or /task-batches"] --> R["Select eligible model + backend"]
     R --> K["Estimate metadata-backed F16 K/V<br/>(or report unknown)"]
     K --> A{"Acquire selected backend's<br/>3:2:1 fair weighted budget"}
-    A -->|"No"| E503["503 server busy"]
+    A -->|"No"| E503["429 queue full or<br/>503 wait timeout"]
     A -->|"Yes"| B{"Execution backend"}
     B -->|"Primary"| GL{"GPU model resident<br/>under transition lock?"}
     B -->|"CPU assignment"| CO["Add num_gpu: 0"]
@@ -334,8 +340,8 @@ falling back to two. The optional CPU pool defaults to one. A saturated GPU burs
 consume the permit held for a small CPU helper. With one parallel slot, those values represent one
 ordinary chat and one embedding. Operators can tune both budgets from queue-wait and resident-memory evidence.
 After FreeLlama admission, each Ollama process applies its own `OLLAMA_MAX_QUEUE`, scheduler,
-`OLLAMA_NUM_PARALLEL`, and loaded-model limit. Raw proxy requests bypass weighted admission but
-still pass the raw concurrency cap, backend exclusion, and host-pressure gate.
+`OLLAMA_NUM_PARALLEL`, and loaded-model limit. Raw proxy generation requests bypass weighted
+admission but still pass the raw concurrency cap, backend exclusion, and host-pressure gate.
 
 | Task | Default cost |
 |---|---:|
@@ -375,9 +381,10 @@ stable ID and `independent:true`; dependent workflow execution is rejected befor
 It bounds local dispatch and returns ordered per-item success/error receipts. Every child still
 passes the same global admission and transition path above.
 
-The K/V preflight derives single-sequence F16 K+V bytes-per-token only for supported model
-architectures with sufficient metadata. Explicit key/value dimensions take precedence; sliding-window,
-shared-KV, recurrent, and unknown layouts report unknown. F16 is advisory because quantized KV can
+The K/V preflight derives single-sequence F16 K+V bytes-per-token for any architecture whose
+metadata declares the block count and head counts. Explicit key/value dimensions take precedence
+over embedding length divided by heads; sliding-window, shared-KV, recurrent, cross-attention, and
+unknown layouts report unknown. F16 is advisory because quantized KV can
 use less memory. The coarse model-file budget refuses files over 80% of local CPU/unified RAM only
 for loopback backends. Forecasts use each backend's independently attributed parallelism and KV
 cache settings where process inspection is available, with explicit fallback sources otherwise.
@@ -393,9 +400,10 @@ growth holds new loads; CPU-load and thermal holds apply to CPU-assigned work an
 already resident on the GPU, which neither waits for the cores nor cools the package by waiting (`ResourceDemand::is_held_by`; the assessment's
 `held_by` lists the holds that applied). Low available RAM (below the larger of 15% or 1 GiB, clearing after two
 healthy samples above the larger of 20% or 2 GiB) depends on the platform (`ResourcePolicy::low_memory`).
+A new load must leave that reserve free, but never more than its own size above the 1 GiB floor.
 On macOS (`advisory`) the estimate undercounts what the OS can reclaim, so a load that does not cover
-it first unloads idle runners and then dispatches with a `memory_advisory`. On Linux, Windows, and
-other platforms (`refuse`) a new load that does not fit first unloads idle runners and then waits
+it first unloads idle runners and then dispatches with a `memory_advisory`. On Linux and other
+platforms (`refuse`) a new load that does not fit first unloads idle runners and then waits
 with `held_insufficient_capacity` until a permit release or a fresh sample frees capacity, or refuses
 with 503 at its deadline: Linux `MemAvailable` already includes reclaimable cache and is the hard cap
 in a container, so over-admitting invites the OOM killer. Already-resident runners add no memory and
@@ -406,8 +414,10 @@ seconds; unavailable signals stay unknown. Remote backends bypass this host gate
 Each pressure signal recovers independently after two fresh samples that meet its recovery
 threshold. A recovered CPU-load signal therefore clears even while RAM remains low.
 
-The default `require_memory` telemetry policy holds local inference when available RAM is missing,
-even when a raw request has no model-footprint estimate. `best_effort` is an explicit opt-in;
+On Linux and macOS the default `require_memory` telemetry policy holds local inference when
+available RAM is missing, even when a raw request has no model-footprint estimate. Windows and other
+platforms have no host collector, so they default to `best_effort` and admit with
+`admitted_telemetry_unknown`; elsewhere `best_effort` is an explicit opt-in;
 `require_all` additionally requires the collector's applicable load, OS-pressure, and thermal signals.
 Unsupported Linux collector signals remain explicitly unavailable rather than being fabricated.
 The pure `ResourceSnapshot::assess_capacity` calculation is shared by admission and previews.
@@ -442,11 +452,11 @@ Resident tasks share a backend lock. Nonresident tasks take that backend's exclu
 load cannot race another managed task on the same server. CPU and GPU backends have separate locks
 and admission pools, so they can progress independently.
 
-In `serve`, mutating raw proxy requests also take the primary backend's exclusive transition lock,
-returning 503 when busy. The response body holds this guard through EOF or disconnect. Metadata
-GET/HEAD and `/api/show` requests remain available. Raw inference waits at most 500 ms for host
-pressure to clear, then returns 503 with `Retry-After`; empty `keep_alive:0` unload requests bypass
-pressure. Raw request-body collection has the configured request deadline too; an incomplete upload
+In `serve`, raw generation requests also take the primary backend's exclusive transition lock,
+returning 503 when it stays busy past the raw queue wait. The response body holds this guard through
+EOF or disconnect. Metadata GET/HEAD, `/api/show`, model-store calls (pull, push, copy, delete, and
+blob uploads), and empty `keep_alive:0` unload requests take no lock and bypass pressure. Raw
+inference waits at most two seconds for host pressure to clear, then returns 503 with `Retry-After`. Raw request-body collection has the configured request deadline too; an incomplete upload
 returns HTTP 408 and releases its guards without contacting Ollama. Admission receipts report
 `queue_wait_ms`, `resource_wait_ms`, `transition_wait_ms`, and
 their sum as `total_wait_ms`. Health and route receipts expose sampled pressure and reservations.
@@ -599,7 +609,7 @@ expected revision. Warming uses ordinary admission and fit checks; omitted resid
 a finite measured policy. See [Scope history and model warming](SCOPES_AND_WARMING.md) for the
 public contract and configured limits.
 
-In `serve`, mutating passthrough traffic shares the primary transition lock and receives
+In `serve`, raw generation traffic shares the primary transition lock and receives
 host-pressure gating, while managed tasks also reserve forecast memory. Direct Ollama callers bypass
 these controls. FreeLlama cannot preempt inference or constrain other processes. A configured but
 unreachable CPU backend makes managed catalog discovery fail closed; raw primary passthrough remains
@@ -614,8 +624,9 @@ explicit model that is not installed, or a task that exceeds the advertised cont
 ## Product boundary
 
 FreeLlama is not an inference engine, remote provider marketplace, billing layer, hosted model
-registry, general agent runtime, or A2A coordinator. It can authenticate every route with one
-operator-managed bearer token and refuses unauthenticated nonloopback listeners. An external layer
+registry, general agent runtime, or A2A coordinator. It can authenticate every route except the
+static UI shell with one operator-managed bearer token and refuses unauthenticated nonloopback
+listeners. An external layer
 must still provide TLS, tenant authorization, tenant-specific limits, and isolation.
 
 Use Ollama directly when a caller only needs raw speed from one exact model. Use FreeLlama when the

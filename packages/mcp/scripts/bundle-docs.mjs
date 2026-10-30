@@ -2,7 +2,6 @@
 // The repository docs/ directory remains the source of truth. This build step copies only the
 // top-level Markdown guides; docs/README.md is served as the index (freellama://docs/index), so an
 // MCP client can fetch one relevant resource rather than receiving every guide at initialization.
-// Developer notes under docs/dev/ are repository-only and are not packaged.
 import { copyFileSync, existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";

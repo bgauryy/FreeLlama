@@ -42,7 +42,6 @@ Use Yarn for the workspace and Cargo for Rust. Choose the checks for the changed
 |---|---|
 | TypeScript and MCP contracts | `yarn typecheck` and `yarn test` |
 | Rust contracts | `yarn test:rust` |
-| Local adapters | `yarn test:agents` |
 | Production release gate | `yarn verify:production` |
 
 See the owning guides for prerequisites and live-system checks.

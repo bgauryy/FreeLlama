@@ -31,7 +31,7 @@ flowchart LR
 
 Scopes retain bounded process-local transcripts with expected revisions. Warming reuses managed
 admission and placement; adaptive keep-alive remains finite unless a caller explicitly overrides it.
-See [Scope history and model warming](../../docs/SCOPES_AND_WARMING.md) for the shared HTTP, CLI,
+See [Scope history and model warming](https://github.com/bgauryy/FreeLlama/blob/main/docs/SCOPES_AND_WARMING.md) for the shared HTTP, CLI,
 and MCP contract.
 
 ## Understand admission
@@ -44,7 +44,8 @@ costs 4 (capped to the pool size).
 - A cold model takes an exclusive lock on its assigned backend.
 - Independent CPU and GPU backends can therefore progress concurrently.
 - A task that cannot acquire its weighted permit before the queue deadline receives HTTP 503.
-- Each backend also bounds retained waiters (16 primary, 8 CPU by default); cancellation removes a
+- Each backend also bounds retained waiters (16 primary, 8 CPU by default; excess work gets HTTP
+  429); cancellation removes a
   waiter immediately and health reports the queue/in-flight counters.
 
 The primary/GPU pool derives its default weighted budget from observed Ollama parallelism;
@@ -69,7 +70,7 @@ Confidence is derived from evidence, not from model metadata alone:
 | No | Yes | Low | `functional_throughput_screen` |
 | No | No | Low | `capability_metadata_only` |
 
-`policy::qualify_from_aggregate` reads correctness pass rates from a harness aggregate. It never
+`policy_eval::qualify` reads correctness pass rates from a harness aggregate. It never
 uses `bench-all` throughput as a quality signal. It also refuses expired evidence, fewer than three
 trials unless explicitly marked as smoke data, and models that are not installed.
 
@@ -96,7 +97,7 @@ serve(config).await?;
 
 The CPU backend is optional. When configured, exact assigned model names use it and receive
 `options.num_gpu=0` on managed requests. Raw `/api/*` and `/v1/*` passthrough always uses the primary
-upstream. See [CPU and GPU model routing](../../docs/CPU_GPU_ROUTING.md) for the operational
+upstream. See [CPU and GPU model routing](https://github.com/bgauryy/FreeLlama/blob/main/docs/CPU_GPU_ROUTING.md) for the operational
 contract.
 
 `/_freellama/v1/health` exposes the `explicit_cpu_assignment` contract and configured backends.

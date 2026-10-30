@@ -82,3 +82,19 @@ it.skipIf(process.platform === "win32")("keeps a new child tracked when an older
   await new Promise((resolve) => setTimeout(resolve, 100));
   await expect(fetch(`${endpoint}/_freellama/v1/health`)).rejects.toThrow();
 }, 10_000);
+
+it.skipIf(process.platform === "win32")("starts serve in the background at launch and logs a failure instead of rejecting", async () => {
+  const { binary, endpoint } = await fixture();
+  const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+  serve!.startServeInBackground();
+  await vi.waitFor(() => expect(stderr).toHaveBeenCalledWith(expect.stringMatching(/background start failed: Could not start freellama serve.*EACCES/)), { timeout: 5_000 });
+  stderr.mockRestore();
+  await writeFile(binary, `#!${process.execPath}\nimport('node:http').then(({createServer}) => {
+    const args = process.argv.slice(2); const listen = args[args.indexOf('--listen') + 1];
+    createServer((req,res) => { res.end('{}'); }).listen(Number(listen.split(':').at(-1)), '127.0.0.1');
+  });\n`);
+  await chmod(binary, 0o700);
+  fixtureLaunch.script = binary;
+  serve!.startServeInBackground();
+  await vi.waitFor(async () => expect((await fetch(`${endpoint}/_freellama/v1/health`)).status).toBe(200), { timeout: 5_000 });
+}, 10_000);

@@ -13,14 +13,13 @@ describe("packaged documentation resources", () => {
     await client.close();
   });
 
-  it("lists one index and every root documentation page, but no developer notes", async () => {
+  it("lists one index and every root documentation page", async () => {
     const listed = await client.listResources();
     const uris = listed.resources.map((resource) => resource.uri);
     expect(uris).toContain("freellama://docs/index");
     expect(uris).toContain("freellama://docs/PRODUCTION");
     expect(uris).toContain("freellama://docs/CLI");
     expect(uris).not.toContain("freellama://docs/README");
-    expect(uris).not.toContain("freellama://docs/OLLAMA_SYSTEM_OPTIMIZATION");
   });
 
   it("serves documentation lazily through the MCP resource protocol", async () => {

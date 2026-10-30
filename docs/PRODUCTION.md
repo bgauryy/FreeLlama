@@ -34,15 +34,14 @@ published tag:
 powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Version VERSION
 ```
 
-The repository has no CI or release workflows; they were removed (see git history). Build, verify,
-and publish artifacts with the [release procedure](../RELEASE.md). The publish verifier checks that
-a version tag matches the workspace version.
+The repository has no CI or release workflows; they were removed (see git history). Release from a
+clean checkout: `yarn release:version <version>`, `yarn release:build` (builds each target's
+executable and addon into `release-artifacts/<target>/`), `node scripts/assemble-release.mjs
+release-artifacts release`, then `yarn release:verify:publish`. The publish verifier checks that
+`FREELLAMA_RELEASE_TAG`, when set, matches the workspace version.
 Live E2E and hardware qualification remain separate operator checks; verify those receipts before tagging.
 
-For manual assembly, build and test every claimed target in a clean
-environment, place each executable and matching addon under `release-artifacts/<target>/`, run
-`node scripts/assemble-release.mjs release-artifacts release` and `yarn release:verify:publish`, then attach
-`release/SHA256SUMS` and binaries to the release. Publish the eight `@octocodeai/freellama-native-*` packages
+Attach `release/SHA256SUMS` and binaries to the release. Publish the eight `@octocodeai/freellama-native-*` packages
 first, followed by the exact-version `@octocodeai/freellama` and `@octocodeai/freellama-mcp-server` packages. Configure
 registry credentials in the release environment; never store them in the repository.
 
@@ -82,7 +81,7 @@ FreeLlama and Ollama have separate queues. FreeLlama caps retained managed waite
 `--max-queued-tasks`/`--cpu-max-queued-tasks`, then waits for at most
 `--max-queue-wait-seconds`. An admitted request can then enter Ollama's internal queue,
 which is bounded by `OLLAMA_MAX_QUEUE`. Raw compatibility traffic bypasses weighted managed
-admission and enters the primary Ollama queue through a separate one-stream default cap in `serve`.
+admission and, for generation, enters the primary Ollama queue through a separate one-stream default cap in `serve`.
 Set all limits from observed latency and overload behavior; changing one does not configure the
 others.
 
@@ -91,7 +90,7 @@ The following flow shows where each production setting applies:
 ```mermaid
 flowchart LR
     C["Client"] --> FQ["FreeLlama admission<br/>weighted budget + wait deadline"]
-    FQ -->|"refused"| E503["503 server busy"]
+    FQ -->|"refused"| E503["429 or 503 server busy"]
     FQ -->|"admitted"| OQ["Ollama queue<br/>OLLAMA_MAX_QUEUE"]
     RAW["Raw /api/* or /v1/*"] --> RC["Raw stream cap<br/>default 1 in serve"]
     RC -->|"refused"| E503
@@ -102,14 +101,24 @@ flowchart LR
 
 These values are conservative starting points, not universal constants. NVIDIA, AMD, Apple, and
 CPU-only hosts must pass hardware validation before promotion. See
-[Ollama and FreeLlama optimization](dev/OLLAMA_SYSTEM_OPTIMIZATION.md) for the ownership boundary and
 [Run models on CPU and GPU](CPU_GPU_ROUTING.md) for device-specific controls.
+
+Ollama already picks the accelerator, fits the model to device memory, splits layers between CPU
+and GPU, and schedules requests; FreeLlama decides which tasks reach it. These changes do not help:
+
+- Forcing one model's layers between CPU and GPU: partial CPU offload usually lowers decode speed.
+  Run a separate CPU-only Ollama process for a second model instead.
+- Running Ollama in Docker on macOS: Docker Desktop gives it no GPU acceleration there.
+- Raising context globally: K/V memory grows with context; size `num_ctx` per request.
+- Pinning several large models in one process without the memory arithmetic: weights, runtime
+  buffers and every active context must fit together.
+- `q4_0` K/V cache as a default: it trades more quality than `q8_0` for the memory it saves.
 
 Put the values in the service manager that owns each Ollama process: launchd on macOS, systemd or
 the container definition on Linux, and the Windows service wrapper. Shell exports and
 `launchctl setenv` are useful diagnostics but are login-session state, not a reboot-persistent
-production configuration. After a real service restart, rerun `doctor` and `skills/freellama/scripts/check.sh` and
-require the same visible values before admitting work.
+production configuration. After a real service restart, rerun `freellama doctor` and `freellama status`
+and require the same visible values before admitting work.
 
 ## Create the security and state files
 
@@ -170,7 +179,8 @@ only model identifiers, scale, and sample count; they contain no prompts.
 Keep adapter context settings distinct from Ollama server context. `FREELLAMA_AGENT_NUM_CTX`
 budgets the adapter conversation; older tool observations are compacted inside that budget while
 the system prompt and original question remain pinned by default. `OLLAMA_CONTEXT_LENGTH` controls
-direct Ollama requests, and managed FreeLlama tasks send their own `num_ctx`.
+direct Ollama requests; managed FreeLlama tasks size their own context and send `num_ctx` unless
+Ollama's known default covers it.
 
 ## Verify lifecycle and placement
 
@@ -187,10 +197,10 @@ Require these health contracts before admitting traffic:
 - `placement_observation: ollama_api_ps_after_execution`
 - `placement_evidence_gate: configured_or_observed`
 
-Run `skills/freellama/scripts/check.sh` with `FREELLAMA_AUTH_TOKEN_FILE` set. It verifies the
-active versions, visible Ollama settings, persisted-feedback contract, authentication contract,
-backend topology, and binary freshness. Also inspect the service definition for any setting that
-the Ollama process does not expose to FreeLlama.
+With `FREELLAMA_AUTH_TOKEN_FILE` set, run `freellama doctor` (Ollama and CLI versions, visible Ollama
+settings, machine) and read `/_freellama/v1/health` (FreeLlama version, `security`, `feedback.persistence`,
+`backends`) and `freellama status` (backend topology, loaded models, admission). Also inspect the
+service definition for any setting that the Ollama process does not expose to FreeLlama.
 
 ## Validate every hardware class
 

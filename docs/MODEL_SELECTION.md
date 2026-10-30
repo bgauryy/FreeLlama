@@ -32,8 +32,9 @@ flowchart TD
 grounded research, image description, OCR, and summarization. Using one large multimodal model also
 avoided contention between separate heavy text and vision runners.
 
-Read the [retained model profile](https://github.com/bgauryy/FreeLlama/blob/main/skills/freellama/references/model-profile-qwen3.8-27b-mlx.md)
-and [delegation measurements](https://github.com/bgauryy/FreeLlama/blob/main/skills/freellama/references/task-delegation.md) for scope and limits.
+In those evaluations it was strong at grounded lookup, long-context retrieval and strict instruction
+following, needed `think:true` and a generous output budget for multi-step reasoning, and about a
+third of its unsupervised code-review findings were false or context-limited.
 These examples do not establish that a tag is installed or suitable on your host.
 
 Dedicated OCR models answer best to the prompts their model card documents; send them with base64

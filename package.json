@@ -1,6 +1,6 @@
 {
   "name": "freellama-workspace",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "private": true,
   "type": "module",
   "description": "Workspace root for FreeLlama's internal Rust core, portable JavaScript entry points, and per-platform native artifact packages.",
@@ -37,8 +37,7 @@
     "test:integration": "vitest run -c packages/mcp/vitest.integration.config.ts",
     "test:e2e": "vitest run -c packages/mcp/vitest.e2e.config.ts",
     "test:rust": "cargo test --workspace",
-    "test:agents": "yarn workspace @octocodeai/freellama-mcp-server build && node --test skills/freellama/scripts/test-check.mjs",
-    "test:all": "yarn typecheck && yarn test && yarn test:agents && yarn test:release && yarn test:integration && yarn test:e2e",
+    "test:all": "yarn typecheck && yarn test && yarn test:release && yarn test:integration && yarn test:e2e",
     "verify:production": "yarn build && yarn lint:rust && yarn test:all && yarn release:verify:publish",
     "release:version": "node scripts/set-version.mjs",
     "release:build": "node scripts/build-release.mjs",
@@ -55,6 +54,7 @@
     "typescript": "^5.7.2",
     "vitest": "^4.1.11"
   },
+  "author": "Guy Bary",
   "license": "Apache-2.0 OR MIT",
   "packageManager": "yarn@4.9.1"
 }

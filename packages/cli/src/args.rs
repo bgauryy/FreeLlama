@@ -45,7 +45,7 @@ pub(crate) struct AdmissionArgs {
     #[arg(long)]
     pub(crate) max_queue_wait_seconds: Option<u64>,
     /// Maximum managed requests retained while the primary/GPU pool is saturated (default 16,
-    /// or the runtime file). Excess work receives 503 immediately.
+    /// or the runtime file). Excess work receives 429 (`admission_queue_full`) immediately.
     #[arg(long)]
     pub(crate) max_queued_tasks: Option<usize>,
     /// Maximum managed requests retained while the CPU pool is saturated (default 8, or the
@@ -100,6 +100,26 @@ mod telemetry_cli_tests {
         assert_eq!(initialization_status(true, false, true), "setup_required");
         assert_eq!(initialization_status(true, true, false), "setup_required");
         assert_eq!(initialization_status(true, true, true), "ready");
+    }
+
+    #[test]
+    fn task_takes_a_prompt_or_an_input_file_but_not_both() {
+        let parsed = Cli::try_parse_from([
+            "freellama",
+            "task",
+            "--task",
+            "embedding",
+            "--input-file",
+            "x.txt",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Command::Task(TaskArgs { prompt: None, .. })
+        ));
+        assert!(Cli::try_parse_from(["freellama", "task", "hi"]).is_ok());
+        assert!(Cli::try_parse_from(["freellama", "task"]).is_err());
+        assert!(Cli::try_parse_from(["freellama", "task", "--input-file", "x.txt", "hi"]).is_err());
     }
 
     #[test]
@@ -205,8 +225,8 @@ pub(crate) struct BackendArgs {
         default_value = freellama::DEFAULT_OLLAMA_ENDPOINT
     )]
     pub(crate) upstream: String,
-    /// Optional second loopback Ollama process forced to CPU. Managed tasks using a model
-    /// named by --cpu-model are sent here; raw Ollama-compatible endpoints stay on --upstream.
+    /// Optional second Ollama process forced to CPU (keep it on loopback). Managed tasks using a
+    /// model named by --cpu-model are sent here; raw Ollama-compatible endpoints stay on --upstream.
     #[arg(long)]
     pub(crate) cpu_upstream: Option<String>,
     /// Model to assign to --cpu-upstream. Repeat for multiple models.
@@ -553,8 +573,9 @@ pub(crate) struct RouteArgs {
 // Flags of the `task` subcommand (help text comes from the variant's doc comment).
 #[derive(Debug, clap::Args)]
 pub(crate) struct TaskArgs {
-    /// Prompt to send as a single user message.
-    pub(crate) prompt: String,
+    /// Prompt to send as a single user message (omit it with --input-file).
+    #[arg(required_unless_present = "input_file", conflicts_with = "input_file")]
+    pub(crate) prompt: Option<String>,
     #[arg(
         long,
         env = "FREELLAMA_SERVE_ENDPOINT",

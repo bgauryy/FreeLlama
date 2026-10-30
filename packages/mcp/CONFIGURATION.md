@@ -9,7 +9,7 @@ server-launch config (for example `.mcp.json`'s `env` block) or the launching sh
 
 | Variable | Default | Affects |
 |---|---|---|
-| `FREELLAMA_OLLAMA_ENDPOINT` | `http://127.0.0.1:11434` | Default Ollama endpoint for `doctor`, the `models` detail/raw/library views, and all `ollama_*` tools |
+| `FREELLAMA_OLLAMA_ENDPOINT` | `http://127.0.0.1:11434` | Default Ollama endpoint for `doctor`, the `models` detail/raw/library views, all `ollama_*` tools, and the autostarted serve's `--upstream` |
 | `FREELLAMA_SERVE_ENDPOINT` | `http://127.0.0.1:11435` | Default `endpoint` for serve-backed tools and `delegate_research` |
 | `FREELLAMA_MCP_DEFAULT_MODEL` | unset (routes to an installed coding model) | `delegate_research`'s default `model` |
 | `FREELLAMA_MCP_DEFAULT_ADAPTER` | `bash` | `delegate_research`'s adapter (`octocode` to switch) |
@@ -22,11 +22,11 @@ server-launch config (for example `.mcp.json`'s `env` block) or the launching sh
 | `FREELLAMA_EXTERNAL_COST_MODEL` | unset | External-model label in estimated avoided-cost telemetry; set all three cost variables or none |
 | `FREELLAMA_EXTERNAL_COST_INPUT_USD_PER_M` | unset | External input USD per million tokens |
 | `FREELLAMA_EXTERNAL_COST_OUTPUT_USD_PER_M` | unset | External output USD per million tokens |
-| `FREELLAMA_CONTROL_TIMEOUT_SECONDS` | `30` | Decision-only serve calls; read by `packages/rust-core/src/napi.rs` |
-| `FREELLAMA_TASK_TIMEOUT_SECONDS` | `900` | Generation calls; read by `packages/rust-core/src/napi.rs` |
+| `FREELLAMA_CONTROL_TIMEOUT_SECONDS` | `30` | Decision-only serve calls; read by the native client (`packages/rust-core/src/serve_client.rs`) |
+| `FREELLAMA_TASK_TIMEOUT_SECONDS` | `900` | Generation calls; read by the native client (`packages/rust-core/src/serve_client.rs`) |
 | `FREELLAMA_AUTH_TOKEN_FILE` | unset | Bearer-token file used by the native client and research adapters for all serve routes |
 | `FREELLAMA_AGENT_TOKEN_CALIBRATION_DIR` | platform data directory | Prompt-free, model-specific token-estimator calibration shared across adapter processes |
-| `FREELLAMA_MCP_AUTOSTART_SERVE` | `1` | When the default loopback serve endpoint does not answer, start `freellama serve` as a child of the MCP server (stopped with it). `0` disables |
+| `FREELLAMA_MCP_AUTOSTART_SERVE` | `1` | When the default loopback serve endpoint does not answer, start `freellama serve` as a child of the MCP server (stopped with it): once in the background at launch, so other local clients find it, and again on a tool call if it is still down. `0` disables |
 | `FREELLAMA_SERVE_BINARY` | checkout `target/release`/`debug`, then the platform package | Binary used for serve autostart |
 | `FREELLAMA_AGENT_OS_SANDBOX` | `auto` | Bash adapter OS confinement: `bwrap` on Linux, `sandbox-exec` on macOS, when present. `off` keeps only the restricted shell |
 | `FREELLAMA_AGENT_OCTOCODE_PACKAGE` | `octocode@19.1.0` | Pinned npm spec the Octocode adapter runs through `npx` |
@@ -103,6 +103,4 @@ slots or relax memory guards. Existing queued work keeps its captured cost. See
 `packages/mcp/evidence/model-evidence.json`. A published package does not include that repository
 file, so its evidence table is empty unless you set `FREELLAMA_MCP_MODEL_EVIDENCE`. An unmeasured
 model yields a `verify` verdict, and an unreadable evidence file is reported on stderr and treated
-as empty. Tool descriptions state the rules; measurement details live in
-[`skills/freellama/references/`](https://github.com/bgauryy/FreeLlama/tree/main/skills/freellama/references/) and
-[`docs/dev/evidence/`](https://github.com/bgauryy/FreeLlama/tree/main/docs/dev/evidence/).
+as empty. Tool descriptions state the rules.

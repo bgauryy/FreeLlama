@@ -78,8 +78,9 @@ npx @octocodeai/freellama serve \
   --cpu-model nomic-embed-text:latest
 ```
 
-FreeLlama rejects a CPU upstream with no assignments, nonloopback upstreams, and endpoints that are
-aliases for the same socket. It also sets `options.num_gpu=0` on CPU-assigned managed requests.
+FreeLlama rejects a CPU upstream with no assignments, `--cpu-model` without `--cpu-upstream`, and a
+CPU upstream that is the same Ollama endpoint as `--upstream`, including loopback aliases on one port.
+It also sets `options.num_gpu=0` on CPU-assigned managed requests.
 Read [CPU and GPU model routing](CPU_GPU_ROUTING.md) before deploying this layout.
 
 After startup, require `contracts.placement_observation` and `placement_evidence_gate`, then inspect
@@ -145,7 +146,8 @@ FreeLlama first unloads idle unpinned runners, then dispatches anyway: the recei
 load fits. On Linux, Windows, and other platforms, where available RAM already counts reclaimable
 cache (and is the hard cap in a container), the same shortfall unloads idle runners and then holds the
 new load with `held_insufficient_capacity` until capacity returns, refusing with 503 at its deadline.
-OS memory pressure holds work on every platform. Active swapping and low RAM hold new loads only:
+OS memory pressure holds all work where the OS reports it (macOS, and Linux when the kernel
+exposes `/proc/pressure/memory`; Windows has no host collector yet). Active swapping and low RAM hold new loads only:
 an already-resident runner adds no memory and stays admitted. CPU-load (one-minute load at or above
 1.5 per logical CPU) and thermal-throttling holds apply to CPU-assigned work and to cold loads, which
 decode weights on the host cores and add a new heat source; a bounded request on a runner already
@@ -153,12 +155,15 @@ resident on the GPU neither waits for the cores nor cools the package by waiting
 lists the holds that applied to the request.
 Both `serve` and `proxy` accept `--resource-telemetry-policy`:
 
-- `require-memory` (default): wait or refuse local inference when available RAM is unknown, including
-  raw requests with zero forecast bytes. Missing thermal data alone does not block this policy.
-- `require-all`: require all signals applicable to the collector. The built-in Linux collector does
-  not provide OS pressure or thermal signals and marks those as unsupported; custom collectors must
-  provide them. Unsupported signals are not evidence of healthy hardware.
-- `best-effort`: explicitly permit unknown telemetry unless an observed pressure hold is active.
+- `require-memory` (default on Linux and macOS): wait or refuse local inference when available RAM is
+  unknown, including raw requests with zero forecast bytes. Missing thermal data alone does not block
+  this policy.
+- `require-all`: require all signals applicable to the collector. The built-in Linux collector reads
+  OS memory pressure from `/proc/pressure/memory` when the kernel provides it, but has no thermal
+  signal and marks it as unsupported; custom collectors must provide it. Unsupported signals are not
+  evidence of healthy hardware.
+- `best-effort`: explicitly permit unknown telemetry unless an observed pressure hold is active. This
+  is the default on Windows, which has no built-in memory collector.
 
 Remote upstreams bypass local host policy. Raw metadata and empty unload requests remain available
 during a hold. Route receipts separate `queue_readiness` from `resource_readiness`, and include
@@ -319,8 +324,6 @@ num_predict = 512
 The MCP server autostarts `serve` with its own environment and an arbitrary working directory, so
 put a machine-wide policy in the config directory or set the variables in the MCP client's `env`.
 `serve` prints each file it picked up.
-
-Replace `MODEL` with the directory containing your completed quality-evaluation aggregate.
 
 `policy from-eval` reads `pass_at_1`, not the throughput produced by `bench-all`. It refuses
 expired aggregates and fewer than three trials unless `--allow-smoke` is explicit, and it skips
