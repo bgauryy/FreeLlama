@@ -1,7 +1,6 @@
 [package]
 name = "freellama-core"
 description = "Local Ollama model gateway, router, and embeddable Rust library — the whole solution"
-publish = false
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

@@ -1,7 +1,6 @@
 [package]
 name = "freellama-cli"
 description = "Command-line interface for FreeLlama — proxy, serve, route, benchmark"
-publish = false
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

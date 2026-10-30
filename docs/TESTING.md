@@ -210,7 +210,8 @@ yarn release:verify:publish
 Build every claimed CLI/native target in a clean environment, assemble `SHA256SUMS`, run the full
 deterministic suite, and inspect every platform package dry run before publishing explicitly.
 Publish the eight `@octocodeai/freellama-native-*` packages before `@octocodeai/freellama` and `@octocodeai/freellama-mcp-server`, all
-at the exact same version. A successful local pack dry run proves package contents; it does not
+at the exact same version, then the crates with `cargo publish --workspace` (`--dry-run` first packages
+and compiles both crates from their published sources). A successful local pack dry run proves package contents; it does not
 prove registry publication or another hardware class.
 
 ## Test one layer while iterating

@@ -85,9 +85,10 @@ freellama --version
 freellama init          # check prerequisites and print a first-run plan; changes nothing
 ```
 
-To try it without installing, prefix any command with `npx @octocodeai/freellama`. For a standalone
-binary without Node.js, use the checksummed installer in [Production](docs/PRODUCTION.md) once a
-GitHub release is tagged.
+To try it without installing, prefix any command with `npx @octocodeai/freellama`. Without Node.js,
+build it from crates.io with `cargo install freellama-cli` (Rust 1.88 or newer; the command is still
+`freellama`), or use the checksummed installer in [Production](docs/PRODUCTION.md) once a GitHub
+release is tagged.
 
 ### MCP server
 

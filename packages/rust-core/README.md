@@ -7,7 +7,14 @@ and benchmarking. `platform::policy_eval` renders routing policies from harness 
 for `freellama policy from-eval`.
 
 The crate is named `freellama-core`; its library is named `freellama`, so consumers import
-`freellama::…`.
+`freellama::…`. Add it from crates.io with:
+
+```toml
+[dependencies]
+freellama = { package = "freellama-core", version = "0.6" }
+```
+
+The `napi` feature builds the Node.js addon and is off by default.
 
 ## Follow the core flow
 

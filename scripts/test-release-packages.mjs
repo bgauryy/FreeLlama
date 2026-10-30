@@ -39,7 +39,7 @@ function fixture() {
   put("tools/cargo", `#!${process.execPath}\nconst fs = require('node:fs'); process.stdout.write(fs.readFileSync(${JSON.stringify(path.join(directory, "cargo-metadata.json"))},'utf8'));\n`);
   chmodSync(path.join(toolDirectory, "npm"), 0o755);
   chmodSync(path.join(toolDirectory, "cargo"), 0o755);
-  const metadata = { packages: ["freellama-core", "freellama-cli"].map((name) => ({ name, version, publish: [] })) };
+  const metadata = { packages: ["freellama-core", "freellama-cli"].map((name) => ({ name, version, publish: null, description: name, license: "Apache-2.0 OR MIT", repository: "https://github.com/bgauryy/FreeLlama" })) };
   put("cargo-metadata.json", JSON.stringify(metadata));
   return {
     directory, put, metadata,
@@ -103,6 +103,22 @@ test("Rust artifact version must match npm release version", () => {
     assert.notEqual(result.status, 0);
     assert.match(result.stderr, /freellama-core: version 9\.8\.7 must match workspace version/);
   } finally { f.cleanup(); }
+});
+
+test("Rust crates must stay publishable to crates.io with its required fields", () => {
+  for (const [change, message] of [
+    [(entry) => { entry.publish = []; }, /freellama-core: must be publishable to crates\.io/],
+    [(entry) => { delete entry.repository; }, /freellama-core: crates\.io needs repository/],
+  ]) {
+    const f = fixture();
+    try {
+      change(f.metadata.packages[0]);
+      f.put("cargo-metadata.json", JSON.stringify(f.metadata));
+      const result = f.run();
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, message);
+    } finally { f.cleanup(); }
+  }
 });
 
 function assemblyFixture() {
