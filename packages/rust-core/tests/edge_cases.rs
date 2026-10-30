@@ -17,6 +17,7 @@ fn model(name: &str, size: u64, capabilities: &[Capability]) -> CatalogModel {
         digest: None,
         size,
         capabilities: capabilities.iter().copied().collect(),
+        other_capabilities: Vec::new(),
         advertised_context: Some(32_768),
         kv_cache_bytes_per_token_f16: None,
         modelfile_num_ctx: None,

@@ -190,7 +190,7 @@ flowchart TD
     S --> G["Primary Ollama"]
     S --> U["Optional CPU Ollama"]
     B -->|"detail, raw; manage; delete"| G
-    B -->|"library view"| W["ollama.com library"]
+    B -->|"library view"| W["ollama.com library + Hugging Face GGUF"]
     B -->|"delegate_research"| A["allowlisted local adapter subprocess"]
     A --> S
     C -->|"resources/read on demand"| D["packaged docs/*.md"]
@@ -265,7 +265,7 @@ see `FREELLAMA_MCP_AUTOSTART_SERVE` in [Configuration](CONFIGURATION.md#environm
 | Tool | Needs `freellama serve`? | What it does |
 |---|---|---|
 | `doctor` | No (except `status`/`usage`) | Runtime/configuration diagnostic. Target another Ollama with `ollamaEndpoint` and serve with `serveEndpoint`. `summary` (default) returns endpoint, version, resident count, host/profile signals, and next step; `full` adds all non-duplicated diagnostics, including admission and categorized Ollama settings; `status` returns serve's live view (per-backend queues, current and adaptive limits, circuit breakers, loaded models, host memory, Ollama's effective settings, today's usage); `usage` returns task and token totals per day and model (`days`, default 7). The report distinguishes an observed same-user macOS process from configuration hints and never claims remote process visibility. |
-| `models` | `installed` (default) and `resident` do; `detail`/`raw`/`library` don't | Views: `installed` (capabilities, use explanations, derived `model_type`, VRAM, context, policy_rank), `resident` (loaded now + managed GPU/CPU split), `detail` (one model, maximum context), paged `raw` (`GET /api/tags`), `library` (two-step ollama.com search: omit `model` for families, pass `model:"<family>"` for all tags/`fitsInMemory`). `includeLibrary:true` enriches installed/detail views with sourced public guidance; `includeReadme:true` returns bounded README text in library step 2 or enriched detail. |
+| `models` | `installed` (default) and `resident` do; `detail`/`raw`/`library` don't | Views: `installed` (capabilities, use explanations, derived `model_type`, VRAM, context, policy_rank), `resident` (loaded now + managed GPU/CPU split), `detail` (one model, maximum context), paged `raw` (`GET /api/tags`), `library` (two-step public search: omit `model` to search ollama.com families and, for a `query`, Hugging Face GGUF repos (`source` limits it to one; `limit` applies per source); pass `model:"<family>"` or `model:"hf.co/<owner>/<repo>"` for every pullable tag with its size and `fitsInMemory`). `includeLibrary:true` enriches installed/detail views with sourced public guidance; `includeReadme:true` returns bounded README text in library step 2 or enriched detail. |
 | `run_task` | Yes | **Routes or executes** a chat/generate/embed call. `preview: true` accepts routing fields only and returns a decision without generation. Execution omits preview and supplies the payload. Embedding results withhold raw vectors by default (`returnEmbeddings: true` to get them). `tasks: [{id, independent:true, task}]` (max 64, `maxParallelism` bounds fan-out) runs a batch whose nested `task` takes the same fields; it is not a dependency scheduler. `warm: true` warms an exact installed `model` through managed admission with residency/profile controls and optional `defer:true`. |
 | `scope` | Yes | Creates, inspects, forks, or deletes process-local message history; history inclusion requires `includeMessages:true`. |
 | `session` | Yes | Creates, deletes, or kills model affinity without storing messages or KV; `kill` cancels the session's in-flight work. |

@@ -5,6 +5,17 @@ use super::{
 };
 
 impl HostResources {
+    /// Whether this sample saw an accelerator: GPU devices (Apple I/O registry, `nvidia-smi`) or
+    /// GPU memory. Without one every model decodes on the host cores, so CPU saturation applies
+    /// to all work; a GPU the collectors cannot read keeps that conservative rule.
+    pub(super) fn has_accelerator(&self) -> bool {
+        self.gpu_memory_total_bytes.is_some()
+            || self
+                .gpu_activity
+                .as_ref()
+                .is_some_and(|activity| !activity.devices.is_empty())
+    }
+
     pub(super) fn missing_required(&self, policy: TelemetryPolicy) -> Vec<TelemetryMetric> {
         let mut missing = Vec::new();
         if policy == TelemetryPolicy::BestEffort {

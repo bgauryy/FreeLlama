@@ -4,8 +4,9 @@ To offload a task, select an installed model with the required capabilities and 
 then check its memory fit under the intended concurrency. FreeLlama applies model eligibility
 and admission; the calling agent still verifies the output.
 
-The measurements in this guide come from one Apple M4 Pro machine with 48 GB unified memory and
-are not compiled into routing. Re-run
+The measurements in this guide come from single machines and are not compiled into routing:
+[Recommended starting points](#recommended-starting-points-by-form) from an Apple M2 Pro with 32 GB,
+the sections after it from an Apple M4 Pro with 48 GB unified memory. Re-run
 `npx @octocodeai/freellama doctor`, `models`, `bench-all`, and your quality suite on the target hardware.
 `doctor.machine.memory_bytes` is host RAM; a discrete GPU's usable VRAM must be observed separately.
 
@@ -24,6 +25,46 @@ flowchart TD
     Q -->|"Yes"| M{"Fits with workload concurrency?"}
     M -->|"No"| N
     M -->|"Yes"| B["Benchmark locally and add policy evidence"]
+```
+
+## Recommended starting points by form
+
+Measured on an Apple M2 Pro with 32 GB, Ollama 0.40.8 and FreeLlama 0.6.1 on 2026-10-30, while
+other builds kept the one-minute load near 14 on 12 cores. Every check had a known answer; the
+batteries are small, so treat these as first picks to re-check on your machine, not rankings.
+
+| Form | Model (download) | Measured | Speed (warm) | How an agent calls it |
+|---|---|---|---|---|
+| Text, tools, JSON, reasoning | `gpt-oss:20b` (13.8 GB) | 7/7: exact output, arithmetic, bat-and-ball, code reading, JSON extraction, tool call, 9/9 ticket routing | 1.4 s per routed ticket | `run_task {model:"gpt-oss:20b", prompt, think:"low"}`; add `tools` or `format:"json"` |
+| Embeddings | `nomic-embed-text:v1.5` (274 MB) | Retrieval 4/4 top-1; ticket routing 9/9 from two examples per team | 51 ms per item, batched | `run_task {task:"embedding", input:[...], returnEmbeddings:true}` |
+| Decisions (classify, route, score) | `strands-decider:2b-nvfp4` (1.3 GB) | Ticket routing 9/9, return-policy yes/no 3/3, damage rubric 2/3 | 0.17 s per question | `POST <serve>/v1/systemone {model, state, questions}`: passthrough, no MCP tool yet |
+| OCR | `glm-ocr:latest` (2.2 GB) | 4/4 phrases from a dense report strip; 0/7 on text tasks | 11 s per strip at a 400-token cap | `run_task {task:"vision", model:"glm-ocr", prompt:"Text Recognition:", images:[...], stopOnRepetition:true}` |
+
+`gpt-oss:20b` reasons before answering; the battery ran it with `think:"low"` and a 2,048-token
+output cap, so leave room for the reasoning when you set `num_predict`. `glm-ocr` reads text from images only and keeps generating
+after the visible text ends, so cap its output or set `stopOnRepetition`. The decision model needs
+Apple silicon and answers only through Ollama's decision API; reach it through `serve` so the call
+still passes FreeLlama's memory checks and stream cap (from 0.6.2 a busy CPU no longer refuses it).
+
+### Classify text three ways
+
+The same nine support tickets, routed to billing, technical or returns:
+
+| Approach | Model | Correct | Per item | Use when |
+|---|---|---:|---:|---|
+| Embeddings and per-class centroids | `nomic-embed-text:v1.5` | 9/9 | 51 ms | Many items, stable classes, a few labeled examples per class |
+| Decision model | `strands-decider:2b-nvfp4` | 9/9 | 0.5 s (first call includes the load) | You need probabilities, yes/no policy checks or rubric scores |
+| Instruction model with JSON output | `gpt-oss:20b` | 9/9 | 1.4 s | Classes change per request or need explanation |
+
+A decision API request names its questions; each answer comes back under the same name:
+
+```bash
+curl -s http://127.0.0.1:11435/v1/systemone -H 'content-type: application/json' -d '{
+  "model": "strands-decider:2b-nvfp4",
+  "state": "Why did my credit card get billed two times?",
+  "questions": {"team": {"type": "choice", "instructions": "Which team handles this ticket?",
+    "criteria": {"billing": "Charges and invoices", "technical": "App errors", "returns": "Returns and refunds"}}}
+}'
 ```
 
 ## Text, code, and vision

@@ -66,40 +66,56 @@ export function libraryTrialCandidate(tag: string, embedding: boolean) {
   };
 }
 
+// A chip like "27b", "1.5b", "e4b" or "8x7b" names a parameter size; any other lowercase chip is a
+// capability ("vision", "tools", "audio", "cloud", ...), so a capability Ollama adds later is kept.
+const SIZE_CHIP = /^(?:\d+x)?(?:e)?\d+(?:\.\d+)?[kmbt]$/i;
+
 /**
  * Parse ollama.com/search result cards.
  *
  * There is no JSON API — `Accept: application/json` still returns HTML, and `/api/search`,
- * `/search.json`, and the registry `_catalog` endpoint all 404. So this parses the rendered page,
- * which means it is inherently coupled to Ollama's markup and can break on a redesign. Failures
- * surface as "0 results" rather than an exception, so the tool degrades to unhelpful instead of
- * broken; the shape it depends on is one <li> per model, each containing a /library/<name> link.
+ * `/search.json`, and the registry `_catalog` endpoint all 404. So this parses the rendered page by
+ * meaning rather than by CSS class: one <li> per model with a /library/<name> (or namespace) link,
+ * the first paragraph as the description, short chip spans as capabilities or sizes, and the
+ * download and tag counts by their text. Both the 2025 and the October 2026 card layouts parse;
+ * a redesign that breaks them surfaces as "0 results" with the source URL, not an exception.
  */
 export function parseModelSearch(html: string) {
   const results = [];
-  for (const block of html.split(/<li\s/).slice(1)) {
+  for (const block of html.split(/<li\b/).slice(1)) {
     const link = block.match(/href="\/(?:library\/([\w.-]+)|([\w.-]+\/[\w.-]+))"/);
     const name = link?.[1] ?? link?.[2];
     if (!name) continue;
-    if (!/<p\b[^>]*class="max-w-lg/.test(block)) continue;
-    const rawDescription = block.match(/<p class="max-w-lg[^"]*">([\s\S]*?)<\/p>/)?.[1];
-    const description = rawDescription === undefined
-      ? ""
-      : decodeHtml(rawDescription.replace(/<[^>]+>/g, "")).replace(/\s+/g, " ").trim();
+    const rawDescription = block.match(/<p\b[^>]*>([\s\S]*?)<\/p>/)?.[1];
+    if (rawDescription === undefined) continue;
+    const description = decodeHtml(rawDescription.replace(/<[^>]+>/g, "")).replace(/\s+/g, " ").trim();
+    const chips = [...block.matchAll(/<span\b[^>]*class="[^"]*\b(?:rounded-md|text-(?:indigo|cyan|blue)-\d+)\b[^"]*"[^>]*>\s*([\w.-]+)\s*<\/span>/g)]
+      .map((m) => ({ text: m[1].toLowerCase(), at: m.index! }));
+    // Capability chips share one container; a later row holds counts, sizes and other badges such
+    // as "free". Without containers (older cards) every chip is in the first group.
+    const first = chips.find((chip) => !SIZE_CHIP.test(chip.text));
+    const groupStart = first ? block.lastIndexOf("<div", first.at) : -1;
+    const groupEnd = groupStart >= 0 ? block.indexOf("</div>", first!.at) : -1;
+    const inGroup = (at: number) => groupStart < 0 || groupEnd < 0 || (at > groupStart && at < groupEnd);
+    const words = chips.filter((chip) => !SIZE_CHIP.test(chip.text) && /^[a-z]+$/.test(chip.text));
+    const sizes = chips.filter((chip) => SIZE_CHIP.test(chip.text)).map((chip) => chip.text);
     // Family chips advertise features. A cloud chip does not prove the absence of local tags.
-    const capabilities = [...block.matchAll(/text-(?:indigo-600|cyan-500)[^>]*>([a-z]+)<\/span>/g)].map(
-      (m) => m[1],
-    );
-    const stat = (label: string) =>
-      block.match(
-        new RegExp(`<span >([\\d.,KMB]+)<\\/span>\\s*<span class="hidden sm:flex">&nbsp;${label}`),
-      )?.[1] ?? null;
+    const capabilities = [...new Set(words.filter((chip) => inGroup(chip.at)).map((chip) => chip.text))];
+    const labels = [...new Set(words.filter((chip) => !inGroup(chip.at)).map((chip) => chip.text))];
+    const legacyStat = (label: string) =>
+      block.match(new RegExp(`<span >([\\d.,KMB]+)<\\/span>\\s*<span class="hidden sm:flex">&nbsp;${label}`))?.[1] ?? null;
+    const downloads = block.match(/title="([\d,]+) downloads"/)?.[1];
+    const pullsShort = block.match(/title="[\d,]+ downloads"[\s\S]*?<span\s*>([\d.,]+[KMB]?)<\/span>/)?.[1];
+    const tagCount = block.match(/>\s*(\d+)\s+tags?\s*</)?.[1];
     results.push({
       name,
       description: clipText(description, 160),
       capabilities,
-      pulls: stat("Pulls"),
-      tags: stat("Tag"),
+      ...(labels.length ? { labels } : {}),
+      ...(sizes.length ? { sizes } : {}),
+      pulls: pullsShort ?? legacyStat("Pulls"),
+      ...(downloads ? { downloads: Number(downloads.replace(/,/g, "")) } : {}),
+      tags: tagCount ?? legacyStat("Tag"),
       cloudAvailable: capabilities.includes("cloud"),
     });
   }

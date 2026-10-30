@@ -1,6 +1,7 @@
 //! Installed-model catalog: Ollama tags, show metadata, residency and KV-cache estimates.
 
 use std::{
+    collections::BTreeSet,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -14,6 +15,28 @@ use super::discovery::parse_capability;
 use super::error::ApiError;
 use super::{Backend, CatalogModel, float, ollama_env};
 use super::{CatalogCache, PlatformState};
+use crate::model_bench::Capability;
+
+/// Ollama's `capabilities`: those routing uses, and the rest verbatim so none is silently dropped.
+fn split_capabilities(show: &Value) -> (BTreeSet<Capability>, Vec<String>) {
+    let reported = show
+        .get("capabilities")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str);
+    let mut routed = BTreeSet::new();
+    let mut other = Vec::new();
+    for value in reported {
+        match parse_capability(value) {
+            Some(capability) => {
+                routed.insert(capability);
+            }
+            None => other.push(value.to_owned()),
+        }
+    }
+    (routed, other)
+}
 
 pub(crate) async fn discover_models(state: &PlatformState) -> Result<Vec<CatalogModel>, ApiError> {
     state.refresh_ollama_settings().await;
@@ -98,14 +121,7 @@ async fn fetch_catalog_from(
         let Some(show) = shows[index].take() else {
             continue;
         };
-        let capabilities = show
-            .get("capabilities")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .filter_map(parse_capability)
-            .collect();
+        let (capabilities, other_capabilities) = split_capabilities(&show);
         let advertised_context = advertised_context_from_show(&show);
         let kv_cache_bytes_per_token_f16 = estimate_kv_cache_bytes_per_token_f16(&show);
         let modelfile_num_ctx = ollama_env::modelfile_num_ctx(&show);
@@ -124,6 +140,7 @@ async fn fetch_catalog_from(
             name: name.to_owned(),
             size: entry.get("size").and_then(Value::as_u64).unwrap_or(0),
             capabilities,
+            other_capabilities,
             advertised_context,
             kv_cache_bytes_per_token_f16,
             modelfile_num_ctx,
@@ -642,6 +659,7 @@ mod kv_estimate_tests {
             name: "test".into(),
             size: 600,
             capabilities: BTreeSet::new(),
+            other_capabilities: Vec::new(),
             advertised_context: None,
             kv_cache_bytes_per_token_f16: Some(10),
             modelfile_num_ctx: None,

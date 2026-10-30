@@ -170,6 +170,10 @@ pub struct CatalogModel {
     /// Installed model file bytes reported by `/api/tags`, used for routing and forecasts.
     pub size: u64,
     pub capabilities: BTreeSet<Capability>,
+    /// Capabilities Ollama reports that routing does not use (for example `decision`),
+    /// kept verbatim so a capability added upstream is visible instead of silently dropped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub other_capabilities: Vec<String>,
     pub advertised_context: Option<u64>,
     /// F16-equivalent bytes needed for K and V cache per token, derived from Ollama's model
     /// metadata when its architecture fields are available. It is intentionally optional: not all

@@ -395,9 +395,11 @@ authority. Configured settings alone do not prove physical processor placement.
 The shared [resource governor](https://github.com/bgauryy/FreeLlama/blob/main/packages/rust-core/src/platform/resources/mod.rs) samples local
 available-memory estimates, load per logical CPU, OS memory pressure, active swap-out growth, and
 thermal throttling when reported. OS memory pressure holds every local demand; active swap-out
-growth holds new loads; CPU-load and thermal holds apply to CPU-assigned work and to cold loads
-(decoding weights is CPU work and a new heat source) but not to a bounded request on a runner
-already resident on the GPU, which neither waits for the cores nor cools the package by waiting (`ResourceDemand::is_held_by`; the assessment's
+growth holds new loads; the CPU-load hold applies only to CPU-assigned work (saturated cores slow
+nothing on the GPU, so raw passthrough, which cannot know residency, is not refused for it), and to
+all work on a host whose sampler sees no accelerator; the
+thermal hold applies to CPU-assigned work and to cold loads (a new heat source) but not to a bounded
+request on a runner already resident on the GPU (`ResourceDemand::is_held_by`; the assessment's
 `held_by` lists the holds that applied). Low available RAM (below the larger of 15% or 1 GiB, clearing after two
 healthy samples above the larger of 20% or 2 GiB) depends on the platform (`ResourcePolicy::low_memory`).
 A new load must leave that reserve free, but never more than its own size above the 1 GiB floor.

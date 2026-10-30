@@ -47,7 +47,7 @@ Behavior of the other projects is taken from their own docs and source, checked 
 | Decision | Other local stacks | FreeLlama |
 |---|---|---|
 | Can this load fit right now? | Ollama predicts a model's footprint and evicts when it exceeds 80% of free memory; its queue holds 512 requests, then returns 503 ([scheduler](https://github.com/ollama/ollama/blob/main/server/sched.go), [FAQ](https://docs.ollama.com/faq)). The llama.cpp router keeps a fixed 1024 MiB margin per device and loads anyway when nothing can be unloaded ([server docs](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md)). llama-swap has no memory reserve setting ([config](https://github.com/mostlygeek/llama-swap/blob/main/docs/config.example.yaml)); LocalAI caps VRAM by percentage but cannot estimate VRAM before a load ([docs](https://localai.io/docs/advanced/vram-management/)). | Admits each task against live host memory with a reserve sized to the load and unloads idle runners first. Where memory is short it holds or refuses with a reason and a `Retry-After` computed from service time (on macOS, where free memory undercounts reclaimable cache, it admits with a memory advisory). |
-| Is the machine busy or hot? | Ollama and the llama.cpp router have no gate on host CPU load or heat. | Holds CPU-bound work and cold loads while the CPUs are saturated or a Mac reports thermal pressure. Inference on a model already resident on the GPU keeps running. |
+| Is the machine busy or hot? | Ollama and the llama.cpp router have no gate on host CPU load or heat. | Holds CPU-assigned work (all work on a host without a GPU) while the CPUs are saturated, and new loads while a Mac reports thermal pressure. GPU work is never blocked by another program's CPU load. |
 | Who goes first? | LiteLLM sheds with 429 once a deployment's parallel limit is reached, with an optional priority queue ([routing](https://docs.litellm.ai/docs/routing), [scheduler](https://docs.litellm.ai/docs/scheduler)). | Weighted fair admission per backend (interactive 3 : normal 2 : background 1) with starvation prevention and bounded waits; GPU and CPU pools are separate. |
 | Which model? | Ollama runs the tag it is given. LiteLLM picks among deployments by load, latency or cost; RouteLLM trains a strong/weak router ([RouteLLM](https://github.com/lm-sys/RouteLLM)). | Picks an installed model from its capabilities, context window, memory estimate and residency, and ranks a model last for a task kind it keeps looping on. |
 | Did it loop? | Ollama aborts some loops with a "token repeat limit" error. | Streams and stops once the output repeats, keeping the text (`stopOnRepetition`), and reports `output_check` on every task. |
@@ -58,7 +58,7 @@ Measured on one Apple M2 Pro (32 GB) unless noted:
 | Workload | Without | With FreeLlama |
 |---|---|---|
 | OCR of 12 report strips, `glm-ocr`, 1,500-token cap | 12,948 output tokens, 126 s | `stopOnRepetition`: 6,452 tokens, 69 to 103 s, every label still read |
-| Resident GPU tasks during a compiler build | 64 to 120 s waits (host-wide CPU-load hold, 0.5.0) | No wait: the hold applies only to CPU-bound work and cold loads |
+| Resident GPU tasks during a compiler build | 64 to 120 s waits (host-wide CPU-load hold, 0.5.0) | No wait: the CPU-load hold applies only to CPU-assigned work |
 | `Retry-After` for a queued burst | 76 s quoted for a 32 s wait (0.5.0) | 32 s |
 | A GPU model and a CPU model side by side (M4 Pro, 48 GB) | 38.0 s median, one Ollama process | 28.2 s median with a second CPU-only Ollama process (1.35x; one of three runs was slower) |
 
@@ -244,17 +244,23 @@ sequenceDiagram
 
 ## Features
 
-| Feature | What you get |
-|---|---|
-| [Model selection](#model-selection) | The right installed model for the task, with a confidence level |
-| [Resource admission](#resource-admission) | Tasks run, wait or are refused with a reason |
-| [CPU and GPU backends](#cpu-and-gpu-backends) | Helper models on CPU next to GPU work, with proof of where each ran |
-| [Loop control](#loop-control) | A repeating answer stops early with every token kept |
-| [Machine awareness](#machine-awareness) | GPU, cores, memory, GPU load and heat read from the OS |
-| [Batches, jobs and history](#batches-jobs-and-history) | Fan-out, submit now and collect later, multi-turn chat without resending history |
-| [Grounded research](#grounded-research) | Read-only repository answers with file and line citations |
-| [Small agent context](#small-agent-context) | Compact results and paged details instead of raw dumps |
-| [Observe and evaluate](#observe-and-evaluate) | Live status, usage, benchmarks, Ollama-compatible passthrough |
+Every feature is reachable from an agent (MCP), the terminal (CLI) and the HTTP control API under
+`/_freellama/v1` unless a cell says otherwise.
+
+| Feature | What you get | MCP tool | CLI | HTTP |
+|---|---|---|---|---|
+| [Model selection](#model-selection) | The right installed model for the task, with a confidence level | `run_task {preview:true}`, `models` | `route`, `models` | `POST /routes`, `GET /models` |
+| [Resource admission](#resource-admission) | Tasks run, wait or are refused with a reason | every `run_task` receipt, `doctor {view:"status"}` | `status` | `GET /health`, `GET /status` |
+| [CPU and GPU backends](#cpu-and-gpu-backends) | Helper models on CPU next to GPU work, with proof of where each ran | `run_task {executionPreference}` | `serve --cpu-upstream --cpu-model` | `POST /tasks` |
+| [Loop control](#loop-control) | A repeating answer stops early with every token kept | `run_task {stopOnRepetition}` | `task --stop-on-repetition` | `stop_on_repetition` |
+| [Machine awareness](#machine-awareness) | GPU, cores, memory, GPU load and heat read from the OS | `doctor` | `machine`, `doctor` | `GET /machine` |
+| [Batches, jobs and history](#batches-jobs-and-history) | Fan-out, submit now and collect later, multi-turn chat without resending history | `run_task {tasks}` / `{defer}`, `task_jobs`, `scope`, `session` | `task --defer`, `jobs`, `scope`, `session` | `/task-batches`, `/jobs`, `/scopes`, `/sessions` |
+| Warm-up | Load a model ahead of use through the same memory checks | `run_task {warm:true}` | `warm` | `POST /warm` |
+| Find and install models | ollama.com and Hugging Face GGUF search, every tag with its size and memory fit, pulls only on approval | `models {view:"library"}`, `ollama_manage`, `ollama_delete` | MCP only | MCP only |
+| [Grounded research](#grounded-research) | Read-only repository answers with file and line citations | `delegate_research` | MCP only | MCP only |
+| [Small agent context](#small-agent-context) | Compact results and paged details instead of raw dumps | every tool | JSON on stdout | JSON |
+| [Observe and evaluate](#observe-and-evaluate) | Live status, usage, metrics, benchmarks, routing policy from evaluations | `doctor {view:"usage"}` | `status`, `usage`, `config`, `bench-all`, `policy from-eval` | `/status`, `/usage`, `/metrics`, `/config`, `/_freellama/ui` |
+| Ollama passthrough | Any Ollama `/api/*` or `/v1/*` call, with retries and a stream cap | — | `serve`, `proxy` | Ollama's own paths |
 
 ### Model selection
 
@@ -394,6 +400,40 @@ Default views are compact, details are cursor-paged, embedding vectors are omitt
   policy from quality-evaluation results. See [model selection](docs/MODEL_SELECTION.md).
 - **Ollama compatible:** `/api/*` and `/v1/*` pass through to Ollama unchanged, including streaming.
   See [Ollama sidecar](docs/ARCHITECTURE.md#ollama-sidecar).
+
+## Model forms
+
+What each kind of local model can do through FreeLlama today. Managed forms get routing,
+admission and a receipt; passthrough forms reach Ollama through `serve` with the raw stream cap
+and memory checks but no routing or receipt.
+
+| Form | Ollama endpoint | Through FreeLlama | Measured here |
+|---|---|---|---|
+| Text, coding, reasoning | `/api/chat` | Managed: `completion`, `coding`, `code_repair`, `long_context`, `think` | `gpt-oss:20b` 4/4 |
+| Tool calling | `/api/chat` with `tools` | Managed: `tools` | `gpt-oss:20b` 1/1 |
+| Structured JSON | `/api/chat` with `format` | Managed: `format` | `gpt-oss:20b` 1/1 |
+| Vision and OCR | `/api/chat` with `images` | Managed: `vision`, `stopOnRepetition` for looping readers | `glm-ocr` 4/4 phrases |
+| Embeddings | `/api/embed` | Managed: `embedding`, batched input, vectors withheld unless asked | `nomic-embed-text:v1.5` retrieval 4/4 |
+| Decisions (classify, route, score) | `/v1/systemone` | Passthrough; the catalog lists the model's `other_capabilities: ["decision"]` | `strands-decider:2b-nvfp4` 9/9, 3/3, 2/3 |
+| Speech (text to speech) | `/v1/audio/speech` | Passthrough; Phonon needs Ollama 0.40.9+ on Apple silicon | not measured |
+| Transcription and translation | `/v1/audio/transcriptions`, `/v1/audio/translations` | Passthrough; LFM3 audio needs Ollama 0.40.12+ | not measured |
+| Image generation | removed from Ollama in 0.32.6 | not available | — |
+
+Find any of these with `models {view:"library", capabilities:["decision"]}` (or `audio`,
+`embedding`, `vision`...), or a GGUF build on Hugging Face with a `query`.
+
+### Local models, measured
+
+One Apple M2 Pro (32 GB), Ollama 0.40.8, FreeLlama 0.6.1, 2026-10-30, while other builds kept the
+one-minute load near 14 on 12 cores. Each check has a known answer; the batteries are small, so
+read the ratings as a first screen for these exact tags, not a benchmark.
+
+| Model | Download | Forms | Result | Speed (warm) | Rating | Use it for |
+|---|---:|---|---|---|---:|---|
+| `gpt-oss:20b` | 13.8 GB | text, tools, thinking, JSON | 7/7: exact output, arithmetic, bat-and-ball, code reading, JSON extraction, tool call, 9/9 ticket routing | 1.4 s per routed ticket; 12 s first call with load | 9/10 | General agent work and tool calls when quality matters |
+| `nomic-embed-text:v1.5` | 274 MB | embedding | Retrieval 4/4 top-1; ticket routing 9/9 from two examples per team | 51 ms per item, batched | 9/10 | Search, deduplication, cheap classification |
+| `strands-decider:2b-nvfp4` | 1.3 GB | decision | Ticket routing 9/9, return-policy yes/no 3/3, damage rubric 2/3 | 0.17 s per question | 8/10 | Fast routing and policy checks with probabilities; rubric scores run low at the top level |
+| `glm-ocr:latest` | 2.2 GB | vision (OCR) | 4/4 phrases read from a dense report strip; 0/7 on text tasks | 11 s per strip at a 400-token cap | 8/10 OCR, 1/10 text | Reading screenshots and scans only |
 
 ## Tune Ollama for local models
 

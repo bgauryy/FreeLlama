@@ -1,7 +1,32 @@
 # Changelog
 
-## Unreleased
+## 0.6.2
 
+- **A busy CPU no longer blocks GPU models:** the CPU-load hold applied to every cold load and to
+  every raw passthrough call (which cannot know residency), so while another program kept the
+  one-minute load above 1.5 per core, no new GPU model loaded and raw calls such as Ollama's
+  decision API got 503 after 2 s. It now applies only to CPU-bound work: models assigned to the CPU
+  backend, and every model on a host whose sampler sees no accelerator (no GPU device or GPU
+  memory), where the GPU backend is the CPU. The thermal hold keeps holding cold loads. Measured: with a build running (load 14 on 12 cores) the decision model
+  answered 9/9 routing questions instead of 0/9 refusals.
+- **No capability is dropped:** `GET /_freellama/v1/models` kept only the six capabilities FreeLlama
+  routes on, so a decision model showed `capabilities: []`. Others reported by Ollama are now listed
+  verbatim in `other_capabilities` (for example `["decision"]`).
+- **Library search works again and covers Hugging Face:** ollama.com redesigned its search cards
+  (October 2026), so `models {view:"library", query}` recognized no cards and answered "0 results".
+  The parser now reads cards by meaning (link, first paragraph, chips, download and tag counts),
+  keeps any capability chip, and reports `sizes` and exact `downloads`. A query also searches Hugging
+  Face GGUF repositories (`source` limits it to one), and `model:"hf.co/<owner>/<repo>"` lists each
+  quant as a pullable `hf.co/<owner>/<repo>:<quant>` tag with its exact size, memory fit and the
+  repo's task, architecture and context length; a file without a recognizable quant is listed under
+  its full filename, which Ollama also accepts; so is a build whose quant another file in the repo
+  shares, so different files are never summed into one tag. Lookups read the repo's current
+  revision and report `gated`, each build's `path`, and a note on builds split into several files.
+  Search cards keep capability chips apart from other badges (`labels`, such as `free`); a Hub
+  embedding search covers both `feature-extraction` and `sentence-similarity`; asking for
+  `source:"huggingface"` when the Hub cannot be searched, or every searched source failing, is an
+  error instead of an empty success. The `capabilities` filter takes any capability word
+  ollama.com shows (`audio` and `decision` included) instead of a fixed list.
 - **Rust crates on crates.io:** `freellama-core` (library `freellama`) and `freellama-cli` (command
   `freellama`) are publishable: `publish = false` is gone, both crates carry license texts, an
   `include` list and crates.io metadata, the CLI pins the core by version, and

@@ -901,10 +901,11 @@ mod bounded_subprocess {
 /// that is already resident on the GPU: that work neither waits for nor adds to the saturated
 /// cores. OS memory pressure still holds everything.
 #[tokio::test]
-async fn cpu_load_hold_spares_resident_gpu_inference() {
+async fn cpu_load_hold_applies_only_to_cpu_bound_work() {
     let busy = ResourceGovernor::with_sampler(quick_policy(), || {
         let mut sample = healthy();
         sample.load_average_one_minute = Some(1_000.0);
+        sample.gpu_memory_total_bytes = Some(24 * GIB);
         sample
     })
     .unwrap();
@@ -919,9 +920,19 @@ async fn cpu_load_hold_spares_resident_gpu_inference() {
         Some(CapacityDenialReason::HostPressure)
     );
     assert_eq!(cpu_assigned.held_by, vec![PressureReason::HighCpuLoad]);
+    // A GPU load is not CPU work either: a saturated host never blocks loading a GPU model (a
+    // build on the same machine kept every cold load waiting), and raw passthrough, which cannot
+    // know residency, is not refused for it.
     let cold_gpu = snapshot.assess_demand(ResourceDemand::load(GIB), false);
-    assert_eq!(cold_gpu.held_by, vec![PressureReason::HighCpuLoad]);
-    assert!(!cold_gpu.admissible);
+    assert_eq!(cold_gpu.held_by, Vec::new());
+    assert!(cold_gpu.admissible, "{cold_gpu:?}");
+    let load_on_cpu = snapshot.assess_demand(ResourceDemand::load(GIB).on_cpu(true), false);
+    assert_eq!(load_on_cpu.held_by, vec![PressureReason::HighCpuLoad]);
+    let raw = busy
+        .wait_for_capacity("http://localhost:11434", 0, Duration::from_millis(20))
+        .await
+        .expect("raw passthrough admitted under a CPU-load hold");
+    assert_eq!(raw.receipt.status, "admitted");
     let permit = busy
         .wait_for_demand(
             "http://localhost:11434",
@@ -932,11 +943,34 @@ async fn cpu_load_hold_spares_resident_gpu_inference() {
         .expect("resident GPU inference admitted under a CPU-load hold");
     assert_eq!(permit.receipt.status, "admitted");
 
+    // With no accelerator observed, every model decodes on the host cores, so the hold applies to
+    // all work again, as on a CPU-only Linux host.
+    let cpu_only = ResourceGovernor::with_sampler(quick_policy(), || {
+        let mut sample = healthy();
+        sample.load_average_one_minute = Some(1_000.0);
+        sample
+    })
+    .unwrap();
+    let cpu_only = cpu_only.snapshot().await;
+    assert_eq!(
+        cpu_only
+            .assess_demand(ResourceDemand::load(GIB), false)
+            .held_by,
+        vec![PressureReason::HighCpuLoad]
+    );
+    assert_eq!(
+        cpu_only
+            .assess_demand(ResourceDemand::resident(), false)
+            .held_by,
+        vec![PressureReason::HighCpuLoad]
+    );
+
     // Thermal throttling follows the same rule: a new load or CPU-bound work waits, a bounded
     // request on a resident GPU runner does not (waiting cools nothing it would heat).
     let throttled = ResourceGovernor::with_sampler(quick_policy(), || {
         let mut sample = healthy();
         sample.thermal_throttled = Some(true);
+        sample.gpu_memory_total_bytes = Some(24 * GIB);
         sample
     })
     .unwrap();

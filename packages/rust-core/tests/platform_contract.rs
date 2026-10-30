@@ -32,6 +32,7 @@ fn candidate(name: &str, size: u64, capabilities: &[Capability], resident: bool)
         digest: None,
         size,
         capabilities: capabilities.iter().copied().collect(),
+        other_capabilities: Vec::new(),
         advertised_context: Some(32_768),
         kv_cache_bytes_per_token_f16: None,
         modelfile_num_ctx: None,
@@ -3824,6 +3825,11 @@ async fn catalog_skips_a_model_whose_show_fails() {
     assert_eq!(names, vec!["good-model"]);
     assert_eq!(body["models"][0]["model_type"], "generative");
     assert_eq!(body["models"][0]["capabilities"], json!(["completion"]));
+    // A capability FreeLlama does not route on is kept verbatim, not dropped.
+    assert_eq!(
+        body["models"][0]["other_capabilities"],
+        json!(["future-capability"])
+    );
     mock_task.abort();
 }
 

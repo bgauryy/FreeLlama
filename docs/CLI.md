@@ -148,10 +148,13 @@ cache (and is the hard cap in a container), the same shortfall unloads idle runn
 new load with `held_insufficient_capacity` until capacity returns, refusing with 503 at its deadline.
 OS memory pressure holds all work where the OS reports it (macOS, and Linux when the kernel
 exposes `/proc/pressure/memory`; Windows has no host collector yet). Active swapping and low RAM hold new loads only:
-an already-resident runner adds no memory and stays admitted. CPU-load (one-minute load at or above
-1.5 per logical CPU) and thermal-throttling holds apply to CPU-assigned work and to cold loads, which
-decode weights on the host cores and add a new heat source; a bounded request on a runner already
-resident on the GPU neither waits for the cores nor cools the package by waiting, so it proceeds. The receipt's `resource_admission.assessment.held_by`
+an already-resident runner adds no memory and stays admitted. The CPU-load hold (one-minute load at
+or above 1.5 per logical CPU) applies only to CPU-assigned work, which decodes on those cores; GPU
+work, loaded or not, proceeds, so another program's build never blocks a GPU model. On a host where
+the sampler sees no accelerator (no GPU device or GPU memory), every model runs on the CPU, so the
+hold applies to all work there. The
+thermal-throttling hold applies to CPU-assigned work and to cold loads, a new heat source; a bounded
+request on a runner already resident on the GPU proceeds. The receipt's `resource_admission.assessment.held_by`
 lists the holds that applied to the request.
 Both `serve` and `proxy` accept `--resource-telemetry-policy`:
 

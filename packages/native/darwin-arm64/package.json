@@ -1,6 +1,6 @@
 {
   "name": "@octocodeai/freellama-native-darwin-arm64",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "description": "FreeLlama native Rust artifacts for macOS Apple Silicon",
   "author": "Guy Bary",
   "license": "Apache-2.0 OR MIT",

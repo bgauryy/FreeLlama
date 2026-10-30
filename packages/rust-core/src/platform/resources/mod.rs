@@ -325,6 +325,12 @@ impl ResourceSnapshot {
         let required_available_bytes = demand.bytes;
         let resident_only = demand.resident_only();
         let advisory_mode = self.policy.low_memory == LowMemoryMode::Advisory;
+        // On a host with no observed accelerator, the "GPU" backend runs on the same cores.
+        let demand = if self.observation.has_accelerator() {
+            demand
+        } else {
+            demand.on_cpu(true)
+        };
         let held_by = self
             .reasons
             .iter()
@@ -394,8 +400,8 @@ pub struct ResourceDemand {
     /// The runner is already loaded with a compatible configuration.
     pub resident: bool,
     /// The work decodes on the host CPUs (a CPU-assigned backend), so CPU saturation slows it
-    /// and it adds to that saturation. A resident GPU runner's inference does neither, so a CPU
-    /// load hold does not apply to it; loading weights is CPU work in both cases.
+    /// and it adds to that saturation. GPU work, loaded or not, does neither, so a CPU load hold
+    /// does not apply to it.
     pub cpu_bound: bool,
 }
 
@@ -433,19 +439,21 @@ impl ResourceDemand {
     /// Whether a host pressure hold applies to this demand. Memory-capacity holds (low available
     /// memory, active swapping) never apply to a resident runner: the load that caused them must
     /// stay reusable or the host deadlocks on its own model, and low available memory is only
-    /// advisory under [`LowMemoryMode::Advisory`]. CPU-load and thermal holds apply to CPU-bound
-    /// work and to cold loads (decoding weights is CPU work and a new heat source), not to
-    /// inference on a resident GPU runner: a bounded request on a loaded runner neither waits for
-    /// the cores nor cools the package by waiting, so holding it only delays the caller. OS memory
+    /// advisory under [`LowMemoryMode::Advisory`]. A CPU-load hold applies only to CPU-bound
+    /// work: saturated cores slow decoding on them, not a GPU load or GPU inference. A thermal
+    /// hold applies to CPU-bound work and to cold loads, a new heat source while the OS reports
+    /// throttling; a bounded request on a loaded GPU runner is not held, as waiting only delays
+    /// the caller. OS memory
     /// pressure holds every demand.
     #[must_use]
     pub fn is_held_by(self, reason: PressureReason, advisory_low_memory: bool) -> bool {
         match reason {
             PressureReason::LowAvailableMemory => !advisory_low_memory && !self.resident_only(),
             PressureReason::ActiveSwapping => !self.resident_only(),
-            PressureReason::HighCpuLoad | PressureReason::ThermalThrottling => {
-                self.cpu_bound || !self.resident
-            }
+            // Saturated host cores slow work that decodes on them; they say nothing about a GPU
+            // load or GPU inference, so a busy compiler never blocks a GPU model.
+            PressureReason::HighCpuLoad => self.cpu_bound,
+            PressureReason::ThermalThrottling => self.cpu_bound || !self.resident,
             PressureReason::OsMemoryPressure => true,
         }
     }

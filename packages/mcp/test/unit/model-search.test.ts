@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
 import { libraryTrialCandidate, parseModelCard, parseModelSearch, parseModelTags } from "../../src/model-search.js";
 
 const tagsHtml = `<a class="md:hidden flex" href="/library/gemma3:1b">
@@ -15,6 +16,31 @@ describe("Ollama library parsing", () => {
     expect(result[0]).toMatchObject({ name: "someone/model", cloudAvailable: true, description: "Coding model" });
     expect(result[0]).not.toHaveProperty("cloudOnly");
   });
+  it("parses the October 2026 search cards by meaning: description, capability and size chips, counts", () => {
+    const html = readFileSync(new URL("../fixtures/ollama-search-2026-10.html", import.meta.url), "utf8");
+    const [qwen, embedding] = parseModelSearch(html);
+    expect(qwen).toMatchObject({ name: "qwen3.8", capabilities: ["vision", "tools", "thinking"], sizes: ["27b"],
+      pulls: "5.3M", downloads: 5_329_359, tags: "13", cloudAvailable: false });
+    expect(qwen.description).toMatch(/^Qwen3\.8 delivers substantial gains/);
+    expect(embedding).toMatchObject({ name: "qwen3-embedding", capabilities: ["embedding"], sizes: ["0.6b", "4b", "8b"],
+      downloads: 4_444_715, tags: "12" });
+  });
+
+  it("reads capabilities from their own chip row and reports other badges as labels", () => {
+    const [card] = parseModelSearch('<li><a href="/library/beam"><div><h2><span>beam</span></h2></div>' +
+      '<div><span class="rounded-md text-indigo-600">tools</span><span class="rounded-md text-cyan-500">cloud</span></div>' +
+      '<p class="any">A model</p><div><span title="9 downloads"><span >9</span></span>' +
+      '<span class="rounded-md text-blue-600">1m</span><span class="rounded-md text-emerald-600">free</span></div></a></li>');
+    expect(card).toMatchObject({ capabilities: ["tools", "cloud"], labels: ["free"], sizes: ["1m"], cloudAvailable: true });
+  });
+
+  it("keeps a capability chip it has never seen and tells sizes from capabilities", () => {
+    const [card] = parseModelSearch('<li><a href="/library/m"><p class="any">Desc</p>' +
+      '<span class="rounded-md text-indigo-600">audio</span><span class="rounded-md text-blue-600">e4b</span>' +
+      '<span class="rounded-md text-blue-600">8x7b</span></a></li>');
+    expect(card).toMatchObject({ capabilities: ["audio"], sizes: ["e4b", "8x7b"] });
+  });
+
   it("reads the complete tag page, deduplicates desktop links, and preserves variant identity", () => {
     const { tags } = parseModelTags(tagsHtml, "gemma3");
     expect(tags).toHaveLength(2);
