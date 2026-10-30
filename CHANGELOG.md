@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- **Rust crates on crates.io:** `freellama-core` (library `freellama`) and `freellama-cli` (command
+  `freellama`) are publishable: `publish = false` is gone, both crates carry license texts, an
+  `include` list and crates.io metadata, the CLI pins the core by version, and
+  `yarn release:verify:publish` now refuses a crate that is not publishable to crates.io or lacks
+  `description`, `license` or `repository`. Install with `cargo install freellama-cli`.
+
 ## 0.6.1
 
 - **MCP server starts serve at launch:** with `FREELLAMA_MCP_AUTOSTART_SERVE` on (the default) the

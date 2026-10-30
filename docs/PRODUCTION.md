@@ -42,8 +42,10 @@ release-artifacts release`, then `yarn release:verify:publish`. The publish veri
 Live E2E and hardware qualification remain separate operator checks; verify those receipts before tagging.
 
 Attach `release/SHA256SUMS` and binaries to the release. Publish the eight `@octocodeai/freellama-native-*` packages
-first, followed by the exact-version `@octocodeai/freellama` and `@octocodeai/freellama-mcp-server` packages. Configure
-registry credentials in the release environment; never store them in the repository.
+first, followed by the exact-version `@octocodeai/freellama` and `@octocodeai/freellama-mcp-server` packages. Publish
+the Rust crates from the same commit with `cargo publish --workspace` (it uploads `freellama-core`
+before `freellama-cli`; run it with `--dry-run` first). Configure registry credentials (`npm login`,
+`cargo login`) in the release environment; never store them in the repository.
 
 ## Configure Ollama explicitly
 

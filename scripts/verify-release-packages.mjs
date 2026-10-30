@@ -128,8 +128,13 @@ for (const target of PLATFORM_PACKAGES) {
 const metadata = JSON.parse(execFileSync("cargo", ["metadata", "--no-deps", "--format-version=1"], { encoding: "utf8" }));
 for (const packageName of ["freellama-core", "freellama-cli"]) {
   const packageInfo = metadata.packages.find((entry) => entry.name === packageName);
-  if (!packageInfo || !Array.isArray(packageInfo.publish) || packageInfo.publish.length !== 0) {
-    throw new Error(`${packageName}: must set publish = false; npm packages bundle the internal Rust artifacts.`);
+  // The crates ship on crates.io beside the npm packages: no registry restriction, and the fields
+  // crates.io refuses to publish without.
+  if (!packageInfo || (packageInfo.publish !== null && !packageInfo.publish?.includes("crates-io"))) {
+    throw new Error(`${packageName}: must be publishable to crates.io; remove publish = false.`);
+  }
+  for (const field of ["description", "license", "repository"]) {
+    if (!packageInfo[field]) throw new Error(`${packageName}: crates.io needs ${field} in Cargo.toml.`);
   }
   if (packageInfo.version !== version) {
     throw new Error(`${packageName}: version ${packageInfo.version} must match workspace version ${version}`);

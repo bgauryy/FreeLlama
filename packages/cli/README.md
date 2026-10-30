@@ -23,6 +23,9 @@ flowchart LR
 
 ## Run it
 
+Install from npm (`npm install -g @octocodeai/freellama`) or crates.io (`cargo install freellama-cli`);
+both give the `freellama` command. The examples use `npx` so nothing needs installing first.
+
 ```bash
 npx @octocodeai/freellama doctor
 npx @octocodeai/freellama auth-token --out ~/.local/share/freellama/auth.token
