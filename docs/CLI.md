@@ -2,7 +2,7 @@
 
 The `freellama` command starts and inspects the local management layer that agents use to offload
 work. It exposes diagnostics, model routing, managed execution, resource controls, benchmarking,
-and Ollama-compatible passthrough. Use the [README CLI section](https://github.com/bgauryy/FreeLlama/blob/main/README.md#use-from-the-terminal-cli) for first
+and Ollama-compatible passthrough. Use the [README CLI section](https://github.com/bgauryy/FreeLlama/blob/main/README.md#from-the-terminal) for first
 use and this reference to look up commands and controls.
 
 ## Choose a command
