@@ -21,7 +21,9 @@ pub use doctor::{
     ollama_config_diagnostics, ollama_env_advisories, parse_macos_thermal_status,
     parse_ollama_cli_version, parse_ollama_process_environment,
 };
-pub use net::{DEFAULT_OLLAMA_ENDPOINT, DEFAULT_SERVE_ENDPOINT};
+pub use net::{
+    DEFAULT_OLLAMA_ENDPOINT, DEFAULT_SERVE_ENDPOINT, build_http_client, system_roots_missing,
+};
 pub use ollama_http::url as endpoint_url;
 pub(crate) use timeouts::{
     DEFAULT_CONTROL_TIMEOUT_SECS, DEFAULT_TASK_TIMEOUT_SECS, timeout_from_env,

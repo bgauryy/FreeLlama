@@ -147,7 +147,7 @@ excludes provider caching and reasoning-token differences, retries, local electr
 amortization; it is not a provider bill or net-profit calculation. Partial or invalid rate-card
 configuration stops the MCP server at startup instead of emitting a misleading estimate.
 
-### Route images and OCR
+### Route images
 
 Use `run_task` for supplied image bytes, not `delegate_research`. Preview
 `{task:"vision", requiredCapabilities:["vision"], preview:true}` before a consequential image
@@ -156,14 +156,19 @@ task. Execute separately with a prompt and base64 `images` values without data-U
 the serve policy file; without either the core refuses rather than trusting a `vision` capability
 tag. Inspect the execution receipt for admission and observed placement.
 
-OCR models answer best to their native prompts (glm-ocr: `Text Recognition:`, `Table Recognition:`,
-`Formula Recognition:`). For a `glmocr`-architecture model, vision routes default
-`options.stop:["```"]` because Ollama >= 0.30 builds repeat the answer behind a Markdown fence;
-pass your own `stop` (even `[]`) to override. Any length-capped answer that ends in a repetition
-loop gets `output_check: {repetition_loop: true, unique_prefix_chars, period_chars}` in the result;
-the MCP answer text shows one copy and the untrimmed output stays in `structuredContent.response`.
-With no policy, single-purpose OCR architectures are a last resort for non-vision tasks, so a
-resident OCR model does not answer general chat.
+Use the prompt the model documents; dedicated OCR models expect their own task prompts.
+FreeLlama adds no stop sequence or other option because of which model was chosen.
+
+Some models repeat their answer until the output cap. Set `stopOnRepetition:true` to stream the
+task and stop once the output repeats itself; everything generated is kept, and the result
+carries `output_check: {stopped_early: true, stop_reason, unique_prefix_chars, ...}`. Without it, a
+length-capped answer that ends in a loop gets `output_check: {repetition_loop: true,
+unique_prefix_chars, period_chars}`. Either way the MCP answer text shows one copy and the
+untrimmed output stays in `structuredContent.response`.
+
+Routing learns from these loops, not from model names: a model that keeps looping on a task kind
+(at least two loops in at most twice as many runs, listed as `observed_loops` by `models`) ranks
+last for automatic selection of that task. An explicit `model` or an operator policy still wins.
 
 FreeLlama can prove that it routed and ran a request. It cannot infer OCR or visual-reasoning
 quality from a capability tag, a model name, or GPU placement. Quality depends on the exact
@@ -356,6 +361,18 @@ conversations. Ollama can still apply the selected model's own template or Model
 `generative`, `multimodal`, `embedding_only`, or `unknown`. Routing continues to use the original
 capability set, not this summary label. Unknown future Ollama capabilities are omitted from the
 typed routing set instead of being treated as a known capability.
+
+### Call the control API directly
+
+Scripts that bypass MCP post the same fields in snake_case to `POST /_freellama/v1/tasks`:
+`task`, `objective`, `model`, `session_id`, `required_capabilities`, `prompt` or `messages`,
+`images`, `priority`, `keep_alive`, `max_wait_seconds`, `timeout_seconds`, `stop_on_repetition`,
+and `request_options: {options, format, think, logprobs, top_logprobs}`. A batch is
+`{tasks: [{id, independent: true, task: {...}}], max_parallelism}`; sessions are
+`POST /_freellama/v1/sessions` with `{}`. `model` accepts a bare name (`name` resolves to
+`name:latest`, or the one installed tag of that family); an ambiguous or unknown name is refused
+with the installed candidates. See [Request shapes](https://github.com/bgauryy/FreeLlama/blob/main/docs/ARCHITECTURE.md#request-shapes)
+for a full body and the receipt fields.
 
 ### Retain history and warm models
 

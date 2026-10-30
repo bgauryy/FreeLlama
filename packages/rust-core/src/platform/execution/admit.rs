@@ -51,9 +51,12 @@ pub(super) fn admission_error(
 ) -> ApiError {
     let budget = execution.admission.total();
     let wait = state.tunables().max_queue_wait();
+    // Lanes are how many tasks of this cost run at once (a vision task can take the whole
+    // budget), not budget units.
+    let lanes = (budget / usize::try_from(cost.max(1)).unwrap_or(usize::MAX)).max(1);
     let retry_after = super::super::runtime::retry_after_seconds(
         execution.admission.queue_depth(),
-        execution.admission.total(),
+        lanes,
         state.average_task_ms(execution.placement),
     );
     let (status, code) = match failure {

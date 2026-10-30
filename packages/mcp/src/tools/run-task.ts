@@ -79,6 +79,7 @@ async function runBatch(tasks: BatchItem[], maxParallelism: number | undefined, 
         priority: task.priority ?? "normal",
         max_wait_seconds: task.maxWaitSeconds,
         timeout_seconds: task.timeoutSeconds,
+        stop_on_repetition: task.stopOnRepetition,
         prompt: task.prompt,
         images: task.images,
         messages: taskMessages(task),
@@ -107,7 +108,7 @@ export function registerRunTaskTool(server: McpServer): void {
         "Use when: offloading caller-supplied work (chat, small tasks, code, tool calls, OCR/vision, embeddings) to a local model. " +
         "Modes: single (`prompt`/`messages`, or `input` for embedding); `tasks` = up to 64 independent items, ordered results, `maxParallelism` caps dispatch; " +
         "`preview:true` decides only; `warm:true` preloads `model`. " +
-        "OCR: base64 `images` + the model's native prompt (docs: MODEL_SELECTION). " +
+        "Images: base64 `images` + the model's own prompt; `stopOnRepetition` ends a looping answer early, keeping its text. " +
         "Do not use when: it needs file access (pass content, or delegate_research) or high-stakes judgment. " +
         "Returns: answer text; receipts in structuredContent.",
       inputSchema: z.object({
@@ -153,6 +154,10 @@ export function registerRunTaskTool(server: McpServer): void {
         priority: z.enum(["interactive", "normal", "background"]).optional(),
         maxWaitSeconds: z.number().int().positive().optional(),
         timeoutSeconds: z.number().int().positive().optional(),
+        stopOnRepetition: z
+          .boolean()
+          .optional()
+          .describe("Stream and stop once output repeats itself (a loop to num_predict); keeps all generated text"),
         defer: z.boolean().optional(),
         returnEmbeddings: z.boolean().optional(),
         preview: z
@@ -204,6 +209,7 @@ export function registerRunTaskTool(server: McpServer): void {
       priority,
       maxWaitSeconds,
       timeoutSeconds,
+      stopOnRepetition,
       defer,
       returnEmbeddings,
       preview,
@@ -216,7 +222,7 @@ export function registerRunTaskTool(server: McpServer): void {
           task, objective, model, sessionId, scopeId, scopeRevision, contextTokens, executionPreference,
           minPlacementEvidence, requiredCapabilities, prompt, systemPrompt, images, messages, input, tools,
           keepAlive, format, think, options, logprobs, topLogprobs, minConfidence, priority, maxWaitSeconds,
-          timeoutSeconds, defer, returnEmbeddings, preview, warm,
+          timeoutSeconds, stopOnRepetition, defer, returnEmbeddings, preview, warm,
         };
         if (tasks !== undefined) {
           const stray = Object.entries(singleFields).filter(([, value]) => value !== undefined).map(([name]) => name);
@@ -267,6 +273,7 @@ export function registerRunTaskTool(server: McpServer): void {
             ["maxWaitSeconds", maxWaitSeconds],
             ["priority", priority],
             ["timeoutSeconds", timeoutSeconds],
+            ["stopOnRepetition", stopOnRepetition],
             ["defer", defer],
           ] satisfies Array<[string, unknown]>)
             .filter(([, value]) => value !== undefined)
@@ -325,6 +332,7 @@ export function registerRunTaskTool(server: McpServer): void {
             priority: priority ?? "normal",
             max_wait_seconds: maxWaitSeconds,
             timeout_seconds: timeoutSeconds,
+            stop_on_repetition: stopOnRepetition,
             defer: defer ?? false,
             execution_preference: executionPreference,
             min_placement_evidence: minPlacementEvidence,

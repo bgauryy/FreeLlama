@@ -127,6 +127,11 @@ The loop is upstream (ollama#16892; zai-org/GLM-OCR#220) and reproduces against 
 flags any length-capped answer ending in a repetition loop as `output_check.repetition_loop` and
 the MCP answer text keeps one copy.
 
+Update 2026-10-30: the architecture-specific stop and the OCR-architecture routing rule were
+removed; FreeLlama no longer adds options or ranks by model name or architecture. Loops are
+handled for any model by `stop_on_repetition` (streaming early stop that keeps all output) and by
+routing on observed loops per task kind.
+
 **Verified again 2026-09-01 through authenticated managed execution.** A held-out one-line image
 read `FREELLAMA OCR 2026`. Fence-only stopping recognized the text but repeated it to the output
 cap, so the production gate rejected the run. Adding a newline stop for that explicitly one-line

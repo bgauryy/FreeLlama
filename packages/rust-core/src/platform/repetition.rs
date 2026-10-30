@@ -1,7 +1,7 @@
 //! Detect a degenerate repetition loop at the end of a length-capped generation.
 //!
-//! Some small models (glm-ocr on Ollama >= 0.30, deepseek-ocr on blank input) answer correctly and
-//! then repeat the answer, or a fence, until `num_predict`. The full output stays in the response
+//! Some models answer correctly and then repeat the answer, or a fence around it, until
+//! `num_predict`. The full output stays in the response
 //! for audit; the receipt only says where the first copy of the repeated tail ends so a caller can
 //! read the useful prefix without guessing.
 
@@ -85,20 +85,47 @@ fn detect_in_window(chars: &[char]) -> Option<TailLoop> {
 
 /// Receipt for a chat response that hit the output cap while looping; `None` otherwise.
 pub(super) fn output_check(response: &Value) -> Option<Value> {
-    if response.get("done_reason").and_then(Value::as_str) != Some("length") {
+    let reason = response.get("done_reason").and_then(Value::as_str)?;
+    // `repetition`: FreeLlama stopped a streamed loop; `repeat_limit`: Ollama aborted it.
+    let stopped_early = matches!(reason, "repetition" | "repeat_limit");
+    if reason != "length" && !stopped_early {
         return None;
     }
     let content = response
         .pointer("/message/content")
         .and_then(Value::as_str)?;
-    let found = detect_tail_loop(content)?;
+    let Some(found) = detect_tail_loop(content) else {
+        // Ollama's own guard counts one repeated token, which this scan may not call a loop.
+        return stopped_early.then(|| {
+            json!({
+                "repetition_loop": true,
+                "stopped_early": true,
+                "stop_reason": reason,
+                "note": "generation stopped because the output repeated; message.content holds everything generated before the stop."
+            })
+        });
+    };
     Some(json!({
         "repetition_loop": true,
+        "stopped_early": stopped_early,
+        "stop_reason": reason,
         "unique_prefix_chars": found.unique_prefix,
         "period_chars": found.period,
         "repeated_chars": found.repeated,
-        "note": "the model repeated its output until the num_predict cap; the first unique_prefix_chars characters of message.content hold one copy. Treat the answer as low confidence or retry with a stop sequence."
+        "note": if stopped_early {
+            "generation stopped once the output repeated itself; message.content keeps everything generated, and its first unique_prefix_chars characters hold one copy."
+        } else {
+            "the model repeated its output until the num_predict cap; the first unique_prefix_chars characters of message.content hold one copy. Treat the answer as low confidence, retry with stop_on_repetition, or set a stop sequence."
+        },
     }))
+}
+
+/// Whether a streamed output that is still growing should be stopped: a periodic tail that has
+/// already repeated its unit twice after the first copy and spans 96+ characters. Stricter than the
+/// post-hoc check so a short legitimate repeat (a table rule, a list marker) never stops a run.
+pub(super) fn should_stop_streaming(text: &str) -> bool {
+    detect_tail_loop(text)
+        .is_some_and(|found| found.repeated >= 2 * found.period && found.repeated >= 96)
 }
 
 #[cfg(test)]
@@ -194,5 +221,50 @@ mod tests {
         assert_eq!(output_check(&capped).unwrap()["unique_prefix_chars"], 10);
         let stopped = json!({"done_reason": "stop", "message": {"content": content}});
         assert_eq!(output_check(&stopped), None);
+    }
+}
+
+#[cfg(test)]
+mod streaming_stop_tests {
+    use super::{output_check, should_stop_streaming};
+    use serde_json::json;
+
+    #[test]
+    fn a_growing_fence_loop_stops_only_after_two_repeats_and_96_chars() {
+        let answer = "Invoice #48213\nTotal: $1,337.42\n";
+        assert!(!should_stop_streaming(answer));
+        assert!(!should_stop_streaming(&format!(
+            "{answer}{}",
+            "```\n".repeat(20)
+        )));
+        assert!(should_stop_streaming(&format!(
+            "{answer}{}",
+            "```\n".repeat(30)
+        )));
+    }
+
+    #[test]
+    fn short_legitimate_repeats_never_stop_a_stream() {
+        let table = format!("| a | b |\n{}| x | y |\n", "|---|---|\n".repeat(3));
+        assert!(!should_stop_streaming(&table));
+        assert!(!should_stop_streaming("- one\n- two\n- three\n"));
+    }
+
+    #[test]
+    fn an_early_stop_is_reported_with_its_reason() {
+        let content = format!("Invoice #48213\n{}", "```\n".repeat(30));
+        let check =
+            output_check(&json!({"done_reason": "repetition", "message": {"content": content}}))
+                .expect("check");
+        assert_eq!(check["stopped_early"], true);
+        assert_eq!(check["stop_reason"], "repetition");
+        assert!(check["unique_prefix_chars"].as_u64().unwrap() <= 19);
+        let limit =
+            output_check(&json!({"done_reason": "repeat_limit", "message": {"content": "abc"}}))
+                .expect("ollama abort is reported");
+        assert_eq!(limit["stopped_early"], true);
+        assert!(
+            output_check(&json!({"done_reason": "stop", "message": {"content": "abc"}})).is_none()
+        );
     }
 }

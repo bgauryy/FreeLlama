@@ -145,8 +145,12 @@ FreeLlama first unloads idle unpinned runners, then dispatches anyway: the recei
 load fits. On Linux, Windows, and other platforms, where available RAM already counts reclaimable
 cache (and is the hard cap in a container), the same shortfall unloads idle runners and then holds the
 new load with `held_insufficient_capacity` until capacity returns, refusing with 503 at its deadline.
-OS memory pressure, active swapping, CPU load, and thermal throttling hold work on every platform;
-an already-resident runner adds no memory and stays admitted through low-RAM and swapping holds.
+OS memory pressure holds work on every platform. Active swapping and low RAM hold new loads only:
+an already-resident runner adds no memory and stays admitted. CPU-load (one-minute load at or above
+1.5 per logical CPU) and thermal-throttling holds apply to CPU-assigned work and to cold loads, which
+decode weights on the host cores and add a new heat source; a bounded request on a runner already
+resident on the GPU neither waits for the cores nor cools the package by waiting, so it proceeds. The receipt's `resource_admission.assessment.held_by`
+lists the holds that applied to the request.
 Both `serve` and `proxy` accept `--resource-telemetry-policy`:
 
 - `require-memory` (default): wait or refuse local inference when available RAM is unknown, including
@@ -227,6 +231,8 @@ Useful task options include:
 - `--priority interactive|normal|background` for fair admission scheduling.
 - `--max-wait-seconds` for a shorter admission/resource wait budget.
 - `--timeout-seconds` for a total deadline including discovery, waiting, loading, and inference.
+- `--stop-on-repetition` to stream the task and stop once the output repeats itself, keeping all
+  generated text.
 - `--defer` to return a job ID immediately.
 
 Inspect deferred work with `jobs`, retrieve a result with `jobs --id <uuid>`, and cancel one task

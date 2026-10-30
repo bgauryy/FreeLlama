@@ -104,3 +104,90 @@ mod tests {
         }
     }
 }
+
+/// Build an HTTP client from `configure`. reqwest 0.13 verifies TLS with the platform verifier,
+/// which refuses to build at all when the system has no CA certificates (a slim or distroless
+/// container), even for a client that only ever talks plain HTTP to a loopback Ollama
+/// (reqwest issue #2988). In that one case the client is rebuilt with an empty trust store:
+/// `http://` upstreams keep working, and an `https://` upstream fails its handshake with a
+/// certificate error that names the cause, instead of the whole process failing at startup.
+/// Bundling static roots instead would trade this for certificates that go stale between builds.
+///
+/// # Errors
+///
+/// Returns the builder error for any other misconfiguration.
+pub fn build_http_client(
+    configure: impl Fn(reqwest::ClientBuilder) -> reqwest::ClientBuilder,
+) -> reqwest::Result<reqwest::Client> {
+    match configure(reqwest::Client::builder()).build() {
+        Err(error) if is_missing_system_roots(&error) => {
+            warn_missing_system_roots();
+            configure(reqwest::Client::builder())
+                .tls_certs_only(Vec::new())
+                .build()
+        }
+        built => built,
+    }
+}
+
+/// The platform verifier's error for an empty system certificate store.
+fn is_missing_system_roots(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if error
+            .to_string()
+            .contains("No CA certificates were loaded from the system")
+        {
+            return true;
+        }
+        current = error.source();
+    }
+    false
+}
+
+/// Whether a client in this process fell back to an empty trust store.
+pub fn system_roots_missing() -> bool {
+    MISSING_ROOTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+static MISSING_ROOTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn warn_missing_system_roots() {
+    if !MISSING_ROOTS.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!(
+            "freellama: no system CA certificates found; plain-HTTP upstreams work, HTTPS upstreams will fail certificate checks. Install your distribution's ca-certificates package or set SSL_CERT_FILE."
+        );
+    }
+}
+
+#[cfg(test)]
+mod tls_root_tests {
+    use super::is_missing_system_roots;
+
+    #[derive(Debug)]
+    struct Wrapped(Box<dyn std::error::Error + 'static>);
+    impl std::fmt::Display for Wrapped {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("builder error")
+        }
+    }
+    impl std::error::Error for Wrapped {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(self.0.as_ref())
+        }
+    }
+
+    #[test]
+    fn missing_roots_is_found_anywhere_in_the_error_chain() {
+        let inner: Box<dyn std::error::Error> =
+            "unexpected error: No CA certificates were loaded from the system".into();
+        assert!(is_missing_system_roots(&Wrapped(inner)));
+        let other: Box<dyn std::error::Error> = "invalid TLS versions".into();
+        assert!(!is_missing_system_roots(&Wrapped(other)));
+    }
+
+    #[test]
+    fn a_client_builds_on_this_host() {
+        super::build_http_client(|builder| builder).expect("client builds");
+    }
+}

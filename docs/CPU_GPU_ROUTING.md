@@ -28,7 +28,9 @@ machine-specific:
 
 `doctor` reports `machine.memory_bytes` on macOS, Linux, and Windows. It reports
 `machine.unified_memory_bytes` only when unified memory is known; that compatibility field is not a
-VRAM estimate on discrete-GPU hosts. Model-library fit is therefore a host-memory preflight, and
+VRAM estimate on discrete-GPU hosts. `machine.gpu` names the accelerator when the OS reports it
+(Apple model and core count, or NVIDIA name and memory on Linux), and `performance_cpus` /
+`efficiency_cpus` split hybrid CPUs on macOS. These are identity facts, not placement proof. Model-library fit is therefore a host-memory preflight, and
 actual accelerator placement must come from Ollama's resident-runner report.
 
 An agent can choose `auto`, `prefer_cpu`, or `prefer_gpu`, but it cannot invent topology. The

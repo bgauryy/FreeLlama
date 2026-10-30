@@ -18,7 +18,7 @@ use axum::{
 use freellama::{
     model_bench::Capability,
     platform::{
-        CatalogModel, ExecutionPreference, ModelRequestDefaults, Objective, RouteInput,
+        CatalogModel, ExecutionPreference, LoopRecord, ModelRequestDefaults, Objective, RouteInput,
         SessionAffinity, TaskKind, app, select_route,
     },
 };
@@ -39,7 +39,9 @@ fn candidate(name: &str, size: u64, capabilities: &[Capability], resident: bool)
         resident,
         resident_size: resident.then_some(size),
         resident_vram: resident.then_some(size),
+        resident_context: None,
         benchmark: BTreeMap::new(),
+        observed_loops: BTreeMap::new(),
         policy_rank: [
             TaskKind::Completion,
             TaskKind::Coding,
@@ -3846,15 +3848,18 @@ fn app_refuses_a_smoke_marked_policy_file() {
     );
 }
 
-fn ocr_specialist(name: &str, resident: bool) -> CatalogModel {
+/// A small model the router would otherwise prefer for a task (resident, smaller), with an
+/// optional observed loop record for that task.
+fn small_model(name: &str, loops: Option<(TaskKind, LoopRecord)>) -> CatalogModel {
     CatalogModel {
-        architecture: Some("glmocr".to_owned()),
+        architecture: Some("anyarch".to_owned()),
         policy_rank: BTreeMap::new(),
+        observed_loops: loops.into_iter().collect(),
         ..candidate(
             name,
             2_000_000_000,
             &[Capability::Completion, Capability::Vision],
-            resident,
+            true,
         )
     }
 }
@@ -3866,12 +3871,14 @@ fn unqualified(model: CatalogModel) -> CatalogModel {
     }
 }
 
-/// OCR networks advertise `completion` but loop on general chat. With no policy, a resident OCR
-/// model must not win a completion fallback over an installed generalist, nor keep a session.
+/// Routing never ranks by a model's name or architecture. A model observed to keep looping on a
+/// task kind loses automatic fallback and session affinity for that task only; one stray loop does
+/// not count, other task kinds are unaffected, and an explicit model or policy still wins.
 #[test]
-fn ocr_specialists_lose_general_fallback_and_session_affinity() {
+fn models_that_keep_looping_on_a_task_lose_automatic_fallback_for_it() {
+    let looping = LoopRecord { runs: 3, loops: 2 };
     let models = vec![
-        ocr_specialist("glm-ocr:latest", true),
+        small_model("small:latest", Some((TaskKind::Completion, looping))),
         unqualified(candidate(
             "general:latest",
             8_000_000_000,
@@ -3879,7 +3886,7 @@ fn ocr_specialists_lose_general_fallback_and_session_affinity() {
             false,
         )),
     ];
-    let sessions = SessionAffinity::from_pairs([("s1".to_owned(), "glm-ocr:latest".to_owned())]);
+    let sessions = SessionAffinity::from_pairs([("s1".to_owned(), "small:latest".to_owned())]);
     for objective in [Objective::Balanced, Objective::Fastest] {
         let input = RouteInput {
             task: TaskKind::Completion,
@@ -3889,69 +3896,102 @@ fn ocr_specialists_lose_general_fallback_and_session_affinity() {
         let decision = select_route(&input, &models, &sessions).unwrap();
         assert_eq!(decision.selected_model, "general:latest", "{objective:?}");
     }
+    let affine = RouteInput {
+        task: TaskKind::Completion,
+        session_id: Some("s1".to_owned()),
+        ..RouteInput::default()
+    };
+    assert_eq!(
+        select_route(&affine, &models, &sessions)
+            .unwrap()
+            .selected_model,
+        "general:latest"
+    );
 
-    let decision = select_route(
-        &RouteInput {
-            task: TaskKind::Completion,
-            session_id: Some("s1".to_owned()),
-            ..RouteInput::default()
-        },
-        &models,
-        &sessions,
-    )
-    .unwrap();
-    assert_eq!(decision.selected_model, "general:latest");
+    // The loops were on completion: for vision the small resident model still wins on speed.
+    let vision = RouteInput {
+        task: TaskKind::Vision,
+        objective: Objective::Fastest,
+        ..RouteInput::default()
+    };
+    assert_eq!(
+        select_route(&vision, &models, &sessions)
+            .unwrap()
+            .selected_model,
+        "small:latest"
+    );
 
-    // Only OCR installed: still routable, but labelled as a last resort.
-    let only = vec![ocr_specialist("glm-ocr:latest", true)];
+    // One loop in three runs is not a pattern: no demotion.
+    let once = vec![
+        small_model(
+            "small:latest",
+            Some((TaskKind::Completion, LoopRecord { runs: 3, loops: 1 })),
+        ),
+        models[1].clone(),
+    ];
+    let fastest = RouteInput {
+        task: TaskKind::Completion,
+        objective: Objective::Fastest,
+        ..RouteInput::default()
+    };
+    assert_eq!(
+        select_route(&fastest, &once, &SessionAffinity::default())
+            .unwrap()
+            .selected_model,
+        "small:latest"
+    );
+
+    // Only the looping model installed: still routable, labelled as a last resort.
+    let only = vec![small_model(
+        "small:latest",
+        Some((TaskKind::Completion, looping)),
+    )];
     let decision =
         select_route(&RouteInput::default(), &only, &SessionAffinity::default()).unwrap();
-    assert_eq!(decision.selected_model, "glm-ocr:latest");
+    assert_eq!(decision.selected_model, "small:latest");
     assert!(
         decision
             .reasons
             .iter()
-            .any(|r| r == "ocr_specialist_last_resort")
+            .any(|r| r == "repeats_on_this_task_last_resort")
+    );
+
+    // An explicit model is never second-guessed.
+    let explicit = RouteInput {
+        task: TaskKind::Completion,
+        model: Some("small:latest".to_owned()),
+        ..RouteInput::default()
+    };
+    assert_eq!(
+        select_route(&explicit, &models, &sessions)
+            .unwrap()
+            .selected_model,
+        "small:latest"
     );
 }
 
-/// glm-ocr on Ollama >= 0.30 repeats its answer behind a Markdown fence; vision routes default a
-/// fence stop the caller can override. Other tasks and architectures get no injected stop.
+/// No request option is injected because of which model or architecture was chosen: stop
+/// sequences belong to the caller.
 #[test]
-fn glm_ocr_vision_routes_default_a_fence_stop() {
-    let models = vec![ocr_specialist("glm-ocr:latest", true)];
-    let vision = RouteInput {
-        task: TaskKind::Vision,
-        model: Some("glm-ocr:latest".to_owned()),
-        ..RouteInput::default()
-    };
-    let decision = select_route(&vision, &models, &SessionAffinity::default()).unwrap();
-    assert_eq!(decision.options["stop"], json!(["```"]));
-    assert!(
-        decision
-            .reasons
-            .iter()
-            .any(|r| r == "architecture_default_stop")
-    );
-
-    let completion = RouteInput {
-        model: Some("glm-ocr:latest".to_owned()),
-        ..RouteInput::default()
-    };
-    let decision = select_route(&completion, &models, &SessionAffinity::default()).unwrap();
-    assert!(decision.options.get("stop").is_none());
-
-    let general = vec![candidate("general:latest", 1, &[Capability::Vision], false)];
-    let decision = select_route(
-        &RouteInput {
-            task: TaskKind::Vision,
-            ..RouteInput::default()
-        },
-        &general,
-        &SessionAffinity::default(),
-    )
-    .unwrap();
-    assert!(decision.options.get("stop").is_none());
+fn no_model_specific_stop_is_injected() {
+    for architecture in ["glmocr", "llama", "anyarch"] {
+        let models = vec![CatalogModel {
+            architecture: Some(architecture.to_owned()),
+            ..small_model("m:latest", None)
+        }];
+        for task in [TaskKind::Vision, TaskKind::Completion] {
+            let input = RouteInput {
+                task,
+                model: Some("m:latest".to_owned()),
+                ..RouteInput::default()
+            };
+            let decision = select_route(&input, &models, &SessionAffinity::default()).unwrap();
+            assert!(
+                decision.options.get("stop").is_none(),
+                "{architecture} {task:?}"
+            );
+        }
+    }
 }
 
 /// Images need a vision model on every surface (CLI, HTTP, MCP). Without an explicit `model`, the
@@ -4043,6 +4083,9 @@ async fn image_tasks_need_an_explicit_or_policy_qualified_vision_model() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let sent = chat_bodies.lock().await.pop().unwrap();
     assert_eq!(sent["model"], "glm-ocr:latest");
-    assert_eq!(sent["options"]["stop"], json!(["```"]));
+    assert!(
+        sent["options"].get("stop").is_none(),
+        "no model-specific stop: {sent}"
+    );
     mock_task.abort();
 }

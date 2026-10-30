@@ -30,6 +30,27 @@ pub struct MachineProfile {
     pub unified_memory_bytes: Option<u64>,
     pub available_disk_bytes: Option<u64>,
     pub ollama_endpoint: String,
+    /// The host GPU as the OS reports it: Apple accelerator model and core count from the I/O
+    /// registry, or NVIDIA name and memory from `nvidia-smi`. `None` when neither is readable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu: Option<GpuProfile>,
+    /// Performance and efficiency core counts on hybrid CPUs (`hw.perflevel0/1.logicalcpu` on
+    /// macOS); `None` where the OS does not split them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub performance_cpus: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub efficiency_cpus: Option<usize>,
+}
+
+/// One GPU as named by its driver.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GpuProfile {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cores: Option<u32>,
+    /// Dedicated memory; `None` for unified memory, which `memory_bytes` already counts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_bytes: Option<u64>,
 }
 
 pub(super) fn load_benchmark(
@@ -165,7 +186,90 @@ pub fn machine_profile(upstream: &str) -> MachineProfile {
         unified_memory_bytes: unified_memory.then_some(memory_bytes).flatten(),
         available_disk_bytes: available_disk_bytes(),
         ollama_endpoint: upstream.to_owned(),
+        gpu: cached_gpu(),
+        performance_cpus: cpu_split().0,
+        efficiency_cpus: cpu_split().1,
     }
+}
+
+fn cached_gpu() -> Option<GpuProfile> {
+    static GPU: OnceLock<Option<GpuProfile>> = OnceLock::new();
+    GPU.get_or_init(gpu_profile).clone()
+}
+
+#[cfg(target_os = "macos")]
+fn gpu_profile() -> Option<GpuProfile> {
+    let (_, text) = super::resources::bounded_output(
+        "/usr/sbin/ioreg",
+        &["-r", "-c", "AGXAccelerator", "-l"],
+        COMMAND_TIMEOUT,
+    )?;
+    parse_apple_gpu(&text)
+}
+
+#[cfg(target_os = "linux")]
+fn gpu_profile() -> Option<GpuProfile> {
+    command_output(
+        "nvidia-smi",
+        &[
+            "--query-gpu=name,memory.total",
+            "--format=csv,noheader,nounits",
+        ],
+    )
+    .and_then(|text| parse_nvidia_gpu(&text))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn gpu_profile() -> Option<GpuProfile> {
+    None
+}
+
+/// The first Apple accelerator's `model` and `gpu-core-count` registry properties.
+#[cfg(any(target_os = "macos", test))]
+fn parse_apple_gpu(text: &str) -> Option<GpuProfile> {
+    let property = |name: &str| {
+        text.lines().find_map(|line| {
+            let line = line.trim_start_matches([' ', '\t', '|']);
+            let rest = line.strip_prefix(&format!("\"{name}\" = "))?;
+            Some(rest.trim().trim_matches('"').to_owned())
+        })
+    };
+    Some(GpuProfile {
+        name: property("model").filter(|name| !name.is_empty())?,
+        cores: property("gpu-core-count").and_then(|value| value.parse().ok()),
+        memory_bytes: None,
+    })
+}
+
+/// The first line of `nvidia-smi --query-gpu=name,memory.total` (MiB).
+#[cfg(any(target_os = "linux", test))]
+fn parse_nvidia_gpu(text: &str) -> Option<GpuProfile> {
+    let (name, memory) = text.lines().next()?.rsplit_once(',')?;
+    Some(GpuProfile {
+        name: name.trim().to_owned(),
+        cores: None,
+        memory_bytes: memory
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .and_then(|mib| mib.checked_mul(1024 * 1024)),
+    })
+    .filter(|gpu| !gpu.name.is_empty())
+}
+
+#[cfg(target_os = "macos")]
+fn cpu_split() -> (Option<usize>, Option<usize>) {
+    let level =
+        |name: &str| command_output("sysctl", &["-n", name]).and_then(|value| value.parse().ok());
+    (
+        level("hw.perflevel0.logicalcpu"),
+        level("hw.perflevel1.logicalcpu"),
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+const fn cpu_split() -> (Option<usize>, Option<usize>) {
+    (None, None)
 }
 
 /// [`machine_profile`] off the async runtime: it may spawn `df`, `sysctl` or `PowerShell`.
@@ -185,6 +289,9 @@ pub(crate) async fn machine_profile_off_runtime(upstream: &str) -> MachineProfil
                 unified_memory_bytes: None,
                 available_disk_bytes: None,
                 ollama_endpoint: upstream.to_owned(),
+                gpu: None,
+                performance_cpus: None,
+                efficiency_cpus: None,
             }
         })
 }
@@ -335,7 +442,33 @@ fn command_output(command: &str, args: &[&str]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{machine_profile, memory_semantics, parse_linux_cpuinfo, parse_linux_meminfo};
+    use super::{
+        GpuProfile, machine_profile, memory_semantics, parse_apple_gpu, parse_linux_cpuinfo,
+        parse_linux_meminfo, parse_nvidia_gpu,
+    };
+
+    #[test]
+    fn gpu_profiles_parse_apple_registry_and_nvidia_smi() {
+        let ioreg = "+-o AGXAcceleratorG14X  <class AGXAcceleratorG14X, id 0x1000003f8>\n    {\n      \"gpu-core-count\" = 19\n      \"model\" = \"Apple M2 Pro\"\n    }\n";
+        assert_eq!(
+            parse_apple_gpu(ioreg),
+            Some(GpuProfile {
+                name: "Apple M2 Pro".into(),
+                cores: Some(19),
+                memory_bytes: None
+            })
+        );
+        assert_eq!(parse_apple_gpu("no accelerator"), None);
+        assert_eq!(
+            parse_nvidia_gpu("NVIDIA GeForce RTX 4090, 24564\nNVIDIA GeForce RTX 4090, 24564\n"),
+            Some(GpuProfile {
+                name: "NVIDIA GeForce RTX 4090".into(),
+                cores: None,
+                memory_bytes: Some(24_564 * 1024 * 1024),
+            })
+        );
+        assert_eq!(parse_nvidia_gpu(""), None);
+    }
 
     #[test]
     fn machine_profile_reports_portable_host_capacity() {

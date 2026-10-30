@@ -120,7 +120,8 @@ struct Inner {
     ledger_pending: u64,
     ledger_failed: u64,
     ledger_dropped: u64,
-    /// backend -> exponentially weighted wall time of successful tasks.
+    /// backend -> exponentially weighted service time (wall time minus queue wait) of successful
+    /// tasks.
     average_ms: BTreeMap<String, u64>,
 }
 
@@ -215,11 +216,14 @@ impl Telemetry {
             counters.queue_wait_ms = counters.queue_wait_ms.saturating_add(record.queue_wait_ms);
             counters.load_ms = counters.load_ms.saturating_add(record.load_ms);
             if record.outcome == "ok" {
+                // Service time, not wall time: a task's own queue wait must not feed the wait
+                // estimate given to the tasks queued behind it, or estimates snowball under load.
+                let service_ms = record.duration_ms.saturating_sub(record.queue_wait_ms);
                 let average = inner
                     .average_ms
                     .entry(record.backend.clone())
-                    .or_insert(record.duration_ms);
-                *average = average.saturating_mul(4).saturating_add(record.duration_ms) / 5;
+                    .or_insert(service_ms);
+                *average = average.saturating_mul(4).saturating_add(service_ms) / 5;
             }
             add_usage(&mut inner, &record);
         }

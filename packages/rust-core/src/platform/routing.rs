@@ -180,8 +180,8 @@ pub struct CatalogModel {
     /// automatic context for requests that leave `num_ctx` unset.
     #[serde(default)]
     pub modelfile_num_ctx: Option<u64>,
-    /// `general.architecture` from Ollama's model metadata (for example `glmocr`). Routing uses
-    /// it, never the tag name, to recognise single-purpose OCR networks.
+    /// `general.architecture` from Ollama's model metadata: the prefix of the model's own
+    /// context and attention fields. Routing never ranks by it.
     #[serde(default)]
     pub architecture: Option<String>,
     pub resident: bool,
@@ -189,12 +189,36 @@ pub struct CatalogModel {
     #[serde(default)]
     pub resident_size: Option<u64>,
     pub resident_vram: Option<u64>,
+    /// `context_length` of the loaded runner reported by `/api/ps`: the context a request must
+    /// match to reuse it (any other explicit `num_ctx` reloads the runner).
+    #[serde(default)]
+    pub resident_context: Option<u64>,
     pub benchmark: BTreeMap<Capability, f64>,
+    /// Managed runs of this model per task kind in this process, and how many of them ended in a
+    /// repetition loop. Observed behaviour, not a guess from the model's name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub observed_loops: BTreeMap<TaskKind, LoopRecord>,
     pub policy_rank: BTreeMap<TaskKind, usize>,
     /// Per-task request defaults a policy file sets for this model; routing applies the entry
     /// for the requested task on top of the generic task profile.
     #[serde(default)]
     pub policy_options: BTreeMap<TaskKind, ModelRequestDefaults>,
+}
+
+/// How often managed runs of one model on one task kind ended in a repetition loop.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoopRecord {
+    pub runs: u32,
+    pub loops: u32,
+}
+
+impl LoopRecord {
+    /// At least two loops in at most twice as many runs: a model that keeps repeating itself on
+    /// this kind of task, which one stray loop does not make.
+    #[must_use]
+    pub const fn keeps_looping(self) -> bool {
+        self.loops >= 2 && self.loops.saturating_mul(2) >= self.runs
+    }
 }
 
 /// Request defaults one task policy sets for one model
@@ -337,6 +361,61 @@ impl SessionAffinity {
 
 /// Select an eligible local model and a bounded Ollama request profile.
 ///
+/// The installed model a caller's name denotes, the way Ollama reads a name: the exact tag, else
+/// `name:latest`, else the one installed tag of that model family. An ambiguous or unknown name
+/// is refused with the installed candidates, never substituted.
+///
+/// # Errors
+///
+/// Returns an error when the name matches no installed model or more than one tag.
+pub fn installed_model<'a>(
+    models: &'a [CatalogModel],
+    requested: &str,
+) -> Result<&'a CatalogModel> {
+    if let Some(exact) = models.iter().find(|model| model.name == requested) {
+        return Ok(exact);
+    }
+    if !requested.contains(':') {
+        let latest = format!("{requested}:latest");
+        if let Some(model) = models.iter().find(|model| model.name == latest) {
+            return Ok(model);
+        }
+        let family = models
+            .iter()
+            .filter(|model| {
+                model
+                    .name
+                    .split_once(':')
+                    .is_some_and(|(name, _)| name == requested)
+            })
+            .collect::<Vec<_>>();
+        match family.as_slice() {
+            [only] => return Ok(only),
+            [_, ..] => bail!(
+                "model name is ambiguous: {requested} (installed: {})",
+                family
+                    .iter()
+                    .map(|model| model.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            [] => {}
+        }
+    }
+    let installed = models
+        .iter()
+        .map(|model| model.name.as_str())
+        .collect::<Vec<_>>();
+    bail!(
+        "model is not installed: {requested} (installed: {})",
+        if installed.is_empty() {
+            "none".to_owned()
+        } else {
+            installed.join(", ")
+        }
+    )
+}
+
 /// # Errors
 ///
 /// Returns an error when no installed model satisfies the request contract.
@@ -360,12 +439,14 @@ pub fn select_route(
 
     let eligible = eligible_for_objective(input, capability_eligible)?;
 
-    let chosen = if let Some(exact) = input.model.as_deref() {
-        let installed = models.iter().find(|model| model.name == exact);
-        let model = installed.with_context(|| format!("model is not installed: {exact}"))?;
+    let chosen = if let Some(requested) = input.model.as_deref() {
+        let model = installed_model(models, requested)?;
         ensure!(
-            eligible.iter().any(|candidate| candidate.name == exact),
-            "model is not eligible for the request: {exact}"
+            eligible
+                .iter()
+                .any(|candidate| candidate.name == model.name),
+            "model is not eligible for the request: {}",
+            model.name
         );
         model
     } else if let Some(affine) = input
@@ -397,10 +478,7 @@ pub fn select_route(
     let policy_qualified = chosen.policy_rank.contains_key(&input.task);
     let mut reasons = vec!["installed".to_owned(), "capabilities_satisfied".to_owned()];
     if input.model.is_none() && !general_fallback_fit(chosen, input.task) {
-        reasons.push("ocr_specialist_last_resort".to_owned());
-    }
-    if options.get("stop").is_some() {
-        reasons.push("architecture_default_stop".to_owned());
+        reasons.push("repeats_on_this_task_last_resort".to_owned());
     }
     if policy_model_options {
         reasons.push("policy_model_options".to_owned());
@@ -660,21 +738,15 @@ fn ranking_capability(task: TaskKind) -> Capability {
     }
 }
 
-/// Single-purpose OCR networks (architecture `glmocr`, `deepseekocr`, ...) advertise `completion`
-/// but loop or answer badly on general chat. Identified from model metadata, never the tag.
-fn is_ocr_specialist(model: &CatalogModel) -> bool {
-    model
-        .architecture
-        .as_deref()
-        .is_some_and(|architecture| architecture.to_ascii_lowercase().ends_with("ocr"))
-}
-
-/// Whether automatic selection (fallback ranking or session affinity) may use this model for the
-/// task. An operator policy naming the model for the task always qualifies it.
+/// Whether automatic selection (fallback ranking or session affinity) may prefer this model for
+/// the task. A model observed to keep looping on this kind of task ranks last for it; an operator
+/// policy naming the model for the task always qualifies it, and an explicit model always wins.
 fn general_fallback_fit(model: &CatalogModel, task: TaskKind) -> bool {
-    matches!(task, TaskKind::Vision)
-        || !is_ocr_specialist(model)
-        || model.policy_rank.contains_key(&task)
+    model.policy_rank.contains_key(&task)
+        || !model
+            .observed_loops
+            .get(&task)
+            .is_some_and(|record| record.keeps_looping())
 }
 
 fn compare_candidates(left: &CatalogModel, right: &CatalogModel, input: &RouteInput) -> Ordering {
@@ -786,13 +858,6 @@ fn profile(input: &RouteInput, model: &CatalogModel) -> TaskProfile {
     if num_predict > 0 {
         options["num_predict"] = json!(num_predict);
     }
-    // Ollama >= 0.30 glm-ocr never emits end-of-turn (ollama/ollama#16892): text recognition
-    // returns the exact text, then repeats it inside markdown fences until num_predict. The fence
-    // ends plain-text output cleanly. Callers override with request_options.options.stop
-    // (`[]` opts out); table output needs its own terminator and is caught by the loop check.
-    if matches!(input.task, TaskKind::Vision) && model.architecture.as_deref() == Some("glmocr") {
-        options["stop"] = json!(["```"]);
-    }
     TaskProfile {
         name: name.to_owned(),
         options,
@@ -807,8 +872,8 @@ fn requested_context(input: &RouteInput) -> u64 {
     input.context_tokens.unwrap_or(match input.task {
         TaskKind::Browser | TaskKind::Tools | TaskKind::CodeRepair => 8_192,
         TaskKind::LongContext => 32_768,
-        // Embeddings are not chat: nomic-embed-text advertises 2048, so the chat default would
-        // make every embed look like a context miss.
+        // Embeddings are not chat: embedding models commonly advertise 2048, so the chat default
+        // would make every embed look like a context miss.
         TaskKind::Embedding => 2_048,
         _ => 16_384,
     })

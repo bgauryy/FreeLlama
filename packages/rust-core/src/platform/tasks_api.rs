@@ -54,6 +54,11 @@ pub(crate) struct TaskInput {
     pub(crate) defer: bool,
     /// Total time including discovery, queueing, loading and generation; capped by the server.
     pub(crate) timeout_seconds: Option<u64>,
+    /// Stream a chat from Ollama and stop as soon as the output repeats itself, instead of
+    /// generating the loop until `num_predict`. Everything generated before the stop is kept in
+    /// `response.message.content`; `output_check` says where the first copy of the loop ends.
+    #[serde(default)]
+    pub(crate) stop_on_repetition: bool,
     #[serde(skip)]
     pub(crate) job_progress: Option<jobs::JobProgress>,
 }

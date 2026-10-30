@@ -13,10 +13,20 @@ use reqwest::{Client, RequestBuilder};
 /// connection and never answers would hang a call forever. Every request therefore sets its own
 /// timeout ([`control_timeout`] or [`task_timeout`]). The client owns a connection pool, a DNS
 /// resolver and background driver tasks, so it is shared; a clone is a handle onto the same pool.
+///
+/// # Panics
+///
+/// Never in practice: a builder with no proxy or TLS options only fails on a missing system
+/// certificate store, which [`crate::net::build_http_client`] already turns into an empty one.
 #[must_use]
 pub fn client() -> Client {
     static CLIENT: std::sync::OnceLock<Client> = std::sync::OnceLock::new();
-    CLIENT.get_or_init(Client::new).clone()
+    CLIENT
+        .get_or_init(|| {
+            crate::net::build_http_client(|builder| builder)
+                .expect("an HTTP client without proxy or TLS options always builds")
+        })
+        .clone()
 }
 
 /// Decision-only control-plane calls: computation over an in-memory model list, so seconds means

@@ -36,6 +36,7 @@ mod execution;
 mod feedback;
 mod footprint;
 mod jobs;
+mod loops;
 mod monitor;
 pub(crate) mod ollama_env;
 pub mod policy_eval;
@@ -69,8 +70,9 @@ pub use discovery::machine_profile;
 pub(crate) use discovery::machine_profile_off_runtime;
 use discovery::{host_has_unified_memory, host_total_memory_bytes};
 pub use routing::{
-    Backend, CatalogModel, ExecutionPreference, ModelRequestDefaults, Objective, PlacementEvidence,
-    RouteDecision, RouteInput, SessionAffinity, TaskKind, TaskPriority, select_route,
+    Backend, CatalogModel, ExecutionPreference, LoopRecord, ModelRequestDefaults, Objective,
+    PlacementEvidence, RouteDecision, RouteInput, SessionAffinity, TaskKind, TaskPriority,
+    installed_model, select_route,
 };
 pub(crate) use runtime::ContextMode;
 pub use runtime::RuntimeFile;
@@ -106,6 +108,8 @@ struct PlatformState {
     footprints: Arc<Mutex<footprint::FootprintHistory>>,
     /// Per-model demand and load history for eviction planning.
     activity: residency::ModelActivity,
+    /// Observed repetition loops per model and task, which automatic routing ranks by.
+    loop_evidence: loops::LoopEvidence,
     /// The most recent eviction plan, for `status` and the UI.
     last_eviction: Arc<std::sync::Mutex<Option<Value>>>,
     client: Client,
@@ -287,6 +291,7 @@ fn build(config: &PlatformConfig) -> Result<(Router, PlatformState)> {
             }
         })),
         activity: residency::ModelActivity::default(),
+        loop_evidence: loops::LoopEvidence::default(),
         last_eviction: Arc::default(),
         // A client-level backstop, not a nicety. `forward_managed_task` holds the
         // `managed_execution` write lock across its upstream call, so an untimed request against
@@ -294,9 +299,7 @@ fn build(config: &PlatformConfig) -> Result<(Router, PlatformState)> {
         // managed task — one hung request deadlocking the whole managed plane. Generous enough
         // for a real generation (Ollama's own OLLAMA_LOAD_TIMEOUT is 5m for the load alone);
         // cheap discovery calls take a much shorter per-request timeout below.
-        client: Client::builder()
-            .timeout(platform_task_timeout())
-            .build()
+        client: crate::net::build_http_client(|builder| builder.timeout(platform_task_timeout()))
             .context("build platform HTTP client")?,
         upstream: config.upstream.clone(),
         cpu_upstream: config.cpu_upstream.clone(),
@@ -558,11 +561,16 @@ async fn machine(State(state): State<PlatformState>) -> Json<MachineProfile> {
 
 async fn models(State(state): State<PlatformState>) -> Result<Json<Value>, ApiError> {
     let models = discover_models(&state).await?;
-    let models = models
-        .into_iter()
-        .map(|model| {
+    let mut views = Vec::with_capacity(models.len());
+    for model in models {
+        {
             let execution = execution_target(&state, &model.name);
             let model_type = ModelType::from_capabilities(model.capabilities.iter().copied());
+            // The context Ollama gives a request that leaves `num_ctx` unset: a managed task that
+            // sends another value reloads the runner, so callers can see what to match.
+            let context_default =
+                monitor::ollama_default_context(&state, Some(&model), execution.placement).await;
+            let resident_context = model.resident_context;
             let mut observation = physical_placement_observation(
                 execution.placement,
                 model.resident_size,
@@ -587,10 +595,17 @@ async fn models(State(state): State<PlatformState>) -> Result<Json<Value>, ApiEr
             if let Some(view) = resident_view {
                 value["resident_view"] = view;
             }
-            value
-        })
-        .collect::<Vec<_>>();
-    Ok(Json(json!({"models": models})))
+            // Unified-memory hosts leave the tier unknown; a loaded runner still shows the
+            // context it was given, which is what a request must match to reuse it.
+            value["context_default"] = match (context_default, resident_context) {
+                (Some((tokens, source)), _) => json!({"num_ctx": tokens, "source": source}),
+                (None, Some(tokens)) => json!({"num_ctx": tokens, "source": "resident_runner"}),
+                (None, None) => json!({"num_ctx": Value::Null, "source": "unknown"}),
+            };
+            views.push(value);
+        }
+    }
+    Ok(Json(json!({"models": views})))
 }
 
 async fn route(

@@ -50,9 +50,7 @@ async fn generate(args: &PolicyFromEvalArgs) -> Result<String> {
 /// List installed Ollama tags from `<endpoint>/api/tags`.
 async fn installed_models(endpoint: &str) -> Result<Vec<String>> {
     let url = freellama::endpoint_url(endpoint, "/api/tags");
-    let tags: Value = reqwest::Client::builder()
-        .timeout(CONTROL_TIMEOUT)
-        .build()?
+    let tags: Value = freellama::build_http_client(|builder| builder.timeout(CONTROL_TIMEOUT))?
         .get(&url)
         .send()
         .await

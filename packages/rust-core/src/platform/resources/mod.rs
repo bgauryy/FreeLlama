@@ -13,12 +13,13 @@ mod tests;
 
 pub use governor::{ResourceGovernor, ResourcePermit};
 
-// Only the macOS process probe in ollama_env.rs reaches this through `resources`.
-#[cfg(target_os = "macos")]
-pub(crate) use sampling::bounded_command_with;
 pub(crate) use sampling::bounded_output;
 pub(crate) use sampling::run_bounded;
 pub use sampling::sample_host_resources;
+// Only macOS callers (the doctor block and the process probe in ollama_env.rs) reach these
+// through `resources`.
+#[cfg(target_os = "macos")]
+pub(crate) use sampling::{apply_thermal_pressure, bounded_command_with};
 
 const GIB: u64 = 1024 * 1024 * 1024;
 
@@ -46,6 +47,10 @@ pub struct GpuDeviceActivity {
     /// Missing, unsupported or malformed percentages stay unknown; observed zero is retained.
     pub busy_percent: Option<f64>,
     pub memory_busy_percent: Option<f64>,
+    /// Memory the GPU driver has allocated from the shared pool (Apple `Alloc system memory`);
+    /// unknown elsewhere. Unified memory is still admitted against host RAM.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allocated_memory_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -65,8 +70,12 @@ pub struct HostResources {
     pub load_average_one_minute: Option<f64>,
     pub logical_cpus: Option<u32>,
     /// `None` means the OS did not provide a thermal observation, including pmset's
-    /// "No CPU power status has been recorded" response.
+    /// "No CPU power status has been recorded" response. On macOS the system thermal pressure
+    /// level counts as throttled from `heavy` up.
     pub thermal_throttled: Option<bool>,
+    /// macOS system thermal pressure (`nominal`, `moderate`, `heavy`, `trapping`, `sleeping`)
+    /// from the `com.apple.system.thermalpressurelevel` notification state, readable unprivileged.
+    pub thermal_pressure: Option<&'static str>,
     pub cpu_speed_limit_percent: Option<u32>,
     pub thermal_warning_level: Option<u32>,
     /// cgroup v2 `memory.max` of this process when it is below physical RAM (containers).
@@ -194,6 +203,19 @@ impl ResourcePolicy {
         Ok(())
     }
 
+    /// The headroom a new load of `bytes` must leave: the host reserve, but never more than the
+    /// load itself above the fixed floor. A 3 GB runner on a 64 GB host is not held for 10 GB of
+    /// spare RAM it will never touch (the pattern peers use is a fixed margin next to the load,
+    /// not a share of the host), while a load near the host's size keeps the full reserve.
+    fn reserve_for(&self, total: Option<u64>, recovering: bool, bytes: u64) -> u64 {
+        let floor = if recovering {
+            self.resume_available_min_bytes
+        } else {
+            self.hold_available_min_bytes
+        };
+        self.reserve(total, recovering).min(bytes.max(floor))
+    }
+
     fn reserve(&self, total: Option<u64>, recovering: bool) -> u64 {
         let (percent, minimum) = if recovering {
             (
@@ -263,6 +285,9 @@ pub struct ResourceCapacityAssessment {
     pub admissible: bool,
     pub denial_reason: Option<CapacityDenialReason>,
     pub memory_advisory: Option<MemoryAdvisory>,
+    /// The active host holds that apply to this demand (empty when none holds it, even while
+    /// the host holds other kinds of work).
+    pub held_by: Vec<PressureReason>,
     pub required_available_bytes: u64,
     pub reserve_bytes: u64,
     pub required_with_reserve_bytes: Option<u64>,
@@ -285,13 +310,12 @@ impl ResourceSnapshot {
         )
     }
 
-    /// Like [`Self::assess_capacity`], for a [`ResourceDemand`]. An already-resident runner adds no
-    /// memory, so memory-capacity holds (low available memory, active swapping) never deny it:
-    /// the load that caused them must stay reusable or the host deadlocks on its own model. For a
-    /// new load, low available memory is a [`MemoryAdvisory`] under [`LowMemoryMode::Advisory`]
-    /// and an [`CapacityDenialReason::InsufficientCapacity`] denial under
-    /// [`LowMemoryMode::Refuse`]; swapping holds it in both modes. OS memory pressure, CPU load
-    /// and thermal holds deny every demand.
+    /// Like [`Self::assess_capacity`], for a [`ResourceDemand`]. Which active holds deny the
+    /// demand is decided per signal by [`ResourceDemand::is_held_by`]: memory-capacity holds spare a
+    /// resident runner, CPU-load and thermal holds spare inference on a resident GPU runner, OS
+    /// memory pressure holds everything. For a new load, low available memory is
+    /// a [`MemoryAdvisory`] under [`LowMemoryMode::Advisory`] and an
+    /// [`CapacityDenialReason::InsufficientCapacity`] denial under [`LowMemoryMode::Refuse`].
     #[must_use]
     pub fn assess_demand(
         &self,
@@ -299,34 +323,28 @@ impl ResourceSnapshot {
         recovering_capacity: bool,
     ) -> ResourceCapacityAssessment {
         let required_available_bytes = demand.bytes;
-        let resident_only = demand.resident && demand.bytes == 0;
-        let low_memory_only = self
+        let resident_only = demand.resident_only();
+        let advisory_mode = self.policy.low_memory == LowMemoryMode::Advisory;
+        let held_by = self
             .reasons
             .iter()
-            .all(|reason| *reason == PressureReason::LowAvailableMemory);
-        let memory_capacity_only = self.reasons.iter().all(|reason| {
-            matches!(
-                reason,
-                PressureReason::LowAvailableMemory | PressureReason::ActiveSwapping
-            )
-        });
-        let reserve_bytes = if recovering_capacity {
-            self.resume_reserve_bytes
-        } else {
-            self.hold_reserve_bytes
-        };
+            .copied()
+            .filter(|reason| demand.is_held_by(*reason, advisory_mode))
+            .collect::<Vec<_>>();
+        let reserve_bytes = self.policy.reserve_for(
+            self.observation.total_memory_bytes,
+            recovering_capacity,
+            required_available_bytes,
+        );
         let required_with_reserve_bytes = required_available_bytes.checked_add(reserve_bytes);
         let missing_telemetry = self
             .observation
             .missing_required(self.policy.telemetry_policy);
-        let advisory_mode = self.policy.low_memory == LowMemoryMode::Advisory;
         let below_reserve = !resident_only
             && self.effective_available_bytes.is_some_and(|available| {
                 required_with_reserve_bytes.is_some_and(|required| available < required)
             });
-        let denial_reason = if self.holding
-            && !((low_memory_only && advisory_mode) || (memory_capacity_only && resident_only))
-        {
+        let denial_reason = if self.holding && !held_by.is_empty() {
             Some(CapacityDenialReason::HostPressure)
         } else if !missing_telemetry.is_empty() {
             Some(CapacityDenialReason::TelemetryUnavailable)
@@ -359,6 +377,7 @@ impl ResourceSnapshot {
             admissible: denial_reason.is_none(),
             denial_reason,
             memory_advisory,
+            held_by,
             required_available_bytes,
             reserve_bytes,
             required_with_reserve_bytes,
@@ -368,12 +387,16 @@ impl ResourceSnapshot {
     }
 }
 
-/// What a request adds to host memory.
+/// What a request adds to host memory, and which host signals can hold it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ResourceDemand {
     pub bytes: u64,
     /// The runner is already loaded with a compatible configuration.
     pub resident: bool,
+    /// The work decodes on the host CPUs (a CPU-assigned backend), so CPU saturation slows it
+    /// and it adds to that saturation. A resident GPU runner's inference does neither, so a CPU
+    /// load hold does not apply to it; loading weights is CPU work in both cases.
+    pub cpu_bound: bool,
 }
 
 impl ResourceDemand {
@@ -382,6 +405,7 @@ impl ResourceDemand {
         Self {
             bytes,
             resident: false,
+            cpu_bound: false,
         }
     }
 
@@ -390,6 +414,39 @@ impl ResourceDemand {
         Self {
             bytes: 0,
             resident: true,
+            cpu_bound: false,
+        }
+    }
+
+    /// The same demand executed by a CPU backend.
+    #[must_use]
+    pub const fn on_cpu(self, cpu_bound: bool) -> Self {
+        Self { cpu_bound, ..self }
+    }
+
+    /// A resident runner that adds no memory.
+    #[must_use]
+    pub const fn resident_only(self) -> bool {
+        self.resident && self.bytes == 0
+    }
+
+    /// Whether a host pressure hold applies to this demand. Memory-capacity holds (low available
+    /// memory, active swapping) never apply to a resident runner: the load that caused them must
+    /// stay reusable or the host deadlocks on its own model, and low available memory is only
+    /// advisory under [`LowMemoryMode::Advisory`]. CPU-load and thermal holds apply to CPU-bound
+    /// work and to cold loads (decoding weights is CPU work and a new heat source), not to
+    /// inference on a resident GPU runner: a bounded request on a loaded runner neither waits for
+    /// the cores nor cools the package by waiting, so holding it only delays the caller. OS memory
+    /// pressure holds every demand.
+    #[must_use]
+    pub fn is_held_by(self, reason: PressureReason, advisory_low_memory: bool) -> bool {
+        match reason {
+            PressureReason::LowAvailableMemory => !advisory_low_memory && !self.resident_only(),
+            PressureReason::ActiveSwapping => !self.resident_only(),
+            PressureReason::HighCpuLoad | PressureReason::ThermalThrottling => {
+                self.cpu_bound || !self.resident
+            }
+            PressureReason::OsMemoryPressure => true,
         }
     }
 }

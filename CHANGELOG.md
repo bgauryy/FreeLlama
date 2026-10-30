@@ -2,6 +2,57 @@
 
 ## Unreleased
 
+- **Model-agnostic routing:** routing no longer ranks by a model's name or architecture. The rule
+  that demoted architectures ending in `ocr` is replaced by observed evidence: automatic selection
+  ranks a model last for a task kind it has looped on at least twice in at most twice as many
+  managed runs (`repeats_on_this_task_last_resort`); an explicit `model` or operator policy still
+  wins. `GET /_freellama/v1/models` lists the evidence as `observed_loops`.
+- **No injected stop sequences:** the `glmocr`-only `options.stop` default is removed; FreeLlama
+  adds no request option because of which model was chosen.
+- **KV estimate from metadata:** `kv_cache_bytes_per_token_f16` is computed for any architecture
+  whose metadata declares a uniform full-attention layout, instead of an allowlist of ten
+  architecture names; recurrent, state-space, sliding-window, shared and cross-attention layouts
+  stay `null`.
+- **`stop_on_repetition` (MCP `stopOnRepetition`, CLI `--stop-on-repetition`):** streams a chat
+  from Ollama and stops once the output repeats itself, keeping everything generated
+  (`done_reason: "repetition"`, `output_check.stopped_early`). An Ollama "token repeat limit" abort
+  now keeps the text generated before it (`done_reason: "repeat_limit"`) instead of failing.
+- **Backend-aware pressure holds:** CPU-load and thermal-throttling holds now apply to CPU-assigned
+  work and to cold loads, not to inference on a runner already resident on the GPU
+  (`ResourceDemand::cpu_bound`); OS memory pressure still holds everything. Measured on a 12-CPU
+  Mac: resident tasks waited 64 to 120 s behind a compiler's CPU load. The assessment's new
+  `held_by` lists the holds that applied to the request.
+- **Memory reserve capped by the load:** the headroom a new load must leave is the host reserve
+  (15% / 20%) but never more than the load itself above the 1 GiB / 2 GiB floor, the way peers
+  keep a fixed margin next to the load rather than a share of the host.
+- **Model names resolve like Ollama:** an explicit `model` accepts a bare name (`name` is
+  `name:latest`, or the one installed tag of that family); unknown and ambiguous names are
+  refused with the installed candidates.
+- **`GET /_freellama/v1/models`** reports each model's `context_default` (`num_ctx`, `source`),
+  the context Ollama gives a request that leaves `num_ctx` unset, and `resident_context`, the loaded
+  runner's context; a different explicit `num_ctx` reloads the runner.
+- **Works without system CA certificates:** on a host with no CA bundle (slim or distroless
+  containers) every HTTP client used to fail to build, even for plain-HTTP Ollama. FreeLlama now
+  falls back to an empty trust store and warns once: `http://` upstreams work, `https://` upstreams
+  fail their certificate check until `ca-certificates` is installed or `SSL_CERT_FILE` is set.
+- **Heat on Apple silicon:** Apple silicon records no `pmset` thermal warning, so the thermal
+  hold never fired there. FreeLlama now reads the system thermal pressure level
+  (`notifyutil com.apple.system.thermalpressurelevel`); `heavy` or worse counts as throttled.
+  `status` reports it as `host.thermal_pressure` and `doctor` as `host_runtime_signals.thermal_pressure`.
+- **Machine and GPU identity:** `doctor`'s `machine` adds `gpu` (Apple accelerator model and core
+  count from the I/O registry, or NVIDIA name and memory from `nvidia-smi` on Linux) and
+  `performance_cpus` / `efficiency_cpus` on hybrid CPUs. Apple `gpu_activity` devices add
+  `allocated_memory_bytes`, the driver's allocated memory.
+- **Accurate `Retry-After`:** the estimate used each task's wall time including its queue wait and
+  divided by budget units instead of runnable lanes, so a queued burst inflated it (76 s measured
+  for a 32 s wait). It now uses service time and lanes (`budget / cost`).
+- **Fixed a stale Linux-only test:** `pinned_models_are_never_evicted` expected a refusal under
+  the advisory memory mode; it now checks both modes (refuse holds the load, advisory dispatches it
+  with a memory advisory) and that the pinned runner is never unloaded.
+- **Docs:** `ARCHITECTURE.md#request-shapes` and the MCP README give the control API's JSON
+  bodies and receipt fields.
+- **Fixed `build:js`:** `yarn workspaces foreach -A` included the root workspace, whose `build`
+  re-ran `build:js`; the recursion forked yarn until killed. The root workspace is excluded.
 - **Removed `benchmark/`:** the harness, hardware runners and local adapter benchmark are gone,
   and the repository no longer contains Python. Their history stays in git.
 - **New `freellama policy from-eval`:** this Rust command replaces `policy_from_eval.py`. It writes

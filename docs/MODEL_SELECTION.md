@@ -36,10 +36,10 @@ Read the [retained model profile](https://github.com/bgauryy/FreeLlama/blob/main
 and [delegation measurements](https://github.com/bgauryy/FreeLlama/blob/main/skills/freellama/references/task-delegation.md) for scope and limits.
 These examples do not establish that a tag is installed or suitable on your host.
 
-Dedicated OCR models answer best to their native prompts; for `glm-ocr`, use `Text Recognition:`,
-`Table Recognition:`, or `Formula Recognition:` with base64 `images` in `run_task`. See
-[Route images and OCR](https://github.com/bgauryy/FreeLlama/blob/main/packages/mcp/README.md#route-images-and-ocr) for the stop-sequence default
-and the `output_check.repetition_loop` receipt.
+Dedicated OCR models answer best to the prompts their model card documents; send them with base64
+`images` in `run_task`. A model that repeats its answer until the output cap can run with
+`stopOnRepetition:true`. See [Route images](https://github.com/bgauryy/FreeLlama/blob/main/packages/mcp/README.md#route-images)
+for the early stop and the `output_check` receipt.
 
 `muse-glimmer:30b-mlx` was a credible alternative and answered 29 of 30 questions correctly
 (96.7%) with the Bash adapter, but it was slower and did not add a required capability in this

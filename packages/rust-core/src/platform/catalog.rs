@@ -135,7 +135,11 @@ async fn fetch_catalog_from(
             resident_vram: running
                 .and_then(|value| value.get("size_vram"))
                 .and_then(Value::as_u64),
+            resident_context: running
+                .and_then(|value| value.get("context_length"))
+                .and_then(Value::as_u64),
             benchmark: state.benchmark.get(name).cloned().unwrap_or_default(),
+            observed_loops: state.loop_evidence.for_model(name),
             policy_options: state
                 .policies
                 .model_options
@@ -177,34 +181,23 @@ fn advertised_context_from_show(show: &Value) -> Option<u64> {
     value.as_u64().filter(|context| *context > 0)
 }
 
-/// Estimate unpadded F16 K+V bytes per token for known, uniform full-attention layouts.
-/// This is not live allocation or a lower bound across cache precisions. Ollama additionally
-/// handles padding, parallel slots, recurrent state, sliding windows and architecture-specific
-/// caches. Return `None` for those layouts rather than pretending the dense formula is exact.
+/// Estimate unpadded F16 K+V bytes per token for a uniform full-attention layout, read from the
+/// model's own metadata whatever its architecture. This is not live allocation or a lower bound
+/// across cache precisions. Ollama additionally handles padding, parallel slots, recurrent state,
+/// sliding windows and architecture-specific caches: metadata that declares any of those (or
+/// per-layer head counts, which are arrays) returns `None` rather than a dense formula that
+/// would be wrong for it.
 fn estimate_kv_cache_bytes_per_token_f16(show: &Value) -> Option<u64> {
     let info = show.get("model_info")?.as_object()?;
     let architecture = info.get("general.architecture")?.as_str()?;
-    if !matches!(
-        architecture,
-        "llama"
-            | "qwen2"
-            | "qwen3"
-            | "qwen3moe"
-            | "gemma"
-            | "phi2"
-            | "phi3"
-            | "stablelm"
-            | "command-r"
-            | "glmocr"
-    ) {
-        return None;
-    }
     let prefix = format!("{architecture}.");
     if info
         .keys()
         .filter_map(|key| key.strip_prefix(&prefix))
         .any(|key| {
             key.starts_with("ssm.")
+                || key.starts_with("wkv")
+                || key.contains("recurrent")
                 || key.contains("sliding_window")
                 || key.contains("shared_kv")
                 || key.contains("cross_attention")
@@ -330,6 +323,11 @@ async fn refresh_residency(
         model.resident_vram = resident
             .and_then(|value| value.get("size_vram"))
             .and_then(Value::as_u64);
+        model.resident_context = resident
+            .and_then(|value| value.get("context_length"))
+            .and_then(Value::as_u64);
+        // Live like residency: cached static metadata must not hide a loop seen since.
+        model.observed_loops = state.loop_evidence.for_model(&model.name);
     }
     Ok(())
 }
@@ -651,7 +649,9 @@ mod kv_estimate_tests {
             resident: false,
             resident_size: None,
             resident_vram: None,
+            resident_context: None,
             benchmark: BTreeMap::new(),
+            observed_loops: BTreeMap::new(),
             policy_rank: BTreeMap::new(),
             policy_options: BTreeMap::new(),
         };

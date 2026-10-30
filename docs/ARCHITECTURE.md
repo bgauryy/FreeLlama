@@ -129,11 +129,48 @@ The control API exposes these endpoints:
 | `POST /_freellama/v1/scopes/:id/fork` | Fork history at an expected revision | No |
 | `DELETE /_freellama/v1/scopes/:id` | Delete retained history | No |
 | `POST /_freellama/v1/warm` | Admitted load of an exact installed runner profile | Load only |
-| `POST /_freellama/v1/tasks` | Managed chat, vision, tools, or embedding task | Yes |
+| `POST /_freellama/v1/tasks` | Managed chat, vision, tools, or embedding task (body shape under [Request shapes](#request-shapes)) | Yes |
 | `GET /_freellama/v1/jobs` | Deferred job metadata without prompts or results | No |
 | `GET /_freellama/v1/jobs/:id` | One deferred receipt and retained result | No |
 | `POST /_freellama/v1/jobs/:id/cancel` | Cancel one deferred task and release its local permits | No new inference |
 | `DELETE /_freellama/v1/jobs/:id` | Cancel active work, release local permits, and remove its retained record | No new inference |
+
+### Request shapes
+
+The control API uses snake_case JSON. A managed task body is the routing fields plus the payload:
+
+```json
+{
+  "task": "vision", "objective": "fastest", "model": "my-vision-model",
+  "session_id": "<uuid from POST /sessions>", "required_capabilities": ["vision"],
+  "prompt": "Text Recognition:", "images": ["<base64, no data-URI prefix>"],
+  "priority": "background", "keep_alive": "5m", "max_wait_seconds": 30, "timeout_seconds": 120,
+  "stop_on_repetition": true,
+  "request_options": { "options": { "temperature": 0, "num_predict": 600 }, "format": "json", "think": false }
+}
+```
+
+`model` is read the way Ollama reads it: an exact installed tag, else `name:latest`, else the one
+installed tag of that family; an unknown or ambiguous name is refused with the installed candidates.
+`messages` (Ollama message objects, images included) replaces `prompt`; `input` serves embeddings;
+`context_tokens` owns `num_ctx` and placement owns `num_gpu`, so neither is accepted inside
+`request_options.options`. `stop_on_repetition: true` streams the chat from Ollama and stops as soon
+as the output repeats its unit twice after the first copy over 96+ characters: the connection
+closes, which cancels generation upstream, and everything generated is kept with
+`done_reason: "repetition"`. An Ollama "token repeat limit" abort is kept the same way
+(`done_reason: "repeat_limit"`). A stopped stream has no Ollama timing fields, so it trains no
+throughput feedback. The receipt holds `route`, `admission` (`queue_wait_ms`,
+`resource_wait_ms`, `transition_wait_ms`, `total_wait_ms`), `execution` (placement, observation,
+`resource_admission`, `context_sizing`, `memory_reservation`), `metrics`, `feedback` and
+`response`, which is Ollama's own answer (`message.content`, `eval_count`, durations).
+
+A batch nests whole task bodies:
+
+```json
+{ "max_parallelism": 2, "tasks": [ { "id": "item-1", "independent": true, "task": { "task": "vision", "model": "my-vision-model", "prompt": "...", "images": ["..."] } } ] }
+```
+
+`POST /sessions` with an empty object returns `session_id`; `POST /warm` takes `{"model": "<tag>"}`.
 
 The machine profile is host-derived rather than model-name-derived. It reports total physical
 memory on macOS (`sysctl`), Linux (`/proc`), and Windows (system APIs), along with CPU, OS,
@@ -159,12 +196,26 @@ flowchart LR
     BENCH["Local benchmark report"] --> CAT
     POLICY["Task policy"] --> CAT
     ASSIGN["CPU model assignments"] --> CAT
-    CAT --> MODEL["CatalogModel<br/>capabilities · context · residency<br/>benchmark · policy rank · backend"]
+    LOOPS["Observed repetition loops"] --> CAT
+    CAT --> MODEL["CatalogModel<br/>capabilities · context · residency<br/>benchmark · policy rank · backend · loops"]
 ```
 
 FreeLlama fetches tags and residency from each configured backend. Models assigned to CPU are
 removed from the primary catalog view and included only from the secondary backend. Static catalog
-metadata is cached for 30 seconds; residency is refreshed before routing.
+metadata is cached for 30 seconds; residency and observed loops are refreshed before routing.
+
+Every field comes from the model's own metadata and from what FreeLlama observed, never from its
+name. `GET /_freellama/v1/models` adds, per model:
+
+- `context_default`: the context Ollama gives a request that leaves `num_ctx` unset (`source` is
+  `modelfile`, `config`, `ollama_context_length`, `vram_tier`, or `resident_runner`). A managed
+  task that sends a different `num_ctx` reloads the runner.
+- `resident_context`: the `context_length` of the loaded runner from `/api/ps`.
+- `observed_loops`: per task kind, managed runs since start and how many ended in a repetition
+  loop (`{runs, loops}`); process-local, not persisted.
+- `kv_cache_bytes_per_token_f16`: estimated from the declared architecture's block count, KV head
+  count and key/value lengths, for any architecture; `null` when the metadata declares recurrent,
+  state-space, sliding-window, shared or cross-attention caches, which the dense formula misstates.
 
 A failed `/api/show` response skips that model instead of failing the entire catalog. An unreachable
 configured backend fails catalog discovery closed because FreeLlama cannot prove the assigned model's
@@ -204,8 +255,17 @@ flowchart TD
     G -->|"Yes or unset"| D["RouteDecision"]
 ```
 
-Explicit model selection never substitutes another model. Every rejected candidate includes a
-reason so callers can distinguish capability, context, policy, and installation failures.
+Explicit model selection never substitutes another model. An explicit `model` is read the way
+Ollama reads it: the exact tag, else `name:latest`, else the one installed tag of that family; an
+unknown or ambiguous name is refused with the installed candidates. Every rejected candidate
+includes a reason so callers can distinguish capability, context, policy, and installation failures.
+
+Routing never ranks by a model's name or architecture. Automatic selection (fallback ranking and
+session affinity) ranks a model last for a task kind when it has looped on that kind at least twice
+in at most twice as many managed runs; the decision then carries
+`repeats_on_this_task_last_resort`. An operator policy naming the model for the task, or an explicit
+`model`, always wins. No request option is added because of which model was chosen: stop sequences
+and decoding settings belong to the caller.
 
 `context_window_fit` means only that requested `num_ctx` fits the model's advertised context
 window. It is not a live-memory, free-VRAM, K/V-cache, thermal, or runner-admission verdict.
@@ -327,8 +387,11 @@ authority. Configured settings alone do not prove physical processor placement.
 
 The shared [resource governor](https://github.com/bgauryy/FreeLlama/blob/main/packages/rust-core/src/platform/resources/mod.rs) samples local
 available-memory estimates, load per logical CPU, OS memory pressure, active swap-out growth, and
-thermal throttling when reported. OS memory pressure, active swap-out growth, CPU load, and thermal
-throttling hold new local work. Low available RAM (below the larger of 15% or 1 GiB, clearing after two
+thermal throttling when reported. OS memory pressure holds every local demand; active swap-out
+growth holds new loads; CPU-load and thermal holds apply to CPU-assigned work and to cold loads
+(decoding weights is CPU work and a new heat source) but not to a bounded request on a runner
+already resident on the GPU, which neither waits for the cores nor cools the package by waiting (`ResourceDemand::is_held_by`; the assessment's
+`held_by` lists the holds that applied). Low available RAM (below the larger of 15% or 1 GiB, clearing after two
 healthy samples above the larger of 20% or 2 GiB) depends on the platform (`ResourcePolicy::low_memory`).
 On macOS (`advisory`) the estimate undercounts what the OS can reclaim, so a load that does not cover
 it first unloads idle runners and then dispatches with a `memory_advisory`. On Linux, Windows, and

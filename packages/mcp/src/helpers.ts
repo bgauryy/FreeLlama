@@ -172,6 +172,7 @@ const batchTaskParam = z.object({
   priority: z.enum(["interactive", "normal", "background"]).optional(),
   maxWaitSeconds: z.number().int().positive().optional(),
   timeoutSeconds: z.number().int().positive().optional(),
+  stopOnRepetition: z.boolean().optional().describe("Stream and stop once output repeats itself; keeps all generated text"),
   prompt: z.string().min(1).optional(),
   systemPrompt: systemPromptParam,
   messages: messagesParam,

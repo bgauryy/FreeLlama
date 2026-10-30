@@ -20,6 +20,7 @@ mod monitoring_contract;
 mod platform_contract;
 mod proxy_contract;
 mod readiness_contract;
+mod repetition_stop_contract;
 mod request_validation_contract;
 mod resident_placement_contract;
 mod resource_governor_contract;

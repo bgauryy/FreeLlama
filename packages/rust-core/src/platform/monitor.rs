@@ -183,6 +183,7 @@ pub(super) async fn status(State(state): State<PlatformState>) -> Json<Value> {
             "load_average_one_minute": observation.load_average_one_minute,
             "logical_cpus": observation.logical_cpus,
             "thermal_throttled": observation.thermal_throttled,
+            "thermal_pressure": observation.thermal_pressure,
             "gpu_memory_total_bytes": observation.gpu_memory_total_bytes,
             "gpu_memory_free_bytes": observation.gpu_memory_free_bytes,
             "gpu_telemetry_source": observation.gpu_telemetry_source,

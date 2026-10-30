@@ -167,7 +167,8 @@ pub(crate) fn build_managed_request(
     let mut body = json!({
         "model": decision.selected_model,
         "messages": messages,
-        "stream": false,
+        // Streaming lets the forward path stop a repetition loop early; see `stop_on_repetition`.
+        "stream": input.stop_on_repetition,
         "truncate": false,
         "shift": false,
         "keep_alive": keep_alive,

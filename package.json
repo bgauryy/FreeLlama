@@ -24,7 +24,7 @@
   },
   "scripts": {
     "build": "yarn build:rust && yarn build:native && yarn build:js",
-    "build:js": "yarn workspaces foreach -A --topological run build",
+    "build:js": "yarn workspaces foreach -A --topological --exclude freellama-workspace run build",
     "build:native": "node scripts/build-native.mjs",
     "build:rust": "cargo build --release",
     "typecheck": "yarn workspaces foreach -A run typecheck",

@@ -15,6 +15,9 @@ not provide tenant isolation or billing.
 - Use the release artifacts for your operating system, or build with Rust 1.88 or later.
 - Preinstall and benchmark exact model tags. Discovery never authorizes a pull.
 - Keep the primary and optional CPU Ollama processes on distinct loopback sockets.
+- In a slim or distroless container, install the CA bundle (`ca-certificates`) or set
+  `SSL_CERT_FILE` if any upstream uses `https://`. Without one, FreeLlama starts with an empty trust
+  store and warns: plain-HTTP upstreams work, HTTPS upstreams fail their certificate check.
 
 After a tag has been published, install that exact checksummed release on macOS or Linux:
 

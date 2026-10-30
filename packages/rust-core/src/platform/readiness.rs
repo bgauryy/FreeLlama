@@ -1,6 +1,6 @@
 //! Read-only, model-aware execution previews. No permits or model loads occur here.
 use super::{
-    PlatformState, TaskKind,
+    Backend, PlatformState, TaskKind,
     execution::{ManagedDecision, model_memory_requirement},
     resources::{ResourceCapacityAssessment, ResourceDemand, ResourceSnapshot},
 };
@@ -46,7 +46,8 @@ pub(super) async fn assess(
         ResourceDemand::resident()
     } else {
         ResourceDemand::load(required)
-    };
+    }
+    .on_cpu(decision.execution.placement == Backend::Cpu);
     let assessment = crate::net::is_loopback_url(&decision.execution.upstream)
         .then(|| resources.assess_demand(demand, false));
     let task_cost = task_cost

@@ -95,6 +95,8 @@ While `serve` runs, a status page is available at `http://127.0.0.1:11435/_freel
 | ⚡ | [Batches, jobs, and history](#batches-jobs-and-history) | Fan-out, submit-now-collect-later, and multi-turn chat without resending history |
 | 🔎 | [Grounded research](#grounded-research) | Read-only repository answers with file/line citations and a verdict |
 | 🧳 | [Small agent context](#small-agent-context) | Compact results, paged details, receipts instead of raw dumps |
+| 🔁 | [Loop control](#loop-control) | Stop a repeating answer early and keep every token; routing learns which model loops on what |
+| 🌡️ | [Machine awareness](#machine-awareness) | GPU, cores, unified memory, thermal pressure and GPU load read from the OS |
 | 📊 | [Observe and evaluate](#observe-and-evaluate) | Live status, usage, benchmarks, routing policies, Ollama-compatible passthrough |
 
 ### What to offload
@@ -112,6 +114,47 @@ flowchart TD
     N -->|"many, independent"| B["run_task {tasks}"]
     N -->|"long-running"| D["run_task {defer:true}<br/>then task_jobs"]
 ```
+
+### The smart flow
+
+Every managed task passes the same four gates. Each gate decides from evidence (installed metadata,
+live host signals, observed behaviour), never from a model's name.
+
+```mermaid
+flowchart LR
+    T(["Task"]) --> R{"Route"}
+    R -->|"capabilities · context · policy<br/>· observed loops"| A{"Admit"}
+    A -->|"fair queue + host signals"| B{"Backend"}
+    B -->|"default"| GPU["Ollama on GPU"]
+    B -->|"operator-assigned helper"| CPU["Ollama on CPU"]
+    GPU --> X["Execute<br/>optional stop on repetition"]
+    CPU --> X
+    X --> Rc(["Result + receipt"])
+    A -->|"queue full or wait budget spent"| No(["Refused with reason<br/>and Retry-After"])
+
+    classDef route fill:#dbeafe,stroke:#1d4ed8,color:#0b1b3f
+    classDef admit fill:#fef3c7,stroke:#b45309,color:#3b2203
+    classDef gpu fill:#dcfce7,stroke:#15803d,color:#052e16
+    classDef cpu fill:#ede9fe,stroke:#6d28d9,color:#1e0b47
+    classDef stop fill:#fee2e2,stroke:#b91c1c,color:#450a0a
+    classDef done fill:#f1f5f9,stroke:#475569,color:#0f172a
+    class R route
+    class A admit
+    class B,GPU gpu
+    class CPU cpu
+    class No stop
+    class T,X,Rc done
+```
+
+- **Route** (blue): filters installed models by task, capabilities, context window and policy, then
+  ranks them. A model that keeps looping on this kind of task ranks last. An explicit `model` always
+  wins.
+- **Admit** (amber): a per-backend budget, a bounded fair queue and host signals decide whether the
+  task runs now, waits, or is refused.
+- **Backend** (green GPU, purple CPU): GPU by default; exact helper tags can run on a second,
+  CPU-only Ollama.
+- **Execute**: Ollama runs the model. With `stopOnRepetition` the answer streams and stops once it
+  repeats itself.
 
 ### One task, end to end
 
@@ -151,33 +194,102 @@ context window, routing policy, and memory fit. Every decision reports a confide
 Set `minConfidence:"medium"` to refuse weakly evidenced routes, `objective:"quality"` to require a
 policy-backed model, or pin `model` yourself. See [model selection](docs/MODEL_SELECTION.md).
 
+FreeLlama treats every model the same way: it never ranks by name or architecture and adds no
+model-specific request options. A bare name works like it does in Ollama (`name` is
+`name:latest`, or the one installed tag of that family). What it learns instead is behaviour: a
+model that keeps looping on a task kind (at least two loops in at most twice as many runs) ranks last
+for that kind, and `models` lists the evidence as `observed_loops`.
+
 ### Resource admission
 
 ```mermaid
 flowchart LR
-    Req["Task"] --> Cap{"Backend slot and safe<br/>host memory available?"}
-    Cap -->|yes| Run["Run on Ollama"]
-    Cap -->|no| Queue["Bounded fair queue<br/>interactive / normal / background"]
-    Queue -->|"capacity frees within wait budget"| Run
-    Queue -->|"queue full or budget expires"| Refuse["Refused: reason +<br/>retry_after_seconds"]
+    Req(["Task"]) --> Q["Fair queue<br/>interactive 3 · normal 2 · background 1 turns"]
+    Q --> Slot{"Budget units free<br/>on this backend?"}
+    Slot -->|yes| Sig{"Host signals<br/>that apply to this task?"}
+    Sig -->|"none hold it"| Run(["Run on Ollama"])
+    Sig -->|"held"| Wait["Wait, slot returned"]
+    Wait -->|"signal clears in budget"| Run
+    Slot -->|"no"| Wait
+    Wait -->|"queue full or budget spent"| Refuse(["429 / 503 + Retry-After"])
+
+    classDef queue fill:#fef3c7,stroke:#b45309,color:#3b2203
+    classDef run fill:#dcfce7,stroke:#15803d,color:#052e16
+    classDef refuse fill:#fee2e2,stroke:#b91c1c,color:#450a0a
+    class Q,Slot,Sig,Wait queue
+    class Run run
+    class Refuse refuse
 ```
 
-Weighted per-backend slots, finite queues, priority classes, wait budgets (`maxWaitSeconds`),
-total deadlines (`timeoutSeconds`), and circuit breakers. See [monitoring and tuning](docs/MONITORING.md).
+- **Budget:** two units per Ollama decoding slot (`OLLAMA_NUM_PARALLEL`); a chat costs 2, a vision
+  task 4 (capped to the budget), an embedding 1 per four inputs. The GPU queue holds 16 tasks, the
+  CPU queue 8; a task waits at most 120 s, or less with `maxWaitSeconds`.
+- **Fairness:** priority classes get 3, 2 and 1 turns per round, FIFO inside a class, and the
+  oldest blocked task reserves capacity after six bypasses, so nothing starves. Measured live: 4
+  interactive tasks submitted last overtook 4 normal and 4 background tasks submitted first.
+- **Refusals are fast and say when to retry:** a full queue answers 429 at once; an expired budget
+  answers 503. `Retry-After` is estimated from tasks ahead, how many of that cost run at once, and
+  recent service time.
+- **Which host signal holds which task:**
+
+| Signal | Holds |
+|---|---|
+| OS memory pressure | everything |
+| Low available RAM, active swapping | new model loads (a model already loaded keeps serving) |
+| CPU load, thermal throttling | CPU-backend work and new loads; not a model already resident on the GPU |
+
+The memory a new load must leave free is the host reserve (15% of RAM, at least 1 GiB) but never more
+than the load itself. On macOS a low estimate unloads idle models and then dispatches with a warning,
+because macOS can reclaim cache the estimate misses; on Linux and Windows the load waits. Also wait
+budgets (`maxWaitSeconds`), total deadlines (`timeoutSeconds`), and circuit breakers. See
+[monitoring and tuning](docs/MONITORING.md).
 
 ### CPU + GPU backends
 
 ```mermaid
 flowchart LR
-    F["FreeLlama"] -->|"main models"| G["Ollama: GPU"]
-    F -->|"operator-assigned helpers<br/>(e.g. embeddings)"| C["Ollama: CPU-only"]
-    G --> P["Receipt: configured backend<br/>+ observed placement"]
+    F["FreeLlama"] -->|"every model by default"| G["Ollama on GPU<br/>Metal · CUDA · ROCm · Vulkan"]
+    F -->|"exact tags the operator assigned"| C["Second Ollama, CPU-only<br/>num_gpu 0"]
+    G --> P["Receipt: configured backend<br/>+ placement observed in /api/ps"]
     C --> P
+
+    classDef gpu fill:#dcfce7,stroke:#15803d,color:#052e16
+    classDef cpu fill:#ede9fe,stroke:#6d28d9,color:#1e0b47
+    classDef receipt fill:#f1f5f9,stroke:#475569,color:#0f172a
+    class G gpu
+    class C cpu
+    class F,P receipt
 ```
+
+Each backend has its own budget, queue and model-transition lock, so a burst of GPU work never takes
+the slot a CPU helper needs.
 
 Optionally run a second, CPU-only Ollama for exact helper models so they never compete with GPU
 work. The operator assigns models; agents may only express `executionPreference`. Ask for
 `minPlacementEvidence:"observed"` when placement matters. See [CPU/GPU routing](docs/CPU_GPU_ROUTING.md).
+
+### Loop control
+
+Some models answer correctly and then repeat the answer until the output cap. Set
+`stopOnRepetition:true` (CLI `--stop-on-repetition`): FreeLlama streams the answer, checks it every
+16 tokens, and stops once it has repeated itself twice over 96+ characters. Closing the connection
+cancels generation in Ollama. Nothing is trimmed: the full text is in `response`, and
+`output_check` says where the first copy ends. Without the flag, a loop that ran to the cap is
+flagged the same way. Either way the loop is recorded for routing.
+
+### Machine awareness
+
+`freellama machine` and `doctor {view:"status"}` report what the OS says about the host, read
+without elevated privileges:
+
+- **Machine:** chip, logical CPUs and (on Apple silicon) the performance/efficiency split, total
+  memory and whether it is unified, and the GPU (on macOS the Apple model and core count from the
+  I/O registry; on Linux the NVIDIA name and memory from `nvidia-smi`).
+- **Live:** available memory and OS memory pressure, CPU load, GPU busy percent (Apple and NVIDIA)
+  and, on Apple silicon, the memory the GPU driver has allocated. Heat on macOS is the system
+  thermal pressure level (`nominal`, `moderate`, `heavy`, `trapping`, `sleeping`; throttled from
+  `heavy`), plus `pmset`'s CPU speed limit on Intel Macs. Linux and Windows report heat as unknown.
+- **Placement:** whether a loaded model sits fully on GPU, fully on CPU, or split, from Ollama.
 
 ### Batches, jobs, and history
 
@@ -213,6 +325,24 @@ See [token economics](packages/mcp/README.md#token-economics).
 - **Ollama compatible:** `/api/*` and `/v1/*` pass through to Ollama unchanged, including streaming.
   See [Ollama sidecar](docs/ARCHITECTURE.md#ollama-sidecar).
 
+## Run local models efficiently out of the box
+
+FreeLlama starts with safe defaults and never changes Ollama's settings for you. These are the
+settings that matter most, from Ollama's docs and measured reports:
+
+| Setting | What it does | Suggested start |
+|---|---|---|
+| `OLLAMA_NUM_PARALLEL` | Decoding slots per model. RAM scales with parallel slots times context ([Ollama FAQ](https://github.com/ollama/ollama/blob/main/docs/faq.mdx)); on Apple silicon the gain is small and some engines run one request at a time anyway ([MLX engine](https://github.com/ollama/ollama/issues/17280)) | `1`; raise only after measuring. FreeLlama's budget follows it (two units per slot) |
+| `OLLAMA_FLASH_ATTENTION` + `OLLAMA_KV_CACHE_TYPE=q8_0` | A quantized KV cache roughly halves its memory and needs flash attention ([Ollama FAQ](https://github.com/ollama/ollama/blob/main/docs/faq.mdx)) | On, when the model's quality holds |
+| Context length | Ollama defaults to 4k below 24 GiB of VRAM; its docs ask for at least 64k for agent and coding work ([context length](https://github.com/ollama/ollama/blob/main/docs/context-length.mdx)) | Size per task: FreeLlama sizes text tasks to the prompt, and `contextTokens` overrides |
+| `OLLAMA_MAX_LOADED_MODELS` | How many runners stay resident | One large model at a time; FreeLlama unloads the idle model that is cheapest to reload when a load needs room |
+| `keep_alive` | How long a runner stays loaded after use | Leave it out: FreeLlama picks a finite time from measured reuse |
+
+What FreeLlama does for you: sizes the context for text tasks, keeps a loaded runner reusable
+(asking for another `num_ctx` reloads it, so `models` shows `context_default` and
+`resident_context`), admits by budget so the GPU stays busy without oversubscribing, holds new
+loads on real memory pressure, and reports the receipt for every task.
+
 ## Good to know
 
 - FreeLlama manages requests around Ollama; Ollama runs inference. Local inference still consumes
@@ -220,10 +350,13 @@ See [token economics](packages/mcp/README.md#token-economics).
 - The name refers to reducing reliance on metered inference; any eligible Ollama model works, not
   only the Meta Llama family. FreeLlama targets one operator or a trusted team.
 - Model searches and recommendations never download anything. Approve one exact tag and size before a pull.
-- Managed tasks are non-streaming. Raw Ollama passthrough keeps streaming.
+- Managed tasks return one result; `stopOnRepetition` streams internally to stop a loop early.
+  Raw Ollama passthrough keeps streaming.
 - CPU assignment is configured by the operator. Trust the returned placement evidence, not the configuration.
-- Memory checks keep a reserve of free RAM, so a model can be refused while the OS still shows free memory.
-  See [CLI admission controls](docs/CLI.md#bound-admission).
+- Memory checks keep a reserve of free RAM (never more than the load itself), so on Linux and Windows a
+  model can wait while the OS still shows some free memory. See [CLI admission controls](docs/CLI.md#bound-admission).
+- In a slim container without CA certificates FreeLlama still starts and serves plain-HTTP Ollama;
+  install `ca-certificates` for HTTPS upstreams.
 - Scopes, sessions, and deferred jobs live in memory and are lost when the service restarts.
 - The service binds to loopback by default. For remote access, see [Production](docs/PRODUCTION.md).
 

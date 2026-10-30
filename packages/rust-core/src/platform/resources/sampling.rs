@@ -366,6 +366,32 @@ pub(crate) fn parse_macos(vmstat: &str, sysctl: &str, thermal: &str) -> HostReso
     }
 }
 
+/// Apply the macOS thermal pressure level (`notifyutil -g com.apple.system.thermalpressurelevel`
+/// prints `<name> <level>`). On macOS the levels are 0 nominal, 1 moderate, 2 heavy, 3 trapping,
+/// 4 sleeping (`OSThermalNotification.h`). `pmset -g therm` reports nothing on Apple silicon, so
+/// this is the only unprivileged thermal signal there. Throttled from `heavy` up; a pmset
+/// observation of throttling is never cleared by it.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn apply_thermal_pressure(observed: &mut HostResources, notify: &str) {
+    let Some(level) = notify
+        .split_whitespace()
+        .last()
+        .and_then(|value| value.parse::<u32>().ok())
+    else {
+        return;
+    };
+    let name = match level {
+        0 => "nominal",
+        1 => "moderate",
+        2 => "heavy",
+        3 => "trapping",
+        4 => "sleeping",
+        _ => return,
+    };
+    observed.thermal_pressure = Some(name);
+    observed.thermal_throttled = Some(observed.thermal_throttled == Some(true) || level >= 2);
+}
+
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn parse_memory_size(value: &str) -> Option<u64> {
     let (number, multiplier) = match value.as_bytes().last()? {
@@ -403,11 +429,16 @@ fn sample_macos() -> HostResources {
         ],
     );
     let therm = bounded_command("/usr/bin/pmset", &["-g", "therm"]);
+    let pressure = bounded_command(
+        "/usr/bin/notifyutil",
+        &["-g", "com.apple.system.thermalpressurelevel"],
+    );
     let mut result = parse_macos(
         vm.as_deref().unwrap_or_default(),
         sys.as_deref().unwrap_or_default(),
         therm.as_deref().unwrap_or_default(),
     );
+    apply_thermal_pressure(&mut result, pressure.as_deref().unwrap_or_default());
     result.gpu_activity = bounded_command("/usr/sbin/ioreg", &["-r", "-c", "AGXAccelerator", "-l"])
         .as_deref()
         .and_then(super::super::device_activity::parse_apple_activity);

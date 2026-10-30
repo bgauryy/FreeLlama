@@ -216,11 +216,15 @@ pub(crate) async fn reserve_task_resources(
         // that guard: an unload request may be what makes recovery possible.
         state.resources.snapshot().await;
     }
+    // A CPU-assigned backend decodes on the host cores, so CPU saturation holds it; a resident
+    // GPU runner is held only by memory pressure and thermal signals.
+    let cpu_bound = execution.placement == Backend::Cpu;
     let demand = if resident && bytes == 0 {
         resources::ResourceDemand::resident()
     } else {
         resources::ResourceDemand::load(bytes)
-    };
+    }
+    .on_cpu(cpu_bound);
     let permit = state
         .resources
         .wait_for_demand(

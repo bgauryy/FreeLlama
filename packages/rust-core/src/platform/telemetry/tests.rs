@@ -214,3 +214,18 @@ async fn prometheus_text_has_typed_families_and_escaped_labels() {
     );
     assert!(text.contains("freellama_queue_depth{backend=\"cpu\"} 0"));
 }
+
+/// The retry estimate's per-task time is service time: a task that waited 9 s and ran 1 s
+/// counts as 1 s, so queue waits do not snowball into ever larger `Retry-After` values.
+#[test]
+fn average_task_time_excludes_queue_wait() {
+    let telemetry = Telemetry::default();
+    for _ in 0..10 {
+        let mut task = record("a", now_seconds(), "ok");
+        task.backend = "gpu".into();
+        task.duration_ms = 10_000;
+        task.queue_wait_ms = 9_000;
+        telemetry.record_task(task);
+    }
+    assert_eq!(telemetry.average_task_ms("gpu"), Some(1_000));
+}

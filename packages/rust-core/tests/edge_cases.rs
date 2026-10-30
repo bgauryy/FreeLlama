@@ -24,7 +24,9 @@ fn model(name: &str, size: u64, capabilities: &[Capability]) -> CatalogModel {
         resident: false,
         resident_size: None,
         resident_vram: None,
+        resident_context: None,
         benchmark: BTreeMap::new(),
+        observed_loops: BTreeMap::new(),
         policy_rank: BTreeMap::new(),
         policy_options: BTreeMap::new(),
     }
@@ -464,4 +466,60 @@ fn runtime_metrics_reports_null_rates_for_zero_or_missing_durations() {
     let missing_fields = runtime_metrics(&json!({}));
     assert!(missing_fields["prompt_tokens_per_second"].is_null());
     assert!(missing_fields["output_tokens_per_second"].is_null());
+}
+
+/// A caller's model name resolves the way Ollama reads it: the exact tag, else `name:latest`,
+/// else the one installed tag of that family. Unknown and ambiguous names are refused with the
+/// installed candidates, never substituted.
+#[test]
+fn model_names_resolve_to_installed_tags_like_ollama() {
+    use freellama::platform::installed_model;
+    let models = vec![
+        model("glm-ocr:latest", 2_900_000_000, &[Capability::Vision]),
+        model("qwen3:8b", 5_000_000_000, &[Capability::Completion]),
+        model("qwen3:1.7b", 1_400_000_000, &[Capability::Completion]),
+    ];
+    assert_eq!(
+        installed_model(&models, "glm-ocr:latest").unwrap().name,
+        "glm-ocr:latest"
+    );
+    assert_eq!(
+        installed_model(&models, "glm-ocr").unwrap().name,
+        "glm-ocr:latest"
+    );
+    assert_eq!(
+        installed_model(&models, "qwen3:8b").unwrap().name,
+        "qwen3:8b"
+    );
+    let ambiguous = installed_model(&models, "qwen3").unwrap_err().to_string();
+    assert!(
+        ambiguous.contains("ambiguous")
+            && ambiguous.contains("qwen3:8b")
+            && ambiguous.contains("qwen3:1.7b"),
+        "{ambiguous}"
+    );
+    let missing = installed_model(&models, "nope").unwrap_err().to_string();
+    assert!(
+        missing.contains("not installed: nope") && missing.contains("glm-ocr:latest"),
+        "{missing}"
+    );
+    let only = vec![model("nomic-embed-text:v1.5", 1, &[Capability::Embedding])];
+    assert_eq!(
+        installed_model(&only, "nomic-embed-text").unwrap().name,
+        "nomic-embed-text:v1.5"
+    );
+
+    // select_route accepts the bare name and reports the resolved tag.
+    let route = select_route(
+        &RouteInput {
+            task: TaskKind::Vision,
+            model: Some("glm-ocr".into()),
+            required_capabilities: [Capability::Vision].into_iter().collect(),
+            ..RouteInput::default()
+        },
+        &models,
+        &SessionAffinity::default(),
+    )
+    .unwrap();
+    assert_eq!(route.selected_model, "glm-ocr:latest");
 }

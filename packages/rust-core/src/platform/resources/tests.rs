@@ -1,8 +1,8 @@
 use super::governor::Reservation;
 use super::pressure::{pressure_reasons, swap_grew};
 use super::sampling::{
-    apply_cgroup_limit, bounded_command, parse_linux, parse_macos, parse_memory_psi,
-    parse_memory_size, parse_nvidia_smi,
+    apply_cgroup_limit, apply_thermal_pressure, bounded_command, parse_linux, parse_macos,
+    parse_memory_psi, parse_memory_size, parse_nvidia_smi,
 };
 use super::*;
 use std::sync::{
@@ -201,8 +201,9 @@ async fn low_memory_hold_admits_resident_runners_and_warns_new_loads() {
         .expect("resident request admitted under low-memory hold");
     assert_eq!(permit.reserved_bytes(), 0);
     assert_eq!(permit.receipt.status, "admitted");
+    // A 2 GiB load reserves its own size on top: 4 GiB needed against 3 GiB available.
     let cold = governor
-        .wait_for_capacity("http://localhost:11434", GIB, Duration::ZERO)
+        .wait_for_capacity("http://localhost:11434", 2 * GIB, Duration::ZERO)
         .await
         .expect("a low memory estimate alone does not refuse a new load");
     assert_eq!(cold.receipt.status, "admitted_low_memory_estimate");
@@ -210,7 +211,7 @@ async fn low_memory_hold_admits_resident_runners_and_warns_new_loads() {
         cold.receipt.assessment.as_ref().unwrap().memory_advisory,
         Some(MemoryAdvisory::BelowReserve)
     );
-    assert_eq!(cold.reserved_bytes(), GIB);
+    assert_eq!(cold.reserved_bytes(), 2 * GIB);
 }
 
 #[tokio::test]
@@ -894,4 +895,144 @@ mod bounded_subprocess {
         assert_eq!(output.stdout.len(), 1000);
         assert_eq!(output.stderr, b"");
     }
+}
+
+/// A CPU-load hold applies to CPU-bound work and to cold loads, never to inference on a runner
+/// that is already resident on the GPU: that work neither waits for nor adds to the saturated
+/// cores. OS memory pressure still holds everything.
+#[tokio::test]
+async fn cpu_load_hold_spares_resident_gpu_inference() {
+    let busy = ResourceGovernor::with_sampler(quick_policy(), || {
+        let mut sample = healthy();
+        sample.load_average_one_minute = Some(1_000.0);
+        sample
+    })
+    .unwrap();
+    let snapshot = busy.snapshot().await;
+    assert_eq!(snapshot.reasons, vec![PressureReason::HighCpuLoad]);
+    let gpu_inference = snapshot.assess_demand(ResourceDemand::resident(), false);
+    assert!(gpu_inference.admissible, "{gpu_inference:?}");
+    assert_eq!(gpu_inference.held_by, Vec::new());
+    let cpu_assigned = snapshot.assess_demand(ResourceDemand::resident().on_cpu(true), false);
+    assert_eq!(
+        cpu_assigned.denial_reason,
+        Some(CapacityDenialReason::HostPressure)
+    );
+    assert_eq!(cpu_assigned.held_by, vec![PressureReason::HighCpuLoad]);
+    let cold_gpu = snapshot.assess_demand(ResourceDemand::load(GIB), false);
+    assert_eq!(cold_gpu.held_by, vec![PressureReason::HighCpuLoad]);
+    assert!(!cold_gpu.admissible);
+    let permit = busy
+        .wait_for_demand(
+            "http://localhost:11434",
+            ResourceDemand::resident(),
+            Duration::from_millis(20),
+        )
+        .await
+        .expect("resident GPU inference admitted under a CPU-load hold");
+    assert_eq!(permit.receipt.status, "admitted");
+
+    // Thermal throttling follows the same rule: a new load or CPU-bound work waits, a bounded
+    // request on a resident GPU runner does not (waiting cools nothing it would heat).
+    let throttled = ResourceGovernor::with_sampler(quick_policy(), || {
+        let mut sample = healthy();
+        sample.thermal_throttled = Some(true);
+        sample
+    })
+    .unwrap();
+    let hot = throttled.snapshot().await;
+    assert_eq!(hot.reasons, vec![PressureReason::ThermalThrottling]);
+    assert!(
+        hot.assess_demand(ResourceDemand::resident(), false)
+            .admissible
+    );
+    assert_eq!(
+        hot.assess_demand(ResourceDemand::load(GIB), false).held_by,
+        vec![PressureReason::ThermalThrottling]
+    );
+    assert_eq!(
+        hot.assess_demand(ResourceDemand::resident().on_cpu(true), false)
+            .held_by,
+        vec![PressureReason::ThermalThrottling]
+    );
+
+    let pressured = ResourceGovernor::with_sampler(quick_policy(), || {
+        let mut sample = healthy();
+        sample.memory_pressure = Some(MemoryPressure::Critical);
+        sample
+    })
+    .unwrap();
+    let assessment = pressured
+        .snapshot()
+        .await
+        .assess_demand(ResourceDemand::resident(), false);
+    assert_eq!(assessment.held_by, vec![PressureReason::OsMemoryPressure]);
+    assert!(!assessment.admissible);
+}
+
+/// The reserve a load must leave is capped by the load itself (above the fixed floor): a small
+/// runner is not held for host headroom it will never touch, a large one keeps the full reserve.
+#[tokio::test]
+async fn memory_reserve_never_exceeds_the_load_it_protects() {
+    let governor = ResourceGovernor::with_sampler(refusing_policy(), healthy).unwrap();
+    let snapshot = governor.snapshot().await;
+    let host_reserve = snapshot.hold_reserve_bytes;
+    assert!(
+        host_reserve > 2 * GIB,
+        "the fixture host is large enough to matter: {host_reserve}"
+    );
+    let small = snapshot.assess_capacity(GIB / 2, false);
+    assert_eq!(small.reserve_bytes, GIB, "the floor applies to a tiny load");
+    let medium = snapshot.assess_capacity(2 * GIB, false);
+    assert_eq!(
+        medium.reserve_bytes,
+        2 * GIB,
+        "a mid-size load reserves its own size"
+    );
+    let large = snapshot.assess_capacity(host_reserve * 4, false);
+    assert_eq!(
+        large.reserve_bytes, host_reserve,
+        "a large load keeps the host reserve"
+    );
+    let resident = snapshot.assess_demand(ResourceDemand::resident(), false);
+    assert_eq!(resident.reserve_bytes, GIB);
+}
+
+/// Apple silicon has no pmset thermal reading; the system thermal pressure level fills it:
+/// nominal and moderate are not throttled, heavy and above are, and a pmset throttle is kept.
+#[test]
+fn macos_thermal_pressure_fills_the_thermal_signal() {
+    let mut sample = HostResources::default();
+    apply_thermal_pressure(&mut sample, "com.apple.system.thermalpressurelevel 0\n");
+    assert_eq!(
+        (sample.thermal_pressure, sample.thermal_throttled),
+        (Some("nominal"), Some(false))
+    );
+    apply_thermal_pressure(&mut sample, "com.apple.system.thermalpressurelevel 1");
+    assert_eq!(
+        (sample.thermal_pressure, sample.thermal_throttled),
+        (Some("moderate"), Some(false))
+    );
+    apply_thermal_pressure(&mut sample, "com.apple.system.thermalpressurelevel 2");
+    assert_eq!(
+        (sample.thermal_pressure, sample.thermal_throttled),
+        (Some("heavy"), Some(true))
+    );
+    let mut pmset = HostResources {
+        thermal_throttled: Some(true),
+        ..HostResources::default()
+    };
+    apply_thermal_pressure(&mut pmset, "com.apple.system.thermalpressurelevel 0");
+    assert_eq!(
+        pmset.thermal_throttled,
+        Some(true),
+        "a pmset throttle is never cleared"
+    );
+    let mut unknown = HostResources::default();
+    apply_thermal_pressure(&mut unknown, "");
+    apply_thermal_pressure(&mut unknown, "com.apple.system.thermalpressurelevel 9");
+    assert_eq!(
+        (unknown.thermal_pressure, unknown.thermal_throttled),
+        (None, None)
+    );
 }

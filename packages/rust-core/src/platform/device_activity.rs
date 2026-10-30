@@ -59,17 +59,20 @@ pub(super) fn parse_apple_activity(text: &str) -> Option<GpuActivityObservation>
         else {
             continue;
         };
-        let busy = dictionary.split(',').find_map(|field| {
-            let (key, value) = field.split_once('=')?;
-            (key.trim() == "\"Device Utilization %\"")
-                .then(|| percentage(value))
-                .flatten()
-        });
+        let field = |name: &str| {
+            dictionary.split(',').find_map(|field| {
+                let (key, value) = field.split_once('=')?;
+                (key.trim() == name).then(|| value.trim().to_owned())
+            })
+        };
+        let busy = field("\"Device Utilization %\"").and_then(|value| percentage(&value));
         if let Some(busy) = busy {
             devices.push(GpuDeviceActivity {
                 device: identity.clone(),
                 busy_percent: Some(busy),
                 memory_busy_percent: None,
+                allocated_memory_bytes: field("\"Alloc system memory\"")
+                    .and_then(|value| value.parse::<u64>().ok()),
             });
         }
     }
@@ -95,6 +98,7 @@ pub(super) fn parse_nvidia_activity(text: &str) -> Option<GpuActivityObservation
                 device: uuid.to_owned(),
                 busy_percent: percentage(fields[2]),
                 memory_busy_percent: percentage(fields[3]),
+                allocated_memory_bytes: None,
             })
         })
         .collect();
@@ -109,6 +113,17 @@ mod tests {
         format!(
             "+-o AGXAcceleratorG14X <class AGXAcceleratorG14X, id 0x401, registered>\n  | {{\n  | \"PerformanceStatistics\" = {{\"Renderer Utilization %\"=99,\"Device Utilization %\"={value}}}\n  | }}\n"
         )
+    }
+
+    #[test]
+    fn apple_reports_gpu_allocated_memory_when_present() {
+        let text = apple("95").replace("=95}", "=95,\"Alloc system memory\"=6700000000}");
+        let devices = parse_apple_activity(&text).unwrap().devices;
+        assert_eq!(devices[0].allocated_memory_bytes, Some(6_700_000_000));
+        assert_eq!(
+            parse_apple_activity(&apple("95")).unwrap().devices[0].allocated_memory_bytes,
+            None
+        );
     }
 
     #[test]

@@ -232,6 +232,9 @@ pub(crate) struct TaskExecutionArgs {
     /// Admission/resource wait budget; capped by server.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     pub(crate) max_wait_seconds: Option<u64>,
+    /// Stream and stop once the output repeats itself; keeps all generated text.
+    #[arg(long)]
+    pub(crate) stop_on_repetition: bool,
 }
 
 /// Production state and network boundary for `serve`.

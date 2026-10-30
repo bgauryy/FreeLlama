@@ -9,7 +9,6 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use reqwest::Client;
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -631,10 +630,26 @@ fn host_runtime_signals() -> Value {
             || json!({ "status": "unavailable" }),
             |output| parse_macos_thermal_status(&output),
         );
+        // Apple silicon records no pmset thermal warning; the system thermal pressure level is
+        // the unprivileged signal there (`OSThermalNotification.h`).
+        let mut pressure_sample = crate::platform::resources::HostResources::default();
+        if let Some(output) = crate::platform::resources::bounded_command_with(
+            "/usr/bin/notifyutil",
+            &["-g", "com.apple.system.thermalpressurelevel"],
+            Duration::from_millis(500),
+        ) {
+            crate::platform::resources::apply_thermal_pressure(&mut pressure_sample, &output);
+        }
         json!({
             "snapshot": "collected during doctor",
             "thermal": { "source": "pmset -g therm", "data": thermal, "permission": "unprivileged" },
-            "gpu_memory": { "status": "unavailable", "reason": "macOS does not expose a stable per-process free-VRAM contract for Apple unified memory" },
+            "thermal_pressure": {
+                "source": "notifyutil com.apple.system.thermalpressurelevel",
+                "level": pressure_sample.thermal_pressure,
+                "throttled": pressure_sample.thermal_throttled,
+                "permission": "unprivileged",
+            },
+            "gpu_memory": { "status": "unavailable", "reason": "macOS does not expose a stable per-process free-VRAM contract for Apple unified memory; status reports the driver's allocated bytes in gpu_activity" },
             "power": { "status": "unavailable", "reason": "powermetrics may provide richer data but requires explicit elevated operator access" },
         })
     }
@@ -660,13 +675,13 @@ pub async fn doctor(endpoint: &str) -> Result<Value> {
     // `reqwest::Client` applies no request timeout unless asked. `doctor` is the tool an agent is
     // told to reach for when something else is already timing out, so it is the last one that
     // should be able to hang against a wedged Ollama.
-    let client = Client::builder()
-        .timeout(timeout_from_env(
+    let client = crate::net::build_http_client(|builder| {
+        builder.timeout(timeout_from_env(
             "FREELLAMA_CONTROL_TIMEOUT_SECONDS",
             DEFAULT_CONTROL_TIMEOUT_SECS,
         ))
-        .build()
-        .context("build Ollama HTTP client")?;
+    })
+    .context("build Ollama HTTP client")?;
     let server_version = server_version(&client, endpoint).await?;
     let running: Value = client
         .get(url(endpoint, "/api/ps"))

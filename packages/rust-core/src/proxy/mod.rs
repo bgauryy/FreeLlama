@@ -118,11 +118,12 @@ pub fn app(config: ProxyConfig) -> Result<Router> {
     config.validate()?;
     let state = ProxyState {
         resource_governor: config.resource_governor,
-        client: Client::builder()
-            .connect_timeout(CONNECT_TIMEOUT.min(config.request_timeout))
-            .read_timeout(config.request_timeout)
-            .build()
-            .context("build upstream HTTP client")?,
+        client: crate::net::build_http_client(|builder| {
+            builder
+                .connect_timeout(CONNECT_TIMEOUT.min(config.request_timeout))
+                .read_timeout(config.request_timeout)
+        })
+        .context("build upstream HTTP client")?,
         request_body_timeout: config.request_timeout,
         upstream: config.upstream,
         auto_restart_ollama: config.auto_restart_ollama,

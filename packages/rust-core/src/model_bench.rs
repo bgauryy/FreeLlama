@@ -304,10 +304,10 @@ pub struct RankingEntry {
 ///
 /// Returns an error when Ollama cannot be reached or its discovery responses are invalid.
 pub async fn benchmark_all(config: &BenchConfig) -> Result<AllModelsReport> {
-    let client = Client::builder()
-        .timeout(Duration::from_secs(config.timeout_seconds))
-        .build()
-        .context("build benchmark HTTP client")?;
+    let client = crate::net::build_http_client(|builder| {
+        builder.timeout(Duration::from_secs(config.timeout_seconds))
+    })
+    .context("build benchmark HTTP client")?;
     let server_version = get_json(
         &client,
         &crate::ollama_http::url(&config.endpoint, "/api/version"),
