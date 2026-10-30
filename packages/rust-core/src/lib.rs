@@ -1,6 +1,7 @@
 //! Local Ollama gateway, evidence-aware router, benchmark harness, and server library.
 
 pub mod auth;
+pub mod capability;
 mod doctor;
 pub mod model_bench;
 #[cfg(feature = "napi")]

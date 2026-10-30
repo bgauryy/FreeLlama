@@ -1,6 +1,6 @@
 // delegate_research: bounded read-only lookup through a local research adapter subprocess.
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { z } from "zod";
+import * as z from "zod";
 import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -23,7 +23,7 @@ import {
 
 const researchResultSchema = z.object({
   answer: z.string(), summary: z.string(), citations: z.unknown().optional(), verification: z.unknown(), usage: z.unknown().optional(), telemetry: z.unknown().optional(),
-}).passthrough();
+}).loose();
 
 
 async function routedResearchModel(endpoint: string | undefined): Promise<string> {
@@ -213,7 +213,7 @@ export function registerDelegateResearchTool(server: McpServer): void {
         if (adapterError) {
           const diagnostic = `research adapter failed: ${result.final_answer}` +
             (evidenceText ? `\nEvidence collected before the failure:\n${evidenceText}` : "");
-          const refusal = z.object({ receipt: z.object({ error: z.string() }).passthrough() })
+          const refusal = z.object({ receipt: z.object({ error: z.string() }).loose() })
             .safeParse(result.model_metadata?.transport_error);
           if (refusal.success) {
             return researchErrorResult(new Error(JSON.stringify(refusal.data.receipt)), diagnostic);

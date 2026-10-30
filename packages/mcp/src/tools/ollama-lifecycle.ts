@@ -1,16 +1,16 @@
 // Ollama lifecycle: talk to Ollama directly (no serve). `models` covers list/ps/show.
 // `ollama_delete` stays its own tool so pull/stop are not marked destructive.
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { z } from "zod";
+import * as z from "zod";
 import { DEFAULT_PULL_TIMEOUT_SECONDS } from "../config.js";
 import { clipText, errorResult, ollamaEndpointParam, ollamaFetch, structuredResult } from "../helpers.js";
 
 const manageResultSchema = z.object({
   status: z.string().optional(), progress: z.unknown().optional(),
-}).passthrough();
+}).loose();
 const deleteResultSchema = z.object({
   deleted: z.string(),
-}).passthrough();
+}).loose();
 
 /**
  * Collapse Ollama `/api/pull` NDJSON into one object an agent can read.

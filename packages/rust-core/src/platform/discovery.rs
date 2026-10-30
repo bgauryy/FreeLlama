@@ -7,7 +7,8 @@ use std::{collections::BTreeMap, path::PathBuf, sync::OnceLock, time::Duration};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
-use crate::model_bench::{AllModelsReport, Capability};
+use crate::capability::Capability;
+use crate::model_bench::AllModelsReport;
 
 use super::{ModelRequestDefaults, TaskKind};
 

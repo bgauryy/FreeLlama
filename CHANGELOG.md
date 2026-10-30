@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.7.0
+
+Breaking: Node.js 22 or newer (Node 20 reached end of life in April 2026), Rust 1.89 or newer, and
+the `freellama-core` types `Capability` and `ModelType` moved from `freellama::model_bench` to
+`freellama::capability`.
+
+- **Security: zod 4.** `npm audit` flagged the MCP server for GHSA-mrhx-c7xc-m3w5 (zod before 4.6.6
+  can exhaust memory validating oversized constrained collections), with no fix in zod 3. The server
+  now uses zod 4.6.7. Its published tool schemas are unchanged: open objects are still sent as
+  `additionalProperties: true` and nothing uses `$ref`. The bundle stays at about 0.9 MB because
+  zod is imported as a namespace (`import * as z`), which lets the bundler leave zod's unused locale
+  tables out.
+- **`scope {action:"create", messages:[]}` accepted again under zod 4:** each messages array now sets
+  its own length bound instead of overriding a shared one (zod 4 accumulates `.min` checks).
+- **`task --input-file` works for every task:** `--task embedding` still reads one item per line in
+  one batched request; any other task now sends the whole file as the prompt. Before, a non-embedding
+  task sent the lines as `input` and the server refused it with "task requires prompt or messages".
+- **Dependencies are current:** MCP SDK 1.32.2, zod 4.6.7, TypeScript 7.0, vitest 5 (with its new
+  `vite` peer), `@napi-rs/cli` 3.10, Yarn 4.18.1; Rust `base64` 0.23, `sha2` 0.11, `toml` 1.1,
+  `napi` 3.16, `napi-derive` 3.7, `tokio` 1.54, `uuid` 1.29, `reqwest` 0.13.5 and current patch
+  releases for every other crate. Execution-profile ids are still the lowercase SHA-256 hex of the
+  same material, so saved feedback keeps matching.
+- **Architecture:** import cycles in the Rust core went from 3 (9 files) to 2 (6 files).
+  `ManagedOperation` lives with `TaskInput`; `Capability` and `ModelType` have their own
+  `capability` module instead of the benchmark module; the upstream HTTP transport (retries, the
+  streaming repetition stop) moved from `execution/forward.rs` to `execution/upstream.rs` with one
+  shared retry loop instead of two copies; the scope-commit deadline error lives in `scopes`. The two
+  cycles left are deliberate: `execution` and `jobs` (a task can be deferred into a job, and a job
+  runs the task under its progress) and `proxy` and `platform` (shared telemetry and resource
+  types).
+
 ## 0.6.2
 
 - **A busy CPU no longer blocks GPU models:** the CPU-load hold applied to every cold load and to

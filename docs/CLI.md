@@ -234,7 +234,7 @@ Useful task options include:
 - `--context-tokens` for the complete input and output context window (`num_ctx`).
 - repeatable `--required-capability` constraints.
 - repeatable `--image` paths for vision tasks.
-- `--input-file` for batched embedding input, one item per line.
+- `--input-file` reads the input from a file: one item per line for `--task embedding` (batched in one request), otherwise the whole file is the prompt.
 - `--min-confidence low|medium` to refuse insufficiently evidenced routes before generation.
 - `--priority interactive|normal|background` for fair admission scheduling.
 - `--max-wait-seconds` for a shorter admission/resource wait budget.

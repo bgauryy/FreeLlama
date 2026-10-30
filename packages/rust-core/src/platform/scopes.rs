@@ -113,7 +113,7 @@ struct RouteDefaults {
     #[serde(skip_serializing_if = "Option::is_none")]
     model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    required_capabilities: Option<BTreeSet<crate::model_bench::Capability>>,
+    required_capabilities: Option<BTreeSet<crate::capability::Capability>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     context_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -455,7 +455,7 @@ impl ScopeLease {
             ));
         }
         if deadline.is_some_and(|limit| tokio::time::Instant::now() >= limit) {
-            return Err(super::execution::scope_commit_deadline());
+            return Err(commit_deadline_exceeded());
         }
         entries.insert(self.id.clone(), candidate);
         Ok(())
@@ -576,6 +576,15 @@ pub(super) async fn fork(
         StatusCode::CREATED,
         Json(state.scopes.fork(&id, input, &state.tunables().scopes)?),
     ))
+}
+
+/// The task's total deadline passed before its history could be committed.
+pub(super) fn commit_deadline_exceeded() -> ApiError {
+    ApiError::new(
+        StatusCode::GATEWAY_TIMEOUT,
+        "task total deadline exceeded before history commit",
+    )
+    .with_code("task_deadline_exceeded")
 }
 
 #[cfg(test)]

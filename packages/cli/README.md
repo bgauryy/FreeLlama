@@ -105,7 +105,7 @@ as `@octocodeai/freellama-native-linux-x64-gnu`; no Rust toolchain is needed by 
 
 Supported prebuilt targets are macOS arm64/x64, Linux arm64/x64 on glibc or musl, and Windows
 arm64/x64. On an unsupported platform or an install made with `--omit=optional`, the launcher
-reports the attempted packages and tells the operator to run `cargo build --release`. Node.js 20
+reports the attempted packages and tells the operator to run `cargo build --release`. Node.js 22
 or newer is required.
 
 ## Test packaging behavior

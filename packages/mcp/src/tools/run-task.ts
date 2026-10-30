@@ -1,6 +1,6 @@
 // run_task: preview, warm, single, and batch execution through managed serve.
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { z } from "zod";
+import * as z from "zod";
 import { DEFAULT_SERVE_ENDPOINT } from "../config.js";
 import { route, runTaskBatchRequest, runTaskRequest, warmModelRequest } from "../serve-client.js";
 import { withBatchTelemetry, withTaskTelemetry } from "../telemetry.js";
@@ -13,10 +13,10 @@ import {
 
 const taskResultSchema = z.object({
   selected_model: z.string().optional(), context_window_fit: z.string().optional(), execution: z.unknown().optional(), response: z.unknown().optional(), telemetry: z.unknown().optional(),
-}).passthrough();
+}).loose();
 const batchResultSchema = z.object({
   results: z.unknown().optional(), telemetry: z.unknown().optional(),
-}).passthrough();
+}).loose();
 
 type BatchItem = z.infer<typeof batchItemParam>;
 type TaskPayload = Pick<BatchItem["task"],
@@ -139,13 +139,13 @@ export function registerRunTaskTool(server: McpServer): void {
         tools: localToolsParam,
         keepAlive: z.string().min(1).optional().describe('"0" unloads now, "-1" pins; omitted = adaptive finite TTL'),
         format: z
-          .union([z.literal("json"), z.record(z.unknown())])
+          .union([z.literal("json"), z.record(z.string(), z.unknown())])
           .optional(),
         think: z
           .union([z.boolean(), z.enum(["low", "medium", "high"])])
           .optional(),
         options: z
-          .record(z.unknown())
+          .record(z.string(), z.unknown())
           .optional()
           .describe("num_ctx/contextTokens and num_gpu/placement are routing-owned; num_predict caps output."),
         logprobs: z.boolean().optional(),
@@ -178,7 +178,7 @@ export function registerRunTaskTool(server: McpServer): void {
           .describe("Batch mode: independent items; per-item fields go inside each item's `task`"),
         maxParallelism: z.number().int().positive().max(64).optional().describe("Batch mode only"),
       }).strict(),
-      outputSchema: taskResultSchema.merge(batchResultSchema),
+      outputSchema: taskResultSchema.extend(batchResultSchema.shape),
       annotations: { destructiveHint: false },
     },
     async ({

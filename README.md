@@ -72,7 +72,7 @@ the task does not need.
 
 - [Ollama](https://ollama.com/download) running (`ollama list` works) with at least one model.
   FreeLlama never downloads a model without your approval.
-- Node.js 20 or newer.
+- Node.js 22 or newer.
 
 Prebuilt binaries cover macOS, Linux (glibc and musl) and Windows on arm64 and x64. They ship as npm
 optional dependencies, so keep those enabled.
@@ -86,7 +86,7 @@ freellama init          # check prerequisites and print a first-run plan; change
 ```
 
 To try it without installing, prefix any command with `npx @octocodeai/freellama`. Without Node.js,
-build it from crates.io with `cargo install freellama-cli` (Rust 1.88 or newer; the command is still
+build it from crates.io with `cargo install freellama-cli` (Rust 1.89 or newer; the command is still
 `freellama`), or use the checksummed installer in [Production](docs/PRODUCTION.md) once a GitHub
 release is tagged.
 
@@ -468,8 +468,7 @@ model's `context_default` and `resident_context` so you can match it.
 
 ## Build from source
 
-Requires Rust 1.88+ (`rust-toolchain.toml` pins the compiler) and Node.js 20.19+ or 22.13+ with
-Corepack.
+Requires Rust 1.89+ (`rust-toolchain.toml` pins the compiler) and Node.js 22.12+ with Corepack.
 
 ```bash
 corepack enable && yarn install && yarn build

@@ -2,7 +2,7 @@
 // delegated answer from what the run did, never the model's self-report.
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import path from "node:path";
-import { z } from "zod";
+import * as z from "zod";
 import { REPO_ROOT } from "./config.js";
 import { errorResult } from "./helpers.js";
 
@@ -229,12 +229,12 @@ const adapterCallSchema = z
       .object({
         tool: z.string().optional(),
         command: z.string().optional(),
-        queries: z.object({ path: z.string().optional() }).passthrough().optional(),
+        queries: z.object({ path: z.string().optional() }).loose().optional(),
       })
-      .passthrough()
+      .loose()
       .optional(),
   })
-  .passthrough();
+  .loose();
 
 const adapterResultSchema = z.object({
   final_answer: z.string(),
@@ -244,7 +244,7 @@ const adapterResultSchema = z.object({
       input_tokens: z.number().nullable().optional(),
       output_tokens: z.number().nullable().optional(),
     })
-    .passthrough()
+    .loose()
     .default({}),
   model_metadata: z
     .object({
@@ -258,10 +258,10 @@ const adapterResultSchema = z.object({
           pinned_overflow: z.enum(["error", "clip"]),
           compactions: z.number().int().nonnegative(),
         })
-        .passthrough()
+        .loose()
         .optional(),
     })
-    .passthrough()
+    .loose()
     .optional(),
 });
 

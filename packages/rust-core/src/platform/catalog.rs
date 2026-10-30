@@ -15,7 +15,7 @@ use super::discovery::parse_capability;
 use super::error::ApiError;
 use super::{Backend, CatalogModel, float, ollama_env};
 use super::{CatalogCache, PlatformState};
-use crate::model_bench::Capability;
+use crate::capability::Capability;
 
 /// Ollama's `capabilities`: those routing uses, and the rest verbatim so none is silently dropped.
 fn split_capabilities(show: &Value) -> (BTreeSet<Capability>, Vec<String>) {

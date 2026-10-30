@@ -1,6 +1,6 @@
 // doctor: Ollama health plus optional managed-serve views.
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { z } from "zod";
+import * as z from "zod";
 import { doctor, health, machine, usage, status } from "../native.js";
 import {
   endpointParam, errorResult, isStructuredSuccess, ollamaEndpointParam, parsedResult, structuredResult,
@@ -8,7 +8,7 @@ import {
 
 const doctorResultSchema = z.object({
   summary: z.string().optional(), endpoint: z.string().optional(),
-}).passthrough();
+}).loose();
 
 export function registerDoctorTool(server: McpServer): void {
   server.registerTool(

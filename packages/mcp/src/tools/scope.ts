@@ -1,8 +1,8 @@
 // scope: server-side message history (create/get/fork/delete); residency is `run_task {warm:true}`.
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { z } from "zod";
+import * as z from "zod";
 import { createScope, deleteScope, forkScope, getScope } from "../serve-client.js";
-import { endpointParam, errorResult, messagesParam, objectResultSchema, parsedResult, structuredResult } from "../helpers.js";
+import { endpointParam, errorResult, messageParam, objectResultSchema, parsedResult, structuredResult } from "../helpers.js";
 
 // Routing is set per run_task call and history bounds are operator configuration, so the MCP tool
 // exposes neither `route_defaults` nor `limits`.
@@ -12,7 +12,7 @@ export function registerScopeTool(server: McpServer): void {
     inputSchema: z.object({
       action: z.enum(["create", "get", "fork", "delete"]), endpoint: endpointParam,
       scopeId: z.string().uuid().optional(), revision: z.number().int().nonnegative().optional(),
-      messages: messagesParam.unwrap().min(0).optional(), includeMessages: z.boolean().optional(),
+      messages: z.array(messageParam).optional(), includeMessages: z.boolean().optional(),
     }).strict(),
     outputSchema: objectResultSchema, annotations: { destructiveHint: true },
   }, async ({ action, endpoint, scopeId, revision, messages, includeMessages }) => {

@@ -117,10 +117,7 @@ pub(crate) fn build_managed_request(
     decision: &RouteDecision,
     keep_alive: &Value,
 ) -> Result<(&'static str, Value), ApiError> {
-    if matches!(
-        input.operation,
-        super::super::warming::ManagedOperation::Warm
-    ) {
+    if matches!(input.operation, super::super::ManagedOperation::Warm) {
         return Ok((
             "/api/chat",
             json!({

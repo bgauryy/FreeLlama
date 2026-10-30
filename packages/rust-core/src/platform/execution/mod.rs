@@ -22,6 +22,7 @@ mod observe;
 mod pipeline;
 mod request;
 mod select;
+mod upstream;
 
 pub(super) use admit::{admit, transition_timeout};
 #[cfg(test)]
@@ -120,9 +121,8 @@ pub(super) async fn execute_task(
         .map(|seconds| task_deadline(Some(seconds)))
         .transpose()?
         .or_else(|| {
-            (input.scope_id.is_some()
-                || matches!(input.operation, super::warming::ManagedOperation::Warm))
-            .then(super::platform_task_timeout)
+            (input.scope_id.is_some() || matches!(input.operation, super::ManagedOperation::Warm))
+                .then(super::platform_task_timeout)
         });
     let cancellation = input
         .job_progress
@@ -203,7 +203,7 @@ pub(super) async fn execute_task(
         result = Err(error);
     }
     record_completion(&state, record, started);
-    if matches!(operation, super::warming::ManagedOperation::Warm)
+    if matches!(operation, super::ManagedOperation::Warm)
         && let Ok(Json(value)) = &mut result
     {
         value["warm"] = super::warming::completion_receipt(&value["execution"]);
@@ -223,7 +223,7 @@ async fn commit_scoped_completion(
     let mut sessions = if let Some(deadline) = deadline {
         tokio::time::timeout_at(deadline, state.sessions.write())
             .await
-            .map_err(|_| scope_commit_deadline())?
+            .map_err(|_| super::scopes::commit_deadline_exceeded())?
     } else {
         state.sessions.write().await
     };
@@ -242,12 +242,4 @@ async fn commit_scoped_completion(
         sessions.bind(id, model);
     }
     Ok(())
-}
-
-pub(super) fn scope_commit_deadline() -> ApiError {
-    ApiError::new(
-        StatusCode::GATEWAY_TIMEOUT,
-        "task total deadline exceeded before history commit",
-    )
-    .with_code("task_deadline_exceeded")
 }

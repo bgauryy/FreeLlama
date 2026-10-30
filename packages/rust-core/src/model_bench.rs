@@ -9,6 +9,7 @@ use anyhow::{Context, Result, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use reqwest::Client;
 
+use crate::capability::{Capability, ModelType};
 use crate::ollama_http::{millis, resident, unload};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -27,68 +28,6 @@ const RED_PIXEL_PNG: &[u8] = &[
     0x90, 0xe3, 0x0b, 0x1a, 0x90, 0xe3, 0x0b, 0x1a, 0x90, 0x7b, 0x36, 0x02, 0xc0, 0xe2, 0xc3, 0x57,
     0x81, 0x0d, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
 ];
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(rename_all = "snake_case")]
-pub enum Capability {
-    Completion,
-    Tools,
-    Vision,
-    Audio,
-    Thinking,
-    Embedding,
-    Other,
-}
-
-impl Capability {
-    #[must_use]
-    pub fn parse(value: &str) -> Self {
-        match value {
-            "completion" => Self::Completion,
-            "tools" => Self::Tools,
-            "vision" => Self::Vision,
-            "audio" => Self::Audio,
-            "thinking" => Self::Thinking,
-            "embedding" => Self::Embedding,
-            _ => Self::Other,
-        }
-    }
-}
-
-/// Coarse inventory classification derived from Ollama's additive capabilities.
-///
-/// This is intentionally descriptive only. Routing must continue to use the full capability set:
-/// a multimodal model is still eligible for ordinary text and coding work.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum ModelType {
-    Generative,
-    Multimodal,
-    EmbeddingOnly,
-    #[default]
-    Unknown,
-}
-
-impl ModelType {
-    #[must_use]
-    pub fn from_capabilities(capabilities: impl IntoIterator<Item = Capability>) -> Self {
-        let capabilities = capabilities.into_iter().collect::<BTreeSet<_>>();
-        if capabilities.contains(&Capability::Embedding)
-            && !capabilities.contains(&Capability::Completion)
-        {
-            Self::EmbeddingOnly
-        } else if capabilities.contains(&Capability::Completion)
-            && (capabilities.contains(&Capability::Vision)
-                || capabilities.contains(&Capability::Audio))
-        {
-            Self::Multimodal
-        } else if capabilities.contains(&Capability::Completion) {
-            Self::Generative
-        } else {
-            Self::Unknown
-        }
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelMetadata {
