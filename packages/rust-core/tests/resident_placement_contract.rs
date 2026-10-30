@@ -12,7 +12,6 @@ use std::sync::{
 };
 use tokio::sync::Mutex;
 use tower::ServiceExt;
-mod common;
 
 struct Backend {
     endpoint: String,
@@ -108,12 +107,11 @@ async fn resident_bytes_drive_gpu_inventory_preview_and_scoped_execution() {
         vec![running("gpu:profile", 1000, 1000)],
     )
     .await;
-    let platform = app(&common::platform_config(
+    let platform = app(&crate::support::platform_config(
         "127.0.0.1:11435",
         backend.endpoint.clone(),
         None,
         None,
-        "intent:separate",
     ))
     .unwrap();
     let (status, inventory) = request(&platform, "GET", "models", Value::Null).await;
@@ -186,12 +184,11 @@ async fn positive_vram_without_runner_total_never_verifies_gpu_or_trains_feedbac
         })],
     )
     .await;
-    let platform = app(&common::platform_config(
+    let platform = app(&crate::support::platform_config(
         "127.0.0.1:11435",
         backend.endpoint.clone(),
         None,
         None,
-        "intent:separate",
     ))
     .unwrap();
     let (_, inventory) = request(&platform, "GET", "models", Value::Null).await;
@@ -233,12 +230,11 @@ async fn positive_vram_without_runner_total_never_verifies_gpu_or_trains_feedbac
 async fn cpu_and_unknown_runner_evidence_preserve_observed_gates() {
     let primary = backend("gpu:profile", 4000, Vec::new()).await;
     let cpu = backend("cpu:profile", 6000, vec![running("cpu:profile", 2000, 0)]).await;
-    let platform = app(&common::platform_config(
+    let platform = app(&crate::support::platform_config(
         "127.0.0.1:11435",
         primary.endpoint.clone(),
         None,
         None,
-        "intent:separate",
     )
     .with_cpu_backend(cpu.endpoint.clone(), ["cpu:profile"]))
     .unwrap();

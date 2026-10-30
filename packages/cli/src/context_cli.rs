@@ -3,6 +3,8 @@ use clap::{Args, Subcommand};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+use freellama::serve_client;
+
 use super::{ExecutionPreference, PlacementEvidence, TaskExecutionArgs, TaskKind};
 
 #[derive(Debug, Subcommand)]
@@ -77,16 +79,14 @@ pub async fn run_scope(endpoint: &str, action: ScopeAction) -> Result<()> {
             .await
         }
         ScopeAction::Delete { scope_id } => {
-            let response = super::authenticate_request(super::cli_client().delete(format!(
-                "{}/_freellama/v1/scopes/{scope_id}",
-                endpoint.trim_end_matches('/')
-            )))?
-            .timeout(super::cli_control_timeout())
+            let response = serve_client::authenticate(serve_client::client().delete(
+                freellama::endpoint_url(endpoint, &format!("/_freellama/v1/scopes/{scope_id}")),
+            ))?
+            .timeout(serve_client::control_timeout())
             .send()
             .await?;
             if response.status() == reqwest::StatusCode::NO_CONTENT {
-                println!("{}", json!({"scope_id": scope_id, "deleted": true}));
-                Ok(())
+                crate::emit(json!({"scope_id": scope_id, "deleted": true}))
             } else {
                 super::print_response(response).await
             }
@@ -99,7 +99,7 @@ pub struct WarmArgs {
     #[arg(
         long,
         env = "FREELLAMA_SERVE_ENDPOINT",
-        default_value = "http://127.0.0.1:11435"
+        default_value = freellama::DEFAULT_SERVE_ENDPOINT
     )]
     endpoint: String,
     #[arg(long)]

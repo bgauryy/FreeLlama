@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Release gate for the portable JS packages and every optional native package.
-// Set FREELLAMA_REQUIRE_ALL_PLATFORMS=1 after `yarn release:assemble`; that is
+// Set FREELLAMA_REQUIRE_ALL_PLATFORMS=1 after `node scripts/assemble-release.mjs`; that is
 // the publish gate and refuses an empty or unpacked native target.
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
@@ -72,8 +72,7 @@ for (const [directory, expectedName] of publicPackages) {
   } else {
     for (const file of [
       "dist/index.js", "native/index.js", "native/index.d.ts", "native/package.json",
-      "adapters/agent_context.py", "adapters/agent_transport.py", "adapters/shell_sandbox.py",
-      "adapters/bash_agent.py", "adapters/octocode_agent.py",
+      "dist/research/bash-agent.js", "dist/research/octocode-agent.js",
     ]) {
       requirePackedFile(directory, paths, file);
     }
@@ -137,4 +136,4 @@ for (const packageName of ["freellama-core", "freellama-cli"]) {
   }
 }
 
-console.log(requireAllPlatforms ? "all release package contents verified; run release:verify:registry before publication" : "package manifests verified; run release:assemble then release:verify:publish before npm publish");
+console.log(requireAllPlatforms ? "all release package contents verified; run release:verify:registry before publication" : "package manifests verified; run node scripts/assemble-release.mjs then release:verify:publish before npm publish");

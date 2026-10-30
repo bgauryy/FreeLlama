@@ -8,6 +8,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::time::Duration;
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
@@ -47,20 +48,18 @@ impl WarmingPolicy {
         Ok(())
     }
     fn duration(&self, usage: super::residency::Usage, holding: bool) -> u64 {
-        #[allow(
-            clippy::cast_precision_loss,
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss
-        )]
-        let seconds = {
-            let reuse = usage.recent_uses * self.reuse_gain_seconds as f64;
-            let load = usage.load_ms.unwrap_or_default() / 1000.0 * self.load_multiplier;
-            let pressure = if holding { self.pressure_factor } else { 1.0 };
-            ((self.base_seconds as f64 + reuse + load) * pressure)
-                .clamp(self.min_seconds as f64, self.max_seconds as f64)
-                .round() as u64
-        };
-        seconds
+        let reuse = usage.recent_uses * super::float(self.reuse_gain_seconds);
+        let load = usage.load_ms.unwrap_or_default() / 1000.0 * self.load_multiplier;
+        let pressure = if holding { self.pressure_factor } else { 1.0 };
+        let seconds = ((super::float(self.base_seconds) + reuse + load) * pressure)
+            .clamp(
+                super::float(self.min_seconds),
+                super::float(self.max_seconds),
+            )
+            .round();
+        // Finite, rounded, and clamped to `[min_seconds, max_seconds]` (validated), so the checked
+        // conversion is exact; the fallback is unreachable.
+        Duration::try_from_secs_f64(seconds).map_or(self.max_seconds, |duration| duration.as_secs())
     }
 }
 #[derive(Debug, Clone, Copy, Default)]

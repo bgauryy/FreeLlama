@@ -6,7 +6,7 @@ use axum::{
 };
 use freellama::platform::{
     PlatformConfig, app,
-    resources::{HostResources, MemoryPressure, ResourceGovernor, ResourcePolicy},
+    resources::{HostResources, LowMemoryMode, MemoryPressure, ResourceGovernor, ResourcePolicy},
 };
 use serde_json::{Value, json};
 use std::{
@@ -19,6 +19,8 @@ use std::{
 use tokio::sync::{mpsc, oneshot};
 use tower::ServiceExt;
 
+/// Low available memory alone only warns, so the OS reports pressure together with it here;
+/// these contracts are about waiting for that pressure to clear.
 fn governor(available: Arc<AtomicU64>) -> ResourceGovernor {
     ResourceGovernor::with_sampler(
         ResourcePolicy {
@@ -28,15 +30,23 @@ fn governor(available: Arc<AtomicU64>) -> ResourceGovernor {
             hold_available_min_bytes: 100,
             resume_available_min_bytes: 200,
             recovery_samples: 2,
+            low_memory: LowMemoryMode::Advisory,
             ..ResourcePolicy::default()
         },
-        move || HostResources {
-            source: "injected_contract".into(),
-            total_memory_bytes: Some(10_000),
-            available_memory_bytes: Some(available.load(Ordering::SeqCst)),
-            memory_pressure: Some(MemoryPressure::Normal),
-            thermal_throttled: Some(false),
-            ..HostResources::default()
+        move || {
+            let available = available.load(Ordering::SeqCst);
+            HostResources {
+                source: "injected_contract".into(),
+                total_memory_bytes: Some(10_000),
+                available_memory_bytes: Some(available),
+                memory_pressure: Some(if available < 1000 {
+                    MemoryPressure::Warning
+                } else {
+                    MemoryPressure::Normal
+                }),
+                thermal_throttled: Some(false),
+                ..HostResources::default()
+            }
         },
     )
     .unwrap()
@@ -77,7 +87,7 @@ async fn platform(
 ) {
     let (primary, _, primary_server) = backend().await;
     let (cpu, receive, cpu_server) = backend().await;
-    let mut config = PlatformConfig::new("127.0.0.1:11435", primary, None, None, "test:latest")
+    let mut config = PlatformConfig::new("127.0.0.1:11435", primary, None, None)
         .with_cpu_max_queued_tasks(1)
         .with_max_queue_wait(wait);
     config.cpu_upstream = Some(cpu);
@@ -131,24 +141,16 @@ async fn known_pressure_holds_managed_execution_until_its_deadline_without_infer
         preview["execution"]["agent_plan"]["dispatch_readiness"],
         "held_host_pressure"
     );
-    for call in [
-        task(),
-        request(
-            "/_freellama/v1/natural-routes",
-            &json!({"text":"answer a short question"}),
-        ),
-    ] {
-        let response = tokio::time::timeout(Duration::from_secs(1), platform.clone().oneshot(call))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert!(
-            receive.try_recv().is_err(),
-            "pressure must prevent model execution"
-        );
-        assert_eq!(governor.snapshot().await.reserved_bytes, 0);
-    }
+    let response = tokio::time::timeout(Duration::from_secs(1), platform.clone().oneshot(task()))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        receive.try_recv().is_err(),
+        "pressure must prevent model execution"
+    );
+    assert_eq!(governor.snapshot().await.reserved_bytes, 0);
     let response = platform
         .oneshot(
             Request::get("/_freellama/v1/health")
@@ -332,73 +334,154 @@ async fn a_task_waiting_without_a_slot_resumes_when_memory_recovers() {
 }
 
 #[tokio::test]
-async fn separate_backend_clones_share_forecast_capacity_and_drop_releases_it() {
+async fn separate_backend_clones_share_forecast_accounting_and_drop_releases_it() {
     let governor = governor(Arc::new(AtomicU64::new(9000)));
     let first = governor
-        .wait_for_capacity("http://127.0.0.1:11434", 5000, Duration::from_secs(1))
+        .wait_for_capacity("http://127.0.0.1:11434", 5000, Duration::ZERO)
         .await
         .unwrap();
+    assert_eq!(first.receipt.status, "admitted");
     let other_backend = governor.clone();
-    let refused = other_backend
-        .wait_for_capacity("http://127.0.0.1:11436", 5000, Duration::from_millis(30))
-        .await;
-    assert!(
-        refused.is_err(),
-        "two backends cannot independently spend the same host headroom"
-    );
-    assert_eq!(governor.snapshot().await.reserved_bytes, 5000);
-    drop(first);
     let second = other_backend
-        .wait_for_capacity("http://127.0.0.1:11436", 5000, Duration::from_millis(30))
+        .wait_for_capacity("http://127.0.0.1:11436", 5000, Duration::ZERO)
         .await
-        .unwrap();
+        .expect("exhausted headroom warns instead of refusing");
+    assert_eq!(
+        second.receipt.status, "admitted_low_memory_estimate",
+        "the second backend sees the first backend's reservation"
+    );
+    assert_eq!(governor.snapshot().await.reserved_bytes, 10_000);
+    drop(first);
     assert_eq!(governor.snapshot().await.reserved_bytes, 5000);
     drop(second);
     assert_eq!(governor.snapshot().await.reserved_bytes, 0);
 }
 
 #[tokio::test]
-async fn releasing_a_reservation_wakes_waiters_before_the_next_telemetry_sample() {
+async fn zero_wait_still_assesses_one_slow_host_sample() {
     let governor = ResourceGovernor::with_sampler(
         ResourcePolicy {
-            sample_interval: Duration::from_secs(5),
+            sample_interval: Duration::from_millis(5),
+            low_memory: LowMemoryMode::Advisory,
+            ..ResourcePolicy::default()
+        },
+        || {
+            // Stands in for a blocking pool that lags under load.
+            std::thread::sleep(Duration::from_millis(50));
+            HostResources {
+                source: "slow_contract".into(),
+                total_memory_bytes: Some(10_000),
+                available_memory_bytes: Some(9000),
+                memory_pressure: Some(MemoryPressure::Normal),
+                thermal_throttled: Some(false),
+                ..HostResources::default()
+            }
+        },
+    )
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let permit = governor
+        .wait_for_capacity("http://127.0.0.1:11434", 1000, Duration::ZERO)
+        .await
+        .expect("a zero wait still observes the host once");
+    assert!(
+        permit.receipt.status.starts_with("admitted"),
+        "{}",
+        permit.receipt.status
+    );
+}
+
+#[tokio::test]
+async fn low_memory_estimate_without_os_pressure_runs_managed_work_with_a_warning() {
+    let governor = ResourceGovernor::with_sampler(
+        ResourcePolicy {
+            sample_interval: Duration::from_millis(5),
             hold_available_min_bytes: 100,
             resume_available_min_bytes: 200,
+            low_memory: LowMemoryMode::Advisory,
             ..ResourcePolicy::default()
         },
         || HostResources {
-            source: "reservation_wakeup_contract".into(),
+            source: "advisory_contract".into(),
             total_memory_bytes: Some(10_000),
-            available_memory_bytes: Some(9000),
+            available_memory_bytes: Some(100),
+            memory_pressure: Some(MemoryPressure::Normal),
+            thermal_throttled: Some(false),
             ..HostResources::default()
         },
     )
     .unwrap();
-    let first = governor
-        .wait_for_capacity("http://127.0.0.1:11434", 5000, Duration::from_secs(1))
+    assert!(governor.snapshot().await.holding);
+    let (platform, mut receive, servers) = platform(governor.clone(), Duration::from_secs(1)).await;
+    let pending = tokio::spawn(async move { platform.oneshot(task()).await.unwrap() });
+    let (_, release) = next_execution(&mut receive).await;
+    release.send(()).unwrap();
+    let response = pending.await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let admission = &body["execution"]["resource_admission"];
+    assert_eq!(
+        admission["status"], "admitted_low_memory_estimate",
+        "{body}"
+    );
+    assert_eq!(admission["assessment"]["memory_advisory"], "below_reserve");
+    assert_eq!(governor.snapshot().await.reserved_bytes, 0);
+    for server in servers {
+        server.abort();
+    }
+}
+
+/// Off macOS the default refuses a load whose estimate does not fit the reserve, even without OS
+/// pressure: Linux `MemAvailable` already counts reclaimable cache and is the container cap.
+#[tokio::test]
+async fn refuse_mode_holds_managed_work_that_does_not_fit_until_its_deadline() {
+    let governor = ResourceGovernor::with_sampler(
+        ResourcePolicy {
+            sample_interval: Duration::from_millis(5),
+            hold_available_min_bytes: 100,
+            resume_available_min_bytes: 200,
+            low_memory: LowMemoryMode::Refuse,
+            ..ResourcePolicy::default()
+        },
+        || HostResources {
+            source: "refuse_contract".into(),
+            total_memory_bytes: Some(10_000),
+            available_memory_bytes: Some(5000),
+            memory_pressure: Some(MemoryPressure::Normal),
+            thermal_throttled: Some(false),
+            ..HostResources::default()
+        },
+    )
+    .unwrap();
+    assert!(!governor.snapshot().await.holding);
+    let (platform, mut receive, servers) =
+        platform(governor.clone(), Duration::from_millis(60)).await;
+    let response = tokio::time::timeout(Duration::from_secs(2), platform.oneshot(task()))
         .await
-        .unwrap();
-    let other = governor.clone();
-    let mut pending = tokio::spawn(async move {
-        other
-            .wait_for_capacity("http://127.0.0.1:11436", 5000, Duration::from_secs(1))
-            .await
-    });
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    assert!(!pending.is_finished());
-    drop(first);
-    let second = tokio::time::timeout(Duration::from_millis(250), &mut pending)
-        .await
-        .expect("released capacity must wake the waiter promptly")
         .unwrap()
         .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["code"], "resource_admission_unavailable", "{body}");
+    assert_eq!(body["resource_admission"]["status"], "deadline_exceeded");
     assert_eq!(
-        governor.snapshot().await.sample_count,
-        1,
-        "reuse cached telemetry instead of polling the OS"
+        governor
+            .snapshot()
+            .await
+            .assess_capacity(5400, false)
+            .status,
+        "held_insufficient_capacity"
     );
-    drop(second);
+    assert!(
+        receive.try_recv().is_err(),
+        "a refused load must not reach the model"
+    );
     assert_eq!(governor.snapshot().await.reserved_bytes, 0);
+    for server in servers {
+        server.abort();
+    }
 }
 
 #[tokio::test]
@@ -443,7 +526,7 @@ async fn warm_forecast_is_rechecked_after_waiting_for_a_model_transition() {
     let cpu = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     let (primary, _, primary_server) = backend().await;
-    let mut config = PlatformConfig::new("127.0.0.1:11435", primary, None, None, "target:latest")
+    let mut config = PlatformConfig::new("127.0.0.1:11435", primary, None, None)
         .with_max_queue_wait(Duration::from_secs(2))
         .with_cpu_max_concurrent_tasks(2);
     config.cpu_upstream = Some(cpu);
@@ -478,18 +561,24 @@ async fn warm_forecast_is_rechecked_after_waiting_for_a_model_transition() {
     warm.store(false, Ordering::SeqCst);
     release.send(()).unwrap();
     assert_eq!(blocker.await.unwrap().status(), StatusCode::OK);
+    let (body, release) = next_execution(&mut receive).await;
+    assert_eq!(body["model"], "target:latest");
+    release.send(()).unwrap();
     let response = tokio::time::timeout(Duration::from_secs(1), target)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(
-        response.status(),
-        StatusCode::SERVICE_UNAVAILABLE,
-        "cold runner no longer fits available memory"
-    );
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let admission = &body["execution"]["resource_revalidation"];
     assert!(
-        receive.try_recv().is_err(),
-        "stale zero-byte forecast cannot authorize inference"
+        admission["required_available_bytes"].as_u64().unwrap() > 0,
+        "the recheck replaces the stale zero-byte forecast: {body}"
+    );
+    assert_eq!(
+        admission["status"], "admitted_low_memory_estimate",
+        "a cold runner that no longer fits the estimate dispatches with a warning"
     );
     assert_eq!(governor.snapshot().await.reserved_bytes, 0);
     server.abort();

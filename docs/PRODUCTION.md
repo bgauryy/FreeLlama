@@ -12,9 +12,12 @@ not provide tenant isolation or billing.
 
 - Install one Ollama CLI and server version. Run `freellama doctor` and resolve any mismatch.
 - Install Node.js 20 or later for MCP and npm distribution use.
-- Use the release artifacts for your operating system, or build with Rust 1.85 or later.
+- Use the release artifacts for your operating system, or build with Rust 1.88 or later.
 - Preinstall and benchmark exact model tags. Discovery never authorizes a pull.
 - Keep the primary and optional CPU Ollama processes on distinct loopback sockets.
+- In a slim or distroless container, install the CA bundle (`ca-certificates`) or set
+  `SSL_CERT_FILE` if any upstream uses `https://`. Without one, FreeLlama starts with an empty trust
+  store and warns: plain-HTTP upstreams work, HTTPS upstreams fail their certificate check.
 
 After a tag has been published, install that exact checksummed release on macOS or Linux:
 
@@ -31,17 +34,14 @@ published tag:
 powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Version VERSION
 ```
 
-The [release workflow](../.github/workflows/release.yml) builds CLI and native artifacts for eight
-targets, assembles packages, verifies package contents, and publishes on version tags. The
-[CI workflow](../.github/workflows/ci.yml) runs Rust checks on macOS, Linux, and Windows, plus
-JavaScript/native checks on macOS and Linux. These workflows do not prove driver compatibility or
-complete the hardware promotion checklist below. Release artifact builds depend on the reusable CI checks.
-The publish step also verifies that a version tag matches the workspace version.
+The repository has no CI or release workflows; they were removed (see git history). Build, verify,
+and publish artifacts with the [release procedure](../RELEASE.md). The publish verifier checks that
+a version tag matches the workspace version.
 Live E2E and hardware qualification remain separate operator checks; verify those receipts before tagging.
 
 For manual assembly, build and test every claimed target in a clean
 environment, place each executable and matching addon under `release-artifacts/<target>/`, run
-`yarn release:assemble release-artifacts release` and `yarn release:verify:publish`, then attach
+`node scripts/assemble-release.mjs release-artifacts release` and `yarn release:verify:publish`, then attach
 `release/SHA256SUMS` and binaries to the release. Publish the eight `@octocodeai/freellama-native-*` packages
 first, followed by the exact-version `@octocodeai/freellama` and `@octocodeai/freellama-mcp-server` packages. Configure
 registry credentials in the release environment; never store them in the repository.
@@ -197,12 +197,9 @@ the Ollama process does not expose to FreeLlama.
 Run compile and deterministic test checks from clean checkouts on Windows, Linux, and macOS. Live
 accelerator acceptance is separate because build machines do not necessarily represent production
 GPU drivers or memory topology. Prepare Apple Metal, NVIDIA Linux, AMD Linux, and NVIDIA Windows
-hosts, then run `benchmark/hardware/run_validation.py` directly on each host.
+hosts, then run a hardware acceptance check directly on each host.
 
-Each environment supplies its exact GPU and CPU model tags and a running FreeLlama endpoint. The
-portable runner in `benchmark/hardware/run_validation.py` executes GPU coding and CPU embedding
-concurrently, verifies physical processor receipts, checks admission receipts, and writes a JSON
-artifact. Add `--vision-model` and `--vision-image` for that host's OCR/vision gate.
+The portable hardware runners were removed from the repository; they remain in git history.
 
 Do not mark a hardware row validated until its archived receipt says `verdict: accept`. Missing
 hardware is an explicit release gap, not a result that documentation can waive.

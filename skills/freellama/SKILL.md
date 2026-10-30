@@ -5,29 +5,22 @@ description: "Use when delegating token-heavy work to local Ollama models throug
 
 # FreeLlama
 
-Operate FreeLlama as governed local-model delegation, not as a frontier-model replacement. MCP tools: `doctor`, `session`, `scope`, `warm_model`, `models`, `run_task`, `task_jobs`, `run_task_batch`, `ollama_manage`, `ollama_delete`, `delegate_research`; `npx @octocodeai/freellama tools` maps them to CLI equivalents.
+Operate FreeLlama as governed local-model delegation, not as a frontier-model replacement. The nine MCP tools and their request shapes are listed in the [MCP reference](https://github.com/bgauryy/FreeLlama/blob/main/packages/mcp/README.md#tools).
 
 Flow: `PREREQUISITE → DIAGNOSE → DECIDE → EXECUTE → VERIFY`
 
 ## Know who owns execution
 
-| Owner | Responsibility |
-|---|---|
-| Calling agent | Decompose the requested goal, decide what is worth offloading, and launch independent MCP calls concurrently |
-| Operator | Configure Ollama processes and endpoints, assign exact `--cpu-model` tags, approve pulls/stops/deletes, and change runtime settings |
-| FreeLlama | Qualify installed models, choose only among eligible operator-assigned backends, enforce admission, forward a managed request, and compare the assignment with post-run `/api/ps` evidence |
-| Ollama | Store/load runners, apply `num_gpu`, manage its request queue and same-model parallelism, and perform inference |
-| OS, driver, accelerator runtime | Schedule the physical CPU/GPU work and memory |
-
-FreeLlama is a governed router, not an unrestricted hardware scheduler. A CPU preference cannot
-move an arbitrary tag: the operator must have assigned that exact model to the CPU Ollama process.
-One managed call contains one task; only the calling agent knows which tasks are independent.
+The calling agent owns decomposition, prompts, and verification; the operator owns endpoints, exact
+`--cpu-model` assignments, and pull/stop/delete approval; FreeLlama routes, admits, and observes;
+Ollama and the OS execute. The full rule is in [Architecture](https://github.com/bgauryy/FreeLlama/blob/main/docs/ARCHITECTURE.md#responsibility-boundary).
+A CPU preference cannot move an arbitrary tag, and one managed call contains one task.
 
 ## Prerequisite and diagnose
 
-1. Call `doctor`. FreeLlama does not install or replace Ollama; if Ollama is missing or unreachable, direct the operator to `https://ollama.com/download` or `ollama serve`, then stop—do not recommend or pull a model.
-2. Read `doctor.machine.memory_bytes`, then `models{view:"installed"}` and `models{view:"resident"}`. Treat `execution.backend` as configuration and `execution.observation.processor` as physical evidence. A mismatch or partial placement warning invalidates feedback. For authenticated serve, set `FREELLAMA_AUTH_TOKEN_FILE` to the same permission-restricted file used at startup.
-3. Check `/_freellama/v1/health` admission slots. Zero slots means queueing up to the configured wait, not a reservation. Read structured refusal codes: queue saturation returns 429, while resource/deadline failures have their own receipts.
+1. Call `models{view:"installed"}`, then `models{view:"resident"}`. Call `doctor` when `models` errors or Ollama is unreachable. FreeLlama does not install or replace Ollama; if Ollama is missing or unreachable, direct the operator to `https://ollama.com/download` or `ollama serve`, then stop—do not recommend or pull a model.
+2. When memory fit matters, read `doctor.machine.memory_bytes`. Treat `execution.backend` as configuration and `execution.observation.processor` as physical evidence. A mismatch or partial placement warning invalidates feedback. For authenticated serve, set `FREELLAMA_AUTH_TOKEN_FILE` to the same permission-restricted file used at startup.
+3. Check admission slots with `doctor{view:"status"}` (HTTP clients: `/_freellama/v1/health`). Zero slots means queueing up to the configured wait, not a reservation. Read structured refusal codes: queue saturation returns 429, while resource/deadline failures have their own receipts.
 
 ## Decide
 
@@ -46,11 +39,11 @@ qualified installed model; never infer inventory from a model family name or thi
 
 ### A — grounded files
 
-Call `delegate_research{question,workspacePath,model?,adapter?,executionPreference?,minPlacementEvidence?,agent?}` with one narrow lookup over 1–5 source files. It needs `serve`: every model turn is a managed `coding` task with admission and physical-placement receipts. Keep the path inside `FREELLAMA_MCP_ALLOWED_ROOTS`; Bash is the measured default, Octocode is opt-in for structural/LSP search. Read `verification`, full `citations[]`, `contextManagement`, and `execution.receipts`. Retry `isError` once, then do the work yourself. Load `references/task-delegation.md` for the measured boundary and `references/context-management.md` before tuning compaction.
+Call `delegate_research{question,workspacePath,model?,adapter?,agent?}` with one narrow lookup over 1–5 source files. It needs `serve`: every model turn is a managed `coding` task with admission and physical-placement receipts. Keep the path inside `FREELLAMA_MCP_ALLOWED_ROOTS`; Bash is the measured default, Octocode is opt-in for structural/LSP search. Read `verification`, full `citations[]`, `contextManagement`, and `execution.receipts`. Retry `isError` once, then do the work yourself. Load `references/task-delegation.md` for the measured boundary and `references/context-management.md` before tuning compaction.
 
 ### B — supplied content or vision
 
-Preview with `run_task{preview:true,task?,model?,executionPreference?,minPlacementEvidence?,minConfidence?}` and routing constraints only. Execute separately with `prompt` or `messages`, plus applicable runtime controls. `run_task` has no file access; `minConfidence` gates quality evidence. `minPlacementEvidence:"observed"` refuses cold, mixed, or mismatched processor placement. Warm once with `"configured"`, inspect the receipt, then require `"observed"`. Images are base64 without a data-URI prefix and require an explicitly trialled vision model. Choose output limits and stop sequences from the tested output contract. Load `references/model-selection.md` before model choice.
+Preview with `run_task{preview:true,task?,model?,executionPreference?,minPlacementEvidence?,minConfidence?}` and routing constraints only. Execute separately with `prompt` or `messages`, plus applicable runtime controls. `run_task` has no file access; `minConfidence` gates quality evidence. `minPlacementEvidence:"observed"` refuses cold, mixed, or mismatched processor placement. Warm once with `"configured"`, inspect the receipt, then require `"observed"`. Images are base64 without a data-URI prefix and need an explicit trialled vision `model` or an operator `[policies.vision]` model; a capability tag alone is refused. If `output_check.repetition_loop` appears, the model looped: the answer text shows one copy, treat it as low confidence. For a model known to loop, set `stopOnRepetition:true` to stop as soon as the output repeats (all generated text is kept, `output_check.stopped_early:true`); routing also ranks a model last for task kinds it keeps looping on. Choose output limits and stop sequences from the tested output contract. Load `references/model-selection.md` before model choice.
 
 ### C — embeddings
 
@@ -64,7 +57,7 @@ Use `scope{action:"create",messages}` for bounded process-local history; `sessio
 model affinity. Pass `scopeId` and `scopeRevision` with new input to `run_task`, then use its
 returned revision. Fork at the expected revision before independent parallel branches. Read history
 only with `includeMessages:true`; failures and cancellations do not append. Use
-`warm_model{model,contextTokens,keepAlive?}` to load an exact installed runner profile through the
+`run_task{warm:true,model,contextTokens,keepAlive?}` to load an exact installed runner profile through the
 same admission and fit checks. Explicit `keepAlive` wins over finite adaptive retention. Load
 `references/context-management.md` for scope limits and cache ownership.
 
@@ -103,4 +96,4 @@ Keep `FREELLAMA_AGENT_PINNED_OVERFLOW=error`; clipping the system prompt/questio
 | Human health audit without an agent | run `scripts/check.sh` |
 | Minimal local vector search example | run `examples/local-rag.sh` |
 
-Use current `doctor` output, installed server behavior, and upstream Ollama docs before changing runtime settings. Read one routed reference at a time; detailed trial transcripts live under `assets/evidence/` and should be opened only when auditing a quantitative claim.
+Use current `doctor` output, installed server behavior, and upstream Ollama docs before changing runtime settings. Read one routed reference at a time; detailed trial transcripts live in the repository under `docs/dev/evidence/` and should be opened only when auditing a quantitative claim.

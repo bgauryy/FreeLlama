@@ -20,7 +20,7 @@ contracts before trusting placement. `doctor` reads chip and host RAM through ma
 `/proc`, or Windows system APIs. Only a non-null `unified_memory_bytes` says that host memory is
 known to be shared with the accelerator.
 
-Retry implementation details and historical asymmetry: `assets/evidence/proxy-vs-serve.md`.
+Retry implementation details and historical asymmetry: `docs/dev/evidence/proxy-vs-serve.md`.
 
 Next: backend choice → `references/resource-routing.md`; failure diagnosis →
 `references/troubleshooting.md`.

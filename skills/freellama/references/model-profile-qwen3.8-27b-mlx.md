@@ -13,6 +13,6 @@ does not distinguish strong retrieval from weak judgment.
 
 Do not transfer these results to another tag, quantization, Ollama version, or machine without a
 held-out rerun. Full question-level evidence and verifier corrections:
-`assets/evidence/model-profile-qwen3.8-27b-mlx.md`.
+`docs/dev/evidence/model-profile-qwen3.8-27b-mlx.md`.
 
 Next: delegate/verify policy → `references/task-delegation.md`.

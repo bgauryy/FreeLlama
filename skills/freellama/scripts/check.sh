@@ -25,6 +25,82 @@ freellama_curl() {
     curl -sf "$@"
   fi
 }
+# Shared JSON/Python-compatible formatting for the `node -e` blocks below. Values print the way
+# the health contract documents them: dicts and lists as Python-style literals, None/True/False.
+IFS= read -r -d '' CHECK_JS_HELPERS <<'JSEOF'
+const fs = require("fs");
+const print = (text) => fs.writeSync(1, text + "\n");
+const isDict = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+const typeName = (value) => value === null ? "NoneType" : Array.isArray(value) ? "list" : isDict(value) ? "dict"
+  : typeof value === "string" ? "str" : typeof value === "boolean" ? "bool" : Number.isInteger(value) ? "int" : "float";
+function get(object, key, fallback = null) {
+  if (!isDict(object)) throw new TypeError(`'${typeName(object)}' object has no attribute 'get'`);
+  return Object.prototype.hasOwnProperty.call(object, key) ? object[key] : fallback;
+}
+function truthy(value) {
+  if (value === null || value === false || value === 0 || value === "") return false;
+  if (Array.isArray(value)) return value.length > 0;
+  if (isDict(value)) return Object.keys(value).length > 0;
+  return true;
+}
+function reprString(text) {
+  const quote = text.includes("'") && !text.includes('"') ? '"' : "'";
+  let out = quote;
+  for (const char of text) {
+    const code = char.codePointAt(0);
+    if (char === "\\" || char === quote) out += "\\" + char;
+    else if (char === "\n") out += "\\n";
+    else if (char === "\r") out += "\\r";
+    else if (char === "\t") out += "\\t";
+    else if (char !== " " && /[\p{Cc}\p{Cf}\p{Cs}\p{Co}\p{Cn}\p{Zl}\p{Zp}\p{Zs}]/u.test(char)) {
+      out += code < 0x100 ? "\\x" + code.toString(16).padStart(2, "0")
+        : code < 0x10000 ? "\\u" + code.toString(16).padStart(4, "0") : "\\U" + code.toString(16).padStart(8, "0");
+    } else out += char;
+  }
+  return out + quote;
+}
+function repr(value) {
+  if (value === null) return "None";
+  if (value === true) return "True";
+  if (value === false) return "False";
+  if (typeof value === "string") return reprString(value);
+  if (typeof value === "number") {
+    if (Number.isInteger(value) && Math.abs(value) < 1e16) return String(value);
+    if (!Number.isFinite(value)) return Number.isNaN(value) ? "nan" : value > 0 ? "inf" : "-inf";
+    return String(value).replace(/e([+-])(\d)$/, "e$10$2");
+  }
+  if (Array.isArray(value)) return "[" + value.map(repr).join(", ") + "]";
+  return "{" + Object.entries(value).map(([key, item]) => reprString(key) + ": " + repr(item)).join(", ") + "}";
+}
+const str = (value) => typeof value === "string" ? value : repr(value);
+function join(separator, value) {
+  const items = typeof value === "string" ? [...value] : Array.isArray(value) ? value : isDict(value) ? Object.keys(value) : null;
+  if (items === null) throw new TypeError("can only join an iterable");
+  for (const item of items) if (typeof item !== "string") throw new TypeError(`sequence item: expected str instance, ${typeName(item)} found`);
+  return items.join(separator);
+}
+// Python `format(x, ".Nf")`: exact binary value, round half to even.
+function fixed(x, digits) {
+  if (!Number.isFinite(x)) return Number.isNaN(x) ? "nan" : x > 0 ? "inf" : "-inf";
+  const view = new DataView(new ArrayBuffer(8));
+  view.setFloat64(0, Math.abs(x));
+  const bits = view.getBigUint64(0);
+  const exponent = Number((bits >> 52n) & 0x7ffn);
+  let mantissa = bits & ((1n << 52n) - 1n);
+  if (exponent !== 0) mantissa |= 1n << 52n;
+  const shift = (exponent === 0 ? -1074 : exponent - 1075);
+  let numerator = mantissa * 10n ** BigInt(digits);
+  let denominator = 1n;
+  if (shift >= 0) numerator <<= BigInt(shift); else denominator <<= BigInt(-shift);
+  let quotient = numerator / denominator;
+  const remainder = numerator % denominator;
+  if (2n * remainder > denominator || (2n * remainder === denominator && quotient % 2n === 1n)) quotient += 1n;
+  const text = quotient.toString().padStart(digits + 1, "0");
+  const body = digits ? text.slice(0, -digits) + "." + text.slice(-digits) : text;
+  return (x < 0 || Object.is(x, -0) ? "-" : "") + body;
+}
+JSEOF
+
 FAILED=0
 WARNED=0
 warn() { echo "  WARN  $1"; WARNED=1; }
@@ -61,7 +137,7 @@ elif command -v ollama >/dev/null 2>&1; then
   if [ -z "$cli_version" ]; then
     cli_version="$(printf '%s\n' "$cli_output" | sed -nE 's/^ollama version is ([0-9]+\.[0-9]+\.[0-9]+).*$/\1/p' | head -1)"
   fi
-  server_version="$(echo "$version_json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("version",""))' 2>/dev/null)"
+  server_version="$(echo "$version_json" | node -e "$CHECK_JS_HELPERS"'print(str(get(JSON.parse(fs.readFileSync(0, "utf8")), "version", "")));' 2>/dev/null)"
   if [ -n "$cli_version" ] && [ -n "$server_version" ] && [ "$cli_version" != "$server_version" ]; then
     warn "ollama CLI ($cli_version at $(command -v ollama)) and server ($server_version) versions differ — align PATH with the active Ollama installation"
   elif [ -n "$cli_version" ] && [ -n "$server_version" ]; then
@@ -128,53 +204,71 @@ echo "  INFO  Config visibility is best effort: this shell environment, plus lau
 echo
 echo "== Resident models & memory =="
 if ps_json=$(curl -sf "$OLLAMA_ENDPOINT/api/ps" 2>/dev/null); then
-  python3 - "$ps_json" <<'PYEOF'
-import ctypes, json, os, platform, subprocess, sys
+  IFS= read -r -d '' RESIDENT_JS <<'JSEOF'
+const os = require("os");
+const { execFileSync } = require("child_process");
 
-def total_memory_bytes():
-    try:
-        if platform.system() == "Darwin":
-            return int(subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True).strip())
-        if platform.system() == "Windows":
-            class MemoryStatus(ctypes.Structure):
-                _fields_ = [("length", ctypes.c_ulong), ("load", ctypes.c_ulong),
-                            ("total", ctypes.c_ulonglong), ("available", ctypes.c_ulonglong),
-                            ("total_page", ctypes.c_ulonglong), ("available_page", ctypes.c_ulonglong),
-                            ("total_virtual", ctypes.c_ulonglong), ("available_virtual", ctypes.c_ulonglong),
-                            ("available_extended", ctypes.c_ulonglong)]
-            status = MemoryStatus()
-            status.length = ctypes.sizeof(status)
-            return status.total if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)) else None
-        return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
-    except (AttributeError, OSError, ValueError, subprocess.SubprocessError):
-        return None
+function totalMemoryBytes() {
+  try {
+    if (process.platform === "darwin") {
+      const text = execFileSync("sysctl", ["-n", "hw.memsize"], { encoding: "utf8", stdio: ["inherit", "pipe", "inherit"] })
+        .replace(/^[\s\x1c-\x1f\x85\xa0]+|[\s\x1c-\x1f\x85\xa0]+$/g, "");
+      if (!/^[+-]?\d+(_\d+)*$/.test(text)) return null;
+      return Number(BigInt(text.replace(/_/g, "")));
+    }
+    return os.totalmem();
+  } catch {
+    return null;
+  }
+}
 
-data = json.loads(sys.argv[1])
-models = data.get("models", [])
-if not models:
-    print("  OK    no models currently resident (cold start)")
-else:
-    total = 0.0
-    for m in models:
-        accelerator_bytes = m.get("size_vram", 0) or 0
-        committed_bytes = accelerator_bytes or m.get("size", 0) or 0
-        size_gb = committed_bytes / (1024**3)
-        total += size_gb
-        placement = "accelerator" if accelerator_bytes else "host RAM"
-        print(f"  INFO  resident: {m['name']:<28} ~{size_gb:.1f} GiB {placement}  expires_at={m.get('expires_at','?')}")
-    memory = total_memory_bytes()
-    if memory:
-        memory_gib = memory / (1024**3)
-        fraction = total / memory_gib if memory_gib else 0
-        print(f"  INFO  model-memory proxy: ~{total:.1f} GiB of {memory_gib:.1f} GiB host RAM ({fraction:.0%})")
-        if fraction >= 0.8:
-            print("  WARN  resident model sizes are at least 80% of physical RAM; leave headroom for")
-            print("        KV caches, the OS, applications, and discrete-GPU staging. Reduce contexts,")
-            print("        unload helpers, or lower the per-process loaded-model cap.")
-            sys.exit(2)
-    else:
-        print(f"  INFO  model-memory proxy: ~{total:.1f} GiB; physical RAM unavailable, so fit is unverified")
-PYEOF
+function gib(value) {
+  if (typeof value === "boolean") return Number(value) / 1024 ** 3;
+  if (typeof value !== "number") throw new TypeError(`unsupported operand type(s) for /: '${typeName(value)}' and 'int'`);
+  return value / 1024 ** 3;
+}
+
+function left(value, width) {
+  if (typeof value === "boolean") value = Number(value);
+  if (typeof value !== "string" && typeof value !== "number") throw new TypeError(`unsupported format string passed to ${typeName(value)}.__format__`);
+  const text = typeof value === "string" ? value : repr(value);
+  return text + " ".repeat(Math.max(0, width - [...text].length));
+}
+
+const data = JSON.parse(process.argv[1]);
+const models = get(data, "models", []);
+if (!truthy(models)) {
+  print("  OK    no models currently resident (cold start)");
+} else {
+  let total = 0;
+  const entries = Array.isArray(models) ? models : typeof models === "string" ? [...models] : isDict(models) ? Object.keys(models) : null;
+  if (entries === null) throw new TypeError(`'${typeName(models)}' object is not iterable`);
+  for (const model of entries) {
+    const acceleratorBytes = truthy(get(model, "size_vram", 0)) ? model.size_vram : 0;
+    const committedBytes = truthy(acceleratorBytes) ? acceleratorBytes : (truthy(get(model, "size", 0)) ? model.size : 0);
+    const sizeGb = gib(committedBytes);
+    total += sizeGb;
+    const placement = truthy(acceleratorBytes) ? "accelerator" : "host RAM";
+    if (!Object.prototype.hasOwnProperty.call(model, "name")) throw new Error("KeyError: 'name'");
+    print(`  INFO  resident: ${left(model.name, 28)} ~${fixed(sizeGb, 1)} GiB ${placement}  expires_at=${str(get(model, "expires_at", "?"))}`);
+  }
+  const memory = totalMemoryBytes();
+  if (truthy(memory)) {
+    const memoryGib = memory / 1024 ** 3;
+    const fraction = memoryGib ? total / memoryGib : 0;
+    print(`  INFO  model-memory proxy: ~${fixed(total, 1)} GiB of ${fixed(memoryGib, 1)} GiB host RAM (${fixed(fraction * 100, 0)}%)`);
+    if (fraction >= 0.8) {
+      print("  WARN  resident model sizes are at least 80% of physical RAM; leave headroom for");
+      print("        KV caches, the OS, applications, and discrete-GPU staging. Reduce contexts,");
+      print("        unload helpers, or lower the per-process loaded-model cap.");
+      process.exitCode = 2;
+    }
+  } else {
+    print(`  INFO  model-memory proxy: ~${fixed(total, 1)} GiB; physical RAM unavailable, so fit is unverified`);
+  }
+}
+JSEOF
+  node -e "$CHECK_JS_HELPERS$RESIDENT_JS" -- "$ps_json"
 py_status=$?
 if [ "$py_status" -eq 2 ]; then
   WARNED=1
@@ -191,61 +285,63 @@ if freellama_curl "$FREELLAMA_ENDPOINT/api/version" >/dev/null 2>&1; then
   ok "reachable at $FREELLAMA_ENDPOINT (passthrough works)"
   if health_json=$(freellama_curl "$FREELLAMA_ENDPOINT/_freellama/v1/health" 2>/dev/null); then
     ok "control-plane routes present — this is 'freellama serve' (full platform)"
-    python3 - "$health_json" <<'PYEOF'
-import json, sys
-health = json.loads(sys.argv[1])
-contracts = health.get("contracts", {})
-backends = health.get("backends", {})
-gpu = backends.get("gpu", {})
-cpu = backends.get("cpu")
-security = health.get("security", {})
-feedback = health.get("feedback", {})
-print(f"  INFO  primary backend: {gpu.get('upstream', '?')} admission={gpu.get('admission', {})}")
-if cpu:
-    print(f"  INFO  CPU backend: {cpu.get('upstream', '?')} models={','.join(cpu.get('models', []))} admission={cpu.get('admission', {})}")
-else:
-    print("  INFO  CPU backend: not configured")
-ok = (
-    contracts.get("hardware_fit") == "sent_num_ctx"
-    and contracts.get("machine_profile") == "portable_host_memory_v2"
-    and contracts.get("model_backends") == "explicit_cpu_assignment"
-    and contracts.get("placement_preference") == "guarded_hint"
-    and contracts.get("placement_observation") == "ollama_api_ps_after_execution"
-    and contracts.get("placement_evidence_gate") == "configured_or_observed"
-    and contracts.get("placement_feedback") == "three_sample_runtime"
-    and contracts.get("placement_feedback_metric") == "normalized_work_unit_10_percent"
-    and contracts.get("placement_feedback_persistence") == "versioned_atomic_snapshot_v1"
-    and contracts.get("authentication") == "optional_bearer_all_routes"
-    and contracts.get("immediate_unload_observation") == "observe_then_unload"
-    and bool(gpu.get("upstream"))
-    and bool(gpu.get("admission", {}).get("slots_total"))
-)
-if not ok:
-    sys.exit(1)
-remote = security.get("remote_access")
-authentication = security.get("authentication")
-if not isinstance(remote, bool) or authentication not in ("none", "bearer") or (remote is True and authentication != "bearer"):
-    sys.exit(3)
-warned = False
-resources = health.get("admission", {}).get("resources", {})
-if resources.get("holding") is True:
-    print(f"  WARN  managed task execution is held: {','.join(resources.get('reasons', [])) or 'host resource policy'}")
-    warned = True
-persistence = feedback.get("persistence", {})
-if persistence.get("enabled") is False:
-    print("  WARN  feedback is intentionally ephemeral; learned placement feedback will not survive restart")
-    warned = True
-elif persistence.get("enabled") is not True:
-    print("  WARN  feedback persistence state is unavailable; persistence is not verified")
-    warned = True
-elif persistence.get("last_error"):
-    print("  WARN  feedback persistence reports an error; inspect doctor for details")
-    warned = True
-if remote is True:
-    print("  WARN  remote access uses bearer authentication; require TLS-protected ingress before exposing the service")
-    warned = True
-sys.exit(2 if warned else 0)
-PYEOF
+    IFS= read -r -d '' HEALTH_JS <<'JSEOF'
+const health = JSON.parse(process.argv[1]);
+const contracts = get(health, "contracts", {});
+const backends = get(health, "backends", {});
+const gpu = get(backends, "gpu", {});
+const cpu = get(backends, "cpu");
+const security = get(health, "security", {});
+const feedback = get(health, "feedback", {});
+print(`  INFO  primary backend: ${str(get(gpu, "upstream", "?"))} admission=${str(get(gpu, "admission", {}))}`);
+if (truthy(cpu)) {
+  print(`  INFO  CPU backend: ${str(get(cpu, "upstream", "?"))} models=${join(",", get(cpu, "models", []))} admission=${str(get(cpu, "admission", {}))}`);
+} else {
+  print("  INFO  CPU backend: not configured");
+}
+const ok = (
+  get(contracts, "hardware_fit") === "sent_num_ctx"
+  && get(contracts, "machine_profile") === "portable_host_memory_v2"
+  && get(contracts, "model_backends") === "explicit_cpu_assignment"
+  && get(contracts, "placement_preference") === "guarded_hint"
+  && get(contracts, "placement_observation") === "ollama_api_ps_after_execution"
+  && get(contracts, "placement_evidence_gate") === "configured_or_observed"
+  && get(contracts, "placement_feedback") === "three_sample_runtime"
+  && get(contracts, "placement_feedback_metric") === "normalized_work_unit_10_percent"
+  && get(contracts, "placement_feedback_persistence") === "versioned_atomic_snapshot_v1"
+  && get(contracts, "authentication") === "optional_bearer_all_routes"
+  && get(contracts, "immediate_unload_observation") === "observe_then_unload"
+  && truthy(get(gpu, "upstream"))
+  && truthy(get(get(gpu, "admission", {}), "slots_total"))
+);
+if (!ok) process.exit(1);
+const remote = get(security, "remote_access");
+const authentication = get(security, "authentication");
+if (typeof remote !== "boolean" || !["none", "bearer"].includes(authentication) || (remote === true && authentication !== "bearer")) process.exit(3);
+let warned = false;
+const resources = get(get(health, "admission", {}), "resources", {});
+if (get(resources, "holding") === true) {
+  print(`  WARN  managed task execution is held: ${join(",", get(resources, "reasons", [])) || "host resource policy"}`);
+  warned = true;
+}
+const persistence = get(feedback, "persistence", {});
+if (get(persistence, "enabled") === false) {
+  print("  WARN  feedback is intentionally ephemeral; learned placement feedback will not survive restart");
+  warned = true;
+} else if (get(persistence, "enabled") !== true) {
+  print("  WARN  feedback persistence state is unavailable; persistence is not verified");
+  warned = true;
+} else if (truthy(get(persistence, "last_error"))) {
+  print("  WARN  feedback persistence reports an error; inspect doctor for details");
+  warned = true;
+}
+if (remote === true) {
+  print("  WARN  remote access uses bearer authentication; require TLS-protected ingress before exposing the service");
+  warned = true;
+}
+process.exitCode = warned ? 2 : 0;
+JSEOF
+    node -e "$CHECK_JS_HELPERS$HEALTH_JS" -- "$health_json"
     health_status=$?
     case "$health_status" in
       0|2)
@@ -264,7 +360,7 @@ PYEOF
   fi
 else
   warn "nothing listening at $FREELLAMA_ENDPOINT — agents/clients are likely hitting Ollama directly,"
-  warn "  which means no retry/backoff/timeout protection (proxy.rs send_with_retries). Start it: freellama proxy"
+  warn "  which means no retry/backoff/timeout protection (proxy/retry.rs send_with_retries). Start it: freellama proxy"
 fi
 
 echo

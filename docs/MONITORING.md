@@ -38,7 +38,9 @@ token and keeps it only for the browser tab.
   whether the model is pinned.
 - **`host`**: available and reserved RAM, whether the pressure gate is holding, and discrete-GPU
   total and free memory (`nvidia-smi` or amdgpu sysfs) when available. Optional `gpu_activity`
-  reports driver counters separately from resident memory.
+  reports driver counters separately from resident memory. On macOS, `thermal_pressure` is the
+  system thermal pressure level (`nominal`, `moderate`, `heavy`, `trapping`, `sleeping`); `heavy`
+  or worse holds CPU-assigned work and cold loads. Other platforms report `null`.
 - **`ollama`**: the Ollama server's effective `OLLAMA_*` settings with a source for each — the
   running process's environment (Linux `/proc/<pid>/environ`, macOS `ps eww` for a same-user
   process), `launchctl getenv` for the macOS app, FreeLlama's own environment, or Ollama's default.
@@ -72,7 +74,8 @@ FreeLlama admission limits remain governed by its runtime configuration.
 
 `host.gpu_activity` is nullable. When available, it identifies its `source`,
 `scope: "observed_devices_all_processes"`, `window: "driver_defined"`, and individual `devices`.
-Each device has an identity, nullable `busy_percent`, and nullable `memory_busy_percent`.
+Each device has an identity, nullable `busy_percent`, and nullable `memory_busy_percent`. Apple
+devices may add `allocated_memory_bytes`, the driver's allocated memory across all processes.
 An observed zero means the driver reported zero; a missing or malformed counter remains unknown.
 Use `host.sample_age_ms` to check freshness.
 
@@ -129,12 +132,13 @@ FreeLlama waits for safe capacity within a deadline and bounds the retained back
 | Managed queue full | `429` | `admission_queue_full` |
 | Raw proxy over its cap after `raw_queue_wait_seconds` | `429` | |
 | Managed wait exceeded `max_queue_wait_seconds` (or the task's `max_wait_seconds`) | `503` | `admission_timeout` |
-| Host resources remain held when the waiting budget expires | `503` | `resource_admission_unavailable` |
+| OS pressure, swapping, CPU, thermal, or required telemetry still holds when the waiting budget expires (low available RAM alone only warns; low RAM and swapping never hold an already-resident runner) | `503` | `resource_admission_unavailable` |
 | Backend circuit open | `503` | `upstream_circuit_open` |
 
 These capacity refusals carry a `Retry-After` header and `retry_after_seconds` in the body. For a queue it
-is estimated from the queue depth, the current limit, and the backend's recent average task time
-(1 to 120 seconds). A task can ask for a shorter wait with `max_wait_seconds` (`maxWaitSeconds`
+is estimated from the queue depth, the lanes that can run at once (current limit divided by the
+task's cost), and the backend's recent average service time, which excludes queue wait (1 to 120
+seconds). A task can ask for a shorter wait with `max_wait_seconds` (`maxWaitSeconds`
 in MCP); the server caps it at the configured maximum.
 
 ## Circuit breaker
@@ -166,7 +170,7 @@ costs, and execution receipts use the resolved policy. Health retains its summar
 exposes the complete task-kind map under `admission.costs.base_by_task`. Task kinds remain
 caller-declared; these weights are cooperative scheduling policy, not workload classification.
 See the
-[runtime example](../freellama.runtime.example.toml) for the table syntax.
+[runtime example](https://github.com/bgauryy/FreeLlama/blob/main/freellama.runtime.example.toml) for the table syntax.
 
 With `adaptive_concurrency = "cpu"` (the default) or `"all"`, each pool's limit moves between 1 and
 its configured ceiling:
@@ -273,13 +277,17 @@ send `num_ctx`.
 
 Put any of the settings above in a TOML file and start `serve --runtime-config <file>` (or set
 `FREELLAMA_RUNTIME_CONFIG`). Start from
-[`freellama.runtime.example.toml`](../freellama.runtime.example.toml). `serve` checks the file every
+[`freellama.runtime.example.toml`](https://github.com/bgauryy/FreeLlama/blob/main/freellama.runtime.example.toml). `serve` checks the file every
 two seconds and applies changes to live admission pools; a waiting task sees the new limit at once.
 
-Precedence for every setting, strongest first: CLI flag, `FREELLAMA_*` environment variable, the
-runtime file, the built-in default. A flag or variable pins a value, so editing the file cannot
-override it; `freellama config` shows which source won. A malformed file or an unknown key is
-rejected at reload and the previous values stay in force.
+Precedence for every setting, strongest first: CLI flag, environment variable (where one exists),
+the runtime file, the built-in default. Only these settings have an environment variable:
+`FREELLAMA_MAX_QUEUE_WAIT_SECONDS`, `FREELLAMA_EVICT_IDLE_MODELS`, `FREELLAMA_USAGE_QUEUE_CAPACITY`,
+and the individual `FREELLAMA_SCOPE_*` and `FREELLAMA_KEEP_ALIVE_*` limits. Set every other key in
+the runtime file or with its CLI flag. A flag or variable pins a value, so editing the file cannot
+override it; `freellama config` shows which source won: `cli`, `env`, `file`, a default source
+such as `default` or `ollama_num_parallel`, or `env_invalid` when a set variable failed validation.
+A malformed file or an unknown key is rejected at reload and the previous values stay in force.
 
 The default GPU budget follows the Ollama server: 2 units per `OLLAMA_NUM_PARALLEL` slot (one chat
 per decoding slot), read from the running Ollama process where visible.

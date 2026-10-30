@@ -6,6 +6,13 @@ const FAILURE_TTL_MS = 60 * 1000;
 const MAX_PAGE_BYTES = 2 * 1024 * 1024;
 const MAX_README_CHARS = 64 * 1024;
 
+const errorMessage = (error: unknown) => error instanceof Error ? error.message : String(error);
+
+/** An Ollama entry that proxies a hosted model: no local weights, so no public-library match applies. */
+export function isRemoteModel(entry: Record<string, unknown>, name: string): boolean {
+  return Boolean(entry.remote_host || entry.remote_model) || /-cloud$/i.test(name);
+}
+
 /** Resolve an exact public name; never guess an alias's base model or accept an arbitrary URL. */
 export function libraryReference(model: string) {
   const match = model.match(/^(?:library\/)?([a-zA-Z0-9][\w.-]*(?:\/[a-zA-Z0-9][\w.-]*)?)(?::([\w.-]+))?$/);
@@ -124,7 +131,9 @@ export class OllamaLibraryClient {
         card: { ...card, readme: card.readme.slice(0, MAX_README_CHARS) } };
     } catch (error) {
       result = { status: error instanceof LibraryFetchError ? error.status : "unavailable",
-        message: error instanceof LibraryFetchError ? error.message : "Ollama library lookup failed or timed out. Local metadata remains available." };
+        message: error instanceof LibraryFetchError
+          ? error.message
+          : `Ollama library lookup failed or timed out (${errorMessage(error)}). Local metadata remains available.` };
     }
     const now = (this.options.now ?? Date.now)();
     return { ...result, sourceUrl: ref.url, tagsSourceUrl: `${ref.url}/tags`, fetchedAt: new Date(now).toISOString(),
@@ -194,7 +203,7 @@ export function modelKnowledge(model: string, data: Record<string, unknown>, rec
     ? [{ capability, ...supportedUses[capability], basis: "supported_feature" }] : []);
   const local = { supportedFeatures: capabilities, supportedFeaturesSource, supportedUseCases, quality: "metadata_only",
     note: "Supported features and advertised uses do not establish task quality. Keep exact-model benchmark and policy evidence separate." };
-  if (data.remote_host || data.remote_model || /-cloud$/i.test(model)) {
+  if (isRemoteModel(data, model)) {
     return { ...local, localModel: false, library: { status: "remote_model", message: "This Ollama entry points to a remote model." } };
   }
   if (!record) return { ...local, localModel: true, library: { status: "not_requested" } };
@@ -239,9 +248,11 @@ export async function enrichInstalledModels(models: Array<Record<string, unknown
             local = { ...model, ...entry };
             if (Array.isArray(entry.capabilities)) featureSource = "ollama_api";
           }
-        } catch { localError = "The selected Ollama backend's inventory could not be verified; public guidance was withheld."; }
+        } catch (error) {
+          localError = `The selected Ollama backend's inventory could not be verified (${errorMessage(error)}); public guidance was withheld.`;
+        }
       }
-      const record = includeLibrary && !localError && !local.remote_host && !local.remote_model && !/-cloud$/i.test(name) ? await client.lookup(name) : undefined;
+      const record = includeLibrary && !localError && !isRemoteModel(local, name) ? await client.lookup(name) : undefined;
       const knowledge = modelKnowledge(name, local, record, false, featureSource);
       results[index] = { ...model, knowledge: localError ? { ...knowledge, library: { status: "unverified", message: localError } } : knowledge };
     }

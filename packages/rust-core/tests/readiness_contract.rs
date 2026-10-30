@@ -6,7 +6,7 @@ use axum::{
 };
 use freellama::platform::{
     PlatformConfig, app,
-    resources::{HostResources, ResourceGovernor, ResourcePolicy, TelemetryPolicy},
+    resources::{HostResources, LowMemoryMode, ResourceGovernor, ResourcePolicy, TelemetryPolicy},
 };
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -29,6 +29,7 @@ async fn fixture(
             resume_available_percent: 20,
             // Windows defaults to best-effort; these contracts are about required memory.
             telemetry_policy: TelemetryPolicy::RequireMemory,
+            low_memory: LowMemoryMode::Advisory,
             ..ResourcePolicy::default()
         },
         move || HostResources {
@@ -61,14 +62,8 @@ async fn fixture(
         b.unwrap();
     });
     // Explicit CPU assignment makes the host-memory contract portable to non-unified CI machines.
-    let mut config = PlatformConfig::new(
-        "127.0.0.1:11435",
-        primary_endpoint,
-        None,
-        None,
-        "test:latest",
-    )
-    .with_cpu_backend(endpoint.clone(), vec!["test:latest".to_owned()]);
+    let mut config = PlatformConfig::new("127.0.0.1:11435", primary_endpoint, None, None)
+        .with_cpu_backend(endpoint.clone(), vec!["test:latest".to_owned()]);
     config.resource_governor = governor.clone();
     (app(&config).unwrap(), governor, endpoint, server)
 }
@@ -82,7 +77,7 @@ async fn preview(platform: Router) -> Value {
 }
 
 #[tokio::test]
-async fn preview_does_not_call_a_cold_model_runnable_when_its_memory_wont_fit() {
+async fn preview_warns_when_a_cold_model_exceeds_the_memory_estimate() {
     let (platform, governor, _, server) = fixture(Some(3500), false).await;
     let result = preview(platform).await;
     assert_eq!(
@@ -91,11 +86,15 @@ async fn preview_does_not_call_a_cold_model_runnable_when_its_memory_wont_fit() 
     );
     assert_eq!(
         result["execution"]["agent_plan"]["dispatch_readiness"],
-        "held_insufficient_capacity"
+        "runnable_low_memory_estimate"
     );
     assert_eq!(
-        result["execution"]["agent_plan"]["independent_tasks_admissible_now"],
-        0
+        result["execution"]["resource_assessment"]["memory_advisory"],
+        "below_reserve"
+    );
+    assert_eq!(
+        result["execution"]["agent_plan"]["independent_tasks_admissible_now"], 1,
+        "the task itself runs; the estimate leaves no headroom for siblings"
     );
     assert_eq!(
         result["execution"]["resource_assessment"]["required_available_bytes"],
@@ -156,7 +155,11 @@ async fn preview_subtracts_existing_cross_backend_reservations() {
     let result = preview(platform).await;
     assert_eq!(
         result["execution"]["agent_plan"]["dispatch_readiness"],
-        "held_insufficient_capacity"
+        "runnable_low_memory_estimate"
+    );
+    assert_eq!(
+        result["execution"]["resource_assessment"]["memory_advisory"],
+        "below_reserve"
     );
     assert_eq!(governor.snapshot().await.reserved_bytes, 5000);
     drop(held);

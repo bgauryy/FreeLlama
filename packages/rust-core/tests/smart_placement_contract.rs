@@ -9,7 +9,7 @@ use axum::{
 };
 use freellama::platform::{
     PlatformConfig, app,
-    resources::{HostResources, MemoryPressure, ResourceGovernor, ResourcePolicy},
+    resources::{HostResources, LowMemoryMode, MemoryPressure, ResourceGovernor, ResourcePolicy},
 };
 use serde_json::{Value, json};
 use std::{
@@ -39,6 +39,7 @@ fn policy() -> ResourcePolicy {
         resume_available_percent: 2,
         hold_available_min_bytes: 100,
         resume_available_min_bytes: 200,
+        low_memory: LowMemoryMode::Advisory,
         ..ResourcePolicy::default()
     }
 }
@@ -130,7 +131,7 @@ async fn run(platform: Router, model: &str, prompt: &str) -> (StatusCode, Value)
 }
 
 fn config(upstream: String, governor: ResourceGovernor) -> PlatformConfig {
-    let mut config = PlatformConfig::new("127.0.0.1:11435", upstream, None, None, "idle:latest")
+    let mut config = PlatformConfig::new("127.0.0.1:11435", upstream, None, None)
         .with_max_queue_wait(Duration::from_millis(1500));
     config.resource_governor = governor;
     config
@@ -240,26 +241,56 @@ async fn discrete_gpu_spill_is_reserved_and_idle_models_are_evicted_to_fit() {
     server.abort();
 }
 
+/// A `keep_alive: -1` runner (far-future expiry) is never unloaded to make room, in either
+/// low-memory mode: refuse mode then holds the load and refuses at its deadline (the Linux and
+/// Windows default), advisory mode dispatches it with a memory advisory and leaves Ollama to
+/// decide. Discrete-GPU telemetry is injected, so the spill path is the one under test.
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 #[tokio::test]
 async fn pinned_models_are_never_evicted() {
-    let mock = Mock::default();
-    mock.loaded.lock().await.push(json!({
-        "name": "idle:latest", "digest": "d-idle", "size": 3000, "size_vram": 3000,
-        "context_length": 2048, "expires_at": "2318-01-01T00:00:00Z"
-    }));
-    let (upstream, server) = backend(mock.clone()).await;
-    let governor = ResourceGovernor::with_sampler(policy(), || sample(2000, Some(1000))).unwrap();
-    let (status, _) = run(
-        app(&config(upstream, governor)).unwrap(),
-        "big:latest",
-        "hi",
-    )
-    .await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    assert!(!mock.unloaded.load(Ordering::SeqCst));
-    assert_eq!(mock.loaded.lock().await.len(), 1);
-    server.abort();
+    for mode in [LowMemoryMode::Refuse, LowMemoryMode::Advisory] {
+        let mock = Mock::default();
+        mock.loaded.lock().await.push(json!({
+            "name": "idle:latest", "digest": "d-idle", "size": 3000, "size_vram": 3000,
+            "context_length": 2048, "expires_at": "2318-01-01T00:00:00Z"
+        }));
+        let (upstream, server) = backend(mock.clone()).await;
+        let policy = ResourcePolicy {
+            low_memory: mode,
+            ..policy()
+        };
+        let governor = ResourceGovernor::with_sampler(policy, || sample(2000, Some(1000))).unwrap();
+        let (status, body) = run(
+            app(&config(upstream, governor)).unwrap(),
+            "big:latest",
+            "hi",
+        )
+        .await;
+        match mode {
+            LowMemoryMode::Refuse => assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}"),
+            LowMemoryMode::Advisory => {
+                assert_eq!(status, StatusCode::OK, "{body}");
+                assert_eq!(
+                    body["execution"]["resource_admission"]["status"],
+                    "admitted_low_memory_estimate",
+                    "{body}"
+                );
+            }
+        }
+        assert!(
+            !mock.unloaded.load(Ordering::SeqCst),
+            "{mode:?}: the pinned runner was unloaded"
+        );
+        assert!(
+            mock.loaded
+                .lock()
+                .await
+                .iter()
+                .any(|entry| entry["name"] == "idle:latest"),
+            "{mode:?}: the pinned runner is gone"
+        );
+        server.abort();
+    }
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]

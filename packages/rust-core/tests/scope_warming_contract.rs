@@ -9,7 +9,6 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tower::ServiceExt;
-mod common;
 
 async fn request(platform: &Router, method: &str, path: &str, body: Value) -> (StatusCode, Value) {
     let response = platform
@@ -51,12 +50,11 @@ async fn fixture() -> (Router, Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<(
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
     (
-        app(&common::platform_config(
+        app(&crate::support::platform_config(
             "127.0.0.1:11435",
             endpoint,
             None,
             None,
-            "test:latest",
         ))
         .unwrap(),
         captured,
@@ -415,7 +413,9 @@ async fn warm_defers_in_existing_job_registry_and_explicit_keep_alive_wins() {
 async fn scope_and_warm_refused_for_capacity_never_infer_or_append() {
     use freellama::platform::{
         PlatformConfig,
-        resources::{HostResources, MemoryPressure, ResourceGovernor, ResourcePolicy},
+        resources::{
+            HostResources, LowMemoryMode, MemoryPressure, ResourceGovernor, ResourcePolicy,
+        },
     };
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let count = calls.clone();
@@ -427,20 +427,22 @@ async fn scope_and_warm_refused_for_capacity_never_infer_or_append() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
-    let mut config = PlatformConfig::new("127.0.0.1:11435", endpoint, None, None, "test:latest")
+    let mut config = PlatformConfig::new("127.0.0.1:11435", endpoint, None, None)
         .with_max_queue_wait(std::time::Duration::from_millis(50));
     config.resource_governor = ResourceGovernor::with_sampler(
         ResourcePolicy {
             sample_interval: std::time::Duration::from_millis(2),
             hold_available_min_bytes: 100,
             resume_available_min_bytes: 200,
+            low_memory: LowMemoryMode::Advisory,
             ..ResourcePolicy::default()
         },
         || HostResources {
             source: "low_capacity_fixture".into(),
             total_memory_bytes: Some(10000),
             available_memory_bytes: Some(50),
-            memory_pressure: Some(MemoryPressure::Normal),
+            // Low available memory alone only warns; the OS must report pressure to refuse.
+            memory_pressure: Some(MemoryPressure::Warning),
             thermal_throttled: Some(false),
             ..HostResources::default()
         },
@@ -519,12 +521,11 @@ async fn warm_immediate_unload_reports_final_residency() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
-    let platform = app(&common::platform_config(
+    let platform = app(&crate::support::platform_config(
         "127.0.0.1:11435",
         endpoint,
         None,
         None,
-        "test:latest",
     ))
     .unwrap();
     let (status, result) = request(

@@ -16,8 +16,6 @@ use std::{
 use tokio::sync::Notify;
 use tower::ServiceExt;
 
-mod common;
-
 const MODEL: &str = "costs:latest";
 
 struct Fixture {
@@ -66,7 +64,7 @@ async fn fixture(runtime: &str, pinned_units: Option<usize>) -> Fixture {
     let directory = tempfile::tempdir().unwrap();
     let file = directory.path().join("runtime.toml");
     std::fs::write(&file, runtime).unwrap();
-    let mut config = common::platform_config("127.0.0.1:11435", endpoint, None, None, MODEL)
+    let mut config = crate::support::platform_config("127.0.0.1:11435", endpoint, None, None)
         .with_runtime_config(file);
     if let Some(units) = pinned_units {
         config = config.with_max_concurrent_tasks(units);

@@ -1,88 +1,32 @@
-//! The `freellama tools` table is hand-maintained (the CLI has no Node dependency, so it cannot
-//! read the MCP server's own tool list). This asserts it stays in sync with the tools the MCP
-//! server actually registers, by checking the same names appear in its source.
+//! Source-level contracts for CLI flags that make advertised task kinds reachable.
 use std::{fs, path::Path};
 
-const MCP_SOURCE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../mcp/src/index.ts");
-const CLI_SOURCE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../cli/src/main.rs");
+const CLI_SOURCE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../cli/src");
 
-#[test]
-fn cli_tool_map_lists_every_registered_mcp_tool() {
-    let mcp = [
-        MCP_SOURCE,
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../mcp/src/context-tools.ts"),
-    ]
-    .iter()
-    .map(|file| fs::read_to_string(file).expect("read MCP registration source"))
-    .collect::<Vec<_>>()
-    .join("\n");
-    let cli = fs::read_to_string(Path::new(CLI_SOURCE)).expect("read CLI source");
-
-    let registered: Vec<String> = mcp
-        .match_indices("server.registerTool(")
-        .filter_map(|(i, _)| {
-            let rest = &mcp[i..];
-            let start = rest.find('"')? + 1;
-            let end = rest[start..].find('"')? + start;
-            Some(rest[start..end].to_owned())
-        })
-        .collect();
-
-    assert!(
-        registered.len() >= 6,
-        "expected at least 6 registered MCP tools, found {}: {registered:?}",
-        registered.len()
-    );
-    // Scope the search to `print_tool_map`'s body so a tool name mentioned incidentally elsewhere
-    // in the CLI cannot satisfy this check.
-    let map_start = cli
-        .find("fn print_tool_map()")
-        .expect("print_tool_map() not found in the CLI source");
-    let map_body = &cli[map_start..];
-    let map_body = &map_body[..map_body.find("\n}\n").unwrap_or(map_body.len())];
-
-    for tool in &registered {
-        assert!(
-            map_body.contains(&format!("\"{tool}\",")),
-            "`freellama tools` does not list the registered MCP tool `{tool}` — update print_tool_map()"
-        );
+/// Concatenate every file with `extension` under `dir`, recursively, in path order.
+fn read_sources(dir: &Path, extension: &str) -> String {
+    let mut paths = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(next) = pending.pop() {
+        for entry in fs::read_dir(&next).expect("read source directory") {
+            let path = entry.expect("read source entry").path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().is_some_and(|ext| ext == extension) {
+                paths.push(path);
+            }
+        }
     }
-    assert!(
-        map_body.contains("freellama task --task <t> <prompt>"),
-        "run_task CLI equivalent must be a valid clap invocation (positional prompt, not --prompt)"
-    );
-    assert!(
-        !map_body.contains("--prompt"),
-        "print_tool_map still documents --prompt, which clap rejects"
-    );
+    paths.sort();
+    paths
+        .iter()
+        .map(|path| fs::read_to_string(path).expect("read source file"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
-#[test]
-fn cli_tool_map_lists_every_cli_only_command() {
-    let cli = fs::read_to_string(Path::new(CLI_SOURCE)).expect("read CLI source");
-    let cli_only = cli
-        .lines()
-        .skip_while(|line| !line.contains("CLI-only:"))
-        .take(3)
-        .collect::<String>();
-
-    for command in [
-        "init",
-        "serve",
-        "proxy",
-        "machine",
-        "bench-all",
-        "policy-from-eval",
-        "eval",
-        "run",
-        "natural-route",
-        "recommend",
-    ] {
-        assert!(
-            cli_only.contains(command),
-            "`freellama tools` omits the CLI-only command `{command}`"
-        );
-    }
+fn cli_source() -> String {
+    read_sources(Path::new(CLI_SOURCE_DIR), "rs")
 }
 
 /// `--task vision` and `--task embedding` are offered as values by clap, so the CLI must actually
@@ -91,7 +35,7 @@ fn cli_tool_map_lists_every_cli_only_command() {
 /// flags that make those task kinds reachable are still present.
 #[test]
 fn cli_can_actually_exercise_the_task_kinds_it_advertises() {
-    let cli = fs::read_to_string(Path::new(CLI_SOURCE)).expect("read CLI source");
+    let cli = cli_source();
     assert!(
         cli.contains(r#"#[arg(long = "image")]"#),
         "`--task vision` is offered but there is no --image flag to hand it an image"
@@ -101,17 +45,13 @@ fn cli_can_actually_exercise_the_task_kinds_it_advertises() {
         "`--task embedding` is offered but there is no --input-file flag for batch input"
     );
     assert!(
-        cli.contains("fn base64_encode"),
+        cli.contains("general_purpose::STANDARD.encode"),
         "images must be base64-encoded before Ollama will accept them"
     );
     assert!(
         cli.contains("execution_preference: ExecutionPreference")
             && cli.contains("execution_preference: Option<ExecutionPreference>"),
         "routing uses a resolved preference; task omission preserves saved scope defaults"
-    );
-    assert!(
-        cli.contains("request_recommendation(endpoint: String, route: RouteInput)"),
-        "recommendation must receive the already typed route instead of reconstructing its fields"
     );
     assert!(
         cli.contains("cpu_max_concurrent_tasks: Option<usize>"),

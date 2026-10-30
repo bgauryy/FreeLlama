@@ -12,8 +12,6 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tower::ServiceExt;
 
-mod common;
-
 type Captured = Arc<Mutex<Vec<Value>>>;
 
 /// A one-model upstream whose Modelfile sets `num_ctx` (as `/api/show` reports it).
@@ -92,12 +90,11 @@ async fn get_json(platform: &Router, path: &str) -> Value {
 #[tokio::test]
 async fn modelfile_context_is_left_to_ollama_and_explicit_mode_still_sends_it() {
     let (address, captured) = upstream("num_ctx 16384", StatusCode::OK).await;
-    let platform = app(&common::platform_config(
+    let platform = app(&crate::support::platform_config(
         "127.0.0.1:11435",
         &address,
         None,
         None,
-        "chat:latest",
     ))
     .unwrap();
     let response = platform.clone().oneshot(task()).await.unwrap();
@@ -125,12 +122,11 @@ async fn modelfile_context_is_left_to_ollama_and_explicit_mode_still_sends_it() 
     let directory = tempfile::tempdir().unwrap();
     let file = directory.path().join("runtime.toml");
     std::fs::write(&file, "context_mode = \"explicit\"\n").unwrap();
-    let explicit =
-        app(
-            &common::platform_config("127.0.0.1:11435", &address, None, None, "chat:latest")
-                .with_runtime_config(&file),
-        )
-        .unwrap();
+    let explicit = app(
+        &crate::support::platform_config("127.0.0.1:11435", &address, None, None)
+            .with_runtime_config(&file),
+    )
+    .unwrap();
     assert_eq!(
         explicit.oneshot(task()).await.unwrap().status(),
         StatusCode::OK
@@ -142,12 +138,11 @@ async fn modelfile_context_is_left_to_ollama_and_explicit_mode_still_sends_it() 
 #[tokio::test]
 async fn a_modelfile_context_too_small_for_the_request_is_not_trusted() {
     let (address, captured) = upstream("num_ctx 1024", StatusCode::OK).await;
-    let platform = app(&common::platform_config(
+    let platform = app(&crate::support::platform_config(
         "127.0.0.1:11435",
         &address,
         None,
         None,
-        "chat:latest",
     ))
     .unwrap();
     assert_eq!(
@@ -163,12 +158,11 @@ async fn metrics_status_usage_and_config_report_finished_work() {
     let (address, _) = upstream("", StatusCode::OK).await;
     let directory = tempfile::tempdir().unwrap();
     let ledger = directory.path().join("usage.jsonl");
-    let platform =
-        app(
-            &common::platform_config("127.0.0.1:11435", &address, None, None, "chat:latest")
-                .with_usage_file(&ledger),
-        )
-        .unwrap();
+    let platform = app(
+        &crate::support::platform_config("127.0.0.1:11435", &address, None, None)
+            .with_usage_file(&ledger),
+    )
+    .unwrap();
     assert_eq!(
         platform.clone().oneshot(task()).await.unwrap().status(),
         StatusCode::OK
@@ -249,12 +243,11 @@ async fn fifo_ledger_does_not_delay_task_completion_and_reports_failed_write() {
     let (address, _) = upstream("", StatusCode::OK).await;
     let directory = tempfile::tempdir().unwrap();
     let ledger = directory.path().join("usage.jsonl");
-    let platform =
-        app(
-            &common::platform_config("127.0.0.1:11435", &address, None, None, "chat:latest")
-                .with_usage_file(&ledger),
-        )
-        .unwrap();
+    let platform = app(
+        &crate::support::platform_config("127.0.0.1:11435", &address, None, None)
+            .with_usage_file(&ledger),
+    )
+    .unwrap();
     assert!(
         std::process::Command::new("mkfifo")
             .arg(&ledger)
@@ -298,12 +291,11 @@ async fn a_config_reload_changes_admission_without_a_restart() {
     let directory = tempfile::tempdir().unwrap();
     let file = directory.path().join("runtime.toml");
     std::fs::write(&file, "max_concurrent_tasks = 3\nmax_queued_tasks = 4\n").unwrap();
-    let platform =
-        app(
-            &common::platform_config("127.0.0.1:11435", &address, None, None, "chat:latest")
-                .with_runtime_config(&file),
-        )
-        .unwrap();
+    let platform = app(
+        &crate::support::platform_config("127.0.0.1:11435", &address, None, None)
+            .with_runtime_config(&file),
+    )
+    .unwrap();
     let health = get_json(&platform, "/_freellama/v1/health").await;
     assert_eq!(health["backends"]["gpu"]["admission"]["slots_total"], 3);
 
@@ -353,12 +345,11 @@ async fn repeated_upstream_failures_open_the_circuit_and_fail_fast() {
         "breaker_failures = 2\nbreaker_cooldown_seconds = 30\n",
     )
     .unwrap();
-    let platform =
-        app(
-            &common::platform_config("127.0.0.1:11435", &address, None, None, "chat:latest")
-                .with_runtime_config(&file),
-        )
-        .unwrap();
+    let platform = app(
+        &crate::support::platform_config("127.0.0.1:11435", &address, None, None)
+            .with_runtime_config(&file),
+    )
+    .unwrap();
     for _ in 0..2 {
         let response = platform.clone().oneshot(task()).await.unwrap();
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
@@ -500,7 +491,9 @@ async fn load_with_idle_runners(
     total: u64,
     available: u64,
 ) -> (Router, Arc<Residency>, Value, tempfile::TempDir) {
-    use freellama::platform::resources::{HostResources, ResourceGovernor, ResourcePolicy};
+    use freellama::platform::resources::{
+        HostResources, LowMemoryMode, ResourceGovernor, ResourcePolicy,
+    };
     let residency = Arc::new(Residency {
         loaded: Mutex::new(vec![
             ("spare:latest".into(), 7 * GIB),
@@ -520,7 +513,7 @@ async fn load_with_idle_runners(
     )
     .unwrap();
     let memory = Arc::clone(&residency);
-    let mut config = common::platform_config("127.0.0.1:11435", &gpu, None, None, "chat:latest")
+    let mut config = crate::support::platform_config("127.0.0.1:11435", &gpu, None, None)
         .with_cpu_backend(
             &cpu,
             [
@@ -532,16 +525,21 @@ async fn load_with_idle_runners(
         )
         .with_runtime_config(&file)
         .with_usage_file(directory.path().join("usage.jsonl"));
-    config.resource_governor =
-        ResourceGovernor::with_sampler(ResourcePolicy::default(), move || HostResources {
+    config.resource_governor = ResourceGovernor::with_sampler(
+        ResourcePolicy {
+            low_memory: LowMemoryMode::Advisory,
+            ..ResourcePolicy::default()
+        },
+        move || HostResources {
             source: "fixture".into(),
             total_memory_bytes: Some(total),
             available_memory_bytes: Some(
                 memory.available.load(std::sync::atomic::Ordering::SeqCst),
             ),
             ..HostResources::default()
-        })
-        .unwrap();
+        },
+    )
+    .unwrap();
     let platform = app(&config).unwrap();
     let response = platform
         .clone()
@@ -613,12 +611,11 @@ async fn a_host_already_holding_for_memory_recovers_by_unloading_an_idle_runner(
 #[tokio::test]
 async fn the_status_page_loads_without_the_token_but_its_data_does_not() {
     let (address, _) = upstream("", StatusCode::OK).await;
-    let platform =
-        app(
-            &common::platform_config("127.0.0.1:11435", &address, None, None, "chat:latest")
-                .with_auth_token("t".repeat(40)),
-        )
-        .unwrap();
+    let platform = app(
+        &crate::support::platform_config("127.0.0.1:11435", &address, None, None)
+            .with_auth_token("t".repeat(40)),
+    )
+    .unwrap();
     let page = platform
         .clone()
         .oneshot(Request::get("/_freellama/ui").body(Body::empty()).unwrap())

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { assessDelegatedAnswer, MODEL_EVIDENCE } from "../../src/delegate.js";
 
-// The evidence table is loaded from benchmark/evidence/model-evidence.json at import time; these
+// The evidence table is loaded from packages/mcp/evidence/model-evidence.json at import time; these
 // tests run inside the repo, so the real table is present. If a model named here is removed from
 // the evidence file, the first test fails loudly instead of the verdicts silently degrading.
 describe("MODEL_EVIDENCE", () => {
@@ -38,7 +38,7 @@ describe("assessDelegatedAnswer", () => {
     expect(verdict.recommendation).toBe("verify");
   });
 
-  it("returns verify for judgment-shaped questions (the ~67% bucket)", () => {
+  it("returns verify for judgment-shaped questions (the low-accuracy bucket)", () => {
     const verdict = assessDelegatedAnswer("should we refactor the proxy retry logic?", 2, STRONG);
     expect(verdict.recommendation).toBe("verify");
     expect(verdict.measuredBaseRate).toMatch(/judgment/);
@@ -67,5 +67,15 @@ describe("assessDelegatedAnswer", () => {
     );
     expect(verdict.recommendation).toBe("accept");
     expect(verdict.grounded).toBe(true);
+  });
+
+  it("quotes each strong model's own measured note, never another model's base rate", () => {
+    const strong = Object.keys(MODEL_EVIDENCE).filter((name) => MODEL_EVIDENCE[name].grade === "strong");
+    expect(strong.length).toBeGreaterThan(0);
+    for (const model of strong) {
+      const verdict = assessDelegatedAnswer("where is DEFAULT_SERVE_ENDPOINT defined?", 2, model);
+      expect(verdict.measuredBaseRate).toBe(`${model}: ${MODEL_EVIDENCE[model].note}`);
+      expect(verdict.why).not.toMatch(/27B|see README/);
+    }
   });
 });

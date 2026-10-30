@@ -152,8 +152,8 @@ They establish feasibility within their measured limits, not a fresh performance
 | Code retrieval and judgment | Historical fixtures reported imperfect semantic-search recall and about 67% code-review accuracy. | Similarity and generated review findings require verification; they cannot authorize deletion or approve changes. |
 
 See [the measured CPU/GPU result](../CPU_GPU_ROUTING.md#interpret-the-measured-mac-result),
-[token economics](../ECONOMICS.md), [adapter caveats](../../benchmark/local/docs/07-adapter-contracts.md), and
-[historical delegation evidence](../../skills/freellama/assets/evidence/task-delegation.md).
+[token economics](../../packages/mcp/README.md#token-economics), adapter caveats (removed; see git history), and
+[historical delegation evidence](evidence/task-delegation.md).
 This review did not rerun those workloads or independently regrade their quality results.
 
 ## Latest check on this Mac
@@ -209,7 +209,7 @@ Competitive advantage in useful throughput remains a hypothesis requiring matche
 Ollama already owns warming and runtime scheduling.
 FreeLlama must demonstrate additional workload value rather than claim these mechanisms as unique inventions.
 Engine-level batching, cache reuse, and device execution should remain engine responsibilities unless a measured integration justifies a change.
-See [Product positioning](../PRODUCT_POSITIONING.md) for the audience and product boundaries.
+See the [README](../../README.md) for the audience and product boundaries.
 
 ## Feature and logic assessment
 
@@ -284,7 +284,6 @@ The following evidence is needed before increasing the ratings:
 7. Rerun current release gates and fresh packed-consumer checks after all edits. Execute foreign native and installer checks on target runtimes.
 8. Evaluate research accuracy and context retention on held-out tasks. Use identical workloads before making competitor performance claims.
 
-Use [Local performance testing](LOCAL_PERFORMANCE_TESTING.md) and the
-[hardware benchmark contracts](../../benchmark/hardware/README.md) for measurement.
-Use the [local adapter benchmark](../../benchmark/local/README.md) for research quality.
+Use [Local performance testing](LOCAL_PERFORMANCE_TESTING.md) for measurement. The hardware
+benchmark contracts and local adapter benchmark were removed; see git history.
 The [release procedure](../../RELEASE.md) owns publication readiness.

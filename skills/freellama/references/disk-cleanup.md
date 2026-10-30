@@ -11,6 +11,6 @@ content-addressed and direct file deletion can corrupt its manifests.
 Never delete files under `~/.ollama/models`, and never infer consent from age. Workspace copies and
 benchmark outputs can also consume many gigabytes; resolve their exact paths before cleanup.
 
-Measured incident details and sources: `assets/evidence/disk-cleanup.md`.
+Measured incident details and sources: `docs/dev/evidence/disk-cleanup.md`.
 
 Next: memory rather than disk → `references/ollama-config.md`.

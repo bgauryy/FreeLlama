@@ -87,8 +87,9 @@ request-specific `num_ctx` from the selected task profile. The coding adapters f
 conversation inside `FREELLAMA_AGENT_NUM_CTX`: by default, they preserve the system prompt and
 original question, compact the oldest observations first, retain recent evidence, and fail before
 the Ollama call if pinned content cannot fit. Raising the Ollama server's global context does not
-disable adapter compaction or increase its configured budget. See [adapter contracts](../../benchmark/local/docs/07-adapter-contracts.md)
-for the complete pagination and compaction contract.
+disable adapter compaction or increase its configured budget. The adapter source in
+[`packages/mcp/src/research/`](../../packages/mcp/src/research/) owns the complete pagination and
+compaction contract.
 
 ## Mac audit (2026-09-01)
 
@@ -241,7 +242,7 @@ verification procedure.
 5. Evaluate request-specific context and residency profiles before testing global K/V-cache or
    concurrency changes. Keep Flash Attention automatic on supported backends or set it explicitly
    to `1` before selecting a quantized K/V cache.
-6. Promote a hardware-and-engine profile only after `benchmark/hardware/run_validation.py` and its
+6. Promote a hardware-and-engine profile only after a hardware validation run and its
    held-out quality workload pass on a real self-hosted runner.
 
 ## Sources

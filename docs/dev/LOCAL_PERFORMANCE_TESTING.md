@@ -21,6 +21,9 @@ flowchart TD
 
 Each result applies to the measured model, workload, configuration, and machine.
 
+The portable hardware runners this procedure uses (host sampler, comparison, and CPU/GPU
+validation runners) were removed from the repository; they remain in git history.
+
 ## 1. Prepare the machine and inputs
 
 Connect mains power and keep the cooling environment consistent.
@@ -50,7 +53,7 @@ cp .octocode/tmp/throughput-qualification/heldout-eight/workload.json \
 ```
 
 Those ignored fixtures are absent from a clean checkout and published packages.
-If they are absent, create a workload using the [hardware manifest example](../../benchmark/hardware/README.md#measure-a-useful-gpu-workload).
+If they are absent, create a workload using the hardware manifest example (removed; see git history).
 Supply at least two distinct cases with independently checked expected answers.
 Image paths resolve relative to the workload file.
 For text generation, omit images and select a supported text task.
@@ -183,18 +186,10 @@ It captures available process activity, CPU/GPU clocks, estimated subsystem powe
 The selected samplers may omit temperature readings in degrees Celsius.
 If a sampler is unavailable, retain the error and report that measurement as unknown.
 
-Run the [host sampler](../../benchmark/hardware/sample_host.py) in another terminal for memory and process observations.
+Run the host sampler (removed; see git history) in another terminal for memory and process observations.
 Find the exact PIDs and executable paths for the owned gateway, Ollama server, and inference runners.
 Repeat `--process PID=/absolute/executable` for those processes.
-For example, replace both placeholders before execution:
-
-```bash
-python3 benchmark/hardware/sample_host.py \
-  --process PID=/absolute/executable \
-  --duration-seconds 180 \
-  --interval-seconds 1 \
-  --output .octocode/hardware/local-test/host-observations.json
-```
+Write its output to `.octocode/hardware/local-test/host-observations.json`.
 
 The host sampler supports at most 180 seconds per invocation.
 Use successive captures for a longer experiment, with separate output files.
@@ -204,15 +199,9 @@ RSS does not equal physical memory footprint.
 GPU driver activity covers all processes; close unrelated GPU workloads and retain the idle baseline.
 Subsystem power estimates do not establish per-task energy.
 
-In terminal D, run the comparison:
-
-```bash
-python3 benchmark/hardware/run_comparison.py \
-  --endpoint http://127.0.0.1:11438 \
-  --ollama-endpoint http://127.0.0.1:11439 \
-  --comparison .octocode/hardware/local-test/comparison.json \
-  --output .octocode/hardware/local-test/comparison-receipt.json
-```
+In terminal D, run the comparison runner (removed; see git history) against the gateway
+(`http://127.0.0.1:11438`) and direct Ollama (`http://127.0.0.1:11439`) with
+`.octocode/hardware/local-test/comparison.json`.
 
 Both paths use the same engine, logical payloads, context, and output controls.
 The runner warms each path and shares the resident runner and prefix cache.
@@ -263,17 +252,9 @@ Higher parallelism can require more context-cache memory. See [Ollama concurrenc
 
 Configure a dedicated CPU upstream and exact CPU model assignment using the [CPU/GPU setup guide](../CPU_GPU_ROUTING.md).
 Ensure both installed models can coexist under the resource policy.
-Replace `EXACT_INSTALLED_GPU_TAG` with your qualified generation tag:
-
-```bash
-python3 benchmark/hardware/run_validation.py \
-  --endpoint http://127.0.0.1:11438 \
-  --gpu-model EXACT_INSTALLED_GPU_TAG \
-  --cpu-model nomic-embed-text:v1.5 \
-  --trials 3 \
-  --minimum-speedup 1.05 \
-  --output .octocode/hardware/local-test/cpu-gpu-receipt.json
-```
+Run the CPU/GPU validation runner (removed; see git history) against `http://127.0.0.1:11438`
+with your qualified GPU generation tag, `nomic-embed-text:v1.5` as the CPU model, three trials,
+and a 1.05 minimum speedup.
 
 Confirm `nomic-embed-text:v1.5` is installed and assigned to the CPU upstream first.
 This runner warms both tasks and compares matched sequential/parallel pairs.
@@ -281,7 +262,7 @@ It requires observed CPU/GPU placement and correct responses.
 The default 1.05 speedup gate is configurable; declare the chosen target before execution.
 This short overlap check does not qualify sustained saturation or general model quality.
 
-Use [fixed-arrival load tests](../../benchmark/hardware/README.md#check-fixed-arrival-load-and-queue-ownership) for burst and queue behavior.
+Use fixed-arrival load tests (removed; see git history) for burst and queue behavior.
 Use real resident mode for physical measurements.
 Synthetic controlled mode supplies no inference throughput or physical placement proof.
 
@@ -294,5 +275,4 @@ Use Ctrl-C in their dedicated terminals.
 Verify no owned tasks or waiters remain before stopping the gateway.
 An inference keepalive expiry or service stop does not delete installed models.
 
-See the [hardware harness reference](../../benchmark/hardware/README.md) for schemas, bounds, and qualification details.
 See [production checks](../PRODUCTION.md) for promotion requirements beyond this local experiment.

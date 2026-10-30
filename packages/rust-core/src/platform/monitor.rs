@@ -11,7 +11,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::telemetry::Gauge;
-use super::{CatalogModel, PlatformState, host_has_unified_memory, ollama_env, runtime};
+use super::{
+    Backend, CatalogModel, PlatformState, float, host_has_unified_memory, ollama_env, runtime,
+};
 
 /// Ollama's own default `num_ctx` for `model` on `placement`, when it can be known, with the
 /// source it came from. Order follows Ollama's resolution in `server/routes.go`: a Modelfile
@@ -23,7 +25,7 @@ use super::{CatalogModel, PlatformState, host_has_unified_memory, ollama_env, ru
 pub(super) async fn ollama_default_context(
     state: &PlatformState,
     model: Option<&CatalogModel>,
-    placement: &str,
+    placement: Backend,
 ) -> Option<(u64, &'static str)> {
     if let Some(value) = model.and_then(|model| model.modelfile_num_ctx) {
         return Some((value, "modelfile"));
@@ -31,7 +33,7 @@ pub(super) async fn ollama_default_context(
     if let Some(value) = state.tunables().ollama_default_context {
         return Some((value, "config"));
     }
-    let settings = if placement == "cpu" {
+    let settings = if placement == Backend::Cpu {
         match &state.cpu_ollama {
             Some(settings) => Some(settings.read().await.clone()),
             None => None,
@@ -45,7 +47,7 @@ pub(super) async fn ollama_default_context(
     {
         return Some((value, "ollama_context_length"));
     }
-    if placement == "cpu" {
+    if placement == Backend::Cpu {
         return None;
     }
     if host_has_unified_memory() {
@@ -65,53 +67,52 @@ pub(super) async fn ollama_default_context(
     ))
 }
 
-fn backend_views(state: &PlatformState) -> Vec<(&'static str, String, &super::AdmissionPool)> {
-    let mut views = vec![("gpu", state.upstream.clone(), &state.gpu_admission)];
+fn backend_views(state: &PlatformState) -> Vec<(Backend, String, &super::AdmissionPool)> {
+    let mut views = vec![(Backend::Gpu, state.upstream.clone(), &state.gpu_admission)];
     if let Some(upstream) = &state.cpu_upstream {
-        views.push(("cpu", upstream.clone(), &state.cpu_admission));
+        views.push((Backend::Cpu, upstream.clone(), &state.cpu_admission));
     }
     views
 }
 
-fn adaptive_enabled(mode: runtime::AdaptiveMode, backend: &str) -> bool {
+fn adaptive_enabled(mode: runtime::AdaptiveMode, backend: Backend) -> bool {
     match mode {
         runtime::AdaptiveMode::Off => false,
-        runtime::AdaptiveMode::Cpu => backend == "cpu",
+        runtime::AdaptiveMode::Cpu => backend == Backend::Cpu,
         runtime::AdaptiveMode::All => true,
     }
 }
 
-pub(super) fn adaptive_applies(state: &PlatformState, backend: &str) -> bool {
+pub(super) fn adaptive_applies(state: &PlatformState, backend: Backend) -> bool {
     adaptive_enabled(state.tunables().adaptive_concurrency, backend)
 }
 
 /// Loaded runners per backend from `/api/ps`, or the error that prevented reading them.
 async fn loaded_models(state: &PlatformState) -> Vec<Value> {
     let mut loaded = Vec::new();
-    let (gpu, cpu) = super::backend_residency(state).await;
+    let (gpu, cpu) = super::catalog::backend_residency(state).await;
     for ((backend, upstream, _), result) in backend_views(state)
         .into_iter()
         .zip(std::iter::once(gpu).chain(cpu))
     {
         match result {
             Ok(ps) => {
-                state
+                let save = state
                     .footprints
                     .lock()
                     .await
                     .observe_resident(&upstream, &ps);
+                if let Some(save) = save {
+                    save.persist().await;
+                }
                 for entry in ps["models"].as_array().into_iter().flatten() {
-                    let name = entry
-                        .get("name")
-                        .or_else(|| entry.get("model"))
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    let usage = state.activity.usage(backend, name);
+                    let name = crate::ollama_http::ps_entry_name(entry).unwrap_or_default();
+                    let usage = state.activity.usage(backend.as_str(), name);
                     let size = entry["size"].as_u64().unwrap_or(0);
                     let vram = entry["size_vram"].as_u64().unwrap_or(0);
                     loaded.push(json!({
                         "backend": backend,
-                        "name": entry.get("name").or_else(|| entry.get("model")),
+                        "name": crate::ollama_http::ps_entry_name(entry),
                         "size_bytes": size,
                         "size_vram_bytes": vram,
                         "gpu_percent": vram.saturating_mul(100).checked_div(size).unwrap_or(0),
@@ -119,7 +120,7 @@ async fn loaded_models(state: &PlatformState) -> Vec<Value> {
                         "expires_at": entry.get("expires_at"),
                         "pinned": state.tunables().pinned_models.contains(name),
                         "active_tasks": usage.active,
-                        "recent_uses": (usage.recent_uses * 100.0).round() / 100.0,
+                        "recent_uses": super::residency::round(usage.recent_uses),
                         "idle_seconds": usage.idle_seconds.map(f64::round),
                         "measured_load_seconds": usage.load_ms.map(|ms| (ms / 10.0).round() / 100.0),
                     }));
@@ -141,7 +142,7 @@ pub(super) async fn status(State(state): State<PlatformState>) -> Json<Value> {
         .into_iter()
         .map(|(backend, upstream, pool)| {
             (
-                backend.to_owned(),
+                backend.as_str().to_owned(),
                 json!({
                     "upstream": upstream,
                     "admission": pool.receipt(),
@@ -149,13 +150,13 @@ pub(super) async fn status(State(state): State<PlatformState>) -> Json<Value> {
                         pool,
                         adaptive_enabled(tunables.adaptive_concurrency, backend),
                     ),
-                    "circuit": breakers.get(backend).cloned()
+                    "circuit": breakers.get(backend.as_str()).cloned()
                         .unwrap_or_else(|| json!({"state": "closed"})),
                 }),
             )
         })
         .collect::<serde_json::Map<_, _>>();
-    let default_context = ollama_default_context(&state, None, "gpu").await;
+    let default_context = ollama_default_context(&state, None, Backend::Gpu).await;
     let observation = &snapshot.observation;
     let gpu_settings = state.ollama.read().await.receipt();
     let cpu_settings = match &state.cpu_ollama {
@@ -182,6 +183,7 @@ pub(super) async fn status(State(state): State<PlatformState>) -> Json<Value> {
             "load_average_one_minute": observation.load_average_one_minute,
             "logical_cpus": observation.logical_cpus,
             "thermal_throttled": observation.thermal_throttled,
+            "thermal_pressure": observation.thermal_pressure,
             "gpu_memory_total_bytes": observation.gpu_memory_total_bytes,
             "gpu_memory_free_bytes": observation.gpu_memory_free_bytes,
             "gpu_telemetry_source": observation.gpu_telemetry_source,
@@ -240,7 +242,7 @@ pub(super) async fn config(State(state): State<PlatformState>) -> Json<Value> {
 }
 
 pub(super) async fn reload_config(State(state): State<PlatformState>) -> Response {
-    match state.runtime.reload(true) {
+    match state.runtime.reload_off_runtime(true).await {
         Ok(changed) => {
             state.apply_tunables();
             let mut receipt = state.runtime.receipt();
@@ -255,19 +257,17 @@ pub(super) async fn reload_config(State(state): State<PlatformState>) -> Respons
     }
 }
 
-#[allow(clippy::cast_precision_loss)]
-fn float(value: u64) -> f64 {
-    value as f64
-}
-
-#[allow(clippy::too_many_lines)] // One flat list of gauge families is easier to audit than helpers.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one flat list of gauge families is easier to audit than helpers"
+)]
 pub(super) async fn metrics(State(state): State<PlatformState>) -> Response {
     state.refresh_ollama_settings().await;
     let snapshot = state.resources.snapshot().await;
     let tunables = state.tunables();
     let mut gauges = Vec::new();
     let views = backend_views(&state);
-    let receipts: Vec<(&str, Value)> = views
+    let receipts: Vec<(Backend, Value)> = views
         .iter()
         .map(|(backend, _, pool)| (*backend, pool.receipt()))
         .collect();
@@ -278,7 +278,7 @@ pub(super) async fn metrics(State(state): State<PlatformState>) -> Response {
                        counter: bool| {
         for (backend, receipt) in &receipts {
             let gauge = Gauge::new(name, help, receipt[field].as_f64().unwrap_or(0.0))
-                .label("backend", *backend);
+                .label("backend", backend.as_str());
             gauges.push(if counter { gauge.counter() } else { gauge });
         }
     };
@@ -348,14 +348,14 @@ pub(super) async fn metrics(State(state): State<PlatformState>) -> Response {
 
     let breakers = state.breakers.receipt();
     for (backend, _) in &receipts {
-        let open = breakers[*backend]["state"] == "open";
+        let open = breakers[backend.as_str()]["state"] == "open";
         gauges.push(
             Gauge::new(
                 "freellama_circuit_open",
                 "1 while the upstream circuit breaker is open.",
                 if open { 1.0 } else { 0.0 },
             )
-            .label("backend", *backend),
+            .label("backend", backend.as_str()),
         );
     }
     for (backend, _) in &receipts {
@@ -363,13 +363,13 @@ pub(super) async fn metrics(State(state): State<PlatformState>) -> Response {
             Gauge::new(
                 "freellama_adaptive_concurrency_enabled",
                 "1 when adaptive concurrency controls this backend.",
-                if adaptive_enabled(tunables.adaptive_concurrency, backend) {
+                if adaptive_enabled(tunables.adaptive_concurrency, *backend) {
                     1.0
                 } else {
                     0.0
                 },
             )
-            .label("backend", *backend),
+            .label("backend", backend.as_str()),
         );
     }
 

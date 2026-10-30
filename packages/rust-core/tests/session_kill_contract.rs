@@ -15,8 +15,6 @@ use std::{
 use tokio::sync::Notify;
 use tower::ServiceExt;
 
-mod common;
-
 async fn call(platform: &Router, path: &str, body: Value) -> (StatusCode, Value) {
     let response = platform
         .clone()
@@ -113,7 +111,7 @@ async fn fixture() -> (
         axum::serve(listener, mock).await.unwrap();
     });
     let platform = freellama::platform::app(
-        &common::platform_config("127.0.0.1:11435", upstream, None, None, "embed-model")
+        &crate::support::platform_config("127.0.0.1:11435", upstream, None, None)
             .with_max_concurrent_tasks(1)
             .with_max_queue_wait(Duration::from_secs(5)),
     )
@@ -245,39 +243,5 @@ async fn kill_cancels_waiting_batch_items_without_dispatching_them_to_ollama() {
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     release.notify_one();
     assert_eq!(running.await.unwrap().0, StatusCode::OK);
-    server.abort();
-}
-
-#[tokio::test]
-async fn kill_also_cancels_session_scoped_intent_inference() {
-    let (platform, started, release, _, server) = fixture().await;
-    let id = session(&platform).await;
-    let running = {
-        let platform = platform.clone();
-        let input = json!({"text":"Summarize a paragraph", "session_id":id});
-        tokio::spawn(async move { call(&platform, "/_freellama/v1/natural-routes", input).await })
-    };
-    tokio::time::timeout(Duration::from_secs(2), started.notified())
-        .await
-        .unwrap();
-    assert_eq!(
-        call(
-            &platform,
-            &format!("/_freellama/v1/sessions/{id}/kill"),
-            json!({})
-        )
-        .await
-        .0,
-        StatusCode::OK
-    );
-    assert_eq!(
-        tokio::time::timeout(Duration::from_secs(2), running)
-            .await
-            .unwrap()
-            .unwrap()
-            .1["code"],
-        "session_killed"
-    );
-    release.notify_one();
     server.abort();
 }

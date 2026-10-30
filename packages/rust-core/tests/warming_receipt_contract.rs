@@ -11,7 +11,6 @@ use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use tower::ServiceExt;
-mod common;
 
 struct Fixture {
     platform: Router,
@@ -77,12 +76,11 @@ async fn fixture(load_response: Value, ps_response: Result<Value, StatusCode>) -
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
-    let platform = app(&common::platform_config(
+    let platform = app(&crate::support::platform_config(
         "127.0.0.1:11435",
         endpoint,
         None,
         None,
-        "intent:separate",
     ))
     .unwrap();
     Fixture {

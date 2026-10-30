@@ -2,14 +2,14 @@
 //! introspection, benchmark/policy file loaders, capability parsing) that the server plane in
 //! `mod.rs` calls but that carry no request state of their own.
 
-use std::{collections::BTreeMap, path::PathBuf, process::Command, sync::OnceLock};
+use std::{collections::BTreeMap, path::PathBuf, sync::OnceLock, time::Duration};
 
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
 use crate::model_bench::{AllModelsReport, Capability};
 
-use super::TaskKind;
+use super::{ModelRequestDefaults, TaskKind};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct MachineProfile {
@@ -18,7 +18,7 @@ pub struct MachineProfile {
     pub chip: Option<String>,
     pub logical_cpus: usize,
     /// Total physical system memory. This is the portable capacity input used for model-fit
-    /// recommendations; it does not imply that a discrete GPU can address all of it.
+    /// checks; it does not imply that a discrete GPU can address all of it.
     pub memory_bytes: Option<u64>,
     /// `unified` only when the host memory is known to be shared with the accelerator. Other
     /// systems report `system`; GPU VRAM remains Ollama's responsibility and is observed through
@@ -30,6 +30,27 @@ pub struct MachineProfile {
     pub unified_memory_bytes: Option<u64>,
     pub available_disk_bytes: Option<u64>,
     pub ollama_endpoint: String,
+    /// The host GPU as the OS reports it: Apple accelerator model and core count from the I/O
+    /// registry, or NVIDIA name and memory from `nvidia-smi`. `None` when neither is readable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu: Option<GpuProfile>,
+    /// Performance and efficiency core counts on hybrid CPUs (`hw.perflevel0/1.logicalcpu` on
+    /// macOS); `None` where the OS does not split them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub performance_cpus: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub efficiency_cpus: Option<usize>,
+}
+
+/// One GPU as named by its driver.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GpuProfile {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cores: Option<u32>,
+    /// Dedicated memory; `None` for unified memory, which `memory_bytes` already counts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_bytes: Option<u64>,
 }
 
 pub(super) fn load_benchmark(
@@ -60,7 +81,7 @@ pub(super) fn load_benchmark(
 #[serde(deny_unknown_fields)]
 struct PolicyFile {
     schema_version: u32,
-    /// Set by `policy-from-eval --allow-smoke`. A smoke file must not unlock `medium` at runtime.
+    /// Set by `freellama policy from-eval --allow-smoke`. A smoke file must not unlock `medium` at runtime.
     #[serde(default)]
     smoke: bool,
     #[serde(default)]
@@ -71,11 +92,23 @@ struct PolicyFile {
 #[serde(deny_unknown_fields)]
 struct TaskPolicy {
     qualified_models: Vec<String>,
+    /// Request defaults per exact model tag, applied when routing picks that model for the task.
+    #[serde(default)]
+    model_options: BTreeMap<String, ModelRequestDefaults>,
 }
 
-pub(super) fn load_policies(path: Option<&PathBuf>) -> Result<BTreeMap<TaskKind, Vec<String>>> {
+/// Task policies loaded from the policy file.
+#[derive(Debug, Default)]
+pub(super) struct Policies {
+    /// Quality-qualified models per task, best first.
+    pub(super) qualified: BTreeMap<TaskKind, Vec<String>>,
+    /// Request defaults per task and exact model tag.
+    pub(super) model_options: BTreeMap<TaskKind, BTreeMap<String, ModelRequestDefaults>>,
+}
+
+pub(super) fn load_policies(path: Option<&PathBuf>) -> Result<Policies> {
     let Some(path) = path else {
-        return Ok(BTreeMap::new());
+        return Ok(Policies::default());
     };
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("read policy file {}", path.display()))?;
@@ -102,12 +135,29 @@ pub(super) fn load_policies(path: Option<&PathBuf>) -> Result<BTreeMap<TaskKind,
                 .all(|model| !model.trim().is_empty()),
             "policy {task:?} contains an empty model"
         );
+        ensure!(
+            policy
+                .model_options
+                .keys()
+                .all(|model| !model.trim().is_empty()),
+            "policy {task:?} has model_options for an empty model"
+        );
+        for (model, options) in &policy.model_options {
+            ensure!(
+                options.num_predict != Some(0),
+                "policy {} model_options for {model:?}: num_predict must be at least 1",
+                task.as_str()
+            );
+        }
     }
-    Ok(file
-        .policies
-        .into_iter()
-        .map(|(task, policy)| (task, policy.qualified_models))
-        .collect())
+    let mut policies = Policies::default();
+    for (task, policy) in file.policies {
+        policies.qualified.insert(task, policy.qualified_models);
+        if !policy.model_options.is_empty() {
+            policies.model_options.insert(task, policy.model_options);
+        }
+    }
+    Ok(policies)
 }
 
 pub(super) fn parse_capability(value: &str) -> Option<Capability> {
@@ -136,11 +186,118 @@ pub fn machine_profile(upstream: &str) -> MachineProfile {
         unified_memory_bytes: unified_memory.then_some(memory_bytes).flatten(),
         available_disk_bytes: available_disk_bytes(),
         ollama_endpoint: upstream.to_owned(),
+        gpu: cached_gpu(),
+        performance_cpus: cpu_split().0,
+        efficiency_cpus: cpu_split().1,
     }
 }
 
+fn cached_gpu() -> Option<GpuProfile> {
+    static GPU: OnceLock<Option<GpuProfile>> = OnceLock::new();
+    GPU.get_or_init(gpu_profile).clone()
+}
+
+#[cfg(target_os = "macos")]
+fn gpu_profile() -> Option<GpuProfile> {
+    let (_, text) = super::resources::bounded_output(
+        "/usr/sbin/ioreg",
+        &["-r", "-c", "AGXAccelerator", "-l"],
+        COMMAND_TIMEOUT,
+    )?;
+    parse_apple_gpu(&text)
+}
+
+#[cfg(target_os = "linux")]
+fn gpu_profile() -> Option<GpuProfile> {
+    command_output(
+        "nvidia-smi",
+        &[
+            "--query-gpu=name,memory.total",
+            "--format=csv,noheader,nounits",
+        ],
+    )
+    .and_then(|text| parse_nvidia_gpu(&text))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn gpu_profile() -> Option<GpuProfile> {
+    None
+}
+
+/// The first Apple accelerator's `model` and `gpu-core-count` registry properties.
+#[cfg(any(target_os = "macos", test))]
+fn parse_apple_gpu(text: &str) -> Option<GpuProfile> {
+    let property = |name: &str| {
+        text.lines().find_map(|line| {
+            let line = line.trim_start_matches([' ', '\t', '|']);
+            let rest = line.strip_prefix(&format!("\"{name}\" = "))?;
+            Some(rest.trim().trim_matches('"').to_owned())
+        })
+    };
+    Some(GpuProfile {
+        name: property("model").filter(|name| !name.is_empty())?,
+        cores: property("gpu-core-count").and_then(|value| value.parse().ok()),
+        memory_bytes: None,
+    })
+}
+
+/// The first line of `nvidia-smi --query-gpu=name,memory.total` (MiB).
+#[cfg(any(target_os = "linux", test))]
+fn parse_nvidia_gpu(text: &str) -> Option<GpuProfile> {
+    let (name, memory) = text.lines().next()?.rsplit_once(',')?;
+    Some(GpuProfile {
+        name: name.trim().to_owned(),
+        cores: None,
+        memory_bytes: memory
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .and_then(|mib| mib.checked_mul(1024 * 1024)),
+    })
+    .filter(|gpu| !gpu.name.is_empty())
+}
+
+#[cfg(target_os = "macos")]
+fn cpu_split() -> (Option<usize>, Option<usize>) {
+    let level =
+        |name: &str| command_output("sysctl", &["-n", name]).and_then(|value| value.parse().ok());
+    (
+        level("hw.perflevel0.logicalcpu"),
+        level("hw.perflevel1.logicalcpu"),
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+const fn cpu_split() -> (Option<usize>, Option<usize>) {
+    (None, None)
+}
+
+/// [`machine_profile`] off the async runtime: it may spawn `df`, `sysctl` or `PowerShell`.
+pub(crate) async fn machine_profile_off_runtime(upstream: &str) -> MachineProfile {
+    let owned = upstream.to_owned();
+    tokio::task::spawn_blocking(move || machine_profile(&owned))
+        .await
+        .unwrap_or_else(|_| {
+            let (memory_kind, _) = memory_semantics(std::env::consts::OS, std::env::consts::ARCH);
+            MachineProfile {
+                os: std::env::consts::OS.to_owned(),
+                architecture: std::env::consts::ARCH.to_owned(),
+                chip: None,
+                logical_cpus: std::thread::available_parallelism().map_or(1, usize::from),
+                memory_bytes: None,
+                memory_kind,
+                unified_memory_bytes: None,
+                available_disk_bytes: None,
+                ollama_endpoint: upstream.to_owned(),
+                gpu: None,
+                performance_cpus: None,
+                efficiency_cpus: None,
+            }
+        })
+}
+
 /// Physical RAM does not change while serve runs, and reading it spawns `sysctl` (macOS) or
-/// `PowerShell` (Windows); the managed hot path used to do that several times per task.
+/// `PowerShell` (Windows), so the value is read once and cached.
 pub fn host_total_memory_bytes() -> Option<u64> {
     static TOTAL: OnceLock<Option<u64>> = OnceLock::new();
     *TOTAL.get_or_init(total_memory_bytes)
@@ -273,18 +430,45 @@ fn parse_linux_cpuinfo(text: &str) -> Option<String> {
         })
 }
 
+/// Deadline for one machine-discovery command; `PowerShell` can take seconds to start.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+
 fn command_output(command: &str, args: &[&str]) -> Option<String> {
-    let output = Command::new(command).args(args).output().ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    let (success, text) = super::resources::bounded_output(command, args, COMMAND_TIMEOUT)?;
+    success
+        .then(|| text.trim().to_owned())
         .filter(|value| !value.is_empty())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{machine_profile, memory_semantics, parse_linux_cpuinfo, parse_linux_meminfo};
+    use super::{
+        GpuProfile, machine_profile, memory_semantics, parse_apple_gpu, parse_linux_cpuinfo,
+        parse_linux_meminfo, parse_nvidia_gpu,
+    };
+
+    #[test]
+    fn gpu_profiles_parse_apple_registry_and_nvidia_smi() {
+        let ioreg = "+-o AGXAcceleratorG14X  <class AGXAcceleratorG14X, id 0x1000003f8>\n    {\n      \"gpu-core-count\" = 19\n      \"model\" = \"Apple M2 Pro\"\n    }\n";
+        assert_eq!(
+            parse_apple_gpu(ioreg),
+            Some(GpuProfile {
+                name: "Apple M2 Pro".into(),
+                cores: Some(19),
+                memory_bytes: None
+            })
+        );
+        assert_eq!(parse_apple_gpu("no accelerator"), None);
+        assert_eq!(
+            parse_nvidia_gpu("NVIDIA GeForce RTX 4090, 24564\nNVIDIA GeForce RTX 4090, 24564\n"),
+            Some(GpuProfile {
+                name: "NVIDIA GeForce RTX 4090".into(),
+                cores: None,
+                memory_bytes: Some(24_564 * 1024 * 1024),
+            })
+        );
+        assert_eq!(parse_nvidia_gpu(""), None);
+    }
 
     #[test]
     fn machine_profile_reports_portable_host_capacity() {

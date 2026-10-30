@@ -9,7 +9,7 @@ memory checks, and model transitions for each backend; the operator configures t
 eligible tags. A configured CPU backend is intent: inspect the placement observation before
 treating it as proof of CPU execution.
 
-This configuration is useful for embeddings, intent interpretation, and other small helper models.
+This configuration is useful for embeddings, short classification, and other small helper models.
 Benchmark large CPU workloads before adopting them. Apple silicon shares memory bandwidth; systems
 with discrete GPUs have different contention and transfer costs, so neither result transfers
 without measurement.
@@ -28,7 +28,9 @@ machine-specific:
 
 `doctor` reports `machine.memory_bytes` on macOS, Linux, and Windows. It reports
 `machine.unified_memory_bytes` only when unified memory is known; that compatibility field is not a
-VRAM estimate on discrete-GPU hosts. Model-library fit is therefore a host-memory preflight, and
+VRAM estimate on discrete-GPU hosts. `machine.gpu` names the accelerator when the OS reports it
+(Apple model and core count, or NVIDIA name and memory on Linux), and `performance_cpus` /
+`efficiency_cpus` split hybrid CPUs on macOS. These are identity facts, not placement proof. Model-library fit is therefore a host-memory preflight, and
 actual accelerator placement must come from Ollama's resident-runner report.
 
 An agent can choose `auto`, `prefer_cpu`, or `prefer_gpu`, but it cannot invent topology. The
@@ -352,7 +354,6 @@ and `execution.lifecycle`; a failed unload is reported without discarding the co
 Prefer the following assignments:
 
 - Small embedding models
-- Lightweight intent models
 - Short extraction or classification helpers with measured CPU behavior
 
 Benchmark these assignments before adopting them:

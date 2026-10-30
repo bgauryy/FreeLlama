@@ -1,7 +1,7 @@
 //! Read-only, model-aware execution previews. No permits or model loads occur here.
 use super::{
-    PlatformState, TaskKind,
-    execution::{ManagedDecision, model_memory_requirement, upstream_is_loopback},
+    Backend, PlatformState, TaskKind,
+    execution::{ManagedDecision, model_memory_requirement},
     resources::{ResourceCapacityAssessment, ResourceDemand, ResourceSnapshot},
 };
 use serde::Serialize;
@@ -46,8 +46,9 @@ pub(super) async fn assess(
         ResourceDemand::resident()
     } else {
         ResourceDemand::load(required)
-    };
-    let assessment = upstream_is_loopback(&decision.execution.upstream)
+    }
+    .on_cpu(decision.execution.placement == Backend::Cpu);
+    let assessment = crate::net::is_loopback_url(&decision.execution.upstream)
         .then(|| resources.assess_demand(demand, false));
     let task_cost = task_cost
         .min(u32::try_from(decision.execution.admission.total()).unwrap_or(u32::MAX))
@@ -67,10 +68,15 @@ pub(super) async fn assess(
         Some(value) if value.status == "ready_telemetry_unknown" && queue_capacity > 0 => {
             "runnable_telemetry_unknown"
         }
+        Some(value) if value.memory_advisory.is_some() && queue_capacity > 0 => {
+            "runnable_low_memory_estimate"
+        }
         _ => queue_readiness,
     };
     let capacity = match assessment.as_ref() {
         Some(value) if !value.admissible => 0,
+        // The low estimate does not refuse this task, but it gives no headroom for siblings.
+        Some(value) if value.memory_advisory.is_some() => queue_capacity.min(1),
         Some(value) if required > 0 => {
             value
                 .effective_available_bytes

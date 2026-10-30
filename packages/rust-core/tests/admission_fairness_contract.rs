@@ -46,12 +46,11 @@ async fn controlled_platform(
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
-    let platform = app(&common::platform_config(
+    let platform = app(&crate::support::platform_config(
         "127.0.0.1:11435",
         format!("http://{address}"),
         None,
         None,
-        "test:latest",
     )
     .with_max_concurrent_tasks(2)
     .with_max_queue_wait(queue_wait))
@@ -180,7 +179,7 @@ async fn cancelling_a_capacity_reservation_unblocks_smaller_work() {
 }
 
 #[tokio::test]
-async fn raw_execution_cannot_extend_managed_or_intent_queue_deadlines() {
+async fn raw_execution_cannot_extend_managed_queue_deadlines() {
     let (platform, mut receive, server) = controlled_platform(Duration::from_millis(80)).await;
     let raw_platform = platform.clone();
     let raw = tokio::spawn(async move {
@@ -195,36 +194,31 @@ async fn raw_execution_cannot_extend_managed_or_intent_queue_deadlines() {
             .unwrap()
     });
     let release_raw = started(&mut receive, "raw").await;
-    for path in ["/_freellama/v1/tasks", "/_freellama/v1/natural-routes"] {
-        let input = if path.ends_with("natural-routes") {
-            json!({"text":"answer a short question"})
-        } else {
-            json!({"task":"embedding","model":"test:latest","objective":"fastest","input":"blocked"})
-        };
-        let response = tokio::time::timeout(
-            Duration::from_secs(1),
-            platform.clone().oneshot(
-                Request::post(path)
-                    .header("content-type", "application/json")
-                    .body(Body::from(input.to_string()))
-                    .unwrap(),
-            ),
-        )
-        .await
-        .expect("transition waiting must use the configured queue deadline")
-        .unwrap();
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        assert!(String::from_utf8_lossy(&body).contains("transition"));
-        assert_eq!(
-            health(&platform).await["backends"]["gpu"]["admission"]["slots_available"],
-            2
-        );
-        assert!(
-            receive.try_recv().is_err(),
-            "timed out work must not reach upstream"
-        );
-    }
+    let input =
+        json!({"task":"embedding","model":"test:latest","objective":"fastest","input":"blocked"});
+    let response = tokio::time::timeout(
+        Duration::from_secs(1),
+        platform.clone().oneshot(
+            Request::post("/_freellama/v1/tasks")
+                .header("content-type", "application/json")
+                .body(Body::from(input.to_string()))
+                .unwrap(),
+        ),
+    )
+    .await
+    .expect("transition waiting must use the configured queue deadline")
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("transition"));
+    assert_eq!(
+        health(&platform).await["backends"]["gpu"]["admission"]["slots_available"],
+        2
+    );
+    assert!(
+        receive.try_recv().is_err(),
+        "timed out work must not reach upstream"
+    );
     release_raw.send(()).unwrap();
     let response = raw.await.unwrap();
     to_bytes(response.into_body(), usize::MAX).await.unwrap();
@@ -236,4 +230,3 @@ async fn raw_execution_cannot_extend_managed_or_intent_queue_deadlines() {
     assert_eq!(followup.await.unwrap(), StatusCode::OK);
     server.abort();
 }
-mod common;

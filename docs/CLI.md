@@ -2,7 +2,7 @@
 
 The `freellama` command starts and inspects the local management layer that agents use to offload
 work. It exposes diagnostics, model routing, managed execution, resource controls, benchmarking,
-and Ollama-compatible passthrough. Use the [README quick start](../README.md#quick-start) for first
+and Ollama-compatible passthrough. Use the [README CLI section](https://github.com/bgauryy/FreeLlama/blob/main/README.md#use-from-the-terminal-cli) for first
 use and this reference to look up commands and controls.
 
 ## Choose a command
@@ -12,13 +12,12 @@ flowchart TD
     Q{"What do you need?"}
     Q -->|"Prepare first use"| I["init"]
     Q -->|"Inspect this machine"| D["doctor or machine"]
-    Q -->|"Inspect or choose a model"| M["models, route, or recommend"]
-    Q -->|"Execute a managed request"| T["session, natural-route, or task"]
+    Q -->|"Inspect or choose a model"| M["models or route"]
+    Q -->|"Execute a managed request"| T["session or task"]
     Q -->|"Run the control plane"| S["serve"]
     Q -->|"Preserve only Ollama APIs"| P["proxy"]
-    Q -->|"Measure or compare"| B["bench-all, run, or eval"]
-    Q -->|"Create a routing policy"| E["policy-from-eval"]
-    Q -->|"Compare CLI and MCP"| L["tools"]
+    Q -->|"Measure models"| B["bench-all"]
+    Q -->|"Write a routing policy"| PE["policy from-eval"]
 ```
 
 | Command | Purpose | Needs `freellama serve` |
@@ -35,17 +34,12 @@ flowchart TD
 | `scope` | Create, inspect, fork, or delete bounded message history | Yes |
 | `warm` | Warm an installed model through managed admission | Yes |
 | `route` | Choose a model and request profile without executing it | Yes |
-| `recommend` | Return an installed route or a reviewed installation plan | Yes |
-| `natural-route` | Convert natural language to a route intent locally, then route it | Yes |
 | `task` | Route and execute one nonstreaming task | Yes |
 | `jobs` | List, inspect, cancel, or remove deferred tasks and warming operations | Yes |
 | `proxy` | Run only the Ollama-compatible retry and telemetry sidecar | No |
 | `bench-all` | Measure installed models by capability group | No |
-| `policy-from-eval` | Generate policy from quality-evaluation pass rates | No |
-| `tools` | Print MCP tools and their CLI equivalents | No |
+| `policy from-eval` | Write a task policy (`platform.toml`) from a quality-evaluation aggregate and the installed tags | No |
 | `doctor` | Inspect Ollama, hardware, versions, and effective settings | No |
-| `run` | Run a frozen suite against one Ollama build | No |
-| `eval` | Compare the same frozen suite against stock and candidate builds | No |
 
 Run `npx @octocodeai/freellama <command> --help` for every accepted flag and enum value. The executable's help
 is authoritative; this page explains how the commands fit together.
@@ -53,13 +47,16 @@ is authoritative; this page explains how the commands fit together.
 ## Start the control plane
 
 ```bash
-npx @octocodeai/freellama serve --recommendation-catalog recommendations.example.toml
+npx @octocodeai/freellama serve
 ```
 
 The default listener is `http://127.0.0.1:11435`, and the default Ollama upstream is
 `http://127.0.0.1:11434`. Use `--listen` and `--upstream` to change them. Nonloopback listeners
 require `--allow-remote` and a token from `--auth-token-file` or
-`FREELLAMA_AUTH_TOKEN_FILE`. Authentication applies to managed and passthrough routes.
+`FREELLAMA_AUTH_TOKEN_FILE`. Authentication applies to managed and passthrough routes. The token
+file must be a regular file, not a symlink, and hold one token of at least 32 bytes; surrounding
+whitespace is trimmed. On Unix it must also be owner-only (mode 0600). Windows file permissions
+(ACLs) are not checked, so protect the file with your user profile's permissions there.
 
 `serve` persists bounded adaptive feedback under the platform data directory by default. Override
 the path with `--feedback-file`; use `--ephemeral-feedback` only for disposable runs. See the
@@ -98,8 +95,8 @@ placement.
 
 ### Bound admission
 
-`--max-concurrent-tasks` is the primary/GPU cost budget, not a request count. Without a flag,
-environment variable, or runtime-file value it defaults to 2 units per `OLLAMA_NUM_PARALLEL` slot of
+`--max-concurrent-tasks` is the primary/GPU cost budget, not a request count. Without a flag or
+runtime-file value it defaults to 2 units per `OLLAMA_NUM_PARALLEL` slot of
 the Ollama server (read from its process environment where visible; Ollama's own default is 1, so 2).
 `freellama config` shows the effective value and where it came from.
 `--cpu-max-concurrent-tasks` controls the independent CPU pool and defaults to 1. Default base costs
@@ -133,19 +130,27 @@ context sizing, can also live in a runtime file (`--runtime-config`) that `serve
 changes. See [Monitoring and live tuning](MONITORING.md). The standalone
 `proxy` command keeps its cap opt-in for compatibility.
 
-The local host-pressure gate defaults to holding below 15% available RAM and resuming above 20%
-after two healthy samples; minimum reserves are 1 GiB and 2 GiB, respectively. Tune the percentages
-with `--resource-hold-available-percent` and `--resource-resume-available-percent`; the hold value
-must be lower than the resume value, and neither can exceed 100. Health reports the policy, sampled
-signals, unknown measurements, and reserved memory. These flags do not change Ollama or OS settings.
+The local host-pressure gate reports low available RAM below 15% and clears it above 20% after two
+healthy samples; minimum reserves are 1 GiB and 2 GiB, respectively. Tune the percentages with
+`--resource-hold-available-percent` and `--resource-resume-available-percent`; the hold value must be
+lower than the resume value, and neither can exceed 100. Health reports the policy, sampled signals,
+unknown measurements, and reserved memory. These flags do not change Ollama or OS settings.
 
-The reserve applies to every new managed load, not only to the pressure gate: a task is admitted
-when effective available RAM covers already-reserved bytes, the task's estimated bytes, and the
-reserve (the hold reserve normally; the larger resume reserve while capacity is recovering).
-Effective available RAM is free memory plus a bounded reclaimable estimate, so it can be far lower
-than the OS "free" percentage. A refusal reports `assessment.status: "held_insufficient_capacity"`
-with `required_with_reserve_bytes` and `effective_available_bytes`; free memory, choose a smaller
-model, or lower the percentages deliberately.
+On macOS, low available RAM is advisory and never refuses a task. Effective available RAM is free
+memory plus a bounded reclaimable estimate, so it can be far lower than what the OS can actually
+reclaim. When it does not cover already-reserved bytes, the task's estimated bytes, and the reserve,
+FreeLlama first unloads idle unpinned runners, then dispatches anyway: the receipt reports
+`status: "admitted_low_memory_estimate"` and `assessment.memory_advisory: "below_reserve"` with
+`required_with_reserve_bytes` and `effective_available_bytes`. Ollama and the OS decide whether the
+load fits. On Linux, Windows, and other platforms, where available RAM already counts reclaimable
+cache (and is the hard cap in a container), the same shortfall unloads idle runners and then holds the
+new load with `held_insufficient_capacity` until capacity returns, refusing with 503 at its deadline.
+OS memory pressure holds work on every platform. Active swapping and low RAM hold new loads only:
+an already-resident runner adds no memory and stays admitted. CPU-load (one-minute load at or above
+1.5 per logical CPU) and thermal-throttling holds apply to CPU-assigned work and to cold loads, which
+decode weights on the host cores and add a new heat source; a bounded request on a runner already
+resident on the GPU neither waits for the cores nor cools the package by waiting, so it proceeds. The receipt's `resource_admission.assessment.held_by`
+lists the holds that applied to the request.
 Both `serve` and `proxy` accept `--resource-telemetry-policy`:
 
 - `require-memory` (default): wait or refuse local inference when available RAM is unknown, including
@@ -163,7 +168,7 @@ its phase and omits estimates that were not obtained.
 
 See [resource admission](ARCHITECTURE.md#managed-task-execution) for scope and limitations.
 
-`route`, `recommend`, and `task` accept
+`route` and `task` accept
 `--execution-preference auto|prefer-cpu|prefer-gpu`. This is a fallback-capable hint over models
 already assigned by the operator; it never rewrites raw passthrough and never makes an ineligible
 model eligible. Preview the route and inspect the `execution` receipt to confirm whether the hint
@@ -203,13 +208,6 @@ without them it falls back to capability/context-compatible models and reports l
 and missing quality evidence. `quality` requires a policy unless you supply an explicit model.
 An explicit minimum-confidence gate still refuses insufficient evidence in every objective.
 
-`recommend` is side-effect-free. If no installed model qualifies, it can return an installation
-plan from the reviewed recommendation catalog, but it never pulls a model.
-
-`natural-route` asks the configured local intent model to produce structured intent, validates that
-intent, and then invokes the same deterministic router as `route`. It does not let the intent model
-choose the final model directly.
-
 ## Execute tasks
 
 The prompt for `task` is positional:
@@ -233,6 +231,8 @@ Useful task options include:
 - `--priority interactive|normal|background` for fair admission scheduling.
 - `--max-wait-seconds` for a shorter admission/resource wait budget.
 - `--timeout-seconds` for a total deadline including discovery, waiting, loading, and inference.
+- `--stop-on-repetition` to stream the task and stop once the output repeats itself, keeping all
+  generated text.
 - `--defer` to return a job ID immediately.
 
 Inspect deferred work with `jobs`, retrieve a result with `jobs --id <uuid>`, and cancel one task
@@ -266,7 +266,7 @@ benchmark record for the selected model.
 
 ```mermaid
 flowchart LR
-    Q["Quality evaluation aggregate"] --> P["policy-from-eval"]
+    Q["Quality evaluation aggregate"] --> P["freellama policy from-eval"]
     P --> PF["platform.toml"]
     T["Local throughput benchmark"] --> BR["benchmark-report.json"]
     PF --> S["freellama serve"]
@@ -274,36 +274,64 @@ flowchart LR
     S --> C["Medium confidence for configured, measured routes"]
 ```
 
-Generate the policy from correctness data and the benchmark report from local runtime data:
+Generate the policy from correctness data with `policy from-eval` and the benchmark report from
+local runtime data:
 
 ```bash
-npx @octocodeai/freellama policy-from-eval \
-  --aggregate benchmark/local/results/MODEL/aggregate.json \
+npx @octocodeai/freellama policy from-eval \
+  --aggregate aggregate.json \
   --task coding \
   --min-pass 0.8 \
   --out platform.toml
 
 npx @octocodeai/freellama bench-all --output benchmark-report.json
-npx @octocodeai/freellama serve --recommendation-catalog recommendations.example.toml
+npx @octocodeai/freellama serve
 ```
 
-`serve` discovers `platform.toml` and `benchmark-report.json` in its working directory. Explicit
-`--policy-file` and `--benchmark-report` values take precedence.
+`serve` resolves each file in this order: the explicit flag, its environment variable, the working
+directory, then the per-user config directory (`$XDG_CONFIG_HOME/freellama/` or
+`~/.config/freellama/`; `%APPDATA%\FreeLlama\` on Windows).
+
+| File | Flag | Environment variable | Discovered name |
+|---|---|---|---|
+| Task policy | `--policy-file` | `FREELLAMA_POLICY_FILE` | `platform.toml` |
+| Benchmark report | `--benchmark-report` | `FREELLAMA_BENCHMARK_REPORT` | `benchmark-report.json` |
+
+A task policy file has this shape:
+
+```toml
+schema_version = 1
+
+[policies.code_repair]
+qualified_models = ["qwen3.8:27b-mlx"]   # best first; quality-qualified only
+
+# Optional request defaults for one exact tag on this task: think and num_predict (>= 1).
+[policies.code_repair.model_options."qwen3.8:27b-mlx"]
+think = false
+num_predict = 512
+```
+
+`serve` rejects unknown fields, including `num_ctx`: context size is routing-owned, so set
+`context_tokens` per request instead. Caller request options win over `model_options`, and
+`think = true` applies only to models with the thinking capability. See the annotated
+[platform.example.toml](https://github.com/bgauryy/FreeLlama/blob/main/platform.example.toml).
+
+The MCP server autostarts `serve` with its own environment and an arbitrary working directory, so
+put a machine-wide policy in the config directory or set the variables in the MCP client's `env`.
+`serve` prints each file it picked up.
 
 Replace `MODEL` with the directory containing your completed quality-evaluation aggregate.
 
-`policy-from-eval` reads `pass_at_1`, not the throughput produced by `bench-all`. It refuses expired
-aggregates and fewer than three trials unless `--allow-smoke` is explicit, and it skips models that
-are not installed. This prevents speed data from being mislabeled as quality evidence.
+`policy from-eval` reads `pass_at_1`, not the throughput produced by `bench-all`. It refuses
+expired aggregates and fewer than three trials unless `--allow-smoke` is explicit, and it skips
+models that are not installed on `--ollama-endpoint` (default `FREELLAMA_OLLAMA_ENDPOINT`, then
+`http://127.0.0.1:11434`). This prevents speed data from being mislabeled as quality evidence.
+It accepts the task kinds `route` accepts, with `-` or `_` (`code-repair` or `code_repair`), writes
+to stdout unless `--out` is given, and reports a refusal as one `error: ...` line with exit status 1.
 
 ## Compare the CLI and MCP surfaces
 
-```bash
-npx @octocodeai/freellama tools
-```
+MCP-only operations are `delegate_research` and the online `models { view: "library" }` view.
+CLI-only operations include `serve`, `proxy`, `bench-all`, `policy from-eval`, and `auth-token`.
 
-The command prints the maintained parity map. MCP-only operations are `delegate_research` and the
-online `models { view: "library" }` view. CLI-only operations include `serve`, `proxy`,
-`recommend`, `natural-route`, `bench-all`, `policy-from-eval`, `run`, and `eval`.
-
-For the MCP tool contracts, read the [MCP package reference](../packages/mcp/README.md).
+For the MCP tool contracts, read the [MCP package reference](https://github.com/bgauryy/FreeLlama/blob/main/packages/mcp/README.md).

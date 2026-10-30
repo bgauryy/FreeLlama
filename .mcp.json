@@ -1,8 +1,8 @@
 {
   "mcpServers": {
     "freellama": {
-      "command": "node",
-      "args": ["packages/mcp/dist/index.js"]
+      "command": "npx",
+      "args": ["@octocodeai/freellama-mcp-server"]
     }
   }
 }

@@ -7,7 +7,7 @@ use axum::{
 };
 use freellama::platform::{
     PlatformConfig, app,
-    resources::{HostResources, ResourceGovernor, ResourcePolicy},
+    resources::{HostResources, LowMemoryMode, ResourceGovernor, ResourcePolicy},
 };
 use serde_json::{Value, json};
 use std::{
@@ -54,11 +54,17 @@ async fn measure(delays: [Duration; 2], peers: bool, trials: usize) -> Vec<f64> 
     let started = Arc::new(AtomicUsize::new(0));
     let (gpu, gpu_server) = backend(delays[0], started.clone(), peers).await;
     let (cpu, cpu_server) = backend(delays[1], started, peers).await;
-    let mut config = PlatformConfig::new("127.0.0.1:11435", gpu, None, None, "helper:latest");
+    let mut config = PlatformConfig::new("127.0.0.1:11435", gpu, None, None);
     config.cpu_upstream = Some(cpu);
     config.cpu_models.insert("cpu-helper:latest".into());
-    config.resource_governor =
-        ResourceGovernor::with_sampler(ResourcePolicy::default(), HostResources::default).unwrap();
+    config.resource_governor = ResourceGovernor::with_sampler(
+        ResourcePolicy {
+            low_memory: LowMemoryMode::Advisory,
+            ..ResourcePolicy::default()
+        },
+        HostResources::default,
+    )
+    .unwrap();
     let platform = app(&config).unwrap();
     let mut times = Vec::new();
     for _ in 0..trials {
@@ -146,12 +152,17 @@ async fn measure_discovery(delay: Duration, peers: bool, trials: usize) -> (Vec<
     let mut cold = Vec::new();
     let mut warm = Vec::new();
     for _ in 0..trials {
-        let mut config = PlatformConfig::new("127.0.0.1:11435", &gpu, None, None, "helper:latest");
+        let mut config = PlatformConfig::new("127.0.0.1:11435", &gpu, None, None);
         config.cpu_upstream = Some(cpu.clone());
         config.cpu_models.insert("cpu-helper:latest".into());
-        config.resource_governor =
-            ResourceGovernor::with_sampler(ResourcePolicy::default(), HostResources::default)
-                .unwrap();
+        config.resource_governor = ResourceGovernor::with_sampler(
+            ResourcePolicy {
+                low_memory: LowMemoryMode::Advisory,
+                ..ResourcePolicy::default()
+            },
+            HostResources::default,
+        )
+        .unwrap();
         let platform = app(&config).unwrap();
         for samples in [&mut cold, &mut warm] {
             let start = Instant::now();

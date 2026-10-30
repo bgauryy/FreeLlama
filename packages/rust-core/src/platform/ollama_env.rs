@@ -115,7 +115,7 @@ impl OllamaSettings {
 
 /// Resolve each tracked setting from the strongest source that has it.
 pub(super) fn probe(endpoint: &str) -> OllamaSettings {
-    let (process, process_inspection) = if endpoint_is_loopback(endpoint) {
+    let (process, process_inspection) = if crate::net::is_loopback_url(endpoint) {
         process_environment(endpoint)
     } else {
         (
@@ -134,7 +134,7 @@ pub(super) fn probe(endpoint: &str) -> OllamaSettings {
 
 /// Fresh endpoint-attributed settings for learning; diagnostic fallback sources are insufficient.
 pub(super) fn probe_comparable_process(endpoint: &str) -> Option<Value> {
-    if !endpoint_is_loopback(endpoint) {
+    if !crate::net::is_loopback_url(endpoint) {
         return None;
     }
     let (process, inspection) = process_environment(endpoint);
@@ -191,20 +191,6 @@ pub(super) fn resolve(
         observed_at: super::telemetry::now_seconds(),
         process_observed: process.is_some(),
     }
-}
-
-fn endpoint_is_loopback(endpoint: &str) -> bool {
-    reqwest::Url::parse(endpoint)
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
-        .is_some_and(|host| {
-            host == "localhost"
-                || host
-                    .trim_start_matches('[')
-                    .trim_end_matches(']')
-                    .parse::<std::net::IpAddr>()
-                    .is_ok_and(|address| address.is_loopback())
-        })
 }
 
 /// Keep only tracked names, so inspection never turns into a generic environment dump.
@@ -371,7 +357,7 @@ fn process_environment(_endpoint: &str) -> (Option<BTreeMap<String, String>>, St
 }
 
 #[cfg(target_os = "macos")]
-fn launchd_getenv(name: &str) -> Option<String> {
+pub(crate) fn launchd_getenv(name: &str) -> Option<String> {
     super::resources::bounded_command_with(
         "launchctl",
         &["getenv", name],
@@ -380,7 +366,7 @@ fn launchd_getenv(name: &str) -> Option<String> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn launchd_getenv(_name: &str) -> Option<String> {
+pub(crate) fn launchd_getenv(_name: &str) -> Option<String> {
     None
 }
 
@@ -537,13 +523,5 @@ mod tests {
             None
         );
         assert_eq!(modelfile_num_ctx(&json!({})), None);
-    }
-
-    #[test]
-    fn only_loopback_endpoints_are_inspected() {
-        assert!(endpoint_is_loopback("http://127.0.0.1:11434"));
-        assert!(endpoint_is_loopback("http://localhost:11434"));
-        assert!(endpoint_is_loopback("http://[::1]:11434"));
-        assert!(!endpoint_is_loopback("http://10.0.0.5:11434"));
     }
 }

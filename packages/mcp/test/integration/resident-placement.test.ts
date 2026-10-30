@@ -9,6 +9,8 @@ describe("resident processor percentages", () => {
   let endpoint: string;
   let residentSize: number | undefined = 1000;
   let vram = 1000;
+  const mismatchWarning = "Configured gpu backend disagrees with Ollama /api/ps: mixed was physically observed. " +
+    "This sample is excluded from adaptive routing feedback.";
   beforeAll(async () => {
     server = createServer((_, response) => {
       response.setHeader("content-type", "application/json");
@@ -18,6 +20,12 @@ describe("resident processor percentages", () => {
           processor: residentSize === undefined ? "unknown" : vram < residentSize ? "mixed" : "gpu",
           status: residentSize === undefined ? "unavailable" : vram < residentSize ? "mismatch" : "verified",
         } },
+        // `freellama serve` derives this view in Rust (platform/catalog.rs `resident_view`).
+        ...(residentSize === undefined ? {} : { resident_view: vram < residentSize
+          ? { gpu_percent: Math.round((vram / residentSize) * 100), processor: "mixed",
+              processor_label: `${Math.round((vram / residentSize) * 100)}% GPU / ${100 - Math.round((vram / residentSize) * 100)}% CPU`,
+              assigned: false, warning: mismatchWarning }
+          : { gpu_percent: 100, processor: "gpu", processor_label: "100% GPU", assigned: false } }),
       }] }));
     });
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -38,6 +46,10 @@ describe("resident processor percentages", () => {
     const result: any = await client.callTool({ name: "models", arguments: { endpoint, view: "resident" } });
     expect(result.isError).not.toBe(true);
     expect(result.structuredContent.models[0]).toMatchObject({ size: 4000, placement: { gpu_percent: fixture.percent } });
+    expect(result.structuredContent.models[0].placement).toEqual(fixture.percent === 100
+      ? { gpu_percent: 100, assigned: false, processor: "100% GPU" }
+      : { gpu_percent: 25, assigned: false, processor: "25% GPU / 75% CPU", warning: mismatchWarning });
+    expect(result.structuredContent.models[0]).not.toHaveProperty("resident_view");
   });
   it("does not infer processor percentages from disk size when resident size is missing", async () => {
     residentSize = undefined; vram = 500;

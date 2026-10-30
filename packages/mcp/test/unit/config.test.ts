@@ -15,9 +15,12 @@ describe("REPO_ROOT", () => {
 });
 
 describe("research adapters", () => {
-  it("resolves both adapters to files that exist", () => {
-    expect(existsSync(RESEARCH_ADAPTERS.bash)).toBe(true);
-    expect(existsSync(RESEARCH_ADAPTERS.octocode)).toBe(true);
+  it("resolves both adapters to their compiled entry points, built from existing sources", () => {
+    const packageRoot = path.join(REPO_ROOT, "packages", "mcp");
+    expect(RESEARCH_ADAPTERS.bash).toBe(path.join(packageRoot, "dist", "research", "bash-agent.js"));
+    expect(RESEARCH_ADAPTERS.octocode).toBe(path.join(packageRoot, "dist", "research", "octocode-agent.js"));
+    expect(existsSync(path.join(packageRoot, "src", "research", "bash-agent.ts"))).toBe(true);
+    expect(existsSync(path.join(packageRoot, "src", "research", "octocode-agent.ts"))).toBe(true);
   });
 });
 

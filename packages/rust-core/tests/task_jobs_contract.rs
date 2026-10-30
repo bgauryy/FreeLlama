@@ -6,7 +6,7 @@ use axum::{
 };
 use freellama::platform::{
     PlatformConfig, app,
-    resources::{HostResources, MemoryPressure, ResourceGovernor, ResourcePolicy},
+    resources::{HostResources, LowMemoryMode, MemoryPressure, ResourceGovernor, ResourcePolicy},
 };
 use serde_json::{Value, json};
 use std::{
@@ -54,19 +54,28 @@ async fn fixture_with_delay(
             resume_available_percent: 2,
             hold_available_min_bytes: 100,
             resume_available_min_bytes: 200,
+            low_memory: LowMemoryMode::Advisory,
             ..ResourcePolicy::default()
         },
-        move || HostResources {
-            source: "test".into(),
-            total_memory_bytes: Some(10000),
-            available_memory_bytes: Some(memory.load(Ordering::SeqCst)),
-            memory_pressure: Some(MemoryPressure::Normal),
-            thermal_throttled: Some(false),
-            ..HostResources::default()
+        move || {
+            let available = memory.load(Ordering::SeqCst);
+            HostResources {
+                source: "test".into(),
+                total_memory_bytes: Some(10000),
+                available_memory_bytes: Some(available),
+                // Low available memory alone only warns; the OS must report pressure to hold.
+                memory_pressure: Some(if available < 100 {
+                    MemoryPressure::Warning
+                } else {
+                    MemoryPressure::Normal
+                }),
+                thermal_throttled: Some(false),
+                ..HostResources::default()
+            }
         },
     )
     .unwrap();
-    let mut config = PlatformConfig::new("127.0.0.1:11435", endpoint, None, None, "helper:latest")
+    let mut config = PlatformConfig::new("127.0.0.1:11435", endpoint, None, None)
         .with_max_queue_wait(Duration::from_secs(5));
     config.resource_governor = governor;
     (app(&config).unwrap(), available, calls, server)
@@ -291,7 +300,7 @@ async fn removing_a_completed_job_discards_its_result_without_new_inference() {
         json!({"id":id,"removed":true,"status":"completed","scope":"process_memory"})
     );
     let (_, listed) = request(&platform, "GET", "jobs", Value::Null).await;
-    assert!(listed["jobs"].as_array().unwrap().is_empty());
+    assert_eq!(listed["jobs"], json!([]));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     server.abort();
 }
@@ -361,7 +370,7 @@ async fn deferred_inputs_are_bounded_and_cannot_be_nested_in_batches() {
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{refusal}");
     assert_eq!(refusal["code"], "task_job_input_too_large");
     let (_, listed) = request(&platform, "GET", "jobs", Value::Null).await;
-    assert!(listed["jobs"].as_array().unwrap().is_empty());
+    assert_eq!(listed["jobs"], json!([]));
     let (status, refusal) = request(
         &platform,
         "POST",

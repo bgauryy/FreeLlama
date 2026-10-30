@@ -12,7 +12,7 @@ if (!/^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/.test(version ?? "")) {
 }
 const root = path.resolve(import.meta.dirname, "..");
 const manifests = [
-  "package.json", "packages/cli/package.json", "packages/mcp/package.json", "packages/view/package.json",
+  "package.json", "packages/cli/package.json", "packages/mcp/package.json",
   ...PLATFORM_PACKAGES.map(({ id }) => `packages/native/${id}/package.json`),
 ];
 

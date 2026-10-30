@@ -3,7 +3,8 @@
 `freellama-core` implements the management layer between calling agents and local Ollama models.
 The CLI and MCP server share this core for task offloading and resource coordination. It owns model
 discovery, deterministic routing, session affinity, scope history, admission control, managed execution,
-benchmarking, recommendation planning, and policy generation.
+and benchmarking. `platform::policy_eval` renders routing policies from harness quality aggregates
+for `freellama policy from-eval`.
 
 The crate is named `freellama-core`; its library is named `freellama`, so consumers import
 `freellama::…`.
@@ -25,10 +26,8 @@ flowchart LR
 | `platform` | Control API, discovery, routing, sessions, managed task execution, and admission |
 | `proxy` | Ollama-compatible passthrough, retries, timeout, jitter, and optional restart |
 | `model_bench` | Capability-grouped throughput measurements across installed models |
-| `recommend` | Side-effect-free installation plans from a reviewed catalog |
-| `policy` | Routing-policy generation from quality-evaluation aggregates |
 | `napi` | Feature-gated Node.js binding and the only FFI boundary |
-| `lib` | Diagnostics, frozen-suite execution, and build comparison |
+| `lib` | Diagnostics (`doctor`), shared endpoints, and timeouts |
 
 Scopes retain bounded process-local transcripts with expected revisions. Warming reuses managed
 admission and placement; adaptive keep-alive remains finite unless a caller explicitly overrides it.
@@ -84,9 +83,7 @@ let config = PlatformConfig::new(
     "http://127.0.0.1:11434",
     None,
     None,
-    "…",
 )
-.with_recommendation_catalog("recommendations.example.toml")
 .with_cpu_backend(
     "http://127.0.0.1:11436",
     vec!["nomic-embed-text:latest".to_owned()],
@@ -103,7 +100,7 @@ upstream. See [CPU and GPU model routing](../../docs/CPU_GPU_ROUTING.md) for the
 contract.
 
 `/_freellama/v1/health` exposes the `explicit_cpu_assignment` contract and configured backends.
-Tests pin that receipt, CPU option injection for tasks and intent interpretation, and byte-exact raw
+Tests pin that receipt, CPU option injection for tasks, and byte-exact raw
 passthrough to the primary backend.
 
 Bearer authentication, when configured, covers control and passthrough routes. Binding a

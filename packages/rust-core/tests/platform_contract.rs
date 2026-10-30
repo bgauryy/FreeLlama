@@ -18,8 +18,8 @@ use axum::{
 use freellama::{
     model_bench::Capability,
     platform::{
-        CatalogModel, ExecutionPreference, Objective, RouteInput, RouteIntent, SessionAffinity,
-        TaskKind, app, intent_schema, normalize_route_intent, parse_route_intent, select_route,
+        CatalogModel, ExecutionPreference, LoopRecord, ModelRequestDefaults, Objective, RouteInput,
+        SessionAffinity, TaskKind, app, select_route,
     },
 };
 use serde_json::{Value, json};
@@ -35,10 +35,13 @@ fn candidate(name: &str, size: u64, capabilities: &[Capability], resident: bool)
         advertised_context: Some(32_768),
         kv_cache_bytes_per_token_f16: None,
         modelfile_num_ctx: None,
+        architecture: None,
         resident,
         resident_size: resident.then_some(size),
         resident_vram: resident.then_some(size),
+        resident_context: None,
         benchmark: BTreeMap::new(),
+        observed_loops: BTreeMap::new(),
         policy_rank: [
             TaskKind::Completion,
             TaskKind::Coding,
@@ -52,6 +55,7 @@ fn candidate(name: &str, size: u64, capabilities: &[Capability], resident: bool)
         .into_iter()
         .map(|task| (task, 0))
         .collect(),
+        policy_options: BTreeMap::new(),
     }
 }
 
@@ -59,12 +63,11 @@ fn candidate(name: &str, size: u64, capabilities: &[Capability], resident: bool)
 /// unbounded proxy for conversation history or runner KV.
 #[tokio::test]
 async fn session_affinity_is_bounded_and_releasable() {
-    let platform = app(&common::platform_config(
+    let platform = app(&crate::support::platform_config(
         "127.0.0.1:11435",
         "http://127.0.0.1:11434",
         None,
         None,
-        "intent-model",
     )
     .with_max_sessions(1))
     .unwrap();
@@ -131,12 +134,11 @@ async fn route_receipt_uses_declared_architecture_kv_dimensions() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream = format!("http://{}", listener.local_addr().unwrap());
     let mock_task = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
-    let platform = app(&common::platform_config(
+    let platform = app(&crate::support::platform_config(
         "127.0.0.1:11435",
         upstream,
         None,
         None,
-        "intent-model",
     ))
     .unwrap();
     let response = platform
@@ -205,12 +207,11 @@ async fn embedding_task_forwards_route_options_and_returns_prompt_free_metrics()
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream = format!("http://{}", listener.local_addr().unwrap());
     let mock_task = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
-    let platform = app(&common::platform_config(
+    let platform = app(&crate::support::platform_config(
         "127.0.0.1:11435",
         upstream,
         None,
         None,
-        "qwen2.5:0.5b",
     ))
     .unwrap();
 
@@ -284,12 +285,11 @@ async fn tool_definitions_require_a_tool_capable_model() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream = format!("http://{}", listener.local_addr().unwrap());
     let mock_task = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
-    let platform = app(&common::platform_config(
+    let platform = app(&crate::support::platform_config(
         "127.0.0.1:11435",
         upstream,
         None,
         None,
-        "text-only",
     ))
     .unwrap();
 
@@ -373,12 +373,11 @@ async fn chat_task_preserves_typed_history_and_advanced_ollama_controls() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream = format!("http://{}", listener.local_addr().unwrap());
     let mock_task = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
-    let platform = app(&common::platform_config(
+    let platform = app(&crate::support::platform_config(
         "127.0.0.1:11435",
         upstream,
         None,
         None,
-        "qwen2.5:0.5b",
     ))
     .unwrap();
 
@@ -443,7 +442,96 @@ async fn chat_task_preserves_typed_history_and_advanced_ollama_controls() {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)] // The mock lifecycle and every receipt assertion form one contract.
+async fn policy_model_options_reach_ollama_and_caller_options_override_them() {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let mock = Router::new()
+        .route(
+            "/api/tags",
+            get(|| async {
+                Json(json!({"models": [{"name": "think-model", "size": 2_000_000_000_u64}]}))
+            }),
+        )
+        .route("/api/ps", get(|| async { Json(json!({"models": []})) }))
+        .route(
+            "/api/show",
+            post(|| async {
+                Json(json!({
+                    "capabilities": ["completion", "thinking"],
+                    "model_info": {"test.context_length": 32768}
+                }))
+            }),
+        )
+        .route(
+            "/api/chat",
+            post(
+                |State(captured): State<Arc<Mutex<Vec<Value>>>>, Json(body): Json<Value>| async move {
+                    captured.lock().await.push(body);
+                    Json(json!({
+                        "message": {"role": "assistant", "content": "done"}, "done": true,
+                        "eval_count": 1,
+                        "eval_duration": 1_000_000_u64
+                    }))
+                },
+            ),
+        )
+        .with_state(captured.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("http://{}", listener.local_addr().unwrap());
+    let mock_task = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    let mut policy = tempfile::NamedTempFile::new().unwrap();
+    std::io::Write::write_all(
+        &mut policy,
+        b"schema_version = 1\n[policies.completion]\nqualified_models = [\"think-model\"]\n\
+          [policies.completion.model_options.\"think-model\"]\nthink = true\nnum_predict = 321\n",
+    )
+    .unwrap();
+    let platform = app(&crate::support::platform_config(
+        "127.0.0.1:11435",
+        upstream,
+        None,
+        Some(policy.path().to_path_buf()),
+    ))
+    .unwrap();
+    let task = |extra: Value| {
+        let mut body = json!({
+            "task": "completion",
+            "objective": "quality",
+            "model": "think-model",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        if let (Some(body), Some(extra)) = (body.as_object_mut(), extra.as_object()) {
+            body.extend(extra.clone());
+        }
+        Request::post("/_freellama/v1/tasks")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+
+    let response = platform.clone().oneshot(task(json!({}))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = platform
+        .oneshot(task(json!({
+            "request_options": {"think": false, "options": {"num_predict": 99}}
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let bodies = captured.lock().await.clone();
+    assert_eq!(bodies.len(), 2, "{bodies:?}");
+    assert_eq!(bodies[0]["think"], true, "{}", bodies[0]);
+    assert_eq!(bodies[0]["options"]["num_predict"], 321, "{}", bodies[0]);
+    assert_eq!(bodies[1]["think"], false, "{}", bodies[1]);
+    assert_eq!(bodies[1]["options"]["num_predict"], 99, "{}", bodies[1]);
+    mock_task.abort();
+}
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one contract fixture with its receipt assertions"
+)]
 async fn immediate_unload_is_observed_before_it_is_verified_unloaded() {
     let captured = Arc::new(Mutex::new(None));
     let lifecycle = Arc::new(AtomicUsize::new(0));
@@ -516,12 +604,11 @@ async fn immediate_unload_is_observed_before_it_is_verified_unloaded() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream = format!("http://{}", listener.local_addr().unwrap());
     let mock_task = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
-    let platform = app(&common::platform_config(
+    let platform = app(&crate::support::platform_config(
         "127.0.0.1:11435",
         upstream,
         None,
         None,
-        "qwen2.5:0.5b",
     ))
     .unwrap();
 
@@ -592,12 +679,11 @@ async fn infinite_keep_alive_string_is_forwarded_in_ollamas_numeric_form() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream = format!("http://{}", listener.local_addr().unwrap());
     let mock_task = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
-    let platform = app(&common::platform_config(
+    let platform = app(&crate::support::platform_config(
         "127.0.0.1:11435",
         upstream,
         None,
         None,
-        "qwen2.5:0.5b",
     ))
     .unwrap();
 
@@ -677,7 +763,7 @@ async fn assigned_cpu_model_uses_the_cpu_ollama_backend() {
     let cpu_task = tokio::spawn(async move { axum::serve(cpu_listener, cpu_app).await.unwrap() });
     let platform =
         app(
-            &common::platform_config("127.0.0.1:11435", gpu_upstream, None, None, "qwen2.5:0.5b")
+            &crate::support::platform_config("127.0.0.1:11435", gpu_upstream, None, None)
                 .with_cpu_backend(cpu_upstream.clone(), ["cpu-model"]),
         )
         .unwrap();
@@ -712,7 +798,10 @@ async fn assigned_cpu_model_uses_the_cpu_ollama_backend() {
 /// CPU process, then an agent may prefer one of those eligible candidates. Preview must expose the
 /// resolved backend so the agent can inspect the decision before spending tokens.
 #[tokio::test]
-#[allow(clippy::too_many_lines)] // Keep preference, observed-evidence, and pin precedence together.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one contract fixture with its receipt assertions"
+)]
 async fn preview_honors_cpu_preference_and_exposes_the_execution_receipt() {
     let backend = |model: &'static str| {
         Router::new()
@@ -750,7 +839,7 @@ async fn preview_honors_cpu_preference_and_exposes_the_execution_receipt() {
     });
     let platform =
         app(
-            &common::platform_config("127.0.0.1:11435", gpu_upstream, None, None, "intent-model")
+            &crate::support::platform_config("127.0.0.1:11435", gpu_upstream, None, None)
                 .with_cpu_backend(cpu_upstream.clone(), ["cpu-model"])
                 .with_cpu_max_concurrent_tasks(2),
         )
@@ -876,7 +965,10 @@ async fn preview_honors_cpu_preference_and_exposes_the_execution_receipt() {
 /// both backends on the same task. This keeps a single cold load or noisy request from rewriting a
 /// route while still closing the observe -> compare -> decide loop.
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one contract fixture with its receipt assertions"
+)]
 async fn auto_placement_does_not_use_samples_without_observed_profile_identity() {
     let backend = |model: &'static str, total_duration: u64, resident_vram: u64| {
         Router::new()
@@ -937,7 +1029,7 @@ async fn auto_placement_does_not_use_samples_without_observed_profile_identity()
     });
     let platform =
         app(
-            &common::platform_config("127.0.0.1:11435", gpu_upstream, None, None, "intent-model")
+            &crate::support::platform_config("127.0.0.1:11435", gpu_upstream, None, None)
                 .with_cpu_backend(cpu_upstream, ["cpu-model"]),
         )
         .unwrap();
@@ -1087,15 +1179,12 @@ async fn physical_gpu_observation_overrides_cpu_assignment_and_withholds_feedbac
         .await
         .unwrap();
     });
-    let platform = app(&common::platform_config(
-        "127.0.0.1:11435",
-        primary_upstream,
-        None,
-        None,
-        "intent-model",
-    )
-    .with_cpu_backend(upstream, ["mlx-model"]))
-    .unwrap();
+    let platform =
+        app(
+            &crate::support::platform_config("127.0.0.1:11435", primary_upstream, None, None)
+                .with_cpu_backend(upstream, ["mlx-model"]),
+        )
+        .unwrap();
 
     let response = platform
         .clone()
@@ -1196,7 +1285,7 @@ async fn gpu_and_cpu_backends_have_independent_admission_pools() {
     let cpu_task = tokio::spawn(async move { axum::serve(cpu_listener, cpu_app).await.unwrap() });
     let platform =
         app(
-            &common::platform_config("127.0.0.1:11435", gpu_upstream, None, None, "intent-model")
+            &crate::support::platform_config("127.0.0.1:11435", gpu_upstream, None, None)
                 .with_cpu_backend(cpu_upstream, ["cpu-model"])
                 .with_max_concurrent_tasks(1)
                 .with_cpu_max_concurrent_tasks(1),
@@ -1264,7 +1353,7 @@ async fn raw_passthrough_stays_byte_exact_on_the_primary_backend_with_cpu_config
 
     let platform =
         app(
-            &common::platform_config("127.0.0.1:11435", gpu_upstream, None, None, "intent-model")
+            &crate::support::platform_config("127.0.0.1:11435", gpu_upstream, None, None)
                 .with_cpu_backend(cpu_upstream, ["cpu-model"]),
         )
         .unwrap();
@@ -1289,169 +1378,6 @@ async fn raw_passthrough_stays_byte_exact_on_the_primary_backend_with_cpu_config
 
     gpu_task.abort();
     cpu_task.abort();
-}
-
-#[tokio::test]
-async fn assigned_intent_model_uses_the_cpu_ollama_backend() {
-    let gpu_calls = Arc::new(AtomicUsize::new(0));
-    let cpu_calls = Arc::new(AtomicUsize::new(0));
-    let cpu_body = Arc::new(Mutex::new(None));
-    let backend = |model: &'static str,
-                   calls: Arc<AtomicUsize>,
-                   intent: bool,
-                   captured: Option<Arc<Mutex<Option<Value>>>>| {
-        Router::new()
-            .route(
-                "/api/tags",
-                get(move || async move {
-                    Json(json!({"models": [{"name": model, "size": 1_000_000_000}]}))
-                }),
-            )
-            .route("/api/ps", get(|| async { Json(json!({"models": []})) }))
-            .route(
-                "/api/show",
-                post(|| async {
-                    Json(json!({
-                        "capabilities": ["completion"],
-                        "model_info": {"test.context_length": 8192}
-                    }))
-                }),
-            )
-            .route(
-                "/api/chat",
-                post(move |Json(body): Json<Value>| {
-                    let calls = Arc::clone(&calls);
-                    let captured = captured.clone();
-                    async move {
-                        calls.fetch_add(1, Ordering::SeqCst);
-                        if let Some(captured) = captured {
-                            *captured.lock().await = Some(body);
-                        }
-                        let content = if intent {
-                            r#"{"task":"completion","objective":"fastest","context_tokens":null,"requires_tools":false,"requires_vision":false}"#
-                        } else {
-                            "unexpected primary interpreter call"
-                        };
-                        Json(json!({"message": {"role": "assistant", "content": content}, "done": true}))
-                    }
-                }),
-            )
-    };
-    let gpu_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let gpu_upstream = format!("http://{}", gpu_listener.local_addr().unwrap());
-    let gpu_app = backend("gpu-model", Arc::clone(&gpu_calls), false, None);
-    let gpu_task = tokio::spawn(async move { axum::serve(gpu_listener, gpu_app).await.unwrap() });
-    let cpu_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let cpu_upstream = format!("http://{}", cpu_listener.local_addr().unwrap());
-    let cpu_app = backend(
-        "intent-model",
-        Arc::clone(&cpu_calls),
-        true,
-        Some(Arc::clone(&cpu_body)),
-    );
-    let cpu_task = tokio::spawn(async move { axum::serve(cpu_listener, cpu_app).await.unwrap() });
-    let platform =
-        app(
-            &common::platform_config("127.0.0.1:11435", gpu_upstream, None, None, "intent-model")
-                .with_cpu_backend(cpu_upstream, ["intent-model"]),
-        )
-        .unwrap();
-
-    let response = platform
-        .oneshot(
-            Request::post("/_freellama/v1/natural-routes")
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"text":"Answer this ordinary question."}"#))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(cpu_calls.load(Ordering::SeqCst), 1);
-    assert_eq!(gpu_calls.load(Ordering::SeqCst), 0);
-    assert_eq!(
-        cpu_body.lock().await.as_ref().unwrap()["options"]["num_gpu"],
-        0
-    );
-    gpu_task.abort();
-    cpu_task.abort();
-}
-
-#[tokio::test]
-async fn natural_route_respects_backend_admission() {
-    let mock = Router::new()
-        .route(
-            "/api/tags",
-            get(|| async {
-                Json(json!({"models": [{"name": "intent-model", "size": 1_000_000_000}]}))
-            }),
-        )
-        .route("/api/ps", get(|| async { Json(json!({"models": []})) }))
-        .route(
-            "/api/show",
-            post(|| async {
-                Json(json!({
-                    "capabilities": ["completion"],
-                    "model_info": {"test.context_length": 8192}
-                }))
-            }),
-        )
-        .route(
-            "/api/chat",
-            post(|Json(body): Json<Value>| async move {
-                let is_intent = body["messages"]
-                    .as_array()
-                    .is_some_and(|messages| messages.len() > 1);
-                if is_intent {
-                    Json(json!({"message": {"role": "assistant", "content": r#"{"task":"completion","objective":"fastest","context_tokens":null,"requires_tools":false,"requires_vision":false}"#}, "done": true}))
-                } else {
-                    tokio::time::sleep(Duration::from_millis(250)).await;
-                    Json(json!({"message": {"role": "assistant", "content": "held"}, "done": true}))
-                }
-            }),
-        );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let upstream = format!("http://{}", listener.local_addr().unwrap());
-    let mock_task = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
-    let platform =
-        app(
-            &common::platform_config("127.0.0.1:11435", upstream, None, None, "intent-model")
-                .with_max_concurrent_tasks(1)
-                .with_max_queue_wait(Duration::from_millis(40)),
-        )
-        .unwrap();
-
-    let holder = {
-        let platform = platform.clone();
-        tokio::spawn(async move {
-            platform
-                .oneshot(
-                    Request::post("/_freellama/v1/tasks")
-                        .header("content-type", "application/json")
-                        .body(Body::from(
-                            r#"{"task":"completion","objective":"fastest","model":"intent-model","prompt":"hold"}"#,
-                        ))
-                        .unwrap(),
-                )
-                .await
-                .unwrap()
-                .status()
-        })
-    };
-    tokio::time::sleep(Duration::from_millis(60)).await;
-    let route = platform
-        .oneshot(
-            Request::post("/_freellama/v1/natural-routes")
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"text":"Answer this question."}"#))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(route.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(holder.await.unwrap(), StatusCode::OK);
-    mock_task.abort();
 }
 
 #[tokio::test]
@@ -1488,12 +1414,11 @@ async fn prompt_task_forwards_images_onto_the_built_message() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream = format!("http://{}", listener.local_addr().unwrap());
     let mock_task = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
-    let platform = app(&common::platform_config(
+    let platform = app(&crate::support::platform_config(
         "127.0.0.1:11435",
         upstream,
         None,
         None,
-        "qwen2.5:0.5b",
     ))
     .unwrap();
 
@@ -1547,12 +1472,11 @@ async fn prompt_task_without_images_sends_no_images_field() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream = format!("http://{}", listener.local_addr().unwrap());
     let mock_task = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
-    let platform = app(&common::platform_config(
+    let platform = app(&crate::support::platform_config(
         "127.0.0.1:11435",
         upstream,
         None,
         None,
-        "qwen2.5:0.5b",
     ))
     .unwrap();
 
@@ -1620,12 +1544,11 @@ async fn nonresident_managed_tasks_serialize_upstream_execution() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream = format!("http://{}", listener.local_addr().unwrap());
     let mock_task = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
-    let platform = app(&common::platform_config(
+    let platform = app(&crate::support::platform_config(
         "127.0.0.1:11435",
         upstream,
         None,
         None,
-        "qwen2.5:0.5b",
     ))
     .unwrap();
     let request = || {
@@ -1693,12 +1616,11 @@ async fn resident_managed_tasks_keep_same_model_concurrency() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream = format!("http://{}", listener.local_addr().unwrap());
     let mock_task = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
-    let platform = app(&common::platform_config(
+    let platform = app(&crate::support::platform_config(
         "127.0.0.1:11435",
         upstream,
         None,
         None,
-        "qwen2.5:0.5b",
     ))
     .unwrap();
     let request = || {
@@ -1768,12 +1690,11 @@ async fn stale_residency_is_rechecked_before_using_the_shared_transition_lock() 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream = format!("http://{}", listener.local_addr().unwrap());
     let mock_task = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
-    let platform = app(&common::platform_config(
+    let platform = app(&crate::support::platform_config(
         "127.0.0.1:11435",
         upstream,
         None,
         None,
-        "qwen2.5:0.5b",
     ))
     .unwrap();
 
@@ -1878,7 +1799,6 @@ fn browser_task_returns_a_bounded_action_configuration() {
     assert_eq!(route.options["num_predict"], 64);
     assert_eq!(route.options["num_ctx"], 8192);
     assert_eq!(route.think, serde_json::Value::Bool(false));
-    assert!(!route.stream);
     assert!(route.strict_tool_validation);
 }
 
@@ -2094,19 +2014,8 @@ fn coding_disables_thinking_when_the_model_does_not_advertise_it() {
     assert_eq!(route.think, serde_json::Value::Bool(false));
 }
 
-#[test]
-fn qwen_code_repair_uses_the_measured_agent_profile() {
-    let model = candidate(
-        "qwen3.8:27b-mlx",
-        18_174_721_847,
-        &[
-            Capability::Completion,
-            Capability::Tools,
-            Capability::Thinking,
-        ],
-        false,
-    );
-    let route = select_route(
+fn code_repair_route(model: CatalogModel) -> freellama::platform::RouteDecision {
+    select_route(
         &RouteInput {
             task: TaskKind::CodeRepair,
             objective: Objective::Quality,
@@ -2115,26 +2024,210 @@ fn qwen_code_repair_uses_the_measured_agent_profile() {
         &[model],
         &SessionAffinity::default(),
     )
-    .unwrap();
+    .unwrap()
+}
+
+fn thinking_repair_model() -> CatalogModel {
+    candidate(
+        "qwen3.8:27b-mlx",
+        18_174_721_847,
+        &[
+            Capability::Completion,
+            Capability::Tools,
+            Capability::Thinking,
+        ],
+        false,
+    )
+}
+
+#[test]
+fn policy_model_options_override_the_generic_code_repair_profile() {
+    let mut model = thinking_repair_model();
+    model.policy_options.insert(
+        TaskKind::CodeRepair,
+        ModelRequestDefaults {
+            think: Some(false),
+            num_predict: Some(512),
+        },
+    );
+    let route = code_repair_route(model);
 
     assert_eq!(route.selected_model, "qwen3.8:27b-mlx");
-    assert_eq!(route.profile, "qwen_code_repair");
+    assert_eq!(route.profile, "code_repair");
     assert_eq!(route.options["num_ctx"], 8192);
     assert_eq!(route.options["num_predict"], 512);
     assert_eq!(route.think, serde_json::Value::Bool(false));
     assert!(route.strict_tool_validation);
     assert!(route.required_capabilities.contains(&Capability::Tools));
+    assert!(
+        route
+            .reasons
+            .iter()
+            .any(|reason| reason == "policy_model_options")
+    );
+}
+
+#[test]
+fn code_repair_without_a_policy_entry_uses_the_generic_profile() {
+    let mut model = thinking_repair_model();
+    // An entry for another task must not leak into code repair.
+    model.policy_options.insert(
+        TaskKind::Coding,
+        ModelRequestDefaults {
+            think: Some(false),
+            num_predict: Some(64),
+        },
+    );
+    let route = code_repair_route(model);
+
+    assert_eq!(route.profile, "code_repair");
+    assert_eq!(route.options["num_ctx"], 8192);
+    assert_eq!(route.options["num_predict"], 2048);
+    assert_eq!(route.think, json!("medium"));
+    assert!(
+        !route
+            .reasons
+            .iter()
+            .any(|reason| reason == "policy_model_options")
+    );
+}
+
+#[test]
+fn policy_think_true_reaches_only_models_that_can_think() {
+    let defaults = ModelRequestDefaults {
+        think: Some(true),
+        num_predict: None,
+    };
+    let mut thinking = thinking_repair_model();
+    thinking
+        .policy_options
+        .insert(TaskKind::CodeRepair, defaults);
+    let route = code_repair_route(thinking);
+    assert_eq!(route.think, serde_json::Value::Bool(true));
+    assert!(
+        !route
+            .reasons
+            .iter()
+            .any(|reason| reason == "policy_think_ignored_without_thinking_capability")
+    );
+
+    let mut plain = candidate(
+        "plain:latest",
+        1_000_000_000,
+        &[Capability::Completion, Capability::Tools],
+        false,
+    );
+    plain.policy_options.insert(TaskKind::CodeRepair, defaults);
+    let route = code_repair_route(plain);
+    assert_eq!(route.think, serde_json::Value::Bool(false));
+    assert!(
+        route
+            .reasons
+            .iter()
+            .any(|reason| reason == "policy_think_ignored_without_thinking_capability"),
+        "{:?}",
+        route.reasons
+    );
+}
+
+#[test]
+fn policy_model_options_leave_context_to_routing() {
+    let mut model = thinking_repair_model();
+    model.policy_options.insert(
+        TaskKind::CodeRepair,
+        ModelRequestDefaults {
+            think: None,
+            num_predict: Some(512),
+        },
+    );
+    let defaulted = code_repair_route(model.clone());
+    assert_eq!(defaulted.options["num_ctx"], 8192);
+    assert!(
+        !defaulted
+            .reasons
+            .iter()
+            .any(|reason| reason == "context_clamped_to_advertised")
+    );
+
+    let route = select_route(
+        &RouteInput {
+            task: TaskKind::CodeRepair,
+            objective: Objective::Quality,
+            context_tokens: Some(16_384),
+            ..RouteInput::default()
+        },
+        &[model],
+        &SessionAffinity::default(),
+    )
+    .unwrap();
+    assert_eq!(route.options["num_ctx"], 16_384);
+}
+
+#[test]
+fn policy_file_model_options_parse_and_reject_unknown_keys() {
+    let load = |text: &str| {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut file, text.as_bytes()).unwrap();
+        app(&crate::support::platform_config(
+            "127.0.0.1:11435",
+            "http://127.0.0.1:9",
+            None,
+            Some(file.path().to_path_buf()),
+        ))
+        .map(|_| ())
+    };
+    load(
+        "schema_version = 1\n[policies.code_repair]\nqualified_models = [\"m\"]\n\
+         [policies.code_repair.model_options.\"m\"]\nthink = false\nnum_predict = 512\n",
+    )
+    .unwrap();
+    let error = load(
+        "schema_version = 1\n[policies.code_repair]\nqualified_models = [\"m\"]\n\
+         [policies.code_repair.model_options.\"m\"]\ntemperature = 0.1\n",
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("temperature"), "{error:#}");
+    // Context size is routing-owned; a policy `num_ctx` is rejected at load.
+    let error = load(
+        "schema_version = 1\n[policies.code_repair]\nqualified_models = [\"m\"]\n\
+         [policies.code_repair.model_options.\"m\"]\nnum_ctx = 8192\n",
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("num_ctx"), "{error:#}");
+    let error = load(
+        "schema_version = 1\n[policies.code_repair]\nqualified_models = [\"m\"]\n\
+         [policies.code_repair.model_options.\"qwen3.8:27b-mlx\"]\nnum_predict = 0\n",
+    )
+    .unwrap_err();
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("num_predict must be at least 1")
+            && message.contains("code_repair")
+            && message.contains("qwen3.8:27b-mlx"),
+        "{message}"
+    );
+}
+
+#[test]
+fn platform_example_policy_file_loads() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../platform.example.toml");
+    let router = app(&crate::support::platform_config(
+        "127.0.0.1:11435",
+        "http://127.0.0.1:9",
+        None,
+        Some(path),
+    ));
+    assert!(
+        router.is_ok(),
+        "platform.example.toml: {:#}",
+        router.unwrap_err()
+    );
 }
 
 #[test]
 fn platform_is_loopback_only() {
-    let config = common::platform_config(
-        "0.0.0.0:11435",
-        "http://127.0.0.1:11434",
-        None,
-        None,
-        "qwen2.5:0.5b",
-    );
+    let config =
+        crate::support::platform_config("0.0.0.0:11435", "http://127.0.0.1:11434", None, None);
     assert!(config.validate().is_err());
 }
 
@@ -2152,13 +2245,8 @@ fn backend_configuration_validation_covers_topology_permutations() {
     for listen in listens {
         for cpu_upstream in cpu_upstreams {
             for models in model_sets {
-                let mut config = common::platform_config(
-                    listen,
-                    "http://127.0.0.1:11434",
-                    None,
-                    None,
-                    "intent-model",
-                );
+                let mut config =
+                    crate::support::platform_config(listen, "http://127.0.0.1:11434", None, None);
                 config.cpu_upstream = cpu_upstream.map(str::to_owned);
                 config.cpu_models = models.iter().map(|model| (*model).to_owned()).collect();
 
@@ -2344,192 +2432,6 @@ fn route_eligibility_covers_every_relevant_capability_permutation() {
     assert_eq!(checked, 8 * 32);
 }
 
-#[test]
-fn natural_language_schema_cannot_select_a_model_directly() {
-    let schema = intent_schema();
-    assert_eq!(schema["additionalProperties"], false);
-    assert!(schema["properties"].get("model").is_none());
-    assert_eq!(
-        schema["properties"]["task"]["enum"]
-            .as_array()
-            .unwrap()
-            .len(),
-        8
-    );
-    assert_eq!(schema["properties"]["context_tokens"]["minimum"], 512);
-}
-
-#[test]
-fn parsed_browser_intent_becomes_capability_requirements() {
-    let intent = parse_route_intent(
-        r#"{"task":"browser","objective":"balanced","context_tokens":8192,"requires_tools":true,"requires_vision":true}"#,
-    )
-    .unwrap();
-    let route = intent.into_route_input(Some("session-a".to_owned()));
-    assert_eq!(route.task, TaskKind::Browser);
-    assert_eq!(route.session_id.as_deref(), Some("session-a"));
-    assert!(route.required_capabilities.contains(&Capability::Tools));
-    assert!(route.required_capabilities.contains(&Capability::Vision));
-}
-
-#[test]
-fn natural_language_output_with_unknown_fields_fails_closed() {
-    let result = parse_route_intent(
-        r#"{"task":"completion","objective":"fastest","context_tokens":null,"requires_tools":false,"requires_vision":false,"model":"tiny"}"#,
-    );
-    assert!(result.is_err());
-}
-
-#[test]
-fn explicit_natural_language_constraints_override_a_weak_interpreter() {
-    let weak = RouteIntent {
-        task: TaskKind::Completion,
-        objective: Objective::Balanced,
-        context_tokens: None,
-        requires_tools: true,
-        requires_vision: true,
-    };
-    let (intent, adjustments) = normalize_route_intent(
-        weak,
-        "Open the checkout screenshot and click the button as fast as possible.",
-    );
-    assert_eq!(intent.task, TaskKind::Browser);
-    assert_eq!(intent.objective, Objective::Fastest);
-    assert!(intent.requires_tools);
-    assert!(intent.requires_vision);
-    assert!(!adjustments.is_empty());
-}
-
-#[test]
-fn unsupported_natural_language_requirements_are_cleared() {
-    let weak = RouteIntent {
-        task: TaskKind::Completion,
-        objective: Objective::Fastest,
-        context_tokens: Some(1),
-        requires_tools: true,
-        requires_vision: true,
-    };
-    let (intent, adjustments) =
-        normalize_route_intent(weak, "Reply as fast as possible to a normal text question.");
-    assert_eq!(intent.task, TaskKind::Completion);
-    assert_eq!(intent.objective, Objective::Fastest);
-    assert_eq!(intent.context_tokens, None);
-    assert!(!intent.requires_tools);
-    assert!(!intent.requires_vision);
-    assert!(
-        adjustments
-            .iter()
-            .any(|value| value == "unsupported_tool_requirement_cleared")
-    );
-    assert!(
-        adjustments
-            .iter()
-            .any(|value| value == "unsupported_vision_requirement_cleared")
-    );
-    assert!(
-        adjustments
-            .iter()
-            .any(|value| value == "unsupported_context_requirement_cleared")
-    );
-}
-
-#[test]
-fn negated_tool_instructions_do_not_become_requirements() {
-    let weak = RouteIntent {
-        task: TaskKind::Completion,
-        objective: Objective::Balanced,
-        context_tokens: None,
-        requires_tools: true,
-        requires_vision: false,
-    };
-    for text in [
-        "Do not use tools; answer from the supplied context.",
-        "Answer without tools.",
-        "Never use tools for this request.",
-    ] {
-        let (intent, _) = normalize_route_intent(weak.clone(), text);
-        assert!(!intent.requires_tools, "negation was ignored for {text:?}");
-    }
-}
-
-#[test]
-fn explicit_small_context_is_clamped_and_task_requirements_are_preserved() {
-    let weak = RouteIntent {
-        task: TaskKind::Tools,
-        objective: Objective::Balanced,
-        context_tokens: Some(1),
-        requires_tools: false,
-        requires_vision: false,
-    };
-    let (intent, adjustments) =
-        normalize_route_intent(weak, "Use tools with a context of one token.");
-    assert_eq!(intent.context_tokens, Some(512));
-    assert!(intent.requires_tools);
-    assert!(
-        adjustments
-            .iter()
-            .any(|value| value == "context_requirement_clamped")
-    );
-}
-
-#[test]
-fn explicit_embedding_and_quality_terms_are_deterministic() {
-    let weak = RouteIntent {
-        task: TaskKind::LongContext,
-        objective: Objective::Fastest,
-        context_tokens: None,
-        requires_tools: true,
-        requires_vision: true,
-    };
-    let (intent, _) = normalize_route_intent(
-        weak,
-        "Create semantic vectors with the best evaluated local setup.",
-    );
-    assert_eq!(intent.task, TaskKind::Embedding);
-    assert_eq!(intent.objective, Objective::Quality);
-    assert!(!intent.requires_tools);
-    assert!(!intent.requires_vision);
-}
-
-#[test]
-fn explicit_code_review_and_maximum_quality_terms_are_deterministic() {
-    let weak = RouteIntent {
-        task: TaskKind::LongContext,
-        objective: Objective::Fastest,
-        context_tokens: None,
-        requires_tools: false,
-        requires_vision: false,
-    };
-    let (intent, _) = normalize_route_intent(
-        weak,
-        "Review and debug a Rust codebase; prioritize maximum answer quality.",
-    );
-    assert_eq!(intent.task, TaskKind::Coding);
-    assert_eq!(intent.objective, Objective::Quality);
-}
-
-#[test]
-fn explicit_bug_fix_terms_select_code_repair_and_require_tools() {
-    let weak = RouteIntent {
-        task: TaskKind::Completion,
-        objective: Objective::Balanced,
-        context_tokens: None,
-        requires_tools: false,
-        requires_vision: false,
-    };
-    let (intent, adjustments) = normalize_route_intent(
-        weak,
-        "Fix the bug in this repository and edit files with the smallest repair.",
-    );
-    assert_eq!(intent.task, TaskKind::CodeRepair);
-    assert!(intent.requires_tools);
-    assert!(
-        adjustments
-            .iter()
-            .any(|value| value == "explicit_code_repair_term")
-    );
-}
-
 /// Discovery routes every managed task needs before it can pick a model. Shared by the
 /// managed-task reliability tests below so each one only has to describe its own `/api/embed`
 /// behaviour.
@@ -2576,12 +2478,11 @@ async fn independent_batch_dispatches_and_accounts_for_embedding_cardinality() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream = format!("http://{}", listener.local_addr().unwrap());
     let mock_task = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
-    let platform =
-        app(
-            &common::platform_config("127.0.0.1:11435", upstream, None, None, "qwen2.5:0.5b")
-                .with_max_concurrent_tasks(2),
-        )
-        .unwrap();
+    let platform = app(
+        &crate::support::platform_config("127.0.0.1:11435", upstream, None, None)
+            .with_max_concurrent_tasks(2),
+    )
+    .unwrap();
     let response = platform
         .oneshot(
             Request::post("/_freellama/v1/task-batches")
@@ -2609,12 +2510,11 @@ async fn independent_batch_dispatches_and_accounts_for_embedding_cardinality() {
 
 #[tokio::test]
 async fn batch_refuses_dependent_items_before_any_upstream_call() {
-    let platform = app(&common::platform_config(
+    let platform = app(&crate::support::platform_config(
         "127.0.0.1:11435",
         "http://127.0.0.1:9",
         None,
         None,
-        "qwen2.5:0.5b",
     ))
     .unwrap();
     let response = platform
@@ -2657,12 +2557,11 @@ async fn managed_task_retries_a_transient_upstream_500() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream = format!("http://{}", listener.local_addr().unwrap());
     let mock_task = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
-    let platform = app(&common::platform_config(
+    let platform = app(&crate::support::platform_config(
         "127.0.0.1:11435",
         upstream,
         None,
         None,
-        "qwen2.5:0.5b",
     ))
     .unwrap();
 
@@ -2697,12 +2596,11 @@ async fn managed_task_does_not_retry_upstream_503() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream = format!("http://{}", listener.local_addr().unwrap());
     let mock_task = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
-    let platform = app(&common::platform_config(
+    let platform = app(&crate::support::platform_config(
         "127.0.0.1:11435",
         upstream,
         None,
         None,
-        "qwen2.5:0.5b",
     ))
     .unwrap();
 
@@ -2736,12 +2634,11 @@ async fn managed_task_preserves_a_non_json_upstream_error() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream = format!("http://{}", listener.local_addr().unwrap());
     let mock_task = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
-    let platform = app(&common::platform_config(
+    let platform = app(&crate::support::platform_config(
         "127.0.0.1:11435",
         upstream,
         None,
         None,
-        "qwen2.5:0.5b",
     ))
     .unwrap();
 
@@ -2817,12 +2714,11 @@ async fn managed_tasks_never_exceed_the_configured_concurrency() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream = format!("http://{}", listener.local_addr().unwrap());
     let mock_task = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
-    let platform =
-        app(
-            &common::platform_config("127.0.0.1:11435", upstream, None, None, "qwen2.5:0.5b")
-                .with_max_concurrent_tasks(2),
-        )
-        .unwrap();
+    let platform = app(
+        &crate::support::platform_config("127.0.0.1:11435", upstream, None, None)
+            .with_max_concurrent_tasks(2),
+    )
+    .unwrap();
 
     // Fire eight at once against a two-slot limit.
     let mut joins = Vec::new();
@@ -2861,12 +2757,11 @@ async fn managed_tasks_report_their_queue_wait_and_slot_budget() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream = format!("http://{}", listener.local_addr().unwrap());
     let mock_task = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
-    let platform = app(&common::platform_config(
+    let platform = app(&crate::support::platform_config(
         "127.0.0.1:11435",
         upstream,
         None,
         None,
-        "qwen2.5:0.5b",
     ))
     .unwrap();
 
@@ -2926,12 +2821,11 @@ async fn vision_tasks_cost_more_admission_than_embeddings() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream = format!("http://{}", listener.local_addr().unwrap());
     let mock_task = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
-    let platform =
-        app(
-            &common::platform_config("127.0.0.1:11435", upstream, None, None, "qwen2.5:0.5b")
-                .with_max_concurrent_tasks(4),
-        )
-        .unwrap();
+    let platform = app(
+        &crate::support::platform_config("127.0.0.1:11435", upstream, None, None)
+            .with_max_concurrent_tasks(4),
+    )
+    .unwrap();
 
     let mut joins = Vec::new();
     for _ in 0..4 {
@@ -2980,13 +2874,12 @@ async fn a_saturated_admission_queue_refuses_instead_of_waiting_forever() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream = format!("http://{}", listener.local_addr().unwrap());
     let mock_task = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
-    let platform =
-        app(
-            &common::platform_config("127.0.0.1:11435", upstream, None, None, "qwen2.5:0.5b")
-                .with_max_concurrent_tasks(1)
-                .with_max_queue_wait(Duration::from_millis(50)),
-        )
-        .unwrap();
+    let platform = app(
+        &crate::support::platform_config("127.0.0.1:11435", upstream, None, None)
+            .with_max_concurrent_tasks(1)
+            .with_max_queue_wait(Duration::from_millis(50)),
+    )
+    .unwrap();
 
     // One task holds the single slot for 400ms; the second cannot get in within 50ms.
     let holder = {
@@ -3033,14 +2926,13 @@ async fn a_full_managed_wait_queue_sheds_excess_work_immediately() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream = format!("http://{}", listener.local_addr().unwrap());
     let mock_task = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
-    let platform =
-        app(
-            &common::platform_config("127.0.0.1:11435", upstream, None, None, "qwen2.5:0.5b")
-                .with_max_concurrent_tasks(1)
-                .with_max_queued_tasks(1)
-                .with_max_queue_wait(Duration::from_secs(2)),
-        )
-        .unwrap();
+    let platform = app(
+        &crate::support::platform_config("127.0.0.1:11435", upstream, None, None)
+            .with_max_concurrent_tasks(1)
+            .with_max_queued_tasks(1)
+            .with_max_queue_wait(Duration::from_secs(2)),
+    )
+    .unwrap();
 
     let holder = {
         let p = platform.clone();
@@ -3096,14 +2988,13 @@ async fn cancelling_a_queued_task_reclaims_its_waiter() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream = format!("http://{}", listener.local_addr().unwrap());
     let mock_task = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
-    let platform =
-        app(
-            &common::platform_config("127.0.0.1:11435", upstream, None, None, "qwen2.5:0.5b")
-                .with_max_concurrent_tasks(1)
-                .with_max_queued_tasks(1)
-                .with_max_queue_wait(Duration::from_secs(2)),
-        )
-        .unwrap();
+    let platform = app(
+        &crate::support::platform_config("127.0.0.1:11435", upstream, None, None)
+            .with_max_concurrent_tasks(1)
+            .with_max_queued_tasks(1)
+            .with_max_queue_wait(Duration::from_secs(2)),
+    )
+    .unwrap();
 
     let holder = {
         let p = platform.clone();
@@ -3172,7 +3063,7 @@ fn min_confidence_is_enforced_by_the_router_itself() {
         "the refusal must name the model it would have picked, got {text}"
     );
     assert!(
-        text.contains("bench-all") && text.contains("policy-from-eval"),
+        text.contains("bench-all") && text.contains("freellama policy from-eval"),
         "the refusal must name both inputs that raise the grade, got {text}"
     );
 }
@@ -3266,13 +3157,12 @@ async fn a_refused_task_does_not_bind_session_affinity() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream = format!("http://{}", listener.local_addr().unwrap());
     let mock_task = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
-    let platform =
-        app(
-            &common::platform_config("127.0.0.1:11435", upstream, None, None, "qwen2.5:0.5b")
-                .with_max_concurrent_tasks(1)
-                .with_max_queue_wait(Duration::from_millis(50)),
-        )
-        .unwrap();
+    let platform = app(
+        &crate::support::platform_config("127.0.0.1:11435", upstream, None, None)
+            .with_max_concurrent_tasks(1)
+            .with_max_queue_wait(Duration::from_millis(50)),
+    )
+    .unwrap();
 
     // Open a real session.
     let created = platform
@@ -3364,12 +3254,11 @@ async fn a_failed_upstream_task_does_not_bind_session_affinity() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream = format!("http://{}", listener.local_addr().unwrap());
     let mock_task = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
-    let platform = app(&common::platform_config(
+    let platform = app(&crate::support::platform_config(
         "127.0.0.1:11435",
         upstream,
         None,
         None,
-        "small",
     ))
     .unwrap();
 
@@ -3445,12 +3334,11 @@ async fn route_preview_does_not_bind_session_affinity() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream = format!("http://{}", listener.local_addr().unwrap());
     let mock_task = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
-    let platform = app(&common::platform_config(
+    let platform = app(&crate::support::platform_config(
         "127.0.0.1:11435",
         upstream,
         None,
         None,
-        "small",
     ))
     .unwrap();
 
@@ -3595,16 +3483,13 @@ async fn health_reports_admission_capacity() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream = format!("http://{}", listener.local_addr().unwrap());
     let mock_task = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
-    let platform = app(&common::platform_config(
-        "127.0.0.1:11435",
-        upstream.clone(),
-        None,
-        None,
-        "qwen2.5:0.5b",
-    )
-    .with_cpu_backend("http://127.0.0.1:11436", ["cpu-model"])
-    .with_max_concurrent_tasks(5))
-    .unwrap();
+    let platform =
+        app(
+            &crate::support::platform_config("127.0.0.1:11435", upstream.clone(), None, None)
+                .with_cpu_backend("http://127.0.0.1:11436", ["cpu-model"])
+                .with_max_concurrent_tasks(5),
+        )
+        .unwrap();
 
     let response = platform
         .oneshot(
@@ -3695,14 +3580,28 @@ async fn health_reports_admission_capacity() {
 }
 
 #[test]
-fn remote_platform_requires_an_explicit_strong_auth_boundary() {
-    let bare = common::platform_config(
-        "0.0.0.0:11435",
-        "http://127.0.0.1:11434",
-        None,
-        None,
-        "intent-model",
+fn platform_config_debug_redacts_the_auth_token() {
+    let secret = "0123456789abcdef0123456789abcdef-secret";
+    let config =
+        crate::support::platform_config("127.0.0.1:11435", "http://127.0.0.1:11434", None, None);
+    let unset = format!("{config:?}");
+    assert!(unset.contains("auth_token: None"), "{unset}");
+    let debug = format!("{:?}", config.with_auth_token(secret));
+    assert!(!debug.contains(secret), "{debug}");
+    assert!(
+        debug.contains("auth_token: Some(\"<redacted>\")"),
+        "{debug}"
     );
+    assert!(
+        debug.contains("upstream: \"http://127.0.0.1:11434\""),
+        "{debug}"
+    );
+}
+
+#[test]
+fn remote_platform_requires_an_explicit_strong_auth_boundary() {
+    let bare =
+        crate::support::platform_config("0.0.0.0:11435", "http://127.0.0.1:11434", None, None);
     assert!(bare.validate().is_err());
     assert!(bare.clone().with_remote_access(true).validate().is_err());
     assert!(
@@ -3721,15 +3620,12 @@ fn remote_platform_requires_an_explicit_strong_auth_boundary() {
 #[tokio::test]
 async fn bearer_auth_protects_control_and_passthrough_routes() {
     let token = "0123456789abcdef0123456789abcdef";
-    let platform = app(&common::platform_config(
-        "127.0.0.1:11435",
-        "http://127.0.0.1:9",
-        None,
-        None,
-        "intent-model",
-    )
-    .with_auth_token(token))
-    .unwrap();
+    let platform =
+        app(
+            &crate::support::platform_config("127.0.0.1:11435", "http://127.0.0.1:9", None, None)
+                .with_auth_token(token),
+        )
+        .unwrap();
 
     for uri in ["/_freellama/v1/health", "/api/version"] {
         let missing = platform
@@ -3800,7 +3696,7 @@ async fn verified_feedback_survives_a_platform_restart() {
     let mock_task = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
     let directory = tempfile::tempdir().unwrap();
     let feedback_file = directory.path().join("feedback.json");
-    let config = common::platform_config("127.0.0.1:11435", upstream, None, None, "intent-model")
+    let config = crate::support::platform_config("127.0.0.1:11435", upstream, None, None)
         .with_feedback_file(&feedback_file);
     let first = app(&config).unwrap();
     let response = first
@@ -3849,12 +3745,11 @@ fn corrupt_or_unsupported_feedback_refuses_startup() {
     ] {
         let feedback_file = directory.path().join(name);
         std::fs::write(&feedback_file, contents).unwrap();
-        let error = app(&common::platform_config(
+        let error = app(&crate::support::platform_config(
             "127.0.0.1:11435",
             "http://127.0.0.1:9",
             None,
             None,
-            "intent-model",
         )
         .with_feedback_file(&feedback_file))
         .expect_err("invalid persisted routing evidence must not be silently discarded");
@@ -3901,12 +3796,11 @@ async fn catalog_skips_a_model_whose_show_fails() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream = format!("http://{}", listener.local_addr().unwrap());
     let mock_task = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
-    let platform = app(&common::platform_config(
+    let platform = app(&crate::support::platform_config(
         "127.0.0.1:11435",
         upstream,
         None,
         None,
-        "qwen2.5:0.5b",
     ))
     .unwrap();
 
@@ -3941,12 +3835,11 @@ fn app_refuses_a_smoke_marked_policy_file() {
         b"schema_version = 1\nsmoke = true\n\n[policies.completion]\nqualified_models = [\"m\"]\n",
     )
     .unwrap();
-    let err = app(&common::platform_config(
+    let err = app(&crate::support::platform_config(
         "127.0.0.1:11435",
         "http://127.0.0.1:9",
         None,
         Some(file.path().to_path_buf()),
-        "qwen2.5:0.5b",
     ))
     .unwrap_err();
     assert!(
@@ -3954,4 +3847,245 @@ fn app_refuses_a_smoke_marked_policy_file() {
         "expected a smoke-policy refusal, got: {err}"
     );
 }
-mod common;
+
+/// A small model the router would otherwise prefer for a task (resident, smaller), with an
+/// optional observed loop record for that task.
+fn small_model(name: &str, loops: Option<(TaskKind, LoopRecord)>) -> CatalogModel {
+    CatalogModel {
+        architecture: Some("anyarch".to_owned()),
+        policy_rank: BTreeMap::new(),
+        observed_loops: loops.into_iter().collect(),
+        ..candidate(
+            name,
+            2_000_000_000,
+            &[Capability::Completion, Capability::Vision],
+            true,
+        )
+    }
+}
+
+fn unqualified(model: CatalogModel) -> CatalogModel {
+    CatalogModel {
+        policy_rank: BTreeMap::new(),
+        ..model
+    }
+}
+
+/// Routing never ranks by a model's name or architecture. A model observed to keep looping on a
+/// task kind loses automatic fallback and session affinity for that task only; one stray loop does
+/// not count, other task kinds are unaffected, and an explicit model or policy still wins.
+#[test]
+fn models_that_keep_looping_on_a_task_lose_automatic_fallback_for_it() {
+    let looping = LoopRecord { runs: 3, loops: 2 };
+    let models = vec![
+        small_model("small:latest", Some((TaskKind::Completion, looping))),
+        unqualified(candidate(
+            "general:latest",
+            8_000_000_000,
+            &[Capability::Completion, Capability::Vision],
+            false,
+        )),
+    ];
+    let sessions = SessionAffinity::from_pairs([("s1".to_owned(), "small:latest".to_owned())]);
+    for objective in [Objective::Balanced, Objective::Fastest] {
+        let input = RouteInput {
+            task: TaskKind::Completion,
+            objective,
+            ..RouteInput::default()
+        };
+        let decision = select_route(&input, &models, &sessions).unwrap();
+        assert_eq!(decision.selected_model, "general:latest", "{objective:?}");
+    }
+    let affine = RouteInput {
+        task: TaskKind::Completion,
+        session_id: Some("s1".to_owned()),
+        ..RouteInput::default()
+    };
+    assert_eq!(
+        select_route(&affine, &models, &sessions)
+            .unwrap()
+            .selected_model,
+        "general:latest"
+    );
+
+    // The loops were on completion: for vision the small resident model still wins on speed.
+    let vision = RouteInput {
+        task: TaskKind::Vision,
+        objective: Objective::Fastest,
+        ..RouteInput::default()
+    };
+    assert_eq!(
+        select_route(&vision, &models, &sessions)
+            .unwrap()
+            .selected_model,
+        "small:latest"
+    );
+
+    // One loop in three runs is not a pattern: no demotion.
+    let once = vec![
+        small_model(
+            "small:latest",
+            Some((TaskKind::Completion, LoopRecord { runs: 3, loops: 1 })),
+        ),
+        models[1].clone(),
+    ];
+    let fastest = RouteInput {
+        task: TaskKind::Completion,
+        objective: Objective::Fastest,
+        ..RouteInput::default()
+    };
+    assert_eq!(
+        select_route(&fastest, &once, &SessionAffinity::default())
+            .unwrap()
+            .selected_model,
+        "small:latest"
+    );
+
+    // Only the looping model installed: still routable, labelled as a last resort.
+    let only = vec![small_model(
+        "small:latest",
+        Some((TaskKind::Completion, looping)),
+    )];
+    let decision =
+        select_route(&RouteInput::default(), &only, &SessionAffinity::default()).unwrap();
+    assert_eq!(decision.selected_model, "small:latest");
+    assert!(
+        decision
+            .reasons
+            .iter()
+            .any(|r| r == "repeats_on_this_task_last_resort")
+    );
+
+    // An explicit model is never second-guessed.
+    let explicit = RouteInput {
+        task: TaskKind::Completion,
+        model: Some("small:latest".to_owned()),
+        ..RouteInput::default()
+    };
+    assert_eq!(
+        select_route(&explicit, &models, &sessions)
+            .unwrap()
+            .selected_model,
+        "small:latest"
+    );
+}
+
+/// No request option is injected because of which model or architecture was chosen: stop
+/// sequences belong to the caller.
+#[test]
+fn no_model_specific_stop_is_injected() {
+    for architecture in ["glmocr", "llama", "anyarch"] {
+        let models = vec![CatalogModel {
+            architecture: Some(architecture.to_owned()),
+            ..small_model("m:latest", None)
+        }];
+        for task in [TaskKind::Vision, TaskKind::Completion] {
+            let input = RouteInput {
+                task,
+                model: Some("m:latest".to_owned()),
+                ..RouteInput::default()
+            };
+            let decision = select_route(&input, &models, &SessionAffinity::default()).unwrap();
+            assert!(
+                decision.options.get("stop").is_none(),
+                "{architecture} {task:?}"
+            );
+        }
+    }
+}
+
+/// Images need a vision model on every surface (CLI, HTTP, MCP). Without an explicit `model`, the
+/// route must be a `[policies.vision]` model; a bare capability tag is not evidence.
+#[tokio::test]
+async fn image_tasks_need_an_explicit_or_policy_qualified_vision_model() {
+    let chat_bodies = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let bodies = Arc::clone(&chat_bodies);
+    let mock = Router::new()
+        .route(
+            "/api/tags",
+            get(|| async {
+                Json(json!({"models": [
+                    {"name": "glm-ocr:latest", "size": 2_000_000_000},
+                    {"name": "text:latest", "size": 1_000_000_000}
+                ]}))
+            }),
+        )
+        .route("/api/ps", get(|| async { Json(json!({"models": []})) }))
+        .route(
+            "/api/show",
+            post(|Json(body): Json<Value>| async move {
+                if body["model"] == "glm-ocr:latest" {
+                    Json(json!({
+                        "capabilities": ["completion", "vision"],
+                        "model_info": {"general.architecture": "glmocr", "glmocr.context_length": 8192}
+                    }))
+                } else {
+                    Json(json!({
+                        "capabilities": ["completion"],
+                        "model_info": {"general.architecture": "llama", "llama.context_length": 8192}
+                    }))
+                }
+            }),
+        )
+        .route(
+            "/api/chat",
+            post(move |Json(body): Json<Value>| async move {
+                bodies.lock().await.push(body);
+                Json(json!({"message": {"role": "assistant", "content": "Invoice #1"}, "done": true, "done_reason": "stop"}))
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("http://{}", listener.local_addr().unwrap());
+    let mock_task = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    let task = |platform: Router| async move {
+        let response = platform
+            .oneshot(
+                Request::post("/_freellama/v1/tasks")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"task":"vision","prompt":"Text Recognition:","images":["aW1hZ2U="]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    };
+
+    let unqualified = app(&crate::support::platform_config(
+        "127.0.0.1:11435",
+        upstream.clone(),
+        None,
+        None,
+    ))
+    .unwrap();
+    let (status, body) = task(unqualified).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(body.contains("[policies.vision]"), "{body}");
+    assert!(chat_bodies.lock().await.is_empty());
+
+    let mut policy = tempfile::NamedTempFile::new().unwrap();
+    std::io::Write::write_all(
+        &mut policy,
+        b"schema_version = 1\n[policies.vision]\nqualified_models = [\"glm-ocr:latest\"]\n",
+    )
+    .unwrap();
+    let qualified = app(&crate::support::platform_config(
+        "127.0.0.1:11435",
+        upstream,
+        None,
+        Some(policy.path().to_path_buf()),
+    ))
+    .unwrap();
+    let (status, body) = task(qualified).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let sent = chat_bodies.lock().await.pop().unwrap();
+    assert_eq!(sent["model"], "glm-ocr:latest");
+    assert!(
+        sent["options"].get("stop").is_none(),
+        "no model-specific stop: {sent}"
+    );
+    mock_task.abort();
+}

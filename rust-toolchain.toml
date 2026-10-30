@@ -1,0 +1,5 @@
+# The exact compiler CI and release builds use; bump deliberately (new clippy lints fail -D warnings).
+# The MSRV floor is `rust-version` in Cargo.toml, checked by CI's msrv job.
+[toolchain]
+channel = "1.99.0"
+components = ["rustfmt", "clippy"]

@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use super::{ApiError, CatalogModel, RouteDecision, TaskInput, TaskKind};
 
 const AUTO_CONTEXT_LIMIT: u64 = 32_768;
-const TEMPLATE_MARGIN: u64 = 512;
+pub(super) const TEMPLATE_MARGIN: u64 = 512;
 
 /// Use UTF-8 bytes so non-ASCII inputs cannot receive the same estimate as equal-length ASCII.
 /// Three bytes/token is a conservative heuristic for ordinary text/code, not an exact bound.

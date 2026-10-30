@@ -7,7 +7,7 @@ system contract, while over-compaction destroys useful evidence and prefix-cache
 For supplied-content conversations, `scope` retains bounded process-local messages with expected
 revisions. Use `scopeId` plus `scopeRevision` with only new input; successful execution returns
 the next revision. Fork before parallel branches, and read full history only when requested.
-Session affinity and Ollama KV remain separate. `warm_model` uses the ordinary managed admission
+Session affinity and Ollama KV remain separate. `run_task {warm:true}` uses the ordinary managed admission
 path; compatible prefix reuse is opportunistic. See
 [Scope history and model warming](https://github.com/bgauryy/FreeLlama/blob/main/docs/SCOPES_AND_WARMING.md) for limits and API shapes;
 installed MCP clients can read `freellama://docs/SCOPES_AND_WARMING` on demand.
@@ -35,7 +35,7 @@ fixed: those are safety invariants, not knobs. Re-run the context contracts and 
 research smoke after changing defaults.
 
 Upstream API status, local boundary results, and reproduction commands:
-`assets/evidence/context-management.md`.
+`docs/dev/evidence/context-management.md`.
 
 Next: KV/memory cost of a larger context → `references/ollama-config.md`; active failures →
 `references/troubleshooting.md`.

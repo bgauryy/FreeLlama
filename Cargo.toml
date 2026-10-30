@@ -4,22 +4,27 @@ members = ["packages/rust-core", "packages/cli"]
 
 # Shared across both crates so versions cannot drift between the library and the CLI that wraps it.
 [workspace.package]
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 license = "Apache-2.0 OR MIT"
-rust-version = "1.85"
+rust-version = "1.88"
 repository = "https://github.com/bgauryy/FreeLlama"
 homepage = "https://github.com/bgauryy/FreeLlama"
 readme = "README.md"
 
 [workspace.lints.rust]
-# `napi.rs` is the sole FFI boundary and opts out explicitly with its own `#![allow(unsafe_code)]`.
-# Everywhere else stays deny-level.
+# `napi.rs` is the sole FFI boundary; it opts out with `#[allow(unsafe_code)]` on its `mod` line in
+# `packages/rust-core/src/lib.rs`. Everywhere else stays deny-level.
 unsafe_code = "deny"
 
 [workspace.lints.clippy]
 all = "warn"
 pedantic = "warn"
+# Production code propagates errors or states the invariant with `expect`; tests may unwrap
+# (clippy.toml).
+unwrap_used = "warn"
+# Every lint suppression states why.
+allow_attributes_without_reason = "warn"
 
 [workspace.dependencies]
 libc = "0.2"
@@ -28,8 +33,8 @@ axum = "0.8"
 base64 = "0.22"
 clap = { version = "4.6", features = ["derive", "env"] }
 http-body = "1.0"
-napi = { version = "2", default-features = false, features = ["napi4", "async", "tokio_rt", "serde-json"] }
-napi-derive = { version = "2" }
+napi = { version = "3", default-features = false, features = ["napi4", "async", "tokio_rt", "serde-json"] }
+napi-derive = { version = "3" }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -39,3 +44,18 @@ toml = "0.9"
 tempfile = "3.20"
 uuid = { version = "1.18", features = ["serde", "v4"] }
 napi-build = { version = "2" }
+
+# Profiles apply only from this workspace root.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+# panic stays "unwind": axum isolates a panicking request task, and napi turns a panic into a
+# JS exception instead of killing the MCP server's Node process.
+
+[profile.dev]
+# file:line backtraces with far less DWARF than full debuginfo.
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false

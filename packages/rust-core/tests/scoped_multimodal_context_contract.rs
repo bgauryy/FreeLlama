@@ -9,7 +9,6 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tower::ServiceExt;
-mod common;
 
 async fn request(platform: &Router, method: &str, path: &str, body: Value) -> (StatusCode, Value) {
     let response = platform
@@ -47,12 +46,11 @@ async fn fixture() -> (Router, Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<(
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
     (
-        app(&common::platform_config(
+        app(&crate::support::platform_config(
             "127.0.0.1:11435",
             endpoint,
             None,
             None,
-            "test:latest",
         ))
         .unwrap(),
         captured,

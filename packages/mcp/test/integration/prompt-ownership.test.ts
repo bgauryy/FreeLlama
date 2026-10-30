@@ -46,9 +46,9 @@ describe("caller-owned task prompts", () => {
     expect(tools.find((tool) => tool.name === "run_task")?.inputSchema.required ?? []).not.toContain("task");
   });
 
-  it.each(["run_task", "run_task_batch"])("%s forwards a bounded caller waiting budget", async (name) => {
+  it.each(["run_task", "batch"])("%s forwards a bounded caller waiting budget", async (name) => {
     const task = { prompt: "Hello", maxWaitSeconds: 30, timeoutSeconds: 60 };
-    const result = await client.callTool({ name, arguments: name === "run_task"
+    const result = await client.callTool({ name: "run_task", arguments: name === "run_task"
       ? { endpoint, ...task }
       : { endpoint, tasks: [{ id: "review", independent: true, task }] },
     });
@@ -66,8 +66,8 @@ describe("caller-owned task prompts", () => {
     expect(requests).toHaveLength(0);
   });
 
-  it.each(["run_task", "run_task_batch"])("%s rejects unknown top-level controls before contacting serve", async (name) => {
-    const result = await client.callTool({ name, arguments: name === "run_task"
+  it.each(["run_task", "batch"])("%s rejects unknown top-level controls before contacting serve", async (name) => {
+    const result = await client.callTool({ name: "run_task", arguments: name === "run_task"
       ? { endpoint, prompt: "Hello", numGpu: 0 }
       : { endpoint, tasks: [{ id: "review", independent: true, task: { prompt: "Hello" } }], numGpu: 0 },
     });
@@ -83,8 +83,8 @@ describe("caller-owned task prompts", () => {
       lifecycle: { requested: "immediate_unload", status: "verified" } } },
   ])("preserves the complete HTTP $status refusal receipt through native MCP", async (fixture) => {
     refusal = fixture;
-    for (const name of ["run_task", "run_task_batch"]) {
-      const result = await client.callTool({ name, arguments: name === "run_task"
+    for (const name of ["run_task", "batch"]) {
+      const result = await client.callTool({ name: "run_task", arguments: name === "run_task"
         ? { endpoint, prompt: "Hello" }
         : { endpoint, tasks: [{ id: "review", independent: true, task: { prompt: "Hello" } }] },
       });
@@ -96,8 +96,8 @@ describe("caller-owned task prompts", () => {
 
   it("advertises local-model prompts and typed function descriptors", async () => {
     const tools = (await client.listTools()).tools;
-    for (const name of ["run_task", "run_task_batch"]) {
-      const schema: any = tools.find((tool) => tool.name === name)!.inputSchema;
+    for (const name of ["run_task", "batch"]) {
+      const schema: any = tools.find((tool) => tool.name === "run_task")!.inputSchema;
       const fields = name === "run_task" ? schema.properties : schema.properties.tasks.items.properties.task.properties;
       expect(fields.systemPrompt).toMatchObject({ type: "string" });
       expect(fields.systemPrompt.description).toMatch(/local model/i);
@@ -107,7 +107,7 @@ describe("caller-owned task prompts", () => {
     }
   });
 
-  it.each(["run_task", "run_task_batch"])("%s forwards the explicit system prompt and tool-call conversation", async (name) => {
+  it.each(["run_task", "batch"])("%s forwards the explicit system prompt and tool-call conversation", async (name) => {
     const systemPrompt = "  Caller instructions for the local model.\n";
     const messages = [
       { role: "system", content: "Existing caller system message" },
@@ -118,7 +118,7 @@ describe("caller-owned task prompts", () => {
       type: "object", properties: { key: { type: "string" } }, required: ["key"], additionalProperties: false,
     }, "x-caller-hint": "keep" } }];
     const task = { systemPrompt, messages, tools };
-    const result = await client.callTool({ name, arguments: name === "run_task"
+    const result = await client.callTool({ name: "run_task", arguments: name === "run_task"
       ? { endpoint, ...task }
       : { endpoint, tasks: [{ id: "review", independent: true, task }] },
     });
@@ -139,9 +139,9 @@ describe("caller-owned task prompts", () => {
     ]);
   });
 
-  it.each(["run_task", "run_task_batch"])("%s accepts a system-only request", async (name) => {
+  it.each(["run_task", "batch"])("%s accepts a system-only request", async (name) => {
     const task = { systemPrompt: "  Begin the caller-defined workflow.\n" };
-    const result = await client.callTool({ name, arguments: name === "run_task"
+    const result = await client.callTool({ name: "run_task", arguments: name === "run_task"
       ? { endpoint, ...task }
       : { endpoint, tasks: [{ id: "review", independent: true, task }] },
     });
@@ -150,10 +150,10 @@ describe("caller-owned task prompts", () => {
     expect(sent.messages).toEqual([{ role: "system", content: task.systemPrompt }]);
   });
 
-  it.each(["run_task", "run_task_batch"])("%s refuses image inputs that would be ignored", async (name) => {
+  it.each(["run_task", "batch"])("%s refuses image inputs that would be ignored", async (name) => {
     for (const extra of [{}, { prompt: "Look", messages: [{ role: "user", content: "Look" }] }]) {
       const task = { model: "test:latest", systemPrompt: "Inspect", images: ["aW1hZ2U="], ...extra };
-      const result = await client.callTool({ name, arguments: name === "run_task"
+      const result = await client.callTool({ name: "run_task", arguments: name === "run_task"
         ? { endpoint, ...task }
         : { endpoint, tasks: [{ id: "review", independent: true, task }] },
       });
@@ -162,14 +162,14 @@ describe("caller-owned task prompts", () => {
     expect(requests).toHaveLength(0);
   });
 
-  it.each(["run_task", "run_task_batch"])("%s rejects malformed function descriptors before execution", async (name) => {
+  it.each(["run_task", "batch"])("%s rejects malformed function descriptors before execution", async (name) => {
     for (const tools of [
       [{ type: "function", function: { name: "" } }],
       [{ type: "function", function: { parameters: {} } }],
       [{ type: "function", function: { name: "lookup", parameters: "not a schema" } }],
     ]) {
       const task = { prompt: "Look", tools };
-      const result = await client.callTool({ name, arguments: name === "run_task"
+      const result = await client.callTool({ name: "run_task", arguments: name === "run_task"
         ? { endpoint, ...task }
         : { endpoint, tasks: [{ id: "review", independent: true, task }] },
       });
@@ -183,7 +183,7 @@ describe("caller-owned task prompts", () => {
       const result = await client.callTool({ name: "run_task", arguments: { endpoint, ...args } });
       expect(result.isError).toBe(true);
     }
-    const batch = await client.callTool({ name: "run_task_batch", arguments: {
+    const batch = await client.callTool({ name: "run_task", arguments: {
       endpoint, tasks: [{ id: "review", independent: true, task: { task: "embedding", input: "x", systemPrompt: "x" } }],
     } });
     expect(batch.isError).toBe(true);
@@ -191,7 +191,7 @@ describe("caller-owned task prompts", () => {
   });
 
   it("defaults independent batch items to ordinary chat too", async () => {
-    const result = await client.callTool({ name: "run_task_batch", arguments: {
+    const result = await client.callTool({ name: "run_task", arguments: {
       endpoint, tasks: [{ id: "review", independent: true, task: { prompt: "Hello" } }],
     } });
     expect(result.isError, JSON.stringify(result)).not.toBe(true);
@@ -228,7 +228,7 @@ describe("caller-owned task prompts", () => {
 
   it("keeps batch review prompts and controls caller-owned too", async () => {
     const messages = [{ role: "system", content: "My batch instructions" }, { role: "user", content: "Review" }];
-    const result = await client.callTool({ name: "run_task_batch", arguments: {
+    const result = await client.callTool({ name: "run_task", arguments: {
       endpoint, tasks: [{ id: "review", independent: true, task: {
         task: "code_review", messages, format: "json", think: true, options: { num_predict: 32 },
       } }],

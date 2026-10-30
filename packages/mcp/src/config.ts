@@ -6,6 +6,9 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 
+/** The package directory: `src/..` in a checkout, `dist/..` once bundled. */
+const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
 /**
  * Repo root, found by walking up to the directory containing `Cargo.toml`.
  *
@@ -15,13 +18,11 @@ import { homedir } from "node:os";
  * Unmarked installs must set `FREELLAMA_MCP_ALLOWED_ROOTS`.
  */
 function findRepoRoot(): string | undefined {
-  const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
   let dir = path.dirname(fileURLToPath(import.meta.url));
   for (let depth = 0; depth < 10; depth += 1) {
-    // Only a FreeLlama checkout counts: this package must sit at <root>/packages/mcp. Any
-    // Cargo.toml used to match, so an npm install inside some other Rust project silently made
-    // that project the default research allowlist.
-    if (existsSync(path.join(dir, "Cargo.toml")) && path.join(dir, "packages", "mcp") === packageRoot) return dir;
+    // Only a FreeLlama checkout counts: this package must sit at <root>/packages/mcp, so an npm
+    // install inside another Rust project never makes that project the research allowlist.
+    if (existsSync(path.join(dir, "Cargo.toml")) && path.join(dir, "packages", "mcp") === PACKAGE_ROOT) return dir;
     const parent = path.dirname(dir);
     if (parent === dir) break;
     dir = parent;
@@ -31,22 +32,21 @@ function findRepoRoot(): string | undefined {
   return undefined;
 }
 
-export const REPO_ROOT = findRepoRoot() ?? path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-// Two interchangeable research adapters. Same env contract and result shape. In-repo
-// measurements: bash tied or beat octocode on every model, and was faster — hence the default.
-// `octocode` remains for structured search when asked. Numbers: benchmark/local/results.
-export const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-// `npm run build` copies adapters into adapters/ so a published tarball still has them.
+const CHECKOUT_ROOT = findRepoRoot();
+export const REPO_ROOT = CHECKOUT_ROOT ?? PACKAGE_ROOT;
 
+// `yarn build` compiles each adapter from src/research/ to a standalone script under dist/research/,
+// in a checkout and in the published tarball alike.
 function adapterPath(file: string): string {
-  const bundled = path.join(PACKAGE_ROOT, "adapters", file);
-  if (existsSync(bundled)) return bundled;
-  return path.join(REPO_ROOT, "benchmark/local/scripts", file);
+  return path.join(PACKAGE_ROOT, "dist", "research", file);
 }
 
+// Two interchangeable research adapters. Same env contract and result shape. In-repo
+// measurements: bash tied or beat octocode on every model, and was faster — hence the default.
+// `octocode` remains for structured search when asked.
 export const RESEARCH_ADAPTERS = {
-  bash: adapterPath("bash_agent.py"),
-  octocode: adapterPath("octocode_agent.py"),
+  bash: adapterPath("bash-agent.js"),
+  octocode: adapterPath("octocode-agent.js"),
 } as const;
 export type ResearchAdapter = keyof typeof RESEARCH_ADAPTERS;
 
@@ -67,8 +67,8 @@ export const DEFAULT_OLLAMA_ENDPOINT = process.env.FREELLAMA_OLLAMA_ENDPOINT ?? 
 // Same env var name the Rust side (packages/rust-core/src/napi.rs) uses for its own serve-endpoint default — one
 // name, one meaning, across both languages.
 export const DEFAULT_SERVE_ENDPOINT = process.env.FREELLAMA_SERVE_ENDPOINT ?? "http://127.0.0.1:11435";
-// No hardcoded tag: the old default (`qwen3.8:27b-mlx`) exists only on Apple Silicon, so every
-// Linux/Windows call without `model` failed. Unset means "route to an installed coding model".
+// No hardcoded tag: installed models differ per machine. Unset means "route to an installed
+// coding model".
 // docs/MODEL_SELECTION.md owns the measured recommendation.
 export const DEFAULT_DELEGATE_MODEL: string | undefined = process.env.FREELLAMA_MCP_DEFAULT_MODEL?.trim() || undefined;
 export const DEFAULT_DELEGATE_MAX_TURNS = envInt("FREELLAMA_MCP_MAX_TURNS", 8);
@@ -100,7 +100,7 @@ export function parseAllowedResearchRoots(raw: string, delimiter = path.delimite
 }
 
 const ALLOWED_RESEARCH_ROOTS = parseAllowedResearchRoots(
-  process.env.FREELLAMA_MCP_ALLOWED_ROOTS ?? findRepoRoot() ?? "",
+  process.env.FREELLAMA_MCP_ALLOWED_ROOTS ?? CHECKOUT_ROOT ?? "",
 );
 
 // Resolved once, lazily, and through symlinks — see `assertAllowedWorkspace`. A root that can't
@@ -158,13 +158,13 @@ export async function assertAllowedWorkspace(workspacePath: string): Promise<str
 
 // The research adapter runs model-chosen commands, so it gets only what it needs: its own
 // FREELLAMA_* settings, locale, temp and the proxy/CA settings `npx octocode` needs. Tokens and
-// API keys in the MCP host's environment used to be inherited verbatim.
+// API keys in the MCP host's environment are never inherited.
 const DELEGATE_ENV_ALLOWLIST = new Set([
   "PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR", "TEMP", "TMP",
   "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "PATHEXT", "APPDATA", "LOCALAPPDATA", "USERPROFILE",
   "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy",
   "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE",
-  "XDG_CACHE_HOME", "XDG_DATA_HOME", "npm_config_cache", "PYTHONPATH",
+  "XDG_CACHE_HOME", "XDG_DATA_HOME", "npm_config_cache",
 ]);
 
 export function delegateEnvironment(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
