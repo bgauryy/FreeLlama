@@ -2,7 +2,7 @@
 
 FreeLlama helps agents offload bounded work to local models through Ollama. The calling agent owns
 the task and verifies the answer; FreeLlama manages model selection and resources around execution.
-Start with the [repository MCP setup](https://github.com/bgauryy/FreeLlama/blob/main/README.md#use-with-your-agent-mcp) to run one managed task.
+Start with the [repository MCP setup](https://github.com/bgauryy/FreeLlama/blob/main/README.md#mcp-server) to run one managed task.
 
 ## Choose a guide
 
