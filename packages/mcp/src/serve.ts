@@ -1,8 +1,10 @@
-// Start `freellama serve` on demand so the shortest path is one tool call.
+// Start `freellama serve` so the shortest path is one tool call.
 //
 // Every generating tool talks to serve. When the caller uses the default loopback endpoint and
 // nothing answers there, start the bundled
-// binary as a child of this server (so it stops with it) and wait for its health route.
+// binary as a child of this server (so it stops with it) and wait for its health route. The server
+// also starts it once in the background at launch, so other local clients of the documented
+// endpoint (skills, scripts, the CLI) find it before the agent's first FreeLlama tool call.
 import { type ChildProcess, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -68,6 +70,13 @@ function serveBinaryCandidates(): string[] {
   }
   if (process.env.FREELLAMA_SERVE_BINARY) candidates.unshift(process.env.FREELLAMA_SERVE_BINARY);
   return candidates;
+}
+
+/** Background start at launch: a failure is logged and the next tool call retries and reports it. */
+export function startServeInBackground(): void {
+  ensureServe(undefined).catch((error: unknown) => {
+    process.stderr.write(`[freellama serve] background start failed: ${error instanceof Error ? error.message : String(error)}\n`);
+  });
 }
 
 export function stopAutostartedServe(): void {

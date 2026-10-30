@@ -24,8 +24,8 @@ yarn install
 yarn build
 ```
 
-The root build compiles the host Rust release binary, NAPI addon, and single-file MCP JavaScript
-bundle. The native `.node` addon remains external to the JavaScript bundle because it is selected
+The root build compiles the host Rust release binary, NAPI addon, and MCP JavaScript bundles
+(server and research adapters). The native `.node` addon remains external to the JavaScript bundle because it is selected
 by platform triple at runtime. Published packages resolve it from an OS/CPU/libc-specific optional
 dependency rather than compiling Rust during installation.
 
@@ -40,7 +40,6 @@ Yarn. Use the `:js` or `:rust` variants to run one side only.
 | All package unit tests (JS + Rust) | `yarn test` | Rust toolchain |
 | JavaScript unit | `yarn test:js` | None |
 | Rust contracts | `yarn test:rust` | Rust toolchain |
-| Local-agent contracts | `yarn test:agents` | None after install; builds the MCP package |
 | TypeScript | `yarn typecheck` | None after install |
 | MCP integration | `yarn test:integration` | Ollama at `FREELLAMA_OLLAMA_ENDPOINT` (default `127.0.0.1:11434`) |
 | MCP end to end | `yarn test:e2e` | Ollama, `freellama serve`, and required models |
@@ -137,11 +136,11 @@ Usage-ledger unit contracts cover ordered writes, bounded queue overflow, failed
 validation, replay, and flush behavior. `monitoring_contract` also checks that a blocked ledger path
 does not hold task completion. Persistence remains best effort, not a zero-loss promise.
 
-MCP `serve.test.ts` checks startup permission failure, retry, and child-lifecycle isolation. The
+MCP `serve.test.ts` checks startup permission failure, retry, child-lifecycle isolation, and the
+background start at launch. The
 protocol integration contracts verify that spawn failure leaves the MCP connection usable and that
 fixture-backed library requests fail on unexpected product errors. External catalog availability
-is separate from these deterministic checks. Runtime-view `app-windows.test.ts` checks legitimate
-Windows static paths alongside traversal refusal.
+is separate from these deterministic checks.
 
 Launcher fixtures use `process.execPath` to avoid an extra PATH-resolved shell wrapper. After the
 MCP fixture's real executable-permission refusal, a test-only transport launches that exact fixture

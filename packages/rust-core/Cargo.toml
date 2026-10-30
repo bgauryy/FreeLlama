@@ -4,6 +4,7 @@ description = "Local Ollama model gateway, router, and embeddable Rust library â
 publish = false
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -14,6 +15,7 @@ autotests = false
 documentation = "https://docs.rs/freellama-core"
 keywords = ["ollama", "llm", "routing", "mcp", "local-ai"]
 categories = ["network-programming", "api-bindings", "asynchronous"]
+include = ["src/**", "build.rs", "README.md", "LICENSE-APACHE", "LICENSE-MIT"]
 
 # The lib keeps the name `freellama`, so `use freellama::...` is unchanged for every consumer
 # (the CLI, the integration tests, and the napi addon) despite the package rename.

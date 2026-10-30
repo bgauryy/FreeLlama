@@ -38,13 +38,41 @@ verifies the answer.
 The name refers to reducing reliance on metered inference. Any model Ollama runs works, not only
 Meta's Llama family.
 
+## How it compares
+
+FreeLlama is not an inference engine. Ollama loads and runs the model; FreeLlama decides whether,
+where and how each task runs, which neither Ollama nor the common local routers do for an agent.
+Behavior of the other projects is taken from their own docs and source, checked on 2026-10-29.
+
+| Decision | Other local stacks | FreeLlama |
+|---|---|---|
+| Can this load fit right now? | Ollama predicts a model's footprint and evicts when it exceeds 80% of free memory; its queue holds 512 requests, then returns 503 ([scheduler](https://github.com/ollama/ollama/blob/main/server/sched.go), [FAQ](https://docs.ollama.com/faq)). The llama.cpp router keeps a fixed 1024 MiB margin per device and loads anyway when nothing can be unloaded ([server docs](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md)). llama-swap has no memory reserve setting ([config](https://github.com/mostlygeek/llama-swap/blob/main/docs/config.example.yaml)); LocalAI caps VRAM by percentage but cannot estimate VRAM before a load ([docs](https://localai.io/docs/advanced/vram-management/)). | Admits each task against live host memory with a reserve sized to the load and unloads idle runners first. Where memory is short it holds or refuses with a reason and a `Retry-After` computed from service time (on macOS, where free memory undercounts reclaimable cache, it admits with a memory advisory). |
+| Is the machine busy or hot? | Ollama and the llama.cpp router have no gate on host CPU load or heat. | Holds CPU-bound work and cold loads while the CPUs are saturated or a Mac reports thermal pressure. Inference on a model already resident on the GPU keeps running. |
+| Who goes first? | LiteLLM sheds with 429 once a deployment's parallel limit is reached, with an optional priority queue ([routing](https://docs.litellm.ai/docs/routing), [scheduler](https://docs.litellm.ai/docs/scheduler)). | Weighted fair admission per backend (interactive 3 : normal 2 : background 1) with starvation prevention and bounded waits; GPU and CPU pools are separate. |
+| Which model? | Ollama runs the tag it is given. LiteLLM picks among deployments by load, latency or cost; RouteLLM trains a strong/weak router ([RouteLLM](https://github.com/lm-sys/RouteLLM)). | Picks an installed model from its capabilities, context window, memory estimate and residency, and ranks a model last for a task kind it keeps looping on. |
+| Did it loop? | Ollama aborts some loops with a "token repeat limit" error. | Streams and stops once the output repeats, keeping the text (`stopOnRepetition`), and reports `output_check` on every task. |
+| Where did it run? | Ollama reports load and token timings. | Adds a receipt: chosen model and why, queue and resource waits, and the placement Ollama actually reported (`/api/ps`), so a silent CPU fallback is visible. |
+
+Measured on one Apple M2 Pro (32 GB) unless noted:
+
+| Workload | Without | With FreeLlama |
+|---|---|---|
+| OCR of 12 report strips, `glm-ocr`, 1,500-token cap | 12,948 output tokens, 126 s | `stopOnRepetition`: 6,452 tokens, 69 to 103 s, every label still read |
+| Resident GPU tasks during a compiler build | 64 to 120 s waits (host-wide CPU-load hold, 0.5.0) | No wait: the hold applies only to CPU-bound work and cold loads |
+| `Retry-After` for a queued burst | 76 s quoted for a 32 s wait (0.5.0) | 32 s |
+| A GPU model and a CPU model side by side (M4 Pro, 48 GB) | 38.0 s median, one Ollama process | 28.2 s median with a second CPU-only Ollama process (1.35x; one of three runs was slower) |
+
+These are single-machine measurements of specific workloads, not a general speed claim: Ollama's
+decode speed is unchanged, and FreeLlama's gains come from not loading, waiting or generating what
+the task does not need.
+
 ## Installation
 
 **Requirements**
 
 - [Ollama](https://ollama.com/download) running (`ollama list` works) with at least one model.
   FreeLlama never downloads a model without your approval.
-- Node.js 20.19+ or 22.12+.
+- Node.js 20 or newer.
 
 Prebuilt binaries cover macOS, Linux (glibc and musl) and Windows on arm64 and x64. They ship as npm
 optional dependencies, so keep those enabled.
@@ -82,8 +110,9 @@ Claude Desktop, Cursor and other hosts use the same command in their JSON config
 }
 ```
 
-The server starts its own FreeLlama service when none is running, so the CLI is not required. It
-does not install or start Ollama.
+The server starts its own FreeLlama service on `127.0.0.1:11435` at launch when none is running,
+so the CLI is not required and other local clients can use that endpoint. It does not install or
+start Ollama.
 
 **Optional: research roots.** `FREELLAMA_MCP_ALLOWED_ROOTS` lists the directories
 `delegate_research` may read, separated by `:` on macOS and Linux or `;` on Windows. Every other tool
@@ -373,7 +402,7 @@ FreeLlama never changes Ollama's settings. These matter most, per Ollama's docs 
 |---|---|---|
 | `OLLAMA_NUM_PARALLEL` | Decoding slots per model. RAM grows with slots times context ([Ollama FAQ](https://github.com/ollama/ollama/blob/main/docs/faq.mdx)). On Apple silicon the gain is small, and some engines run one request at a time ([MLX engine](https://github.com/ollama/ollama/issues/17280)) | `1`, raised only after measuring. FreeLlama's budget follows it |
 | `OLLAMA_FLASH_ATTENTION` + `OLLAMA_KV_CACHE_TYPE=q8_0` | A quantized KV cache roughly halves its memory and needs flash attention ([Ollama FAQ](https://github.com/ollama/ollama/blob/main/docs/faq.mdx)) | On, when the model's quality holds |
-| Context length | Ollama defaults to 4k below 24 GiB of VRAM and recommends at least 64k for agent and coding work ([context length](https://github.com/ollama/ollama/blob/main/docs/context-length.mdx)) | Size per task. FreeLlama sizes text tasks to the prompt, and `contextTokens` overrides |
+| Context length | Ollama defaults to 4k below 24 GiB of VRAM and recommends at least 64k for agent and coding work ([context length](https://github.com/ollama/ollama/blob/main/docs/context-length.mdx)) | Size per task. FreeLlama keeps Ollama's default when it covers the prompt and otherwise sizes text tasks to the prompt; `contextTokens` overrides |
 | `OLLAMA_MAX_LOADED_MODELS` | How many runners stay resident | One large model at a time. FreeLlama unloads the idle model that is cheapest to reload when a load needs room |
 | `keep_alive` | How long a runner stays loaded after use | Leave it out. FreeLlama picks a finite time from measured reuse |
 
@@ -398,7 +427,8 @@ model's `context_default` and `resident_context` so you can match it.
 
 ## Build from source
 
-Requires Rust 1.88+ (`rust-toolchain.toml` pins the compiler) and Node.js with Corepack.
+Requires Rust 1.88+ (`rust-toolchain.toml` pins the compiler) and Node.js 20.19+ or 22.13+ with
+Corepack.
 
 ```bash
 corepack enable && yarn install && yarn build
@@ -420,9 +450,10 @@ gate is `yarn verify:production`.
 | CPU/GPU setup and placement | [CPU/GPU routing](docs/CPU_GPU_ROUTING.md) |
 | Queues, memory, live tuning | [Monitoring](docs/MONITORING.md) |
 | Choosing models | [Model selection and metadata](docs/MODEL_SELECTION.md) |
-| Deployment and releases | [Production](docs/PRODUCTION.md), [Release](RELEASE.md) |
+| Deployment and releases | [Production](docs/PRODUCTION.md), [release packages](docs/TESTING.md#verify-release-packages) |
 | Embedding the Rust core | [Rust core](packages/rust-core/README.md) |
 
 ## License
 
-Licensed under [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT), at your option.
+Copyright (c) 2026 Guy Bary. Licensed under [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT),
+at your option.

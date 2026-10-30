@@ -56,7 +56,7 @@ flowchart TB
     CP --> CPU["CPU runner"]
 ```
 
-FreeLlama does not inspect or rewrite raw passthrough request bodies. A direct Ollama client that
+FreeLlama does not rewrite raw passthrough request bodies or route them by model. A direct Ollama client that
 needs model-aware CPU placement must use the managed task endpoint instead.
 
 ## Start the backends
@@ -117,7 +117,7 @@ unsafe or ambiguous configurations:
 - A CPU model assignment without `--cpu-upstream`
 - Empty model names
 - The same socket expressed through aliases such as `localhost:11434` and `127.0.0.1:11434`
-- A nonloopback upstream
+- An upstream that points back to the FreeLlama listener, or an unspecified host such as `0.0.0.0`
 
 A nonloopback FreeLlama listener requires `--allow-remote` and bearer-token authentication.
 See the [production runbook](PRODUCTION.md) for remote ingress requirements.
@@ -216,7 +216,7 @@ curl --silent http://127.0.0.1:11436/api/ps | jq '.models[] | {name, size, size_
 A fully CPU-loaded model reports `size_vram:0`; a fully GPU-loaded model reports positive VRAM
 covering its resident `size`. Compare both values from the same `/api/ps` entry. Installed `/api/tags`
 file bytes can differ from resident memory and cannot prove a mixed placement. Positive VRAM without
-total resident size stays unknown. `observation.status` is `verified`, `mismatch`, or unavailable. Unknown, mixed, and mismatched
+total resident size stays unknown. `observation.status` is `verified`, `mismatch`, `not_resident`, or `unavailable`. Unknown, mixed, and mismatched
 samples are reported but excluded from adaptive feedback.
 
 ## Understand concurrency
@@ -252,17 +252,18 @@ FreeLlama can overlap requests across the two servers even when each Ollama proc
 `OLLAMA_NUM_PARALLEL=1`. Raising `OLLAMA_NUM_PARALLEL` affects parallel requests within one server
 and multiplies K/V-cache memory; it is a separate tuning decision. `OLLAMA_MAX_QUEUE` likewise
 bounds each Ollama process after FreeLlama admission. It does not replace either backend's weighted
-FreeLlama budget, bounded waiter count, or queue-wait deadline. Raw passthrough uses a separate
-one-stream default cap in `serve`; its permit is held until the streamed response ends or is dropped.
+FreeLlama budget, bounded waiter count, or queue-wait deadline. Raw generation passthrough uses a
+separate one-stream default cap in `serve`; its permit is held until the streamed response ends or is dropped.
 
 The runtime file's `[task_costs]` table can tune individual task-kind weights without increasing
 the entire pool's ceiling. Default vision weight four can serialize two vision requests under a
 four-unit budget even when Ollama has two slots. A lower weight requires a qualified workload;
 it does not add engine slots or relax memory checks. See
 [monitoring controls](MONITORING.md#adaptive-concurrency).
-Mutating raw requests also require exclusive access to the primary backend's managed transition
-lock and receive 503 while it is busy. Metadata GET/HEAD calls remain available. This prevents raw
-inference or model lifecycle calls from overlapping a managed generation on that backend.
+Raw generation requests also require exclusive access to the primary backend's managed transition
+lock and receive 503 if it stays busy past the raw queue wait. Metadata GET/HEAD, `/api/show`,
+model-store calls (pull, push, copy, delete), and empty `keep_alive:0` unloads remain available.
+This prevents raw inference from overlapping a managed generation on that backend.
 
 ## Understand automatic feedback
 
@@ -382,9 +383,8 @@ A configured but unreachable CPU backend causes model discovery to fail closed. 
 can also be unavailable until the secondary server returns. Raw passthrough to the primary server
 continues to work because it does not depend on catalog discovery.
 
-For the surrounding runtime settings, see
-[Ollama and FreeLlama optimization](dev/OLLAMA_SYSTEM_OPTIMIZATION.md). For all `serve` flags, see the
-[CLI reference](CLI.md).
+For the surrounding Ollama settings, see [Production](PRODUCTION.md#configure-ollama-explicitly). For
+all `serve` flags, see the [CLI reference](CLI.md).
 
 ## Upstream sources
 

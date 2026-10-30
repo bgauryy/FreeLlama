@@ -19,7 +19,7 @@ Start with the [repository MCP setup](https://github.com/bgauryy/FreeLlama/blob/
 | Understand raw Ollama compatibility | [Ollama sidecar](ARCHITECTURE.md#ollama-sidecar) |
 | Evaluate context offload and its cost | [Token economics](https://github.com/bgauryy/FreeLlama/blob/main/packages/mcp/README.md#token-economics) |
 | Deploy the management layer | [Production runbook](PRODUCTION.md) |
-| Run development and release checks | [Testing](TESTING.md), [release procedure](https://github.com/bgauryy/FreeLlama/blob/main/RELEASE.md) |
+| Run development and release checks | [Testing](TESTING.md), [release packages](TESTING.md#verify-release-packages) |
 | Embed the routing core | [Rust core](https://github.com/bgauryy/FreeLlama/blob/main/packages/rust-core/README.md) |
 | Use the read-only status page | `/_freellama/ui` on a running `serve` (see [Monitoring](MONITORING.md)) |
 
@@ -27,10 +27,6 @@ Start with the [repository MCP setup](https://github.com/bgauryy/FreeLlama/blob/
 
 | Goal | Source |
 |---|---|
-| Review dated findings and project comparisons | [Findings report](dev/FINDINGS_AND_POSITIONING.md) |
-| Measure inference, device activity, and thermal behavior | [Local performance testing](dev/LOCAL_PERFORMANCE_TESTING.md) |
-| Separate management controls from inference tuning | [Ollama optimization boundary](dev/OLLAMA_SYSTEM_OPTIMIZATION.md) |
-| Understand backend selection decisions | [Resource-routing ADR](dev/ADR_RESOURCE_AWARE_BACKEND_ROUTING.md) |
 
 Historical measurements describe one model, machine, and workload. Inspect current state and
 repeat the relevant checks before using them to select models or set resource limits.

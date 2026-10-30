@@ -11,6 +11,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { SERVER_VERSION } from "./native.js";
 import { installProcessLifecycle } from "./lifecycle.js";
+import { startServeInBackground } from "./serve.js";
 import { withoutSchemaDialect } from "./schema-dialect.js";
 import { registerDocsResources } from "./docs-resources.js";
 import { registerDoctorTool } from "./tools/doctor.js";
@@ -51,3 +52,4 @@ registerDelegateResearchTool(server);
 
 const transport = withoutSchemaDialect(new StdioServerTransport());
 await server.connect(transport);
+startServeInBackground();

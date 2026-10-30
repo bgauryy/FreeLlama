@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // Sets one release version everywhere it is declared: every workspace package.json, the native
-// optionalDependencies pins, and [workspace.package] in Cargo.toml. Lockfiles are refreshed after.
+// optionalDependencies pins, [workspace.package] in Cargo.toml and the CLI's freellama-core pin.
+// Lockfiles are refreshed after.
 import { execFileSync } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
@@ -31,6 +32,13 @@ const cargo = readFileSync(cargoFile, "utf8");
 const updated = cargo.replace(/(\[workspace\.package\][^[]*?\nversion = )"[^"]*"/, `$1"${version}"`);
 if (updated === cargo && !cargo.includes(`version = "${version}"`)) throw new Error("Cargo.toml: [workspace.package] version not found");
 writeFileSync(cargoFile, updated);
+
+// The CLI names the core crate by path and version (crates.io needs both), so the pin moves too.
+const cliCargoFile = path.join(root, "packages/cli/Cargo.toml");
+const cliCargo = readFileSync(cliCargoFile, "utf8");
+const cliUpdated = cliCargo.replace(/(package = "freellama-core", version = )"[^"]*"/, `$1"${version}"`);
+if (cliUpdated === cliCargo && !cliCargo.includes(`package = "freellama-core", version = "${version}"`)) throw new Error("packages/cli/Cargo.toml: freellama-core dependency version not found");
+writeFileSync(cliCargoFile, cliUpdated);
 
 execFileSync("yarn", ["install"], { cwd: root, stdio: "inherit" });
 execFileSync("cargo", ["update", "--workspace"], { cwd: root, stdio: "inherit" });

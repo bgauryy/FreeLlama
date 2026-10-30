@@ -1,6 +1,32 @@
 # Changelog
 
-## Unreleased
+## 0.6.1
+
+- **MCP server starts serve at launch:** with `FREELLAMA_MCP_AUTOSTART_SERVE` on (the default) the
+  server now starts `freellama serve` in the background when it launches, not only on the first
+  tool call, so other local clients of `127.0.0.1:11435` (skills, scripts, the CLI) find it in a
+  fresh session instead of falling back to raw Ollama. A failed start is logged to stderr and the
+  next tool call retries and reports it.
+- **Docs:** `docs/dev/` (findings report, ADR, performance-testing guide and evidence notes) is
+  removed; git history keeps it. The README gains a "How it compares" section with peer behavior
+  from primary sources and single-machine measurements. Every guide was rechecked against the code
+  (status codes, platform support, routes, flags); the CLI help for `--max-queued-tasks` now says
+  429, matching the server.
+- **CLI `task --input-file` works:** the positional prompt was still required, so embedding input
+  from a file was refused before reaching the server. The prompt is now optional with
+  `--input-file` (and conflicts with it).
+- **Skill is one file:** `skills/freellama/` is now just `SKILL.md`. Its references are folded in
+  or point to the docs; `scripts/check.sh` (use `freellama doctor`, `freellama status` and
+  `/_freellama/v1/health`), its test, `examples/local-rag.sh` and the `test:agents` script are removed.
+- **License:** copyright holder is Guy Bary; package manifests and crates name the author.
+- **Test fix:** the scope and warming integration suite set `FREELLAMA_AUTOSTART_SERVE`, which no
+  code reads; it now sets `FREELLAMA_MCP_AUTOSTART_SERVE=0` as intended.
+
+## 0.6.0
+
+Breaking cleanup release: fewer surfaces, stricter contracts, and safer admission.
+
+### Routing, loop control and host awareness
 
 - **Model-agnostic routing:** routing no longer ranks by a model's name or architecture. The rule
   that demoted architectures ending in `ocr` is replaced by observed evidence: automatic selection
@@ -63,10 +89,6 @@
 - **Root scripts:** `build`, `lint` and `test` now run every package (JS and Rust). `test:js`,
   `lint:js` and `build:js` run the JS side only. `test:hardware` and `test:agents:node` are removed.
 
-## 0.6.0
-
-Breaking cleanup release: fewer surfaces, stricter contracts, and safer admission.
-
 ### MCP server (`@octocodeai/freellama-mcp-server`)
 
 - **9 tools:** `run_task`, `task_jobs`, `delegate_research`, `models`, `session`, `scope`,
@@ -88,8 +110,7 @@ Breaking cleanup release: fewer surfaces, stricter contracts, and safer admissio
 ### CLI (`@octocodeai/freellama`)
 
 - **Removed commands:** `natural-route`, `recommend`, `eval`, `run`, `policy-from-eval`, `tools`.
-  - `policy-from-eval` is replaced by
-    `python3 benchmark/harness/scripts/policy_from_eval.py`.
+  - `policy-from-eval` is replaced by `freellama policy from-eval`.
 - **Removed flags:** `--intent-model`, `--recommendation-catalog`.
 - **Removed environment variables:** use the flag or a `--runtime-config` key instead.
   - `FREELLAMA_ADAPTIVE_CONCURRENCY`, `FREELLAMA_AUTO_CONTEXT_MAX`
@@ -107,7 +128,6 @@ Breaking cleanup release: fewer surfaces, stricter contracts, and safer admissio
 ### Routing and execution
 
 - Image input is refused unless a vision policy or a vision-capable model applies.
-- OCR specialists (detected from `general.architecture` metadata) rank last for general tasks.
 - Repetition loops are flagged in the result (64 KiB scan window); output is not truncated.
 - `/models` reports `resident_view`.
 - Unload requests no longer send `"prompt":""`.
@@ -121,7 +141,7 @@ Breaking cleanup release: fewer surfaces, stricter contracts, and safer admissio
 - **Resident reuse:** an already-loaded model adds no memory, so low-RAM and active-swapping holds
   no longer block it. A large load can no longer lock out its own runner, which previously made
   multi-turn `delegate_research` time out. New loads still wait while the host swaps. OS memory
-  pressure, CPU load and thermal holds still apply to every request.
+  pressure still holds every request.
 - **First-sample grace:** a `ResourcePolicy.first_sample_grace` field (default 2s).
 
 ### Contract changes
@@ -137,13 +157,14 @@ Breaking cleanup release: fewer surfaces, stricter contracts, and safer admissio
   Run `corepack enable` once.
 - Generated logo and native README copies are no longer tracked; the build regenerates them.
 - **Rust:** MSRV is 1.88 (the code needs `let` chains; the declared 1.85 never built).
-  `rust-toolchain.toml` pins the compiler; CI checks the MSRV and runs `cargo deny`
+  `rust-toolchain.toml` pins the compiler; `deny.toml` configures `cargo deny`
   (advisories, licenses, sources).
 - **Security:** `rustls` 0.23.45 fixes RUSTSEC-2026-0285.
 - **Release profile:** fat LTO, one codegen unit, stripped symbols. The CLI binary shrinks from
   13.1 MB to 7.3 MB, the native addon from 7.5 MB to 4.7 MB (darwin-arm64).
 - **Native binding:** napi-rs 3. `native/index.d.ts` is generated from `napi.rs` by
-  `yarn build:native`, and CI fails when the committed file is stale.
+  `yarn build:native`, which fails when the file declares a different number of functions than
+  `napi.rs` exports.
 - **Tests:** the Rust integration tests build as one binary (`--test integration`).
 - **CLI output:** a closed pipe (`freellama doctor | head`) exits quietly with status 0 instead
   of panicking with status 101.

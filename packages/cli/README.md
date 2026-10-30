@@ -9,7 +9,7 @@ submit managed tasks. Ollama supplies model loading and inference.
 The JavaScript launcher locates the
 compiled Rust CLI in the matching optional native package and forwards arguments, signals, and exit
 status. In a source checkout, it uses `target/release/freellama` after a build. Routing and execution
-logic remain in [`freellama-core`](../rust-core/README.md).
+logic remain in [`freellama-core`](https://github.com/bgauryy/FreeLlama/blob/main/packages/rust-core/README.md).
 
 ```mermaid
 flowchart LR
@@ -43,9 +43,9 @@ npx @octocodeai/freellama route --task coding --objective fastest
 npx @octocodeai/freellama task --task completion --objective fastest "Reply with exactly OK."
 ```
 
-Read the repository [CLI reference](../../docs/CLI.md) for the complete command map, task kinds, routing
+Read the repository [CLI reference](https://github.com/bgauryy/FreeLlama/blob/main/docs/CLI.md) for the complete command map, task kinds, routing
 confidence, policy generation, and admission controls. Use the
-[Scope history and model warming reference](../../docs/SCOPES_AND_WARMING.md) for `scope`, `warm`,
+[Scope history and model warming reference](https://github.com/bgauryy/FreeLlama/blob/main/docs/SCOPES_AND_WARMING.md) for `scope`, `warm`,
 and the scoped task flags.
 
 ## Run separate CPU and GPU backends
@@ -60,7 +60,7 @@ npx @octocodeai/freellama serve \
 ```
 
 Managed tasks for assigned models use the CPU backend; other managed models and raw Ollama
-passthrough use the primary backend. See [CPU and GPU model routing](../../docs/CPU_GPU_ROUTING.md)
+passthrough use the primary backend. See [CPU and GPU model routing](https://github.com/bgauryy/FreeLlama/blob/main/docs/CPU_GPU_ROUTING.md)
 for the process setup, verification steps, and measured concurrency result.
 
 The primary admission pool derives its default weighted budget from observed Ollama parallelism;
@@ -75,13 +75,13 @@ The health endpoint advertises backend, guarded-preference, runtime-feedback, an
 persistence contracts, plus per-backend admission capacity. Comparable speed samples require matching
 model digest, observed context, controls, process settings, and serial admission identity. A successful
 parallel request can report verified placement without qualifying a speed sample. See
-[feedback and adaptive profiles](../../docs/MONITORING.md#adaptive-concurrency) for sample eligibility.
+[feedback and adaptive profiles](https://github.com/bgauryy/FreeLlama/blob/main/docs/MONITORING.md#adaptive-concurrency) for sample eligibility.
 Treat a missing contract as a stale running binary, then rebuild and restart before testing placement.
 
 Authentication covers both control routes and raw Ollama passthrough. A nonloopback listener also
 requires `--allow-remote`; terminate TLS and add tenant authorization outside FreeLlama. The CLI
 persists bounded aggregate feedback by default. Use `--ephemeral-feedback` only for disposable
-runs. See the [production runbook](../../docs/PRODUCTION.md).
+runs. See the [production runbook](https://github.com/bgauryy/FreeLlama/blob/main/docs/PRODUCTION.md).
 
 ## Build the launcher and binary
 
@@ -119,7 +119,7 @@ errors, and the files included in the package. Core CLI contracts live in
 
 `delegate_research` and the online model-library view are MCP-only. Control-plane startup, proxy
 startup, auth-token creation, and benchmarks are CLI-only. Generate a routing policy with
-`freellama policy from-eval` (see [CLI reference](../../docs/CLI.md#earn-medium-routing-confidence)).
+`freellama policy from-eval` (see [CLI reference](https://github.com/bgauryy/FreeLlama/blob/main/docs/CLI.md#earn-medium-routing-confidence)).
 
 Use the surfaces together: the CLI starts and verifies the local services; MCP lets an agent inspect
 that state and submit bounded work. An installed MCP client can read `freellama://docs/index` and

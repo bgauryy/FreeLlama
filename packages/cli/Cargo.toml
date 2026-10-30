@@ -4,8 +4,16 @@ description = "Command-line interface for FreeLlama — proxy, serve, route, ben
 publish = false
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["ollama", "llm", "cli", "local-ai", "routing"]
+categories = ["command-line-utilities"]
+# The crate ships the Rust CLI only; the npm launcher, its tests and Node config stay out.
+include = ["src/**", "README.md", "LICENSE-APACHE", "LICENSE-MIT"]
 
 # The binary keeps the name `freellama`; only the package name changed.
 [[bin]]
@@ -13,7 +21,7 @@ name = "freellama"
 path = "src/main.rs"
 
 [dependencies]
-freellama = { package = "freellama-core", path = "../rust-core" }
+freellama = { package = "freellama-core", version = "0.6.1", path = "../rust-core" }
 anyhow.workspace = true
 base64.workspace = true
 clap.workspace = true

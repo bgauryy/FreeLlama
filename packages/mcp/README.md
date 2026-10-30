@@ -14,7 +14,7 @@ The server uses the official [TypeScript SDK](https://github.com/modelcontextpro
 
 ## Understand the tools
 
-`doctor`, `models`, `run_task`, and `task_jobs` call the Rust core through native NAPI bindings
+`doctor`, `models`, `run_task`, `task_jobs`, `scope`, and `session` call the Rust core through native NAPI bindings
 (`packages/rust-core/src/napi.rs`), with no CLI subprocess and no routing decisions in TypeScript; the
 TypeScript layer validates request shapes and derives presentation fields (see
 [what the MCP layer computes](#what-the-mcp-layer-computes)). `run_task` has four modes: one task,
@@ -218,9 +218,8 @@ The TypeScript server adds a small set of derived fields on top of core results:
 
 ## Read packaged documentation through MCP
 
-The published MCP package includes the top-level Markdown guides from the repository `docs/`
-directory (developer notes under `docs/dev/` are not packaged). The repository directory remains the
-source of truth; the package build copies it into `docs/`.
+The published MCP package includes the Markdown guides from the repository `docs/` directory.
+The repository directory remains the source of truth; the package build copies it into `docs/`.
 
 MCP clients can list resources and read `freellama://docs/index` (the repository `docs/README.md`),
 then fetch exactly one relevant guide such as `freellama://docs/PRODUCTION` or
@@ -243,6 +242,8 @@ node packages/mcp/dist/index.js
 ```
 
 The server speaks MCP over stdio — configure it in your MCP client, do not run it interactively.
+At launch it starts `freellama serve` in the background when the default endpoint does not answer;
+see `FREELLAMA_MCP_AUTOSTART_SERVE` in [Configuration](CONFIGURATION.md#environment-variables).
 
 **Claude Desktop (`claude_desktop_config.json`):**
 
@@ -318,8 +319,8 @@ Memory admission, authentication, and capability requirements apply in every mod
   tasks or `input` for embeddings, plus any applicable Ollama runtime controls.
 
 Preview rejects `prompt`, `systemPrompt`, `messages`, `input`, `images`, `tools`, `keepAlive`, `format`, `think`,
-`options`, `logprobs`, `topLogprobs`, `returnEmbeddings`, `priority`, `maxWaitSeconds`, `timeoutSeconds`, and
-`defer`, `scopeId`, and `scopeRevision`. This prevents a client from attaching
+`options`, `logprobs`, `topLogprobs`, `returnEmbeddings`, `priority`, `maxWaitSeconds`, `timeoutSeconds`,
+`stopOnRepetition`, `defer`, `scopeId`, and `scopeRevision`. This prevents a client from attaching
 work to a decision-only call and mistakenly assuming it ran.
 
 `run_task.messages` preserves Ollama message fields beyond `role` and `content`, including images,
@@ -368,7 +369,7 @@ Scripts that bypass MCP post the same fields in snake_case to `POST /_freellama/
 `task`, `objective`, `model`, `session_id`, `required_capabilities`, `prompt` or `messages`,
 `images`, `priority`, `keep_alive`, `max_wait_seconds`, `timeout_seconds`, `stop_on_repetition`,
 and `request_options: {options, format, think, logprobs, top_logprobs}`. A batch is
-`{tasks: [{id, independent: true, task: {...}}], max_parallelism}`; sessions are
+`POST /_freellama/v1/task-batches` with `{tasks: [{id, independent: true, task: {...}}], max_parallelism}`; sessions are
 `POST /_freellama/v1/sessions` with `{}`. `model` accepts a bare name (`name` resolves to
 `name:latest`, or the one installed tag of that family); an ambiguous or unknown name is refused
 with the installed candidates. See [Request shapes](https://github.com/bgauryy/FreeLlama/blob/main/docs/ARCHITECTURE.md#request-shapes)

@@ -29,7 +29,7 @@ describe("scope and warming client contracts", () => {
     const address = server.address();
     if (!address || typeof address === "string") throw new Error("missing fixture address");
     endpoint = `http://127.0.0.1:${address.port}`;
-    client = await connectClient({ FREELLAMA_AUTOSTART_SERVE: "0" });
+    client = await connectClient({ FREELLAMA_MCP_AUTOSTART_SERVE: "0" });
   });
   beforeEach(() => { requests.length = 0; refusal = undefined; });
   afterAll(async () => {

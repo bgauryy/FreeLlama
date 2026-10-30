@@ -1,7 +1,8 @@
 {
   "name": "@octocodeai/freellama-native-linux-x64-musl",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "FreeLlama native Rust artifacts for Linux x64 (musl)",
+  "author": "Guy Bary",
   "license": "Apache-2.0 OR MIT",
   "os": [
     "linux"
