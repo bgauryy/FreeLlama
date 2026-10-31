@@ -29,6 +29,16 @@ pub(crate) async fn unload_after_observation(
         Ok((status, _)) if status.is_success() => {
             let observation = observe_physical_placement(state, execution, model).await;
             let unloaded = observation["status"] == "not_resident";
+            if unloaded {
+                state.audit.record(&super::super::audit::Entry {
+                    backend: execution.placement.as_str(),
+                    model,
+                    event: "unload",
+                    trigger: "caller_unload",
+                    duration_ms: None,
+                    bytes: None,
+                });
+            }
             json!({
                 "requested": "immediate_unload",
                 "status": if unloaded { "verified" } else { "failed" },

@@ -106,7 +106,10 @@ struct StreamedMessage {
     content: String,
     thinking: String,
     tool_calls: Vec<Value>,
+    /// Per-token log probabilities, when the request asked for them; Ollama sends them per chunk.
+    logprobs: Vec<Value>,
     tokens: u64,
+    thinking_tokens: u64,
 }
 
 impl StreamedMessage {
@@ -117,8 +120,14 @@ impl StreamedMessage {
             self.content.push_str(piece);
             self.tokens += 1;
         }
-        if let Some(piece) = chunk.pointer("/message/thinking").and_then(Value::as_str) {
+        if let Some(piece) = chunk.pointer("/message/thinking").and_then(Value::as_str)
+            && !piece.is_empty()
+        {
             self.thinking.push_str(piece);
+            self.thinking_tokens += 1;
+        }
+        if let Some(logprobs) = chunk.get("logprobs").and_then(Value::as_array) {
+            self.logprobs.extend(logprobs.iter().cloned());
         }
         if let Some(calls) = chunk
             .pointer("/message/tool_calls")
@@ -137,6 +146,22 @@ impl StreamedMessage {
             message["tool_calls"] = json!(self.tool_calls);
         }
         message
+    }
+
+    /// The finished response: Ollama's final chunk with the accumulated message and log
+    /// probabilities, as a non-streaming response would carry them.
+    fn finish(&self, mut value: Value) -> Value {
+        value["message"] = self.message();
+        if !self.logprobs.is_empty() {
+            value["logprobs"] = json!(self.logprobs);
+        }
+        value
+    }
+
+    /// Whether the answer or the reasoning before it has started repeating itself.
+    fn looping(&self) -> bool {
+        repetition::should_stop_streaming(&self.content)
+            || repetition::should_stop_streaming(&self.thinking)
     }
 }
 
@@ -195,14 +220,13 @@ pub(crate) async fn post_streaming_chat_with_retries(
             }
             streamed.absorb(&chunk);
             if chunk["done"] == true {
-                let mut value = chunk;
-                value["message"] = streamed.message();
-                return Ok((status, value));
+                return Ok((status, streamed.finish(chunk)));
             }
             last = chunk;
-            if streamed.tokens >= checked_at + LOOP_CHECK_TOKENS {
-                checked_at = streamed.tokens;
-                if repetition::should_stop_streaming(&streamed.content) {
+            let generated = streamed.tokens + streamed.thinking_tokens;
+            if generated >= checked_at + LOOP_CHECK_TOKENS {
+                checked_at = generated;
+                if streamed.looping() {
                     // Returning drops `response`: the connection closes and Ollama cancels.
                     let value = streamed_completion(
                         &last,
@@ -216,9 +240,49 @@ pub(crate) async fn post_streaming_chat_with_retries(
             }
         }
     }
+    // A last line without a newline is still a line: a server that ignores `stream` sends its
+    // whole answer that way.
+    if let Ok(chunk) = serde_json::from_slice::<Value>(&pending)
+        && chunk["done"] == true
+    {
+        streamed.absorb(&chunk);
+        return Ok((status, streamed.finish(chunk)));
+    }
     // The stream ended without a final chunk: report it as incomplete, keeping the text.
     Ok((
         status,
         json!({"done": false, "message": streamed.message()}),
     ))
+}
+
+#[cfg(test)]
+mod streamed_tests {
+    use super::StreamedMessage;
+    use serde_json::json;
+
+    #[test]
+    fn a_stream_keeps_every_log_probability_and_the_final_metrics() {
+        let mut streamed = StreamedMessage::default();
+        for (piece, token) in [("Hel", "Hel"), ("lo", "lo")] {
+            streamed.absorb(&json!({"message":{"content":piece},"logprobs":[{"token":token}]}));
+        }
+        let finished = streamed.finish(json!({"done":true,"eval_count":2,"load_duration":7}));
+        assert_eq!(finished["message"]["content"], "Hello");
+        assert_eq!(
+            finished["logprobs"],
+            json!([{"token":"Hel"},{"token":"lo"}])
+        );
+        assert_eq!(finished["load_duration"], 7);
+    }
+
+    #[test]
+    fn a_loop_in_the_reasoning_is_caught_too() {
+        let mut streamed = StreamedMessage::default();
+        let unit = "Let me check the total again and recompute it carefully. ";
+        for _ in 0..8 {
+            streamed.absorb(&json!({"message":{"thinking":unit}}));
+        }
+        assert_eq!(streamed.content, "");
+        assert!(streamed.looping());
+    }
 }

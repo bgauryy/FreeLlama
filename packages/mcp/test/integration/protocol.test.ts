@@ -16,7 +16,7 @@ import { connectClient, REPO_ROOT, serveAuthHeaders, serveIsUp, SERVE_ENDPOINT }
 type Tool = { name: string; description?: string; annotations?: any; outputSchema?: any; inputSchema?: any; title?: string };
 type ToolResult = { isError?: boolean; content: { text: string }[]; structuredContent?: any };
 
-const EXPECTED_TOOLS = ["doctor", "models", "run_task", "task_jobs", "session", "ollama_manage", "ollama_delete", "delegate_research", "scope"];
+const EXPECTED_TOOLS = ["doctor", "models", "run_task", "task_jobs", "session", "ollama_manage", "ollama_delete", "delegate_research", "scope", "read_response"];
 
 // Whether `freellama serve` is up decides which half of the contract is checkable.
 const serveUp = await serveIsUp();

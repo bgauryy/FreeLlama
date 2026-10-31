@@ -1,5 +1,5 @@
 //! `stop_on_repetition`: a managed chat streams from Ollama and stops as soon as the output
-//! loops, keeping everything generated; without the flag the request stays non-streaming.
+//! loops, keeping everything generated. Unset, it is on exactly when nothing caps the output.
 //!
 //! The fake Ollama speaks raw HTTP so it can stream NDJSON line by line and see the client close
 //! the connection, which is how a stopped stream cancels generation upstream.
@@ -289,13 +289,47 @@ async fn ollama_repeat_limit_keeps_the_text_generated_before_it() {
 }
 
 #[tokio::test]
-async fn without_the_flag_the_request_stays_non_streaming() {
+async fn a_capped_task_without_the_flag_stays_non_streaming() {
     let fake = fake(Script::FenceLoop);
     let (status, body) = run(&fake, json!({})).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(fake.chats.lock().await[0]["stream"], false);
     assert_eq!(body["response"]["message"]["content"], "ok");
     assert!(body.get("output_check").is_none(), "{body}");
+}
+
+/// With no `num_predict`, only a loop stop bounds a runaway answer short of the model's context,
+/// so it is on by default there; `stop_on_repetition: false` turns it off.
+#[tokio::test]
+async fn an_uncapped_task_stops_a_loop_by_default_unless_the_caller_opts_out() {
+    let uncapped = json!({"request_options": {"options": {}}});
+    let fake_default = fake(Script::FenceLoop);
+    let (status, body) = run(&fake_default, uncapped.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(fake_default.chats.lock().await[0]["stream"], true);
+    assert!(
+        fake_default.chats.lock().await[0]["options"]
+            .get("num_predict")
+            .is_none()
+    );
+    assert_eq!(body["response"]["done_reason"], "repetition", "{body}");
+
+    let fake_off = fake(Script::FenceLoop);
+    let mut opted_out = uncapped;
+    opted_out["stop_on_repetition"] = json!(false);
+    let (status, body) = run(&fake_off, opted_out).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(fake_off.chats.lock().await[0]["stream"], false);
+
+    // JSON can be legitimately periodic: a structured answer is not cut by default.
+    let fake_json = fake(Script::FenceLoop);
+    let (status, body) = run(
+        &fake_json,
+        json!({"request_options": {"options": {}, "format": "json"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(fake_json.chats.lock().await[0]["stream"], false);
 }
 
 /// Loops are recorded per model and task from real runs and exposed in the catalog, which is

@@ -156,11 +156,10 @@ async fn a_modelfile_context_too_small_for_the_request_is_not_trusted() {
 #[tokio::test]
 async fn metrics_status_usage_and_config_report_finished_work() {
     let (address, _) = upstream("", StatusCode::OK).await;
-    let directory = tempfile::tempdir().unwrap();
-    let ledger = directory.path().join("usage.jsonl");
+    let store = freellama::store::Store::in_memory().unwrap();
     let platform = app(
         &crate::support::platform_config("127.0.0.1:11435", &address, None, None)
-            .with_usage_file(&ledger),
+            .with_store(store.clone()),
     )
     .unwrap();
     assert_eq!(
@@ -222,10 +221,10 @@ async fn metrics_status_usage_and_config_report_finished_work() {
     assert_eq!(usage["by_model"]["chat:latest"]["output_tokens"], 30);
     assert_eq!(usage["ledger"]["records"], 1);
     assert_eq!(usage["ledger"]["failed"], 0);
-    let line = std::fs::read_to_string(&ledger).unwrap();
-    assert_eq!(line.lines().count(), 1);
+    let rows = store.usage_since(0).unwrap();
+    assert_eq!(rows.len(), 1);
     assert_eq!(
-        serde_json::from_str::<Value>(line.trim()).unwrap()["model"],
+        serde_json::from_str::<Value>(&rows[0]).unwrap()["model"],
         "chat:latest"
     );
 
@@ -234,54 +233,6 @@ async fn metrics_status_usage_and_config_report_finished_work() {
     assert_eq!(
         config["settings"]["max_concurrent_tasks"]["source"],
         "ollama_num_parallel"
-    );
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn fifo_ledger_does_not_delay_task_completion_and_reports_failed_write() {
-    let (address, _) = upstream("", StatusCode::OK).await;
-    let directory = tempfile::tempdir().unwrap();
-    let ledger = directory.path().join("usage.jsonl");
-    let platform = app(
-        &crate::support::platform_config("127.0.0.1:11435", &address, None, None)
-            .with_usage_file(&ledger),
-    )
-    .unwrap();
-    assert!(
-        std::process::Command::new("mkfifo")
-            .arg(&ledger)
-            .status()
-            .unwrap()
-            .success()
-    );
-    let response = tokio::time::timeout(
-        std::time::Duration::from_secs(1),
-        platform.clone().oneshot(task()),
-    )
-    .await
-    .expect("ledger I/O must not hold the task completion path")
-    .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let usage = tokio::time::timeout(std::time::Duration::from_secs(1), async {
-        loop {
-            let usage = get_json(&platform, "/_freellama/v1/usage").await;
-            if usage["ledger"]["pending"] == 0 {
-                break usage;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
-    assert_eq!(usage["totals"]["tasks"], 1);
-    assert_eq!(usage["ledger"]["records"], 0);
-    assert_eq!(usage["ledger"]["failed"], 1);
-    assert!(
-        usage["ledger"]["last_error"]
-            .as_str()
-            .unwrap()
-            .contains("regular file")
     );
 }
 
@@ -524,7 +475,10 @@ async fn load_with_idle_runners(
             ],
         )
         .with_runtime_config(&file)
-        .with_usage_file(directory.path().join("usage.jsonl"));
+        .with_store(
+            freellama::store::Store::open(&directory.path().join(freellama::store::DATABASE_FILE))
+                .unwrap(),
+        );
     config.resource_governor = ResourceGovernor::with_sampler(
         ResourcePolicy {
             low_memory: LowMemoryMode::Advisory,
@@ -591,9 +545,12 @@ async fn a_load_unloads_the_cheapest_idle_runner_and_keeps_pinned_and_weighted_o
             .unwrap()
             >= 3
     );
+    let store =
+        freellama::store::Store::open(&directory.path().join(freellama::store::DATABASE_FILE))
+            .unwrap();
     assert!(
-        directory.path().join("footprints.json").exists(),
-        "measured sizes persist next to the ledger"
+        !store.footprints(64).unwrap().is_empty(),
+        "measured sizes persist in the shared database"
     );
 }
 

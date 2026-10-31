@@ -124,7 +124,10 @@ impl AdaptiveLimiter {
     }
 
     pub(crate) fn reset_healthy_streak(&self) {
-        let mut state = self.inner.lock().expect("adaptive state poisoned");
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.healthy_streak = 0;
         state.last_profile = None;
     }
@@ -134,7 +137,10 @@ impl AdaptiveLimiter {
         pool: &AdmissionPool,
         completion: &Completion<'_>,
     ) -> Option<(&'static str, usize)> {
-        let mut state = self.inner.lock().expect("adaptive state poisoned");
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let slow = completion.metric.and_then(|metric| {
             let tps = metric.tokens_per_second;
             let profile = completion.profile?;
@@ -222,7 +228,10 @@ impl AdaptiveLimiter {
     }
 
     pub(crate) fn receipt(&self, pool: &AdmissionPool, enabled: bool) -> Value {
-        let state = self.inner.lock().expect("adaptive state poisoned");
+        let state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         json!({
             "enabled": enabled,
             "limit": pool.total(),

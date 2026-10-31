@@ -14,7 +14,8 @@ use super::{PinnedTunables, RuntimeFile, Tunables, process_env, resolve};
 /// Live tunables plus what is needed to re-resolve them.
 #[derive(Clone)]
 pub(crate) struct RuntimeSettings {
-    current: Arc<std::sync::RwLock<Tunables>>,
+    /// Shared, immutable snapshots: a reader clones the `Arc`, never the settings.
+    current: Arc<std::sync::RwLock<Arc<Tunables>>>,
     pinned: Arc<PinnedTunables>,
     file: Option<Arc<PathBuf>>,
     num_parallel: u64,
@@ -56,8 +57,9 @@ impl RuntimeSettings {
         }
         tunables.scopes.validate()?;
         tunables.warming.validate()?;
+        tunables.preload.validate()?;
         Ok(Self {
-            current: Arc::new(std::sync::RwLock::new(tunables)),
+            current: Arc::new(std::sync::RwLock::new(Arc::new(tunables))),
             pinned: Arc::new(pinned),
             file: file.map(Arc::new),
             num_parallel,
@@ -68,8 +70,13 @@ impl RuntimeSettings {
         })
     }
 
-    pub(crate) fn get(&self) -> Tunables {
-        self.current.read().expect("tunables poisoned").clone()
+    pub(crate) fn get(&self) -> Arc<Tunables> {
+        Arc::clone(
+            &self
+                .current
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
     }
 
     pub(crate) fn file(&self) -> Option<&Path> {
@@ -99,7 +106,10 @@ impl RuntimeSettings {
             .ok()
             .and_then(|meta| meta.modified().ok());
         {
-            let status = self.last_reload.lock().expect("reload status poisoned");
+            let status = self
+                .last_reload
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if !force && status.modified == modified {
                 return Ok(None);
             }
@@ -109,7 +119,10 @@ impl RuntimeSettings {
         } else {
             Ok(RuntimeFile::default())
         };
-        let mut status = self.last_reload.lock().expect("reload status poisoned");
+        let mut status = self
+            .last_reload
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         status.modified = modified;
         let parsed = match parsed {
             Ok(parsed) => parsed,
@@ -124,6 +137,7 @@ impl RuntimeSettings {
             .scopes
             .validate()
             .and_then(|()| next.warming.validate())
+            .and_then(|()| next.preload.validate())
         {
             let message = error.to_string();
             status.last_error = Some(message.clone());
@@ -139,11 +153,14 @@ impl RuntimeSettings {
         status.reloads += 1;
         status.last_reload_unix = Some(super::super::telemetry::now_seconds());
         drop(status);
-        let mut current = self.current.write().expect("tunables poisoned");
-        if *current == next {
+        let mut current = self
+            .current
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if **current == next {
             return Ok(None);
         }
-        *current = next.clone();
+        *current = Arc::new(next.clone());
         Ok(Some(next))
     }
 
@@ -151,7 +168,7 @@ impl RuntimeSettings {
         let status = self
             .last_reload
             .lock()
-            .expect("reload status poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         json!({
             "file": self.file.as_deref(),

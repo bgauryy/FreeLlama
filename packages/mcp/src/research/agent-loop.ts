@@ -12,6 +12,7 @@ import { AgentContextManager, writeFailureResult } from "./context-manager.js";
 import { AgentRuntimeConfig, type Env, type Message } from "./context-policy.js";
 import { ValidationError, isToolError } from "./errors.js";
 import { ObservationStore } from "./observations.js";
+import { progressEmitter } from "./progress-events.js";
 import { cpSlice, decodeUtf8, normalizeNewlines, trimSpace } from "./text.js";
 import {
   PromptCacheUsage, chatErrorDetails, chatRequest, errorDiagnostic, isTransportError, requestJson,
@@ -78,6 +79,7 @@ async function runLoop(spec: AdapterSpec, hooks: AdapterHooks, env: Env, inputs:
   const { model, workspace, prompt, resultPath } = inputs;
   const print = hooks.print ?? ((line: string) => process.stdout.write(`${line}\n`));
   const sendJson = hooks.requestJson ?? requestJson;
+  const progress = hooks.progress ?? progressEmitter(env);
   const endpoint = (env.FREELLAMA_OLLAMA_ENDPOINT ?? "http://127.0.0.1:11434").replace(/\/+$/, "");
   const managedEndpoint = (env.FREELLAMA_AGENT_MANAGED_ENDPOINT ?? "").replace(/\/+$/, "");
   const executionPreference = env.FREELLAMA_AGENT_EXECUTION_PREFERENCE ?? "auto";
@@ -146,7 +148,10 @@ async function runLoop(spec: AdapterSpec, hooks: AdapterHooks, env: Env, inputs:
       } catch (error) {
         if (!isTransportError(error) || !retryableChatError(error)) throw error;
         lastError = error;
-        if (attempt + 1 < runtime.retry_attempts) await sleep(runtime.retry_backoff_seconds * 1000);
+        if (attempt + 1 < runtime.retry_attempts) {
+          progress?.({ event: "retry", attempt: attempt + 2, attempts: runtime.retry_attempts });
+          await sleep(runtime.retry_backoff_seconds * 1000);
+        }
       }
     }
     if (response === null) throw lastError;
@@ -188,6 +193,8 @@ async function runLoop(spec: AdapterSpec, hooks: AdapterHooks, env: Env, inputs:
     let parseFailures = 0;
     let exhausted = true;
     for (let turn = 0; turn < runtime.max_turns; turn += 1) {
+      const at = { turn: turn + 1, maxTurns: runtime.max_turns };
+      progress?.({ event: "model", ...at });
       // Transport failures are terminal (callModel already retried them). A parse failure is not:
       // tell the model what was wrong and let it correct itself, keeping every tool result so far.
       let response: Record<string, unknown>;
@@ -213,6 +220,7 @@ async function runLoop(spec: AdapterSpec, hooks: AdapterHooks, env: Env, inputs:
           exhausted = false;
           break;
         }
+        progress?.({ event: "repair", ...at });
         messages.push({ role: "assistant", content: cpSlice(raw, 0, runtime.parse_repair_echo_chars) });
         messages.push({ role: "user", content: PARSE_REPAIR_NOTICE });
         if (!refit()) {
@@ -226,6 +234,7 @@ async function runLoop(spec: AdapterSpec, hooks: AdapterHooks, env: Env, inputs:
       if (action.action === "page") {
         const wantStep = Math.trunc(numberOr(action.step, 0));
         const wantPage = Math.trunc(numberOr(action.page, 1));
+        progress?.({ event: "action", ...at, action });
         messages.push({ role: "assistant", content: echo(action) });
         messages.push({ role: "user", content: observations.message(wantStep, wantPage) });
         if (!refit()) {
@@ -235,6 +244,7 @@ async function runLoop(spec: AdapterSpec, hooks: AdapterHooks, env: Env, inputs:
         continue;
       }
       if (action.action === "finish") {
+        progress?.({ event: "finish", ...at });
         answer = trimSpace(String(action.answer ?? ""));
         exhausted = false;
         break;
@@ -247,9 +257,11 @@ async function runLoop(spec: AdapterSpec, hooks: AdapterHooks, env: Env, inputs:
       let observation: string;
       let status: string;
       if (seenCalls.has(signature)) {
+        progress?.({ event: "action", ...at, action, repeat: true });
         observation = REPEAT_NOTICE;
         status = "repeat";
       } else {
+        progress?.({ event: "action", ...at, action });
         try {
           observation = hooks.runTool ? await hooks.runTool(call.record.arguments as Record<string, unknown>) : await call.run();
           status = "ok";
@@ -276,6 +288,7 @@ async function runLoop(spec: AdapterSpec, hooks: AdapterHooks, env: Env, inputs:
       }
     }
     if (exhausted) {
+      progress?.({ event: "finalize", maxTurns: runtime.max_turns });
       messages.push({ role: "user", content: spec.exhausted });
       if (refit()) {
         try {

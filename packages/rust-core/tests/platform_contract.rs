@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -43,6 +43,7 @@ fn candidate(name: &str, size: u64, capabilities: &[Capability], resident: bool)
         resident_context: None,
         benchmark: BTreeMap::new(),
         observed_loops: BTreeMap::new(),
+        learned_output_tokens: None,
         policy_rank: [
             TaskKind::Completion,
             TaskKind::Coding,
@@ -1646,10 +1647,11 @@ async fn resident_managed_tasks_keep_same_model_concurrency() {
 
 /// A resident bit from discovery is only a snapshot. If the runner disappears before execution,
 /// the task must not proceed under the shared lock and risk loading a model alongside other
-/// readers. The second `/api/ps` response simulates that intervening transition.
+/// readers. The mock reports the runner at discovery, then gone until the task loads it again.
 #[tokio::test]
 async fn stale_residency_is_rechecked_before_using_the_shared_transition_lock() {
     let ps_calls = Arc::new(AtomicUsize::new(0));
+    let embedded = Arc::new(AtomicBool::new(false));
     let mock = Router::new()
         .route(
             "/api/tags",
@@ -1659,20 +1661,22 @@ async fn stale_residency_is_rechecked_before_using_the_shared_transition_lock() 
         )
         .route(
             "/api/ps",
-            get(|State(calls): State<Arc<AtomicUsize>>| async move {
-                let call = calls.fetch_add(1, Ordering::SeqCst);
-                if call == 1 {
-                    Json(json!({"models": []}))
-                } else {
-                    Json(json!({
-                        "models": [{
-                            "name": "embed-model",
-                            "size": 274_000_000,
-                            "size_vram": 274_000_000
-                        }]
-                    }))
-                }
-            }),
+            get(
+                |State((calls, embedded)): State<(Arc<AtomicUsize>, Arc<AtomicBool>)>| async move {
+                    let call = calls.fetch_add(1, Ordering::SeqCst);
+                    if call > 0 && !embedded.load(Ordering::SeqCst) {
+                        Json(json!({"models": []}))
+                    } else {
+                        Json(json!({
+                            "models": [{
+                                "name": "embed-model",
+                                "size": 274_000_000,
+                                "size_vram": 274_000_000
+                            }]
+                        }))
+                    }
+                },
+            ),
         )
         .route(
             "/api/show",
@@ -1685,9 +1689,14 @@ async fn stale_residency_is_rechecked_before_using_the_shared_transition_lock() 
         )
         .route(
             "/api/embed",
-            post(|| async { Json(json!({"embeddings": [[0.1]]})) }),
+            post(
+                |State((_, embedded)): State<(Arc<AtomicUsize>, Arc<AtomicBool>)>| async move {
+                    embedded.store(true, Ordering::SeqCst);
+                    Json(json!({"embeddings": [[0.1]]}))
+                },
+            ),
         )
-        .with_state(ps_calls.clone());
+        .with_state((ps_calls.clone(), embedded));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream = format!("http://{}", listener.local_addr().unwrap());
     let mock_task = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
@@ -1710,8 +1719,9 @@ async fn stale_residency_is_rechecked_before_using_the_shared_transition_lock() 
     );
     assert_eq!(
         ps_calls.load(Ordering::SeqCst),
-        3,
-        "expected discovery, the under-lock residency recheck, and post-run observation"
+        4,
+        "expected discovery, the memory-budget check, the under-lock residency recheck, and \
+         post-run observation"
     );
     mock_task.abort();
 }
@@ -1797,7 +1807,10 @@ fn browser_task_returns_a_bounded_action_configuration() {
     .unwrap();
 
     assert_eq!(route.profile, "browser_action");
-    assert_eq!(route.options["num_predict"], 64);
+    // The expected action plus room for a thinking-capable model to reason sizes the context;
+    // no output cap is sent.
+    assert_eq!(route.output_reserve_tokens, 2048);
+    assert!(route.options.get("num_predict").is_none());
     assert_eq!(route.options["num_ctx"], 8192);
     assert_eq!(route.think, serde_json::Value::Bool(false));
     assert!(route.strict_tool_validation);
@@ -2083,7 +2096,8 @@ fn code_repair_without_a_policy_entry_uses_the_generic_profile() {
 
     assert_eq!(route.profile, "code_repair");
     assert_eq!(route.options["num_ctx"], 8192);
-    assert_eq!(route.options["num_predict"], 2048);
+    assert_eq!(route.output_reserve_tokens, 2048);
+    assert!(route.options.get("num_predict").is_none());
     assert_eq!(route.think, json!("medium"));
     assert!(
         !route
@@ -3696,9 +3710,10 @@ async fn verified_feedback_survives_a_platform_restart() {
     let upstream = format!("http://{}", listener.local_addr().unwrap());
     let mock_task = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
     let directory = tempfile::tempdir().unwrap();
-    let feedback_file = directory.path().join("feedback.json");
+    let database = directory.path().join(freellama::store::DATABASE_FILE);
+    let store = freellama::store::Store::open(&database).unwrap();
     let config = crate::support::platform_config("127.0.0.1:11435", upstream, None, None)
-        .with_feedback_file(&feedback_file);
+        .with_store(store.clone());
     let first = app(&config).unwrap();
     let response = first
         .oneshot(
@@ -3712,9 +3727,11 @@ async fn verified_feedback_survives_a_platform_restart() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert!(feedback_file.exists());
+    assert!(store.snapshot("placement_feedback").unwrap().is_some());
 
-    let restarted = app(&config).unwrap();
+    // A second process opening the same database sees what the first one learned.
+    let restarted =
+        app(&config.with_store(freellama::store::Store::open(&database).unwrap())).unwrap();
     let health = restarted
         .oneshot(
             Request::get("/_freellama/v1/health")
@@ -3729,34 +3746,30 @@ async fn verified_feedback_survives_a_platform_restart() {
     assert_eq!(health["feedback"]["persistence"]["enabled"], true);
     assert_eq!(
         health["contracts"]["placement_feedback_persistence"],
-        "versioned_atomic_snapshot_v1"
+        "shared_database_snapshot_v1"
     );
     mock_task.abort();
 }
 
 #[test]
 fn corrupt_or_unsupported_feedback_refuses_startup() {
-    let directory = tempfile::tempdir().unwrap();
-    for (name, contents) in [
-        ("corrupt.json", "not-json"),
-        (
-            "future.json",
-            r#"{"schema_version":999,"feedback":{"gpu":{},"cpu":{}}}"#,
-        ),
+    for contents in [
+        "not-json",
+        r#"{"schema_version":999,"feedback":{"gpu":{},"cpu":{}}}"#,
     ] {
-        let feedback_file = directory.path().join(name);
-        std::fs::write(&feedback_file, contents).unwrap();
+        let store = freellama::store::Store::in_memory().unwrap();
+        store.put_snapshot("placement_feedback", contents).unwrap();
         let error = app(&crate::support::platform_config(
             "127.0.0.1:11435",
             "http://127.0.0.1:9",
             None,
             None,
         )
-        .with_feedback_file(&feedback_file))
+        .with_store(store))
         .expect_err("invalid persisted routing evidence must not be silently discarded");
         let message = format!("{error:#}");
         assert!(
-            message.contains("parse feedback snapshot")
+            message.contains("parse the stored feedback snapshot")
                 || message.contains("unsupported feedback snapshot schema"),
             "unexpected startup error: {message}"
         );

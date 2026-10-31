@@ -41,7 +41,7 @@ fn local_conservative_posture_prefers_observed_service_settings_over_hints() {
         "status": "observed",
         "settings": {
             "OLLAMA_NO_CLOUD": "1",
-            "OLLAMA_MAX_LOADED_MODELS": "1",
+            "OLLAMA_MAX_LOADED_MODELS": "8",
             "OLLAMA_NUM_PARALLEL": "1",
             "OLLAMA_MAX_QUEUE": "16"
         }
@@ -49,6 +49,14 @@ fn local_conservative_posture_prefers_observed_service_settings_over_hints() {
     let posture = local_conservative_config_posture(&config, &observed);
     assert_eq!(posture["profile"], "local-conservative-v1");
     assert_eq!(posture["overall"], "ready");
+    // One resident model would reload on every switch the memory budget could have kept.
+    let mut single = observed.clone();
+    single["settings"]["OLLAMA_MAX_LOADED_MODELS"] = serde_json::json!("1");
+    let single = local_conservative_config_posture(&config, &single);
+    assert_eq!(
+        single["settings"]["OLLAMA_MAX_LOADED_MODELS"]["status"],
+        "review"
+    );
     assert_eq!(
         posture["settings"]["OLLAMA_NO_CLOUD"]["source"],
         "observed_process"

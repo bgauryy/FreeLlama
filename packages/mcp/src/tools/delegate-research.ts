@@ -12,9 +12,12 @@ import {
 } from "../config.js";
 import { route } from "../serve-client.js";
 import { killDelegateTree, liveDelegates, runDelegate } from "../lifecycle.js";
+import { progressSink } from "../progress.js";
+import { researchProgressFilter } from "../research-progress.js";
+import { PROGRESS_ENV } from "../research/progress-events.js";
 import { EXTERNAL_COST } from "../telemetry.js";
 import {
-  ANSWER_TEXT_MAX_CHARS, clipText, costTelemetry, endpointParam,
+  costTelemetry, endpointParam,
   structuredResult,
 } from "../helpers.js";
 import {
@@ -60,10 +63,15 @@ export function registerDelegateResearchTool(server: McpServer): void {
           })
           .strict()
           .optional(),
+        receipt: z
+          .enum(["compact", "full"])
+          .optional()
+          .describe("compact (default): answer, verification, citations; trail and observations at response_file. full: all inline"),
       }).strict(),
       outputSchema: researchResultSchema,
       annotations: { destructiveHint: false },
     },
+    // `receipt` only shapes the inline view (tool-results.ts); the tool always returns everything.
     async ({ question, workspacePath, adapter, model, endpoint, agent }, extra) => {
       const chosenAdapter: ResearchAdapter = adapter ?? DEFAULT_RESEARCH_ADAPTER;
       let resolvedWorkspace: string;
@@ -105,20 +113,30 @@ export function registerDelegateResearchTool(server: McpServer): void {
             ),
           );
         }
+        // With a client progressToken the adapter reports each step as a prefixed stderr line; the
+        // filter turns those into progress notifications and keeps them out of captured stderr.
+        const report = progressSink(extra);
+        report?.(`starting ${chosenAdapter} research with ${chosenModel}`);
+        const environment: NodeJS.ProcessEnv = {
+          ...delegateEnvironment(),
+          FREELLAMA_TARGET_MODEL: chosenModel,
+          FREELLAMA_AGENT_MANAGED_ENDPOINT: endpoint ?? DEFAULT_SERVE_ENDPOINT,
+          FREELLAMA_AGENT_TOKEN_CALIBRATION_DIR: DEFAULT_TOKEN_CALIBRATION_DIR,
+          FREELLAMA_BENCH_WORKSPACE: resolvedWorkspace,
+          FREELLAMA_BENCH_PROMPT: promptFile,
+          FREELLAMA_AGENT_RESULT: resultFile,
+          FREELLAMA_AGENT_MAX_TURNS: String(agent?.maxTurns ?? DEFAULT_DELEGATE_MAX_TURNS),
+          ...(agent?.contextTokens !== undefined ? { FREELLAMA_AGENT_NUM_CTX: String(agent.contextTokens) } : {}),
+          ...(agent?.outputTokens !== undefined ? { FREELLAMA_AGENT_NUM_PREDICT: String(agent.outputTokens) } : {}),
+        };
+        // Never inherited from this server's environment: unfiltered progress lines would land in
+        // the stderr that failure diagnostics quote.
+        delete environment[PROGRESS_ENV];
+        if (report) environment[PROGRESS_ENV] = "stderr";
         const running = runDelegate(process.execPath, [adapter], {
           signal: extra.signal,
-          env: {
-            ...delegateEnvironment(),
-            FREELLAMA_TARGET_MODEL: chosenModel,
-            FREELLAMA_AGENT_MANAGED_ENDPOINT: endpoint ?? DEFAULT_SERVE_ENDPOINT,
-            FREELLAMA_AGENT_TOKEN_CALIBRATION_DIR: DEFAULT_TOKEN_CALIBRATION_DIR,
-            FREELLAMA_BENCH_WORKSPACE: resolvedWorkspace,
-            FREELLAMA_BENCH_PROMPT: promptFile,
-            FREELLAMA_AGENT_RESULT: resultFile,
-            FREELLAMA_AGENT_MAX_TURNS: String(agent?.maxTurns ?? DEFAULT_DELEGATE_MAX_TURNS),
-            ...(agent?.contextTokens !== undefined ? { FREELLAMA_AGENT_NUM_CTX: String(agent.contextTokens) } : {}),
-            ...(agent?.outputTokens !== undefined ? { FREELLAMA_AGENT_NUM_PREDICT: String(agent.outputTokens) } : {}),
-          },
+          env: environment,
+          ...(report ? { stderrFilter: researchProgressFilter(report, resolvedWorkspace) } : {}),
           timeoutMs: DEFAULT_DELEGATE_TIMEOUT_SECONDS * 1000,
           // The answer is read from `resultFile`, never from stdout — but execFile's usual 1 MB
           // maxBuffer still applies to the agent's own progress logging, and overflowing it kills
@@ -176,7 +194,7 @@ export function registerDelegateResearchTool(server: McpServer): void {
         const evidence = result.tool_calls.map((call, index) => {
           const target = call.arguments?.queries?.path;
           const rawDetail = call.arguments?.command ?? null;
-          const detail = rawDetail ? clipText(rawDetail, 400) : null;
+          const detail = rawDetail ?? null;
           return {
             step: index + 1,
             tool: call.arguments?.tool ?? call.raw_name ?? "?",
@@ -190,13 +208,11 @@ export function registerDelegateResearchTool(server: McpServer): void {
                 ? extractExistingWorkspacePath(detail, resolvedWorkspace)
                 : null,
             detail,
-            detail_truncated: rawDetail !== detail,
           };
         });
         const succeeded = evidence.filter((step) => step.status === "ok");
         const failed = evidence.length - succeeded.length;
-        // Commands can be arbitrarily long and are not reasoning-relevant by themselves. Keep a
-        // marked excerpt in both halves; the cited path and tool remain enough to spot-check source.
+        // Each step's command is reported whole, with the cited path and tool, to spot-check source.
         const evidenceText = evidence
           .map(
             (step) =>
@@ -210,15 +226,26 @@ export function registerDelegateResearchTool(server: McpServer): void {
         // Successful steps only: a failed command is not a citation for anything.
         // Citations point into `evidence` by step instead of repeating each command a second time.
         const citations = succeeded.map((step) => ({ step: step.step, tool: step.tool, path: step.path }));
+        // Every observation the model saw, whole: the adapter's store is deleted with `dir` below,
+        // so the saved response is the only place they survive.
+        const observations = result.tool_calls.map((call, index) => ({
+          step: index + 1,
+          tool: evidence[index]?.tool ?? "?",
+          status: call.status ?? "ok",
+          arguments: call.arguments ?? null,
+          result: typeof call.result === "string" ? call.result : (call.result ?? null),
+        }));
         if (adapterError) {
           const diagnostic = `research adapter failed: ${result.final_answer}` +
             (evidenceText ? `\nEvidence collected before the failure:\n${evidenceText}` : "");
           const refusal = z.object({ receipt: z.object({ error: z.string() }).loose() })
             .safeParse(result.model_metadata?.transport_error);
-          if (refusal.success) {
-            return researchErrorResult(new Error(JSON.stringify(refusal.data.receipt)), diagnostic);
-          }
-          return researchErrorResult(new Error(diagnostic));
+          const failure = refusal.success
+            ? researchErrorResult(new Error(JSON.stringify(refusal.data.receipt)), diagnostic)
+            : researchErrorResult(new Error(diagnostic));
+          return observations.length > 0
+            ? { ...failure, structuredContent: { ...failure.structuredContent, observations } }
+            : failure;
         }
         // Grade on what actually read something. A run of failed commands is ungrounded no matter
         // how many of them there were.
@@ -248,15 +275,16 @@ export function registerDelegateResearchTool(server: McpServer): void {
             contextManagement: result.model_metadata?.context_management ?? null,
             execution: { receipts: result.model_metadata?.execution_receipts ?? [] },
             evidence,
+            observations,
             summary,
           };
         // The answer itself goes in TextContent: clients that forward only text to the model
         // otherwise received a pointer to structuredContent and never the answer.
         const cited = [...new Set(citations.map((citation) => citation.path).filter(Boolean))];
         const answerText =
-          `${clipText(result.final_answer, ANSWER_TEXT_MAX_CHARS)}\n\n` +
+          `${result.final_answer}\n\n` +
           `verification: ${verification.recommendation}` +
-          (cited.length ? `\ncited: ${cited.slice(0, 20).join(", ")}` : "") +
+          (cited.length ? `\ncited: ${cited.join(", ")}` : "") +
           `\n(${chosenModel}, ${result.tool_calls.length} tool call(s))`;
         return structuredResult(payload, { text: answerText });
       } catch (error) {

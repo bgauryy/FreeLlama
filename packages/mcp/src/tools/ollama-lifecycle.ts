@@ -1,9 +1,12 @@
-// Ollama lifecycle: talk to Ollama directly (no serve). `models` covers list/ps/show.
+// Ollama lifecycle: pull and delete talk to Ollama directly; stop goes through serve when it can
+// (it waits for running tasks), else Ollama. `models` covers list/ps/show.
 // `ollama_delete` stays its own tool so pull/stop are not marked destructive.
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as z from "zod";
 import { DEFAULT_PULL_TIMEOUT_SECONDS } from "../config.js";
-import { clipText, errorResult, ollamaEndpointParam, ollamaFetch, structuredResult } from "../helpers.js";
+import { errorResult, ollamaEndpointParam, ollamaFetch, structuredResult } from "../helpers.js";
+import type { ToolExtra } from "../progress.js";
+import { serveUnload } from "../serve-http.js";
 
 const manageResultSchema = z.object({
   status: z.string().optional(), progress: z.unknown().optional(),
@@ -42,9 +45,9 @@ export function summarizeOllamaPullStream(text: string): Record<string, unknown>
         return parsed as Record<string, unknown>;
       }
     } catch {
-      return { status: "unparsed", raw: clipText(text, 500) };
+      return { status: "unparsed", raw: text };
     }
-    return { status: "unparsed", raw: clipText(text, 500) };
+    return { status: "unparsed", raw: text };
   }
   const last = events[events.length - 1] ?? {};
   const withBytes = [...events]
@@ -93,14 +96,6 @@ async function ollamaPull(
 }
 
 
-type ToolExtra = {
-  signal: AbortSignal;
-  _meta?: { progressToken?: string | number };
-  sendNotification: (notification: {
-    method: "notifications/progress";
-    params: { progressToken: string | number; progress: number; total?: number; message?: string };
-  }) => Promise<void>;
-};
 
 /** MCP progress for a pull: clients that sent a progressToken see bytes instead of a silent wait. */
 function pullProgressReporter(extra: ToolExtra): ((event: Record<string, unknown>) => void) | undefined {
@@ -127,13 +122,38 @@ function pullProgressReporter(extra: ToolExtra): ((event: Record<string, unknown
   };
 }
 
+/**
+ * Unload one model. With the default Ollama endpoint, serve does it: it waits for that model's
+ * running tasks and records the unload. Ollama is asked directly when a caller names another
+ * Ollama endpoint, or serve is unreachable or too old to have `/unload`.
+ */
+export async function stopModel(
+  model: string,
+  ollamaEndpoint: string | undefined,
+  signal?: AbortSignal,
+  unloadThroughServe: typeof serveUnload = serveUnload,
+): Promise<Record<string, unknown>> {
+  if (ollamaEndpoint === undefined) {
+    const served = await unloadThroughServe(model, { signal });
+    if (served) return { ...served, via: "freellama_serve" };
+  }
+  const payload = await ollamaFetch(ollamaEndpoint, "/api/generate", {
+    method: "POST",
+    body: { model, keep_alive: 0 },
+    signal,
+  }) as Record<string, unknown>;
+  if (typeof payload.error === "string" && payload.error) return payload;
+  // Ollama accepted the unload; it does not report whether the runner is gone yet.
+  return { ...payload, model, unloaded: payload.done === true, status: "unload_requested", via: "ollama" };
+}
+
 export function registerOllamaLifecycleTools(server: McpServer): void {
   server.registerTool(
     "ollama_manage",
     {
       description:
         "Use when: a human approved pulling one exact tag (action:pull) or unloading a loaded model (action:stop). " +
-        "Do not use when: deleting (ollama_delete), searching (models), or preloading (run_task {warm:true}). Returns: receipt; timeoutSeconds is pull-only.",
+        "Do not use when: deleting (ollama_delete), searching (models), or preloading (run_task {warm:true}). Returns: receipt (stop: unloaded, status; waits for the model's running tasks); timeoutSeconds is pull-only.",
       inputSchema: z.object({
         action: z.enum(["pull", "stop"]),
         model: z.string().min(1),
@@ -158,11 +178,7 @@ export function registerOllamaLifecycleTools(server: McpServer): void {
                 signal: extra.signal,
                 onProgress: pullProgressReporter(extra),
               })
-            : await ollamaFetch(ollamaEndpoint, "/api/generate", {
-                method: "POST",
-                body: { model, keep_alive: 0 },
-                signal: extra.signal,
-              });
+            : await stopModel(model, ollamaEndpoint, extra.signal);
         const payload = data as Record<string, unknown>;
         // Pull failures arrive as an {"error": ...} event on an HTTP 200 stream, so the fetch
         // above succeeds; report them as errors or a caller gating on isError believes the model

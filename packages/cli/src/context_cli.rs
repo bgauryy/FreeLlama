@@ -117,10 +117,6 @@ pub struct WarmArgs {
 }
 
 pub async fn run_warm(args: WarmArgs) -> Result<()> {
-    ensure!(
-        !matches!(args.task, Some(TaskKind::Embedding)),
-        "warm supports chat models; embedding warming is unsupported"
-    );
     let mut body = json!({"model": args.model, "context_tokens": args.context_tokens,
         "execution_preference": args.execution_preference, "min_placement_evidence": args.min_placement_evidence,
         "keep_alive": args.execution.keep_alive, "priority": args.execution.priority,

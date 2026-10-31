@@ -17,6 +17,11 @@ use std::{
 const USE_HALF_LIFE: Duration = Duration::from_secs(30 * 60);
 /// A load shorter than this was a warm runner, not a load worth learning from.
 const MIN_LEARNED_LOAD_MS: u64 = 200;
+
+/// Whether Ollama's reported `load_duration` means the request loaded its runner.
+pub(super) const fn was_a_load(load_ms: u64) -> bool {
+    load_ms >= MIN_LEARNED_LOAD_MS
+}
 /// Assumed read throughput when a model has never been loaded here (bytes per second).
 const ASSUMED_LOAD_BYTES_PER_SECOND: f64 = 1.5e9;
 /// Exhaustive search over candidate sets stays cheap up to this many runners.
@@ -72,6 +77,25 @@ pub(super) struct Usage {
 }
 
 impl ModelActivity {
+    /// Start from the load times this machine measured before, so the first eviction plan after a
+    /// restart already knows what reloading each model costs.
+    pub(super) fn seeded(store: Option<&crate::store::Store>) -> Self {
+        let activity = Self::default();
+        for backend in [super::Backend::Gpu, super::Backend::Cpu] {
+            let measured = store
+                .and_then(|store| store.load_times(backend.as_str()).ok())
+                .unwrap_or_default();
+            let mut inner = activity.lock();
+            for (model, load_ms) in measured {
+                inner
+                    .entry((backend.as_str().to_owned(), model))
+                    .or_default()
+                    .load_ms = Some(load_ms);
+            }
+        }
+        activity
+    }
+
     fn lock(&self) -> MutexGuard<'_, HashMap<(String, String), Activity>> {
         self.0
             .lock()
@@ -105,7 +129,7 @@ impl ModelActivity {
         entry.decay(now);
         entry.uses += 1.0;
         entry.last_used = Some(now);
-        if load_ms >= MIN_LEARNED_LOAD_MS {
+        if was_a_load(load_ms) {
             let sample = super::float(load_ms);
             entry.load_ms = Some(
                 entry
@@ -113,6 +137,23 @@ impl ModelActivity {
                     .map_or(sample, |previous| previous * 0.7 + sample * 0.3),
             );
         }
+    }
+
+    /// Learn a cold-load time observed outside a managed task, without counting a use.
+    pub(super) fn learn_load(&self, backend: &str, model: &str, load_ms: u64) {
+        if !was_a_load(load_ms) {
+            return;
+        }
+        let sample = super::float(load_ms);
+        let mut inner = self.lock();
+        let entry = inner
+            .entry((backend.to_owned(), model.to_owned()))
+            .or_default();
+        entry.load_ms = Some(
+            entry
+                .load_ms
+                .map_or(sample, |previous| previous * 0.7 + sample * 0.3),
+        );
     }
 
     pub(super) fn usage(&self, backend: &str, model: &str) -> Usage {

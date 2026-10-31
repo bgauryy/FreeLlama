@@ -75,16 +75,10 @@ export const DEFAULT_DELEGATE_MAX_TURNS = envInt("FREELLAMA_MCP_MAX_TURNS", 8);
 export const DEFAULT_DELEGATE_TIMEOUT_SECONDS = envInt("FREELLAMA_MCP_DELEGATE_TIMEOUT_SECONDS", 180);
 export const DEFAULT_PULL_TIMEOUT_SECONDS = envInt("FREELLAMA_MCP_PULL_TIMEOUT_SECONDS", 1200);
 export const DEFAULT_OLLAMA_FETCH_TIMEOUT_SECONDS = envInt("FREELLAMA_MCP_FETCH_TIMEOUT_SECONDS", 30);
+// The FreeLlama home, shared with `serve` (packages/rust-core/src/store.rs `default_home`).
+export const FREELLAMA_HOME = process.env.FREELLAMA_HOME || path.join(homedir(), ".octocode", "freellama");
 export const DEFAULT_TOKEN_CALIBRATION_DIR =
-  process.env.FREELLAMA_AGENT_TOKEN_CALIBRATION_DIR ??
-  path.join(
-    process.env.XDG_DATA_HOME ??
-      (process.platform === "win32"
-        ? (process.env.LOCALAPPDATA ?? path.join(homedir(), "AppData", "Local"))
-        : path.join(homedir(), ".local", "share")),
-    "freellama",
-    "token-calibration",
-  );
+  process.env.FREELLAMA_AGENT_TOKEN_CALIBRATION_DIR ?? path.join(FREELLAMA_HOME, "token-calibration");
 
 // `delegate_research` grants a local model read access to whatever directory it's pointed at.
 // Without a boundary, an orchestrator (or a bug, or a compromised orchestrator) could point it at

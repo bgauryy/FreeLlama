@@ -40,6 +40,8 @@ pub struct ProxyConfig {
     pub(crate) restart_action: RestartAction,
     pub(crate) raw_admission: Option<RawAdmission>,
     pub(crate) telemetry: Option<Telemetry>,
+    pub(crate) hooks: Option<Arc<dyn super::RawModelHooks>>,
+    pub(crate) upstreams: Vec<super::OpenAiUpstream>,
 }
 
 impl ProxyConfig {
@@ -58,7 +60,16 @@ impl ProxyConfig {
             restart_action: Arc::new(default_restart_ollama),
             raw_admission: None,
             telemetry: None,
+            hooks: None,
+            upstreams: Vec::new(),
         }
+    }
+
+    /// Route OpenAI-compatible requests for models these engines serve to them.
+    #[must_use]
+    pub fn with_upstreams(mut self, upstreams: Vec<super::OpenAiUpstream>) -> Self {
+        self.upstreams = upstreams;
+        self
     }
 
     /// Overrides the upstream idle timeout (default 300s): the longest silence allowed between
@@ -104,6 +115,13 @@ impl ProxyConfig {
     #[must_use]
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
         self.telemetry = Some(telemetry);
+        self
+    }
+
+    /// Let the platform track and make room for the models raw generations name.
+    #[must_use]
+    pub fn with_hooks(mut self, hooks: Arc<dyn super::RawModelHooks>) -> Self {
+        self.hooks = Some(hooks);
         self
     }
 

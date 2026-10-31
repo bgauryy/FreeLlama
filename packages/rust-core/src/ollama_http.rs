@@ -65,6 +65,59 @@ pub(crate) fn ps_entry_name(entry: &Value) -> Option<&str> {
         .and_then(Value::as_str)
 }
 
+/// The listed name a caller's model name denotes, the way Ollama reads a name: the exact tag,
+/// else `name:latest`, else the one listed tag of that model family. `Err` holds the candidates
+/// of an ambiguous family; `Ok(None)` means nothing listed matches.
+pub(crate) fn resolve_listed<'a>(
+    listed: &[&'a str],
+    requested: &str,
+) -> Result<Option<&'a str>, Vec<&'a str>> {
+    if let Some(exact) = listed.iter().find(|name| **name == requested) {
+        return Ok(Some(exact));
+    }
+    if requested.contains(':') {
+        return Ok(None);
+    }
+    let latest = format!("{requested}:latest");
+    if let Some(name) = listed.iter().find(|name| **name == latest) {
+        return Ok(Some(name));
+    }
+    let family: Vec<&str> = listed
+        .iter()
+        .copied()
+        .filter(|name| {
+            name.split_once(':')
+                .is_some_and(|(base, _)| base == requested)
+        })
+        .collect();
+    match family.as_slice() {
+        [only] => Ok(Some(only)),
+        [] => Ok(None),
+        _ => Err(family),
+    }
+}
+
+/// The listed name Ollama's own API uses for `requested`: the exact tag, else `name:latest`.
+/// Unlike [`resolve_listed`], Ollama does not pick a family's only tag, so a raw request keeps
+/// that meaning.
+pub(crate) fn resolve_as_ollama<'a>(listed: &[&'a str], requested: &str) -> Option<&'a str> {
+    let latest = (!requested.contains(':')).then(|| format!("{requested}:latest"));
+    listed
+        .iter()
+        .find(|name| **name == requested || latest.as_deref() == Some(**name))
+        .copied()
+}
+
+/// Model names in an `/api/tags` or `/api/ps` response.
+pub(crate) fn listed_names(listing: &Value) -> Vec<&str> {
+    listing["models"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(ps_entry_name)
+        .collect()
+}
+
 /// The `/api/ps` entry whose [`ps_entry_name`] is exactly `model`. The single matcher for every
 /// residency lookup, so the benchmark and platform agree on what "loaded" means.
 pub(crate) fn find_ps_entry<'a>(ps: &'a Value, model: &str) -> Option<&'a Value> {

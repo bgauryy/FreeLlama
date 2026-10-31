@@ -1,13 +1,12 @@
 //! Persisted placement feedback: per-backend latency stats and the CPU/GPU placement they suggest.
 
-use std::{collections::BTreeMap, io::Write, path::Path};
+use std::collections::BTreeMap;
 
+use super::{Backend, ExecutionPreference, Objective, TaskKind, runtime};
+use crate::store::Store;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tempfile::NamedTempFile;
-
-use super::{Backend, ExecutionPreference, Objective, TaskKind, runtime};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct FeedbackStats {
@@ -100,6 +99,10 @@ fn meaningfully_faster(candidate: u128, baseline: u128) -> bool {
 /// testable. The selected model is still resolved separately, so a hint can never bypass model
 /// eligibility or an operator assignment.
 #[derive(Debug, Clone, Copy)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag is an independent request signal; the permutation test covers every combination"
+)]
 pub(crate) struct PlacementSignals {
     pub(crate) route_is_pinned: bool,
     pub(crate) objective: Objective,
@@ -111,6 +114,30 @@ pub(crate) struct PlacementSignals {
     pub(crate) gpu_task_cost: usize,
     pub(crate) cpu_task_cost: usize,
     pub(crate) cpu_configured: bool,
+    /// Whether each backend's eligible model is already loaded.
+    pub(crate) gpu_resident: bool,
+    pub(crate) cpu_resident: bool,
+}
+
+/// A measured speed advantage does not justify a cold load while the other backend already holds
+/// an eligible model with a free slot: the load is certain, the saving is not, and following speed
+/// alone can move runners back and forth between backends. Warming the faster model switches.
+fn measured_choice(
+    faster: Backend,
+    (faster_ready, faster_resident): (bool, bool),
+    (other_ready, other_resident): (bool, bool),
+) -> (Backend, &'static str) {
+    let other = match faster {
+        Backend::Gpu => Backend::Cpu,
+        Backend::Cpu => Backend::Gpu,
+    };
+    if !faster_resident && other_resident && other_ready {
+        (other, "resident_backend_avoids_cold_load")
+    } else if faster_ready || !other_ready {
+        (faster, "measured_backend_faster")
+    } else {
+        (other, "backend_capacity_available")
+    }
 }
 
 pub(crate) fn desired_placement(signals: PlacementSignals) -> Option<(Backend, &'static str)> {
@@ -136,20 +163,14 @@ pub(crate) fn desired_placement(signals: PlacementSignals) -> Option<(Backend, &
     if signals.route_is_pinned || matches!(signals.objective, Objective::Quality) {
         return None;
     }
+    let gpu = (gpu_ready, signals.gpu_resident);
+    let cpu = (cpu_ready, signals.cpu_resident);
     match (signals.gpu_work_unit_ns, signals.cpu_work_unit_ns) {
-        (Some(gpu), Some(cpu)) if meaningfully_faster(cpu, gpu) => {
-            return Some(if cpu_ready || !gpu_ready {
-                (Backend::Cpu, "measured_backend_faster")
-            } else {
-                (Backend::Gpu, "backend_capacity_available")
-            });
+        (Some(gpu_ns), Some(cpu_ns)) if meaningfully_faster(cpu_ns, gpu_ns) => {
+            return Some(measured_choice(Backend::Cpu, cpu, gpu));
         }
-        (Some(gpu), Some(cpu)) if meaningfully_faster(gpu, cpu) => {
-            return Some(if gpu_ready || !cpu_ready {
-                (Backend::Gpu, "measured_backend_faster")
-            } else {
-                (Backend::Cpu, "backend_capacity_available")
-            });
+        (Some(gpu_ns), Some(cpu_ns)) if meaningfully_faster(gpu_ns, cpu_ns) => {
+            return Some(measured_choice(Backend::Gpu, gpu, cpu));
         }
         _ => {}
     }
@@ -176,50 +197,52 @@ pub(crate) struct FeedbackSnapshot {
     pub(crate) feedback: PlacementFeedback,
 }
 
-pub(crate) fn load_feedback(path: &Path) -> Result<PlacementFeedback> {
-    if !path.exists() {
+/// The name of the placement-feedback snapshot in the shared database.
+const FEEDBACK_SNAPSHOT: &str = "placement_feedback";
+
+pub(crate) fn load_feedback(store: &Store) -> Result<PlacementFeedback> {
+    let Some(body) = store.snapshot(FEEDBACK_SNAPSHOT)? else {
         return Ok(PlacementFeedback::default());
-    }
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("read feedback snapshot {}", path.display()))?;
-    let snapshot: FeedbackSnapshot = serde_json::from_slice(&bytes)
-        .with_context(|| format!("parse feedback snapshot {}", path.display()))?;
+    };
+    let snapshot: FeedbackSnapshot =
+        serde_json::from_str(&body).context("parse the stored feedback snapshot")?;
     ensure!(
         snapshot.schema_version == FEEDBACK_SCHEMA_VERSION,
-        "unsupported feedback snapshot schema {} in {}",
-        snapshot.schema_version,
-        path.display()
+        "unsupported feedback snapshot schema {}",
+        snapshot.schema_version
     );
     Ok(snapshot.feedback)
 }
 
-pub(crate) fn persist_feedback(path: &Path, feedback: &PlacementFeedback) -> Result<()> {
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    std::fs::create_dir_all(parent)
-        .with_context(|| format!("create feedback directory {}", parent.display()))?;
-    let mut temporary = NamedTempFile::new_in(parent)
-        .with_context(|| format!("create feedback temporary file in {}", parent.display()))?;
-    serde_json::to_writer_pretty(
-        temporary.as_file_mut(),
-        &FeedbackSnapshot {
+/// Save this process's feedback, merged with what other processes saved meanwhile: per backend and
+/// task the stats with more completed samples win, so no process erases another's longer history.
+pub(crate) fn persist_feedback(store: &Store, feedback: &PlacementFeedback) -> Result<()> {
+    store.update_snapshot(FEEDBACK_SNAPSHOT, |current| {
+        let stored = current
+            .and_then(|body| serde_json::from_str::<FeedbackSnapshot>(body).ok())
+            .filter(|snapshot| snapshot.schema_version == FEEDBACK_SCHEMA_VERSION)
+            .map(|snapshot| snapshot.feedback)
+            .unwrap_or_default();
+        serde_json::to_string(&FeedbackSnapshot {
             schema_version: FEEDBACK_SCHEMA_VERSION,
-            feedback: feedback.clone(),
-        },
-    )
-    .context("serialize feedback snapshot")?;
-    temporary.as_file_mut().write_all(b"\n")?;
-    temporary
-        .as_file()
-        .sync_all()
-        .context("sync feedback snapshot")?;
-    temporary
-        .persist(path)
-        .map_err(|error| error.error)
-        .with_context(|| format!("atomically replace feedback snapshot {}", path.display()))?;
-    Ok(())
+            feedback: merged(stored, feedback),
+        })
+        .context("serialize feedback snapshot")
+    })
+}
+
+fn merged(mut stored: PlacementFeedback, ours: &PlacementFeedback) -> PlacementFeedback {
+    for (theirs, mine) in [(&mut stored.gpu, &ours.gpu), (&mut stored.cpu, &ours.cpu)] {
+        for (task, stats) in mine {
+            let keep_ours = theirs
+                .get(task)
+                .is_none_or(|existing| stats.completed >= existing.completed);
+            if keep_ours {
+                theirs.insert(*task, stats.clone());
+            }
+        }
+    }
+    stored
 }
 
 #[cfg(test)]
@@ -227,6 +250,26 @@ mod feedback_tests {
     use super::super::{Backend, ExecutionPreference, Objective, TaskKind, feedback_work_unit_ns};
     use super::{FeedbackStats, PlacementSignals, desired_placement, meaningfully_faster};
     use serde_json::json;
+
+    #[test]
+    fn two_processes_saving_feedback_keep_the_longer_history_per_task() {
+        let store = crate::store::Store::in_memory().unwrap();
+        let stats = |completed| FeedbackStats {
+            completed,
+            ..FeedbackStats::default()
+        };
+        let mut first = super::PlacementFeedback::default();
+        first.gpu.insert(TaskKind::Completion, stats(9));
+        super::persist_feedback(&store, &first).unwrap();
+        // A second process that started earlier knows less about completion, more about embedding.
+        let mut second = super::PlacementFeedback::default();
+        second.gpu.insert(TaskKind::Completion, stats(2));
+        second.gpu.insert(TaskKind::Embedding, stats(4));
+        super::persist_feedback(&store, &second).unwrap();
+        let saved = super::load_feedback(&store).unwrap();
+        assert_eq!(saved.gpu[&TaskKind::Completion].completed, 9);
+        assert_eq!(saved.gpu[&TaskKind::Embedding].completed, 4);
+    }
 
     #[test]
     fn backend_feedback_requires_a_real_ten_percent_advantage() {
@@ -257,25 +300,29 @@ mod feedback_tests {
                                     for gpu_task_cost in [1, 2, 4] {
                                         for cpu_task_cost in [1, 2, 4] {
                                             for cpu_configured in [false, true] {
-                                                let signals = PlacementSignals {
-                                                    route_is_pinned,
-                                                    objective,
-                                                    execution_preference,
-                                                    gpu_work_unit_ns,
-                                                    cpu_work_unit_ns,
-                                                    gpu_slots_available,
-                                                    cpu_slots_available,
-                                                    gpu_task_cost,
-                                                    cpu_task_cost,
-                                                    cpu_configured,
-                                                };
-                                                let expected = placement_oracle(signals);
-                                                assert_eq!(
-                                                    desired_placement(signals),
-                                                    expected,
-                                                    "placement mismatch for {signals:?}"
-                                                );
-                                                checked += 1;
+                                                for (gpu_resident, cpu_resident) in RESIDENCY {
+                                                    let signals = PlacementSignals {
+                                                        route_is_pinned,
+                                                        objective,
+                                                        execution_preference,
+                                                        gpu_work_unit_ns,
+                                                        cpu_work_unit_ns,
+                                                        gpu_slots_available,
+                                                        cpu_slots_available,
+                                                        gpu_task_cost,
+                                                        cpu_task_cost,
+                                                        cpu_configured,
+                                                        gpu_resident,
+                                                        cpu_resident,
+                                                    };
+                                                    let expected = placement_oracle(signals);
+                                                    assert_eq!(
+                                                        desired_placement(signals),
+                                                        expected,
+                                                        "placement mismatch for {signals:?}"
+                                                    );
+                                                    checked += 1;
+                                                }
                                             }
                                         }
                                     }
@@ -287,8 +334,11 @@ mod feedback_tests {
             }
         }
 
-        assert_eq!(checked, 2 * 3 * 3 * 2 * 6 * 3 * 3 * 3 * 3 * 2);
+        assert_eq!(checked, 2 * 3 * 3 * 2 * 6 * 3 * 3 * 3 * 3 * 2 * 4);
     }
+
+    const RESIDENCY: [(bool, bool); 4] =
+        [(false, false), (false, true), (true, false), (true, true)];
 
     fn placement_oracle(signals: PlacementSignals) -> Option<(Backend, &'static str)> {
         let gpu_ready = signals.gpu_slots_available >= signals.gpu_task_cost;
@@ -316,18 +366,26 @@ mod feedback_tests {
         }
         match (signals.gpu_work_unit_ns, signals.cpu_work_unit_ns) {
             (Some(gpu), Some(cpu)) if meaningfully_faster(cpu, gpu) => {
-                return Some(if cpu_ready || !gpu_ready {
-                    (Backend::Cpu, "measured_backend_faster")
-                } else {
-                    (Backend::Gpu, "backend_capacity_available")
-                });
+                return Some(
+                    if !signals.cpu_resident && signals.gpu_resident && gpu_ready {
+                        (Backend::Gpu, "resident_backend_avoids_cold_load")
+                    } else if cpu_ready || !gpu_ready {
+                        (Backend::Cpu, "measured_backend_faster")
+                    } else {
+                        (Backend::Gpu, "backend_capacity_available")
+                    },
+                );
             }
             (Some(gpu), Some(cpu)) if meaningfully_faster(gpu, cpu) => {
-                return Some(if gpu_ready || !cpu_ready {
-                    (Backend::Gpu, "measured_backend_faster")
-                } else {
-                    (Backend::Cpu, "backend_capacity_available")
-                });
+                return Some(
+                    if !signals.gpu_resident && signals.cpu_resident && cpu_ready {
+                        (Backend::Cpu, "resident_backend_avoids_cold_load")
+                    } else if gpu_ready || !cpu_ready {
+                        (Backend::Gpu, "measured_backend_faster")
+                    } else {
+                        (Backend::Cpu, "backend_capacity_available")
+                    },
+                );
             }
             _ => {}
         }

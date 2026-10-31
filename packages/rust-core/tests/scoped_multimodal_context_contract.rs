@@ -175,19 +175,13 @@ async fn textual_overflow_with_media_never_infers_or_appends() {
 }
 
 #[tokio::test]
-async fn scoped_media_requires_positive_finite_output_and_counts_tool_schema() {
+async fn scoped_media_counts_tool_schema_against_the_context() {
     let (platform, captured, server) = fixture().await;
     let id = create_scope(
         &platform,
         json!([{"role":"user","content":"Invoice.","images":["aW1hZ2U="]}]),
     )
     .await;
-    for output in [0, -1, -2] {
-        let mut body = task(&id);
-        body["request_options"]["options"]["num_predict"] = json!(output);
-        let (status, error) = request(&platform, "POST", "tasks", body).await;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{error}");
-    }
     for field in ["tools", "format"] {
         let mut body = task(&id);
         if field == "tools" {

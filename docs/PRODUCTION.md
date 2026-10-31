@@ -127,16 +127,15 @@ and require the same visible values before admitting work.
 Generate a token without placing the secret in shell history or the process list:
 
 ```bash
-freellama auth-token --out ~/.local/share/freellama/auth.token
+freellama auth-token --out ~/.octocode/freellama/auth.token
 ```
 
 The command creates a new file with mode `0600` on Unix and refuses to overwrite an existing
-token. Start the service with persistent feedback and authentication:
+token. Start the service with authentication:
 
 ```bash
 freellama serve \
-  --feedback-file ~/.local/share/freellama/feedback.json \
-  --auth-token-file ~/.local/share/freellama/auth.token \
+  --auth-token-file ~/.octocode/freellama/auth.token \
   --upstream http://127.0.0.1:11434 \
   --cpu-upstream http://127.0.0.1:11436 \
   --cpu-model nomic-embed-text:latest
@@ -147,10 +146,64 @@ adapters. Authentication covers both `/_freellama/v1/*` and Ollama-compatible pa
 Use `--allow-remote` only with an authentication token. The server refuses unauthenticated
 nonloopback listeners.
 
-The feedback snapshot is versioned, bounded by backend and task type, and replaced atomically.
-Only physically verified warm samples are saved. A corrupt or unsupported snapshot makes startup
-fail instead of silently discarding routing evidence. Use `--ephemeral-feedback` only for
-disposable tests.
+### Client keys
+
+Give each agent, team or tool its own key instead of sharing the operator token. Create one token
+file per client with `freellama auth-token --out`, then list them in `clients.toml` in the home (or
+pass `--client-keys` / `FREELLAMA_CLIENT_KEYS`):
+
+```toml
+[[client]]
+name = "octocode"
+token_file = "keys/octocode.token"   # relative to this file; mode 0600
+daily_tokens = 2000000               # optional; unmetered when absent
+admin = false                        # optional; true allows model files and config reload
+```
+
+A key's usage is the tokens the backend processed for it per UTC day: output plus the prompt tokens
+not reused from a prompt cache, for managed tasks and raw Ollama or OpenAI calls. The budget is
+checked before each generating request, so the request that crosses it finishes; later ones get 429
+with `code: "client_budget_exhausted"` and a `Retry-After` until the next UTC day. Reads still work.
+Non-admin keys get 403 (`client_not_admin`) for pull, push, copy, create, delete, blob uploads and
+`config/reload`. `usage` shows each key's `tokens_today`, `daily_tokens` and `remaining_today`; a
+client key sees only its own row. Today's totals start from the shared database at startup and
+then count this process's traffic. Point a client's `FREELLAMA_AUTH_TOKEN_FILE` at its own key. A
+serve that the MCP server starts itself treats that file as the operator token, so run `serve`
+yourself when you use client keys.
+
+### Other OpenAI-compatible engines
+
+`upstreams.toml` in the home (or `--upstreams` / `FREELLAMA_UPSTREAMS`) puts other engines behind
+the same endpoint:
+
+```toml
+[[upstream]]
+name = "lmstudio"
+url = "http://127.0.0.1:1234/v1"
+
+[[upstream]]
+name = "cloud"
+url = "https://api.example.com/v1"
+api_key_file = "keys/cloud.key"      # mode 0600; sent only over HTTPS or to this machine
+```
+
+Only OpenAI-compatible paths (`/v1/...`) route by model: `name/model` goes to that engine as
+`model`; a bare name goes to Ollama when Ollama has it, else to the first engine whose `/v1/models`
+lists it. `GET /v1/models` merges every list and names unreachable engines. A request to an engine is
+sent once (no retries), streams through unchanged, carries the `x-freellama-upstream` header and is
+counted in usage. An engine on this machine waits out host holds as a loaded Ollama model would; a
+remote one does not. Managed tasks, residency and the memory budget cover Ollama only, and there is no
+automatic failover from one engine to another.
+
+Everything the server learns lives in one `SQLite` database, `~/.octocode/freellama/freellama.sqlite`
+(`--home` or `FREELLAMA_HOME` moves the home): measured runner sizes, placement feedback, the usage
+ledger and the residency audit. It uses write-ahead logging, so several FreeLlama processes on one
+machine share it safely and learn from each other. The feedback snapshot is versioned and bounded by
+backend and task type; only physically verified warm samples are saved, and a corrupt or unsupported
+snapshot makes startup fail instead of silently discarding routing evidence. The first start imports
+the files earlier versions kept under `~/.local/share/freellama` once and copies `platform.toml`
+from `~/.config/freellama`, leaving the old files in place. Use `--ephemeral` only for disposable
+tests.
 
 ## Bound conversation history and residency
 
@@ -193,7 +246,7 @@ longer resident before returning. Inspect both `execution.observation` and
 
 Require these health contracts before admitting traffic:
 
-- `placement_feedback_persistence: versioned_atomic_snapshot_v1`
+- `placement_feedback_persistence: shared_database_snapshot_v1`
 - `authentication: optional_bearer_all_routes`
 - `immediate_unload_observation: observe_then_unload`
 - `placement_observation: ollama_api_ps_after_execution`

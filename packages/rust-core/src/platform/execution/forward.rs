@@ -154,9 +154,13 @@ pub(crate) async fn forward_managed_task(
     } else {
         post_json_with_retries(state, &execution.upstream, path, &body).await
     };
+    // A stream reports a runner that died mid-generation as an error line under HTTP 200.
     let upstream_failed = match &posted {
         Err(_) => true,
-        Ok((status, _)) => matches!(status.as_u16(), 500 | 502 | 504),
+        Ok((status, value)) => {
+            matches!(status.as_u16(), 500 | 502 | 504)
+                || value.get("error").is_some_and(|error| !error.is_null())
+        }
     };
     record_upstream_outcome(state, execution, breaker_probe, upstream_failed);
     if upstream_failed {
@@ -282,10 +286,10 @@ pub(crate) async fn forward_managed_task(
         let snapshot = feedback.clone();
         drop(feedback);
         let persistence = if feedback_accepted {
-            if let Some(path) = state.feedback_file.clone() {
-                // A synchronous fsync-and-rename on a runtime worker stalls every task sharing it.
+            if let Some(store) = state.store.clone() {
+                // A synchronous database write on a runtime worker stalls every task sharing it.
                 let written =
-                    tokio::task::spawn_blocking(move || persist_feedback(&path, &snapshot))
+                    tokio::task::spawn_blocking(move || persist_feedback(&store, &snapshot))
                         .await
                         .unwrap_or_else(|error| {
                             Err(anyhow::anyhow!("feedback writer panicked: {error}"))
@@ -305,7 +309,7 @@ pub(crate) async fn forward_managed_task(
                 json!({"enabled": false, "persisted": false})
             }
         } else {
-            json!({"enabled": state.feedback_file.is_some(), "persisted": false, "reason": "sample_not_accepted"})
+            json!({"enabled": state.store.is_some(), "persisted": false, "reason": "sample_not_accepted"})
         };
         receipt["persistence"] = persistence;
         receipt
@@ -317,13 +321,21 @@ pub(crate) async fn forward_managed_task(
     drop(slot);
     let output_check = super::super::repetition::output_check(&value);
     if path == "/api/chat" {
-        // Routing learns from what a model does, not its name: count the run and any loop.
-        state.loop_evidence.record(
+        // Routing learns from what a model does, not its name: count the run and any loop, and
+        // how much room its answer needed.
+        let digest = execution_receipt["model_digest"].as_str();
+        let looped = output_check
+            .as_ref()
+            .is_some_and(|check| check["repetition_loop"] == true);
+        state
+            .model_facts
+            .record_run(&decision.selected_model, digest, decision.task, looped);
+        state.model_facts.learn_output(
             &decision.selected_model,
-            decision.task,
-            output_check
-                .as_ref()
-                .is_some_and(|check| check["repetition_loop"] == true),
+            digest,
+            decision.options["num_predict"].as_u64(),
+            &value,
+            looped,
         );
     }
     let mut receipt = json!({

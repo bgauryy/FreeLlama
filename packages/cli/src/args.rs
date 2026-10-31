@@ -25,6 +25,10 @@ pub(crate) struct AdmissionArgs {
     /// Required local telemetry: RAM by default; best-effort explicitly permits unknown RAM.
     #[arg(long, value_enum)]
     pub(crate) resource_telemetry_policy: Option<TelemetryPolicyArg>,
+    /// What a new load that does not fit available memory does: `refuse` (default) waits for
+    /// memory and is refused at its deadline; `advisory` loads anyway with a warning.
+    #[arg(long, value_enum, env = "FREELLAMA_LOW_MEMORY")]
+    pub(crate) low_memory: Option<LowMemoryArg>,
     /// Available host-memory percentage held back before admitting model work (default 15).
     #[arg(long)]
     pub(crate) resource_hold_available_percent: Option<u32>,
@@ -67,6 +71,21 @@ pub(crate) struct AdmissionArgs {
     /// Expire idle affinity handles after this many seconds (default 3600).
     #[arg(long)]
     pub(crate) session_ttl_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub(crate) enum LowMemoryArg {
+    Refuse,
+    Advisory,
+}
+
+impl From<LowMemoryArg> for freellama::platform::resources::LowMemoryMode {
+    fn from(value: LowMemoryArg) -> Self {
+        match value {
+            LowMemoryArg::Refuse => Self::Refuse,
+            LowMemoryArg::Advisory => Self::Advisory,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -252,39 +271,46 @@ pub(crate) struct TaskExecutionArgs {
     /// Admission/resource wait budget; capped by server.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     pub(crate) max_wait_seconds: Option<u64>,
-    /// Stream and stop once the output repeats itself; keeps all generated text.
-    #[arg(long)]
-    pub(crate) stop_on_repetition: bool,
+    /// Stream and stop once the output repeats itself, keeping all generated text. Unset, the
+    /// server turns it on when nothing caps the output; `--stop-on-repetition false` turns it off.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+    pub(crate) stop_on_repetition: Option<bool>,
 }
 
 /// Production state and network boundary for `serve`.
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct ProductionArgs {
-    /// Versioned adaptive-feedback snapshot. Defaults to the platform data directory.
+    /// `FreeLlama` home: `platform.toml`, `runtime.toml`, `benchmark-report.json` and the shared
+    /// database of footprints, placement feedback, usage and the residency audit. Defaults to
+    /// `~/.octocode/freellama`.
+    #[arg(long, env = "FREELLAMA_HOME")]
+    pub(crate) home: Option<PathBuf>,
+    /// Keep what this server learns in memory only (primarily for disposable tests).
     #[arg(long)]
-    pub(crate) feedback_file: Option<PathBuf>,
-    /// Disable feedback persistence explicitly (primarily for disposable tests).
-    #[arg(long, conflicts_with = "feedback_file")]
-    pub(crate) ephemeral_feedback: bool,
+    pub(crate) ephemeral: bool,
     /// File containing a bearer token of at least 32 bytes. The token is never accepted on the
     /// command line, where process inspection could expose it.
     #[arg(long)]
     pub(crate) auth_token_file: Option<PathBuf>,
+    /// Client keys (TOML `[[client]]` tables: `name`, `token_file`, optional `daily_tokens` and
+    /// `admin`): one bearer token per agent or tool, with its own usage and budget. Defaults to
+    /// `clients.toml` in the home when it exists.
+    #[arg(long, env = "FREELLAMA_CLIENT_KEYS")]
+    pub(crate) client_keys: Option<PathBuf>,
+    /// Other OpenAI-compatible engines (TOML `[[upstream]]` tables: `name`, `url` such as
+    /// `http://127.0.0.1:1234/v1`, optional `api_key_file`). `/v1/...` requests for their models
+    /// go to them; `name/model` picks one. Defaults to `upstreams.toml` in the home when it exists.
+    #[arg(long, env = "FREELLAMA_UPSTREAMS")]
+    pub(crate) upstreams: Option<PathBuf>,
     /// Permit a non-loopback listener. Requires --auth-token-file (or
-    /// `FREELLAMA_AUTH_TOKEN_FILE`).
+    /// `FREELLAMA_AUTH_TOKEN_FILE`) or client keys.
     #[arg(long)]
     pub(crate) allow_remote: bool,
     /// Live-tunable settings (TOML), re-read when the file changes. Defaults to
-    /// `FREELLAMA_RUNTIME_CONFIG`; see `freellama.runtime.example.toml`.
+    /// `FREELLAMA_RUNTIME_CONFIG`, then `runtime.toml` in the home; see
+    /// `freellama.runtime.example.toml`.
     #[arg(long)]
     pub(crate) runtime_config: Option<PathBuf>,
-    /// JSON-lines usage ledger, replayed at startup for daily totals. Defaults to the platform
-    /// data directory (or `FREELLAMA_USAGE_FILE`).
-    #[arg(long)]
-    pub(crate) usage_file: Option<PathBuf>,
-    /// Keep usage totals in memory only.
-    #[arg(long, conflicts_with = "usage_file")]
-    pub(crate) ephemeral_usage: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -356,6 +382,31 @@ pub(crate) enum Command {
         )]
         endpoint: String,
     },
+    /// Exit 0 once the server can serve managed work (Ollama answers and its catalog reads);
+    /// otherwise print what it is waiting for and exit non-zero, so scripts can wait on it.
+    Ready {
+        #[arg(
+            long,
+            env = "FREELLAMA_SERVE_ENDPOINT",
+            default_value = freellama::DEFAULT_SERVE_ENDPOINT
+        )]
+        endpoint: String,
+    },
+    /// Unload a resident model once the tasks using it finish. A model that is not loaded is
+    /// reported, never loaded first. Works for any model kind; no task is needed.
+    Unload {
+        #[arg(
+            long,
+            env = "FREELLAMA_SERVE_ENDPOINT",
+            default_value = freellama::DEFAULT_SERVE_ENDPOINT
+        )]
+        endpoint: String,
+        #[arg(long)]
+        model: String,
+        /// How long to wait for running tasks on the model to finish (default: the queue wait).
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        max_wait_seconds: Option<u64>,
+    },
     /// Usage totals per day and per model (tasks, errors, tokens, busy and queue time).
     Usage {
         #[arg(
@@ -399,7 +450,8 @@ pub(crate) enum Command {
         #[command(subcommand)]
         action: crate::context_cli::ScopeAction,
     },
-    /// Preload an exact installed chat model through managed resource admission.
+    /// Load an exact installed model (chat or embedding) through managed resource admission.
+    /// `--keep-alive 0` on a resident model unloads it; prefer `unload` for that.
     Warm(crate::context_cli::WarmArgs),
     /// Resolve a task to a local model and Ollama request profile without running it.
     Route(RouteArgs),

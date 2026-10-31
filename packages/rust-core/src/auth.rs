@@ -7,7 +7,8 @@ use anyhow::{Context, Result, ensure};
 /// Minimum bearer-token length in bytes.
 pub const MIN_TOKEN_BYTES: usize = 32;
 
-/// Read a bearer token from a regular file that only its owner can access (mode 600 on Unix).
+/// Read a secret (a bearer token or an upstream API key) from a regular file that only its owner
+/// can access (mode 600 on Unix).
 ///
 /// The file is opened once, without following a final symlink, and every check runs on the
 /// opened handle, so the path cannot be swapped between the checks and the read. Surrounding
@@ -21,7 +22,7 @@ pub const MIN_TOKEN_BYTES: usize = 32;
 /// Returns an error when the path is a symlink or not a regular file, is group- or
 /// world-accessible (Unix), cannot be read, or does not hold exactly one whitespace-free token of
 /// at least [`MIN_TOKEN_BYTES`].
-pub fn read_token_file(path: &Path) -> Result<String> {
+pub fn read_secret_file(path: &Path) -> Result<String> {
     use std::io::Read;
 
     let mut options = std::fs::OpenOptions::new();
@@ -68,6 +69,21 @@ pub fn read_token_file(path: &Path) -> Result<String> {
     file.read_to_string(&mut token)
         .with_context(|| format!("read authentication token file {}", path.display()))?;
     let token = token.trim().to_owned();
+    ensure!(
+        !token.is_empty() && !token.chars().any(char::is_whitespace),
+        "secret file {} must hold one value without whitespace",
+        path.display()
+    );
+    Ok(token)
+}
+
+/// Read a bearer token with [`read_secret_file`]'s checks, at least [`MIN_TOKEN_BYTES`] long.
+///
+/// # Errors
+///
+/// As [`read_secret_file`], and when the token is shorter than [`MIN_TOKEN_BYTES`].
+pub fn read_token_file(path: &Path) -> Result<String> {
+    let token = read_secret_file(path)?;
     validate_token(&token)?;
     Ok(token)
 }

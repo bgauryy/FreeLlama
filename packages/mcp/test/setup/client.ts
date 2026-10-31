@@ -4,7 +4,8 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { type ChildProcess, spawn } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { createServer } from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -32,6 +33,9 @@ export function serveAuthHeaders(): Record<string, string> | undefined {
     : undefined;
 }
 
+/** Tests never write into the user's FreeLlama home (response files, token calibration). */
+const TEST_HOME = mkdtempSync(path.join(tmpdir(), "freellama-test-home-"));
+
 export async function connectClient(env?: Record<string, string>): Promise<Client> {
   const transport = new StdioClientTransport({
     command: process.execPath,
@@ -39,10 +43,29 @@ export async function connectClient(env?: Record<string, string>): Promise<Clien
     // The SDK's implicit child environment is intentionally allowlisted and drops product-specific
     // variables. Always pass the test process environment explicitly so endpoint/config overrides
     // used by isolated live tests actually reach the MCP server child.
-    env: { ...process.env, ...env } as Record<string, string>,
+    env: { FREELLAMA_HOME: TEST_HOME, ...process.env, ...env } as Record<string, string>,
   });
   const client = new Client({ name: "vitest-client", version: "0.0.1" });
   await client.connect(transport);
+  // Every tool result carries `timing` (src/timing.ts). Receipt tests compare forwarded bodies
+  // exactly, so the timing moves beside them: every call must still report one.
+  const call = client.callTool.bind(client);
+  client.callTool = (async (...args: Parameters<typeof call>) => {
+    const result = await call(...args);
+    const content = result.structuredContent as Record<string, unknown> | undefined;
+    const timing = content?.timing ?? (result._meta as Record<string, unknown> | undefined)?.["freellama/timing"];
+    // The SDK refuses arguments that fail the input schema before the tool runs; nothing to time.
+    const refusedInput = result.isError === true && JSON.stringify(result.content).includes("Input validation error");
+    if (timing === undefined && !refusedInput) {
+      throw new Error(`tool result without timing: ${JSON.stringify(result).slice(0, 300)}`);
+    }
+    if (timing === undefined) return result;
+    if (content) {
+      const { timing: _, response_file: file, ...rest } = content;
+      return { ...result, structuredContent: rest, timing, response_file: file };
+    }
+    return { ...result, timing };
+  }) as typeof client.callTool;
   return client;
 }
 
@@ -85,8 +108,7 @@ export async function startIsolatedServe(): Promise<IsolatedServe> {
       `127.0.0.1:${address.port}`,
       "--upstream",
       process.env.FREELLAMA_OLLAMA_ENDPOINT ?? "http://127.0.0.1:11434",
-      "--ephemeral-feedback",
-      "--ephemeral-usage",
+      "--ephemeral",
     ],
     { cwd: REPO_ROOT, stdio: ["ignore", "ignore", "pipe"] },
   );

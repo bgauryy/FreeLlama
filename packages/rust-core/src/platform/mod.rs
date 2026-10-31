@@ -25,8 +25,11 @@ use crate::{
 };
 
 mod admission;
+mod audit;
 mod bearer;
+mod budget;
 mod catalog;
+mod clients;
 mod config;
 mod context;
 mod device_activity;
@@ -36,10 +39,12 @@ mod execution;
 mod feedback;
 mod footprint;
 mod jobs;
-mod loops;
+mod model_facts;
 mod monitor;
 pub(crate) mod ollama_env;
 pub mod policy_eval;
+mod preload;
+mod raw_models;
 mod readiness;
 mod repetition;
 mod residency;
@@ -48,12 +53,14 @@ mod routing;
 mod runtime;
 mod scopes;
 mod sessions;
+mod sweep;
 mod tasks_api;
 mod telemetry;
 mod warming;
 
 use bearer::{AuthState, require_bearer};
 use catalog::{discover_models, get_json};
+pub use clients::{ClientKey, load_client_keys};
 pub use config::PlatformConfig;
 use config::{platform_task_timeout, report_admission_budgets};
 use feedback::{
@@ -69,6 +76,7 @@ use discovery::MachineProfile;
 pub use discovery::machine_profile;
 pub(crate) use discovery::machine_profile_off_runtime;
 use discovery::{host_has_unified_memory, host_total_memory_bytes};
+pub use preload::{PreloadModel, PreloadPolicy, PreloadSpec};
 pub use routing::{
     Backend, CatalogModel, ExecutionPreference, LoopRecord, ModelRequestDefaults, Objective,
     PlacementEvidence, RouteDecision, RouteInput, SessionAffinity, TaskKind, TaskPriority,
@@ -108,8 +116,12 @@ struct PlatformState {
     footprints: Arc<Mutex<footprint::FootprintHistory>>,
     /// Per-model demand and load history for eviction planning.
     activity: residency::ModelActivity,
-    /// Observed repetition loops per model and task, which automatic routing ranks by.
-    loop_evidence: loops::LoopEvidence,
+    /// Every load, unload and eviction, with its cause and duration.
+    audit: audit::Audit,
+    /// What each model revision has shown it needs, saved per model in the shared database.
+    model_facts: model_facts::ModelFacts,
+    /// Startup and predicted loads.
+    preload: preload::Preloader,
     /// The most recent eviction plan, for `status` and the UI.
     last_eviction: Arc<std::sync::Mutex<Option<Value>>>,
     client: Client,
@@ -127,9 +139,12 @@ struct PlatformState {
     gpu_admission: AdmissionPool,
     cpu_admission: AdmissionPool,
     feedback: Arc<RwLock<PlacementFeedback>>,
-    feedback_file: Option<Arc<PathBuf>>,
+    /// The shared database, when this server persists what it learns.
+    store: Option<crate::store::Store>,
     feedback_persistence_error: Arc<RwLock<Option<String>>>,
     auth_required: bool,
+    /// Client keys, for the usage view of their budgets.
+    clients: Arc<[clients::ClientKey]>,
     remote_access: bool,
     max_sessions: usize,
     session_ttl: Duration,
@@ -183,7 +198,7 @@ impl PlatformState {
         *refreshed = Instant::now();
     }
 
-    fn tunables(&self) -> runtime::Tunables {
+    fn tunables(&self) -> Arc<runtime::Tunables> {
         self.runtime.get()
     }
 
@@ -214,6 +229,10 @@ impl PlatformState {
             tunables.raw_max_concurrent_requests,
             tunables.raw_queue_wait(),
         );
+        // A reloaded file may add startup preloads; only the new ones load.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            preload::start(self);
+        }
     }
 }
 
@@ -255,20 +274,15 @@ fn build(config: &PlatformConfig) -> Result<(Router, PlatformState)> {
         ollama.num_parallel(),
     )?;
     let tunables = runtime.get();
-    let usage_file = config.usage_file.clone().or_else(|| {
-        std::env::var_os("FREELLAMA_USAGE_FILE")
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-    });
     let telemetry =
-        Telemetry::with_ledger_capacity(usage_file.clone(), tunables.usage_queue_capacity);
+        Telemetry::with_ledger_capacity(config.store.clone(), tunables.usage_queue_capacity);
     let raw_admission = proxy::RawAdmission::new(
         tunables.raw_max_concurrent_requests,
         tunables.raw_queue_wait(),
     );
     let feedback = config
-        .feedback_file
-        .as_deref()
+        .store
+        .as_ref()
         .map(load_feedback)
         .transpose()?
         .unwrap_or_default();
@@ -284,14 +298,16 @@ fn build(config: &PlatformConfig) -> Result<(Router, PlatformState)> {
                     footprint::RuntimeHints::from_lookup(|name| settings.lookup(name)),
                 );
             }
-            // Measured runner sizes live next to the usage ledger, so a restart keeps them.
-            match &usage_file {
-                Some(ledger) => history.with_file(ledger.with_file_name("footprints.json")),
+            // Measured runner sizes live in the shared database, so a restart keeps them.
+            match &config.store {
+                Some(store) => history.with_store(store.clone()),
                 None => history,
             }
         })),
-        activity: residency::ModelActivity::default(),
-        loop_evidence: loops::LoopEvidence::default(),
+        activity: residency::ModelActivity::seeded(config.store.as_ref()),
+        audit: audit::Audit::new(config.store.clone()),
+        model_facts: model_facts::ModelFacts::loaded(config.store.clone()),
+        preload: preload::Preloader::default(),
         last_eviction: Arc::default(),
         // A client-level backstop, not a nicety. `forward_managed_task` holds the
         // `managed_execution` write lock across its upstream call, so an untimed request against
@@ -318,9 +334,10 @@ fn build(config: &PlatformConfig) -> Result<(Router, PlatformState)> {
             tunables.cpu_max_queued_tasks,
         ),
         feedback: Arc::new(RwLock::new(feedback)),
-        feedback_file: config.feedback_file.clone().map(Arc::new),
+        store: config.store.clone(),
         feedback_persistence_error: Arc::new(RwLock::new(None)),
-        auth_required: config.auth_token.is_some(),
+        auth_required: config.authenticates(),
+        clients: Arc::from(config.client_keys.clone()),
         remote_access: config.allow_remote,
         max_sessions: config.max_sessions.unwrap_or(1024),
         session_ttl: config.session_ttl.unwrap_or(Duration::from_secs(3600)),
@@ -339,9 +356,12 @@ fn build(config: &PlatformConfig) -> Result<(Router, PlatformState)> {
         .with_raw_admission(raw_admission)
         .with_telemetry(telemetry)
         .with_execution_lock(Arc::clone(&state.managed_execution))
-        .with_resource_governor(state.resources.clone());
+        .with_resource_governor(state.resources.clone())
+        .with_hooks(Arc::new(raw_models::RawModels(state.clone())))
+        .with_upstreams(config.upstreams.clone());
     let platform = Router::new()
         .route(&format!("{API_ROOT}/health"), get(health))
+        .route(&format!("{API_ROOT}/ready"), get(ready))
         .route(&format!("{API_ROOT}/machine"), get(machine))
         .route(&format!("{API_ROOT}/models"), get(models))
         .route(&format!("{API_ROOT}/routes"), post(route))
@@ -364,6 +384,7 @@ fn build(config: &PlatformConfig) -> Result<(Router, PlatformState)> {
             post(scopes::fork),
         )
         .route(&format!("{API_ROOT}/warm"), post(warming::warm))
+        .route(&format!("{API_ROOT}/unload"), post(warming::unload))
         .route(&format!("{API_ROOT}/tasks"), post(run_task))
         .route(&format!("{API_ROOT}/jobs"), get(jobs::list))
         .route(
@@ -383,13 +404,19 @@ fn build(config: &PlatformConfig) -> Result<(Router, PlatformState)> {
             &format!("{API_ROOT}/config/reload"),
             post(monitor::reload_config),
         )
+        // Images travel base64 inside task JSON; axum's own 2 MB default refused a screenshot.
+        .layer(axum::extract::DefaultBodyLimit::max(
+            crate::net::max_request_bytes(),
+        ))
         .with_state(state.clone());
     let fallback = proxy::app(fallback_config)?;
     let app = platform.merge(fallback);
-    let router = if let Some(token) = config.auth_token.as_deref() {
+    let router = if config.authenticates() {
         app.layer(middleware::from_fn_with_state(
             AuthState {
-                token: Arc::from(token),
+                token: config.auth_token.as_deref().map(Arc::from),
+                clients: Arc::clone(&state.clients),
+                telemetry: state.telemetry.clone(),
             },
             require_bearer,
         ))
@@ -411,7 +438,27 @@ pub async fn serve(config: PlatformConfig) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&config.listen)
         .await
         .with_context(|| format!("bind platform at {}", config.listen))?;
-    let (app, state) = build(&config)?;
+    // The port is taken first so a second server fails fast; until `build` returns, connections
+    // wait unanswered, so say what is happening and how long it took.
+    eprintln!(
+        "freellama: preparing on {} (store, Ollama settings probe, usage replay)",
+        config.listen
+    );
+    let preparing = Instant::now();
+    // `build` runs bounded blocking probes (macOS `ps`/`launchctl`); keep them off a runtime
+    // worker when the runtime has other workers to hand its tasks to.
+    let built = if tokio::runtime::Handle::current().runtime_flavor()
+        == tokio::runtime::RuntimeFlavor::MultiThread
+    {
+        tokio::task::block_in_place(|| build(&config))
+    } else {
+        build(&config)
+    };
+    let (app, state) = built?;
+    eprintln!(
+        "freellama: prepared in {} ms",
+        preparing.elapsed().as_millis()
+    );
     if state.runtime.file().is_some() {
         // Poll the runtime config's modification time; a changed file is re-resolved and pushed
         // into admission without a restart. A bad edit keeps the last good values.
@@ -432,6 +479,8 @@ pub async fn serve(config: PlatformConfig) -> Result<()> {
         });
     }
     report_admission_budgets(&state.tunables());
+    preload::start(&state);
+    sweep::start(&state);
     // A closed stdout must not stop the server; the banner is informational.
     let _ = writeln!(
         std::io::stdout(),
@@ -448,6 +497,66 @@ pub async fn serve(config: PlatformConfig) -> Result<()> {
         eprintln!("usage ledger flush did not finish within shutdown deadline");
     }
     Ok(())
+}
+
+/// Readiness: whether a managed task can be served now, unlike `/health`, which answers as soon
+/// as the server listens. Ready means the primary Ollama answers `/api/version` and its model
+/// catalog can be read (and the CPU backend answers, when one is configured). A 503 names what
+/// is missing, so a caller can wait for it instead of submitting work that would fail.
+async fn ready(State(state): State<PlatformState>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let unready = |waiting_for: &str, detail: String| {
+        (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"ready": false, "waiting_for": waiting_for, "detail": detail})),
+        )
+            .into_response()
+    };
+    let version = match catalog::get_json(&state.client, &state.upstream, "/api/version").await {
+        Ok(version) => version,
+        Err(error) => {
+            return unready(
+                "ollama",
+                format!(
+                    "Ollama at {} does not answer: {}",
+                    state.upstream, error.body.error
+                ),
+            );
+        }
+    };
+    let cpu = if let Some(upstream) = &state.cpu_upstream {
+        match catalog::get_json(&state.client, upstream, "/api/version").await {
+            Ok(cpu_version) => json!({"reachable": true, "version": cpu_version["version"]}),
+            Err(error) => {
+                return unready(
+                    "cpu_backend",
+                    format!(
+                        "CPU backend at {upstream} does not answer: {}",
+                        error.body.error
+                    ),
+                );
+            }
+        }
+    } else {
+        Value::Null
+    };
+    let models = match catalog::discover_models(&state).await {
+        Ok(models) => models,
+        Err(error) => {
+            return unready(
+                "catalog",
+                format!("model catalog unavailable: {}", error.body.error),
+            );
+        }
+    };
+    let resident = models.iter().filter(|model| model.resident).count();
+    Json(json!({
+        "ready": true,
+        "ollama": {"reachable": true, "version": version["version"]},
+        "cpu_backend": cpu,
+        "models": {"installed": models.len(), "resident": resident},
+    }))
+    .into_response()
 }
 
 /// Liveness plus a load-shedding signal.
@@ -499,7 +608,7 @@ async fn health(State(state): State<PlatformState>) -> Json<Value> {
             "placement_evidence_gate": "configured_or_observed",
             "placement_feedback": "three_sample_runtime",
             "placement_feedback_metric": "normalized_work_unit_10_percent",
-            "placement_feedback_persistence": "versioned_atomic_snapshot_v1",
+            "placement_feedback_persistence": "shared_database_snapshot_v1",
             "authentication": "optional_bearer_all_routes",
             "immediate_unload_observation": "observe_then_unload",
             "task_batches": "independent_only_bounded_priority_fair",
@@ -544,9 +653,9 @@ async fn health(State(state): State<PlatformState>) -> Json<Value> {
         },
         "feedback": {
             "persistence": {
-                "enabled": state.feedback_file.is_some(),
+                "enabled": state.store.is_some(),
                 "schema_version": FEEDBACK_SCHEMA_VERSION,
-                "path": state.feedback_file.as_deref(),
+                "path": state.store.as_ref().and_then(crate::store::Store::path),
                 "last_error": persistence_error,
             },
             "gpu": feedback_for(Backend::Gpu),

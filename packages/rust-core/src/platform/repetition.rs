@@ -33,7 +33,7 @@ fn detect_tail_loop(text: &str) -> Option<TailLoop> {
     let total = text.chars().count();
     let offset = total.saturating_sub(SCAN_WINDOW);
     let window: Vec<char> = text.chars().skip(offset).collect();
-    let mut found = detect_in_window(&window)?;
+    let mut found = detect_in_window(&window, MAX_PERIOD)?;
     if offset > 0 && found.unique_prefix == found.period {
         let chars: Vec<char> = text.chars().collect();
         let mut start = offset;
@@ -48,10 +48,10 @@ fn detect_tail_loop(text: &str) -> Option<TailLoop> {
     Some(found)
 }
 
-fn detect_in_window(chars: &[char]) -> Option<TailLoop> {
+fn detect_in_window(chars: &[char], max_period: usize) -> Option<TailLoop> {
     let n = chars.len();
     let mut best: Option<TailLoop> = None;
-    for period in 1..=MAX_PERIOD.min(n.saturating_sub(1)) {
+    for period in 1..=max_period.min(n.saturating_sub(1)) {
         // A run with this period ends its first copy at `start + period >= period`, so once the
         // period reaches the best prefix no longer unit can start earlier.
         if best
@@ -83,7 +83,7 @@ fn detect_in_window(chars: &[char]) -> Option<TailLoop> {
     best
 }
 
-/// Receipt for a chat response that hit the output cap while looping; `None` otherwise.
+/// Receipt for a chat response that hit its output limit while looping; `None` otherwise.
 pub(super) fn output_check(response: &Value) -> Option<Value> {
     let reason = response.get("done_reason").and_then(Value::as_str)?;
     // `repetition`: FreeLlama stopped a streamed loop; `repeat_limit`: Ollama aborted it.
@@ -115,7 +115,7 @@ pub(super) fn output_check(response: &Value) -> Option<Value> {
         "note": if stopped_early {
             "generation stopped once the output repeated itself; message.content keeps everything generated, and its first unique_prefix_chars characters hold one copy."
         } else {
-            "the model repeated its output until the num_predict cap; the first unique_prefix_chars characters of message.content hold one copy. Treat the answer as low confidence, retry with stop_on_repetition, or set a stop sequence."
+            "the model repeated its output until its output limit (a num_predict cap, or the end of its context); the first unique_prefix_chars characters of message.content hold one copy. Treat the answer as low confidence, retry with stop_on_repetition, or set a stop sequence."
         },
     }))
 }
@@ -123,14 +123,45 @@ pub(super) fn output_check(response: &Value) -> Option<Value> {
 /// Whether a streamed output that is still growing should be stopped: a periodic tail that has
 /// already repeated its unit twice after the first copy and spans 96+ characters. Stricter than the
 /// post-hoc check so a short legitimate repeat (a table rule, a list marker) never stops a run.
+///
+/// It runs every few streamed tokens, so it reads only a byte-bounded tail: the cost stays flat as a
+/// long answer or thinking trace grows, instead of recounting the whole text each time. A unit
+/// longer than [`STREAM_MAX_PERIOD`] is left to the final [`output_check`].
 pub(super) fn should_stop_streaming(text: &str) -> bool {
-    detect_tail_loop(text)
+    let mut start = text.len().saturating_sub(STREAM_WINDOW_BYTES);
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    let window: Vec<char> = text[start..].chars().collect();
+    detect_in_window(&window, STREAM_MAX_PERIOD)
         .is_some_and(|found| found.repeated >= 2 * found.period && found.repeated >= 96)
 }
+
+/// Trailing bytes a streaming check reads.
+const STREAM_WINDOW_BYTES: usize = 16 * 1024;
+/// Longest unit a streaming check looks for, in characters; three copies fit the window.
+const STREAM_MAX_PERIOD: usize = 2_048;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streaming_check_reads_only_the_tail_of_a_long_output() {
+        // A long, varied answer followed by a loop: the check still stops it while reading a tail.
+        let mut text = String::new();
+        for index in 0..20_000 {
+            text.push_str("item ");
+            text.push_str(&index.to_string());
+            text.push_str("; ");
+        }
+        assert!(!should_stop_streaming(&text));
+        text.push_str(&"the same sentence again. ".repeat(12));
+        assert!(should_stop_streaming(&text));
+        // Multibyte characters at the window edge never split a character.
+        let wide = format!("{}{}", "é".repeat(STREAM_WINDOW_BYTES), "loop! ".repeat(40));
+        assert!(should_stop_streaming(&wide));
+    }
 
     #[test]
     fn trims_a_fence_loop_after_the_answer() {

@@ -40,9 +40,10 @@ batteries are small, so treat these as first picks to re-check on your machine, 
 | Decisions (classify, route, score) | `strands-decider:2b-nvfp4` (1.3 GB) | Ticket routing 9/9, return-policy yes/no 3/3, damage rubric 2/3 | 0.17 s per question | `POST <serve>/v1/systemone {model, state, questions}`: passthrough, no MCP tool yet |
 | OCR | `glm-ocr:latest` (2.2 GB) | 4/4 phrases from a dense report strip; 0/7 on text tasks | 11 s per strip at a 400-token cap | `run_task {task:"vision", model:"glm-ocr", prompt:"Text Recognition:", images:[...], stopOnRepetition:true}` |
 
-`gpt-oss:20b` reasons before answering; the battery ran it with `think:"low"` and a 2,048-token
-output cap, so leave room for the reasoning when you set `num_predict`. `glm-ocr` reads text from images only and keeps generating
-after the visible text ends, so cap its output or set `stopOnRepetition`. The decision model needs
+`gpt-oss:20b` reasons before answering, and its reasoning counts as output. FreeLlama sends no
+output cap of its own and sizes the context from what the model has needed before, so leave room
+for the reasoning if you set `num_predict` yourself. `glm-ocr` reads text from images only and keeps generating
+after the visible text ends, so set `stopOnRepetition` (or a `num_predict` cap). The decision model needs
 Apple silicon and answers only through Ollama's decision API; reach it through `serve` so the call
 still passes FreeLlama's memory checks and stream cap (from 0.6.2 a busy CPU no longer refuses it).
 
@@ -67,6 +68,33 @@ curl -s http://127.0.0.1:11435/v1/systemone -H 'content-type: application/json' 
 }'
 ```
 
+Ollama answers `noul` (yes/no), `choice` (2–26 options) and `score` (2–10 levels) questions here,
+not `box`, up to 64 per request. Text and schema must fit in 64 KiB (1 MiB for `kev` and `d1`);
+larger requests get 413, and input is never truncated. The request takes no `options`, so
+`keep_alive` is its only residency control. Images go in a top-level `images` array of base64
+strings shared by every question, and only a vision decision model reads them: `strands-decider`
+refuses them with 400. Ollama drops a TypeSafe-style `assets` map without an error, so `serve`
+moves those images into `images` when every image applies to every question and refuses the
+request otherwise. Find decision models with `models {view:"library", capabilities:["decision"]}`.
+
+### Use it as Octocode's classifier
+
+Octocode's `clasify` speaks the same System One format, so FreeLlama can serve it locally. In the
+shell or the Octocode home `.env`:
+
+```bash
+OCTOCODE_CLASSIFICATION_API_HOST=http://127.0.0.1:11435
+OCTOCODE_CLASSIFICATION_MODEL=strands-decider:2b-nvfp4
+OCTOCODE_CLASSIFICATION_API=local   # any nonblank value; the local server ignores it
+```
+
+`clasify` `evaluate` and `sections` work with yes/no, choice and score questions, and image
+questions work with a vision decision model. Octocode's `operation:"models"` fails, because Ollama
+lists models in the OpenAI format, and box questions do not exist in Ollama. Raw requests share one slot by default, so Octocode's
+parallel calls queue behind each other; a busy queue answers 429 with `Retry-After`, which
+Octocode honors. Inline `classification` on search results asks a three-level score question, where
+the 2B model's distributions are flat and few candidates clear the 0.5 selection threshold.
+
 ## Text, code, and vision
 
 `qwen3.8:27b-mlx` was the strongest general model in the local evaluations. It handled coding,
@@ -79,7 +107,7 @@ third of its unsupervised code-review findings were false or context-limited.
 These examples do not establish that a tag is installed or suitable on your host.
 
 Dedicated OCR models answer best to the prompts their model card documents; send them with base64
-`images` in `run_task`. A model that repeats its answer until the output cap can run with
+`images` in `run_task`. A model that repeats its answer until its output limit can run with
 `stopOnRepetition:true`. See [Route images](https://github.com/bgauryy/FreeLlama/blob/main/packages/mcp/README.md#route-images)
 for the early stop and the `output_check` receipt.
 
@@ -143,7 +171,7 @@ command reports the core catalog and does not expose these enrichment flags.
 | Option | Valid views | Default | Meaning |
 |---|---|---|---|
 | `includeLibrary` | `installed`, `detail` | `false` | Requests public metadata; the default makes no website calls |
-| `includeReadme` | Library step 2, or `detail` with `includeLibrary:true` | `false` | Returns README text, capped at 65,536 characters, with its format and truncation flag |
+| `includeReadme` | Library step 2, or `detail` with `includeLibrary:true` | `false` | Returns the README text with its format |
 | `includeVerbose` | `detail` | `false` | Returns Ollama's license and Modelfile fields independently of README enrichment |
 | `limit`, `cursor` | `raw`, library tag listings; `limit` also applies to library search | Tag/raw page size 20; search limit 10 | Pages large lists; the tag cursor rejects a changed tag list |
 | `ollamaEndpoint` | Direct Ollama views and library inventory reads | Configured Ollama endpoint | Chooses the Ollama instance; enriched managed inventory uses each model's assigned backend |
@@ -182,9 +210,9 @@ For a verified installed model, `knowledge.library` contains the source page, ta
 | `advertisedFamilyCapabilities` | Family feature chips; these do not extend the local tag's capabilities |
 | `advertisedUseCases` | Recognized coding, tool-calling, image-understanding/OCR, reasoning, embedding, summarization, question-answering, translation, and long-context claims |
 | `advertisedUseCases[].evidence` | A bounded source excerpt, source URL, and fetch timestamp |
-| `usageNotes` | Bounded excerpts about requirements, restrictions, context, memory, languages, or query prefixes |
+| `usageNotes` | Sentences about requirements, restrictions, context, memory, languages, or query prefixes |
 | `readmeAvailable` | Whether a README was extracted |
-| `readme` | Requested text with `format` (`markdown` or `text`) and `truncated` |
+| `readme` | Requested text with `format` (`markdown` or `text`) |
 
 
 Advertised uses have `basis:"advertised"`, `scope:"family"`, and `quality:"unmeasured"`. Extraction

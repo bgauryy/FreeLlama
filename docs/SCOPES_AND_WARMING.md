@@ -146,8 +146,13 @@ Expired entries are removed during store operations.
 ## Warm API
 
 `POST /warm`, MCP `run_task {warm:true}`, and CLI `warm` load an exact installed model with a matching
-non-embedding task profile. They do not accept prompts or messages, pull a model, or store conversation
-history. The default task profile is `completion`.
+task profile; `task: "embedding"` loads an embedding model with an empty `/api/embed` request. A
+chat warm may carry `messages` (MCP: `systemPrompt` and/or `messages`): the runner evaluates them
+into its prompt cache with `num_predict: 0` and generates nothing, so a later request that starts
+with the same messages, at the same context, reuses that work (its receipt reports
+`cached_prompt_tokens`). Warming never pulls a model or stores conversation history. The default task
+profile is `completion`. Ollama has no load-only request for decision models: they load on their
+first `/v1/systemone` call, and `keep_alive` on that call sets their residency.
 
 | HTTP field | MCP field | Meaning |
 |---|---|---|
@@ -161,6 +166,7 @@ history. The default task profile is `completion`.
 | `max_wait_seconds` | `maxWaitSeconds` | Shorter admission/resource wait budget. |
 | `timeout_seconds` | `timeoutSeconds` | Total request deadline, capped by server policy. |
 | `defer` | `defer` | Return a job handle for the same managed operation. |
+| `messages` | `systemPrompt`, `messages` | A prompt prefix to evaluate into the runner's prompt cache. |
 
 Synchronous warming returns HTTP `200`; deferred warming returns HTTP `202`. Inspect deferred
 work through `task_jobs` or `jobs` using its returned ID. Warming reuses ordinary routing,
@@ -177,15 +183,43 @@ chat requires Ollama's `done:true`; an absent or non-boolean completion marker i
 These are separate observations in Ollama's [chat response](https://docs.ollama.com/api/chat) and
 [running-model inventory](https://docs.ollama.com/api/ps).
 
-With `keep_alive:"0"`, warming observes placement and then unloads. The `warm` receipt describes
-residency after unload: `loaded:false` on verified unload, with
-`residency_source:"ollama_api_ps_after_unload"`.
+With `keep_alive:"0"` on a model that is not resident, warming loads it, observes placement and then
+unloads. The `warm` receipt describes residency after unload: `loaded:false` on verified unload,
+with `residency_source:"ollama_api_ps_after_unload"`. On a model that is already resident,
+`keep_alive:"0"` is a plain unload: it waits for that model's running tasks, unloads it and returns
+`{"unloaded": true, "status": "unloaded", "unload_ms": …}` without loading or routing anything.
+`POST /_freellama/v1/unload {"model": …}` (CLI `unload`) does the same and never loads a model that is
+not resident (`status: "not_resident"`).
+
+A warm without `task` loads an embedding-only model as an embedding task, so
+`{"model":"nomic-embed-text:v1.5"}` works without `"task":"embedding"`. Warms and preloads teach
+FreeLlama a model's load time but do not count as uses, so they never lengthen their own residency.
 
 Warming uses the same truncation and context-shift policy as managed chat. This preserves a
 compatible runner profile instead of forcing a transition solely because warming omitted those
 controls. Use a context/task profile compatible with the following task. Warming a different profile can
 require another runner transition. Warm residency does not reserve a later execution slot. Cache reuse depends on the compatible
 profile, unchanged prefix, and inference backend. See [Managed execution](ARCHITECTURE.md#managed-task-execution).
+
+## Preload
+
+The runtime file's `[preload]` table loads models without a caller asking:
+
+- `startup`: tags, or tables with `model` and optional `context_tokens`, `keep_alive` (default: the
+  warming policy's `max_seconds`) and `messages`, loaded in order once the server is up and again
+  for entries a reloaded runtime file adds. `FREELLAMA_PRELOAD` sets a comma-separated list.
+- `predictive` (on by default): every switch from one model to another within
+  `follow_window_seconds` (600) is counted in the shared database. Once at least `min_observations`
+  (3) switches away from a model happened and `min_probability` (0.5) of them went to one successor,
+  finishing a caller's work on the model loads that successor in the background, but only when it
+  is not loaded, fits without unloading anything (budget, GPU and host memory), the host is under no
+  pressure, and nothing is running or queued on the backend. Only the primary backend predicts.
+  `FREELLAMA_PREDICTIVE_PRELOAD=0` turns it off.
+
+Each preload is a background warm under the usual admission, memory and pressure rules, and the
+residency audit records it as `preload` (or `preload_failed`) with trigger `startup` or
+`predicted_after:<model>`. Switches are counted per process from the order requests finish, so
+several agents interleaving models add noise that the probability threshold has to outweigh.
 
 For a bounded warm operation, replace `MODEL_TAG` with an exact installed tag:
 

@@ -118,26 +118,21 @@ impl Default for TelemetryPolicy {
 
 /// What admission does when a new load's estimate does not fit the available-memory reserve and
 /// no OS signal reports pressure.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LowMemoryMode {
     /// Admit with a [`MemoryAdvisory`] and let Ollama and the OS decide whether the load fits.
-    /// Justified on macOS, whose available-memory figure undercounts what it can reclaim.
+    /// An operator choice (`--low-memory advisory`) for hosts whose available figure is known to
+    /// undercount what the OS can reclaim.
     Advisory,
-    /// Hold the request (`held_insufficient_capacity`) until capacity returns or the deadline
-    /// passes. On Linux `MemAvailable` already counts reclaimable cache and in containers it is
-    /// the hard cap, so over-admitting invites the OOM killer; Windows is similar.
+    /// Hold a new load (`held_insufficient_capacity`) until capacity returns or the deadline
+    /// passes; work on a resident runner is never held by it. The default everywhere: on Linux
+    /// `MemAvailable` counts reclaimable cache and in containers it is the hard cap, and on macOS
+    /// the available figure already adds bounded reclaimable pages (inactive, speculative,
+    /// purgeable), so admitting a load that does not fit pushes the host into compression and
+    /// swap, which freezes an interactive machine.
+    #[default]
     Refuse,
-}
-
-impl Default for LowMemoryMode {
-    fn default() -> Self {
-        if cfg!(target_os = "macos") {
-            Self::Advisory
-        } else {
-            Self::Refuse
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -152,7 +147,7 @@ pub enum TelemetryMetric {
 #[derive(Debug, Clone, Serialize)]
 pub struct ResourcePolicy {
     pub telemetry_policy: TelemetryPolicy,
-    /// Platform-dependent by default: advisory on macOS, refusing elsewhere.
+    /// Hold new loads that do not fit by default; `Advisory` admits them with a warning.
     pub low_memory: LowMemoryMode,
     pub sample_interval: Duration,
     pub hold_available_percent: u32,
@@ -313,7 +308,7 @@ impl ResourceSnapshot {
     /// Like [`Self::assess_capacity`], for a [`ResourceDemand`]. Which active holds deny the
     /// demand is decided per signal by [`ResourceDemand::is_held_by`]: memory-capacity holds spare a
     /// resident runner, CPU-load and thermal holds spare inference on a resident GPU runner, OS
-    /// memory pressure holds everything. For a new load, low available memory is
+    /// memory pressure holds new loads and, when critical, resident runners too. For a new load, low available memory is
     /// a [`MemoryAdvisory`] under [`LowMemoryMode::Advisory`] and an
     /// [`CapacityDenialReason::InsufficientCapacity`] denial under [`LowMemoryMode::Refuse`].
     #[must_use]
@@ -325,6 +320,7 @@ impl ResourceSnapshot {
         let required_available_bytes = demand.bytes;
         let resident_only = demand.resident_only();
         let advisory_mode = self.policy.low_memory == LowMemoryMode::Advisory;
+        let os_critical = self.observation.memory_pressure == Some(MemoryPressure::Critical);
         // On a host with no observed accelerator, the "GPU" backend runs on the same cores.
         let demand = if self.observation.has_accelerator() {
             demand
@@ -335,7 +331,7 @@ impl ResourceSnapshot {
             .reasons
             .iter()
             .copied()
-            .filter(|reason| demand.is_held_by(*reason, advisory_mode))
+            .filter(|reason| demand.is_held_by(*reason, advisory_mode, os_critical))
             .collect::<Vec<_>>();
         let reserve_bytes = self.policy.reserve_for(
             self.observation.total_memory_bytes,
@@ -443,10 +439,16 @@ impl ResourceDemand {
     /// work: saturated cores slow decoding on them, not a GPU load or GPU inference. A thermal
     /// hold applies to CPU-bound work and to cold loads, a new heat source while the OS reports
     /// throttling; a bounded request on a loaded GPU runner is not held, as waiting only delays
-    /// the caller. OS memory
-    /// pressure holds every demand.
+    /// the caller. OS memory pressure holds every new load; it holds a resident runner only at
+    /// the critical level, since a warning is what a large load itself raises and the runner
+    /// must stay reusable for the same reason as the memory-capacity holds.
     #[must_use]
-    pub fn is_held_by(self, reason: PressureReason, advisory_low_memory: bool) -> bool {
+    pub fn is_held_by(
+        self,
+        reason: PressureReason,
+        advisory_low_memory: bool,
+        os_critical: bool,
+    ) -> bool {
         match reason {
             PressureReason::LowAvailableMemory => !advisory_low_memory && !self.resident_only(),
             PressureReason::ActiveSwapping => !self.resident_only(),
@@ -454,7 +456,7 @@ impl ResourceDemand {
             // load or GPU inference, so a busy compiler never blocks a GPU model.
             PressureReason::HighCpuLoad => self.cpu_bound,
             PressureReason::ThermalThrottling => self.cpu_bound || !self.resident,
-            PressureReason::OsMemoryPressure => true,
+            PressureReason::OsMemoryPressure => os_critical || !self.resident_only(),
         }
     }
 }

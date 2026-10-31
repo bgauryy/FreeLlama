@@ -121,62 +121,100 @@ async fn fetch_catalog_from(
         let Some(show) = shows[index].take() else {
             continue;
         };
-        let (capabilities, other_capabilities) = split_capabilities(&show);
-        let advertised_context = advertised_context_from_show(&show);
-        let kv_cache_bytes_per_token_f16 = estimate_kv_cache_bytes_per_token_f16(&show);
-        let modelfile_num_ctx = ollama_env::modelfile_num_ctx(&show);
-        let architecture = show
-            .pointer("/model_info/general.architecture")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        let running = resident
-            .iter()
-            .find(|running| crate::ollama_http::ps_entry_name(running) == Some(name));
-        models.push(CatalogModel {
-            digest: entry
-                .get("digest")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            name: name.to_owned(),
-            size: entry.get("size").and_then(Value::as_u64).unwrap_or(0),
-            capabilities,
-            other_capabilities,
-            advertised_context,
-            kv_cache_bytes_per_token_f16,
-            modelfile_num_ctx,
-            architecture,
-            resident: running.is_some(),
-            resident_size: running
-                .and_then(|value| value.get("size"))
-                .and_then(Value::as_u64),
-            resident_vram: running
-                .and_then(|value| value.get("size_vram"))
-                .and_then(Value::as_u64),
-            resident_context: running
-                .and_then(|value| value.get("context_length"))
-                .and_then(Value::as_u64),
-            benchmark: state.benchmark.get(name).cloned().unwrap_or_default(),
-            observed_loops: state.loop_evidence.for_model(name),
-            policy_options: state
-                .policies
-                .model_options
-                .iter()
-                .filter_map(|(task, models)| models.get(name).map(|options| (*task, *options)))
-                .collect(),
-            policy_rank: state
-                .policies
-                .qualified
-                .iter()
-                .filter_map(|(task, candidates)| {
-                    candidates
-                        .iter()
-                        .position(|candidate| candidate == name)
-                        .map(|rank| (*task, rank))
-                })
-                .collect(),
-        });
+        models.push(catalog_model(state, entry, name, &show, &resident));
     }
     Ok(models)
+}
+
+/// One catalog entry from Ollama's `tags` entry, its `show` metadata and the running list.
+fn catalog_model(
+    state: &PlatformState,
+    entry: &Value,
+    name: &str,
+    show: &Value,
+    resident: &[Value],
+) -> CatalogModel {
+    let (capabilities, other_capabilities) = split_capabilities(show);
+    let advertised_context = advertised_context_from_show(show);
+    let kv_cache_bytes_per_token_f16 = estimate_kv_cache_bytes_per_token_f16(show);
+    let modelfile_num_ctx = ollama_env::modelfile_num_ctx(show);
+    let architecture = show
+        .pointer("/model_info/general.architecture")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let running = resident
+        .iter()
+        .find(|running| crate::ollama_http::ps_entry_name(running) == Some(name));
+    let digest = entry
+        .get("digest")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    CatalogModel {
+        observed_loops: state.model_facts.loops_for(name, digest.as_deref()),
+        learned_output_tokens: state.model_facts.output_need(name, digest.as_deref()),
+        digest,
+        name: name.to_owned(),
+        size: entry.get("size").and_then(Value::as_u64).unwrap_or(0),
+        capabilities,
+        other_capabilities,
+        advertised_context,
+        kv_cache_bytes_per_token_f16,
+        modelfile_num_ctx,
+        architecture,
+        resident: running.is_some(),
+        resident_size: running
+            .and_then(|value| value.get("size"))
+            .and_then(Value::as_u64),
+        resident_vram: running
+            .and_then(|value| value.get("size_vram"))
+            .and_then(Value::as_u64),
+        resident_context: running
+            .and_then(|value| value.get("context_length"))
+            .and_then(Value::as_u64),
+        benchmark: state.benchmark.get(name).cloned().unwrap_or_default(),
+        policy_options: state
+            .policies
+            .model_options
+            .iter()
+            .filter_map(|(task, models)| models.get(name).map(|options| (*task, *options)))
+            .collect(),
+        policy_rank: state
+            .policies
+            .qualified
+            .iter()
+            .filter_map(|(task, candidates)| {
+                candidates
+                    .iter()
+                    .position(|candidate| candidate == name)
+                    .map(|rank| (*task, rank))
+            })
+            .collect(),
+    }
+}
+
+/// One installed model of the primary backend, for sizing a raw passthrough load: from the shared
+/// catalog while it is fresh, else from that backend alone (its tags, running list and one `show`),
+/// so a raw request never waits on the CPU backend or on every model's metadata.
+pub(crate) async fn primary_model(state: &PlatformState, name: &str) -> Option<CatalogModel> {
+    if let Some(models) = snapshot_catalog(&state.catalog_cache).await
+        && let Some(model) = models
+            .into_iter()
+            .find(|model| model.name == name && !state.cpu_models.contains(name))
+    {
+        return Some(model);
+    }
+    let (tags, ps) = tokio::join!(
+        get_json(&state.client, &state.upstream, "/api/tags"),
+        get_json(&state.client, &state.upstream, "/api/ps")
+    );
+    let (tags, ps) = (tags.ok()?, ps.ok()?);
+    let entry = tags["models"]
+        .as_array()?
+        .iter()
+        .find(|entry| crate::ollama_http::ps_entry_name(entry) == Some(name))?;
+    let show = show_model(state, &state.upstream, name).await.ok()??;
+    let resident = ps["models"].as_array().cloned().unwrap_or_default();
+    Some(catalog_model(state, entry, name, &show, &resident))
 }
 
 /// Text context belongs to the declared architecture, not an auxiliary vision encoder. Legacy
@@ -344,7 +382,12 @@ async fn refresh_residency(
             .and_then(|value| value.get("context_length"))
             .and_then(Value::as_u64);
         // Live like residency: cached static metadata must not hide a loop seen since.
-        model.observed_loops = state.loop_evidence.for_model(&model.name);
+        model.observed_loops = state
+            .model_facts
+            .loops_for(&model.name, model.digest.as_deref());
+        model.learned_output_tokens = state
+            .model_facts
+            .output_need(&model.name, model.digest.as_deref());
     }
     Ok(())
 }
@@ -670,6 +713,7 @@ mod kv_estimate_tests {
             resident_context: None,
             benchmark: BTreeMap::new(),
             observed_loops: BTreeMap::new(),
+            learned_output_tokens: None,
             policy_rank: BTreeMap::new(),
             policy_options: BTreeMap::new(),
         };

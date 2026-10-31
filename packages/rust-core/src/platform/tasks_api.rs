@@ -63,12 +63,17 @@ pub(crate) struct TaskInput {
     /// Total time including discovery, queueing, loading and generation; capped by the server.
     pub(crate) timeout_seconds: Option<u64>,
     /// Stream a chat from Ollama and stop as soon as the output repeats itself, instead of
-    /// generating the loop until `num_predict`. Everything generated before the stop is kept in
-    /// `response.message.content`; `output_check` says where the first copy of the loop ends.
+    /// generating the loop to the end of its output limit. Everything generated before the stop
+    /// is kept in `response.message.content`; `output_check` says where the first copy of the loop
+    /// ends. Unset, it is on when nothing caps the output (no `num_predict`), since only a loop
+    /// stop then bounds a runaway answer short of the model's context; `false` turns it off.
     #[serde(default)]
-    pub(crate) stop_on_repetition: bool,
+    pub(crate) stop_on_repetition: Option<bool>,
     #[serde(skip)]
     pub(crate) job_progress: Option<jobs::JobProgress>,
+    /// The client key that sent the task, for the usage ledger.
+    #[serde(skip)]
+    pub(crate) client: Option<String>,
 }
 
 impl Serialize for TaskInput {
@@ -141,9 +146,15 @@ fn next_batch_task(
 
 pub(crate) async fn run_task_batch(
     State(state): State<PlatformState>,
+    caller: Option<axum::Extension<crate::proxy::Caller>>,
     input: Result<Json<TaskBatchInput>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<Value>, ApiError> {
-    let Json(input) = input.map_err(|error| ApiError::invalid_task_request(&error))?;
+    let Json(mut input) = input.map_err(|error| ApiError::invalid_task_request(&error))?;
+    if let Some(axum::Extension(caller)) = caller {
+        for item in &mut input.tasks {
+            item.task.client = Some(caller.0.to_string());
+        }
+    }
     if input.tasks.is_empty() || input.tasks.len() > MAX_BATCH_TASKS {
         return Err(ApiError::bad_request(format!(
             "tasks must contain 1 to {MAX_BATCH_TASKS} items"

@@ -68,13 +68,15 @@ fn size_scoped_explicit_context(
     {
         estimated = estimated.saturating_add(estimated_text_tokens(&schema.to_string()));
     }
-    let output = decision.options["num_predict"].as_u64().ok_or_else(|| {
-        ApiError::bad_request("scoped history requires a finite positive output budget")
-    })?;
+    let available = decision.options["num_ctx"].as_u64().unwrap_or_default();
+    // As for unscoped work: a caller's cap must fit, the expected output gives way to the history.
+    let room = available.saturating_sub(estimated.saturating_add(TEMPLATE_MARGIN));
+    let output = decision.options["num_predict"]
+        .as_u64()
+        .unwrap_or_else(|| decision.output_reserve_tokens.min(room));
     let required = estimated
         .saturating_add(output)
         .saturating_add(TEMPLATE_MARGIN);
-    let available = decision.options["num_ctx"].as_u64().unwrap_or_default();
     if required > available {
         let estimate_scope = if unestimated_modality {
             "scoped text and metadata"
@@ -109,20 +111,10 @@ pub(super) fn size_context(
         return Ok(json!({"mode":"warm_profile","tokens":decision.options["num_ctx"]}));
     }
     let unestimated_modality = has_unestimated_modality(input);
-    if input.scope_id.is_some() {
-        if decision.options["num_predict"]
-            .as_u64()
-            .is_none_or(|output| output == 0)
-        {
-            return Err(ApiError::bad_request(
-                "scoped history requires a finite positive output budget",
-            ));
-        }
-        if unestimated_modality && input.route.context_tokens.is_none() {
-            return Err(ApiError::bad_request(
-                "scoped multimodal history requires explicit context_tokens; total token cost requires a model-specific estimator",
-            ));
-        }
+    if input.scope_id.is_some() && unestimated_modality && input.route.context_tokens.is_none() {
+        return Err(ApiError::bad_request(
+            "scoped multimodal history requires explicit context_tokens; total token cost requires a model-specific estimator",
+        ));
     }
     if input.scope_id.is_some() && input.route.context_tokens.is_some() {
         return size_scoped_explicit_context(input, decision, unestimated_modality);
@@ -136,14 +128,7 @@ pub(super) fn size_context(
             json!({"mode": "profile", "reason": "modality_requires_model_specific_estimator"}),
         );
     }
-    let Some(output) = decision.options.get("num_predict").and_then(Value::as_u64) else {
-        if input.scope_id.is_some() {
-            return Err(ApiError::bad_request(
-                "scoped history requires a finite positive output budget",
-            ));
-        }
-        return Ok(json!({"mode": "profile", "reason": "output_budget_not_bounded"}));
-    };
+    let capped = decision.options["num_predict"].as_u64();
     let payload = if input.messages.is_empty() {
         input.prompt.clone().unwrap_or_default()
     } else {
@@ -156,16 +141,20 @@ pub(super) fn size_context(
     {
         estimated = estimated.saturating_add(estimated_text_tokens(&schema.to_string()));
     }
-    let required = estimated
-        .saturating_add(output)
-        .saturating_add(TEMPLATE_MARGIN);
     let cap = model
         .advertised_context
         .unwrap_or_else(|| decision.options["num_ctx"].as_u64().unwrap_or(2048))
         .min(AUTO_CONTEXT_LIMIT);
+    // A caller's `num_predict` is a promise that must fit. The expected output is only an
+    // estimate: it gives way to the prompt, so a long prompt still runs in the model's window.
+    let room = cap.saturating_sub(estimated.saturating_add(TEMPLATE_MARGIN));
+    let output = capped.unwrap_or_else(|| decision.output_reserve_tokens.min(room));
+    let required = estimated
+        .saturating_add(output)
+        .saturating_add(TEMPLATE_MARGIN);
     if required > cap {
         return Err(ApiError::bad_request(format!(
-            "estimated prompt plus output reserve requires {required} context tokens, above the automatic cap {cap}; compact the supplied history or set an explicit context_tokens supported by the model"
+            "estimated prompt plus requested output requires {required} context tokens, above the automatic cap {cap}; compact the supplied history or set an explicit context_tokens supported by the model"
         )));
     }
     let selected = [2048, 4096, 8192, 16_384, AUTO_CONTEXT_LIMIT]
@@ -183,6 +172,7 @@ pub(super) fn size_context(
     Ok(json!({
         "mode": "prompt_estimate", "estimator": "utf8_bytes_div_3",
         "estimated_input_tokens": estimated, "output_reserve_tokens": output,
+        "output_capped": capped.is_some(),
         "template_margin_tokens": TEMPLATE_MARGIN, "tokens": selected,
         "automatic_cap_tokens": cap, "exact_token_count": false,
     }))
@@ -245,12 +235,50 @@ mod tests {
     }
 
     #[test]
-    fn short_text_uses_smallest_bucket_and_preserves_output_budget() {
+    fn a_thinking_model_gets_room_to_think_before_it_answers() {
+        let input: TaskInput = serde_json::from_value(json!({
+            "task": "completion", "objective": "fastest", "prompt": "hello"
+        }))
+        .unwrap();
+        let model: CatalogModel = serde_json::from_value(json!({
+            "name": "thinker", "size": 1, "capabilities": ["completion", "thinking"],
+            "advertised_context": 32768, "resident": false,
+            "benchmark": {}, "policy_rank": {}
+        }))
+        .unwrap();
+        let decision = select_route(
+            &input.route,
+            std::slice::from_ref(&model),
+            &SessionAffinity::default(),
+        )
+        .unwrap();
+        // Room to reason is expected for context sizing; no cap is sent.
+        assert_eq!(decision.output_reserve_tokens, 2048);
+        assert!(decision.options.get("num_predict").is_none());
+    }
+
+    #[test]
+    fn short_text_uses_smallest_bucket_and_sends_no_output_cap() {
         let (input, model, mut decision) = request("hello");
         let receipt = size_context(&input, &mut decision, &model).unwrap();
         assert_eq!(decision.options["num_ctx"], 2048);
-        assert_eq!(decision.options["num_predict"], 512);
+        assert!(decision.options.get("num_predict").is_none());
+        assert_eq!(receipt["output_reserve_tokens"], 512);
+        assert_eq!(receipt["output_capped"], false);
         assert_eq!(receipt["exact_token_count"], false);
+    }
+
+    #[test]
+    fn the_expected_output_gives_way_to_a_long_prompt_but_a_cap_must_fit() {
+        let (mut input, mut model, mut decision) = request("hello");
+        model.advertised_context = Some(4096);
+        // About 3,400 prompt tokens plus the template margin leave less than the expected 512.
+        input.prompt = Some("x".repeat(3 * 3_400));
+        let receipt = size_context(&input, &mut decision, &model).unwrap();
+        assert_eq!(decision.options["num_ctx"], 4096);
+        assert!(receipt["output_reserve_tokens"].as_u64().unwrap() < 512);
+        decision.options["num_predict"] = json!(512);
+        assert!(size_context(&input, &mut decision, &model).is_err());
     }
 
     #[test]
@@ -308,16 +336,18 @@ mod tests {
     }
 
     #[test]
-    fn scoped_output_budget_must_be_positive_with_automatic_or_explicit_context() {
+    fn scoped_history_without_a_cap_sizes_from_the_expected_output() {
         let (mut input, model, mut decision) = request("hello");
         input.scope_id = Some("scope".into());
         input.messages = vec![json!({"role":"user","content":"hello"})];
-        for context in [None, Some(4096)] {
-            input.route.context_tokens = context;
-            for output in [0, -1, -2] {
-                decision.options["num_predict"] = json!(output);
-                assert!(size_context(&input, &mut decision, &model).is_err());
-            }
-        }
+        input.route.context_tokens = Some(4096);
+        decision.options["num_ctx"] = json!(4096);
+        let receipt = size_context(&input, &mut decision, &model).unwrap();
+        assert_eq!(receipt["output_reserve_tokens"], 512);
+        assert!(decision.options.get("num_predict").is_none());
+        // A learned need larger than the window gives way instead of refusing the history.
+        decision.output_reserve_tokens = 100_000;
+        let receipt = size_context(&input, &mut decision, &model).unwrap();
+        assert!(receipt["output_reserve_tokens"].as_u64().unwrap() < 4096);
     }
 }

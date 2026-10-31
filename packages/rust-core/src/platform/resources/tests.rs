@@ -43,14 +43,9 @@ fn refusing_policy() -> ResourcePolicy {
 }
 
 #[test]
-fn low_memory_mode_defaults_to_advisory_only_on_macos() {
-    let expected = if cfg!(target_os = "macos") {
-        LowMemoryMode::Advisory
-    } else {
-        LowMemoryMode::Refuse
-    };
-    assert_eq!(LowMemoryMode::default(), expected);
-    assert_eq!(ResourcePolicy::default().low_memory, expected);
+fn low_memory_mode_holds_new_loads_by_default_everywhere() {
+    assert_eq!(LowMemoryMode::default(), LowMemoryMode::Refuse);
+    assert_eq!(ResourcePolicy::default().low_memory, LowMemoryMode::Refuse);
 }
 
 #[tokio::test]
@@ -212,6 +207,24 @@ async fn low_memory_hold_admits_resident_runners_and_warns_new_loads() {
         Some(MemoryAdvisory::BelowReserve)
     );
     assert_eq!(cold.reserved_bytes(), 2 * GIB);
+}
+
+#[tokio::test]
+async fn an_os_memory_warning_holds_new_loads_but_not_resident_reuse() {
+    // A large load is what raises the macOS warning level; the runner it loaded must stay usable.
+    let governor = ResourceGovernor::with_sampler(quick_policy(), || {
+        let mut sample = healthy();
+        sample.memory_pressure = Some(MemoryPressure::Warning);
+        sample
+    })
+    .unwrap();
+    let snapshot = governor.snapshot().await;
+    assert!(snapshot.reasons.contains(&PressureReason::OsMemoryPressure));
+    let resident = snapshot.assess_demand(ResourceDemand::resident(), false);
+    assert!(resident.admissible, "{resident:?}");
+    let cold = snapshot.assess_demand(ResourceDemand::load(GIB), false);
+    assert_eq!(cold.held_by, vec![PressureReason::OsMemoryPressure]);
+    assert!(!cold.admissible);
 }
 
 #[tokio::test]

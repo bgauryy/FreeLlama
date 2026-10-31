@@ -15,6 +15,7 @@ mod ollama_http;
 pub mod platform;
 pub mod proxy;
 pub mod serve_client;
+pub mod store;
 mod timeouts;
 
 pub use doctor::{

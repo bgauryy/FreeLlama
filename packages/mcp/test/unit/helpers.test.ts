@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
   canonicalTaskKind,
-  clipText,
   configuredExternalCost,
   costTelemetry,
   errorResult,
@@ -9,7 +8,6 @@ import {
   structuredResult,
   taskAnswerText,
   batchAnswerText,
-  ANSWER_TEXT_MAX_CHARS,
   summarizeEmbeddings,
   withRequiredCapability,
 } from "../../src/helpers.js";
@@ -177,25 +175,6 @@ describe("summarizeOllamaPullStream", () => {
   });
 });
 
-describe("clipText", () => {
-  it("returns short text unchanged", () => {
-    expect(clipText("short", 100)).toBe("short");
-  });
-
-  it("keeps both ends and states how much was dropped", () => {
-    const long = "A".repeat(100) + "MIDDLE" + "Z".repeat(100);
-    const clipped = clipText(long, 60);
-    expect(clipped.length).toBeLessThanOrEqual(60);
-    expect(clipped.startsWith("A")).toBe(true);
-    expect(clipped.endsWith("Z")).toBe(true);
-    expect(clipped).toMatch(/more chars/);
-  });
-
-  it("falls back to a plain head slice when the limit can't fit the marker", () => {
-    expect(clipText("ABCDEFGHIJ", 3)).toBe("ABC");
-  });
-});
-
 describe("result shapes", () => {
   it("structuredResult keeps the object canonical and emits a compact text cue", () => {
     const result = structuredResult({ hello: "world" });
@@ -271,11 +250,23 @@ describe("task answer text", () => {
     expect(result.structuredContent).toBe(payload);
   });
 
-  it("includes tool calls and clips very long answers", () => {
+  it("adds one lifecycle clause for a cold load or evictions, and none for a warm call", () => {
+    const answer = (metrics: Record<string, unknown>, evicted?: string[]) => taskAnswerText({
+      route: { selected_model: "gpt-oss:20b" }, metrics,
+      execution: { memory_reservation: evicted ? { evicted_idle_models: evicted } : {} },
+      response: { message: { content: "hi" } },
+    });
+    expect(answer({ load_duration_ns: 8_900_000_000 }, ["glm-ocr:latest"])).toBe("[gpt-oss:20b · loaded 8.9 s, evicted glm-ocr:latest] hi");
+    expect(answer({ load_duration_ns: 1_200_000_000 })).toBe("[gpt-oss:20b · loaded 1.2 s] hi");
+    expect(answer({ load_duration_ns: 40_000_000 }, ["a:1", "b:2"])).toBe("[gpt-oss:20b · evicted a:1, b:2] hi");
+    expect(answer({ load_duration_ns: 40_000_000 })).toBe("[gpt-oss:20b] hi");
+  });
+
+  it("includes tool calls and returns a long answer whole", () => {
     const calls = taskAnswerText({ response: { message: { content: "", tool_calls: [{ function: { name: "f" } }] } } });
     expect(calls).toContain('tool_calls: [{"function":{"name":"f"}}]');
-    const long = taskAnswerText({ response: { message: { content: "x".repeat(ANSWER_TEXT_MAX_CHARS * 2) } } });
-    expect(long!.length).toBeLessThanOrEqual(ANSWER_TEXT_MAX_CHARS);
+    const content = "x".repeat(100_000);
+    expect(taskAnswerText({ response: { message: { content } } })).toBe(content);
   });
 
   it("shows one copy of a looped answer and keeps the full text out of the answer only", () => {
@@ -284,7 +275,7 @@ describe("task answer text", () => {
       response: { message: { content } },
       output_check: { repetition_loop: true, unique_prefix_chars: 16 },
     });
-    expect(text).toMatch(/^Total: \$1\.00\n```\n\[freellama: trimmed \d+ repeated characters/);
+    expect(text).toMatch(/^Total: \$1\.00\n```\n\[freellama: \d+ repeated characters omitted here \(full text in structuredContent\)/);
     expect(taskAnswerText({ response: { message: { content } } })).toBe(content.trim());
   });
 

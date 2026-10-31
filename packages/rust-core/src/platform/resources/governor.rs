@@ -147,6 +147,12 @@ impl ResourceGovernor {
 
     /// Make the next [`Self::snapshot`] sample afresh, after `FreeLlama` itself changed what the
     /// host holds (for example by unloading idle models).
+    /// The thresholds and sampling cadence this governor applies.
+    #[must_use]
+    pub const fn policy(&self) -> &ResourcePolicy {
+        &self.policy
+    }
+
     pub async fn invalidate(&self) {
         self.state.lock().await.stale = true;
     }

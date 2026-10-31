@@ -251,8 +251,9 @@ pub fn max_loaded_models_advisory(raw: Option<&str>) -> Option<String> {
          envconfig/config.go is a sentinel that server/sched.go resolves to 3 x GPU count, i.e. \
          an effective cap of 3 on a single-GPU or CPU-only machine. Capacity is not inferred from \
          that count: three large models may exceed host RAM or accelerator memory, while a large \
-         model plus small helpers may fit. Set an explicit value in each Ollama process's service \
-         environment after measuring this machine, then restart that process."
+         model plus small helpers may fit. Under FreeLlama the model memory budget does the \
+         unloading by size and reload cost, so set a count above what the budget can hold in \
+         each Ollama process's service environment, then restart that process."
             .to_owned()
     })
 }
@@ -520,16 +521,20 @@ pub fn local_conservative_config_posture(config: &Value, observed_process: &Valu
     let (context, _) = posture_value(config, observed_process, "OLLAMA_CONTEXT_LENGTH");
     let (flash, _) = posture_value(config, observed_process, "OLLAMA_FLASH_ATTENTION");
     let (kv_cache, _) = posture_value(config, observed_process, "OLLAMA_KV_CACHE_TYPE");
+    let (cache_ram, _) = posture_value(config, observed_process, "LLAMA_ARG_CACHE_RAM");
 
     let no_cloud_status = if matches!(no_cloud.as_deref(), Some("1" | "true" | "TRUE")) {
         "ready"
     } else {
         "action_required"
     };
+    // FreeLlama's model memory budget decides which runners stay resident. Unset and `0` both
+    // resolve to Ollama's 3 per GPU, which unloads by count before the budget is reached; 1
+    // reloads on every switch.
     let max_loaded_status = match max_loaded.as_deref() {
-        Some("1") => "ready",
-        Some(_) => "review",
-        None => "recommended",
+        None | Some("0") => "recommended",
+        Some("1") => "review",
+        Some(_) => "ready",
     };
     let parallel_status = match parallel.as_deref() {
         None | Some("1") => "ready",
@@ -549,6 +554,13 @@ pub fn local_conservative_config_posture(config: &Value, observed_process: &Valu
         None | Some("f16") => "ready",
         Some("q8_0" | "q4_0") => "qualified_only",
         Some(_) => "review",
+    };
+    // Advisory only (not part of `overall`): unset, each llama-server may keep up to 8 GiB of
+    // displaced prompt caches in host RAM, which no footprint estimate counts.
+    let cache_ram_status = if cache_ram.is_some() {
+        "ready"
+    } else {
+        "recommended"
     };
     let overall = if no_cloud_status == "action_required" {
         "action_required"
@@ -574,12 +586,13 @@ pub fn local_conservative_config_posture(config: &Value, observed_process: &Valu
         "scope": "portable local-only starter profile, not a hardware or quality benchmark result",
         "settings": {
             "OLLAMA_NO_CLOUD": rule("OLLAMA_NO_CLOUD", "1", no_cloud_status, "FreeLlama local-only deployments must disable Ollama cloud features."),
-            "OLLAMA_MAX_LOADED_MODELS": rule("OLLAMA_MAX_LOADED_MODELS", "1", max_loaded_status, "Start with one resident model per process; raise only after measured concurrent-fit validation."),
-            "OLLAMA_NUM_PARALLEL": rule("OLLAMA_NUM_PARALLEL", "1", parallel_status, "Raise only after validating the multiplied context/KV memory and tail latency."),
+            "OLLAMA_MAX_LOADED_MODELS": rule("OLLAMA_MAX_LOADED_MODELS", "more than the models the memory budget can hold", max_loaded_status, "FreeLlama's model_memory_budget unloads the cheapest idle runners before a load would pass it. Unset and 0 resolve to 3 per GPU, so Ollama unloads its least recently used runner by count first; 1 reloads on every switch."),
+            "OLLAMA_NUM_PARALLEL": rule("OLLAMA_NUM_PARALLEL", "1", parallel_status, "Each slot holds its own context and prompt cache, so the runner's K/V memory multiplies by it; raise only after validating that memory and tail latency."),
             "OLLAMA_MAX_QUEUE": rule("OLLAMA_MAX_QUEUE", "1-16", queue_status, "Keep Ollama's internal backlog finite; FreeLlama admission is a separate queue."),
-            "OLLAMA_CONTEXT_LENGTH": rule("OLLAMA_CONTEXT_LENGTH", "unset; observe the VRAM-tiered runtime default with /api/ps", context_status, "Use per-request num_ctx for managed work; current upstream pages disagree on a fixed default, so qualify any global override and inspect the loaded runner."),
+            "OLLAMA_CONTEXT_LENGTH": rule("OLLAMA_CONTEXT_LENGTH", "unset; observe the VRAM-tiered runtime default with /api/ps", context_status, "Use per-request num_ctx for managed work; a request at another num_ctx reloads the runner and loses its prompt cache, so keep callers of one model on one context. Qualify any global override and inspect the loaded runner."),
             "OLLAMA_FLASH_ATTENTION": rule("OLLAMA_FLASH_ATTENTION", "auto", flash_status, "Ollama enables it automatically on supported backends; forcing it is not a performance claim."),
-            "OLLAMA_KV_CACHE_TYPE": rule("OLLAMA_KV_CACHE_TYPE", "f16", kv_status, "q8_0/q4_0 are process-wide quality-versus-memory choices and require workload qualification."),
+            "LLAMA_ARG_CACHE_RAM": rule("LLAMA_ARG_CACHE_RAM", "2048 on hosts with 32 GB or less", cache_ram_status, "llama.cpp keeps prompt caches that a new prompt displaced in host RAM, up to 8192 MiB per runner by default, and FreeLlama's memory estimates do not see it. Ollama passes its environment to each llama-server, so setting this on the Ollama server bounds it; 0 disables the cache (later prompts then re-evaluate their prefix)."),
+            "OLLAMA_KV_CACHE_TYPE": rule("OLLAMA_KV_CACHE_TYPE", "f16", kv_status, "q8_0 halves and q4_0 quarters K/V memory (more models fit the memory budget, longer contexts fit a runner) at a quality cost; they are process-wide and need workload qualification."),
         },
         "apply": {
             "mutates_nothing": true,

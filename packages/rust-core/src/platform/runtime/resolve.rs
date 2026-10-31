@@ -160,6 +160,14 @@ pub(super) fn resolve(
         BTreeMap::new(),
         "default"
     );
+    let model_memory_budget = pick!(
+        "model_memory_budget",
+        None::<super::super::budget::MemoryBudget>,
+        reader.checked("FREELLAMA_MODEL_MEMORY_BUDGET", |value| value.parse().ok()),
+        file.model_memory_budget,
+        super::super::budget::MemoryBudget::DEFAULT,
+        "default"
+    );
     let adaptive_concurrency = pick!(
         "adaptive_concurrency",
         None::<AdaptiveMode>,
@@ -248,6 +256,30 @@ pub(super) fn resolve(
         super::super::WarmingPolicy::default(),
         "default"
     );
+    let mut preload = pick!(
+        "preload",
+        None::<super::super::PreloadPolicy>,
+        None::<super::super::PreloadPolicy>,
+        file.preload.clone(),
+        super::super::PreloadPolicy::default(),
+        "default"
+    );
+    if let Some(models) = reader.checked("FREELLAMA_PRELOAD", |value| {
+        let models = value
+            .split(',')
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(|model| super::super::PreloadModel::Tag(model.to_owned()))
+            .collect::<Vec<_>>();
+        (!models.is_empty()).then_some(models)
+    }) {
+        preload.startup = models;
+        sources.insert("preload", "env");
+    }
+    if let Some(predictive) = boolean("FREELLAMA_PREDICTIVE_PRELOAD") {
+        preload.predictive = predictive;
+        sources.insert("preload", "env");
+    }
     macro_rules! env_override {
         ($policy:ident, $field:ident, $name:literal, $parser:expr, $source:literal) => {
             if let Some(value) = $parser($name) {
@@ -352,6 +384,7 @@ pub(super) fn resolve(
         pinned_models,
         evict_idle_models,
         eviction_costs,
+        model_memory_budget,
         adaptive_concurrency,
         task_costs,
         context_mode,
@@ -360,6 +393,7 @@ pub(super) fn resolve(
         usage_queue_capacity,
         scopes,
         warming,
+        preload,
         breaker_failures,
         breaker_cooldown_seconds,
         sources,

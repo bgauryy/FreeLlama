@@ -37,9 +37,13 @@ pub(super) async fn assess(
 ) -> CapacityPreview {
     // Share the execution estimator, including exact digest/context residency and reservations.
     // Observe resources after metadata I/O; everything remains advisory and is rechecked at dispatch.
-    let footprint =
-        model_memory_requirement(state, &decision.execution, &decision.model, &decision.route)
-            .await;
+    let footprint = model_memory_requirement(
+        state,
+        &decision.execution,
+        &decision.model,
+        super::execution::requested_context(&decision.route),
+    )
+    .await;
     let resources = state.resources.snapshot().await;
     let required = footprint["required_available_bytes"].as_u64().unwrap_or(0);
     let demand = if required == 0 && footprint["source"] == "matching_resident_context" {

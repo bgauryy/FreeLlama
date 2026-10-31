@@ -105,14 +105,13 @@ describe("bounded Ollama library fetch and cache", () => {
     expect((await new OllamaLibraryClient({ fetch: abortingFetch, timeoutMs: 5 }).lookup("gemma3:1b")).status).toBe("unavailable");
   });
 
-  it("caps received bytes even without Content-Length and labels README truncation", async () => {
+  it("refuses an oversized page even without Content-Length and returns a README whole", async () => {
     const oversized = mockFetch("x".repeat(2 * 1024 * 1024 + 1));
     expect((await new OllamaLibraryClient({ fetch: oversized }).lookup("gemma3:1b")).status).toBe("unavailable");
     const largeCard = `<meta name="description" content="Coding"><textarea id="editor">${"x".repeat(70_000)}</textarea>`;
     const record = await new OllamaLibraryClient({ fetch: mockFetch(largeCard) }).lookup("gemma3:1b");
-    expect(record.readmeTruncated).toBe(true);
-    expect(record.card!.readme).toHaveLength(65_536);
-    expect(publicModelGuidance(record, undefined, true)).toMatchObject({ readme: { truncated: true } });
+    expect(record.card!.readme).toHaveLength(70_000);
+    expect(publicModelGuidance(record, undefined, true)).toMatchObject({ readme: { text: "x".repeat(70_000) } });
   });
 });
 
@@ -190,9 +189,9 @@ describe("supported features and advertised uses", () => {
     }
   });
 
-  it("returns full bounded README text only on request, with sourced usage notes", async () => {
+  it("returns the full README text only on request, with sourced usage notes", async () => {
     const knowledge = modelKnowledge("gemma3:1b", { digest, capabilities: ["completion"] }, await fixtureRecord(), true);
-    expect(knowledge.library).toMatchObject({ readme: { text: expect.stringContaining("Requires Ollama 0.6"), format: "markdown", truncated: false },
+    expect(knowledge.library).toMatchObject({ readme: { text: expect.stringContaining("Requires Ollama 0.6"), format: "markdown" },
       usageNotes: expect.arrayContaining([expect.objectContaining({ text: "Requires Ollama 0.6 or later.", scope: "family" })]) });
   });
 

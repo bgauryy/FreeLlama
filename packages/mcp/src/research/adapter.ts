@@ -3,6 +3,7 @@
 import type { Action } from "./actions.js";
 import type { AgentRuntimeConfig, Env } from "./context-policy.js";
 import type { ObservationStore } from "./observations.js";
+import type { ProgressEmitter } from "./progress-events.js";
 import type { resolveModelIdentity } from "./transport.js";
 
 export type { Action };
@@ -44,6 +45,8 @@ export interface AdapterHooks {
   runTool?: (args: Record<string, unknown>) => string | Promise<string>;
   observationStore?: (pageSize: number) => ObservationStore;
   print?: (line: string) => void;
+  /** Receives each progress event; defaults to the stderr line emitter when the env asks for one. */
+  progress?: ProgressEmitter;
 }
 
 /** The page action shape: a positive integer (`true` counts as 1). */

@@ -428,7 +428,13 @@ fn sample_macos() -> HostResources {
             "kern.memorystatus_vm_pressure_level",
         ],
     );
-    let therm = bounded_command("/usr/bin/pmset", &["-g", "therm"]);
+    // `pmset -g therm` reports nothing on Apple silicon (see `apply_thermal_pressure`), so the
+    // spawn is skipped there and the notifyutil level is the thermal signal.
+    let therm = if cfg!(target_arch = "aarch64") {
+        Some(String::new())
+    } else {
+        bounded_command("/usr/bin/pmset", &["-g", "therm"])
+    };
     let pressure = bounded_command(
         "/usr/bin/notifyutil",
         &["-g", "com.apple.system.thermalpressurelevel"],

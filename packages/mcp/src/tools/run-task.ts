@@ -2,12 +2,15 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as z from "zod";
 import { DEFAULT_SERVE_ENDPOINT } from "../config.js";
-import { route, runTaskBatchRequest, runTaskRequest, warmModelRequest } from "../serve-client.js";
+import { cancelTaskJob, getTaskJob, route, runTaskBatchRequest, runTaskRequest, warmModelRequest } from "../serve-client.js";
 import { withBatchTelemetry, withTaskTelemetry } from "../telemetry.js";
+import { runWithJobProgress } from "../job-progress.js";
+import { progressSink, type ToolExtra } from "../progress.js";
+import { ensureServe } from "../serve.js";
 import {
   BATCH_TASK_FIELDS, batchItemParam, canonicalTaskKind, endpointParam, errorResult, executionPreferenceParam,
   isStructuredSuccess, localToolsParam, messagesParam, minConfidenceParam, minPlacementEvidenceParam, objectiveParam,
-  parsedResult, requiredCapabilitiesParam, structuredResult, summarizeEmbeddings, systemPromptParam, taskMessages,
+  parsedResult, requiredCapabilitiesParam, summarizeEmbeddings, systemPromptParam, taskAnswerText, taskMessages,
   taskParam, withRequiredCapability,
 } from "../helpers.js";
 
@@ -107,9 +110,10 @@ export function registerRunTaskTool(server: McpServer): void {
       description:
         "Use when: offloading caller-supplied work (chat, small tasks, code, tool calls, OCR/vision, embeddings) to a local model. " +
         "Modes: single (`prompt`/`messages`, or `input` for embedding); `tasks` = up to 64 independent items, ordered results, `maxParallelism` caps dispatch; " +
-        "`preview:true` decides only; `warm:true` preloads `model`. " +
+        "`preview:true` decides only; `warm:true` preloads `model`, caching `systemPrompt`/`messages` as a prompt prefix. " +
         "Images: base64 `images` + the model's own prompt; `stopOnRepetition` ends a looping answer early, keeping its text. " +
         "Do not use when: it needs file access (pass content, or delegate_research) or high-stakes judgment. " +
+        "With a client progressToken, a single task reports queue, memory, load and run phases as progress. " +
         "Returns: answer text; receipts in structuredContent.",
       inputSchema: z.object({
         endpoint: endpointParam,
@@ -147,7 +151,7 @@ export function registerRunTaskTool(server: McpServer): void {
         options: z
           .record(z.string(), z.unknown())
           .optional()
-          .describe("num_ctx/contextTokens and num_gpu/placement are routing-owned; num_predict caps output."),
+          .describe("num_ctx/num_gpu are routing-owned; num_predict caps output (unset: no cap)."),
         logprobs: z.boolean().optional(),
         topLogprobs: z.number().int().nonnegative().optional(),
         minConfidence: minConfidenceParam,
@@ -157,7 +161,11 @@ export function registerRunTaskTool(server: McpServer): void {
         stopOnRepetition: z
           .boolean()
           .optional()
-          .describe("Stream and stop once output repeats itself (a loop to num_predict); keeps all generated text"),
+          .describe("Stop a repeating loop, keeping its text; default on without num_predict"),
+        receipt: z
+          .enum(["compact", "full"])
+          .optional()
+          .describe("compact (default): whole answer + key fields; full receipt at response_file. full: all inline"),
         defer: z.boolean().optional(),
         returnEmbeddings: z.boolean().optional(),
         preview: z
@@ -216,7 +224,7 @@ export function registerRunTaskTool(server: McpServer): void {
       warm,
       tasks,
       maxParallelism,
-    }) => {
+    }, extra?: ToolExtra) => {
       try {
         const singleFields = {
           task, objective, model, sessionId, scopeId, scopeRevision, contextTokens, executionPreference,
@@ -239,15 +247,17 @@ export function registerRunTaskTool(server: McpServer): void {
         if (maxParallelism !== undefined) return errorResult(new Error("`maxParallelism` is valid only with `tasks`."));
         if (warm) {
           const allowed = new Set(["warm", "model", "task", "contextTokens", "executionPreference", "minPlacementEvidence",
-            "priority", "keepAlive", "maxWaitSeconds", "timeoutSeconds", "defer"]);
+            "priority", "keepAlive", "maxWaitSeconds", "timeoutSeconds", "defer", "systemPrompt", "messages"]);
           const stray = Object.entries(singleFields)
             .filter(([name, value]) => value !== undefined && !allowed.has(name))
             .map(([name]) => `\`${name}\``);
           if (stray.length > 0) return errorResult(new Error(`\`warm:true\` loads a model without generation; remove ${stray.join(", ")}.`));
           if (model === undefined) return errorResult(new Error("`warm:true` requires an exact installed `model`."));
-          if (task === "embedding") return errorResult(new Error("`warm:true` supports chat models; embedding warming is unsupported."));
+          // A system prompt or messages are evaluated into the runner's prompt cache while it loads.
+          const prefix = taskMessages({ systemPrompt, messages });
           return parsedResult(await warmModelRequest(endpoint, {
             model, task: task === undefined ? undefined : canonicalTaskKind(task), context_tokens: contextTokens,
+            messages: prefix.length === 0 ? undefined : prefix,
             execution_preference: executionPreference, min_placement_evidence: minPlacementEvidence,
             priority, keep_alive: keepAlive, max_wait_seconds: maxWaitSeconds, timeout_seconds: timeoutSeconds, defer,
           }));
@@ -312,45 +322,59 @@ export function registerRunTaskTool(server: McpServer): void {
           );
           if (!isStructuredSuccess(decision)) return decision;
         }
-        const result = parsedResult(
-          await runTaskRequest(endpoint ?? DEFAULT_SERVE_ENDPOINT, {
-            task: scopeId !== undefined && task === undefined ? undefined : canonicalTask,
-            objective: objective ?? (scopeId === undefined ? "balanced" : undefined),
-            model,
-            session_id: sessionId,
-            scope_id: scopeId,
-            scope_revision: scopeRevision,
-            context_tokens: contextTokens,
-            required_capabilities: effectiveRequiredCapabilities,
-            prompt,
-            images,
-            messages: taskMessages({ systemPrompt, messages, prompt, images }),
-            input,
-            tools,
-            keep_alive: keepAlive,
-            min_confidence: minConfidence,
-            priority: priority ?? "normal",
-            max_wait_seconds: maxWaitSeconds,
-            timeout_seconds: timeoutSeconds,
-            stop_on_repetition: stopOnRepetition,
-            defer: defer ?? false,
-            execution_preference: executionPreference,
-            min_placement_evidence: minPlacementEvidence,
-            request_options: {
-              format,
-              think,
-              options,
-              logprobs,
-              top_logprobs: topLogprobs,
-            },
-          }),
-        );
+        const request = {
+          task: scopeId !== undefined && task === undefined ? undefined : canonicalTask,
+          objective: objective ?? (scopeId === undefined ? "balanced" : undefined),
+          model,
+          session_id: sessionId,
+          scope_id: scopeId,
+          scope_revision: scopeRevision,
+          context_tokens: contextTokens,
+          required_capabilities: effectiveRequiredCapabilities,
+          prompt,
+          images,
+          messages: taskMessages({ systemPrompt, messages, prompt, images }),
+          input,
+          tools,
+          keep_alive: keepAlive,
+          min_confidence: minConfidence,
+          priority: priority ?? "normal",
+          max_wait_seconds: maxWaitSeconds,
+          timeout_seconds: timeoutSeconds,
+          stop_on_repetition: stopOnRepetition,
+          defer: defer ?? false,
+          execution_preference: executionPreference,
+          min_placement_evidence: minPlacementEvidence,
+          request_options: {
+            format,
+            think,
+            options,
+            logprobs,
+            top_logprobs: topLogprobs,
+          },
+        };
+        const target = endpoint ?? DEFAULT_SERVE_ENDPOINT;
+        const synchronous = () => runTaskRequest(target, request);
+        // A progressToken asks for phases: the same task runs as a job whose status is reported.
+        const report = defer ? undefined : progressSink(extra);
+        // A serve this server is still starting reports its phases too.
+        if (report) await ensureServe(endpoint, { signal: extra?.signal, report });
+        const result = parsedResult(report
+          ? await runWithJobProgress({
+            submit: () => runTaskRequest(target, { ...request, defer: true }),
+            get: (id) => getTaskJob(target, id),
+            cancel: (id) => cancelTaskJob(target, id),
+            sync: synchronous,
+          }, report, extra?.signal)
+          : await synchronous());
         if (isStructuredSuccess(result) && result.structuredContent.deferred === true) return result;
-        if (!returnEmbeddings && isStructuredSuccess(result)) {
-          const trimmed = summarizeEmbeddings(result.structuredContent);
-          if (trimmed) return withTaskTelemetry(structuredResult(trimmed));
+        const finished = withTaskTelemetry(result);
+        // The vectors stay in the saved response; the inline result and its text omit them.
+        if (!returnEmbeddings && isStructuredSuccess(finished)) {
+          const trimmed = summarizeEmbeddings(finished.structuredContent);
+          if (trimmed) return { ...finished, content: [{ type: "text" as const, text: taskAnswerText(trimmed) ?? "" }] };
         }
-        return withTaskTelemetry(result);
+        return finished;
       } catch (error) {
         return errorResult(error);
       }

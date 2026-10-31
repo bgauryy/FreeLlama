@@ -75,12 +75,15 @@ pub(super) struct WarmInput {
     max_wait_seconds: Option<u64>,
     timeout_seconds: Option<u64>,
     defer: Option<bool>,
+    /// Chat messages to evaluate into the runner's prompt cache while loading, such as a long
+    /// system prompt: later requests that start with the same messages skip evaluating them.
+    messages: Option<Vec<Value>>,
 }
 impl WarmInput {
     fn into_task(self) -> Result<TaskInput, ApiError> {
-        if self.model.trim().is_empty() || self.task == Some(TaskKind::Embedding) {
+        if self.model.trim().is_empty() {
             return Err(ApiError::bad_request(
-                "warm requires an installed model tag and a non-embedding task",
+                "warm requires an installed model tag",
             ));
         }
         let mut value = serde_json::to_value(self).expect("warm request serializes");
@@ -93,12 +96,106 @@ impl WarmInput {
         Ok(input)
     }
 }
+/// A background-able warm of `model`, as the preloader runs it.
+pub(super) fn preload_task(
+    model: String,
+    context_tokens: Option<u64>,
+    keep_alive: Option<String>,
+    messages: Vec<Value>,
+    priority: super::TaskPriority,
+) -> Result<TaskInput, ApiError> {
+    WarmInput {
+        model,
+        task: None,
+        context_tokens,
+        execution_preference: None,
+        min_placement_evidence: None,
+        priority: Some(priority),
+        keep_alive,
+        max_wait_seconds: None,
+        timeout_seconds: None,
+        defer: None,
+        messages: (!messages.is_empty()).then_some(messages),
+    }
+    .into_task()
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct UnloadInput {
+    model: String,
+    max_wait_seconds: Option<u64>,
+}
+
+/// Unload a resident model once the tasks using it finish. Unlike `warm` with `keep_alive: 0`,
+/// a model that is not resident is reported, never loaded first.
+pub(super) async fn unload(
+    State(state): State<PlatformState>,
+    input: Result<Json<UnloadInput>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Json(input) = input.map_err(|error| ApiError::invalid_task_request(&error))?;
+    let model = input.model.trim();
+    if model.is_empty() {
+        return Err(ApiError::bad_request("unload requires a model tag"));
+    }
+    let wait = input.max_wait_seconds.map_or_else(
+        || state.tunables().max_queue_wait(),
+        |seconds| Duration::from_secs(seconds.max(1)),
+    );
+    Ok(Json(
+        execution::unload_resident_model(&state, model, wait)
+            .await?
+            .unwrap_or_else(|| {
+                json!({
+                    "model": model,
+                    "backend": execution::execution_target_name(&state, model),
+                    "unloaded": false,
+                    "status": "not_resident",
+                })
+            }),
+    ))
+}
+
 pub(super) async fn warm(
     State(state): State<PlatformState>,
+    caller: Option<axum::Extension<crate::proxy::Caller>>,
     input: Result<Json<WarmInput>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Response, ApiError> {
     let Json(input) = input.map_err(|error| ApiError::invalid_task_request(&error))?;
-    let input = input.into_task()?;
+    let mut input = input;
+    let unload = execution::requests_immediate_unload(input.keep_alive.as_deref())
+        && input.messages.as_ref().is_none_or(Vec::is_empty)
+        && input.defer != Some(true);
+    // `keep_alive: 0` on a resident model with nothing to evaluate is an unload, not a load: it
+    // needs no task, route or eligibility, only the model's name. A model that is not resident
+    // keeps the documented observe-then-unload probe below.
+    if unload && !input.model.trim().is_empty() {
+        let wait = input.max_wait_seconds.map_or_else(
+            || state.tunables().max_queue_wait(),
+            |seconds| Duration::from_secs(seconds.max(1)),
+        );
+        if let Some(receipt) =
+            execution::unload_resident_model(&state, input.model.trim(), wait).await?
+        {
+            return Ok(Json(receipt).into_response());
+        }
+    }
+    // Without a task, warm the model as what it is: an embedding-only model as an embedding task
+    // rather than refusing it as ineligible for completion.
+    if input.task.is_none()
+        && let Ok(models) = super::catalog::discover_models(&state).await
+        && let Some(model) = models.iter().find(|model| model.name == input.model.trim())
+        && model
+            .capabilities
+            .contains(&crate::capability::Capability::Embedding)
+        && !model
+            .capabilities
+            .contains(&crate::capability::Capability::Completion)
+    {
+        input.task = Some(TaskKind::Embedding);
+    }
+    let mut input = input.into_task()?;
+    input.client = caller.map(|axum::Extension(caller)| caller.0.to_string());
     if input.defer {
         return super::jobs::submit(state, input)
             .await
@@ -124,7 +221,7 @@ pub(super) async fn keep_alive(
         let receipt = json!({"mode":"explicit","value":wire,"reason":"caller_override","finite":!value.trim_start().starts_with('-'),"physical_placement":"reported_separately_in_execution_observation"});
         return (wire, receipt);
     }
-    let policy = state.tunables().warming;
+    let policy = state.tunables().warming.clone();
     let usage = state.activity.usage(backend, model);
     let pressure = state.resources.snapshot().await;
     let seconds = policy.duration(usage, pressure.holding);

@@ -83,7 +83,11 @@ impl AdmissionPermit {
 
 impl Drop for AdmissionPermit {
     fn drop(&mut self) {
-        let mut state = self.pool.state.lock().expect("admission state poisoned");
+        let mut state = self
+            .pool
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.active = state.active.saturating_sub(self.cost);
         state.in_flight = state.in_flight.saturating_sub(1);
         state.released = state.released.saturating_add(1);
@@ -119,7 +123,10 @@ impl ResourceWaitGuard {
         let pool = self.pool.clone();
         let queued = Instant::now();
         {
-            let mut state = pool.state.lock().expect("admission state poisoned");
+            let mut state = pool
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             state
                 .resource_waiting
                 .retain(|(ticket, _)| *ticket != self.ticket);
@@ -146,7 +153,11 @@ impl ResourceWaitGuard {
 
 impl Drop for ResourceWaitGuard {
     fn drop(&mut self) {
-        let mut state = self.pool.state.lock().expect("admission state poisoned");
+        let mut state = self
+            .pool
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state
             .resource_waiting
             .retain(|(ticket, _)| *ticket != self.ticket);
@@ -160,7 +171,11 @@ impl Drop for ResourceWaitGuard {
 
 impl Drop for AdmissionWaitGuard {
     fn drop(&mut self) {
-        let mut state = self.pool.state.lock().expect("admission state poisoned");
+        let mut state = self
+            .pool
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let before = state.waiting.len();
         state.waiting.retain(|waiter| waiter.ticket != self.ticket);
         if state.granted == Some(self.ticket) {
@@ -196,19 +211,28 @@ pub(super) const fn priority_index(priority: TaskPriority) -> usize {
 impl AdmissionPool {
     /// Current capacity in units (the adaptive limit, at most the configured ceiling).
     pub(super) fn total(&self) -> usize {
-        self.state.lock().expect("admission state poisoned").limit
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .limit
     }
 
     /// Configured maximum capacity.
     pub(super) fn ceiling(&self) -> usize {
-        self.state.lock().expect("admission state poisoned").ceiling
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .ceiling
     }
 
     /// Change the configured maximum. The current limit follows it down, and follows it up only
     /// when it was already at the old ceiling (an adaptive reduction stays in force).
     pub(super) fn set_ceiling(&self, ceiling: usize) {
         let ceiling = ceiling.max(1);
-        let mut state = self.state.lock().expect("admission state poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let previous = (state.limit, state.ceiling);
         if state.limit >= state.ceiling || state.limit > ceiling {
             state.limit = ceiling;
@@ -223,7 +247,10 @@ impl AdmissionPool {
 
     /// Set the current limit within `1..=ceiling`; returns the value applied.
     pub(super) fn set_limit(&self, limit: usize) -> usize {
-        let mut state = self.state.lock().expect("admission state poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let next = limit.clamp(1, state.ceiling);
         if next != state.limit {
             state.policy_epoch = state.policy_epoch.wrapping_add(1);
@@ -238,7 +265,7 @@ impl AdmissionPool {
     pub(super) fn set_max_waiters(&self, max_waiters: usize) {
         self.state
             .lock()
-            .expect("admission state poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .max_waiters = max_waiters.max(1);
     }
 
@@ -246,12 +273,15 @@ impl AdmissionPool {
     pub(super) fn queue_depth(&self) -> usize {
         self.state
             .lock()
-            .expect("admission state poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .queue_depth()
     }
 
     pub(super) fn register_resource_waiter(&self) -> Result<ResourceWaitGuard, AdmissionFailure> {
-        let mut state = self.state.lock().expect("admission state poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.queue_depth() >= state.max_waiters {
             state.queue_full_rejections = state.queue_full_rejections.saturating_add(1);
             return Err(AdmissionFailure::QueueFull);
@@ -267,7 +297,10 @@ impl AdmissionPool {
     }
 
     pub(super) fn record_transition_timeout(&self) {
-        let mut state = self.state.lock().expect("admission state poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.transition_timeouts = state.transition_timeouts.saturating_add(1);
     }
 
@@ -297,11 +330,17 @@ impl AdmissionPool {
     }
 
     pub(super) fn available(&self) -> usize {
-        self.state.lock().expect("admission state poisoned").free()
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .free()
     }
 
     pub(super) fn receipt(&self) -> Value {
-        let state = self.state.lock().expect("admission state poisoned");
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         json!({
             "slots_total": state.limit,
             "slots_ceiling": state.ceiling,
@@ -387,7 +426,10 @@ impl AdmissionPool {
     ) -> Result<(AdmissionPermit, u128), AdmissionFailure> {
         let queued = Instant::now();
         let ticket = {
-            let mut state = self.state.lock().expect("admission state poisoned");
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if tokio::time::Instant::now() >= deadline {
                 state.queue_timeouts = state.queue_timeouts.saturating_add(1);
                 return Err(AdmissionFailure::TimedOut);
@@ -429,7 +471,10 @@ impl AdmissionPool {
             tokio::pin!(changed);
             changed.as_mut().enable();
             let (acquired, selected, units) = {
-                let mut state = self.state.lock().expect("admission state poisoned");
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if tokio::time::Instant::now() >= deadline {
                     state.queue_timeouts = state.queue_timeouts.saturating_add(1);
                     registration.count_cancellation = false;
@@ -482,7 +527,10 @@ impl AdmissionPool {
                 self.changed.notify_waiters();
             }
             if tokio::time::timeout_at(deadline, changed).await.is_err() {
-                let mut state = self.state.lock().expect("admission state poisoned");
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 state.queue_timeouts = state.queue_timeouts.saturating_add(1);
                 drop(state);
                 registration.count_cancellation = false;

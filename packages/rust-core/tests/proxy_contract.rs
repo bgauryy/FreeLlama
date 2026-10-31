@@ -702,3 +702,185 @@ async fn raw_queue_wait_admits_a_waiter_when_the_stream_ends() {
     assert_eq!(waiter.await.unwrap(), StatusCode::OK);
     assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
+
+#[tokio::test]
+async fn a_swapping_hold_spares_raw_requests_for_a_resident_model() {
+    use freellama::platform::resources::{
+        HostResources, LowMemoryMode, ResourceGovernor, ResourcePolicy,
+    };
+    // Loading a large model leaves the host swapping. Requests for that loaded model must keep
+    // running; a cold model, or the loaded one at another context size, waits for recovery.
+    let upstream = Router::new()
+        .route(
+            "/api/ps",
+            any(|| async {
+                axum::Json(serde_json::json!({"models":[{"name":"warm:1b","context_length":4096}]}))
+            }),
+        )
+        .route("/api/chat", any(|| async { "{}" }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+    let swap = Arc::new(AtomicUsize::new(100));
+    let governor = ResourceGovernor::with_sampler(
+        ResourcePolicy {
+            low_memory: LowMemoryMode::Advisory,
+            sample_interval: Duration::from_millis(5),
+            ..ResourcePolicy::default()
+        },
+        move || HostResources {
+            source: "swapping_fixture".into(),
+            total_memory_bytes: Some(32 << 30),
+            available_memory_bytes: Some(3 << 30),
+            swap_out_pages: Some(swap.fetch_add(1000, Ordering::AcqRel) as u64),
+            ..HostResources::default()
+        },
+    )
+    .unwrap();
+    governor.snapshot().await;
+    governor.invalidate().await;
+    assert!(governor.snapshot().await.holding, "fixture must hold");
+    let proxy = app(
+        crate::support::proxy_config("127.0.0.1:0", format!("http://{addr}"), false)
+            .with_resource_governor(governor),
+    )
+    .unwrap();
+    let chat = |body: &'static str| {
+        let proxy = proxy.clone();
+        async move {
+            proxy
+                .oneshot(Request::post("/api/chat").body(Body::from(body)).unwrap())
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+    assert_eq!(chat(r#"{"model":"warm:1b"}"#).await, StatusCode::OK);
+    assert_eq!(
+        chat(r#"{"model":"warm:1b","options":{"num_ctx":4096}}"#).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        chat(r#"{"model":"cold:1b"}"#).await,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        chat(r#"{"model":"warm:1b","options":{"num_ctx":8192}}"#).await,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+}
+
+/// Records what the proxy asks of the platform for raw generations.
+#[derive(Default)]
+struct RecordingHooks {
+    prepared: std::sync::Mutex<Vec<(String, Option<u64>)>>,
+    begun: AtomicUsize,
+    served: std::sync::Mutex<Vec<(String, bool)>>,
+    unloaded: std::sync::Mutex<Vec<String>>,
+}
+
+impl freellama::proxy::RawModelHooks for RecordingHooks {
+    fn prepare<'a>(
+        &'a self,
+        model: &'a str,
+        context: Option<u64>,
+    ) -> freellama::proxy::HookFuture<'a> {
+        self.prepared
+            .lock()
+            .unwrap()
+            .push((model.to_owned(), context));
+        Box::pin(async {})
+    }
+
+    fn begin(&self, _model: &str) -> Box<dyn Send> {
+        self.begun.fetch_add(1, Ordering::SeqCst);
+        Box::new(())
+    }
+
+    fn served(&self, model: &str, loaded: bool) {
+        self.served.lock().unwrap().push((model.to_owned(), loaded));
+    }
+
+    fn unloaded(&self, model: &str) {
+        self.unloaded.lock().unwrap().push(model.to_owned());
+    }
+}
+
+#[tokio::test]
+async fn raw_generations_tell_the_platform_which_model_they_load_and_use() {
+    let upstream = Router::new()
+        .route(
+            "/api/ps",
+            any(|| async {
+                axum::Json(serde_json::json!({"models":[
+                    {"name":"warm:1b","context_length":4096},
+                    {"name":"plain:latest","context_length":4096}
+                ]}))
+            }),
+        )
+        .route("/api/chat", any(|| async { "{}" }))
+        .route("/api/generate", any(|| async { "{}" }))
+        .route("/api/tags", any(|| async { "{\"models\":[]}" }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+    let hooks = Arc::new(RecordingHooks::default());
+    let proxy = app(
+        crate::support::proxy_config("127.0.0.1:0", format!("http://{addr}"), false)
+            .with_hooks(hooks.clone()),
+    )
+    .unwrap();
+    for body in [
+        r#"{"model":"warm:1b"}"#,
+        r#"{"model":"cold:1b","options":{"num_ctx":8192}}"#,
+        r#"{"model":"warm:1b","options":{"num_ctx":8192}}"#,
+        // A bare name means `:latest` to Ollama, never a family's only other tag.
+        r#"{"model":"plain"}"#,
+        r#"{"model":"warm"}"#,
+    ] {
+        let response = proxy
+            .clone()
+            .oneshot(Request::post("/api/chat").body(Body::from(body)).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    }
+    // Metadata reads name no model to load.
+    let tags = proxy
+        .clone()
+        .oneshot(Request::get("/api/tags").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(tags.status(), StatusCode::OK);
+    let unload = proxy
+        .oneshot(
+            Request::post("/api/generate")
+                .body(Body::from(r#"{"model":"warm:1b","keep_alive":0}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unload.status(), StatusCode::OK);
+    assert_eq!(*hooks.unloaded.lock().unwrap(), vec!["warm:1b"]);
+    // Only loads make room: a cold model, or a resident one at another context size.
+    assert_eq!(
+        *hooks.prepared.lock().unwrap(),
+        vec![
+            ("cold:1b".to_owned(), Some(8192)),
+            ("warm:1b".to_owned(), Some(8192)),
+            ("warm:latest".to_owned(), None)
+        ]
+    );
+    assert_eq!(hooks.begun.load(Ordering::SeqCst), 5);
+    assert_eq!(
+        *hooks.served.lock().unwrap(),
+        vec![
+            ("warm:1b".to_owned(), false),
+            ("cold:1b".to_owned(), true),
+            ("warm:1b".to_owned(), true),
+            ("plain:latest".to_owned(), false),
+            ("warm:latest".to_owned(), true)
+        ]
+    );
+}

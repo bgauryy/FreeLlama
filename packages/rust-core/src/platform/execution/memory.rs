@@ -7,17 +7,22 @@ use serde_json::{Value, json};
 
 use super::super::error::{ApiError, resource_error};
 use super::super::{
-    Backend, CatalogModel, PlatformState, RouteDecision, get_json, host_has_unified_memory,
+    Backend, CatalogModel, PlatformState, RouteDecision, budget, get_json, host_has_unified_memory,
     host_total_memory_bytes, residency, resources,
 };
 use super::observe::request_unload;
 use super::{ExecutionTarget, model_is_resident, resident_entry};
 
+/// The context size a route asks the runner for; 0 when it leaves the size to Ollama.
+pub(crate) fn requested_context(decision: &RouteDecision) -> u64 {
+    decision.options["num_ctx"].as_u64().unwrap_or(0)
+}
+
 pub(crate) async fn model_memory_requirement(
     state: &PlatformState,
     execution: &ExecutionTarget,
     model: &CatalogModel,
-    decision: &RouteDecision,
+    context: u64,
 ) -> Value {
     let loopback = crate::net::is_loopback_url(&execution.upstream);
     let host_relevant = host_memory_relevant(&execution.upstream, execution.placement);
@@ -30,7 +35,6 @@ pub(crate) async fn model_memory_requirement(
     } else {
         None
     };
-    let context = decision.options["num_ctx"].as_u64().unwrap_or(0);
     let mut footprint = state.footprints.lock().await.requirement(
         &execution.upstream,
         model,
@@ -67,8 +71,10 @@ fn apply_discrete_gpu_budget(
     }
 }
 
-/// Size the load for `model` and, when it would not fit, unload idle runners first. Returns the
-/// footprint (re-measured after any unload) and the eviction receipts.
+/// Size the load for `model` at `context` and, when it would not fit, unload idle runners first.
+/// Three limits can each ask for room, in this order: a discrete GPU's free VRAM, the model memory
+/// budget, and host memory pressure. Returns the footprint (re-measured after any unload) and the
+/// eviction receipts. Raw passthrough loads use the same path.
 ///
 /// Runs once per task, after it has a slot and before the resource timeouts start. It must not run
 /// inside the 2-second slot-held reservation attempt: cancelling a multi-second unload halfway
@@ -78,11 +84,11 @@ pub(crate) async fn make_room(
     state: &PlatformState,
     execution: &ExecutionTarget,
     model: &CatalogModel,
-    decision: &RouteDecision,
+    context: u64,
     deadline: tokio::time::Instant,
 ) -> (Value, Vec<Value>) {
     let mut evictions = Vec::new();
-    let mut footprint = model_memory_requirement(state, execution, model, decision).await;
+    let mut footprint = model_memory_requirement(state, execution, model, context).await;
     if !state.tunables().evict_idle_models {
         return (footprint, evictions);
     }
@@ -94,7 +100,7 @@ pub(crate) async fn make_room(
         footprint["gpu_memory_free_bytes"].as_u64(),
     ) {
         // A resident copy at a smaller context is replaced, so its VRAM comes back too.
-        let own = resident_entry(&state.client, &execution.upstream, &decision.selected_model)
+        let own = resident_entry(&state.client, &execution.upstream, &model.name)
             .await
             .and_then(|entry| entry["size_vram"].as_u64())
             .unwrap_or(0);
@@ -113,16 +119,23 @@ pub(crate) async fn make_room(
             && let Some(receipt) = evict_detached(
                 state,
                 execution,
-                &decision.selected_model,
+                &model.name,
                 residency::Freed::Vram,
                 shortfall,
                 deadline,
+                "gpu_memory",
             )
             .await
         {
             evictions.push(receipt);
-            footprint = model_memory_requirement(state, execution, model, decision).await;
+            footprint = model_memory_requirement(state, execution, model, context).await;
         }
+    }
+    if let Some(receipt) =
+        keep_within_budget(state, execution, &model.name, &footprint, deadline).await
+    {
+        evictions.push(receipt);
+        footprint = model_memory_requirement(state, execution, model, context).await;
     }
     let bytes = footprint["required_available_bytes"].as_u64().unwrap_or(0);
     if bytes > 0 {
@@ -158,19 +171,59 @@ pub(crate) async fn make_room(
             if let Some(receipt) = evict_detached(
                 state,
                 execution,
-                &decision.selected_model,
+                &model.name,
                 freed,
                 shortfall,
                 deadline,
+                "host_memory",
             )
             .await
             {
                 evictions.push(receipt);
-                footprint = model_memory_requirement(state, execution, model, decision).await;
+                footprint = model_memory_requirement(state, execution, model, context).await;
             }
         }
     }
     (footprint, evictions)
+}
+
+/// Unload idle runners so that loading `keep` leaves the backend's resident total within the model
+/// memory budget. Applies where the runners hold host memory (a CPU backend or unified memory);
+/// a load already resident at a compatible context needs nothing.
+async fn keep_within_budget(
+    state: &PlatformState,
+    execution: &ExecutionTarget,
+    keep: &str,
+    footprint: &Value,
+    deadline: tokio::time::Instant,
+) -> Option<Value> {
+    let load = footprint["required_available_bytes"].as_u64().unwrap_or(0);
+    if load == 0 || !host_memory_relevant(&execution.upstream, execution.placement) {
+        return None;
+    }
+    let budget = state
+        .tunables()
+        .model_memory_budget
+        .bytes(host_total_memory_bytes())?;
+    let ps = get_json(&state.client, &execution.upstream, "/api/ps")
+        .await
+        .ok()?;
+    let over = budget::overage(budget, budget::resident_bytes(&ps, keep), load);
+    if over == 0 {
+        return None;
+    }
+    let mut receipt = evict_detached(
+        state,
+        execution,
+        keep,
+        residency::Freed::Total,
+        over,
+        deadline,
+        "model_memory_budget",
+    )
+    .await?;
+    receipt["budget_bytes"] = json!(budget);
+    Some(receipt)
 }
 
 /// Run an eviction that a deadline can stop waiting for but never cancel halfway: the unloads,
@@ -182,10 +235,11 @@ async fn evict_detached(
     freed: residency::Freed,
     shortfall: u64,
     deadline: tokio::time::Instant,
+    trigger: &'static str,
 ) -> Option<Value> {
     let (state, execution, keep) = (state.clone(), execution.clone(), keep.to_owned());
     let eviction = tokio::spawn(async move {
-        evict_idle_models(&state, &execution, &keep, freed, shortfall).await
+        evict_idle_models(&state, &execution, &keep, freed, shortfall, trigger).await
     });
     tokio::time::timeout_at(deadline, eviction)
         .await
@@ -204,7 +258,9 @@ pub(crate) async fn reserve_task_resources(
 ) -> Result<(resources::ResourcePermit, Value), ApiError> {
     let footprint = match sized {
         Some(footprint) => footprint,
-        None => model_memory_requirement(state, execution, model, decision).await,
+        None => {
+            model_memory_requirement(state, execution, model, requested_context(decision)).await
+        }
     };
     let bytes = footprint["required_available_bytes"]
         .as_u64()
@@ -255,6 +311,7 @@ pub(crate) async fn evict_idle_models(
     keep: &str,
     freed: residency::Freed,
     shortfall: u64,
+    trigger: &'static str,
 ) -> Option<Value> {
     let ps = get_json(&state.client, &execution.upstream, "/api/ps")
         .await
@@ -280,9 +337,51 @@ pub(crate) async fn evict_idle_models(
             shortfall,
         },
     );
+    if plan.victims.is_empty() {
+        return None;
+    }
+    let (evicted, claimed, unload_ms) =
+        unload_victims(state, execution, &plan.victims, trigger).await;
+    state
+        .telemetry
+        .record_evictions(execution.placement.as_str(), evicted.len());
+    if !evicted.is_empty() {
+        // The cached sample predates the unload; the next capacity check must re-read.
+        state.resources.invalidate().await;
+    }
+    let mut receipt = plan.receipt();
+    receipt["backend"] = json!(execution.placement);
+    receipt["for_model"] = json!(keep);
+    receipt["trigger"] = json!(trigger);
+    receipt["unload_ms"] = json!(unload_ms);
+    receipt["memory"] = json!(match freed {
+        residency::Freed::Total => "host",
+        residency::Freed::Vram => "vram",
+        residency::Freed::HostSpill => "host_spill",
+    });
+    receipt["unloaded_ok"] = json!(evicted);
+    receipt["claimed_before_unload"] = json!(claimed);
+    receipt["at"] = json!(super::super::telemetry::now_seconds());
+    *state
+        .last_eviction
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(receipt.clone());
+    Some(receipt)
+}
+
+/// Unload the planned victims that are still idle, wait (bounded) until Ollama has released them,
+/// and record each in the audit. Returns the unloaded runners, the ones a task claimed after the
+/// plan was made, and how long unloading took.
+async fn unload_victims(
+    state: &PlatformState,
+    execution: &ExecutionTarget,
+    victims: &[residency::Candidate],
+    trigger: &'static str,
+) -> (Vec<String>, Vec<String>, u64) {
+    let unloading = Instant::now();
     let mut evicted = Vec::new();
     let mut claimed = Vec::new();
-    for victim in &plan.victims {
+    for victim in victims {
         // A task may have been routed to this runner since the plan was made.
         if state
             .activity
@@ -315,32 +414,21 @@ pub(crate) async fn evict_idle_models(
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    if plan.victims.is_empty() {
-        return None;
+    let unload_ms = u64::try_from(unloading.elapsed().as_millis()).unwrap_or(u64::MAX);
+    for victim in victims
+        .iter()
+        .filter(|victim| evicted.contains(&victim.name))
+    {
+        state.audit.record(&super::super::audit::Entry {
+            backend: execution.placement.as_str(),
+            model: &victim.name,
+            event: "evict",
+            trigger,
+            duration_ms: Some(unload_ms),
+            bytes: Some(victim.bytes),
+        });
     }
-    state
-        .telemetry
-        .record_evictions(execution.placement.as_str(), evicted.len());
-    if !evicted.is_empty() {
-        // The cached sample predates the unload; the next capacity check must re-read.
-        state.resources.invalidate().await;
-    }
-    let mut receipt = plan.receipt();
-    receipt["backend"] = json!(execution.placement);
-    receipt["for_model"] = json!(keep);
-    receipt["memory"] = json!(match freed {
-        residency::Freed::Total => "host",
-        residency::Freed::Vram => "vram",
-        residency::Freed::HostSpill => "host_spill",
-    });
-    receipt["unloaded_ok"] = json!(evicted);
-    receipt["claimed_before_unload"] = json!(claimed);
-    receipt["at"] = json!(super::super::telemetry::now_seconds());
-    *state
-        .last_eviction
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(receipt.clone());
-    Some(receipt)
+    (evicted, claimed, unload_ms)
 }
 
 /// Host RAM is charged for a loopback backend that runs on the CPU or shares unified memory.

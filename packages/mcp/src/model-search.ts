@@ -1,5 +1,4 @@
 // Parsers for Ollama's public HTML library. Website claims are not routing evidence.
-import { clipText } from "./helpers.js";
 
 function decodeHtml(text: string): string {
   const entities: Record<string, string> = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ", middot: "·", bull: "•" };
@@ -109,7 +108,7 @@ export function parseModelSearch(html: string) {
     const tagCount = block.match(/>\s*(\d+)\s+tags?\s*</)?.[1];
     results.push({
       name,
-      description: clipText(description, 160),
+      description,
       capabilities,
       ...(labels.length ? { labels } : {}),
       ...(sizes.length ? { sizes } : {}),

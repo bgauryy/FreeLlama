@@ -169,6 +169,9 @@ pub(super) struct GetInput {
 struct History {
     revision: u64,
     messages: Vec<Value>,
+    /// Serialized size of `messages`, measured once when they are stored, so capacity checks sum
+    /// numbers instead of re-serializing every history.
+    bytes: usize,
     defaults: RouteDefaults,
     limits: ScopeLimits,
     touched: Instant,
@@ -236,11 +239,13 @@ impl ScopeStore {
         validate_size(&input.messages, &limits)?;
         let mut entries = self.lock();
         Self::prune(&mut entries, policy);
-        Self::capacity(&entries, history_size(&input.messages).0, policy)?;
+        let bytes = history_size(&input.messages).0;
+        Self::capacity(&entries, bytes, policy)?;
         let id = Uuid::new_v4().to_string();
         let history = History {
             revision: 0,
             messages: input.messages,
+            bytes,
             defaults: input.route_defaults,
             expires_at: super::telemetry::now_seconds().saturating_add(limits.ttl_seconds),
             limits,
@@ -286,6 +291,7 @@ impl ScopeStore {
         let history = History {
             revision: 0,
             messages: source.messages.clone(),
+            bytes: source.bytes,
             defaults,
             expires_at: super::telemetry::now_seconds().saturating_add(limits.ttl_seconds),
             limits,
@@ -293,7 +299,7 @@ impl ScopeStore {
             lease: None,
             forked_from: Some(json!({"scope_id":id,"revision":input.revision})),
         };
-        Self::capacity(&entries, history_size(&history.messages).0, policy)?;
+        Self::capacity(&entries, history.bytes, policy)?;
         let new_id = Uuid::new_v4().to_string();
         let receipt = history.receipt(&new_id, false, policy);
         entries.insert(new_id, history);
@@ -418,9 +424,10 @@ impl ScopeLease {
         }
         let limits = history.limits.bounded(policy);
         validate_size(&self.messages, &limits)?;
+        let bytes = history_size(&self.messages).0;
         let projected = total_bytes(&entries)
-            .saturating_sub(history_size(&history.messages).0)
-            .saturating_add(history_size(&self.messages).0);
+            .saturating_sub(history.bytes)
+            .saturating_add(bytes);
         if projected > policy.total_max_bytes {
             return Err(scope_error(
                 StatusCode::TOO_MANY_REQUESTS,
@@ -432,6 +439,7 @@ impl ScopeLease {
         let candidate = History {
             revision: history.revision + 1,
             messages: std::mem::take(&mut self.messages),
+            bytes,
             defaults: history.defaults.clone(),
             limits: history.limits.clone(),
             touched: Instant::now(),
@@ -443,11 +451,7 @@ impl ScopeLease {
         receipt["previous_revision"] = json!(self.revision);
         receipt["committed"] = json!(true);
         result["scope"] = receipt;
-        if serde_json::to_vec(result)
-            .map_err(ApiError::bad_request)?
-            .len()
-            > self.result_budget
-        {
+        if serialized_len(result).map_err(ApiError::bad_request)? > self.result_budget {
             return Err(scope_error(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "task_job_result_too_large",
@@ -475,10 +479,23 @@ fn history_size(messages: &[Value]) -> (usize, u64) {
     (payload.len(), context::estimated_text_tokens(&payload))
 }
 fn total_bytes(entries: &BTreeMap<String, History>) -> usize {
-    entries
-        .values()
-        .map(|entry| history_size(&entry.messages).0)
-        .sum()
+    entries.values().map(|entry| entry.bytes).sum()
+}
+/// The serialized length of `value`, counted without building the bytes.
+fn serialized_len(value: &Value) -> serde_json::Result<usize> {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    serde_json::to_writer(&mut counter, value)?;
+    Ok(counter.0)
 }
 fn validate_size(messages: &[Value], limits: &ScopeLimits) -> Result<(), ApiError> {
     let (bytes, tokens) = history_size(messages);

@@ -10,7 +10,7 @@ use std::{
 use anyhow::Result;
 use axum::body::{Body, Bytes};
 use http_body::{Body as HttpBody, Frame, SizeHint};
-use tokio::sync::{Notify, OwnedRwLockWriteGuard};
+use tokio::sync::{Notify, OwnedRwLockReadGuard, OwnedRwLockWriteGuard};
 
 use crate::platform::resources::ResourcePermit;
 
@@ -66,7 +66,10 @@ impl RawAdmission {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, RawAdmissionState> {
-        self.inner.state.lock().expect("raw admission poisoned")
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Change the limit and wait; takes effect for the next request.
@@ -126,7 +129,8 @@ impl RawAdmission {
             }
             state.waiting += 1;
         }
-        let result = loop {
+        let _waiting = Waiting(self);
+        loop {
             let changed = self.inner.changed.notified();
             {
                 let mut state = self.lock();
@@ -144,9 +148,17 @@ impl RawAdmission {
                     retry_after_seconds: Self::retry_after(&state),
                 });
             }
-        };
-        self.lock().waiting -= 1;
-        result
+        }
+    }
+}
+
+/// One queued caller in `waiting`, uncounted however the wait ends: with a slot, a rejection, or
+/// a dropped request future when the client disconnects mid-wait.
+struct Waiting<'a>(&'a RawAdmission);
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.lock().waiting -= 1;
     }
 }
 
@@ -178,14 +190,50 @@ impl Drop for RawPermit {
     }
 }
 
+/// The backend execution lock a raw generation holds until its response ends: shared for a model
+/// already resident, exclusive for one it loads.
+#[expect(
+    dead_code,
+    reason = "each guard is held only for its Drop, which releases the lock when the response ends"
+)]
+pub(crate) enum ExecutionGuard {
+    Shared(OwnedRwLockReadGuard<()>),
+    Exclusive(OwnedRwLockWriteGuard<()>),
+}
+
 /// Response body that owns the raw-admission permit for the complete upstream stream lifetime.
 /// Receiving headers is not completion for Ollama: generation usually continues while bytes are
 /// streamed, so releasing earlier turns a concurrency cap into a headers-only cap.
 pub(crate) struct AdmittedBody {
     pub(crate) inner: Body,
     pub(crate) permit: Option<RawPermit>,
-    pub(crate) execution: Option<OwnedRwLockWriteGuard<()>>,
+    pub(crate) execution: Option<ExecutionGuard>,
     pub(crate) resource: Option<ResourcePermit>,
+    /// The platform's in-use mark for the model the request names.
+    pub(crate) in_use: Option<Box<dyn Send>>,
+    /// Reads what the response reports using and hands it on once the stream ends or the
+    /// client goes away.
+    pub(crate) usage: Option<UsageTap>,
+}
+
+/// The scanner of one response and what to do with its counts.
+pub(crate) struct UsageTap {
+    pub(crate) scanner: super::usage::UsageScanner,
+    pub(crate) finished: Option<Box<dyn FnOnce(super::usage::RawUsage) + Send>>,
+}
+
+impl UsageTap {
+    fn finish(&mut self) {
+        if let Some(finished) = self.finished.take() {
+            finished(self.scanner.usage());
+        }
+    }
+}
+
+impl Drop for UsageTap {
+    fn drop(&mut self) {
+        self.finish();
+    }
 }
 
 impl HttpBody for AdmittedBody {
@@ -197,10 +245,19 @@ impl HttpBody for AdmittedBody {
         context: &mut TaskContext<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let result = Pin::new(&mut self.inner).poll_frame(context);
+        if let (Poll::Ready(Some(Ok(frame))), Some(tap)) = (&result, self.usage.as_mut())
+            && let Some(data) = frame.data_ref()
+        {
+            tap.scanner.feed(data);
+        }
         if matches!(&result, Poll::Ready(None)) {
+            if let Some(mut tap) = self.usage.take() {
+                tap.finish();
+            }
             self.permit.take();
             self.execution.take();
             self.resource.take();
+            self.in_use.take();
         }
         result
     }
@@ -211,5 +268,30 @@ impl HttpBody for AdmittedBody {
 
     fn size_hint(&self) -> SizeHint {
         self.inner.size_hint()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_waiter_whose_client_disconnects_leaves_the_queue() {
+        let admission = RawAdmission::new(1, Duration::from_secs(10));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let held = admission.acquire(deadline).await.ok().expect("first slot");
+        let queued = {
+            let admission = admission.clone();
+            tokio::spawn(async move { admission.acquire(deadline).await.is_ok() })
+        };
+        while admission.receipt()["waiting"] != 1 {
+            tokio::task::yield_now().await;
+        }
+        queued.abort();
+        let _ = queued.await;
+        assert_eq!(admission.receipt()["waiting"], 0);
+        drop(held);
+        assert!(admission.acquire(deadline).await.is_ok());
+        assert_eq!(admission.receipt()["waiting"], 0);
     }
 }

@@ -98,3 +98,77 @@ it.skipIf(process.platform === "win32")("starts serve in the background at launc
   serve!.startServeInBackground();
   await vi.waitFor(async () => expect((await fetch(`${endpoint}/_freellama/v1/health`)).status).toBe(200), { timeout: 5_000 });
 }, 10_000);
+
+/** A serve stand-in: records its arguments, answers /ready with `phases` in turn, then ready. */
+function readyScript(argsFile: string, phases: { status: number; body: unknown }[]) {
+  return `#!${process.execPath}\nimport('node:http').then(({createServer}) => {
+    const args = process.argv.slice(2); const listen = args[args.indexOf('--listen') + 1];
+    require('node:fs').writeFileSync(${JSON.stringify(argsFile)}, JSON.stringify(args));
+    const phases = ${JSON.stringify(phases)}; let index = 0;
+    process.stderr.write('store 3 ms\\n');
+    createServer((req,res) => {
+      if (req.url !== '/_freellama/v1/ready') { res.end('{}'); return; }
+      const phase = phases[index++];
+      if (!phase) { res.end(JSON.stringify({ ready: true })); return; }
+      res.statusCode = phase.status; res.end(JSON.stringify(phase.body));
+    }).listen(Number(listen.split(':').at(-1)), '127.0.0.1');
+  });\n`;
+}
+
+it.skipIf(process.platform === "win32")("waits while the catalog loads, reports phases and passes the operator runtime file", async () => {
+  const home = await mkdtemp(join(tmpdir(), "freellama-home-"));
+  await writeFile(join(home, "runtime.toml"), "# operator settings\n");
+  vi.stubEnv("FREELLAMA_HOME", home);
+  vi.stubEnv("FREELLAMA_RUNTIME_CONFIG", "");
+  const { binary, endpoint } = await fixture();
+  const argsFile = join(home, "args.json");
+  const catalog = { status: 503, body: { ready: false, waiting_for: "catalog", detail: "first fetch" } };
+  await writeFile(binary, readyScript(argsFile, [catalog, catalog, catalog]));
+  await chmod(binary, 0o700);
+  fixtureLaunch.script = binary;
+  const phases: string[] = [];
+  await serve!.ensureServe(undefined, { report: (message) => phases.push(message) });
+  expect(phases[0]).toBe("starting freellama serve");
+  expect(phases).toContain("freellama serve: waiting for catalog (first fetch)");
+  expect(phases.at(-1)).toBe("freellama serve ready");
+  const { readFile } = await import("node:fs/promises");
+  const args = JSON.parse(await readFile(argsFile, "utf8")) as string[];
+  expect(args.slice(args.indexOf("--runtime-config"), args.indexOf("--runtime-config") + 2)).toEqual(["--runtime-config", join(home, "runtime.toml")]);
+  expect(await serve!.readiness(endpoint, 1_000)).toEqual({ state: "ready" });
+  await rm(home, { recursive: true, force: true });
+}, 15_000);
+
+it.skipIf(process.platform === "win32")("stops waiting when serve answers but Ollama is down, and omits a missing runtime file", async () => {
+  const home = await mkdtemp(join(tmpdir(), "freellama-home-"));
+  vi.stubEnv("FREELLAMA_HOME", home);
+  vi.stubEnv("FREELLAMA_RUNTIME_CONFIG", "");
+  const { binary } = await fixture();
+  const argsFile = join(home, "args.json");
+  const down = { status: 503, body: { ready: false, waiting_for: "ollama", detail: "connection refused" } };
+  await writeFile(binary, readyScript(argsFile, Array.from({ length: 1_000 }, () => down)));
+  await chmod(binary, 0o700);
+  fixtureLaunch.script = binary;
+  const started = Date.now();
+  await serve!.ensureServe(undefined);
+  expect(Date.now() - started).toBeLessThan(8_000);
+  const { readFile } = await import("node:fs/promises");
+  expect(JSON.parse(await readFile(argsFile, "utf8"))).not.toContain("--runtime-config");
+  await rm(home, { recursive: true, force: true });
+}, 15_000);
+
+it.skipIf(process.platform === "win32")("ends a caller's wait on abort without stopping the start", async () => {
+  const { binary, endpoint } = await fixture();
+  // Binds only after a delay, as a slow startup would.
+  await writeFile(binary, `#!${process.execPath}\nsetTimeout(() => import('node:http').then(({createServer}) => {
+    const args = process.argv.slice(2); const listen = args[args.indexOf('--listen') + 1];
+    createServer((req,res) => { res.end('{}'); }).listen(Number(listen.split(':').at(-1)), '127.0.0.1');
+  }), 1_500);\n`);
+  await chmod(binary, 0o700);
+  fixtureLaunch.script = binary;
+  const controller = new AbortController();
+  const waiting = serve!.ensureServe(undefined, { signal: controller.signal });
+  setTimeout(() => controller.abort(), 200);
+  await expect(waiting).rejects.toThrow(/Cancelled while freellama serve was starting/);
+  await expect(serve!.ensureServe(undefined)).resolves.toBeUndefined();
+  expect((await fetch(`${endpoint}/_freellama/v1/health`)).status).toBe(200);
+}, 15_000);

@@ -32,6 +32,8 @@ pub(super) async fn run_session_task(
     Json(mut input): Json<TaskInput>,
 ) -> Result<Json<Value>, ApiError> {
     let progress = input.job_progress.clone();
+    // Refuse a task with nothing to do before routing loads a model for it.
+    super::request::require_payload(&input)?;
     // Function definitions are an execution requirement, not merely an optional payload field.
     // Derive the capability at the server boundary so direct HTTP/NAPI callers cannot accidentally
     // route tool work to a completion-only model.
@@ -207,7 +209,7 @@ pub(super) async fn run_session_task(
         &state,
         &execution,
         &resource_model,
-        &decision,
+        super::memory::requested_context(&decision),
         queue_deadline,
     )
     .await;
@@ -250,7 +252,8 @@ pub(super) async fn run_session_task(
             .with_resource_deadline(
                 "initial_reservation",
                 resource_started.elapsed().as_millis(),
-            ));
+            )
+            .with_holds(state.resources.snapshot().await.reasons));
         }
         _ => {
             let resource_waiter =
@@ -274,18 +277,18 @@ pub(super) async fn run_session_task(
                 ),
             )
             .await;
-            let reserved = reserved
-                .map_err(|_| {
-                    ApiError::new(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "resource admission deadline exceeded",
-                    )
-                    .with_resource_deadline(
-                        "initial_reservation",
-                        resource_started.elapsed().as_millis(),
-                    )
-                })
-                .and_then(std::convert::identity);
+            let reserved = match reserved {
+                Ok(reserved) => reserved,
+                Err(_) => Err(ApiError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "resource admission deadline exceeded",
+                )
+                .with_resource_deadline(
+                    "initial_reservation",
+                    resource_started.elapsed().as_millis(),
+                )
+                .with_holds(state.resources.snapshot().await.reasons)),
+            };
             let reserved = match reserved {
                 Ok(reserved) => reserved,
                 Err(error) => {
@@ -361,7 +364,7 @@ pub(super) async fn run_session_task(
     .map_err(|_| transition_timeout(&execution))?;
     let transition_wait_ms = transition_started.elapsed().as_millis();
     let recheck_started = Instant::now();
-    let (resource_recheck, footprint) = tokio::time::timeout_at(
+    let revalidated = tokio::time::timeout_at(
         queue_deadline,
         reserve_task_resources(
             &state,
@@ -373,13 +376,18 @@ pub(super) async fn run_session_task(
             None,
         ),
     )
-    .await
-    .map_err(|_| {
-        transition_timeout(&execution).with_resource_deadline(
-            "reservation_revalidation",
-            recheck_started.elapsed().as_millis(),
-        )
-    })??;
+    .await;
+    let (resource_recheck, footprint) = match revalidated {
+        Ok(revalidated) => revalidated?,
+        Err(_) => {
+            return Err(transition_timeout(&execution)
+                .with_resource_deadline(
+                    "reservation_revalidation",
+                    recheck_started.elapsed().as_millis(),
+                )
+                .with_holds(state.resources.snapshot().await.reasons));
+        }
+    };
     resource_wait_ms = resource_wait_ms.saturating_add(recheck_started.elapsed().as_millis());
     execution_receipt["resource_revalidation"] = json!(resource_recheck.receipt);
     let previous = execution_receipt["memory_reservation"].clone();
@@ -394,15 +402,30 @@ pub(super) async fn run_session_task(
     let session_id = input.route.session_id.clone();
     let mut permits = [resource_permit, resource_recheck];
     if let Some(progress) = &progress {
-        progress.update(
-            if admission_mode == "resident_shared" {
-                super::super::jobs::JobStatus::Running
-            } else {
-                super::super::jobs::JobStatus::Loading
-            },
-            "forwarding_to_ollama",
-            None,
-        );
+        if admission_mode == "resident_shared" {
+            progress.update(
+                super::super::jobs::JobStatus::Running,
+                "forwarding_to_ollama",
+                None,
+            );
+        } else {
+            // What a waiting caller needs to say "loading X (~N s)": the model, where it loads,
+            // the last measured load time (absent when never measured) and what made room.
+            let usage = state
+                .activity
+                .usage(execution.placement.as_str(), &selected_model);
+            progress.update(
+                super::super::jobs::JobStatus::Loading,
+                "forwarding_to_ollama",
+                Some(json!({
+                    "model": selected_model,
+                    "backend": execution.placement.as_str(),
+                    "expected_load_ms": usage.load_ms.map(f64::round),
+                    "evicted": execution_receipt["memory_reservation"]["evicted_idle_models"]
+                        .clone(),
+                })),
+            );
+        }
     }
     let forward = forward_managed_task(
         &state,
@@ -428,7 +451,14 @@ pub(super) async fn run_session_task(
     // reservation that covered the load is returned as soon as the runner is resident instead of
     // being counted a second time until the response ends. (With mmap'd weights on Linux the
     // page cache still reads as available, so there the reservation is held to the end.)
+    // A cold load holds the backend's transition lock exclusively. Once the runner is resident
+    // the transition is over: the guard is downgraded to shared so tasks on other resident
+    // runners proceed while this one generates. Other loads still wait for the shared side to
+    // drop, and this runner cannot be evicted meanwhile because its task counts as active.
+    let mut transition = Some(transition);
+    let exclusive = matches!(transition, Some(TransitionPermit::Exclusive(_)));
     let result = if progress.is_some()
+        || exclusive
         || host_has_unified_memory() && permits.iter().any(|permit| permit.reserved_bytes() > 0)
     {
         let client = state.client.clone();
@@ -437,6 +467,9 @@ pub(super) async fn run_session_task(
             loop {
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 if model_is_resident(&client, &upstream, &selected_model).await {
+                    if let Some(TransitionPermit::Exclusive(guard)) = transition.take() {
+                        transition = Some(TransitionPermit::Shared(guard.downgrade()));
+                    }
                     if let Some(progress) = &progress {
                         progress.update(
                             super::super::jobs::JobStatus::Running,

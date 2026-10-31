@@ -1,74 +1,43 @@
 //! Bounded empirical runner footprints. No extrapolation across model revisions or contexts.
 use super::CatalogModel;
+use crate::store::{FootprintRow, Store};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{
-    collections::{BTreeMap, VecDeque},
-    path::PathBuf,
-    sync::{Arc, Mutex},
-};
+use std::collections::{BTreeMap, VecDeque};
 
-/// Measured runner sizes, newest last, plus the settings that scale an estimate. With a file,
-/// samples survive restarts, so estimates come from Ollama's own measurements from the start.
+/// Measured runner sizes, newest last, plus the settings that scale an estimate. With a store,
+/// samples survive restarts and are shared with every `FreeLlama` process on the machine, so
+/// estimates come from Ollama's own measurements from the start.
 #[derive(Default)]
 pub(super) struct FootprintHistory {
     samples: VecDeque<Sample>,
     hints: RuntimeHints,
     backend_hints: BTreeMap<String, RuntimeHints>,
-    file: Option<PathBuf>,
-    /// Incremented per snapshot; `persisted` holds the newest generation written, so a slow
-    /// write of an older snapshot never replaces a newer file.
-    generation: u64,
-    persisted: Arc<Mutex<u64>>,
+    store: Option<Store>,
 }
 
-/// A serialized history waiting to be written. Taken under the history lock and written after
-/// it is released, so a slow disk never blocks routing or other observers.
+/// Measurements waiting to be written. Taken under the history lock and written after it is
+/// released, so a slow disk never blocks routing or other observers. The store keeps the larger
+/// size per runner identity, so writes from several processes, in any order, converge.
 #[must_use = "a footprint snapshot does nothing until it is written"]
 pub(super) struct FootprintSave {
-    path: PathBuf,
-    bytes: Vec<u8>,
-    generation: u64,
-    persisted: Arc<Mutex<u64>>,
+    store: Store,
+    rows: Vec<FootprintRow>,
 }
 
 impl FootprintSave {
-    /// Write off the async runtime. Failures are reported once per process, as before.
+    /// Write off the async runtime. Failures are reported once per process.
     pub(super) async fn persist(self) {
-        // A panic in the writer loses one cache write; the next measurement rewrites the file.
+        // A panic in the writer loses one cache write; the next measurement rewrites it.
         let _ = tokio::task::spawn_blocking(move || self.write()).await;
     }
 
     fn write(self) {
-        static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         static SAVE_FAILURE_REPORTED: std::sync::Once = std::sync::Once::new();
-        let mut persisted = self
-            .persisted
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if *persisted >= self.generation {
-            return;
-        }
-        let path = &self.path;
-        // Unique per process and write: two servers sharing a data directory must not rename
-        // each other's half-written file into place.
-        let write = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let temporary = path.with_extension(format!("json.{}.{write}.tmp", std::process::id()));
-        if let Some(parent) = path.parent() {
-            // A failure here surfaces as the write error below.
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let result = std::fs::write(&temporary, &self.bytes)
-            .and_then(|()| std::fs::rename(&temporary, path));
-        match result {
-            Ok(()) => *persisted = self.generation,
-            Err(error) => {
-                // Best-effort cleanup; the temporary may not exist when the write itself failed.
-                let _ = std::fs::remove_file(&temporary);
-                SAVE_FAILURE_REPORTED.call_once(|| {
-                    eprintln!("footprint history not saved to {}: {error}", path.display());
-                });
-            }
+        if let Err(error) = self.store.record_footprints(&self.rows) {
+            SAVE_FAILURE_REPORTED.call_once(|| {
+                eprintln!("footprint history not saved: {error:#}");
+            });
         }
     }
 }
@@ -120,6 +89,15 @@ const GRAPH_MARGIN_PERCENT: u64 = 10;
 /// When an architecture's KV shape is unknown (sliding-window, SSM, hybrid), assume the cache
 /// needs a quarter of the file size rather than zero.
 const UNKNOWN_KV_PERCENT_OF_FILE: u64 = 25;
+
+/// A load estimate from the model file alone, for when nothing else about the model is known:
+/// the file, an assumed KV cache and the graph margin, as [`FootprintHistory::requirement`]
+/// assumes without KV metadata.
+pub(super) const fn file_only_estimate(file_bytes: u64) -> u64 {
+    file_bytes
+        .saturating_add(file_bytes / 100 * UNKNOWN_KV_PERCENT_OF_FILE)
+        .saturating_add(file_bytes / 100 * GRAPH_MARGIN_PERCENT)
+}
 /// Measurements kept (one per backend, model revision and context size).
 const HISTORY_LIMIT: usize = 64;
 
@@ -148,6 +126,32 @@ impl Sample {
     }
 }
 
+impl From<FootprintRow> for Sample {
+    fn from(row: FootprintRow) -> Self {
+        Self {
+            backend: row.backend,
+            digest: row.digest,
+            context: row.context,
+            bytes: row.bytes,
+            num_parallel: row.num_parallel,
+            kv_cache_percent: row.kv_cache_percent,
+        }
+    }
+}
+
+impl From<&Sample> for FootprintRow {
+    fn from(sample: &Sample) -> Self {
+        Self {
+            backend: sample.backend.clone(),
+            digest: sample.digest.clone(),
+            context: sample.context,
+            num_parallel: sample.num_parallel,
+            kv_cache_percent: sample.kv_cache_percent,
+            bytes: sample.bytes,
+        }
+    }
+}
+
 impl FootprintHistory {
     pub(super) fn with_hints(hints: RuntimeHints) -> Self {
         Self {
@@ -169,35 +173,21 @@ impl FootprintHistory {
         self.samples.len()
     }
 
-    /// Load and keep saving samples at `path`. An unreadable or corrupt file starts empty: it is
-    /// a cache of measurements, never a source of truth.
-    pub(super) fn with_file(mut self, path: PathBuf) -> Self {
-        if let Some(samples) = std::fs::read(&path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Vec<Sample>>(&bytes).ok())
-        {
-            self.samples = samples
-                .into_iter()
-                .rev()
-                .take(HISTORY_LIMIT)
-                .rev()
-                .collect();
+    /// Load and keep saving samples in `store`. An unreadable store starts empty: it is a cache
+    /// of measurements, never a source of truth.
+    pub(super) fn with_store(mut self, store: Store) -> Self {
+        if let Ok(rows) = store.footprints(HISTORY_LIMIT) {
+            self.samples = rows.into_iter().map(Sample::from).collect();
         }
-        self.file = Some(path);
+        self.store = Some(store);
         self
     }
 
-    /// Serialize the samples for writing after the caller releases the history lock.
-    fn snapshot(&mut self) -> Option<FootprintSave> {
-        let path = self.file.clone()?;
-        // A few kilobytes at most, taken only when a measurement changes.
-        let bytes = serde_json::to_vec(&self.samples).ok()?;
-        self.generation += 1;
+    /// The measurements to write after the caller releases the history lock.
+    fn snapshot(&self) -> Option<FootprintSave> {
         Some(FootprintSave {
-            path,
-            bytes,
-            generation: self.generation,
-            persisted: Arc::clone(&self.persisted),
+            store: self.store.clone()?,
+            rows: self.samples.iter().map(FootprintRow::from).collect(),
         })
     }
 
@@ -315,8 +305,10 @@ impl FootprintHistory {
             .filter(|sample| sample.context >= context)
             .map(|sample| sample.bytes)
             .max();
+        // Context 0 means the context is unknown, not empty: fall back to the assumed KV share.
         let kv = model
             .kv_cache_bytes_per_token_f16
+            .filter(|_| context > 0)
             .and_then(|bytes| bytes.checked_mul(context))
             .and_then(|bytes| bytes.checked_mul(hints.num_parallel))
             .map(|bytes| bytes / 100 * hints.kv_cache_percent);
@@ -507,19 +499,16 @@ mod tests {
 
     #[test]
     fn resident_runners_are_learned_and_survive_a_restart() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("footprints.json");
-        let mut history = FootprintHistory::default().with_file(path.clone());
+        let store = Store::in_memory().unwrap();
+        let mut history = FootprintHistory::default().with_store(store.clone());
         let ps = json!({"models":[
             {"name":"m","digest":"a","size":4321,"context_length":8192},
             {"name":"no-digest","size":1,"context_length":1},
         ]});
         persist(history.observe_resident("cpu", &ps));
-        let saved = std::fs::metadata(&path).unwrap().modified().unwrap();
-        // The same measurement again changes nothing and is not rewritten.
-        persist(history.observe_resident("cpu", &ps));
-        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), saved);
-        let restored = FootprintHistory::default().with_file(path);
+        // The same measurement again changes nothing and writes nothing.
+        assert!(history.observe_resident("cpu", &ps).is_none());
+        let restored = FootprintHistory::default().with_store(store);
         assert_eq!(
             restored.requirement("cpu", &model(), 4096, None, true)["required_available_bytes"],
             4321
@@ -527,25 +516,25 @@ mod tests {
     }
 
     #[test]
-    fn a_late_older_snapshot_never_replaces_a_newer_file() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("footprints.json");
-        let mut history = FootprintHistory::default().with_file(path.clone());
-        let older = history
-            .observe_resident(
-                "cpu",
-                &json!({"models":[{"name":"m","digest":"a","size":1111,"context_length":8192}]}),
-            )
-            .unwrap();
-        let newer = history
+    fn writes_from_two_processes_in_any_order_keep_the_larger_size() {
+        let store = Store::in_memory().unwrap();
+        let mut first = FootprintHistory::default().with_store(store.clone());
+        let mut second = FootprintHistory::default().with_store(store.clone());
+        let larger = first
             .observe_resident(
                 "cpu",
                 &json!({"models":[{"name":"m","digest":"a","size":4321,"context_length":8192}]}),
             )
             .unwrap();
-        newer.write();
-        older.write();
-        let restored = FootprintHistory::default().with_file(path);
+        let smaller = second
+            .observe_resident(
+                "cpu",
+                &json!({"models":[{"name":"m","digest":"a","size":1111,"context_length":8192}]}),
+            )
+            .unwrap();
+        larger.write();
+        smaller.write();
+        let restored = FootprintHistory::default().with_store(store);
         assert_eq!(
             restored.requirement("cpu", &model(), 4096, None, true)["required_available_bytes"],
             4321
@@ -554,9 +543,8 @@ mod tests {
 
     #[test]
     fn a_restart_under_different_ollama_settings_ignores_old_measurements() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("footprints.json");
-        let mut history = FootprintHistory::default().with_file(path.clone());
+        let store = Store::in_memory().unwrap();
+        let mut history = FootprintHistory::default().with_store(store.clone());
         persist(history.observe_resident(
             "cpu",
             &json!({"models":[{"name":"m","digest":"a","size":4321,"context_length":8192}]}),
@@ -566,21 +554,10 @@ mod tests {
             num_parallel: 4,
             kv_cache_percent: 100,
         };
-        let restored = FootprintHistory::with_hints(four_slots).with_file(path.clone());
+        let restored = FootprintHistory::with_hints(four_slots).with_store(store);
         assert_ne!(
             restored.requirement("cpu", &model(), 4096, None, true)["source"],
             "observed_same_digest_at_equal_or_larger_context"
-        );
-        // A file written before samples carried their settings is ignored, not trusted.
-        std::fs::write(
-            &path,
-            r#"[{"backend":"cpu","digest":"a","context":8192,"bytes":9}]"#,
-        )
-        .unwrap();
-        let legacy = FootprintHistory::default().with_file(path);
-        assert_ne!(
-            legacy.requirement("cpu", &model(), 4096, None, true)["required_available_bytes"],
-            9
         );
     }
 

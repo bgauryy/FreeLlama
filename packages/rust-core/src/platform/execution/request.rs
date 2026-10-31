@@ -112,22 +112,85 @@ pub(crate) fn apply_request_options(
     Ok(())
 }
 
+/// A generation needs something to work on: an embedding needs `input`; a chat needs messages,
+/// or a prompt with text or images. Checked before routing, so an empty request never costs a
+/// model load.
+pub(crate) fn require_payload(input: &TaskInput) -> Result<(), ApiError> {
+    if matches!(input.operation, super::super::ManagedOperation::Warm) {
+        return Ok(());
+    }
+    if matches!(input.route.task, TaskKind::Embedding) {
+        let empty = match &input.input {
+            None | Some(Value::Null) => true,
+            Some(Value::String(text)) => text.is_empty(),
+            Some(Value::Array(items)) => items.is_empty(),
+            Some(_) => false,
+        };
+        return if empty {
+            Err(ApiError::bad_request(anyhow::anyhow!(
+                "embedding task requires a non-empty input; use warm to load the model"
+            )))
+        } else {
+            Ok(())
+        };
+    }
+    let has_text = input
+        .prompt
+        .as_deref()
+        .is_some_and(|prompt| !prompt.trim().is_empty());
+    let has_images = input
+        .images
+        .as_ref()
+        .is_some_and(|images| !images.is_empty());
+    if input.messages.is_empty() && !has_text && !has_images {
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "task requires messages, or a prompt with text or images; use warm to load a model without generating"
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn build_managed_request(
     input: &mut TaskInput,
     decision: &RouteDecision,
     keep_alive: &Value,
 ) -> Result<(&'static str, Value), ApiError> {
     if matches!(input.operation, super::super::ManagedOperation::Warm) {
+        // Ollama loads a model on an empty request: no messages for chat, no input for embed.
+        if matches!(input.route.task, TaskKind::Embedding) {
+            if !input.messages.is_empty() {
+                return Err(ApiError::bad_request(
+                    "warm messages fill a chat model's prompt cache; embedding warms take none",
+                ));
+            }
+            return Ok((
+                "/api/embed",
+                json!({
+                    "model": decision.selected_model,
+                    "input": [],
+                    "truncate": false,
+                    "keep_alive": keep_alive,
+                    "options": decision.options,
+                }),
+            ));
+        }
+        // With messages, the runner evaluates them into its prompt cache and generates nothing
+        // (`num_predict: 0`), so the next request that starts with them reuses that work.
+        let messages = std::mem::take(&mut input.messages);
+        let mut options = decision.options.clone();
+        if !messages.is_empty() {
+            options["num_predict"] = json!(0);
+        }
         return Ok((
             "/api/chat",
             json!({
                 "model": decision.selected_model,
-                "messages": [],
+                "messages": messages,
                 "stream": false,
                 "truncate": false,
                 "shift": false,
                 "keep_alive": keep_alive,
-                "options": decision.options,
+                "options": options,
             }),
         ));
     }
@@ -165,7 +228,13 @@ pub(crate) fn build_managed_request(
         "model": decision.selected_model,
         "messages": messages,
         // Streaming lets the forward path stop a repetition loop early; see `stop_on_repetition`.
-        "stream": input.stop_on_repetition,
+        // On by default only for free text with nothing capping it: JSON and tool calls can be
+        // legitimately periodic, and a cut there leaves an invalid answer.
+        "stream": input.stop_on_repetition.unwrap_or_else(|| {
+            decision.options.get("num_predict").is_none()
+                && input.tools.is_none()
+                && input.request_options.format.is_none()
+        }),
         "truncate": false,
         "shift": false,
         "keep_alive": keep_alive,

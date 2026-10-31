@@ -96,7 +96,7 @@ let config = PlatformConfig::new(
     "http://127.0.0.1:11436",
     vec!["nomic-embed-text:latest".to_owned()],
 )
-.with_feedback_file("/var/lib/freellama/feedback.json")
+.with_store(freellama::store::Store::open("/var/lib/freellama/freellama.sqlite".as_ref())?)
 .with_auth_token("replace-with-a-secret-of-at-least-32-bytes");
 
 serve(config).await?;
@@ -123,7 +123,9 @@ owns `num_gpu`; callers cannot override those two keys through `options`. Raw pa
 full-control escape hatch, including streaming.
 
 When `context_tokens` is omitted, managed text execution sizes context from the supplied prompt,
-schemas and output budget, up to 32K and the selected model's limit. Explicit context and multimodal
+schemas and the expected output (what this model revision has needed before, `output_reserve_tokens`
+in the route), up to 32K and the selected model's limit. No output cap is sent unless the caller or a
+policy sets `num_predict`. Explicit context and multimodal
 profiles are preserved. `execution.context_sizing` reports the estimate. Chat uses `truncate:false`
 and `shift:false`; embeddings use `truncate:false`. Unsupported upstream versions may ignore these
 fields, so qualify overflow behavior when deploying a different Ollama version.

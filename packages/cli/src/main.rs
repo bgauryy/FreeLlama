@@ -115,6 +115,21 @@ async fn run() -> Result<()> {
         Command::Status { endpoint } => {
             print_get(&endpoint, "/_freellama/v1/status").await?;
         }
+        Command::Ready { endpoint } => {
+            print_get(&endpoint, "/_freellama/v1/ready").await?;
+        }
+        Command::Unload {
+            endpoint,
+            model,
+            max_wait_seconds,
+        } => {
+            print_post(
+                &endpoint,
+                "/_freellama/v1/unload",
+                &json!({"model": model, "max_wait_seconds": max_wait_seconds}),
+            )
+            .await?;
+        }
         Command::Usage { endpoint, days } => {
             print_get(&endpoint, &format!("/_freellama/v1/usage?days={days}")).await?;
         }

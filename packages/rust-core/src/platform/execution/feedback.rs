@@ -10,16 +10,40 @@ use super::super::error::ApiError;
 use super::super::{PlatformState, TaskKind, TaskPriority, resources};
 use super::ExecutionTarget;
 
+/// `served_a_caller` is false for warms and preloads: they still teach the load time, but only
+/// answered work counts as a use, so a preload cannot extend its own residency or make itself
+/// costlier to evict.
 pub(crate) fn record_completion(
     state: &PlatformState,
     mut record: super::super::telemetry::TaskRecord,
     started: Instant,
+    served_a_caller: bool,
 ) {
     record.duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     if record.outcome == "ok" {
-        state
-            .activity
-            .completed(&record.backend, &record.model, record.load_ms);
+        if served_a_caller {
+            state
+                .activity
+                .completed(&record.backend, &record.model, record.load_ms);
+        } else {
+            state
+                .activity
+                .learn_load(&record.backend, &record.model, record.load_ms);
+        }
+        if super::super::residency::was_a_load(record.load_ms) {
+            state.audit.record(&super::super::audit::Entry {
+                backend: &record.backend,
+                model: &record.model,
+                event: "load",
+                trigger: if served_a_caller {
+                    "managed_task"
+                } else {
+                    "warm"
+                },
+                duration_ms: Some(record.load_ms),
+                bytes: None,
+            });
+        }
     }
     state.telemetry.record_task(record);
 }
@@ -31,6 +55,7 @@ pub(crate) fn task_record(
     task: &str,
     priority: TaskPriority,
     requested_model: Option<&str>,
+    client: Option<&str>,
 ) -> super::super::telemetry::TaskRecord {
     let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let priority = match priority {
@@ -52,6 +77,8 @@ pub(crate) fn task_record(
         queue_wait_ms: 0,
         load_ms: 0,
         output_tokens_per_second: None,
+        cached_prompt_tokens: 0,
+        client: client.map(str::to_owned),
     };
     match result {
         Ok(Json(value)) => {
@@ -64,6 +91,7 @@ pub(crate) fn task_record(
             let metrics = &value["metrics"];
             record.prompt_tokens = metrics["prompt_tokens"].as_u64().unwrap_or(0);
             record.output_tokens = metrics["output_tokens"].as_u64().unwrap_or(0);
+            record.cached_prompt_tokens = metrics["cached_prompt_tokens"].as_u64().unwrap_or(0);
             record.load_ms = metrics["load_duration_ns"].as_u64().unwrap_or(0) / 1_000_000;
             record.output_tokens_per_second = metrics["output_tokens_per_second"].as_f64();
             record.queue_wait_ms = value["admission"]["total_wait_ms"].as_u64().unwrap_or(0);

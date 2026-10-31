@@ -313,3 +313,86 @@ async fn a_model_larger_than_the_gpu_does_not_empty_vram() {
     assert!(!mock.unloaded.load(Ordering::SeqCst));
     server.abort();
 }
+
+/// A runtime file that sets only the model memory budget.
+fn budget_file(budget: &str) -> tempfile::NamedTempFile {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), format!("model_memory_budget = \"{budget}\"\n")).unwrap();
+    file
+}
+
+/// Under a budget, a load that would take the resident total past it unloads the cheapest idle
+/// runner first, while the host still has memory to spare; with the budget off it does not. A CPU
+/// backend shares host memory on every platform, so the budget applies to it everywhere.
+#[tokio::test]
+async fn a_load_past_the_model_memory_budget_unloads_an_idle_runner_first() {
+    for (budget, evicts) in [("12000", true), ("off", false)] {
+        let mock = Mock::default();
+        mock.loaded.lock().await.push(json!({
+            "name": "idle:latest", "digest": "d-idle", "size": 3000, "size_vram": 0,
+            "context_length": 2048, "expires_at": "2026-01-01T00:05:00Z"
+        }));
+        let (cpu, server) = backend(mock.clone()).await;
+        let (primary, primary_server) = backend(Mock::default()).await;
+        // Plenty of host memory: only the budget can ask for room.
+        let governor = ResourceGovernor::with_sampler(policy(), || sample(20_000, None)).unwrap();
+        let file = budget_file(budget);
+        let config = config(primary, governor)
+            .with_cpu_backend(cpu, ["big:latest", "idle:latest"])
+            .with_runtime_config(file.path());
+        let (status, body) = run(app(&config).unwrap(), "big:latest", "hi").await;
+        assert_eq!(status, StatusCode::OK, "{budget}: {body}");
+        let reservation = &body["execution"]["memory_reservation"];
+        assert_eq!(
+            mock.unloaded.load(Ordering::SeqCst),
+            evicts,
+            "{budget}: {body}"
+        );
+        if evicts {
+            assert_eq!(reservation["evicted_idle_models"], json!(["idle:latest"]));
+            let eviction = &reservation["eviction"][0];
+            assert_eq!(eviction["trigger"], "model_memory_budget", "{eviction}");
+            assert_eq!(eviction["budget_bytes"], 12_000);
+        } else {
+            assert!(reservation.get("eviction").is_none(), "{reservation}");
+        }
+        server.abort();
+        primary_server.abort();
+    }
+}
+
+/// Raw passthrough traffic makes room the same way: a raw chat for a model Ollama does not hold
+/// unloads an idle runner when the load would pass the budget. The primary backend shares host
+/// memory only on unified-memory hosts.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[tokio::test]
+async fn a_raw_load_past_the_budget_makes_room_like_a_managed_one() {
+    let mock = Mock::default();
+    mock.loaded.lock().await.push(json!({
+        "name": "idle:latest", "digest": "d-idle", "size": 3000, "size_vram": 3000,
+        "context_length": 2048, "expires_at": "2026-01-01T00:05:00Z"
+    }));
+    let (upstream, server) = backend(mock.clone()).await;
+    let governor = ResourceGovernor::with_sampler(policy(), || sample(9_000, None)).unwrap();
+    let file = budget_file("12000");
+    let platform = app(&config(upstream, governor).with_runtime_config(file.path())).unwrap();
+    let response = platform
+        .oneshot(
+            Request::post("/api/chat")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"model":"big:latest","messages":[{"role":"user","content":"hi"}],"stream":false})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        mock.unloaded.load(Ordering::SeqCst),
+        "the idle runner stayed loaded"
+    );
+    assert_eq!(mock.chats.lock().await.len(), 1);
+    server.abort();
+}

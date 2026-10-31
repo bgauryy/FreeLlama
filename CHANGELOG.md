@@ -1,5 +1,157 @@
 # Changelog
 
+## 0.8.0
+
+Breaking: `serve` keeps everything it learns in one shared database under the FreeLlama home,
+`~/.octocode/freellama/` (`--home` or `FREELLAMA_HOME` moves it). `--feedback-file`,
+`--usage-file`, `--ephemeral-feedback`, `--ephemeral-usage`, `FREELLAMA_FEEDBACK_FILE` and
+`FREELLAMA_USAGE_FILE` are gone; `--ephemeral` keeps everything in memory. `PlatformConfig`
+replaces `with_feedback_file`/`with_usage_file` with `with_store`. The health contract
+`placement_feedback_persistence` is now `shared_database_snapshot_v1`.
+
+- **Readiness, load and unload.** `GET /ready` (CLI `ready`) returns 200 only when Ollama answers,
+  the CPU backend answers when one is configured, and the model catalog reads; otherwise 503 with
+  `waiting_for`. `/health` stays a liveness check. `POST /unload` (CLI `unload`) unloads a resident
+  model once its tasks finish and never loads one first; `warm` with `keep_alive: 0` on a resident
+  model is the same unload, with no task or eligibility check. A warm without `task` loads an
+  embedding-only model as an embedding task. Warms and preloads no longer count as uses. A runtime
+  reload that removes a preload entry unloads that model if it is idle. Deferred jobs in the
+  `loading` phase report the model, backend, last measured load time and evicted models. `serve`
+  prints how long it took to prepare after binding.
+- **New loads wait for memory on macOS too.** A load that does not fit available memory (after
+  unloading idle runners) now waits and is refused at its deadline on every platform, instead of
+  dispatching with a memory advisory on macOS, where loading past it pushed the machine into
+  compression and swap. `serve --low-memory advisory` (`FREELLAMA_LOW_MEMORY`) restores the old
+  behaviour. Work on a loaded model is never held by it.
+- **Lighter on the host.** The streaming loop check reads a bounded tail instead of rescanning the
+  whole answer every 16 tokens; the per-task Ollama process probe is cached for 5 s; `pmset` is not
+  spawned on Apple silicon; the status page polls every 5 s and only while visible; a poisoned lock
+  no longer fails every later request. `doctor` advises `LLAMA_ARG_CACHE_RAM`, since each
+  llama-server may otherwise keep up to 8 GiB of displaced prompt caches in host RAM.
+- **More work runs side by side.** A cold load's exclusive backend lock is downgraded to shared once
+  the runner is resident, and a raw generation for a resident model takes the shared side instead of
+  the exclusive one, so tasks on other loaded models no longer wait for a whole generation. Settings
+  are shared snapshots instead of a deep copy per request, scope commits no longer re-serialize every
+  stored history, and startup replays only the 400-day usage window the reports can show (every row
+  stays on disk). Managed overhead over raw passthrough fell from 56 ms to 4 ms at the median on an
+  M2 Pro.
+- **Idle runners released under memory pressure.** While a model is resident, `serve` checks the host
+  at a multiple of its sampling interval; when low available memory, OS memory pressure or swapping
+  holds it, the cheapest idle runners are unloaded (audit trigger `pressure_sweep`). Pinned,
+  `keep_alive: -1` and busy models stay, and `evict_idle_models = false` turns it off. Nothing is
+  sampled while no model is resident.
+- **Preload.** The runtime file's `[preload]` table loads `startup` models once the server is up
+  (and entries a reload adds), optionally with `messages` evaluated into the runner's prompt cache
+  (`num_predict: 0`). Predictive preload, on by default, counts switches between models in the shared
+  database and loads a model's clear successor in the background, only when it fits without
+  unloading anything, the host is under no pressure and the backend is idle. `FREELLAMA_PRELOAD` and
+  `FREELLAMA_PREDICTIVE_PRELOAD` override it. Warms (`POST /warm`, MCP `warm:true` with
+  `systemPrompt`/`messages`) accept a prompt prefix too.
+- **Client keys and budgets.** `clients.toml` (or `--client-keys`) adds named bearer tokens with an
+  optional `daily_tokens` budget, counted as output plus prompt tokens not reused from a cache, and an
+  optional `admin` right for model files and config reload. A spent budget returns 429
+  `client_budget_exhausted` with `Retry-After` until the next UTC day; `usage` shows each key's
+  totals.
+- **Other OpenAI-compatible engines.** `upstreams.toml` (or `--upstreams`) routes `/v1/...` requests
+  by model to LM Studio, a llama.cpp server, vLLM or a cloud API: `name/model` picks the engine, a
+  bare name goes to Ollama first. `GET /v1/models` merges every list. The caller's token never leaves;
+  an engine's key goes only over HTTPS or to this machine.
+- **Raw traffic in the usage ledger.** Raw generations are recorded (`task: "raw"`) with the token
+  counts read from their responses as they stream through, `cached_prompt_tokens` joins every usage
+  record and total, and a raw load is audited with Ollama's measured `load_duration`, which also
+  feeds the eviction planner.
+- **Refusals say what held them.** A resource deadline names the host signals in
+  `resource_admission.held_by` and the error text (for example `thermal_throttling`).
+- **Doctor no longer recommends `OLLAMA_MAX_LOADED_MODELS=1`.** With the memory budget deciding
+  residency, a count of one reloads on every switch; the posture now asks for a count above what the
+  budget can hold (unset and `0` both mean 3 per GPU).
+- **Response files, on by default.** Every MCP tool result is saved whole, with the call's arguments
+  (prompts included), to `~/.octocode/freellama/responses/<session>/<n>-<tool>.json` (owner-only)
+  and names it as `response_file`; `FREELLAMA_RESPONSE_STORE_BYTES=0` turns this off. A successful `run_task` now returns the answer whole plus model, `output_check`,
+  `metrics` and `timing`, with the full receipt in the file; `receipt:"full"` returns everything
+  inline, and previews stay whole. The store keeps at most `FREELLAMA_RESPONSE_STORE_BYTES` (1 GiB by
+  default, `0` turns it off), dropping the oldest files first.
+- **The repetition stop is on by default for uncapped free text.** With no `num_predict`, only a
+  loop stop bounds a runaway answer short of the model's context, so managed chats without `format`
+  or `tools` stream and stop a repeating loop (in the answer or the reasoning) unless the caller
+  passes `stop_on_repetition: false` (CLI `--stop-on-repetition false`). Streaming keeps every
+  `logprobs` entry and Ollama's final metrics, and a runner error mid-stream counts against the
+  circuit breaker. A server that ignores `stream` and answers with one unterminated JSON body is still read.
+- **No output cap of FreeLlama's own.** Managed tasks no longer get a default `num_predict` (it
+  was 64 to 2,048 tokens by task): a model answers until it is done, bounded only by its own context
+  window. Only the caller or an operator policy caps output. The context is sized from the prompt
+  plus the expected output, `route.output_reserve_tokens`, which gives way to a long prompt instead
+  of refusing it. Measured: gpt-oss:20b under the old 512-token cap spent all of it reasoning and
+  returned an empty answer.
+- **Learned per model, saved per model.** A `model_facts` table keeps, per model and digest, the
+  output an answer has needed (an answer a cap or the context cut off doubles it; a repetition loop
+  teaches nothing) and the managed runs and loops per task that routing already used, now shared
+  across processes and restarts. A thinking-capable model always expects room to reason. A
+  re-pulled model with a new digest starts fresh.
+- **Nothing is cut or deleted.** MCP text answers, batch items, upstream errors, summaries,
+  `delegate_research` answers and citations, model descriptions, README text and usage notes are
+  returned whole. Usage history and the residency audit are never deleted; usage totals cover all
+  days. A repeated loop is still shown once in the text cue, with the full text in
+  `structuredContent`. Oversized external pages (ollama.com over 2 MiB, Hugging Face over 4 MiB) are
+  refused, not cut.
+- **A model memory budget.** `model_memory_budget` (runtime file or `FREELLAMA_MODEL_MEMORY_BUDGET`;
+  `"75%"` of RAM by default, a size such as `"24GiB"`, or `"off"`) caps what one backend's loaded
+  models hold together where they share host memory (Apple silicon, or a CPU backend). A load past it
+  unloads the cheapest idle models first, before the OS starts swapping. Measured on a 32 GB Mac with
+  a 14 GiB budget: loading glm-ocr unloaded gpt-oss:20b with trigger `model_memory_budget`.
+- **Raw passthrough traffic takes part in residency.** An Ollama API call for a model that is not
+  loaded makes room the same way a managed load does (GPU VRAM fit, memory budget, host memory),
+  sized at Ollama's own default context when the call sets no `num_ctx`; raw calls in flight count
+  as busy, so the eviction planner never unloads their model under them, and served raw calls count
+  as recent use. Room-making reads only the primary backend and is bounded to 10 seconds, so a slow
+  backend cannot stall managed work. A bare name (`gemma3`) is resolved as Ollama resolves it,
+  `gemma3:latest`.
+- **The residency audit.** Every load, unload and eviction is recorded with its cause
+  (`managed_task`, `raw_request`, `caller_unload`, `model_memory_budget`, `host_memory`,
+  `gpu_memory`) and duration. `status` shows it under `residency`: the budget in use, counts by cause,
+  measured switch time per model, and models loaded 3 or more times in 10 minutes (`thrashing`).
+  Eviction receipts carry `trigger` and `unload_ms`; `switch_ms` includes the total time each model
+  spent loading. The database counts the window in full. Measured load times seed the eviction
+  planner after a restart. The budget view lists every backend it applies to.
+- **Every MCP tool result reports its time.** `timing` carries `elapsed_ms` and `started_at`, and
+  for a task the `queue_ms`, `load_ms`, `prompt_ms` and `output_ms` phases.
+- **One shared database.** `~/.octocode/freellama/freellama.sqlite` (write-ahead logging) holds
+  measured runner sizes, placement feedback, the usage ledger and the audit, shared by every
+  FreeLlama process on the machine; two processes measuring one runner keep the larger size, and
+  placement feedback merges (per backend and task the longer history wins). The first start
+  imports the old `~/.local/share/freellama` files (`usage.jsonl.1` included) once, in one
+  transaction, so two processes starting together import once, and copies `platform.toml`,
+  `runtime.toml` and `benchmark-report.json` from `~/.config/freellama`, leaving the old files in
+  place. `--ephemeral` writes nothing. `runtime.toml` in the home is read when no runtime config is given. The MCP server's token
+  calibration moves to `~/.octocode/freellama/token-calibration`.
+- **No ping-pong between backends.** A measured speed advantage no longer forces a cold load while
+  the other backend already has an eligible model loaded (`resident_backend_avoids_cold_load`).
+- **Unloads through `/api/embed`.** An empty embed request with `keep_alive: 0` is treated as the
+  unload it is, not a generation.
+
+- **Loaded models keep serving under memory pressure.** Loading a large model (gpt-oss:20b,
+  12.8 GB, on a 32 GB Mac) leaves macOS swapping and at its memory-pressure warning level, and
+  FreeLlama then refused every raw request with 503, including requests to the model it had just
+  loaded. A raw request now counts as resident reuse when its `model` is in Ollama's `/api/ps` at a
+  compatible `num_ctx`, which the swapping and low-memory holds already spare, and an OS memory
+  warning holds only new loads; the critical level still holds everything. New loads still wait.
+- **Raw requests no longer leak queue places:** when a client gave up while queued for the raw
+  passthrough slot (for example a decision-API caller hitting its own deadline), the queued count
+  was never decremented. Leaked places inflated `Retry-After` and, after eight, every raw request
+  that had to wait was refused at once with 429. The count is now released however the wait ends,
+  and `/_freellama/v1/health` reports `raw_proxy.waiting` back at 0.
+- **TypeSafe `assets` work on `/v1/systemone`.** Ollama reads images only from a shared `images`
+  list and drops `assets` without an error, so an image question was answered from the text alone.
+  The proxy now moves assets into `images` when every image applies to every question (one question,
+  or images referenced from the state) and refuses with 400 when an image belongs to one question of
+  several, or is not a PNG or JPEG. A text-only decision model then refuses the image explicitly.
+- **`warm` loads embedding models:** `warm {task:"embedding"}` (HTTP, MCP `run_task {warm:true}`,
+  CLI `warm --task embedding`) sends Ollama's empty `/api/embed` request instead of refusing.
+  Decision models still load on their first `/v1/systemone` call; Ollama has no load-only request
+  for them.
+- **Docs:** `docs/MODEL_SELECTION.md` shows how to use FreeLlama as Octocode's local `clasify`
+  provider and what Ollama's decision API accepts.
+
 ## 0.7.0
 
 Breaking: Node.js 22 or newer (Node 20 reached end of life in April 2026), Rust 1.89 or newer, and

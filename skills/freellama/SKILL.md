@@ -5,7 +5,7 @@ description: "Use when delegating token-heavy work to local Ollama models throug
 
 # FreeLlama
 
-Operate FreeLlama as governed local-model delegation, not as a frontier-model replacement. The nine MCP tools and their request shapes are listed in the [MCP reference](https://github.com/bgauryy/FreeLlama/blob/main/packages/mcp/README.md#tools).
+Operate FreeLlama as governed local-model delegation, not as a frontier-model replacement. The ten MCP tools and their request shapes are listed in the [MCP reference](https://github.com/bgauryy/FreeLlama/blob/main/packages/mcp/README.md#tools).
 
 Flow: `PREREQUISITE → DIAGNOSE → DECIDE → EXECUTE → VERIFY`
 
@@ -29,6 +29,9 @@ Prefer the MCP server when the host has it; the same operations run from a shell
 | `run_task{task:"embedding",input}` | `task --task embedding --input-file FILE` (one item per line) |
 | `run_task{warm:true,model,contextTokens}` | `warm --model TAG --context-tokens N` |
 | `run_task{defer:true}`, `task_jobs` | `task --defer ...`, `jobs`, `jobs --id ID [--cancel or --remove]` |
+| `ollama_manage{action:"stop",model}` | `unload --model TAG` (waits for the model's running tasks; never loads it first) |
+| `doctor` (its `platform_health.readiness`) | `ready` (exit 0 only when serve can run work) |
+| `read_response{file,section?,offset?,limit?}` | read the `response_file` JSON directly |
 | `session{action:"create"}`, `scope{...}` | `session`, `scope create`, `scope get`, `scope fork`, `scope delete` |
 | `models{view:"library"}`, `models{view:"detail"}`, `ollama_manage`, `ollama_delete`, `delegate_research` | MCP only |
 
@@ -63,7 +66,7 @@ qualified installed model; never infer inventory from a model family name or thi
 
 ### A — grounded files
 
-Call `delegate_research{question,workspacePath,model?,adapter?,agent?}` with one narrow lookup over 1–5 source files. It needs `serve`: every model turn is a managed `coding` task with admission and physical-placement receipts. Keep the path inside `FREELLAMA_MCP_ALLOWED_ROOTS`; never widen it to `$HOME` or `/` for convenience. Bash is the measured default adapter, Octocode is opt-in for structural/LSP search. Read `verification`, successful call counts, full `citations[]`, `contextManagement`, and `execution.receipts`; failed calls do not ground a claim. Retry `isError` once, then do the work yourself.
+Call `delegate_research{question,workspacePath,model?,adapter?,agent?}` with one narrow lookup over 1–5 source files. It needs `serve`: every model turn is a managed `coding` task with admission and physical-placement receipts. Keep the path inside `FREELLAMA_MCP_ALLOWED_ROOTS`; never widen it to `$HOME` or `/` for convenience. Bash is the measured default adapter, Octocode is opt-in for structural/LSP search. Read `verification`, successful call counts and full `citations[]` inline; `contextManagement`, `execution.receipts`, the evidence trail and every observation the model saw are in `response_file` (read one with `read_response{file,section}`, or pass `receipt:"full"`). Failed calls do not ground a claim. Retry `isError` once, then do the work yourself.
 
 Context: the adapter budget is `contextTokens - outputTokens - safetyMarginTokens`. Older observations compact first and full tool output stays retrievable through pages. The token estimate starts at `charsPerToken` and calibrates upward from Ollama's real counts per model; read `token_counting` and `calibration_samples` rather than assuming exact counts. Keep `pinnedOverflow:"error"` (system prompt and question are byte-preserved); `"clip"` needs explicit human acceptance, and raising `contextTokens` or narrowing the task is safer. Tune per call with `agent`, deployment defaults with `FREELLAMA_AGENT_*`; confinement and read-only actions are not knobs.
 
@@ -75,7 +78,7 @@ Preview with `run_task{preview:true,task?,model?,executionPreference?,minPlaceme
 
 Batch `run_task{task:"embedding",input:[...]}` and leave `returnEmbeddings:false` unless code, not the orchestrator, needs vectors.
 
-For work that may wait, use `run_task{defer:true,timeoutSeconds,priority,...}` and inspect its ID with `task_jobs{action:"get",jobId}`. `timeoutSeconds` includes discovery, queueing, loading, and inference. `task_jobs{action:"cancel",jobId}` waits for local permit release; it does not prove Ollama stopped decoding. Jobs and bounded results are process-local and expire; they are not resumed after restart. Preview accepts routing fields only: omit payloads, priorities, deadlines, and `defer`, then make a separate execution call.
+When the client sends a `progressToken`, a single `run_task` reports its phases (queued, waiting for memory, loading, running) as progress and still returns the normal result. For work that may wait, use `run_task{defer:true,timeoutSeconds,priority,...}` and inspect its ID with `task_jobs{action:"get",jobId}`. `timeoutSeconds` includes discovery, queueing, loading, and inference. `task_jobs{action:"cancel",jobId}` waits for local permit release; it does not prove Ollama stopped decoding. Jobs and bounded results are process-local and expire; they are not resumed after restart. Preview accepts routing fields only: omit payloads, priorities, deadlines, and `defer`, then make a separate execution call.
 
 ### D — retain history or prepare a runner
 
@@ -96,7 +99,7 @@ Ask for missing workload/modality, quality, latency, context, privacy, download,
 
 ### F — diagnose a failure
 
-Run `doctor`, `doctor{view:"status"}` and `models{view:"resident"}`, then match the symptom:
+Run `doctor`, `doctor{view:"status"}` and `models{view:"resident"}`, then match the symptom. `doctor` reports `status:"degraded"` with `problems` when serve is unreachable or its readiness check names what it waits for (`ollama`, `catalog`, `cpu_backend`). A compacted result's `sections` name what its `response_file` holds; `read_response` returns one section or page.
 
 | Symptom | Cause and action |
 |---|---|
@@ -108,10 +111,20 @@ Run `doctor`, `doctor{view:"status"}` and `models{view:"resident"}`, then match 
 | Research root refusal | Keep `workspacePath` inside an allowlisted root. |
 | CLI and server disagree | Restart or align versions before trusting CLI-specific flags. |
 
+## Keep local work fast and light
+
+- One model, one context: send the same `contextTokens` to a model and warm at that context; a different `num_ctx` reloads the runner and drops its prompt cache.
+- Stable prefix first: system prompt, tool list and documents before the variable part, and append rather than edit. Warm a long prefix once (`run_task{warm:true,systemPrompt}`) or keep follow-ups in a `scope`; read `metrics.cached_prompt_tokens` to confirm reuse.
+- Spend output deliberately: keep the `think:false` defaults outside coding, set `num_predict` from the output contract, and use `stopOnRepetition` for models known to loop.
+- Free memory explicitly: `ollama_manage{action:"stop",model}` before switching to a large model; never stack two large models without the memory arithmetic. A load that does not fit waits, then is refused; do not retry it in a loop, free memory or pick a smaller model.
+- Keep your own context small: use the inline answer and verdict, and fetch only the `response_file` section you need with `read_response`.
+- Progress: send a `progressToken` and a waiting task reports `waiting for memory`, `loading MODEL (~N s)`, `running`. A long wait is the machine protecting itself, not a hang.
+
 ## Memory, placement and disk
 
 - Budget model weights, KV cache, other residents and the host reserve from current observations; never co-resident two large models without that arithmetic. `OLLAMA_NUM_PARALLEL` multiplies KV by context; unset `OLLAMA_MAX_LOADED_MODELS` resolves to 3 × GPU count. KV precision (`q8_0`, `q4_0`) is a process-wide quality trade-off: compare on representative tasks first.
 - For a large GPU model plus a small CPU helper, the operator runs a second Ollama process with `serve --cpu-upstream ... --cpu-model <exact-tag>` and you require observed `size_vram:0`. Some runners (MLX on Metal) stay fully on the GPU even when assigned to CPU. `executionPreference` only chooses among already-eligible models; explicit `model` and session affinity win, and an unmet preference returns `execution.preference_satisfied:false`. Feedback rules: [CPU and GPU routing](https://github.com/bgauryy/FreeLlama/blob/main/docs/CPU_GPU_ROUTING.md).
+- `doctor` advises `LLAMA_ARG_CACHE_RAM` (for example 2048 on 32 GB hosts): each runner otherwise may keep up to 8 GiB of displaced prompt caches in host RAM.
 - Apply `OLLAMA_*` changes only with human intent, in the environment of the Ollama service, then restart it ([Production](https://github.com/bgauryy/FreeLlama/blob/main/docs/PRODUCTION.md#configure-ollama-explicitly)).
 - Disk: treat old models as candidates, never a retention policy. Delete only an exact tag a human names in the current conversation, with `ollama rm <tag>` or `ollama_delete`; never delete files under `~/.ollama/models`.
 

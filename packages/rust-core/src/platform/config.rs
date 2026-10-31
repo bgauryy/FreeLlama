@@ -47,18 +47,20 @@ pub struct PlatformConfig {
     /// How long a raw generation may wait for a slot or for managed execution before 429/503.
     /// `None` falls back to the runtime file, then 10s.
     pub raw_queue_wait: Option<Duration>,
-    /// Optional versioned, atomically replaced adaptive-feedback snapshot.
-    pub feedback_file: Option<PathBuf>,
     /// Optional bearer token protecting both control and Ollama-compatible routes.
     pub auth_token: Option<String>,
+    /// Named bearer tokens with their own usage, budgets and rights; see `clients`.
+    pub client_keys: Vec<super::clients::ClientKey>,
+    /// Other OpenAI-compatible engines that `/v1/...` requests route to by model.
+    pub upstreams: Vec<crate::proxy::OpenAiUpstream>,
     /// Explicit opt-in for a non-loopback listener. Requires `auth_token`.
     pub allow_remote: bool,
     /// Optional runtime config file (TOML), re-read when it changes. `None` falls back to
     /// `FREELLAMA_RUNTIME_CONFIG`.
     pub runtime_config: Option<PathBuf>,
-    /// Optional JSON-lines usage ledger. `None` falls back to `FREELLAMA_USAGE_FILE`; without
-    /// either, usage totals are kept in memory only.
-    pub usage_file: Option<PathBuf>,
+    /// The shared database for measured footprints, placement feedback, usage and the residency
+    /// audit. `None` keeps them in memory for this process only.
+    pub store: Option<crate::store::Store>,
 }
 
 /// Manual so the bearer token never reaches logs: a set token prints as `"<redacted>"`.
@@ -82,11 +84,12 @@ impl std::fmt::Debug for PlatformConfig {
             session_ttl,
             raw_proxy_max_concurrent_requests,
             raw_queue_wait,
-            feedback_file,
             auth_token,
+            client_keys,
+            upstreams,
             allow_remote,
             runtime_config,
-            usage_file,
+            store,
         } = self;
         formatter
             .debug_struct("PlatformConfig")
@@ -109,11 +112,12 @@ impl std::fmt::Debug for PlatformConfig {
                 raw_proxy_max_concurrent_requests,
             )
             .field("raw_queue_wait", raw_queue_wait)
-            .field("feedback_file", feedback_file)
             .field("auth_token", &auth_token.as_ref().map(|_| "<redacted>"))
+            .field("client_keys", client_keys)
+            .field("upstreams", upstreams)
             .field("allow_remote", allow_remote)
             .field("runtime_config", runtime_config)
-            .field("usage_file", usage_file)
+            .field("store", store)
             .finish()
     }
 }
@@ -143,11 +147,12 @@ impl PlatformConfig {
             session_ttl: None,
             raw_proxy_max_concurrent_requests: None,
             raw_queue_wait: None,
-            feedback_file: None,
             auth_token: None,
+            client_keys: Vec::new(),
+            upstreams: Vec::new(),
             allow_remote: false,
             runtime_config: None,
-            usage_file: None,
+            store: None,
         }
     }
 
@@ -158,10 +163,11 @@ impl PlatformConfig {
         self
     }
 
-    /// Append one JSON line per finished managed task to `path` and replay it at startup.
+    /// Keep footprints, placement feedback, usage and the residency audit in `store`, shared with
+    /// every other `FreeLlama` process that opens the same file.
     #[must_use]
-    pub fn with_usage_file(mut self, path: impl Into<PathBuf>) -> Self {
-        self.usage_file = Some(path.into());
+    pub fn with_store(mut self, store: crate::store::Store) -> Self {
+        self.store = Some(store);
         self
     }
 
@@ -236,18 +242,30 @@ impl PlatformConfig {
         self
     }
 
-    /// Persist bounded adaptive feedback across service restarts.
-    #[must_use]
-    pub fn with_feedback_file(mut self, path: impl Into<PathBuf>) -> Self {
-        self.feedback_file = Some(path.into());
-        self
-    }
-
     /// Require a bearer token on every platform and passthrough request.
     #[must_use]
     pub fn with_auth_token(mut self, token: impl Into<String>) -> Self {
         self.auth_token = Some(token.into());
         self
+    }
+
+    /// Accept these client keys besides the operator token.
+    #[must_use]
+    pub fn with_client_keys(mut self, keys: Vec<super::clients::ClientKey>) -> Self {
+        self.client_keys = keys;
+        self
+    }
+
+    /// Route OpenAI-compatible requests for models these engines serve to them.
+    #[must_use]
+    pub fn with_upstreams(mut self, upstreams: Vec<crate::proxy::OpenAiUpstream>) -> Self {
+        self.upstreams = upstreams;
+        self
+    }
+
+    /// Whether any bearer check applies.
+    pub(super) fn authenticates(&self) -> bool {
+        self.auth_token.is_some() || !self.client_keys.is_empty()
     }
 
     /// Permit a non-loopback listener. Validation still requires bearer authentication.
@@ -281,14 +299,16 @@ impl PlatformConfig {
     pub fn validate(&self) -> Result<()> {
         let listen: SocketAddr = self.listen.parse().context("invalid --listen address")?;
         ensure!(
-            listen.ip().is_loopback() || (self.allow_remote && self.auth_token.is_some()),
+            listen.ip().is_loopback() || (self.allow_remote && self.authenticates()),
             "non-loopback platform listeners require remote access and bearer authentication"
         );
         if let Some(token) = self.auth_token.as_deref() {
             crate::auth::validate_token(token)?;
         }
+        super::clients::validate(&self.client_keys, self.auth_token.as_deref())?;
+        crate::proxy::validate_upstreams(&self.upstreams)?;
         ensure!(
-            !self.allow_remote || self.auth_token.is_some(),
+            !self.allow_remote || self.authenticates(),
             "remote access requires bearer authentication"
         );
         ProxyConfig::new(&self.listen, &self.upstream, self.allow_remote).validate()?;

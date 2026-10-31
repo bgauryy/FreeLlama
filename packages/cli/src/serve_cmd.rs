@@ -1,6 +1,6 @@
 //! `freellama serve`: operator file discovery, platform configuration and startup.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -9,7 +9,7 @@ use freellama::platform::{PlatformConfig, serve as serve_platform};
 use super::args::{AdmissionArgs, PlatformStartArgs, ProductionArgs};
 
 /// Operator evidence files for `serve`: flag, then environment, then the working directory, then
-/// the per-user config directory.
+/// the `FreeLlama` home.
 ///
 /// `minConfidence: "medium"` needs BOTH a policy file and a benchmark report, and requiring two
 /// explicit flags meant almost nobody ever had them — the gate degraded to refusing everything.
@@ -18,9 +18,11 @@ use super::args::{AdmissionArgs, PlatformStartArgs, ProductionArgs};
 fn resolve_operator_files(
     policy_file: Option<PathBuf>,
     benchmark_report: Option<PathBuf>,
+    home: Option<&Path>,
 ) -> (Option<PathBuf>, Option<PathBuf>) {
-    let policy_file = policy_file.or_else(|| discover_config("platform.toml"));
-    let benchmark_report = benchmark_report.or_else(|| discover_config("benchmark-report.json"));
+    let policy_file = policy_file.or_else(|| discover_config("platform.toml", home));
+    let benchmark_report =
+        benchmark_report.or_else(|| discover_config("benchmark-report.json", home));
     for (label, path) in [
         ("policy file", &policy_file),
         ("benchmark report", &benchmark_report),
@@ -41,8 +43,17 @@ fn resolve_operator_files(
 }
 
 pub(crate) async fn start_platform(args: PlatformStartArgs) -> Result<()> {
+    let home = args
+        .production
+        .home
+        .clone()
+        .or_else(freellama::store::default_home);
+    // An ephemeral server writes nothing, not even the one-time copy of older operator files.
+    if let Some(home) = home.as_deref().filter(|_| !args.production.ephemeral) {
+        adopt_legacy_config(home);
+    }
     let (policy_file, benchmark_report) =
-        resolve_operator_files(args.policy_file, args.benchmark_report);
+        resolve_operator_files(args.policy_file, args.benchmark_report, home.as_deref());
     let mut config = PlatformConfig::new(
         args.listen,
         args.backends.upstream,
@@ -78,27 +89,13 @@ pub(crate) async fn start_platform(args: PlatformStartArgs) -> Result<()> {
     if let Some(seconds) = args.admission.raw_queue_wait_seconds {
         config = config.with_raw_queue_wait(Duration::from_secs(seconds));
     }
-    config = with_runtime_and_usage(config, &args.production);
+    config = with_runtime_and_store(config, &args.production, home.as_deref())?;
+    config = with_keys_and_upstreams(config, &args.production, home.as_deref())?;
     if let Some(max) = args.admission.max_sessions {
         config = config.with_max_sessions(max);
     }
     if let Some(seconds) = args.admission.session_ttl_seconds {
         config = config.with_session_ttl(Duration::from_secs(seconds));
-    }
-    if !args.production.ephemeral_feedback {
-        let path = args
-            .production
-            .feedback_file
-            .or_else(|| std::env::var_os("FREELLAMA_FEEDBACK_FILE").map(PathBuf::from))
-            .or_else(default_feedback_file)
-            .context(
-                "cannot determine a feedback path; pass --feedback-file or --ephemeral-feedback",
-            )?;
-        eprintln!(
-            "freellama: persisting bounded placement feedback at {}",
-            path.display()
-        );
-        config = config.with_feedback_file(path);
     }
     let token_file = args
         .production
@@ -126,8 +123,12 @@ pub(crate) fn configure_resource_policy(
     if args.resource_hold_available_percent.is_some()
         || args.resource_resume_available_percent.is_some()
         || args.resource_telemetry_policy.is_some()
+        || args.low_memory.is_some()
     {
         let mut policy = freellama::platform::resources::ResourcePolicy::default();
+        if let Some(value) = args.low_memory {
+            policy.low_memory = value.into();
+        }
         if let Some(value) = args.resource_hold_available_percent {
             policy.hold_available_percent = value;
         }
@@ -143,27 +144,96 @@ pub(crate) fn configure_resource_policy(
     Ok(())
 }
 
-/// The live-tunable runtime file and the usage ledger (on by default, next to the feedback file).
-fn with_runtime_and_usage(
+/// The live-tunable runtime file and the shared database (on by default, in the home).
+fn with_runtime_and_store(
     mut config: PlatformConfig,
     production: &ProductionArgs,
-) -> PlatformConfig {
-    if let Some(path) = &production.runtime_config {
+    home: Option<&Path>,
+) -> Result<PlatformConfig> {
+    let runtime = production
+        .runtime_config
+        .clone()
+        .or_else(|| std::env::var_os("FREELLAMA_RUNTIME_CONFIG").map(PathBuf::from))
+        .or_else(|| {
+            home.map(|home| home.join("runtime.toml"))
+                .filter(|path| path.is_file())
+        });
+    if let Some(path) = runtime {
         eprintln!("freellama: watching runtime config {}", path.display());
         config = config.with_runtime_config(path);
     }
-    if !production.ephemeral_usage {
-        let path = production
-            .usage_file
-            .clone()
-            .or_else(|| std::env::var_os("FREELLAMA_USAGE_FILE").map(PathBuf::from))
-            .or_else(|| default_feedback_file().map(|path| path.with_file_name("usage.jsonl")));
-        if let Some(path) = path {
-            eprintln!("freellama: recording task usage at {}", path.display());
-            config = config.with_usage_file(path);
-        }
+    if production.ephemeral {
+        return Ok(config);
     }
-    config
+    let home = home.context("cannot determine the FreeLlama home; pass --home or --ephemeral")?;
+    let path = home.join(freellama::store::DATABASE_FILE);
+    let store = freellama::store::Store::open(&path)?;
+    if let Some(legacy) = legacy_data_dir()
+        && let Some(imported) = store.import_legacy(&legacy)?
+        && (imported.feedback || imported.footprints > 0 || imported.usage > 0)
+    {
+        eprintln!(
+            "freellama: imported {} usage records, {} footprints{} from {}",
+            imported.usage,
+            imported.footprints,
+            if imported.feedback {
+                " and placement feedback"
+            } else {
+                ""
+            },
+            legacy.display()
+        );
+    }
+    eprintln!(
+        "freellama: keeping footprints, feedback, usage and the residency audit in {}",
+        path.display()
+    );
+    Ok(config.with_store(store))
+}
+
+/// Client keys and OpenAI-compatible upstreams, from their flags or the home's `clients.toml`
+/// and `upstreams.toml`.
+fn with_keys_and_upstreams(
+    mut config: PlatformConfig,
+    production: &ProductionArgs,
+    home: Option<&Path>,
+) -> Result<PlatformConfig> {
+    let in_home = |name: &str| {
+        home.map(|home| home.join(name))
+            .filter(|path| path.is_file())
+    };
+    if let Some(path) = production
+        .client_keys
+        .clone()
+        .or_else(|| in_home("clients.toml"))
+    {
+        let keys = freellama::platform::load_client_keys(&path)?;
+        eprintln!(
+            "freellama: {} client key(s) from {}",
+            keys.len(),
+            path.display()
+        );
+        config = config.with_client_keys(keys);
+    }
+    if let Some(path) = production
+        .upstreams
+        .clone()
+        .or_else(|| in_home("upstreams.toml"))
+    {
+        let upstreams = freellama::proxy::load_upstreams(&path)?;
+        eprintln!(
+            "freellama: {} OpenAI-compatible upstream(s) from {}: {}",
+            upstreams.len(),
+            path.display(),
+            upstreams
+                .iter()
+                .map(|upstream| format!("{} at {}", upstream.name, upstream.base_url))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        config = config.with_upstreams(upstreams);
+    }
+    Ok(config)
 }
 
 fn report_admission_config() {
@@ -179,41 +249,58 @@ fn report_admission_config() {
     );
 }
 
-fn default_feedback_file() -> Option<PathBuf> {
+/// Where versions before the shared database kept their data files.
+fn legacy_data_dir() -> Option<PathBuf> {
     if cfg!(target_os = "windows") {
-        return std::env::var_os("LOCALAPPDATA")
-            .map(PathBuf::from)
-            .map(|path| path.join("FreeLlama").join("feedback.json"));
+        return std::env::var_os("LOCALAPPDATA").map(|path| PathBuf::from(path).join("FreeLlama"));
     }
     std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
-        .map(|path| path.join("freellama").join("feedback.json"))
+        .map(|path| path.join("freellama"))
 }
 
-/// Look for a conventional config file next to the working directory, then at the repo root.
-///
-/// Only used when the corresponding flag is absent. Explicit flags always win; this exists so the
-/// documented happy path does not require remembering two of them.
-/// The working directory first (a project-local policy), then the per-user config directory, which
-/// is what an MCP-autostarted `serve` — launched from whatever directory the client chose — can
-/// rely on.
-fn discover_config(name: &str) -> Option<PathBuf> {
+/// Where versions before the home directory kept their operator files.
+fn legacy_config_dir() -> Option<PathBuf> {
+    if cfg!(target_os = "windows") {
+        return std::env::var_os("APPDATA").map(|path| PathBuf::from(path).join("FreeLlama"));
+    }
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+        .map(|path| path.join("freellama"))
+}
+
+/// Copy operator files from the old per-user config directory into the home once, so an upgrade
+/// keeps its policy. The old files stay where they were.
+fn adopt_legacy_config(home: &Path) {
+    let Some(legacy) = legacy_config_dir() else {
+        return;
+    };
+    for name in ["platform.toml", "benchmark-report.json", "runtime.toml"] {
+        let (from, to) = (legacy.join(name), home.join(name));
+        if from.is_file() && !to.exists() {
+            let copied = std::fs::create_dir_all(home).and_then(|()| std::fs::copy(&from, &to));
+            match copied {
+                Ok(_) => eprintln!(
+                    "freellama: copied {} into {}",
+                    from.display(),
+                    home.display()
+                ),
+                Err(error) => eprintln!("freellama: could not copy {}: {error}", from.display()),
+            }
+        }
+    }
+}
+
+/// Look for a conventional config file in the working directory (a project-local policy), then
+/// in the `FreeLlama` home, which is what an MCP-autostarted `serve`, launched from whatever
+/// directory the client chose, can rely on. Only used when the corresponding flag is absent.
+fn discover_config(name: &str, home: Option<&Path>) -> Option<PathBuf> {
     let local = PathBuf::from(name);
     if local.is_file() {
         return Some(local);
     }
-    user_config_file(name)
-}
-
-fn user_config_file(name: &str) -> Option<PathBuf> {
-    let dir = if cfg!(target_os = "windows") {
-        std::env::var_os("APPDATA").map(|path| PathBuf::from(path).join("FreeLlama"))
-    } else {
-        std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-            .map(|path| path.join("freellama"))
-    }?;
-    Some(dir.join(name)).filter(|path| path.is_file())
+    home.map(|home| home.join(name))
+        .filter(|path| path.is_file())
 }

@@ -45,9 +45,17 @@ flowchart LR
     F -->|"raw /api and /v1"| G["Primary Ollama"]
     F -->|"managed primary task"| G
     F -->|"managed assigned task"| U["Optional CPU Ollama"]
+    F -->|"/v1 for an engine's model"| O["Optional OpenAI-compatible engines<br/>LM Studio, llama.cpp, vLLM, cloud"]
     G --> E["Metal, MLX, CUDA, ROCm, Vulkan, or CPU runner"]
     U --> E2["CPU runner"]
 ```
+
+Bearer checks run first: the operator token, or a client key whose budget and rights are checked
+and whose name tags the request (`proxy::Caller`). Raw responses stream through unchanged while
+`proxy/usage.rs` reads the token counts and `load_duration` they report; the platform's raw hooks
+turn them into usage-ledger rows, audit events and load-time samples. `proxy/upstreams.rs` routes
+OpenAI-compatible requests by model to other engines. `platform/preload.rs` runs startup loads and
+learns model successors (`next:<model>` facts) for predicted loads.
 
 FreeLlama does not make an individual model decode faster. It can improve workload completion by
 avoiding unsuitable routes, reducing avoidable transitions, refusing unsupported work early, and
@@ -159,7 +167,8 @@ The control API uses snake_case JSON. A managed task body is the routing fields 
 installed tag of that family; an unknown or ambiguous name is refused with the installed candidates.
 `messages` (Ollama message objects, images included) replaces `prompt`; `input` serves embeddings;
 `context_tokens` owns `num_ctx` and placement owns `num_gpu`, so neither is accepted inside
-`request_options.options`. `stop_on_repetition: true` streams the chat from Ollama and stops as soon
+`request_options.options`. `stop_on_repetition` (on by default when no `num_predict` caps the output,
+`false` to turn it off) streams the chat from Ollama and stops as soon
 as the output repeats its unit twice after the first copy over 96+ characters: the connection
 closes, which cancels generation upstream, and everything generated is kept with
 `done_reason: "repetition"`. An Ollama "token repeat limit" abort is kept the same way
@@ -394,24 +403,26 @@ authority. Configured settings alone do not prove physical processor placement.
 
 The shared [resource governor](https://github.com/bgauryy/FreeLlama/blob/main/packages/rust-core/src/platform/resources/mod.rs) samples local
 available-memory estimates, load per logical CPU, OS memory pressure, active swap-out growth, and
-thermal throttling when reported. OS memory pressure holds every local demand; active swap-out
-growth holds new loads; the CPU-load hold applies only to CPU-assigned work (saturated cores slow
+thermal throttling when reported. OS memory pressure holds new loads, and resident runners only
+at the critical level; active swap-out growth holds new loads (a raw passthrough request counts as
+resident when its `model` is in `/api/ps` at a compatible context); the CPU-load hold applies only to CPU-assigned work (saturated cores slow
 nothing on the GPU, so raw passthrough, which cannot know residency, is not refused for it), and to
 all work on a host whose sampler sees no accelerator; the
 thermal hold applies to CPU-assigned work and to cold loads (a new heat source) but not to a bounded
 request on a runner already resident on the GPU (`ResourceDemand::is_held_by`; the assessment's
 `held_by` lists the holds that applied). Low available RAM (below the larger of 15% or 1 GiB, clearing after two
-healthy samples above the larger of 20% or 2 GiB) depends on the platform (`ResourcePolicy::low_memory`).
+healthy samples above the larger of 20% or 2 GiB) follows `ResourcePolicy::low_memory`.
 A new load must leave that reserve free, but never more than its own size above the 1 GiB floor.
-On macOS (`advisory`) the estimate undercounts what the OS can reclaim, so a load that does not cover
-it first unloads idle runners and then dispatches with a `memory_advisory`. On Linux and other
-platforms (`refuse`) a new load that does not fit first unloads idle runners and then waits
+By default (`refuse`, every platform) a new load that does not fit first unloads idle runners and then waits
 with `held_insufficient_capacity` until a permit release or a fresh sample frees capacity, or refuses
 with 503 at its deadline: Linux `MemAvailable` already includes reclaimable cache and is the hard cap
 in a container, so over-admitting invites the OOM killer. Already-resident runners add no memory and
 are admitted in both modes, also during an active-swapping hold, so a large load never locks out
 reuse of its own runner; swapping still holds new loads. Historical swap occupancy alone is not pressure. Samples are cached for two
 seconds; unavailable signals stay unknown. Remote backends bypass this host gate.
+On macOS the available figure adds bounded reclaimable pages (inactive, speculative, purgeable), so a
+load past it pushes the host into compression and swap. `--low-memory advisory` (`FREELLAMA_LOW_MEMORY`)
+admits such a load with a `memory_advisory` instead, after unloading idle runners.
 
 Each pressure signal recovers independently after two fresh samples that meet its recovery
 threshold. A recovered CPU-load signal therefore clears even while RAM remains low.
@@ -424,8 +435,8 @@ platforms have no host collector, so they default to `best_effort` and admit wit
 Unsupported Linux collector signals remain explicitly unavailable rather than being fabricated.
 The pure `ResourceSnapshot::assess_capacity` calculation is shared by admission and previews.
 Previews use the same footprint lookup, subtract existing reservations, and expose both queue and
-resource readiness. Insufficient model headroom reports `runnable_low_memory_estimate` and admits
-no siblings on macOS; elsewhere it reports `held_insufficient_capacity`. Preview capacity is advisory and conservative, never a reservation.
+resource readiness. Insufficient model headroom reports `held_insufficient_capacity`, or
+`runnable_low_memory_estimate` under `--low-memory advisory`. Preview capacity is advisory and conservative, never a reservation.
 
 Managed CPU/unified-memory tasks reserve estimated additional model-file and known F16 KV bytes
 across both backends. Verified runner footprints replace that estimate only for the same backend,
@@ -496,8 +507,8 @@ flowchart TD
 
 The hint never changes the operator's CPU assignment. If the preferred backend has no eligible
 model, routing falls back and returns `preference_satisfied: false`. Feedback is task-specific,
-bounded, versioned, and prompt-free. The CLI persists it with atomic file replacement by default;
-restart-reset behavior is available only through the explicit `--ephemeral-feedback` mode. It
+bounded, versioned, and prompt-free. The CLI keeps it in the shared database by default;
+restart-reset behavior is available only through the explicit `--ephemeral` mode. It
 records normalized latency only for already-resident, physically verified tasks so prompt size and
 cold-load cost do not poison the comparison. It requires more than a 10% advantage; capacity can
 break a tie before the sample threshold. Quality routing, explicit model selection, and session
@@ -604,7 +615,7 @@ FreeLlama keeps these values in memory:
 
 Sessions are bounded (default 1024) and expire after idle time (default one hour); they store only
 model affinity, never prompts or Ollama KV. Restarting `freellama serve` clears sessions and the catalog cache. Persisted placement feedback is
-reloaded; `--ephemeral-feedback` intentionally resets it. Ollama owns model residency, so loaded
+reloaded; `--ephemeral` intentionally resets it. Ollama owns model residency, so loaded
 models survive a FreeLlama restart. Scope histories and their revisions do not survive restart.
 They store messages independently from affinity and append only a successful generation at the
 expected revision. Warming uses ordinary admission and fit checks; omitted residency controls use

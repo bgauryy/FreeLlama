@@ -40,6 +40,8 @@ enum ResourceFailureReceipt {
         status: &'static str,
         phase: &'static str,
         waited_ms: u128,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        held_by: Vec<resources::PressureReason>,
     },
 }
 
@@ -128,7 +130,28 @@ impl ApiError {
             status: "deadline_exceeded",
             phase,
             waited_ms,
+            held_by: Vec::new(),
         });
+        self
+    }
+
+    /// Name the host signals that were holding work when a resource deadline passed, so a
+    /// caller can tell heat from memory from CPU load.
+    pub(super) fn with_holds(mut self, reasons: Vec<resources::PressureReason>) -> Self {
+        if let Some(ResourceFailureReceipt::Deadline { held_by, .. }) =
+            self.body.resource_admission.as_mut()
+        {
+            if !reasons.is_empty() {
+                let names = reasons
+                    .iter()
+                    .filter_map(|reason| serde_json::to_value(reason).ok())
+                    .filter_map(|value| value.as_str().map(str::to_owned))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                self.body.error = format!("{}: host held by {names}", self.body.error);
+            }
+            *held_by = reasons;
+        }
         self
     }
 

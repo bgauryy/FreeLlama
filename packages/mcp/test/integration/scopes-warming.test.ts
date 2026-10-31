@@ -86,7 +86,6 @@ describe("scope and warming client contracts", () => {
     { name: "scope", args: { action: "delete", scopeId: id, includeMessages: false } },
     { name: "run_task", args: { scopeId: id, prompt: "missing revision" } },
     { name: "run_task", args: { preview: true, scopeId: id, scopeRevision: 0 } },
-    { name: "run_task", args: { warm: true, model: "test:latest", task: "embedding" } },
     { name: "run_task", args: { warm: true, task: "completion" } },
     { name: "run_task", args: { warm: true, model: "test:latest", prompt: "hidden generation" } },
     { name: "run_task", args: { prompt: "solo", maxParallelism: 2 } },
@@ -112,6 +111,13 @@ describe("scope and warming client contracts", () => {
     expect(result.isError, JSON.stringify(result)).not.toBe(true);
     expect(requests[0]).toEqual({ method: "POST", path: "/_freellama/v1/warm", body: {
       model: "test:latest", context_tokens: 4096, defer: true, priority: "background", timeout_seconds: 10,
+    } });
+  });
+  it("forwards an embedding warm to the server, which loads it with an empty embed request", async () => {
+    const result = await call("run_task", { warm: true, model: "test:latest", task: "embedding", keepAlive: "60s" });
+    expect(result.isError, JSON.stringify(result)).not.toBe(true);
+    expect(requests[0]).toEqual({ method: "POST", path: "/_freellama/v1/warm", body: {
+      model: "test:latest", task: "embedding", keep_alive: "60s",
     } });
   });
   it.runIf(releaseServeAvailable)("CLI omitted controls preserve saved routing defaults", async () => {

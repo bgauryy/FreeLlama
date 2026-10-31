@@ -70,6 +70,9 @@ pub struct RuntimeFile {
     /// Per-model multiplier on the cost of unloading it (default 1): raise it for a model that is
     /// expensive to lose, lower it for one that is cheap to reload.
     pub eviction_costs: Option<BTreeMap<String, f64>>,
+    /// Most memory the resident runners of one local backend may hold together (`off`, `75%`,
+    /// `24GiB`); a load past it unloads the cheapest idle runners first.
+    pub model_memory_budget: Option<super::budget::MemoryBudget>,
     pub adaptive_concurrency: Option<AdaptiveMode>,
     /// Admission units per task; embeddings charge this base for each four-input group.
     pub task_costs: Option<BTreeMap<super::TaskKind, NonZeroU32>>,
@@ -79,6 +82,8 @@ pub struct RuntimeFile {
     pub usage_queue_capacity: Option<std::num::NonZeroUsize>,
     pub scopes: Option<super::ScopePolicy>,
     pub warming: Option<super::WarmingPolicy>,
+    /// Models to load at startup, and whether to load the model that usually comes next.
+    pub preload: Option<super::PreloadPolicy>,
     pub breaker_failures: Option<u32>,
     pub breaker_cooldown_seconds: Option<u64>,
 }
@@ -94,6 +99,9 @@ impl RuntimeFile {
             policy.validate()?;
         }
         if let Some(policy) = &file.warming {
+            policy.validate()?;
+        }
+        if let Some(policy) = &file.preload {
             policy.validate()?;
         }
         Ok(file)
@@ -126,6 +134,7 @@ pub struct Tunables {
     pub pinned_models: BTreeSet<String>,
     pub evict_idle_models: bool,
     pub eviction_costs: BTreeMap<String, f64>,
+    pub model_memory_budget: super::budget::MemoryBudget,
     pub adaptive_concurrency: AdaptiveMode,
     pub task_costs: BTreeMap<super::TaskKind, NonZeroU32>,
     pub context_mode: ContextMode,
@@ -135,6 +144,7 @@ pub struct Tunables {
     pub usage_queue_capacity: std::num::NonZeroUsize,
     pub scopes: super::ScopePolicy,
     pub warming: super::WarmingPolicy,
+    pub preload: super::PreloadPolicy,
     pub breaker_failures: u32,
     pub breaker_cooldown_seconds: u64,
     /// Setting name -> `cli`, `env`, `env_invalid`, `file`, `default`, or `ollama_num_parallel`.

@@ -32,6 +32,15 @@ export function killDelegateTree(child: ChildProcess): void {
 
 type DelegateRun = { child: ChildProcess; done: Promise<{ stdout: string; stderr: string }> };
 
+/** Diverts some stderr bytes (progress lines) away from the captured stderr. */
+export interface StderrFilter {
+  /** Returns the bytes of `chunk` to capture; bytes held for a later chunk count as `pending`. */
+  push(chunk: Buffer): Buffer;
+  /** End of stream: the held bytes to capture. */
+  end(): Buffer;
+  readonly pending: number;
+}
+
 /**
  * `execFile` with the delegate's group semantics. execFile ignores `detached` and its timeout,
  * maxBuffer, and abort paths kill only the direct child, so this mirrors its contract (utf8
@@ -41,7 +50,7 @@ type DelegateRun = { child: ChildProcess; done: Promise<{ stdout: string; stderr
 export function runDelegate(
   file: string,
   args: string[],
-  options: { env: NodeJS.ProcessEnv; signal?: AbortSignal; timeoutMs: number; maxBuffer: number },
+  options: { env: NodeJS.ProcessEnv; signal?: AbortSignal; timeoutMs: number; maxBuffer: number; stderrFilter?: StderrFilter },
 ): DelegateRun {
   const child = spawn(file, args, { env: options.env, detached: DETACH_DELEGATES, stdio: ["ignore", "pipe", "pipe"] });
   const done = new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
@@ -65,8 +74,11 @@ export function runDelegate(
     };
     if (options.signal?.aborted) onAbort();
     else options.signal?.addEventListener("abort", onAbort, { once: true });
-    const collect = (chunks: Buffer[], name: "stdout" | "stderr") => (chunk: Buffer) => {
-      const length = (name === "stdout" ? (outLen += chunk.length) : (errLen += chunk.length));
+    const filter = options.stderrFilter;
+    const collect = (chunks: Buffer[], name: "stdout" | "stderr") => (raw: Buffer) => {
+      // Filtered-out bytes are never captured, so they do not count toward maxBuffer.
+      const chunk = name === "stderr" && filter ? filter.push(raw) : raw;
+      const length = name === "stdout" ? (outLen += chunk.length) : (errLen += chunk.length) + (filter?.pending ?? 0);
       if (length > options.maxBuffer) {
         const overflow = new RangeError(`${name} maxBuffer length exceeded`);
         (overflow as NodeJS.ErrnoException).code = "ERR_CHILD_PROCESS_STDIO_MAXBUFFER";
@@ -82,6 +94,7 @@ export function runDelegate(
       settled = true;
       clearTimeout(timer);
       options.signal?.removeEventListener("abort", onAbort);
+      if (filter) err.push(filter.end());
       const stdout = Buffer.concat(out).toString("utf8");
       const stderr = Buffer.concat(err).toString("utf8");
       if (spawnError ?? failure) { reject(spawnError ?? failure); return; }

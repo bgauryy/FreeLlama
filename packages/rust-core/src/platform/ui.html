@@ -236,8 +236,18 @@ $("auth").addEventListener("submit", (event) => {
   try { sessionStorage.setItem("freellama-token", token); } catch (_) { /* storage blocked */ }
   refresh();
 });
+// Poll only while the page is visible: each refresh can make the server sample the host.
+let timer = null;
+function schedule() {
+  clearInterval(timer);
+  timer = document.hidden ? null : setInterval(refresh, 5000);
+}
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) refresh();
+  schedule();
+});
 refresh();
-setInterval(refresh, 2000);
+schedule();
 </script>
 </body>
 </html>

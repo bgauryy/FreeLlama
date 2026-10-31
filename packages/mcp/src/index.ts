@@ -13,6 +13,7 @@ import { SERVER_VERSION } from "./native.js";
 import { installProcessLifecycle } from "./lifecycle.js";
 import { startServeInBackground } from "./serve.js";
 import { withNormalizedToolSchemas } from "./schema-dialect.js";
+import { withToolResults } from "./tool-results.js";
 import { registerDocsResources } from "./docs-resources.js";
 import { registerDoctorTool } from "./tools/doctor.js";
 import { registerSessionTool } from "./tools/session.js";
@@ -22,6 +23,7 @@ import { registerRunTaskTool } from "./tools/run-task.js";
 import { registerTaskJobsTool } from "./tools/task-jobs.js";
 import { registerOllamaLifecycleTools } from "./tools/ollama-lifecycle.js";
 import { registerDelegateResearchTool } from "./tools/delegate-research.js";
+import { registerReadResponseTool } from "./tools/read-response.js";
 
 installProcessLifecycle();
 
@@ -34,10 +36,10 @@ caller owns task decomposition/prompts/format/verification; findings are candida
 ask approval for one exact tag and reported size before ollama_manage pull; search or recommendation is never download permission. Stop/delete need exact-tag approval.
 serve :11435; default-endpoint autostart optional. Docs: freellama://docs/index.`;
 
-const server = new McpServer(
+const server = withToolResults(new McpServer(
   { name: "freellama", version: SERVER_VERSION },
   { instructions: INSTRUCTIONS },
-);
+));
 
 registerDocsResources(server);
 // Registration order is the tools/list order clients display.
@@ -49,6 +51,7 @@ registerRunTaskTool(server);
 registerTaskJobsTool(server);
 registerOllamaLifecycleTools(server);
 registerDelegateResearchTool(server);
+registerReadResponseTool(server);
 
 const transport = withNormalizedToolSchemas(new StdioServerTransport());
 await server.connect(transport);

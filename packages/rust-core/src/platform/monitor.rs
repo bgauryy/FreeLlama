@@ -132,9 +132,39 @@ async fn loaded_models(state: &PlatformState) -> Vec<Value> {
     loaded
 }
 
+/// The model memory budget against what each backend's loaded runners hold now. The budget
+/// applies to a backend whose runners share host memory (unified memory, or a CPU backend).
+fn budget_view(state: &PlatformState, tunables: &runtime::Tunables, loaded: &[Value]) -> Value {
+    let budget = tunables.model_memory_budget;
+    let bytes = budget.bytes(super::host_total_memory_bytes());
+    let backends: serde_json::Map<String, Value> = backend_views(state)
+        .into_iter()
+        .map(|(backend, upstream, _)| {
+            let resident: u64 = loaded
+                .iter()
+                .filter(|entry| entry["backend"] == backend.as_str())
+                .filter_map(|entry| entry["size_bytes"].as_u64())
+                .sum();
+            let applies = super::execution::host_memory_relevant(&upstream, backend);
+            (
+                backend.as_str().to_owned(),
+                json!({
+                    "applies": applies,
+                    "resident_bytes": resident,
+                    "used_percent": bytes
+                        .filter(|bytes| applies && *bytes > 0)
+                        .map(|bytes| (float(resident) / float(bytes) * 1000.0).round() / 10.0),
+                }),
+            )
+        })
+        .collect();
+    json!({"setting": budget.to_string(), "bytes": bytes, "backends": backends})
+}
+
 /// One compact view of what the machine and `FreeLlama` are doing right now.
 pub(super) async fn status(State(state): State<PlatformState>) -> Json<Value> {
     state.refresh_ollama_settings().await;
+    let loaded = loaded_models(&state).await;
     let snapshot = state.resources.snapshot().await;
     let tunables = state.tunables();
     let breakers = state.breakers.receipt();
@@ -168,7 +198,11 @@ pub(super) async fn status(State(state): State<PlatformState>) -> Json<Value> {
         "backends": backends,
         "raw_proxy": state.raw_admission.receipt(),
         "task_jobs": super::jobs::snapshot(&state.jobs),
-        "loaded_models": loaded_models(&state).await,
+        "loaded_models": loaded,
+        "residency": {
+            "model_memory_budget": budget_view(&state, &tunables, &loaded),
+            "audit": state.audit.summary().await,
+        },
         "host": {
             "status": snapshot.status,
             "holding": snapshot.holding,
@@ -223,11 +257,46 @@ pub(super) struct UsageQuery {
     days: Option<u32>,
 }
 
+/// Usage totals, plus today's tokens and budget of each client key. A client key sees only its
+/// own row.
 pub(super) async fn usage(
     State(state): State<PlatformState>,
+    caller: Option<axum::Extension<crate::proxy::Caller>>,
     Query(query): Query<UsageQuery>,
 ) -> Json<Value> {
-    Json(state.telemetry.usage(query.days.unwrap_or(7).clamp(1, 400)))
+    let mut view = state.telemetry.usage(
+        query
+            .days
+            .unwrap_or(7)
+            .clamp(1, super::telemetry::REPORT_WINDOW_DAYS),
+    );
+    if !state.clients.is_empty() {
+        let today = state.telemetry.clients_today();
+        let caller = caller.map(|axum::Extension(caller)| caller.0);
+        let clients: serde_json::Map<String, Value> = state
+            .clients
+            .iter()
+            .filter(|key| caller.as_deref().is_none_or(|name| name == key.name))
+            .map(|key| {
+                let used = today.get(&key.name).copied().unwrap_or(0);
+                (
+                    key.name.clone(),
+                    json!({
+                        "tokens_today": used,
+                        "daily_tokens": key.daily_tokens,
+                        "remaining_today": key.daily_tokens.map(|budget| budget.saturating_sub(used)),
+                        "admin": key.admin,
+                    }),
+                )
+            })
+            .collect();
+        view["clients"] = json!({
+            "day": "UTC",
+            "counts": "output tokens plus prompt tokens not reused from a prompt cache",
+            "keys": clients,
+        });
+    }
+    Json(view)
 }
 
 pub(super) async fn config(State(state): State<PlatformState>) -> Json<Value> {

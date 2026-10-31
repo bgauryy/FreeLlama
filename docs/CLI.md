@@ -32,7 +32,9 @@ flowchart TD
 | `config` | Effective runtime settings and the source of each; `--reload` re-reads the runtime file | Yes |
 | `session` | Create model affinity for related tasks | Yes |
 | `scope` | Create, inspect, fork, or delete bounded message history | Yes |
-| `warm` | Warm an installed model through managed admission | Yes |
+| `ready` | Exit 0 once `serve` can run managed work (Ollama answers and its catalog reads); otherwise print what it waits for and exit non-zero | Yes |
+| `warm` | Load an installed model (chat or embedding) through managed admission | Yes |
+| `unload` | Unload a resident model once its running tasks finish; a model that is not loaded is reported, never loaded first | Yes |
 | `route` | Choose a model and request profile without executing it | Yes |
 | `task` | Route and execute one nonstreaming task | Yes |
 | `jobs` | List, inspect, cancel, or remove deferred tasks and warming operations | Yes |
@@ -58,9 +60,17 @@ file must be a regular file, not a symlink, and hold one token of at least 32 by
 whitespace is trimmed. On Unix it must also be owner-only (mode 0600). Windows file permissions
 (ACLs) are not checked, so protect the file with your user profile's permissions there.
 
-`serve` persists bounded adaptive feedback under the platform data directory by default. Override
-the path with `--feedback-file`; use `--ephemeral-feedback` only for disposable runs. See the
+`serve` keeps what it learns (runner sizes, placement feedback, usage and the residency audit) in
+`~/.octocode/freellama/freellama.sqlite`, shared with every other FreeLlama process on the machine.
+`--home` (or `FREELLAMA_HOME`) moves the home; use `--ephemeral` only for disposable runs. See the
 [production runbook](PRODUCTION.md) for token generation, state files, and ingress requirements.
+
+`--client-keys` (or `FREELLAMA_CLIENT_KEYS`, default `clients.toml` in the home) adds named client
+keys with daily token budgets, and `--upstreams` (or `FREELLAMA_UPSTREAMS`, default
+`upstreams.toml` in the home) adds OpenAI-compatible engines that `/v1/*` requests route to by
+model; see [client keys and other engines](PRODUCTION.md#client-keys). The runtime file's
+`[preload]` table loads models at startup and predicts the next one; see
+[Preload](SCOPES_AND_WARMING.md#preload).
 
 `serve` exposes both managed routes under `/_freellama/v1/*` and byte-preserving Ollama routes under
 `/api/*` and `/v1/*`. Use `proxy` when you need only the latter. See
@@ -137,18 +147,21 @@ healthy samples; minimum reserves are 1 GiB and 2 GiB, respectively. Tune the pe
 lower than the resume value, and neither can exceed 100. Health reports the policy, sampled signals,
 unknown measurements, and reserved memory. These flags do not change Ollama or OS settings.
 
-On macOS, low available RAM is advisory and never refuses a task. Effective available RAM is free
-memory plus a bounded reclaimable estimate, so it can be far lower than what the OS can actually
-reclaim. When it does not cover already-reserved bytes, the task's estimated bytes, and the reserve,
-FreeLlama first unloads idle unpinned runners, then dispatches anyway: the receipt reports
+When effective available RAM does not cover already-reserved bytes, the task's estimated bytes and the
+reserve, FreeLlama first unloads idle unpinned runners, then holds the new load with
+`held_insufficient_capacity` until capacity returns, refusing with 503 at its deadline. This is the
+default on every platform: Linux and Windows available RAM already counts reclaimable cache (and is
+the hard cap in a container), and on macOS effective available RAM is free memory plus a bounded
+reclaimable estimate. A load already resident is never held by it. `--low-memory advisory` (or
+`FREELLAMA_LOW_MEMORY=advisory`) instead dispatches such a load: the receipt reports
 `status: "admitted_low_memory_estimate"` and `assessment.memory_advisory: "below_reserve"` with
-`required_with_reserve_bytes` and `effective_available_bytes`. Ollama and the OS decide whether the
-load fits. On Linux, Windows, and other platforms, where available RAM already counts reclaimable
-cache (and is the hard cap in a container), the same shortfall unloads idle runners and then holds the
-new load with `held_insufficient_capacity` until capacity returns, refusing with 503 at its deadline.
-OS memory pressure holds all work where the OS reports it (macOS, and Linux when the kernel
-exposes `/proc/pressure/memory`; Windows has no host collector yet). Active swapping and low RAM hold new loads only:
-an already-resident runner adds no memory and stays admitted. The CPU-load hold (one-minute load at
+`required_with_reserve_bytes` and `effective_available_bytes`, and Ollama and the OS decide whether
+it fits.
+OS memory pressure holds new loads where the OS reports it (macOS, and Linux when the kernel
+exposes `/proc/pressure/memory`; Windows has no host collector yet), and holds already-resident
+runners too only at the critical level: a warning is what a large load itself raises. Active
+swapping and low RAM hold new loads only: an already-resident runner adds no memory and stays
+admitted, for raw passthrough requests too when the request's `model` is in Ollama's `/api/ps`. The CPU-load hold (one-minute load at
 or above 1.5 per logical CPU) applies only to CPU-assigned work, which decodes on those cores; GPU
 work, loaded or not, proceeds, so another program's build never blocks a GPU model. On a host where
 the sampler sees no accelerator (no GPU device or GPU memory), every model runs on the CPU, so the
@@ -197,6 +210,14 @@ npx @octocodeai/freellama init
 npx @octocodeai/freellama doctor
 npx @octocodeai/freellama models
 npx @octocodeai/freellama machine
+```
+
+`serve` answers `/health` as soon as it listens. Wait on `ready` instead before sending work from a
+script; it returns 503 with `waiting_for: "ollama" | "cpu_backend" | "catalog"` until it can serve:
+
+```bash
+until npx @octocodeai/freellama ready >/dev/null 2>&1; do sleep 1; done
+npx @octocodeai/freellama unload --model nomic-embed-text:v1.5
 ```
 
 Preview a deterministic decision without spending generation tokens:
@@ -297,8 +318,8 @@ npx @octocodeai/freellama serve
 ```
 
 `serve` resolves each file in this order: the explicit flag, its environment variable, the working
-directory, then the per-user config directory (`$XDG_CONFIG_HOME/freellama/` or
-`~/.config/freellama/`; `%APPDATA%\FreeLlama\` on Windows).
+directory, then the FreeLlama home (`~/.octocode/freellama`, or `--home` / `FREELLAMA_HOME`). The home also holds
+`runtime.toml`, read when neither `--runtime-config` nor `FREELLAMA_RUNTIME_CONFIG` is set.
 
 | File | Flag | Environment variable | Discovered name |
 |---|---|---|---|

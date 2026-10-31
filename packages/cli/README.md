@@ -28,10 +28,8 @@ both give the `freellama` command. The examples use `npx` so nothing needs insta
 
 ```bash
 npx @octocodeai/freellama doctor
-npx @octocodeai/freellama auth-token --out ~/.local/share/freellama/auth.token
-npx @octocodeai/freellama serve \
-  --auth-token-file ~/.local/share/freellama/auth.token \
-  --feedback-file ~/.local/share/freellama/feedback.json
+npx @octocodeai/freellama auth-token --out ~/.octocode/freellama/auth.token
+npx @octocodeai/freellama serve --auth-token-file ~/.octocode/freellama/auth.token
 ```
 
 `doctor` works without the control plane. It reports Ollama reachability, CLI/server version drift,
@@ -83,8 +81,8 @@ Treat a missing contract as a stale running binary, then rebuild and restart bef
 
 Authentication covers both control routes and raw Ollama passthrough. A nonloopback listener also
 requires `--allow-remote`; terminate TLS and add tenant authorization outside FreeLlama. The CLI
-persists bounded aggregate feedback by default. Use `--ephemeral-feedback` only for disposable
-runs. See the [production runbook](https://github.com/bgauryy/FreeLlama/blob/main/docs/PRODUCTION.md).
+keeps what it learns in `~/.octocode/freellama/freellama.sqlite` by default (`--home` moves it). Use `--ephemeral`
+only for disposable runs. See the [production runbook](https://github.com/bgauryy/FreeLlama/blob/main/docs/PRODUCTION.md).
 
 ## Build the launcher and binary
 

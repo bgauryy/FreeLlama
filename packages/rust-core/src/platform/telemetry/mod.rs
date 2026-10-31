@@ -1,12 +1,12 @@
 //! Monitoring: Prometheus counters, a usage ledger, and per-day usage totals.
 //!
-//! Counters are process-lifetime. The optional ledger is a bounded, asynchronous best-effort
-//! sink: successful appends are replayed at startup; pending records are not durable yet.
+//! Counters are process-lifetime. The optional ledger is the shared database's `usage` table,
+//! written by a bounded, asynchronous best-effort worker: successful appends are replayed at
+//! startup; pending records are not durable yet.
 
 use std::{
     collections::BTreeMap,
     num::NonZeroUsize,
-    path::PathBuf,
     sync::{Arc, Mutex as StdMutex, mpsc},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -15,15 +15,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 mod ledger;
+
+/// The longest window the usage view can show; `/usage?days=` is clamped to it and startup
+/// replays only this window.
+pub(crate) const REPORT_WINDOW_DAYS: u32 = 400;
 mod prometheus;
 
 use ledger::{civil_day, day_number, ledger_worker, replay, unix_day};
 pub(super) use prometheus::Gauge;
 
-/// Rotate the ledger to `<file>.1` past this size; the replay reads at most this much.
-const LEDGER_MAX_BYTES: u64 = 16 * 1024 * 1024;
-/// Daily totals kept in memory.
-const MAX_USAGE_DAYS: usize = 400;
 pub(super) const LEDGER_QUEUE_CAPACITY: NonZeroUsize =
     NonZeroUsize::new(128).expect("128 is nonzero");
 
@@ -32,7 +32,7 @@ enum LedgerCommand {
     Flush(tokio::sync::oneshot::Sender<()>),
 }
 
-/// One finished managed task, as written to the ledger.
+/// One finished managed task or raw generation (`task: "raw"`), as written to the ledger.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(super) struct TaskRecord {
     /// Unix seconds when the task finished.
@@ -57,6 +57,21 @@ pub(super) struct TaskRecord {
     pub(super) load_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) output_tokens_per_second: Option<f64>,
+    /// Prompt tokens Ollama reused from the runner's prompt cache instead of evaluating.
+    #[serde(default)]
+    pub(super) cached_prompt_tokens: u64,
+    /// The client key that made the request, when the server uses client keys.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) client: Option<String>,
+}
+
+impl TaskRecord {
+    /// Tokens the backend had to process: output plus the prompt tokens it did not reuse.
+    pub(super) fn processed_tokens(&self) -> u64 {
+        self.prompt_tokens
+            .saturating_sub(self.cached_prompt_tokens)
+            .saturating_add(self.output_tokens)
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, PartialEq)]
@@ -64,6 +79,7 @@ pub(super) struct UsageTotals {
     pub(super) tasks: u64,
     pub(super) errors: u64,
     pub(super) prompt_tokens: u64,
+    pub(super) cached_prompt_tokens: u64,
     pub(super) output_tokens: u64,
     pub(super) busy_ms: u64,
     pub(super) queue_wait_ms: u64,
@@ -76,6 +92,9 @@ impl UsageTotals {
             self.errors += 1;
         }
         self.prompt_tokens = self.prompt_tokens.saturating_add(record.prompt_tokens);
+        self.cached_prompt_tokens = self
+            .cached_prompt_tokens
+            .saturating_add(record.cached_prompt_tokens);
         self.output_tokens = self.output_tokens.saturating_add(record.output_tokens);
         self.busy_ms = self.busy_ms.saturating_add(record.duration_ms);
         self.queue_wait_ms = self.queue_wait_ms.saturating_add(record.queue_wait_ms);
@@ -85,6 +104,9 @@ impl UsageTotals {
         self.tasks += other.tasks;
         self.errors += other.errors;
         self.prompt_tokens = self.prompt_tokens.saturating_add(other.prompt_tokens);
+        self.cached_prompt_tokens = self
+            .cached_prompt_tokens
+            .saturating_add(other.cached_prompt_tokens);
         self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
         self.busy_ms = self.busy_ms.saturating_add(other.busy_ms);
         self.queue_wait_ms = self.queue_wait_ms.saturating_add(other.queue_wait_ms);
@@ -107,6 +129,8 @@ struct Inner {
     tasks: BTreeMap<(String, String, String, String), TaskCounters>,
     /// (day, model)
     usage: BTreeMap<(String, String), UsageTotals>,
+    /// (day number, client) -> tokens processed for that client key.
+    clients: BTreeMap<(u64, String), u64>,
     /// (kind, outcome) for raw passthrough requests.
     raw: BTreeMap<(String, String), u64>,
     /// backend -> models unloaded to make room.
@@ -129,7 +153,7 @@ struct Inner {
 #[derive(Clone)]
 pub struct Telemetry {
     inner: Arc<StdMutex<Inner>>,
-    ledger: Option<Arc<PathBuf>>,
+    ledger: Option<crate::store::Store>,
     writer: Option<Arc<mpsc::SyncSender<LedgerCommand>>>,
     ledger_capacity: usize,
     started: Instant,
@@ -151,39 +175,62 @@ impl Default for Telemetry {
 }
 
 impl Telemetry {
-    /// Create a sink, replaying daily totals from `ledger` when it exists.
+    /// Create a sink, replaying daily totals from the `ledger` store when there is one.
     #[must_use]
-    pub fn new(ledger: Option<PathBuf>) -> Self {
+    pub fn new(ledger: Option<crate::store::Store>) -> Self {
         Self::with_ledger_capacity(ledger, LEDGER_QUEUE_CAPACITY)
     }
 
     /// Configure the maximum queued writes; zero capacity is excluded by the type.
     #[must_use]
-    pub fn with_ledger_capacity(ledger: Option<PathBuf>, capacity: NonZeroUsize) -> Self {
+    pub fn with_ledger_capacity(
+        ledger: Option<crate::store::Store>,
+        capacity: NonZeroUsize,
+    ) -> Self {
         let mut telemetry = Self {
             inner: Arc::new(StdMutex::new(Inner::default())),
-            ledger: ledger.map(Arc::new),
+            ledger,
             writer: None,
             ledger_capacity: capacity.get(),
             started: Instant::now(),
         };
-        if let Some(path) = telemetry.ledger.as_deref() {
-            match replay(path) {
-                Ok(records) => {
+        if let Some(store) = telemetry.ledger.clone() {
+            match replay(&store) {
+                Ok(days) => {
                     let mut inner = telemetry.lock();
-                    for record in &records {
-                        add_usage(&mut inner, record);
+                    for day in days {
+                        inner.ledger_records += day.tasks;
+                        inner.usage.insert(
+                            (day.day, day.model),
+                            UsageTotals {
+                                tasks: day.tasks,
+                                errors: day.errors,
+                                prompt_tokens: day.prompt_tokens,
+                                cached_prompt_tokens: day.cached_prompt_tokens,
+                                output_tokens: day.output_tokens,
+                                busy_ms: day.busy_ms,
+                                queue_wait_ms: day.queue_wait_ms,
+                            },
+                        );
                     }
-                    inner.ledger_records = records.len() as u64;
+                }
+                Err(error) => telemetry.lock().ledger_error = Some(error.to_string()),
+            }
+            let today = unix_day(now_seconds());
+            match store.client_tokens_since(today * 86_400) {
+                Ok(clients) => {
+                    let mut inner = telemetry.lock();
+                    for (client, tokens) in clients {
+                        inner.clients.insert((today, client), tokens);
+                    }
                 }
                 Err(error) => telemetry.lock().ledger_error = Some(error.to_string()),
             }
             let (sender, receiver) = mpsc::sync_channel(capacity.get());
-            let path = path.clone();
             let inner = Arc::clone(&telemetry.inner);
             match std::thread::Builder::new()
                 .name("freellama-ledger".into())
-                .spawn(move || ledger_worker(&path, &inner, receiver))
+                .spawn(move || ledger_worker(&store, &inner, receiver))
             {
                 Ok(_) => telemetry.writer = Some(Arc::new(sender)),
                 Err(error) => telemetry.lock().ledger_error = Some(error.to_string()),
@@ -193,7 +240,9 @@ impl Telemetry {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
-        self.inner.lock().expect("telemetry state poisoned")
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     // Synchronous: task completion never waits for disk or for room in the ledger queue.
@@ -215,7 +264,8 @@ impl Telemetry {
             counters.duration_ms = counters.duration_ms.saturating_add(record.duration_ms);
             counters.queue_wait_ms = counters.queue_wait_ms.saturating_add(record.queue_wait_ms);
             counters.load_ms = counters.load_ms.saturating_add(record.load_ms);
-            if record.outcome == "ok" {
+            if record.outcome == "ok" && record.task != "raw" {
+                // A raw response's time includes however its client read the stream.
                 // Service time, not wall time: a task's own queue wait must not feed the wait
                 // estimate given to the tasks queued behind it, or estimates snowball under load.
                 let service_ms = record.duration_ms.saturating_sub(record.queue_wait_ms);
@@ -346,7 +396,7 @@ impl Telemetry {
                 "models": models,
             })).collect::<Vec<_>>(),
             "ledger": {
-                "path": self.ledger.as_deref(),
+                "path": self.ledger.as_ref().and_then(crate::store::Store::path),
                 "records": inner.ledger_records,
                 "last_error": inner.ledger_error,
                 "pending": inner.ledger_pending,
@@ -358,11 +408,33 @@ impl Telemetry {
         })
     }
 
+    /// Tokens processed today (UTC) for `client`, as this process has seen them since it
+    /// started plus what the shared database held then.
+    pub(super) fn client_tokens_today(&self, client: &str) -> u64 {
+        let today = unix_day(now_seconds());
+        self.lock()
+            .clients
+            .get(&(today, client.to_owned()))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Today's processed tokens per client key.
+    pub(super) fn clients_today(&self) -> BTreeMap<String, u64> {
+        let today = unix_day(now_seconds());
+        self.lock()
+            .clients
+            .iter()
+            .filter(|((day, _), _)| *day == today)
+            .map(|((_, client), tokens)| (client.clone(), *tokens))
+            .collect()
+    }
+
     pub(super) fn ledger_receipt(&self) -> Value {
         let inner = self.lock();
         json!({
             "enabled": self.ledger.is_some(),
-            "path": self.ledger.as_deref(),
+            "path": self.ledger.as_ref().and_then(crate::store::Store::path),
             "records": inner.ledger_records,
             "last_error": inner.ledger_error,
             "pending": inner.ledger_pending,
@@ -375,25 +447,18 @@ impl Telemetry {
 }
 
 fn add_usage(inner: &mut Inner, record: &TaskRecord) {
+    if let Some(client) = &record.client {
+        let tokens = inner
+            .clients
+            .entry((unix_day(record.ts), client.clone()))
+            .or_default();
+        *tokens = tokens.saturating_add(record.processed_tokens());
+    }
     inner
         .usage
         .entry((civil_day(unix_day(record.ts)), record.model.clone()))
         .or_default()
         .add(record);
-    // Days sort lexically as ISO dates; drop the oldest beyond the retention bound.
-    while inner
-        .usage
-        .keys()
-        .map(|(day, _)| day)
-        .collect::<std::collections::BTreeSet<_>>()
-        .len()
-        > MAX_USAGE_DAYS
-    {
-        let Some(oldest) = inner.usage.keys().next().map(|(day, _)| day.clone()) else {
-            break;
-        };
-        inner.usage.retain(|(day, _), _| *day != oldest);
-    }
 }
 
 pub(super) fn now_seconds() -> u64 {

@@ -40,7 +40,7 @@ impl Drop for BreakerProbe {
             .breakers
             .inner
             .lock()
-            .expect("breaker poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get_mut(&self.backend)
         {
             state.probe_in_flight = false;
@@ -52,7 +52,10 @@ impl Breakers {
     /// `Err(remaining)` while the circuit is open; `Ok(Some(probe))` for the one request allowed
     /// through after the cooldown.
     pub(crate) fn check(&self, backend: &str) -> Result<Option<BreakerProbe>, Duration> {
-        let mut map = self.inner.lock().expect("breaker poisoned");
+        let mut map = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let state = map.entry(backend.to_owned()).or_default();
         let Some(until) = state.open_until else {
             return Ok(None);
@@ -79,7 +82,10 @@ impl Breakers {
         threshold: u32,
         cooldown: Duration,
     ) -> bool {
-        let mut map = self.inner.lock().expect("breaker poisoned");
+        let mut map = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let state = map.entry(backend.to_owned()).or_default();
         let was_probe = state.open_until.is_some();
         if success {
@@ -97,7 +103,10 @@ impl Breakers {
     }
 
     pub(crate) fn receipt(&self) -> Value {
-        let map = self.inner.lock().expect("breaker poisoned");
+        let map = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = Instant::now();
         map.iter()
             .map(|(backend, state)| {

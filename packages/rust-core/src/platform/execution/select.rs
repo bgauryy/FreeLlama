@@ -153,6 +153,8 @@ pub(crate) async fn select_managed_route(
         .unwrap_or(usize::MAX)
         .max(1),
         cpu_configured: state.cpu_upstream.is_some(),
+        gpu_resident: gpu_candidate.as_ref().is_some_and(|route| route.resident),
+        cpu_resident: cpu_candidate.as_ref().is_some_and(|route| route.resident),
     });
 
     let preferred = desired.and_then(|(placement, reason)| {
@@ -359,17 +361,43 @@ pub(crate) fn profile_from_observations(
     })
 }
 
+/// Ollama's process settings change only when it restarts, so one probe (`pgrep` + `ps`) per
+/// endpoint serves every task for a few seconds instead of spawning two processes per task.
+const SETTINGS_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+type SettingsCache =
+    std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, Option<Value>)>>;
+
+fn settings_cache() -> &'static SettingsCache {
+    static CACHE: std::sync::OnceLock<SettingsCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
 pub(crate) async fn comparable_backend_settings(
     _state: &PlatformState,
     execution: &ExecutionTarget,
 ) -> Option<Value> {
     let endpoint = execution.upstream.clone();
-    tokio::task::spawn_blocking(move || {
+    if let Some((at, settings)) = settings_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&endpoint)
+        && at.elapsed() < SETTINGS_TTL
+    {
+        return settings.clone();
+    }
+    let key = endpoint.clone();
+    let settings = tokio::task::spawn_blocking(move || {
         super::super::ollama_env::probe_comparable_process(&endpoint)
     })
     .await
     .ok()
-    .flatten()
+    .flatten();
+    settings_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key, (std::time::Instant::now(), settings.clone()));
+    settings
 }
 
 async fn routing_profile(

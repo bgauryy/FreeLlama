@@ -92,10 +92,15 @@ until capacity recovers, its deadline expires, or it is cancelled.
 
 ## Record usage
 
-Every managed task updates in-memory usage totals and offers one record to a bounded writer queue.
-The record contains time, model, backend, task kind, priority, outcome, HTTP status, prompt and
-output tokens, duration, queue wait, load time, and output tokens per second. It contains no prompt
-or response text. One worker writes records in order; task completion does not wait for disk.
+Every managed task, and every raw Ollama or OpenAI-compatible generation, updates in-memory usage
+totals and offers one record to a bounded writer queue. The record contains time, model, backend,
+task kind (`raw` for passthrough, whose `priority` field holds the path), priority, outcome, HTTP
+status, prompt, cached prompt and output tokens, duration, queue wait, load time, output tokens per
+second and, with client keys, the client. It contains no prompt or response text. Raw counts are read
+from the fields each response reports (`prompt_eval_count`, `prompt_eval_cached_count`, `eval_count`,
+OpenAI `usage`, decision `usage`) as it streams through unchanged; a client that leaves early records
+what arrived. `cached_prompt_tokens` totals show how much prompt work the runners' prompt caches
+saved. One worker writes records in order; task completion does not wait for disk.
 
 The writer queue defaults to 128 records. Configure its positive startup-only capacity through
 `usage_queue_capacity` or `FREELLAMA_USAGE_QUEUE_CAPACITY`; runtime reload does not resize the worker.
@@ -105,13 +110,13 @@ failure records a failed write. Inspect `usage_ledger` in `status`, or `ledger` 
 `asynchronous_best_effort`: pending records can be lost on a crash, and in-memory totals can exceed
 persisted totals. Error evidence remains visible after later successful writes.
 
-`serve` replays a bounded regular-file ledger at startup and rotates it to `usage.jsonl.1` at
-16 MiB. Successful writes contribute to restart totals; completion is not a zero-loss persistence
-promise. Embedded callers can use the bounded `flush_ledger` barrier for orderly teardown; it
-confirms attempted writes, not recovery of dropped/failed records or a filesystem sync.
-
-The ledger lives next to the feedback file in the platform data directory. Choose another path with
-`--usage-file` (or `FREELLAMA_USAGE_FILE`), or keep totals in memory only with `--ephemeral-usage`.
+The ledger is the `usage` table of the shared database (`~/.octocode/freellama/freellama.sqlite`). `serve`
+computes daily totals over every stored record at startup (in the database, so startup does not hold
+the history in memory) and never deletes records. Successful writes
+contribute to restart totals; completion is not a zero-loss persistence promise. Embedded callers
+can use the bounded `flush_ledger` barrier for orderly teardown; it confirms attempted writes, not
+recovery of dropped/failed records. `--home` moves the database; `--ephemeral` keeps totals in
+memory only.
 
 ## Scrape metrics
 
@@ -214,9 +219,16 @@ Explicit values take precedence. For governed prewarming, profile compatibility,
 settings, see [Scope history and model warming](SCOPES_AND_WARMING.md).
 
 When a model about to load needs room, FreeLlama unloads idle runners itself (`keep_alive: 0`)
-instead of letting the load wait, fail, or spill to CPU. It does this in three cases: host RAM
-can fall below the reserve, the host is already holding for low memory, or (discrete GPU) the
-model does not fit in free VRAM, where Ollama otherwise chooses its own victim.
+instead of letting the load wait, fail, or spill to CPU. It does this in four cases, checked in
+this order: (discrete GPU) the model does not fit in free VRAM, where Ollama otherwise chooses its
+own victim; the load would take the backend's loaded models past `model_memory_budget`; host RAM
+can fall below the reserve; or the host is already holding for low memory. Raw passthrough loads
+(an Ollama API call for a model that is not loaded) take the same steps, and raw calls in flight
+count as busy, so their models are not unloaded under them.
+
+`model_memory_budget` (runtime file, or `FREELLAMA_MODEL_MEMORY_BUDGET`) is `"75%"` of RAM by
+default; set a size such as `"24GiB"`, another share, or `"off"`. It applies where the runners share
+host memory: unified memory (Apple silicon) or a CPU backend.
 
 Which runners go is a small optimisation, in the spirit of llama-swap's `evict_costs` and LocalAI's
 busy-aware LRU:
@@ -226,7 +238,7 @@ busy-aware LRU:
 - **Not for a model bigger than the GPU:** it spills to the CPU whatever is unloaded, so VRAM is
   left alone.
 - **Cost of unloading a runner** = its reload time (Ollama's measured `load_duration` from earlier
-  loads, or size ÷ 1.5 GB/s before the first one) × (1 + recent uses, decaying with a 30-minute
+  loads, kept in the shared database across restarts, or size ÷ 1.5 GB/s before the first one) × (1 + recent uses, decaying with a 30-minute
   half-life; only tasks served count) × its `eviction_costs` weight (default 1).
 - **Choice:** the set of runners with the lowest total cost that frees enough memory; ties go to
   fewer runners, then less memory freed beyond what is needed. Only the memory that matters is
@@ -234,10 +246,33 @@ busy-aware LRU:
   memory.
 
 Every managed receipt that caused an eviction carries the plan under
-`memory_reservation.eviction`: what was unloaded, its cost and reload estimate, and what was kept
-and why. `status` and the page show the latest one that unloaded something. Eviction runs once per
-task, after admission and before the memory wait, and is never cancelled halfway by a deadline.
-Set `evict_idle_models = false` to leave residency entirely to Ollama.
+`memory_reservation.eviction`: what was unloaded, its cost and reload estimate, what was kept and
+why, the `trigger` (`gpu_memory`, `model_memory_budget` or `host_memory`) and `unload_ms`. `status`
+and the page show the latest one that unloaded something. Eviction runs once per task, after
+admission and before the memory wait, and is never cancelled halfway by a deadline. Set
+`evict_idle_models = false` to leave residency entirely to Ollama.
+
+### The residency audit
+
+Every load, unload and eviction is recorded with its cause and duration in the shared database, so
+the audit covers every FreeLlama process on the machine. `status` summarizes the last hour under
+`residency`:
+
+| Field | Meaning |
+|---|---|
+| `model_memory_budget` | The setting, its bytes, and per backend whether it applies, what its loaded models hold, and the share used |
+| `audit.counts`, `audit.by_trigger` | Loads, unloads and evictions; causes such as `managed_task`, `raw_request`, `caller_unload`, `model_memory_budget`, `host_memory` |
+| `audit.switch_ms` | Per model: measured loads, average, total and last load time (Ollama's `load_duration`) |
+| `audit.thrashing` | Models loaded 3 or more times in 10 minutes: raise the budget, pin the model, or give it its own backend |
+| `audit.recent` | The 20 newest events (the database keeps every event; counts cover the whole hour) |
+
+A raw passthrough load is recorded when its response ends, with the `load_duration` Ollama
+reported in it, and that time also teaches the eviction planner what reloading the model costs.
+Preloads appear as `preload` or `preload_failed` events with trigger `startup` or
+`predicted_after:<model>`.
+
+A task refused because the host stayed under pressure says which signals held it:
+`resource_admission.held_by` (such as `["thermal_throttling"]`), also named in the error text.
 
 ## Who decides what: FreeLlama and Ollama
 
@@ -253,8 +288,8 @@ Two schedulers that both guess at memory can disagree. The split is:
 | Context size | Ollama by default | `num_ctx` is left to Ollama when its default covers the request |
 
 To keep the estimates honest, FreeLlama learns from every runner Ollama reports as resident,
-including ones loaded by raw clients, and saves those measurements to `footprints.json` next to the
-usage ledger. After a restart a model it has seen before is sized from Ollama's measurement, not a
+including ones loaded by raw clients, and saves those measurements in the shared database, keeping
+the larger size when two processes measure the same runner. After a restart a model it has seen before is sized from Ollama's measurement, not a
 formula. Each measurement records the `OLLAMA_NUM_PARALLEL` and KV-cache type it was taken under and
 is used only while those match, so changing either setting falls back to the formula until Ollama
 measures again. A larger context than any measured one is sized as the measurement plus exactly the extra

@@ -28,6 +28,11 @@
 # evict_idle_models = true
 # Per-model weight on that cost (default 1): higher keeps a model loaded longer.
 # eviction_costs = { "qwen3:8b" = 3.0, "nomic-embed-text" = 0.2 }
+# Most memory the loaded models of one backend may hold together, where they share host memory
+# (unified memory or a CPU backend): "off", a share of RAM such as "75%" (default), or a size such
+# as "24GiB". A load past it unloads the cheapest idle models first, before the OS starts swapping.
+# Env: FREELLAMA_MODEL_MEMORY_BUDGET.
+# model_memory_budget = "75%"
 
 # --- Throttling ---
 # Adaptive concurrency halves a pool's limit on errors, memory pressure, or a throughput drop and
@@ -76,6 +81,25 @@
 # reuse_gain_seconds = 30
 # load_multiplier = 2.0
 # pressure_factor = 0.25
+
+# --- Preloading ---
+# `startup` loads these models once the server is up (and new entries when this file changes),
+# each as a background warm under the usual admission, memory budget and host-pressure rules.
+# An entry is a tag, or a table with `model` and optional `context_tokens`, `keep_alive`
+# (default: warming.max_seconds; pin a model to keep it longer) and `messages`, a prompt prefix
+# such as a long system prompt that is evaluated into the runner's prompt cache, so requests that
+# start with the same messages, at the same context, skip evaluating it again.
+# `predictive` counts every switch from one model to another within `follow_window_seconds`; once
+# `min_probability` of at least `min_observations` switches away from a model went to one
+# successor, finishing work on it loads that successor, but only when the load fits without
+# unloading anything, the host is under no pressure and nothing is queued for the backend.
+# FREELLAMA_PRELOAD (comma-separated tags) and FREELLAMA_PREDICTIVE_PRELOAD override these.
+# [preload]
+# startup = ["nomic-embed-text:latest", { model = "qwen3:8b", messages = [{ role = "system", content = "You review Rust code." }] }]
+# predictive = true
+# min_probability = 0.5
+# min_observations = 3
+# follow_window_seconds = 600
 
 # --- Task admission costs ---
 # Optional per-kind positive u32 base weights. Unspecified kinds keep their defaults:

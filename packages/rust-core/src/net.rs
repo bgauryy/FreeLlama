@@ -7,6 +7,22 @@ pub const DEFAULT_SERVE_ENDPOINT: &str = "http://127.0.0.1:11435";
 /// Default address of the Ollama server itself.
 pub const DEFAULT_OLLAMA_ENDPOINT: &str = "http://127.0.0.1:11434";
 
+/// Default for `FREELLAMA_MAX_REQUEST_BYTES`: the largest request body `serve` reads, managed or
+/// raw. Images travel base64-encoded inside JSON, so a few screenshots, or a batch of them, are
+/// tens of megabytes.
+pub const DEFAULT_MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
+
+/// The largest request body `serve` and `proxy` read: `FREELLAMA_MAX_REQUEST_BYTES`, else
+/// [`DEFAULT_MAX_REQUEST_BYTES`]. Zero and unparseable values fall back to the default.
+#[must_use]
+pub fn max_request_bytes() -> usize {
+    std::env::var("FREELLAMA_MAX_REQUEST_BYTES")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|bytes| *bytes > 0)
+        .unwrap_or(DEFAULT_MAX_REQUEST_BYTES)
+}
+
 /// The bracket-free form of a host: `url` renders IPv6 hosts as `[::1]`, while `IpAddr` and
 /// `SocketAddr::ip()` do not. Only a matching `[`…`]` pair is removed.
 pub(crate) fn strip_ipv6_brackets(host: &str) -> &str {

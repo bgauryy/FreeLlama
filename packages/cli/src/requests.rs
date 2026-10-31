@@ -80,8 +80,8 @@ pub(crate) async fn request_task(args: TaskArgs) -> Result<()> {
     body["timeout_seconds"] = json!(execution.timeout_seconds);
     body["priority"] = json!(execution.priority);
     body["max_wait_seconds"] = json!(execution.max_wait_seconds);
-    if execution.stop_on_repetition {
-        body["stop_on_repetition"] = json!(true);
+    if let Some(stop) = execution.stop_on_repetition {
+        body["stop_on_repetition"] = json!(stop);
     }
 
     // Omitted flags must remain absent so scoped routing defaults can apply.

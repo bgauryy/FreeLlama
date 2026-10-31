@@ -1,6 +1,5 @@
-use std::io::Write as _;
-
 use super::*;
+use crate::store::Store;
 
 fn record(model: &str, ts: u64, outcome: &str) -> TaskRecord {
     TaskRecord {
@@ -17,6 +16,8 @@ fn record(model: &str, ts: u64, outcome: &str) -> TaskRecord {
         queue_wait_ms: 250,
         load_ms: 0,
         output_tokens_per_second: Some(40.0),
+        cached_prompt_tokens: 0,
+        client: None,
     }
 }
 
@@ -46,22 +47,21 @@ async fn usage_totals_group_by_day_and_model_and_count_errors() {
 }
 
 #[tokio::test]
-async fn ledger_survives_a_restart_and_skips_garbage_lines() {
+async fn ledger_survives_a_restart_and_skips_garbage_rows() {
     let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("usage.jsonl");
-    let telemetry = Telemetry::new(Some(path.clone()));
+    let path = directory.path().join("freellama.sqlite");
+    let telemetry = Telemetry::new(Some(Store::open(&path).unwrap()));
     telemetry.record_task(record("a", now_seconds(), "ok"));
     assert!(telemetry.flush_ledger(Duration::from_secs(1)).await);
-    std::fs::OpenOptions::new()
-        .append(true)
-        .open(&path)
+    Store::open(&path)
         .unwrap()
-        .write_all(b"not json\n")
+        .append_usage(now_seconds(), "not json")
         .unwrap();
-    let restarted = Telemetry::new(Some(path));
+    let restarted = Telemetry::new(Some(Store::open(&path).unwrap()));
     let usage = restarted.usage(1);
     assert_eq!(usage["totals"]["tasks"], 1);
     assert_eq!(usage["ledger"]["records"], 1);
+    assert_eq!(usage["ledger"]["path"], path.display().to_string());
     assert!(usage["ledger"]["last_error"].is_null());
 }
 
@@ -70,7 +70,7 @@ async fn bounded_queue_reports_loss_without_delaying_tasks() {
     let (sender, receiver) = mpsc::sync_channel(1);
     let telemetry = Telemetry {
         inner: Arc::new(StdMutex::new(Inner::default())),
-        ledger: Some(Arc::new(PathBuf::from("unused-test-ledger"))),
+        ledger: Some(Store::in_memory().unwrap()),
         writer: Some(Arc::new(sender)),
         ledger_capacity: 1,
         started: Instant::now(),
@@ -104,9 +104,8 @@ async fn bounded_queue_reports_loss_without_delaying_tasks() {
 
 #[tokio::test]
 async fn one_worker_serializes_records_and_exits_after_final_sender_drops() {
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("usage.jsonl");
-    let telemetry = Telemetry::new(Some(path.clone()));
+    let store = Store::in_memory().unwrap();
+    let telemetry = Telemetry::new(Some(store.clone()));
     for index in 0..100 {
         telemetry.record_task(record(&format!("model-{index}"), now_seconds(), "ok"));
     }
@@ -116,7 +115,7 @@ async fn one_worker_serializes_records_and_exits_after_final_sender_drops() {
     assert_eq!(receipt["pending"], 0);
     assert_eq!(receipt["failed"], 0);
     assert_eq!(receipt["dropped"], 0);
-    assert_eq!(replay(&path).unwrap().len(), 100);
+    assert_eq!(replay(&store).unwrap().len(), 100);
     let sender = Arc::downgrade(telemetry.writer.as_ref().unwrap());
     let worker_state = Arc::downgrade(&telemetry.inner);
     let clone = telemetry.clone();
@@ -134,64 +133,6 @@ async fn one_worker_serializes_records_and_exits_after_final_sender_drops() {
     })
     .await
     .expect("closed ledger worker must exit and release its state");
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn fifo_is_rejected_on_replay_and_when_substituted_after_startup() {
-    use super::ledger::append;
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("usage.jsonl");
-    let telemetry = Telemetry::new(Some(path.clone()));
-    assert!(
-        std::process::Command::new("mkfifo")
-            .arg(&path)
-            .status()
-            .unwrap()
-            .success()
-    );
-    assert_eq!(
-        replay(&path).unwrap_err().kind(),
-        std::io::ErrorKind::InvalidInput
-    );
-    assert_eq!(
-        append(&path, &record("a", now_seconds(), "ok"))
-            .unwrap_err()
-            .kind(),
-        std::io::ErrorKind::InvalidInput
-    );
-    telemetry.record_task(record("a", now_seconds(), "ok"));
-    assert!(telemetry.flush_ledger(Duration::from_secs(1)).await);
-    let receipt = telemetry.ledger_receipt();
-    assert_eq!(receipt["failed"], 1);
-    assert_eq!(receipt["pending"], 0);
-    assert_eq!(receipt["records"], 0);
-    assert!(
-        receipt["last_error"]
-            .as_str()
-            .unwrap()
-            .contains("regular file")
-    );
-    let restarted = Telemetry::new(Some(path.clone()));
-    assert!(
-        restarted.ledger_receipt()["last_error"]
-            .as_str()
-            .unwrap()
-            .contains("regular file")
-    );
-    std::fs::remove_file(&path).unwrap();
-    telemetry.record_task(record("a", now_seconds(), "ok"));
-    assert!(telemetry.flush_ledger(Duration::from_secs(1)).await);
-    let recovered = telemetry.ledger_receipt();
-    assert_eq!(recovered["records"], 1);
-    assert_eq!(recovered["failed"], 1);
-    assert!(
-        recovered["last_error"]
-            .as_str()
-            .unwrap()
-            .contains("regular file"),
-        "a successful retry must not erase earlier loss evidence"
-    );
 }
 
 #[tokio::test]

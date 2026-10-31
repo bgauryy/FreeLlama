@@ -48,6 +48,15 @@ impl TaskKind {
             Self::LongContext => "long_context",
         }
     }
+
+    /// The task with this wire name.
+    #[must_use]
+    pub fn from_wire(name: &str) -> Option<Self> {
+        <Self as clap::ValueEnum>::value_variants()
+            .iter()
+            .copied()
+            .find(|task| task.as_str() == name)
+    }
 }
 
 /// Relative service class for managed work.
@@ -202,6 +211,10 @@ pub struct CatalogModel {
     /// repetition loop. Observed behaviour, not a guess from the model's name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub observed_loops: BTreeMap<TaskKind, LoopRecord>,
+    /// Output tokens (reasoning included) one answer from this model revision has needed, as
+    /// observed; it raises the expected output the context is sized for.
+    #[serde(default)]
+    pub learned_output_tokens: Option<u64>,
     pub policy_rank: BTreeMap<TaskKind, usize>,
     /// Per-task request defaults a policy file sets for this model; routing applies the entry
     /// for the requested task on top of the generic task profile.
@@ -246,6 +259,11 @@ pub struct RouteDecision {
     pub profile: String,
     pub required_capabilities: BTreeSet<Capability>,
     pub options: Value,
+    /// Output tokens (reasoning included) this answer is expected to need, for sizing the context
+    /// window. Not a cap: `FreeLlama` sends no `num_predict` of its own; only the caller or an
+    /// operator policy caps output. The model's own context window is the only other limit.
+    #[serde(default)]
+    pub output_reserve_tokens: u64,
     pub think: Value,
     pub strict_tool_validation: bool,
     pub resident: bool,
@@ -376,35 +394,18 @@ pub fn installed_model<'a>(
     models: &'a [CatalogModel],
     requested: &str,
 ) -> Result<&'a CatalogModel> {
-    if let Some(exact) = models.iter().find(|model| model.name == requested) {
-        return Ok(exact);
-    }
-    if !requested.contains(':') {
-        let latest = format!("{requested}:latest");
-        if let Some(model) = models.iter().find(|model| model.name == latest) {
-            return Ok(model);
+    let names: Vec<&str> = models.iter().map(|model| model.name.as_str()).collect();
+    match crate::ollama_http::resolve_listed(&names, requested) {
+        Ok(Some(name)) => {
+            if let Some(model) = models.iter().find(|model| model.name == name) {
+                return Ok(model);
+            }
         }
-        let family = models
-            .iter()
-            .filter(|model| {
-                model
-                    .name
-                    .split_once(':')
-                    .is_some_and(|(name, _)| name == requested)
-            })
-            .collect::<Vec<_>>();
-        match family.as_slice() {
-            [only] => return Ok(only),
-            [_, ..] => bail!(
-                "model name is ambiguous: {requested} (installed: {})",
-                family
-                    .iter()
-                    .map(|model| model.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-            [] => {}
-        }
+        Ok(None) => {}
+        Err(family) => bail!(
+            "model name is ambiguous: {requested} (installed: {})",
+            family.join(", ")
+        ),
     }
     let installed = models
         .iter()
@@ -472,6 +473,7 @@ pub fn select_route(
     let TaskProfile {
         name: profile,
         options,
+        output_reserve,
         think,
         strict_tool_validation,
         policy_model_options,
@@ -515,6 +517,7 @@ pub fn select_route(
         profile,
         required_capabilities: required,
         options,
+        output_reserve_tokens: output_reserve,
         think,
         strict_tool_validation,
         resident: chosen.resident,
@@ -817,6 +820,7 @@ fn policy_preference(left: &CatalogModel, right: &CatalogModel, task: TaskKind) 
 struct TaskProfile {
     name: String,
     options: Value,
+    output_reserve: u64,
     think: Value,
     strict_tool_validation: bool,
     /// True when a policy `model_options` entry changed the generic task profile.
@@ -825,13 +829,20 @@ struct TaskProfile {
     policy_think_dropped: bool,
 }
 
+/// Expected room for a thinking-capable model's reasoning plus an answer, matching the coding
+/// estimate; used only to size the context, and its own runs can only raise it.
+const THINKING_OUTPUT_ESTIMATE: u64 = 2_048;
+
 fn profile(input: &RouteInput, model: &CatalogModel) -> TaskProfile {
     let policy = model.policy_options.get(&input.task).copied();
     let requested_context = requested_context(input);
     let num_ctx = requested_context
         .min(model.advertised_context.unwrap_or(requested_context))
         .min(u64::from(u32::MAX));
-    let (name, num_predict, think, strict) = match input.task {
+    // How much output to expect, only for sizing the context window: a starting estimate per task,
+    // raised by what this model revision has needed before (plus a quarter for variation) and, for
+    // a model reporting the thinking capability, by room to reason. Never sent as a cap.
+    let (name, starting_estimate, think, strict) = match input.task {
         TaskKind::Browser => ("browser_action", 64, Value::Bool(false), true),
         TaskKind::Tools => ("tools", 256, Value::Bool(false), true),
         TaskKind::CodeRepair => ("code_repair", 2_048, thinking_or_off(model, "medium"), true),
@@ -846,9 +857,25 @@ fn profile(input: &RouteInput, model: &CatalogModel) -> TaskProfile {
         TaskKind::Embedding => ("embedding", 0, Value::Null, false),
         TaskKind::Completion => ("completion", 512, Value::Bool(false), false),
     };
-    let num_predict = policy
-        .and_then(|entry| entry.num_predict)
-        .unwrap_or(num_predict);
+    let output_reserve = if starting_estimate == 0 {
+        0
+    } else {
+        let observed = model
+            .learned_output_tokens
+            .map_or(0, |tokens| tokens.saturating_add(tokens / 4));
+        let thinking = if model.capabilities.contains(&Capability::Thinking) {
+            THINKING_OUTPUT_ESTIMATE
+        } else {
+            0
+        };
+        // Never more than half the model's own window: the prompt needs the rest.
+        let ceiling = model
+            .advertised_context
+            .map_or(u64::MAX, |context| context / 2);
+        starting_estimate.max(observed.max(thinking).min(ceiling))
+    };
+    // An operator policy may cap output for one model and task; nothing else does.
+    let policy_cap = policy.and_then(|entry| entry.num_predict);
     // `think = true` only reaches a model that can think; Ollama rejects it otherwise.
     let policy_think = policy.and_then(|entry| entry.think);
     let policy_think_dropped =
@@ -859,12 +886,13 @@ fn profile(input: &RouteInput, model: &CatalogModel) -> TaskProfile {
         None => think,
     };
     let mut options = json!({"num_ctx": num_ctx});
-    if num_predict > 0 {
-        options["num_predict"] = json!(num_predict);
+    if let Some(cap) = policy_cap {
+        options["num_predict"] = json!(cap);
     }
     TaskProfile {
         name: name.to_owned(),
         options,
+        output_reserve: policy_cap.unwrap_or(output_reserve),
         think,
         strict_tool_validation: strict,
         policy_model_options: policy.is_some_and(|entry| entry != ModelRequestDefaults::default()),

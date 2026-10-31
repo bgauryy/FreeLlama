@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
 /// Settings whose values change how `FreeLlama` should admit and size work.
-pub(super) const TRACKED: [&str; 8] = [
+pub(super) const TRACKED: [&str; 9] = [
     "OLLAMA_NUM_PARALLEL",
     "OLLAMA_MAX_LOADED_MODELS",
     "OLLAMA_MAX_QUEUE",
@@ -25,6 +25,9 @@ pub(super) const TRACKED: [&str; 8] = [
     "OLLAMA_FLASH_ATTENTION",
     "OLLAMA_KV_CACHE_TYPE",
     "OLLAMA_GPU_OVERHEAD",
+    // llama.cpp's host-RAM cache of displaced prompts (default 8192 MiB), inherited by the
+    // llama-server Ollama starts for each model.
+    "LLAMA_ARG_CACHE_RAM",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

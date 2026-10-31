@@ -1,6 +1,7 @@
 // Shared MCP result helpers, Zod parameter schemas, the confidence gate, and payload trimming.
 import * as z from "zod";
 import { DEFAULT_OLLAMA_ENDPOINT, DEFAULT_OLLAMA_FETCH_TIMEOUT_SECONDS, DEFAULT_SERVE_ENDPOINT } from "./config.js";
+import { modelNames, seconds } from "./job-progress.js";
 
 export async function ollamaFetch(
   endpoint: string | undefined,
@@ -174,7 +175,7 @@ const batchTaskParam = z.object({
   priority: z.enum(["interactive", "normal", "background"]).optional(),
   maxWaitSeconds: z.number().int().positive().optional(),
   timeoutSeconds: z.number().int().positive().optional(),
-  stopOnRepetition: z.boolean().optional().describe("Stream and stop once output repeats itself; keeps all generated text"),
+  stopOnRepetition: z.boolean().optional().describe("Stop a repeating loop, keeping its text; default on without num_predict"),
   prompt: z.string().min(1).optional(),
   systemPrompt: systemPromptParam,
   messages: messagesParam,
@@ -272,37 +273,13 @@ export function withRequiredCapability<T extends string>(
   return [...new Set([...(required ?? []), capability])];
 }
 
-/**
- * Clip text to `limit` characters, keeping BOTH ends and saying how much was dropped.
- *
- * Four call sites each rolled their own `slice()`, three of them with no marker — so a reader could
- * not tell a complete value from a cut one. That is how a `delegate_research` evidence line came
- * back as `... --exclude-dir={node_modules,target,.venv,__pycach`: a hard 120-char head slice
- * through the middle of a command, which is unauditable precisely when auditing matters.
- *
- * Head-biased because the start of a command or message identifies it, with a tail so the target
- * of a long `grep` survives. Mirrors `clip` in src/research/fit.ts on the adapter side, deliberately: the
- * same rule on both sides of the boundary.
- */
-export function clipText(text: string, limit: number): string {
-  if (text.length <= limit) return text;
-  const marker = `… [${text.length - limit} more chars] …`;
-  const usable = Math.max(limit - marker.length, 0);
-  if (usable === 0) return text.slice(0, limit);
-  const head = Math.floor((usable * 2) / 3);
-  return text.slice(0, head) + marker + text.slice(-(usable - head));
-}
-
 /** A short human/backward-client cue; canonical result data stays in structuredContent. */
 function resultSummary(value: Record<string, unknown>): string {
   const explicit = value.summary;
-  if (typeof explicit === "string" && explicit.trim()) return clipText(explicit.trim(), 500);
+  if (typeof explicit === "string" && explicit.trim()) return explicit.trim();
   const keys = Object.keys(value);
-  return `Structured result available (${keys.slice(0, 8).join(", ") || "empty object"}).`;
+  return `Structured result available (${keys.join(", ") || "empty object"}).`;
 }
-
-/** Text budget for a model answer in TextContent; the full answer stays in structuredContent. */
-export const ANSWER_TEXT_MAX_CHARS = 8 * 1024;
 
 function record(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
@@ -316,7 +293,8 @@ export function taskAnswerText(payload: Record<string, unknown>): string | undef
   const response = record(payload.response);
   if (!response) return undefined;
   const model = record(payload.route)?.selected_model ?? payload.selected_model ?? response.model;
-  const header = typeof model === "string" && model ? `[${model}] ` : "";
+  const label = [typeof model === "string" && model ? model : "", lifecycleClause(payload)].filter(Boolean).join(" · ");
+  const header = label ? `[${label}] ` : "";
   const message = record(response.message);
   if (message) {
     const parts: string[] = [];
@@ -325,9 +303,9 @@ export function taskAnswerText(payload: Record<string, unknown>): string | undef
       parts.push(`tool_calls: ${JSON.stringify(message.tool_calls)}`);
     }
     if (parts.length === 0) parts.push("(empty response)");
-    return clipText(header + parts.join("\n"), ANSWER_TEXT_MAX_CHARS);
+    return header + parts.join("\n");
   }
-  if (typeof response.response === "string") return clipText(header + response.response.trim(), ANSWER_TEXT_MAX_CHARS);
+  if (typeof response.response === "string") return header + response.response.trim();
   const omitted = record(response.embeddings_omitted);
   if (Array.isArray(response.embeddings) || omitted) {
     const count = Array.isArray(response.embeddings) ? response.embeddings.length : omitted?.count;
@@ -337,8 +315,22 @@ export function taskAnswerText(payload: Record<string, unknown>): string | undef
   return undefined;
 }
 
+/** A cold load costs at least this much before the answer line mentions it. */
+const NOTABLE_LOAD_MS = 250;
+
+/** `loaded 8.9 s, evicted a:latest` when the call loaded a model or unloaded others to fit. */
+function lifecycleClause(payload: Record<string, unknown>): string {
+  const loadNs = record(payload.metrics)?.load_duration_ns;
+  const loadMs = typeof loadNs === "number" ? loadNs / 1e6 : 0;
+  const evicted = modelNames(record(record(payload.execution)?.memory_reservation)?.evicted_idle_models);
+  return [
+    loadMs > NOTABLE_LOAD_MS ? `loaded ${seconds(loadMs)}` : "",
+    evicted.length > 0 ? `evicted ${evicted.join(", ")}` : "",
+  ].filter(Boolean).join(", ");
+}
+
 /**
- * A model that looped until the output cap (core `output_check.repetition_loop`) is shown as one
+ * A model that looped until its output limit (core `output_check.repetition_loop`) is shown as one
  * copy plus a note; the untrimmed text stays in structuredContent.response for audit.
  */
 function answerContent(content: string, payload: Record<string, unknown>): string {
@@ -347,19 +339,18 @@ function answerContent(content: string, payload: Record<string, unknown>): strin
   if (check?.repetition_loop !== true || typeof keep !== "number") return content.trim();
   const characters = Array.from(content);
   const trimmed = characters.slice(0, keep).join("").trim();
-  return `${trimmed}\n[freellama: trimmed ${characters.length - keep} repeated characters; the model looped until num_predict — treat as low confidence]`;
+  return `${trimmed}\n[freellama: ${characters.length - keep} repeated characters omitted here (full text in structuredContent); the model looped until its output limit — treat as low confidence]`;
 }
 
 /** Batch counterpart of taskAnswerText: one labelled answer per item, in request order. */
 export function batchAnswerText(payload: Record<string, unknown>): string | undefined {
   if (!Array.isArray(payload.results)) return undefined;
-  const perItem = Math.max(512, Math.floor(ANSWER_TEXT_MAX_CHARS / Math.max(payload.results.length, 1)));
   const lines = payload.results.map((row) => {
     const item = record(row) ?? {};
     const id = String(item.id ?? "?");
-    if (item.ok !== true) return `## ${id} (failed)\n${clipText(JSON.stringify(item.error ?? item), perItem)}`;
+    if (item.ok !== true) return `## ${id} (failed)\n${JSON.stringify(item.error ?? item)}`;
     const answer = taskAnswerText(record(item.response) ?? {}) ?? "(no answer)";
-    return `## ${id}\n${clipText(answer, perItem)}`;
+    return `## ${id}\n${answer}`;
   });
   return lines.join("\n\n");
 }
@@ -393,12 +384,12 @@ export function parsedResult(raw: string) {
       new Error(
         `upstream returned a payload that is not valid JSON: ${
           error instanceof Error ? error.message : String(error)
-        }\n${clipText(raw, 2000)}`,
+        }\n${raw}`,
       ),
     );
   }
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
-    return errorResult(new Error(`expected a JSON object from upstream, got: ${clipText(raw, 500)}`));
+    return errorResult(new Error(`expected a JSON object from upstream, got: ${raw}`));
   }
   return structuredResult(value as Record<string, unknown>);
 }
@@ -473,7 +464,10 @@ export function errorResult(error: unknown) {
  * Returns `null` when there is no embedding matrix to strip, so non-embedding tasks pass through
  * untouched.
  */
-export function summarizeEmbeddings(payload: Record<string, unknown>): Record<string, unknown> | null {
+export function summarizeEmbeddings(
+  payload: Record<string, unknown>,
+  options: { saved?: boolean } = {},
+): Record<string, unknown> | null {
   const response = payload.response;
   if (response === null || typeof response !== "object") return null;
   const { embeddings, ...rest } = response as Record<string, unknown>;
@@ -489,7 +483,8 @@ export function summarizeEmbeddings(payload: Record<string, unknown>): Record<st
         dimensions,
         preview: Array.isArray(first) ? first.slice(0, 8) : null,
         note:
-          "Vectors withheld to keep them out of the orchestrator's context — pass " +
+          "Vectors withheld to keep them out of the orchestrator's context — " +
+          (options.saved ? "the full matrix is in response_file (read_response section \"embeddings\"), or pass " : "pass ") +
           "`returnEmbeddings: true` to get the full matrix (a single 768-dim vector is ~4,400 " +
           "tokens). `preview` is the first 8 values of the first vector, enough to confirm the " +
           "call really produced numbers.",

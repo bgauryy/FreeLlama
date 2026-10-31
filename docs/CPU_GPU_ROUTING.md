@@ -289,9 +289,11 @@ Identity includes installed/resident digest, rate metric kind, explicit observed
 endpoint-attributed process settings, and serial admission class. Unknown or changed evidence,
 cold transitions, and overlapping managed work supply no speed sample. A difference
 of 10% or less is treated as noise. Feedback never overrides an explicit model, session affinity,
-capability or policy guards, or the `quality` objective. The CLI persists the bounded, versioned,
-prompt-free snapshot atomically by default; `--ephemeral-feedback` opts into reset-on-restart
-behavior. Legacy aggregate fields survive loading but do not qualify learned hints. Health's
+capability or policy guards, or the `quality` objective. A measured advantage also never forces a
+cold load: when the faster backend's model is not loaded but the other backend's eligible model is,
+the loaded one runs (`resident_backend_avoids_cold_load`); warm the faster model to switch. The CLI
+keeps the bounded, versioned, prompt-free snapshot in the shared database by default; `--ephemeral`
+opts into reset-on-restart behavior. Legacy aggregate fields survive loading but do not qualify learned hints. Health's
 `decision_ready` describes the stored profile window; the current request must independently
 match it before routing can use its speed. `GET /_freellama/v1/health` exposes profile identity,
 profile sample counts, persistence status, and per-backend admission capacity. Physically verified

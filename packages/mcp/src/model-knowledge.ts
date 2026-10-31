@@ -4,7 +4,6 @@ import { parseModelCard, parseModelSearch, parseModelTags } from "./model-search
 const CACHE_TTL_MS = 60 * 60 * 1000;
 const FAILURE_TTL_MS = 60 * 1000;
 const MAX_PAGE_BYTES = 2 * 1024 * 1024;
-const MAX_README_CHARS = 64 * 1024;
 
 const errorMessage = (error: unknown) => error instanceof Error ? error.message : String(error);
 
@@ -33,7 +32,6 @@ export type LibraryRecord = {
   cached: boolean;
   card?: Card;
   tags?: Tag[];
-  readmeTruncated?: boolean;
   message?: string;
 };
 
@@ -116,7 +114,7 @@ export class OllamaLibraryClient {
   }
 
   private async load(ref: NonNullable<ReturnType<typeof libraryReference>>): Promise<LibraryRecord> {
-    let result: Pick<LibraryRecord, "status" | "card" | "tags" | "readmeTruncated" | "message">;
+    let result: Pick<LibraryRecord, "status" | "card" | "tags" | "message">;
     try {
       // Independent pages; wait for both even if one fails so every request is accounted for.
       const pages = await Promise.allSettled([this.page(ref.url), this.page(`${ref.url}/tags`)]);
@@ -127,8 +125,7 @@ export class OllamaLibraryClient {
       catch { throw new LibraryFetchError("parse_error", "Ollama model-card markup was not recognized."); }
       const { tags } = parseModelTags(pages[1].value, ref.family);
       if (tags.length === 0) throw new LibraryFetchError("parse_error", "No tag rows were recognized; check the source page before concluding a model is absent.");
-      result = { status: "available", tags, readmeTruncated: card.readme.length > MAX_README_CHARS,
-        card: { ...card, readme: card.readme.slice(0, MAX_README_CHARS) } };
+      result = { status: "available", tags, card };
     } catch (error) {
       result = { status: error instanceof LibraryFetchError ? error.status : "unavailable",
         message: error instanceof LibraryFetchError
@@ -180,19 +177,18 @@ export function publicModelGuidance(record: LibraryRecord, capabilities?: string
     if (capabilities && !capabilities.includes(requires)) return [];
     const sentence = sentences.find((sentence) => pattern.test(sentence) &&
       !/\b(not|never|cannot|unsupported|without)\b|doesn['’]t/i.test(sentence));
-    const start = sentence ? Math.max(0, sentence.search(pattern) - 120) : 0;
     return sentence ? [{ task, basis: "advertised", scope: "family", quality: "unmeasured",
-      evidence: { excerpt: sentence.slice(start, start + 320), sourceUrl: record.sourceUrl, fetchedAt: record.fetchedAt } }] : [];
+      evidence: { excerpt: sentence, sourceUrl: record.sourceUrl, fetchedAt: record.fetchedAt } }] : [];
   });
   const usageNotes = sentences.filter((sentence) => /\b(requires?|only|cannot|limitations?|must|memory|languages?|prefix)\b|not support|context (window|length)/i.test(sentence))
-    .slice(0, 8).map((text) => ({ text: text.slice(0, 400), scope: "family", sourceUrl: record.sourceUrl }));
+    .map((text) => ({ text, scope: "family", sourceUrl: record.sourceUrl }));
   return { description: card.description, advertisedFamilyCapabilities: card.capabilities, advertisedUseCases, usageNotes,
     readmeAvailable: card.readme.length > 0,
-    ...(includeReadme ? { readme: { text: card.readme, format: card.readmeFormat, truncated: record.readmeTruncated ?? false } } : {}) };
+    ...(includeReadme ? { readme: { text: card.readme, format: card.readmeFormat } } : {}) };
 }
 
 function provenance(record: LibraryRecord) {
-  const { card: _card, tags: _tags, readmeTruncated: _truncated, ...source } = record;
+  const { card: _card, tags: _tags, ...source } = record;
   return source;
 }
 

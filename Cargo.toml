@@ -4,7 +4,7 @@ members = ["packages/rust-core", "packages/cli"]
 
 # Shared across both crates so versions cannot drift between the library and the CLI that wraps it.
 [workspace.package]
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 authors = ["Guy Bary"]
 license = "Apache-2.0 OR MIT"
@@ -36,6 +36,7 @@ clap = { version = "4.6.7", features = ["derive", "env"] }
 http-body = "1.1"
 napi = { version = "3.16", default-features = false, features = ["napi4", "async", "tokio_rt", "serde-json"] }
 napi-derive = { version = "3.7" }
+rusqlite = { version = "0.41.1", features = ["bundled"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls", "stream"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
