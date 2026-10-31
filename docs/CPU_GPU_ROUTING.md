@@ -68,7 +68,18 @@ OLLAMA_HOST=127.0.0.1:11434 OLLAMA_NO_CLOUD=1 \
     OLLAMA_MAX_LOADED_MODELS=1 OLLAMA_NUM_PARALLEL=1 ollama serve
 ```
 
-Start a second process on another loopback port:
+Or let `serve` start and own the CPU process: `--spawn-cpu-backend` runs `ollama serve` on
+`127.0.0.1:11436` (`--cpu-backend-port`, `--ollama-binary`) with `OLLAMA_NO_CLOUD=1`,
+`OLLAMA_LLM_LIBRARY=cpu`, `OLLAMA_NUM_PARALLEL=1` and every GPU runtime hidden
+(`CUDA_VISIBLE_DEVICES`, `ROCR_VISIBLE_DEVICES`, `HIP_VISIBLE_DEVICES`, `GGML_VK_VISIBLE_DEVICES` set
+to `-1`), waits until it answers, logs it to `cpu-ollama.log` in the FreeLlama home, and stops it
+when `serve` exits. A port that already answers is refused rather than adopted:
+
+```bash
+npx @octocodeai/freellama serve --spawn-cpu-backend --cpu-model nomic-embed-text:v1.5
+```
+
+To run the second process yourself, start it on another loopback port:
 
 ```bash
 OLLAMA_HOST=127.0.0.1:11436 OLLAMA_NO_CLOUD=1 \

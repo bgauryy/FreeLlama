@@ -4,7 +4,8 @@ import type { Action } from "./actions.js";
 import type { AgentRuntimeConfig, Env } from "./context-policy.js";
 import type { ObservationStore } from "./observations.js";
 import type { ProgressEmitter } from "./progress-events.js";
-import type { resolveModelIdentity } from "./transport.js";
+import type { httpRequest } from "./transport-http.js";
+import type { resolveModelIdentity, resolvePlatformTokenRatio } from "./transport.js";
 
 export type { Action };
 
@@ -40,7 +41,11 @@ export interface AdapterSession {
 export interface AdapterHooks {
   env?: Env;
   requestJson?: (url: string, payload: unknown, timeoutSeconds: number) => unknown | Promise<unknown>;
+  /** The HTTP client of managed job turns (progress on, no `requestJson`). */
+  httpRequest?: typeof httpRequest;
   resolveModelIdentity?: typeof resolveModelIdentity;
+  /** Reads serve's learned token ratio for the model (managed runs only). */
+  resolvePlatformTokenRatio?: typeof resolvePlatformTokenRatio;
   /** Replaces the tool runner; receives the recorded call arguments. */
   runTool?: (args: Record<string, unknown>) => string | Promise<string>;
   observationStore?: (pageSize: number) => ObservationStore;

@@ -150,6 +150,42 @@ pub(crate) fn require_payload(input: &TaskInput) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// Ollama embeds each item whole (`truncate: false`) and fails the batch, after loading the
+/// model, when one item is longer than the model's context. Refuse before admission the items
+/// that certainly cannot fit: more than 8 bytes per token of the window, a ratio real text stays
+/// well under, so nothing that might fit is refused. The caller splits them; `FreeLlama` does not,
+/// because where to cut changes what an embedding means.
+fn refuse_oversized_embedding_items(input: &Value, window: Option<u64>) -> Result<(), ApiError> {
+    let Some(window) = window.filter(|window| *window > 0) else {
+        return Ok(());
+    };
+    let limit = window.saturating_mul(8);
+    let items: Vec<&str> = match input {
+        Value::String(text) => vec![text.as_str()],
+        Value::Array(items) => items.iter().filter_map(Value::as_str).collect(),
+        _ => Vec::new(),
+    };
+    let oversized: Vec<Value> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, text)| text.len() as u64 > limit)
+        .map(|(index, text)| json!({"index": index, "bytes": text.len()}))
+        .collect();
+    if oversized.is_empty() {
+        return Ok(());
+    }
+    Err(ApiError::new(
+        axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+        format!(
+            "{} embedding item(s) cannot fit this model's {window}-token context (more than {limit} bytes each): {}; split each into chunks of about {} bytes or less and embed the chunks",
+            oversized.len(),
+            Value::Array(oversized.clone()),
+            window.saturating_mul(3),
+        ),
+    )
+    .with_code("embedding_item_exceeds_context"))
+}
+
 pub(crate) fn build_managed_request(
     input: &mut TaskInput,
     decision: &RouteDecision,
@@ -200,6 +236,7 @@ pub(crate) fn build_managed_request(
             .take()
             .context("embedding task requires input")
             .map_err(ApiError::bad_request)?;
+        refuse_oversized_embedding_items(&value, decision.options["num_ctx"].as_u64())?;
         return Ok((
             "/api/embed",
             json!({

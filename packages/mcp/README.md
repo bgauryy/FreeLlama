@@ -89,8 +89,11 @@ Use this economical sequence:
 For a delegated agent, estimated usable input is `contextTokens - outputTokens - safetyMarginTokens`
 (the default margin is 256). The adapter pins the system instruction and question, preserves the
 newest observations, compacts older observations into breadcrumbs, and refuses a pinned overflow
-by default. `FREELLAMA_AGENT_PINNED_OVERFLOW=clip` is a deliberate quality-risk override. Initial token counting
-is conservative; successful Ollama calls calibrate later estimates.
+by default. `FREELLAMA_AGENT_PINNED_OVERFLOW=clip` is a deliberate quality-risk override. When serve has learned
+the model's bytes-per-token ratio (`bytes_per_token_milli` in `/_freellama/v1/models`), the adapter
+counts tokens exactly as serve does and reports `token_counting: "platform_learned_ratio"`;
+otherwise it falls back to the conservative `charsPerToken` estimate that successful Ollama calls
+calibrate upward (`"local_chars_per_token"`).
 
 Do not confuse operational evidence with answer quality. A receipt can prove admission, token
 counts, placement, or unloading. It cannot prove research correctness, coding judgment, sustained
@@ -278,7 +281,7 @@ catalog loading; a server without `/ready` counts as ready once it answers. See
 | `task_jobs` | Yes | Inspects, cancels, or removes a deferred task or warming operation. |
 | `ollama_manage` | Pull: no. Stop: when available | `action: "pull"` downloads a model from Ollama directly (additive); `action: "stop"` unloads it through serve's `/unload`, which waits for that model's running tasks, and asks Ollama directly when serve is unreachable, older, or another `ollamaEndpoint` is named. Both are idempotent |
 | `ollama_delete` | No (direct to Ollama) | **Destructive**: permanently removes a model. Call only on an explicit human instruction naming the exact model |
-| `delegate_research` | Yes (and spawns the adapter) | Answers a grounded question from files under `workspacePath`; returns the answer, citations, and an independent verification verdict inline, with placement receipts, the evidence trail and every observation in the response file (`receipt:"full"` for all inline). With an MCP `progressToken`, each research step (model turn, tool call, page, finish) is reported as `notifications/progress`, for example `turn 2/8: grep 'foo' in src`; the result is unchanged |
+| `delegate_research` | Yes (and spawns the adapter) | Answers a grounded question from files under `workspacePath`; returns the answer, citations, and an independent verification verdict inline, with placement receipts, the evidence trail and every observation in the response file (`receipt:"full"` for all inline). With an MCP `progressToken`, each research step (model turn, tool call, page, finish) is reported as `notifications/progress`, for example `turn 2/8: grep 'foo' in src`; the result is unchanged. Each managed turn then runs as a deferred job, so waiting for admission or memory and loading the model are reported too (`turn 2/8: loading gpt-oss:20b (~8.7 s)`), with the synchronous call as fallback when the job path cannot carry the turn |
 | `read_response` | No | Returns one section of a saved `response_file` (a `sections` name, a top-level field, or a JSON pointer), paged by `offset`/`limit`; omit `section` for an outline. Only files under the response directory are read |
 
 Every tool result is also saved whole to `~/.octocode/freellama/responses/<session>/<n>-<tool>.json`
@@ -397,7 +400,8 @@ Scripts that bypass MCP post the same fields in snake_case to `POST /_freellama/
 `task`, `objective`, `model`, `session_id`, `required_capabilities`, `prompt` or `messages`,
 `images`, `priority`, `keep_alive`, `max_wait_seconds`, `timeout_seconds`, `stop_on_repetition`,
 and `request_options: {options, format, think, logprobs, top_logprobs}`. A batch is
-`POST /_freellama/v1/task-batches` with `{tasks: [{id, independent: true, task: {...}}], max_parallelism}`; sessions are
+`POST /_freellama/v1/task-batches` with `{tasks: [{id, independent: true, task: {...}}], max_parallelism, progress_id?}`
+(`GET /_freellama/v1/task-batches/{progress_id}` reports done, failed, running and queued items while it runs); sessions are
 `POST /_freellama/v1/sessions` with `{}`. `model` accepts a bare name (`name` resolves to
 `name:latest`, or the one installed tag of that family); an ambiguous or unknown name is refused
 with the installed candidates. See [Request shapes](https://github.com/bgauryy/FreeLlama/blob/main/docs/ARCHITECTURE.md#request-shapes)

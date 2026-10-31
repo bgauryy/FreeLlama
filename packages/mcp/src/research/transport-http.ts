@@ -54,6 +54,8 @@ export interface HttpOptions {
   timeoutSeconds: number;
   /** Read at most this many response bytes; unlimited by default. */
   limit?: number;
+  /** Aborting it destroys the request, which rejects with the abort reason. */
+  signal?: AbortSignal;
 }
 
 /**
@@ -80,13 +82,21 @@ export function httpRequest(url: string, options: HttpOptions): Promise<Buffer> 
     if (options.body) headers["content-length"] = String(options.body.length);
     let sent = false;
     let settled = false;
+    const { signal } = options;
+    const onAbort = () => fail(signal?.reason instanceof Error ? signal.reason : new Error("request aborted"));
     const fail = (error: Error) => {
       if (settled) return;
       settled = true;
+      signal?.removeEventListener("abort", onAbort);
       request.destroy();
       reject(error);
     };
+    if (signal?.aborted) {
+      reject(signal.reason instanceof Error ? signal.reason : new Error("request aborted"));
+      return;
+    }
     const request = client.request(parsed, { method: options.method, headers });
+    signal?.addEventListener("abort", onAbort, { once: true });
     request.setTimeout(Math.max(options.timeoutSeconds * 1000, 1), () => {
       fail(sent ? new RequestTimeoutError() : new URLError(new RequestTimeoutError()));
     });
@@ -103,6 +113,7 @@ export function httpRequest(url: string, options: HttpOptions): Promise<Buffer> 
       const finish = () => {
         if (settled) return;
         settled = true;
+        signal?.removeEventListener("abort", onAbort);
         const body = Buffer.concat(chunks);
         request.destroy();
         if (ok) resolve(body);

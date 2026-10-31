@@ -10,10 +10,10 @@ import {
   DEFAULT_SERVE_ENDPOINT, DEFAULT_TOKEN_CALIBRATION_DIR, RESEARCH_ADAPTERS, type ResearchAdapter, assertAllowedWorkspace,
   delegateEnvironment,
 } from "../config.js";
-import { route } from "../serve-client.js";
+import { cancelTaskJob, route } from "../serve-client.js";
 import { killDelegateTree, liveDelegates, runDelegate } from "../lifecycle.js";
 import { progressSink } from "../progress.js";
-import { researchProgressFilter } from "../research-progress.js";
+import { cancelOpenJobs, researchProgressFilter } from "../research-progress.js";
 import { PROGRESS_ENV } from "../research/progress-events.js";
 import { EXTERNAL_COST } from "../telemetry.js";
 import {
@@ -133,10 +133,13 @@ export function registerDelegateResearchTool(server: McpServer): void {
         // the stderr that failure diagnostics quote.
         delete environment[PROGRESS_ENV];
         if (report) environment[PROGRESS_ENV] = "stderr";
+        // With progress on, each managed turn is a deferred job; one still open when the adapter
+        // has exited (it was killed) is cancelled here so it does not keep a runner busy.
+        const openJobs = new Set<string>();
         const running = runDelegate(process.execPath, [adapter], {
           signal: extra.signal,
           env: environment,
-          ...(report ? { stderrFilter: researchProgressFilter(report, resolvedWorkspace) } : {}),
+          ...(report ? { stderrFilter: researchProgressFilter(report, resolvedWorkspace, openJobs) } : {}),
           timeoutMs: DEFAULT_DELEGATE_TIMEOUT_SECONDS * 1000,
           // The answer is read from `resultFile`, never from stdout — but execFile's usual 1 MB
           // maxBuffer still applies to the agent's own progress logging, and overflowing it kills
@@ -162,6 +165,7 @@ export function registerDelegateResearchTool(server: McpServer): void {
           liveDelegates.delete(running.child);
           // Reap anything the adapter left behind in its group, even after a normal exit.
           killDelegateTree(running.child);
+          cancelOpenJobs(openJobs, (id) => cancelTaskJob(endpoint ?? DEFAULT_SERVE_ENDPOINT, id));
         }
         let result: ReturnType<typeof parseAdapterResult>;
         try {

@@ -337,6 +337,23 @@ pub(crate) async fn forward_managed_task(
             &value,
             looped,
         );
+        // Learn this model's bytes per prompt token from a text-only chat, measured exactly as
+        // context sizing measures a prompt, so the next estimate uses its own tokenizer.
+        let text_only = body["messages"].as_array().is_some_and(|messages| {
+            messages
+                .iter()
+                .all(|message| message.get("images").is_none() && message["content"].is_string())
+        });
+        if text_only && let Some(prompt_tokens) = value["prompt_eval_count"].as_u64() {
+            let message_bytes =
+                serde_json::to_string(&body["messages"]).map_or(0, |text| text.len());
+            state.model_facts.learn_prompt_ratio(
+                &decision.selected_model,
+                digest,
+                u64::try_from(message_bytes).unwrap_or(u64::MAX),
+                prompt_tokens,
+            );
+        }
     }
     let mut receipt = json!({
         "route": decision,

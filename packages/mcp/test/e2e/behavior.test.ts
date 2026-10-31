@@ -184,6 +184,13 @@ describe.runIf(releaseServeAvailable)("behavior: every tool against the live sys
     expect(grounded.contextManagement.chars_per_token).toBe(3.5);
     expect(grounded.contextManagement.observation_page_chars).toBe(2048);
     expect(grounded.contextManagement.pinned_overflow).toBe("error");
-    expect(grounded.contextManagement.calibration_samples).toBeGreaterThan(0);
+    // Serve's learned ratio, once measured, replaces local calibration.
+    if (grounded.contextManagement.token_counting === "platform_learned_ratio") {
+      expect(grounded.contextManagement.bytes_per_token_milli).toBeGreaterThan(0);
+      expect(grounded.contextManagement.calibration_samples).toBe(0);
+    } else {
+      expect(grounded.contextManagement.token_counting).toBe("local_chars_per_token");
+      expect(grounded.contextManagement.calibration_samples).toBeGreaterThan(0);
+    }
   });
 });

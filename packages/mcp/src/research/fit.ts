@@ -1,22 +1,24 @@
 // Context-window fitting shared by the research adapters.
 //
-// Both adapters run at `num_ctx=8192` and append an observation after every turn. Ollama does not
-// error when a conversation exceeds the window: it silently truncates from the front of the
-// prompt, and the front holds the system prompt and the question. `fitToContext` keeps every
-// request inside the window:
+// Both adapters run at `num_ctx=8192` and append an observation after every turn. Requests set
+// `truncate: false` (managed requests go through FreeLlama, which does the same), so an oversized
+// conversation is refused instead of silently front-truncated; either way the run loses the turn.
+// `fitToContext` keeps every request inside the window:
 //
 // - Pinned: the system prompt (index 0) and the question (index 1) are never compacted unless the
 //   operator sets FREELLAMA_AGENT_PINNED_OVERFLOW=clip; otherwise an overflow is an explicit error.
 // - Compaction: older observations become a deterministic breadcrumb plus a stored-page handle.
 // - Pagination (observations.ts): every observation is stored in full and shown page by page.
-// - Calibration: the first call uses a character estimate; Ollama's `prompt_eval_count` raises
-//   (never lowers) the estimate multiplier (`ContextBudgeter`).
+// - Estimate: when serve has learned the model's bytes-per-token ratio, messages are counted exactly
+//   as the platform counts them (`platformTextTokens`). Otherwise the fallback is a character
+//   estimate whose multiplier Ollama's `prompt_eval_count` raises, never lowers (`ContextBudgeter`).
 import { canonicalJson } from "./canonical-json.js";
 import {
   CHARS_PER_TOKEN, CLIP_HEAD_RATIO, COMPACTION_TARGET_RATIO, ContextPolicy, contextBudget, type Message,
 } from "./context-policy.js";
 import { ValidationError } from "./errors.js";
 import { cpLength, cpSlice, cpTail } from "./text.js";
+import type { PlatformTokenRatio } from "./transport.js";
 
 export const COMPACT_MARKER = "[earlier observation compacted to save context";
 
@@ -28,37 +30,77 @@ export function estimateTokens(text: string, charsPerToken: number = CHARS_PER_T
   return Math.floor(cpLength(text) / charsPerToken) + 1;
 }
 
-/** Estimate typed Ollama messages without flattening images/tool calls into text. */
-export function messagesTokens(messages: Message[], policy: ContextPolicy = new ContextPolicy()): number {
+/** Bytes per token (times 1000) serve assumes for a model it has not measured: 3 bytes/token. */
+export const UNMEASURED_BYTES_PER_TOKEN_MILLI = 3000;
+
+/**
+ * The ratio the platform estimates with (rust-core `platform/context.rs`): the learned ratio less a
+ * 10% margin, so estimates err toward more tokens, clamped to 1–8 bytes per token; 3 bytes per token
+ * while unmeasured.
+ */
+export function platformBytesPerTokenMilli(learnedMilli: number | null | undefined): number {
+  if (learnedMilli === null || learnedMilli === undefined) return UNMEASURED_BYTES_PER_TOKEN_MILLI;
+  return Math.min(Math.max(Math.floor(learnedMilli / 10) * 9, 1000), 8000);
+}
+
+/** The platform's token estimate for `text`: UTF-8 bytes ×1000 / the margined ratio, rounded up. */
+export function platformTextTokens(text: string, learnedMilli: number | null | undefined): number {
+  return Math.ceil((Buffer.byteLength(text, "utf8") * 1000) / platformBytesPerTokenMilli(learnedMilli));
+}
+
+/**
+ * Estimate typed Ollama messages without flattening images/tool calls into text. With
+ * `learnedMilli` (serve's learned ratio) each message is counted as the platform counts it: its
+ * `JSON.stringify` bytes, the form the ratio was learned from, plus one; images keep their fixed
+ * charge. Without it the configured characters-per-token estimate applies.
+ */
+export function messagesTokens(
+  messages: Message[], policy: ContextPolicy = new ContextPolicy(), learnedMilli: number | null = null,
+): number {
   let total = 0;
   for (const message of messages) {
-    const { content = "", images = [], ...metadata } = message;
-    total += estimateTokens(typeof content === "string" ? content : estimateText(content), policy.chars_per_token);
+    const { images = [], ...text } = message;
     if (Array.isArray(images)) total += images.length * policy.image_token_estimate;
+    if (learnedMilli !== null) {
+      total += platformTextTokens(JSON.stringify(text), learnedMilli) + 1;
+      continue;
+    }
+    const { content = "", ...metadata } = text;
+    total += estimateTokens(typeof content === "string" ? content : estimateText(content), policy.chars_per_token);
     total += estimateTokens(estimateText(metadata), policy.chars_per_token);
   }
   return total;
 }
 
 /**
- * Conservative estimate calibrated by Ollama's real post-call prompt count. The first call uses the
- * configured character estimate; each successful call's `prompt_eval_count` raises (never lowers)
- * the multiplier.
+ * One token estimator per run. With serve's learned ratio (`platformRatio`) it counts as the
+ * platform does and is never rescaled: serve already learns from every managed chat. Otherwise it
+ * is the conservative character estimate calibrated by Ollama's real post-call prompt count: each
+ * successful call's `prompt_eval_count` raises (never lowers) the multiplier.
  */
 export class ContextBudgeter {
   readonly policy: ContextPolicy;
+  readonly platformRatio: PlatformTokenRatio | null;
   scale: number;
   calibration_samples: number;
 
-  constructor(policy: ContextPolicy = new ContextPolicy(), options: { initialScale?: number; calibrationSamples?: number } = {}) {
+  constructor(
+    policy: ContextPolicy = new ContextPolicy(),
+    options: { initialScale?: number; calibrationSamples?: number; platformRatio?: PlatformTokenRatio | null } = {},
+  ) {
     this.policy = policy;
-    this.scale = Math.max(options.initialScale ?? 1, 1);
-    this.calibration_samples = Math.max(Math.trunc(options.calibrationSamples ?? 0), 0);
+    this.platformRatio = options.platformRatio ?? null;
+    this.scale = this.platformRatio ? 1 : Math.max(options.initialScale ?? 1, 1);
+    this.calibration_samples = this.platformRatio ? 0 : Math.max(Math.trunc(options.calibrationSamples ?? 0), 0);
   }
 
-  estimate = (messages: Message[]): number => Math.ceil(messagesTokens(messages, this.policy) * this.scale);
+  estimate = (messages: Message[]): number => this.platformRatio
+    ? messagesTokens(messages, this.policy, this.platformRatio.bytes_per_token_milli)
+    : Math.ceil(messagesTokens(messages, this.policy) * this.scale);
 
+  /** Calibrate the fallback estimate; returns whether the multiplier rose (and should persist). */
   observe(messages: Message[], promptEvalCount: unknown): boolean {
+    if (this.platformRatio) return false;
     if (typeof promptEvalCount !== "number" || !Number.isFinite(promptEvalCount)) return false;
     const actual = Math.trunc(promptEvalCount);
     if (actual <= 0) return false;
@@ -70,10 +112,14 @@ export class ContextBudgeter {
   }
 
   metadata(): Record<string, unknown> {
+    const ratio = this.platformRatio;
     return {
-      token_counting: this.calibration_samples ? "model_calibrated_estimate" : "configured_estimate",
+      token_counting: ratio ? "platform_learned_ratio" : "local_chars_per_token",
       estimate_scale: Math.round(this.scale * 1e6) / 1e6,
       calibration_samples: this.calibration_samples,
+      bytes_per_token_milli: ratio?.bytes_per_token_milli ?? null,
+      bytes_per_token_milli_with_margin: ratio ? platformBytesPerTokenMilli(ratio.bytes_per_token_milli) : null,
+      bytes_per_token_samples: ratio?.bytes_per_token_samples ?? null,
     };
   }
 }

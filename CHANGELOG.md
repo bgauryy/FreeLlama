@@ -35,6 +35,21 @@ replaces `with_feedback_file`/`with_usage_file` with `with_store`. The health co
   stored history, and startup replays only the 400-day usage window the reports can show (every row
   stays on disk). Managed overhead over raw passthrough fell from 56 ms to 4 ms at the median on an
   M2 Pro.
+- **`serve --spawn-cpu-backend`.** `serve` can start and own the CPU-only Ollama for `--cpu-model`
+  models: loopback port 11436 (`--cpu-backend-port`), every GPU runtime hidden, logged to
+  `cpu-ollama.log` in the home, stopped with `serve`. A port that already answers is refused.
+- **Batch progress.** `POST /task-batches` accepts a `progress_id`; `GET /task-batches/{id}` reports
+  total, done, failed, running and queued items while the call runs and for a minute after. MCP
+  `run_task {tasks}` sends `batch: 3/8 done, running: a, b` as progress when the client asks for it.
+  `delegate_research` reports each research step as progress.
+- **One learned token estimate.** Each managed text chat teaches FreeLlama the model's real ratio of
+  message bytes to the prompt tokens Ollama counted (`bytes_per_token_milli` in `/models` and in
+  `context_sizing`); context sizing uses it with a 10% margin instead of a fixed 3 bytes per token,
+  and the research agent uses the same ratio instead of its own characters-per-token guess.
+- **Big inputs.** An embedding item that cannot fit the model's context (over 8 bytes per token of it)
+  is refused before any load with `embedding_item_exceeds_context` and the item indices, instead of
+  failing the whole batch inside Ollama after a load. MCP runs embedding batches of more than 32 items
+  directly rather than as a progress job, whose 2 MiB result limit made a large batch run twice.
 - **Idle runners released under memory pressure.** While a model is resident, `serve` checks the host
   at a multiple of its sampling interval; when low available memory, OS memory pressure or swapping
   holds it, the cheapest idle runners are unloaded (audit trigger `pressure_sweep`). Pinned,

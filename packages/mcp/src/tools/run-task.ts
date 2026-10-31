@@ -7,6 +7,9 @@ import { withBatchTelemetry, withTaskTelemetry } from "../telemetry.js";
 import { runWithJobProgress } from "../job-progress.js";
 import { progressSink, type ToolExtra } from "../progress.js";
 import { ensureServe } from "../serve.js";
+import { serveBatchProgress } from "../serve-http.js";
+import { reportBatchProgress } from "../batch-progress.js";
+import { randomUUID } from "node:crypto";
 import {
   BATCH_TASK_FIELDS, batchItemParam, canonicalTaskKind, endpointParam, errorResult, executionPreferenceParam,
   isStructuredSuccess, localToolsParam, messagesParam, minConfidenceParam, minPlacementEvidenceParam, objectiveParam,
@@ -57,12 +60,28 @@ function validateTaskPayload(task: TaskPayload, label?: string): string | null {
   return null;
 }
 
-async function runBatch(tasks: BatchItem[], maxParallelism: number | undefined, endpoint: string | undefined) {
+/** Embedding items a deferred job can carry: 32 vectors of 4096 floats stay under its 2 MiB. */
+export const EMBEDDINGS_PER_JOB = 32;
+
+async function runBatch(
+  tasks: BatchItem[],
+  maxParallelism: number | undefined,
+  endpoint: string | undefined,
+  extra?: ToolExtra,
+) {
   for (const item of tasks) {
     const problem = validateTaskPayload(item.task, `batch item ${item.id}`);
     if (problem) return errorResult(new Error(problem));
   }
-  return withBatchTelemetry(parsedResult(await runTaskBatchRequest(endpoint ?? DEFAULT_SERVE_ENDPOINT, {
+  const report = progressSink(extra);
+  let progressId: string | undefined;
+  if (report) {
+    await ensureServe(endpoint, { signal: extra?.signal, report });
+    const id = randomUUID();
+    // Only a server that knows batch progress accepts `progress_id` (batch fields are strict).
+    if ((await serveBatchProgress(id, { endpoint, signal: extra?.signal })) !== "unsupported") progressId = id;
+  }
+  const request = runTaskBatchRequest(endpoint ?? DEFAULT_SERVE_ENDPOINT, {
     tasks: tasks.map(({ id, independent, task }) => ({
       id,
       independent,
@@ -100,7 +119,12 @@ async function runBatch(tasks: BatchItem[], maxParallelism: number | undefined, 
       },
     })),
     max_parallelism: maxParallelism,
-  })));
+    ...(progressId !== undefined ? { progress_id: progressId } : {}),
+  });
+  const raw = report && progressId !== undefined
+    ? await reportBatchProgress(progressId, endpoint, report, request, extra?.signal)
+    : await request;
+  return withBatchTelemetry(parsedResult(raw));
 }
 
 export function registerRunTaskTool(server: McpServer): void {
@@ -242,7 +266,7 @@ export function registerRunTaskTool(server: McpServer): void {
           if (movable.length > 0) {
             return errorResult(new Error(`With \`tasks\`, put ${movable.join(", ")} inside each item's \`task\`.`));
           }
-          return await runBatch(tasks, maxParallelism, endpoint);
+          return await runBatch(tasks, maxParallelism, endpoint, extra);
         }
         if (maxParallelism !== undefined) return errorResult(new Error("`maxParallelism` is valid only with `tasks`."));
         if (warm) {
@@ -359,13 +383,18 @@ export function registerRunTaskTool(server: McpServer): void {
         const report = defer ? undefined : progressSink(extra);
         // A serve this server is still starting reports its phases too.
         if (report) await ensureServe(endpoint, { signal: extra?.signal, report });
-        const result = parsedResult(report
+        // A job keeps at most 2 MiB of result, and a few dozen vectors of a large embedding model
+        // pass that; such a job would be refused and the batch embedded a second time. Large
+        // embedding batches therefore run synchronously, reported as one phase.
+        const bulkEmbedding = request.task === "embedding" && Array.isArray(input) && input.length > EMBEDDINGS_PER_JOB;
+        if (report && bulkEmbedding) report(`embedding ${input.length} items (too many vectors to keep as a job; running directly)`);
+        const result = parsedResult(report && !bulkEmbedding
           ? await runWithJobProgress({
             submit: () => runTaskRequest(target, { ...request, defer: true }),
             get: (id) => getTaskJob(target, id),
             cancel: (id) => cancelTaskJob(target, id),
             sync: synchronous,
-          }, report, extra?.signal)
+          }, report, { signal: extra?.signal })
           : await synchronous());
         if (isStructuredSuccess(result) && result.structuredContent.deferred === true) return result;
         const finished = withTaskTelemetry(result);

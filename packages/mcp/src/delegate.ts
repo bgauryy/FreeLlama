@@ -252,7 +252,7 @@ const adapterResultSchema = z.object({
       runtime_config: z.record(z.string(), z.unknown()).optional(),
       context_management: z
         .object({
-          token_counting: z.enum(["configured_estimate", "model_calibrated_estimate"]),
+          token_counting: z.enum(["platform_learned_ratio", "local_chars_per_token"]),
           estimate_scale: z.number().positive(),
           calibration_samples: z.number().int().nonnegative(),
           pinned_overflow: z.enum(["error", "clip"]),

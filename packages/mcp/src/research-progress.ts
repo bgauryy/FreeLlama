@@ -236,15 +236,42 @@ export function researchProgressMessage(value: unknown, workspace: string): stri
       return "finishing answer";
     case "finalize":
       return `turn budget used${maxTurns !== undefined ? ` (${maxTurns})` : ""}; finishing answer`;
+    case "job_phase": {
+      const message = text(event.message);
+      return message && `${at ?? "final answer"}: ${message}`;
+    }
     default:
       return undefined;
   }
 }
 
-/** The stderr filter that reports each adapter progress line to `report`. */
-export function researchProgressFilter(report: ProgressSink, workspace: string): PrefixedLineFilter {
+/**
+ * The stderr filter that reports each adapter progress line to `report`. When `openJobs` is given
+ * it holds the deferred jobs the adapter has open, for {@link cancelOpenJobs} after it exits.
+ */
+export function researchProgressFilter(report: ProgressSink, workspace: string, openJobs?: Set<string>): PrefixedLineFilter {
   return new PrefixedLineFilter(PROGRESS_PREFIX, (payload) => {
-    const message = researchProgressMessage(JSON.parse(payload), workspace);
+    const event: unknown = JSON.parse(payload);
+    const fields = object(event);
+    const id = text(fields?.id);
+    if (id && fields?.event === "job_open") openJobs?.add(id);
+    if (id && fields?.event === "job_closed") openJobs?.delete(id);
+    const message = researchProgressMessage(event, workspace);
     if (message) report(message);
   });
+}
+
+/**
+ * Cancel, best-effort and without waiting, every job an exited adapter left open: it was killed
+ * (timeout, client cancel) before it could cancel the job itself.
+ */
+export function cancelOpenJobs(openJobs: Set<string>, cancel: (id: string) => Promise<unknown>): void {
+  for (const id of openJobs) {
+    try {
+      void cancel(id).catch(() => undefined);
+    } catch {
+      // A failed cancel leaves the job to its own deadline.
+    }
+  }
+  openJobs.clear();
 }

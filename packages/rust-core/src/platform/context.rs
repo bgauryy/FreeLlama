@@ -13,6 +13,21 @@ pub(super) fn estimated_text_tokens(text: &str) -> u64 {
     (text.len() as u64).div_ceil(3)
 }
 
+/// Bytes per token (times 1000) used for a model: its learned ratio less a 10% margin, so an
+/// estimate errs toward more tokens, or the fixed 3 until it has been measured.
+fn bytes_per_token_milli(model: &CatalogModel) -> u64 {
+    model
+        .bytes_per_token_milli
+        .map_or(3000, |milli| (milli / 10 * 9).clamp(1000, 8000))
+}
+
+/// Tokens in `text` for `model`, from its learned ratio when known; rounded up.
+pub(super) fn estimated_model_tokens(text: &str, model: &CatalogModel) -> u64 {
+    (text.len() as u64)
+        .saturating_mul(1000)
+        .div_ceil(bytes_per_token_milli(model))
+}
+
 fn has_unestimated_modality(input: &TaskInput) -> bool {
     matches!(input.route.task, TaskKind::Embedding | TaskKind::Vision)
         || input
@@ -134,12 +149,12 @@ pub(super) fn size_context(
     } else {
         serde_json::to_string(&input.messages).expect("JSON messages serialize")
     };
-    let mut estimated = estimated_text_tokens(&payload);
+    let mut estimated = estimated_model_tokens(&payload, model);
     for schema in [input.tools.as_ref(), input.request_options.format.as_ref()]
         .into_iter()
         .flatten()
     {
-        estimated = estimated.saturating_add(estimated_text_tokens(&schema.to_string()));
+        estimated = estimated.saturating_add(estimated_model_tokens(&schema.to_string(), model));
     }
     let cap = model
         .advertised_context
@@ -170,7 +185,10 @@ pub(super) fn size_context(
         .reasons
         .push("context_sized_from_execution_payload".to_owned());
     Ok(json!({
-        "mode": "prompt_estimate", "estimator": "utf8_bytes_div_3",
+        "mode": "prompt_estimate",
+        "estimator": if model.bytes_per_token_milli.is_some() { "utf8_bytes_per_learned_token_ratio" } else { "utf8_bytes_div_3" },
+        "bytes_per_token_milli": bytes_per_token_milli(model),
+        "bytes_per_token_samples": model.bytes_per_token_samples,
         "estimated_input_tokens": estimated, "output_reserve_tokens": output,
         "output_capped": capped.is_some(),
         "template_margin_tokens": TEMPLATE_MARGIN, "tokens": selected,
@@ -232,6 +250,26 @@ mod tests {
         )
         .unwrap();
         (input, model, decision)
+    }
+
+    #[test]
+    fn a_learned_token_ratio_replaces_the_fixed_one_with_a_safety_margin() {
+        let (_, mut model, _) = request("x");
+        let text = "a".repeat(9_000);
+        assert_eq!(
+            estimated_model_tokens(&text, &model),
+            3_000,
+            "unmeasured: 3 bytes per token"
+        );
+        model.bytes_per_token_milli = Some(4_000);
+        // 4.0 bytes per token less 10% is 3.6: 9000 / 3.6 = 2500.
+        assert_eq!(estimated_model_tokens(&text, &model), 2_500);
+        model.bytes_per_token_milli = Some(100_000);
+        assert_eq!(
+            estimated_model_tokens(&text, &model),
+            1_125,
+            "capped at 8 bytes per token"
+        );
     }
 
     #[test]

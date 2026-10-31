@@ -17,10 +17,30 @@ const IDENTITY_LIMIT = 1024 * 1024;
 
 const trimSlashes = (text: string) => text.replace(/\/+$/, "");
 
-async function readIdentityJson(url: string): Promise<unknown> {
-  const payload = await httpRequest(url, { method: "GET", headers: requestHeaders(), timeoutSeconds: 5, limit: IDENTITY_LIMIT + 1 });
+/** GET the model catalog (`/api/tags`, or serve's `/_freellama/v1/models`) as bounded JSON. */
+export async function readCatalogJson(url: string, request: typeof httpRequest = httpRequest): Promise<unknown> {
+  const payload = await request(url, { method: "GET", headers: requestHeaders(), timeoutSeconds: 5, limit: IDENTITY_LIMIT + 1 });
   if (payload.length > IDENTITY_LIMIT) throw new ValidationError("model identity catalog exceeds size limit");
   return parseJsonBody(payload, "model identity catalog");
+}
+
+/**
+ * The catalog entry named `model` (or `model:latest` for an untagged name). `ambiguous` when an
+ * entry's name is a list or object, `null` when the payload is not a catalog or lacks the model.
+ */
+function catalogEntry(payload: unknown, model: string): Record<string, unknown> | null | "ambiguous" {
+  const entries = isRecord(payload) ? payload.models ?? [] : [];
+  if (!Array.isArray(entries)) return null;
+  const names = new Set([model]);
+  const lastSegment = model.slice(model.lastIndexOf("/") + 1);
+  if (!lastSegment.includes(":")) names.add(model + ":latest");
+  for (const item of entries) {
+    if (!isRecord(item)) continue;
+    const name = Object.hasOwn(item, "name") ? item.name : item.model;
+    if (typeof name === "object" && name !== null) return "ambiguous";
+    if (typeof name === "string" && names.has(name)) return item;
+  }
+  return null;
 }
 
 export interface ModelIdentity {
@@ -50,23 +70,9 @@ export async function resolveModelIdentity(
     : endpoint + "/api/tags";
   const unknown: ModelIdentity = { identity: "", verified: false, scope: "current_process_only" };
   try {
-    const payload = await (options.readJson ?? readIdentityJson)(url);
-    const entries = isRecord(payload) ? payload.models ?? [] : [];
-    if (!Array.isArray(entries)) return unknown;
-    const names = new Set([model]);
-    const lastSegment = model.slice(model.lastIndexOf("/") + 1);
-    if (!lastSegment.includes(":")) names.add(model + ":latest");
-    let entry: Record<string, unknown> | null = null;
-    for (const item of entries) {
-      if (!isRecord(item)) continue;
-      const name = Object.hasOwn(item, "name") ? item.name : item.model;
-      // A list or object name makes the catalog ambiguous: identity stays unverified.
-      if (typeof name === "object" && name !== null) return unknown;
-      if (typeof name === "string" && names.has(name)) {
-        entry = item;
-        break;
-      }
-    }
+    const entry = catalogEntry(await (options.readJson ?? readCatalogJson)(url), model);
+    // A list or object name makes the catalog ambiguous: identity stays unverified.
+    if (entry === "ambiguous") return unknown;
     const digestValue = entry?.digest;
     if (typeof digestValue !== "string" || !DIGEST.test(digestValue)) return unknown;
     const digest = (digestValue.startsWith("sha256:") ? digestValue.slice("sha256:".length) : digestValue).toLowerCase();
@@ -83,6 +89,40 @@ export async function resolveModelIdentity(
       return unknown;
     }
     throw error;
+  }
+}
+
+/** The prompt-token ratio serve learned for a model from its own managed chats. */
+export interface PlatformTokenRatio {
+  /** UTF-8 bytes of the serialized chat messages per prompt token Ollama counted, times 1000. */
+  bytes_per_token_milli: number;
+  bytes_per_token_samples: number;
+}
+
+/**
+ * Read the chosen model's learned bytes-per-token ratio from serve's catalog, once per run. Returns
+ * `null` when the ratio is unmeasured, the model is absent, or serve is unreachable, older (no
+ * field) or refuses; the caller then keeps its local estimate.
+ */
+export async function resolvePlatformTokenRatio(
+  serveEndpoint: string,
+  model: string,
+  options: { readJson?: (url: string) => unknown | Promise<unknown> } = {},
+): Promise<PlatformTokenRatio | null> {
+  try {
+    const url = `${trimSlashes(serveEndpoint)}/_freellama/v1/models`;
+    const entry = catalogEntry(await (options.readJson ?? readCatalogJson)(url), model);
+    if (entry === null || entry === "ambiguous") return null;
+    const milli = entry.bytes_per_token_milli;
+    if (typeof milli !== "number" || !Number.isSafeInteger(milli) || milli <= 0) return null;
+    const samples = entry.bytes_per_token_samples;
+    return {
+      bytes_per_token_milli: milli,
+      bytes_per_token_samples: typeof samples === "number" && Number.isSafeInteger(samples) && samples > 0 ? samples : 1,
+    };
+  } catch {
+    // Optional evidence: any failure to read it falls back to the local estimate.
+    return null;
   }
 }
 

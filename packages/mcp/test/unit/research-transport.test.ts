@@ -88,7 +88,7 @@ describe("transport", () => {
           Buffer.from(JSON.stringify({ ...receipt, prompt: "private research question", authorization: "Bearer private-token" })));
         const pending = { message: { content: '{"action":"page","step":999,"page":1}' } };
         const request = finalizing ? scripted(pending, refused) : scripted(refused);
-        expect(await runAdapter(adapter, { env, requestJson: request, print: quiet })).toBe(1);
+        expect(await runAdapter(adapter, { env, requestJson: request, resolvePlatformTokenRatio: async () => null, print: quiet })).toBe(1);
         expect(request.calls).toBe(finalizing ? 2 : 1);
         const text = readFileSync(result, "utf8");
         const record = JSON.parse(text);

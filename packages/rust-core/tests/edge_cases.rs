@@ -30,6 +30,8 @@ fn model(name: &str, size: u64, capabilities: &[Capability]) -> CatalogModel {
         benchmark: BTreeMap::new(),
         observed_loops: BTreeMap::new(),
         learned_output_tokens: None,
+        bytes_per_token_milli: None,
+        bytes_per_token_samples: 0,
         policy_rank: BTreeMap::new(),
         policy_options: BTreeMap::new(),
     }

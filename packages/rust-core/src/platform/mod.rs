@@ -26,6 +26,7 @@ use crate::{
 
 mod admission;
 mod audit;
+mod batch_progress;
 mod bearer;
 mod budget;
 mod catalog;
@@ -160,6 +161,7 @@ struct PlatformState {
     ollama_refresh: Arc<Mutex<Instant>>,
     raw_admission: proxy::RawAdmission,
     jobs: Arc<std::sync::Mutex<jobs::JobRegistry>>,
+    batch_progress: Arc<batch_progress::BatchProgress>,
 }
 
 impl PlatformState {
@@ -351,6 +353,7 @@ fn build(config: &PlatformConfig) -> Result<(Router, PlatformState)> {
         ollama_refresh: Arc::new(Mutex::new(Instant::now())),
         raw_admission: raw_admission.clone(),
         jobs: Arc::default(),
+        batch_progress: Arc::default(),
     };
     let fallback_config = ProxyConfig::new(&config.listen, &config.upstream, config.allow_remote)
         .with_raw_admission(raw_admission)
@@ -396,6 +399,10 @@ fn build(config: &PlatformConfig) -> Result<(Router, PlatformState)> {
             post(jobs::cancel),
         )
         .route(&format!("{API_ROOT}/task-batches"), post(run_task_batch))
+        .route(
+            &format!("{API_ROOT}/task-batches/{{id}}"),
+            get(batch_progress::get),
+        )
         .route(&format!("{API_ROOT}/metrics"), get(monitor::metrics))
         .route(&format!("{API_ROOT}/status"), get(monitor::status))
         .route(&format!("{API_ROOT}/usage"), get(monitor::usage))

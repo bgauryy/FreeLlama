@@ -44,6 +44,8 @@ fn candidate(name: &str, size: u64, capabilities: &[Capability], resident: bool)
         benchmark: BTreeMap::new(),
         observed_loops: BTreeMap::new(),
         learned_output_tokens: None,
+        bytes_per_token_milli: None,
+        bytes_per_token_samples: 0,
         policy_rank: [
             TaskKind::Completion,
             TaskKind::Coding,

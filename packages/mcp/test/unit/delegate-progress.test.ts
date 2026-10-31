@@ -7,9 +7,10 @@ import { PROGRESS_ENV, PROGRESS_PREFIX } from "../../src/research/progress-event
 const fixture = vi.hoisted(() => ({
   handlers: new Map<string, (...args: any[]) => Promise<any>>(),
   exec: vi.fn(),
+  cancelTaskJob: vi.fn(async (_endpoint: string, _id: string) => "{}"),
 }));
 
-vi.mock("../../src/serve-client.js", () => ({ route: vi.fn() }));
+vi.mock("../../src/serve-client.js", () => ({ route: vi.fn(), cancelTaskJob: fixture.cancelTaskJob }));
 vi.mock("node:fs", async (importOriginal) => {
   const original = await importOriginal<typeof import("node:fs")>();
   return { ...original, existsSync: (file: string) => /(?:bash|octocode)-agent\.js$/.test(file) || original.existsSync(file) };
@@ -44,6 +45,7 @@ describe("delegate_research progress", () => {
   });
   beforeEach(() => {
     fixture.exec.mockReset();
+    fixture.cancelTaskJob.mockClear();
     vi.unstubAllEnvs();
   });
 
@@ -73,6 +75,24 @@ describe("delegate_research progress", () => {
       { progressToken: "t1", progress: 2, message: "turn 1/8: model thinking" },
       { progressToken: "t1", progress: 3, message: "turn 1/8: grep 'foo' in src" },
     ]);
+  });
+
+  it("cancels a turn's job that the adapter left open when it was killed", async () => {
+    fixture.exec.mockImplementation(async (_file: string, _argv: string[], options: Options) => {
+      options.stderrFilter!.push(Buffer.from(
+        `${PROGRESS_PREFIX}{"event":"job_open","id":"done-job"}\n${PROGRESS_PREFIX}{"event":"job_closed","id":"done-job"}\n` +
+          `${PROGRESS_PREFIX}{"event":"job_open","id":"live-job"}\n` +
+          `${PROGRESS_PREFIX}{"event":"job_phase","turn":2,"maxTurns":8,"message":"loading m (~8.7 s)"}\n`,
+      ));
+      throw new Error("Command failed: killed by SIGKILL");
+    });
+    const sendNotification = vi.fn(async () => undefined);
+    await fixture.handlers.get("delegate_research")!({ ...args, endpoint: "http://127.0.0.1:11435" }, {
+      signal: new AbortController().signal, _meta: { progressToken: "t2" }, sendNotification,
+    });
+    expect(fixture.cancelTaskJob.mock.calls).toEqual([["http://127.0.0.1:11435", "live-job"]]);
+    const sent = sendNotification.mock.calls.map(([notification]: any[]) => notification.params.message);
+    expect(sent).toContain("turn 2/8: loading m (~8.7 s)");
   });
 
   it("without a progressToken spawns exactly as before, even if the server env names the variable", async () => {

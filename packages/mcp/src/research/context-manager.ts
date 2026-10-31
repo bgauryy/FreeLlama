@@ -1,11 +1,14 @@
-// Stateful context management for one adapter run: fit each request, calibrate the token estimate
-// from Ollama's `prompt_eval_count`, and persist the calibration per verified model identity.
+// Stateful context management for one adapter run: fit each request with one token estimator.
+// With serve's learned bytes-per-token ratio it counts as the platform does; otherwise it falls back
+// to the character estimate calibrated from Ollama's `prompt_eval_count`, persisted per verified
+// model identity.
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { canonicalJson, isRecord } from "./canonical-json.js";
 import { AgentRuntimeConfig, COMPACTION_TARGET_RATIO, contextBudget, type Message } from "./context-policy.js";
 import { ContextBudgeter, fitToContext } from "./fit.js";
+import type { PlatformTokenRatio } from "./transport.js";
 
 export interface CalibrationContract {
   schema_version: number;
@@ -32,14 +35,20 @@ export class AgentContextManager {
   readonly calibrationSource: string;
   compactions = 0;
 
-  constructor(runtime: AgentRuntimeConfig, options: { model?: string; calibrationDir?: string | null; calibrationIdentity?: string } = {}) {
+  constructor(runtime: AgentRuntimeConfig, options: {
+    model?: string; calibrationDir?: string | null; calibrationIdentity?: string; platformRatio?: PlatformTokenRatio | null;
+  } = {}) {
     this.runtime = runtime;
     this.model = options.model ?? "";
-    this.calibrationDir = options.calibrationDir ?? null;
+    const platformRatio = options.platformRatio ?? null;
+    // The platform ratio replaces local calibration: none is loaded, applied or written.
+    this.calibrationDir = platformRatio ? null : options.calibrationDir ?? null;
     this.calibrationIdentity = options.calibrationIdentity ?? "";
     const loaded = this.loadCalibration();
-    this.budgeter = new ContextBudgeter(runtime.context, { initialScale: loaded?.scale ?? 1, calibrationSamples: loaded?.samples ?? 0 });
-    this.calibrationSource = loaded ? "persistent_model_cache" : "current_process";
+    this.budgeter = new ContextBudgeter(runtime.context, {
+      initialScale: loaded?.scale ?? 1, calibrationSamples: loaded?.samples ?? 0, platformRatio,
+    });
+    this.calibrationSource = platformRatio ? "not_applied" : loaded ? "persistent_model_cache" : "current_process";
   }
 
   modelKey(): string {

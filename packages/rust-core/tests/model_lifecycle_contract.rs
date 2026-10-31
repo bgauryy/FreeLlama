@@ -238,3 +238,40 @@ async fn unload_never_loads_a_model_that_is_not_resident() {
     assert_eq!(*ollama.unloads.lock().unwrap(), 1);
     ollama.server.abort();
 }
+
+#[tokio::test]
+async fn an_embedding_item_that_cannot_fit_is_refused_before_any_load() {
+    let ollama = embedding_ollama(false).await;
+    let platform = platform(&ollama.endpoint);
+    let (status, error) = send(
+        &platform,
+        "POST",
+        "/_freellama/v1/tasks",
+        json!({"task":"embedding","model":"embed:1","input":["short", "x".repeat(64 * 1024)]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{error}");
+    assert_eq!(error["code"], "embedding_item_exceeds_context");
+    assert!(
+        error["error"].as_str().unwrap().contains("\"index\":1"),
+        "{error}"
+    );
+    assert!(
+        ollama.embeds.lock().unwrap().is_empty(),
+        "nothing reached Ollama"
+    );
+    assert!(
+        !ollama.resident.load(Ordering::SeqCst),
+        "nothing was loaded"
+    );
+    // Items that may fit still go through.
+    let (status, _) = send(
+        &platform,
+        "POST",
+        "/_freellama/v1/tasks",
+        json!({"task":"embedding","model":"embed:1","input":["short", "y".repeat(6 * 1024)]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    ollama.server.abort();
+}

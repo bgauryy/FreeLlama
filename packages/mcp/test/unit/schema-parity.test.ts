@@ -19,7 +19,7 @@ function rustEnumMembers(file: string, name: string): string[] {
 describe("MCP schema parity with Rust routing types", () => {
   it("advertises every TaskKind and no unsupported task strings", () => {
     expect([...TASK_KINDS]).toEqual(
-      rustEnumMembers("packages/rust-core/src/platform/routing.rs", "TaskKind"),
+      rustEnumMembers("packages/rust-core/src/platform/routing/mod.rs", "TaskKind"),
     );
   });
 

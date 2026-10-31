@@ -61,7 +61,28 @@ pub(crate) async fn start_platform(args: PlatformStartArgs) -> Result<()> {
         policy_file,
     );
     configure_resource_policy(&mut config, &args.admission)?;
-    if let Some(cpu_upstream) = args.backends.cpu_upstream {
+    // Owned for the life of this function: dropping it stops the CPU Ollama when serve returns.
+    let cpu_backend = if args.backends.spawn_cpu_backend {
+        let log = home
+            .as_deref()
+            .filter(|_| !args.production.ephemeral)
+            .map(|home| home.join("cpu-ollama.log"));
+        Some(
+            super::cpu_backend::spawn(
+                args.backends.cpu_backend_port,
+                &args.backends.ollama_binary,
+                log.as_deref(),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let cpu_upstream = args
+        .backends
+        .cpu_upstream
+        .or_else(|| cpu_backend.as_ref().map(|backend| backend.endpoint.clone()));
+    if let Some(cpu_upstream) = cpu_upstream {
         eprintln!(
             "freellama: assigning {} model(s) to CPU Ollama at {cpu_upstream}",
             args.backends.cpu_model.len()
@@ -113,7 +134,9 @@ pub(crate) async fn start_platform(args: PlatformStartArgs) -> Result<()> {
         config = config.with_remote_access(true);
     }
     report_admission_config();
-    serve_platform(config).await
+    let served = serve_platform(config).await;
+    drop(cpu_backend);
+    served
 }
 
 pub(crate) fn configure_resource_policy(

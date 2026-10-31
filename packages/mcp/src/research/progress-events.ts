@@ -20,7 +20,13 @@ export type ResearchProgressEvent =
   | { event: "repair"; turn: number; maxTurns: number }
   | { event: "action"; turn: number; maxTurns: number; action: Action; repeat?: boolean }
   | { event: "finish"; turn: number; maxTurns: number }
-  | { event: "finalize"; maxTurns: number };
+  | { event: "finalize"; maxTurns: number }
+  /** A managed turn's job phase (queued, waiting for memory, loading...); no `turn` when finalizing. */
+  | { event: "job_phase"; turn?: number; maxTurns: number; message: string }
+  /** The server holds deferred job `id` for a turn; the MCP server cancels it if the adapter dies. */
+  | { event: "job_open"; id: string }
+  /** Job `id` has settled, disappeared or been cancelled. */
+  | { event: "job_closed"; id: string };
 
 export type ProgressEmitter = (event: ResearchProgressEvent) => void;
 

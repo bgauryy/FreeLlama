@@ -7,6 +7,9 @@
 //!   by a cap or by the end of its context (not a repetition loop) doubles it for next time.
 //! - `runs:<task>` / `loops:<task>`: managed chat runs and the repetition loops among them, the
 //!   evidence routing uses to stop preferring a model for work it keeps looping on.
+//! - `bytes_per_token_milli` / `bytes_per_token_samples`: UTF-8 bytes of the serialized chat
+//!   messages per prompt token Ollama counted, a running average, so context sizing and the
+//!   research agent estimate this model's prompts from its own tokenizer instead of a fixed ratio.
 //! - `next:<model>` (any digest): how often callers switched from this model to that one, which
 //!   predictive preload reads.
 
@@ -19,6 +22,11 @@ use super::{LoopRecord, TaskKind};
 use crate::store::Store;
 
 const OUTPUT_NEED: &str = "output_need";
+/// Learned bytes per prompt token, times 1000.
+const BYTES_PER_TOKEN: &str = "bytes_per_token_milli";
+const BYTES_PER_TOKEN_SAMPLES: &str = "bytes_per_token_samples";
+/// Prompts shorter than this teach nothing: the chat template's fixed tokens dominate them.
+const MIN_RATIO_PROMPT_TOKENS: u64 = 64;
 
 type Key = (String, String, String);
 
@@ -109,6 +117,56 @@ impl ModelFacts {
         };
         let (model, digest, fact) = key;
         self.persist(move |store| store.set_fact(&model, &digest, &fact, updated));
+    }
+
+    /// The learned bytes-per-token ratio (times 1000) and its sample count, when measured.
+    pub(crate) fn bytes_per_token(&self, model: &str, digest: Option<&str>) -> Option<(u64, u64)> {
+        let values = self.lock();
+        let milli = values.get(&key(model, digest, BYTES_PER_TOKEN)).copied()?;
+        let samples = values
+            .get(&key(model, digest, BYTES_PER_TOKEN_SAMPLES))
+            .copied()
+            .unwrap_or(1);
+        Some((milli, samples))
+    }
+
+    /// Learn the ratio from one text chat: `message_bytes` of serialized messages sent, and the
+    /// `prompt_tokens` Ollama counted for them (cached tokens included). The template's own tokens
+    /// count too, which keeps the ratio on the safe (lower) side.
+    pub(crate) fn learn_prompt_ratio(
+        &self,
+        model: &str,
+        digest: Option<&str>,
+        message_bytes: u64,
+        prompt_tokens: u64,
+    ) {
+        if prompt_tokens < MIN_RATIO_PROMPT_TOKENS {
+            return;
+        }
+        // 1 to 8 bytes per token covers every tokenizer; outside it the sample is noise.
+        let observed = message_bytes
+            .saturating_mul(1000)
+            .checked_div(prompt_tokens)
+            .unwrap_or(0)
+            .clamp(1000, 8000);
+        let ratio_key = key(model, digest, BYTES_PER_TOKEN);
+        let samples_key = key(model, digest, BYTES_PER_TOKEN_SAMPLES);
+        let (updated, samples) = {
+            let mut values = self.lock();
+            let updated = values.get(&ratio_key).map_or(observed, |stored| {
+                // A running average that settles after a few runs and keeps adapting.
+                (stored * 7 + observed * 3) / 10
+            });
+            values.insert(ratio_key.clone(), updated);
+            let samples = values.get(&samples_key).copied().unwrap_or(0) + 1;
+            values.insert(samples_key.clone(), samples);
+            (updated, samples)
+        };
+        let (model, digest, _) = ratio_key;
+        self.persist(move |store| {
+            store.set_fact(&model, &digest, BYTES_PER_TOKEN, updated)?;
+            store.set_fact(&model, &digest, BYTES_PER_TOKEN_SAMPLES, samples)
+        });
     }
 
     /// Count one managed chat run; `looped` when its output repeated itself.
@@ -223,6 +281,33 @@ fn next_need(stored: Option<u64>, observed: Observed) -> u64 {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn the_token_ratio_is_learned_from_real_counts_and_ignores_tiny_prompts() {
+        let facts = ModelFacts::default();
+        facts.learn_prompt_ratio("m", Some("d"), 400, 20);
+        assert_eq!(
+            facts.bytes_per_token("m", Some("d")),
+            None,
+            "under 64 tokens teaches nothing"
+        );
+        facts.learn_prompt_ratio("m", Some("d"), 4_000, 1_000);
+        assert_eq!(facts.bytes_per_token("m", Some("d")), Some((4_000, 1)));
+        facts.learn_prompt_ratio("m", Some("d"), 3_000, 1_000);
+        // 0.7 of the stored ratio plus 0.3 of the new one.
+        assert_eq!(facts.bytes_per_token("m", Some("d")), Some((3_700, 2)));
+        assert_eq!(
+            facts.bytes_per_token("m", Some("other")),
+            None,
+            "a new digest starts fresh"
+        );
+        facts.learn_prompt_ratio("m", Some("d"), 1, 1_000);
+        assert_eq!(
+            facts.bytes_per_token("m", Some("d")).unwrap().0,
+            2_890,
+            "noise is clamped to 1 byte"
+        );
+    }
 
     #[test]
     fn a_model_that_ran_out_of_room_while_reasoning_gets_twice_the_room() {

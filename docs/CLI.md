@@ -88,8 +88,17 @@ npx @octocodeai/freellama serve \
   --cpu-model nomic-embed-text:latest
 ```
 
-FreeLlama rejects a CPU upstream with no assignments, `--cpu-model` without `--cpu-upstream`, and a
-CPU upstream that is the same Ollama endpoint as `--upstream`, including loopback aliases on one port.
+Or let `serve` start and own the CPU process (stopped when `serve` exits; a port that already answers
+is refused):
+
+```bash
+npx @octocodeai/freellama serve --spawn-cpu-backend --cpu-model nomic-embed-text:latest \
+  [--cpu-backend-port 11436] [--ollama-binary /path/to/ollama]
+```
+
+FreeLlama rejects a CPU upstream with no assignments, `--cpu-model` without `--cpu-upstream` or
+`--spawn-cpu-backend`, both of those together, and a CPU upstream that is the same Ollama endpoint as
+`--upstream`, including loopback aliases on one port.
 It also sets `options.num_gpu=0` on CPU-assigned managed requests.
 Read [CPU and GPU model routing](CPU_GPU_ROUTING.md) before deploying this layout.
 

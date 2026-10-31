@@ -17,6 +17,17 @@ use uuid::Uuid;
 
 use crate::capability::Capability;
 
+mod candidates;
+mod profile;
+mod session;
+
+use candidates::{
+    compare_candidates, eligible_for_objective, general_fallback_fit, ranking_capability,
+    requirements,
+};
+use profile::{TaskProfile, profile, requested_context};
+pub use session::SessionAffinity;
+
 #[derive(
     Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Default, ValueEnum,
 )]
@@ -215,6 +226,14 @@ pub struct CatalogModel {
     /// observed; it raises the expected output the context is sized for.
     #[serde(default)]
     pub learned_output_tokens: Option<u64>,
+    /// UTF-8 bytes of serialized chat messages per prompt token Ollama counted for this model
+    /// revision, times 1000, learned from its own runs; `None` until measured. The one token
+    /// estimate both context sizing and the research agent use.
+    #[serde(default)]
+    pub bytes_per_token_milli: Option<u64>,
+    /// How many runs the ratio was learned from.
+    #[serde(default)]
+    pub bytes_per_token_samples: u64,
     pub policy_rank: BTreeMap<TaskKind, usize>,
     /// Per-task request defaults a policy file sets for this model; routing applies the entry
     /// for the requested task on top of the generic task profile.
@@ -282,103 +301,6 @@ pub struct RouteDecision {
     /// Every other eligible candidate and why it lost.
     pub rejected: Vec<Value>,
     pub reasons: Vec<String>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct SessionAffinity {
-    sessions: BTreeMap<String, SessionRecord>,
-}
-
-#[derive(Debug, Clone)]
-struct SessionRecord {
-    model: Option<String>,
-    last_used: Instant,
-    killed: tokio::sync::watch::Sender<bool>,
-}
-
-impl SessionAffinity {
-    #[must_use]
-    pub fn from_pairs(pairs: impl IntoIterator<Item = (String, String)>) -> Self {
-        Self {
-            sessions: pairs
-                .into_iter()
-                .map(|(session, model)| {
-                    (
-                        session,
-                        SessionRecord {
-                            model: Some(model),
-                            last_used: Instant::now(),
-                            killed: tokio::sync::watch::channel(false).0,
-                        },
-                    )
-                })
-                .collect(),
-        }
-    }
-
-    pub(super) fn create(&mut self) -> String {
-        let id = Uuid::new_v4().to_string();
-        self.sessions.insert(
-            id.clone(),
-            SessionRecord {
-                model: None,
-                last_used: Instant::now(),
-                killed: tokio::sync::watch::channel(false).0,
-            },
-        );
-        id
-    }
-
-    pub(super) fn assigned(&self, id: &str) -> Option<&str> {
-        self.sessions
-            .get(id)
-            .and_then(|record| record.model.as_deref())
-    }
-
-    pub(super) fn bind(&mut self, id: &str, model: &str) {
-        if let Some(record) = self.sessions.get_mut(id) {
-            record.model = Some(model.to_owned());
-            record.last_used = Instant::now();
-        }
-    }
-
-    pub(super) fn touch(&mut self, id: &str, ttl: Duration) -> bool {
-        self.prune_expired(ttl);
-        if let Some(record) = self.sessions.get_mut(id) {
-            record.last_used = Instant::now();
-            true
-        } else {
-            false
-        }
-    }
-
-    pub(super) fn prune_expired(&mut self, ttl: Duration) {
-        let now = Instant::now();
-        self.sessions
-            .retain(|_, record| now.duration_since(record.last_used) < ttl);
-    }
-
-    pub(super) fn remove(&mut self, id: &str) -> bool {
-        self.sessions.remove(id).is_some()
-    }
-
-    pub(super) fn cancellation(&self, id: &str) -> Option<tokio::sync::watch::Receiver<bool>> {
-        self.sessions
-            .get(id)
-            .map(|record| record.killed.subscribe())
-    }
-
-    pub(super) fn kill(&mut self, id: &str) -> bool {
-        let Some(record) = self.sessions.remove(id) else {
-            return false;
-        };
-        record.killed.send_replace(true);
-        true
-    }
-
-    pub(super) fn len(&self) -> usize {
-        self.sessions.len()
-    }
 }
 
 /// Select an eligible local model and a bounded Ollama request profile.
@@ -718,204 +640,6 @@ fn route_evidence(
         },
         confidence,
         evidence,
-    }
-}
-
-fn requirements(input: &RouteInput) -> BTreeSet<Capability> {
-    let mut required = input.required_capabilities.clone();
-    required.insert(ranking_capability(input.task));
-    if matches!(
-        input.task,
-        TaskKind::Tools | TaskKind::Browser | TaskKind::CodeRepair
-    ) {
-        required.insert(Capability::Completion);
-        required.insert(Capability::Tools);
-    }
-    required
-}
-
-fn ranking_capability(task: TaskKind) -> Capability {
-    match task {
-        TaskKind::Tools | TaskKind::Browser => Capability::Tools,
-        TaskKind::Vision => Capability::Vision,
-        TaskKind::Embedding => Capability::Embedding,
-        TaskKind::Completion | TaskKind::Coding | TaskKind::CodeRepair | TaskKind::LongContext => {
-            Capability::Completion
-        }
-    }
-}
-
-/// Whether automatic selection (fallback ranking or session affinity) may prefer this model for
-/// the task. A model observed to keep looping on this kind of task ranks last for it; an operator
-/// policy naming the model for the task always qualifies it, and an explicit model always wins.
-fn general_fallback_fit(model: &CatalogModel, task: TaskKind) -> bool {
-    model.policy_rank.contains_key(&task)
-        || !model
-            .observed_loops
-            .get(&task)
-            .is_some_and(|record| record.keeps_looping())
-}
-
-fn compare_candidates(left: &CatalogModel, right: &CatalogModel, input: &RouteInput) -> Ordering {
-    let capability = ranking_capability(input.task);
-    let left_score = left.benchmark.get(&capability).copied();
-    let right_score = right.benchmark.get(&capability).copied();
-    let fit = general_fallback_fit(left, input.task).cmp(&general_fallback_fit(right, input.task));
-    match input.objective {
-        Objective::Fastest => fit
-            .then_with(|| {
-                left_score
-                    .unwrap_or(0.0)
-                    .total_cmp(&right_score.unwrap_or(0.0))
-            })
-            .then_with(|| right.size.cmp(&left.size))
-            .then_with(|| right.name.cmp(&left.name)),
-        Objective::Balanced => fit
-            .then_with(|| left_score.is_some().cmp(&right_score.is_some()))
-            .then_with(|| left.resident.cmp(&right.resident))
-            .then_with(|| {
-                left_score
-                    .unwrap_or(0.0)
-                    .total_cmp(&right_score.unwrap_or(0.0))
-            })
-            .then_with(|| policy_preference(left, right, input.task))
-            .then_with(|| right.name.cmp(&left.name)),
-        Objective::Quality => {
-            policy_preference(left, right, input.task).then_with(|| right.name.cmp(&left.name))
-        }
-    }
-}
-
-fn eligible_for_objective<'a>(
-    input: &RouteInput,
-    capability_eligible: Vec<&'a CatalogModel>,
-) -> Result<Vec<&'a CatalogModel>> {
-    if input.model.is_some() || matches!(input.objective, Objective::Fastest) {
-        return Ok(capability_eligible);
-    }
-    let qualified = capability_eligible
-        .iter()
-        .copied()
-        .filter(|model| model.policy_rank.contains_key(&input.task))
-        .collect::<Vec<_>>();
-    if qualified.is_empty() && matches!(input.objective, Objective::Balanced) {
-        // Ordinary requests need no quality-policy setup. Retain capability/context filters
-        // and report missing quality evidence; an explicit confidence floor still applies.
-        return Ok(capability_eligible);
-    }
-    ensure!(
-        !qualified.is_empty(),
-        "no quality-qualified model exists for this task; configure a task policy (`freellama policy from-eval`), choose objective \"fastest\" (CLI: --objective fastest; MCP: objective:\"fastest\"), or name an explicit model. Run `freellama doctor` — unset OLLAMA_MAX_LOADED_MODELS / OLLAMA_KV_CACHE_TYPE is a machine-config gap, not a missing model"
-    );
-    Ok(qualified)
-}
-
-fn policy_preference(left: &CatalogModel, right: &CatalogModel, task: TaskKind) -> Ordering {
-    let left_rank = left.policy_rank.get(&task).copied().unwrap_or(usize::MAX);
-    let right_rank = right.policy_rank.get(&task).copied().unwrap_or(usize::MAX);
-    right_rank.cmp(&left_rank)
-}
-
-/// Request options and validation mode chosen for one routed model.
-struct TaskProfile {
-    name: String,
-    options: Value,
-    output_reserve: u64,
-    think: Value,
-    strict_tool_validation: bool,
-    /// True when a policy `model_options` entry changed the generic task profile.
-    policy_model_options: bool,
-    /// True when the policy asked for `think = true` on a model without the Thinking capability.
-    policy_think_dropped: bool,
-}
-
-/// Expected room for a thinking-capable model's reasoning plus an answer, matching the coding
-/// estimate; used only to size the context, and its own runs can only raise it.
-const THINKING_OUTPUT_ESTIMATE: u64 = 2_048;
-
-fn profile(input: &RouteInput, model: &CatalogModel) -> TaskProfile {
-    let policy = model.policy_options.get(&input.task).copied();
-    let requested_context = requested_context(input);
-    let num_ctx = requested_context
-        .min(model.advertised_context.unwrap_or(requested_context))
-        .min(u64::from(u32::MAX));
-    // How much output to expect, only for sizing the context window: a starting estimate per task,
-    // raised by what this model revision has needed before (plus a quarter for variation) and, for
-    // a model reporting the thinking capability, by room to reason. Never sent as a cap.
-    let (name, starting_estimate, think, strict) = match input.task {
-        TaskKind::Browser => ("browser_action", 64, Value::Bool(false), true),
-        TaskKind::Tools => ("tools", 256, Value::Bool(false), true),
-        TaskKind::CodeRepair => ("code_repair", 2_048, thinking_or_off(model, "medium"), true),
-        TaskKind::Coding => ("coding", 2_048, thinking_or_off(model, "medium"), false),
-        TaskKind::LongContext => (
-            "long_context",
-            2_048,
-            thinking_or_off(model, "medium"),
-            false,
-        ),
-        TaskKind::Vision => ("vision", 512, Value::Bool(false), false),
-        TaskKind::Embedding => ("embedding", 0, Value::Null, false),
-        TaskKind::Completion => ("completion", 512, Value::Bool(false), false),
-    };
-    let output_reserve = if starting_estimate == 0 {
-        0
-    } else {
-        let observed = model
-            .learned_output_tokens
-            .map_or(0, |tokens| tokens.saturating_add(tokens / 4));
-        let thinking = if model.capabilities.contains(&Capability::Thinking) {
-            THINKING_OUTPUT_ESTIMATE
-        } else {
-            0
-        };
-        // Never more than half the model's own window: the prompt needs the rest.
-        let ceiling = model
-            .advertised_context
-            .map_or(u64::MAX, |context| context / 2);
-        starting_estimate.max(observed.max(thinking).min(ceiling))
-    };
-    // An operator policy may cap output for one model and task; nothing else does.
-    let policy_cap = policy.and_then(|entry| entry.num_predict);
-    // `think = true` only reaches a model that can think; Ollama rejects it otherwise.
-    let policy_think = policy.and_then(|entry| entry.think);
-    let policy_think_dropped =
-        policy_think == Some(true) && !model.capabilities.contains(&Capability::Thinking);
-    let think = match policy_think {
-        Some(true) => thinking_or_off(model, true),
-        Some(false) => Value::Bool(false),
-        None => think,
-    };
-    let mut options = json!({"num_ctx": num_ctx});
-    if let Some(cap) = policy_cap {
-        options["num_predict"] = json!(cap);
-    }
-    TaskProfile {
-        name: name.to_owned(),
-        options,
-        output_reserve: policy_cap.unwrap_or(output_reserve),
-        think,
-        strict_tool_validation: strict,
-        policy_model_options: policy.is_some_and(|entry| entry != ModelRequestDefaults::default()),
-        policy_think_dropped,
-    }
-}
-
-fn requested_context(input: &RouteInput) -> u64 {
-    input.context_tokens.unwrap_or(match input.task {
-        TaskKind::Browser | TaskKind::Tools | TaskKind::CodeRepair => 8_192,
-        TaskKind::LongContext => 32_768,
-        // Embeddings are not chat: embedding models commonly advertise 2048, so the chat default
-        // would make every embed look like a context miss.
-        TaskKind::Embedding => 2_048,
-        _ => 16_384,
-    })
-}
-
-fn thinking_or_off(model: &CatalogModel, effort: impl Into<Value>) -> Value {
-    if model.capabilities.contains(&Capability::Thinking) {
-        effort.into()
-    } else {
-        Value::Bool(false)
     }
 }
 

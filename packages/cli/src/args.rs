@@ -137,6 +137,45 @@ mod telemetry_cli_tests {
             Command::Task(TaskArgs { prompt: None, .. })
         ));
         assert!(Cli::try_parse_from(["freellama", "task", "hi"]).is_ok());
+        <Cli as clap::CommandFactory>::command().debug_assert();
+        // A CPU model needs a CPU backend: an endpoint, or one serve starts and owns.
+        assert!(Cli::try_parse_from(["freellama", "serve", "--cpu-model", "m"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "freellama",
+                "serve",
+                "--spawn-cpu-backend",
+                "--cpu-model",
+                "m"
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "freellama",
+                "serve",
+                "--cpu-upstream",
+                "http://127.0.0.1:11436",
+                "--cpu-model",
+                "m",
+            ])
+            .is_ok()
+        );
+        assert!(Cli::try_parse_from(["freellama", "serve", "--spawn-cpu-backend"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "freellama",
+                "serve",
+                "--spawn-cpu-backend",
+                "--cpu-upstream",
+                "http://x",
+                "--cpu-model",
+                "m",
+            ])
+            .is_err(),
+            "spawning and naming a CPU backend are exclusive"
+        );
+        assert!(Cli::try_parse_from(["freellama", "serve", "--cpu-backend-port", "1"]).is_err());
         assert!(Cli::try_parse_from(["freellama", "task"]).is_err());
         assert!(Cli::try_parse_from(["freellama", "task", "--input-file", "x.txt", "hi"]).is_err());
     }
@@ -246,10 +285,21 @@ pub(crate) struct BackendArgs {
     pub(crate) upstream: String,
     /// Optional second Ollama process forced to CPU (keep it on loopback). Managed tasks using a
     /// model named by --cpu-model are sent here; raw Ollama-compatible endpoints stay on --upstream.
-    #[arg(long)]
+    #[arg(long, group = "cpu_backend")]
     pub(crate) cpu_upstream: Option<String>,
-    /// Model to assign to --cpu-upstream. Repeat for multiple models.
-    #[arg(long, requires = "cpu_upstream")]
+    /// Start and own a CPU-only Ollama on 127.0.0.1:--cpu-backend-port for the --cpu-model models,
+    /// stopped when `serve` exits. A port that already answers is refused, not adopted.
+    #[arg(long, group = "cpu_backend", requires = "cpu_model")]
+    pub(crate) spawn_cpu_backend: bool,
+    /// Port of the CPU-only Ollama that --spawn-cpu-backend starts.
+    #[arg(long, default_value_t = 11436, requires = "spawn_cpu_backend")]
+    pub(crate) cpu_backend_port: u16,
+    /// Ollama executable --spawn-cpu-backend runs (default: `ollama` on PATH).
+    #[arg(long, default_value = "ollama", requires = "spawn_cpu_backend")]
+    pub(crate) ollama_binary: String,
+    /// Model to assign to the CPU backend (--cpu-upstream or --spawn-cpu-backend). Repeat for
+    /// multiple models.
+    #[arg(long, requires = "cpu_backend")]
     pub(crate) cpu_model: Vec<String>,
 }
 

@@ -152,6 +152,14 @@ fn catalog_model(
     CatalogModel {
         observed_loops: state.model_facts.loops_for(name, digest.as_deref()),
         learned_output_tokens: state.model_facts.output_need(name, digest.as_deref()),
+        bytes_per_token_milli: state
+            .model_facts
+            .bytes_per_token(name, digest.as_deref())
+            .map(|(milli, _)| milli),
+        bytes_per_token_samples: state
+            .model_facts
+            .bytes_per_token(name, digest.as_deref())
+            .map_or(0, |(_, samples)| samples),
         digest,
         name: name.to_owned(),
         size: entry.get("size").and_then(Value::as_u64).unwrap_or(0),
@@ -388,6 +396,11 @@ async fn refresh_residency(
         model.learned_output_tokens = state
             .model_facts
             .output_need(&model.name, model.digest.as_deref());
+        let ratio = state
+            .model_facts
+            .bytes_per_token(&model.name, model.digest.as_deref());
+        model.bytes_per_token_milli = ratio.map(|(milli, _)| milli);
+        model.bytes_per_token_samples = ratio.map_or(0, |(_, samples)| samples);
     }
     Ok(())
 }
@@ -714,6 +727,8 @@ mod kv_estimate_tests {
             benchmark: BTreeMap::new(),
             observed_loops: BTreeMap::new(),
             learned_output_tokens: None,
+            bytes_per_token_milli: None,
+            bytes_per_token_samples: 0,
             policy_rank: BTreeMap::new(),
             policy_options: BTreeMap::new(),
         };

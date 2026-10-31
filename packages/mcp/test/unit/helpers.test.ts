@@ -100,7 +100,7 @@ describe("parseAdapterResult", () => {
         final_answer: "ok",
         model_metadata: {
           context_management: {
-            token_counting: "model_calibrated_estimate",
+            token_counting: "local_chars_per_token",
             estimate_scale: 1.2,
             calibration_samples: 3,
             pinned_overflow: "error",

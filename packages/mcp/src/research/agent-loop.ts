@@ -15,9 +15,10 @@ import { ObservationStore } from "./observations.js";
 import { progressEmitter } from "./progress-events.js";
 import { cpSlice, decodeUtf8, normalizeNewlines, trimSpace } from "./text.js";
 import {
-  PromptCacheUsage, chatErrorDetails, chatRequest, errorDiagnostic, isTransportError, requestJson,
-  resolveModelIdentity, retryableChatError, unwrapChatResponse, type ModelIdentity,
+  PromptCacheUsage, chatErrorDetails, chatRequest, errorDiagnostic, isTransportError, readCatalogJson,
+  requestJson, resolveModelIdentity, resolvePlatformTokenRatio, retryableChatError, unwrapChatResponse, type ModelIdentity,
 } from "./transport.js";
+import { requestJsonAsJob } from "./transport-jobs.js";
 import { resolvePath } from "./workspace-path.js";
 
 export type { Action, AdapterHooks, AdapterSession, AdapterSpec, ToolCall } from "./adapter.js";
@@ -78,10 +79,20 @@ interface RunInputs {
 async function runLoop(spec: AdapterSpec, hooks: AdapterHooks, env: Env, inputs: RunInputs): Promise<number> {
   const { model, workspace, prompt, resultPath } = inputs;
   const print = hooks.print ?? ((line: string) => process.stdout.write(`${line}\n`));
-  const sendJson = hooks.requestJson ?? requestJson;
   const progress = hooks.progress ?? progressEmitter(env);
   const endpoint = (env.FREELLAMA_OLLAMA_ENDPOINT ?? "http://127.0.0.1:11434").replace(/\/+$/, "");
   const managedEndpoint = (env.FREELLAMA_AGENT_MANAGED_ENDPOINT ?? "").replace(/\/+$/, "");
+  // The turn (or the final answer, without `turn`) a managed job's phases are reported under.
+  let phaseAt: { turn?: number; maxTurns: number } = { maxTurns: 0 };
+  // With progress on, a managed turn runs as a deferred job so its admission, memory and load
+  // waits are reported; its result and errors are the synchronous call's.
+  const sendJson = hooks.requestJson ?? (progress && managedEndpoint
+    ? (url: string, payload: Record<string, unknown>, timeoutSeconds: number) => requestJsonAsJob(url, payload, timeoutSeconds, {
+      report: (message) => progress({ event: "job_phase", ...phaseAt, message }),
+      onJob: (id, open) => progress({ event: open ? "job_open" : "job_closed", id }),
+      request: hooks.httpRequest,
+    })
+    : requestJson);
   const executionPreference = env.FREELLAMA_AGENT_EXECUTION_PREFERENCE ?? "auto";
   const minPlacementEvidence = env.FREELLAMA_AGENT_MIN_PLACEMENT_EVIDENCE ?? "configured";
   let runtime: AgentRuntimeConfig;
@@ -106,14 +117,21 @@ async function runLoop(spec: AdapterSpec, hooks: AdapterHooks, env: Env, inputs:
   let answer = "";
   let failure: string | null = null;
   let transportError: Record<string, unknown> | null = null;
+  const readCatalog = (url: string) => readCatalogJson(url, hooks.httpRequest);
+  const platformRatio = managedEndpoint
+    ? await (hooks.resolvePlatformTokenRatio ?? resolvePlatformTokenRatio)(managedEndpoint, model, { readJson: readCatalog })
+    : null;
   const calibrationDir = trimSpace(env.FREELLAMA_AGENT_TOKEN_CALIBRATION_DIR ?? "");
   const calibrationModelIdentity: ModelIdentity = calibrationDir
-    ? await (hooks.resolveModelIdentity ?? resolveModelIdentity)(managedEndpoint || endpoint, model, messages[0]!.content as string)
+    ? await (hooks.resolveModelIdentity ?? resolveModelIdentity)(
+      managedEndpoint || endpoint, model, messages[0]!.content as string, { readJson: readCatalog },
+    )
     : { verified: false, scope: "persistence_disabled", identity: "" };
   const contextManager = new AgentContextManager(runtime, {
     model,
     calibrationIdentity: calibrationModelIdentity.identity,
     calibrationDir: calibrationDir && calibrationModelIdentity.verified ? calibrationDir : null,
+    platformRatio,
   });
   try {
     messages = contextManager.fit(messages);
@@ -194,6 +212,7 @@ async function runLoop(spec: AdapterSpec, hooks: AdapterHooks, env: Env, inputs:
     let exhausted = true;
     for (let turn = 0; turn < runtime.max_turns; turn += 1) {
       const at = { turn: turn + 1, maxTurns: runtime.max_turns };
+      phaseAt = at;
       progress?.({ event: "model", ...at });
       // Transport failures are terminal (callModel already retried them). A parse failure is not:
       // tell the model what was wrong and let it correct itself, keeping every tool result so far.
@@ -289,6 +308,7 @@ async function runLoop(spec: AdapterSpec, hooks: AdapterHooks, env: Env, inputs:
     }
     if (exhausted) {
       progress?.({ event: "finalize", maxTurns: runtime.max_turns });
+      phaseAt = { maxTurns: runtime.max_turns };
       messages.push({ role: "user", content: spec.exhausted });
       if (refit()) {
         try {

@@ -54,7 +54,7 @@ on 2026-10-31.
 | Where did it run? | Ollama reports load and token timings. | A receipt with the chosen model and why, queue and resource waits, and the placement Ollama reported in `/api/ps`, so a silent CPU fallback is visible. |
 
 Limits: FreeLlama does not change Ollama's decode speed, does not fail over between engines, and runs
-CPU work only on a second, CPU-only Ollama process that you start.
+CPU work only on a second, CPU-only Ollama process (`serve --spawn-cpu-backend` starts and stops one for you).
 
 Measured on one Apple M2 Pro (32 GB) unless noted; single-machine measurements of specific
 workloads, not a general speed claim. The gains come from not loading, waiting or generating what the
@@ -68,6 +68,7 @@ task does not need:
 | A GPU model and a CPU model side by side (M4 Pro, 48 GB) | 38.0 s median, one Ollama process | 28.2 s median with a second CPU-only Ollama process (1.35x; one of three runs was slower) |
 | Cost of a managed task over raw Ollama, resident embedding, n=20 (0.8.0, 2026-10-31) | raw passthrough: 2.7–2.9 ms median | 4.0 ms median, 5–7 ms p90, with routing, admission and a receipt (56 ms before the per-task process probe was cached) |
 | CPU placement through a second CPU-only Ollama (0.8.0, 2026-10-31) | — | `nomic-embed-text:v1.5` reported `processor: "cpu"`, `size_vram: 0`, verified from `/api/ps`; 265 ms load |
+| `gpt-oss:20b` cold load while the host had 12.7 GB available (0.8.0, 2026-10-31) | 0.7.0 admitted it with a memory warning on macOS; a run like this froze the machine | Held (`held_insufficient_capacity`: needs 18.0 GB with the reserve), then refused at the caller's deadline with `Retry-After`; the model never loaded |
 
 ## Installation
 
@@ -342,7 +343,8 @@ url = "http://127.0.0.1:1234/v1"
 ### CPU and GPU backends
 
 An optional second, CPU-only Ollama runs exact helper models, such as an embedder, so they never
-compete with GPU work. Each backend has its own budget, queue and model-transition lock. The operator
+compete with GPU work: `serve --spawn-cpu-backend --cpu-model TAG` starts it on loopback, waits for it
+and stops it with `serve`, or point `--cpu-upstream` at one you run. Each backend has its own budget, queue and model-transition lock. The operator
 assigns models; agents can only state an `executionPreference`. Ask for
 `minPlacementEvidence:"observed"` when placement matters, and trust the receipt's observed placement
 over the configuration. See [CPU/GPU routing](docs/CPU_GPU_ROUTING.md).

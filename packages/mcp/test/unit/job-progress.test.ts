@@ -46,7 +46,7 @@ describe("runWithJobProgress", () => {
       { status: "completed", reason: "completed", selected_model: "m", result: { response: { message: { content: "hi" } } } },
     ]);
     const messages: string[] = [];
-    const raw = await runWithJobProgress(calls, (message) => messages.push(message), undefined, noWait);
+    const raw = await runWithJobProgress(calls, (message) => messages.push(message), { wait: noWait });
     expect(JSON.parse(raw)).toEqual({ response: { message: { content: "hi" } } });
     expect(messages).toEqual(["queued", "waiting for runner", "loading m", "running m", "completed"]);
     expect(calls.sync).not.toHaveBeenCalled();
@@ -56,7 +56,7 @@ describe("runWithJobProgress", () => {
     const same = { status: "waiting_for_admission", reason: "waiting_for_backend_capacity" };
     const calls = scripted([same, same, same, same, same, same, same, same, { status: "running" }, { status: "completed", result: {} }]);
     const delays: number[] = [];
-    await runWithJobProgress(calls, () => undefined, undefined, async (ms) => { delays.push(ms); });
+    await runWithJobProgress(calls, () => undefined, { wait: async (ms) => { delays.push(ms); } });
     expect(delays[0]).toBe(250);
     expect(Math.max(...delays)).toBeLessThanOrEqual(2_000);
     expect(delays.slice(1, 8).every((delay, index) => delay >= delays[index]!)).toBe(true);
@@ -65,14 +65,14 @@ describe("runWithJobProgress", () => {
 
   it("throws the error body the synchronous call would have thrown", async () => {
     const calls = scripted([{ status: "failed", error: { id: ID, ok: false, status: 409, error: "scope revision changed", code: "scope_conflict" } }]);
-    await expect(runWithJobProgress(calls, () => undefined, undefined, noWait))
+    await expect(runWithJobProgress(calls, () => undefined, { wait: noWait }))
       .rejects.toThrow(JSON.stringify({ error: "scope revision changed", code: "scope_conflict" }));
   });
 
   it("falls back to the synchronous call when the result is too large to keep as a job", async () => {
     const calls = scripted([{ status: "failed", error: { id: ID, ok: false, status: 413, code: "task_job_result_too_large", error: "too large" } }]);
     const messages: string[] = [];
-    expect(await runWithJobProgress(calls, (message) => messages.push(message), undefined, noWait)).toBe('{"sync":true}');
+    expect(await runWithJobProgress(calls, (message) => messages.push(message), { wait: noWait })).toBe('{"sync":true}');
     expect(calls.sync).toHaveBeenCalledTimes(1);
     expect(messages.at(-1)).toMatch(/running synchronously/);
   });
@@ -81,24 +81,24 @@ describe("runWithJobProgress", () => {
     for (const message of ['{"error":"deferred input exceeds the 1 MiB retention limit","code":"task_job_input_too_large"}', "HTTP 404 Not Found"]) {
       const calls = scripted([]);
       calls.submit.mockRejectedValueOnce(new Error(message));
-      expect(await runWithJobProgress(calls, () => undefined, undefined, noWait)).toBe('{"sync":true}');
+      expect(await runWithJobProgress(calls, () => undefined, { wait: noWait })).toBe('{"sync":true}');
     }
     const gone = scripted([]);
     gone.get.mockRejectedValue(new Error('{"error":"job does not exist or has expired"}'));
-    expect(await runWithJobProgress(gone, () => undefined, undefined, noWait)).toBe('{"sync":true}');
+    expect(await runWithJobProgress(gone, () => undefined, { wait: noWait })).toBe('{"sync":true}');
   });
 
   it("passes other submit errors through without retrying synchronously", async () => {
     const calls = scripted([]);
     calls.submit.mockRejectedValueOnce(new Error('{"error":"confidence below floor","code":"min_confidence_unmet"}'));
-    await expect(runWithJobProgress(calls, () => undefined, undefined, noWait)).rejects.toThrow(/confidence below floor/);
+    await expect(runWithJobProgress(calls, () => undefined, { wait: noWait })).rejects.toThrow(/confidence below floor/);
     expect(calls.sync).not.toHaveBeenCalled();
   });
 
   it("returns the answer of a server that ignored defer", async () => {
     const calls = scripted([]);
     calls.submit.mockResolvedValueOnce('{"selected_model":"m","response":{}}');
-    expect(await runWithJobProgress(calls, () => undefined, undefined, noWait)).toBe('{"selected_model":"m","response":{}}');
+    expect(await runWithJobProgress(calls, () => undefined, { wait: noWait })).toBe('{"selected_model":"m","response":{}}');
     expect(calls.get).not.toHaveBeenCalled();
   });
 
@@ -106,17 +106,19 @@ describe("runWithJobProgress", () => {
     const calls = scripted([{ status: "running" }]);
     const controller = new AbortController();
     const wait = async () => { controller.abort(); };
-    await expect(runWithJobProgress(calls, () => undefined, controller.signal, wait)).rejects.toThrow(/cancelled by the client/);
+    await expect(runWithJobProgress(calls, () => undefined, { signal: controller.signal, wait })).rejects.toThrow(/cancelled by the client/);
     expect(calls.cancel).toHaveBeenCalledWith(ID);
   });
 
   it("tolerates a few failed polls and reports a persistent failure", async () => {
     const flaky = scripted([{ status: "completed", result: { ok: 1 } }]);
     flaky.get.mockRejectedValueOnce(new Error("connection reset")).mockRejectedValueOnce(new Error("connection reset"));
-    expect(JSON.parse(await runWithJobProgress(flaky, () => undefined, undefined, noWait))).toEqual({ ok: 1 });
+    expect(JSON.parse(await runWithJobProgress(flaky, () => undefined, { wait: noWait }))).toEqual({ ok: 1 });
     const down = scripted([]);
     down.get.mockRejectedValue(new Error("connection refused"));
-    await expect(runWithJobProgress(down, () => undefined, undefined, noWait)).rejects.toThrow("connection refused");
+    await expect(runWithJobProgress(down, () => undefined, { wait: noWait })).rejects.toThrow("connection refused");
+    // Nobody follows the job any more, so it is cancelled rather than left running.
+    expect(down.cancel).toHaveBeenCalledWith(ID);
   });
 });
 

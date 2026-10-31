@@ -1,6 +1,7 @@
 mod args;
 mod bench_cmd;
 mod context_cli;
+mod cpu_backend;
 mod http;
 mod init;
 mod policy_cmd;
