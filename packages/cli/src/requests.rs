@@ -235,53 +235,30 @@ async fn request_nearest(
         "input file {} has no non-empty lines",
         path.display()
     );
-    let mut input = vec![query];
-    input.extend(&items);
-    body["input"] = json!(input);
+    body["input"] = json!(items);
+    // The core embeds the query with the lines and ranks them.
+    body["nearest"] = json!({ "query": query, "top": top });
     let result = post_json(endpoint, "/_freellama/v1/tasks", &body).await?;
-    let vectors: Vec<Vec<f64>> = serde_json::from_value(result["response"]["embeddings"].clone())
-        .context("the embedding response carried no vectors")?;
-    crate::emit(serde_json::to_string_pretty(&json!({
-        "selected_model": result["route"]["selected_model"],
-        "nearest": rank(&vectors, &items, top),
-    }))?)
-}
-
-/// The `top` items closest to the query (vector 0), by cosine similarity, with their line number.
-fn rank(vectors: &[Vec<f64>], items: &[&str], top: usize) -> Vec<Value> {
-    let norm = |vector: &[f64]| vector.iter().map(|value| value * value).sum::<f64>().sqrt();
-    let Some((query, rest)) = vectors.split_first() else {
-        return Vec::new();
-    };
-    let query_norm = norm(query);
-    let mut scored: Vec<(usize, f64)> = rest
+    let matches = result["nearest"]["matches"]
+        .as_array()
+        .context("the embedding response carried no ranking")?;
+    let ranked: Vec<Value> = matches
         .iter()
-        .enumerate()
-        .map(|(index, vector)| {
-            let dot: f64 = query.iter().zip(vector).map(|(a, b)| a * b).sum();
-            let denominator = query_norm * norm(vector);
-            (
-                index,
-                if denominator == 0.0 {
-                    0.0
-                } else {
-                    dot / denominator
-                },
-            )
-        })
-        .collect();
-    scored.sort_by(|left, right| right.1.total_cmp(&left.1));
-    scored
-        .into_iter()
-        .take(top)
-        .map(|(index, score)| {
+        .map(|found| {
+            let index = found["index"]
+                .as_u64()
+                .and_then(|i| usize::try_from(i).ok());
             json!({
-                "item": index + 1,
-                "score": (score * 1000.0).round() / 1000.0,
-                "text": items.get(index).copied().unwrap_or_default(),
+                "item": index.map(|index| index + 1),
+                "score": found["score"],
+                "text": index.and_then(|index| items.get(index).copied()).unwrap_or_default(),
             })
         })
-        .collect()
+        .collect();
+    crate::emit(serde_json::to_string_pretty(&json!({
+        "selected_model": result["route"]["selected_model"],
+        "nearest": ranked,
+    }))?)
 }
 
 /// `--questions` as a JSON object, inline or from `@path`.
@@ -292,7 +269,8 @@ fn decision_questions(argument: &str) -> Result<Value> {
         }
         None => argument.to_owned(),
     };
-    let questions: Value = serde_json::from_str(&text).context("--questions is not JSON")?;
+    let questions: Value = serde_json::from_str(&text)
+        .map_err(|error| anyhow::anyhow!("--questions is not valid JSON: {error}"))?;
     ensure!(
         questions
             .as_object()
@@ -317,7 +295,7 @@ fn file_input(text: &str, embedding: bool) -> Result<(&'static str, Value)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{catalog_view, decision_questions, file_input, rank};
+    use super::{catalog_view, decision_questions, file_input};
 
     #[test]
     fn the_catalog_marks_what_is_installed_and_fits_and_stays_unknown_without_serve() {
@@ -335,20 +313,6 @@ mod tests {
         assert!(catalog_view(Some("poetry"), None, None).is_err());
     }
 
-    #[test]
-    fn nearest_ranks_items_against_the_query_vector() {
-        let vectors = vec![
-            vec![1.0, 0.0],
-            vec![0.0, 1.0],
-            vec![0.9, 0.1],
-            vec![0.0, 0.0],
-        ];
-        let ranked = rank(&vectors, &["far", "near", "empty"], 2);
-        assert_eq!(ranked[0]["text"], "near");
-        assert_eq!(ranked[0]["item"], 2);
-        assert_eq!(ranked[1]["text"], "far");
-        assert_eq!(ranked.len(), 2);
-    }
     use serde_json::json;
 
     #[test]
@@ -361,6 +325,11 @@ mod tests {
         assert!(decision_questions("[1]").is_err());
         assert!(decision_questions("{}").is_err());
         assert!(decision_questions("not json").is_err());
+        let message = decision_questions("{bad").unwrap_err().to_string();
+        assert!(
+            message.starts_with("--questions is not valid JSON: key must be a string"),
+            "{message}"
+        );
         assert!(decision_questions("@/nonexistent/questions.json").is_err());
     }
 

@@ -82,7 +82,7 @@ async fn fixture(runtime: &str, pinned_units: Option<usize>) -> Fixture {
 async fn queued_work_keeps_its_cost_while_reload_changes_new_work() {
     let fixture = Arc::new(fixture("[task_costs]\nvision = 2\n", Some(8)).await);
     fixture.blocking.store(true, Ordering::SeqCst);
-    let payload = json!({"task":"vision","model":MODEL,"objective":"fastest","context_tokens":4096,"prompt":"fixture"});
+    let payload = json!({"task":"vision","model":MODEL,"objective":"fastest","context_tokens":4096,"prompt":"fixture","images":["aW1hZ2U="]});
     let mut holders = Vec::new();
     for _ in 0..4 {
         let fixture = Arc::clone(&fixture);
@@ -182,6 +182,9 @@ async fn assert_cost(fixture: &Fixture, task: &str, expected: u64, input: Option
     } else {
         payload["prompt"] = json!("fixture");
     }
+    if task == "vision" {
+        payload["images"] = json!(["aW1hZ2U="]);
+    }
     let (status, result) = request(fixture, "POST", "tasks", payload).await;
     assert_eq!(status, StatusCode::OK, "{result}");
     assert_eq!(
@@ -261,7 +264,7 @@ async fn queued_charge_after_resize(
             &queued_fixture,
             "POST",
             "tasks",
-            json!({"task":"vision","model":MODEL,"context_tokens":4096,"prompt":"queued"}),
+            json!({"task":"vision","model":MODEL,"context_tokens":4096,"prompt":"queued","images":["aW1hZ2U="]}),
         )
         .await
     });

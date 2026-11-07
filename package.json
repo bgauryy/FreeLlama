@@ -1,6 +1,6 @@
 {
   "name": "freellama-workspace",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "private": true,
   "type": "module",
   "description": "Workspace root for FreeLlama's internal Rust core, portable JavaScript entry points, and per-platform native artifact packages.",
@@ -38,13 +38,14 @@
     "test:e2e": "vitest run -c packages/mcp/vitest.e2e.config.ts",
     "test:rust": "cargo test --workspace",
     "test:all": "yarn typecheck && yarn test && yarn test:release && yarn test:integration && yarn test:e2e",
-    "verify:production": "yarn build && yarn lint:rust && yarn test:all && yarn release:verify:publish",
+    "verify:production": "yarn build && yarn lint:rust && yarn test:all && yarn release:verify:publish && yarn release:smoke",
     "release:version": "node scripts/set-version.mjs",
     "release:build": "node scripts/build-release.mjs",
     "release:verify": "node scripts/verify-release-packages.mjs",
     "release:verify:publish": "FREELLAMA_REQUIRE_ALL_PLATFORMS=1 node scripts/verify-release-packages.mjs",
     "build:licenses": "node scripts/bundle-licenses.mjs",
     "test:release": "node --test scripts/test-release-packages.mjs scripts/test-release-registry.mjs",
+    "release:smoke": "node scripts/smoke-packed-install.mjs",
     "release:verify:registry": "node scripts/verify-release-registry.mjs"
   },
   "devDependencies": {

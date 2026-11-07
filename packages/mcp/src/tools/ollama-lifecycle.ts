@@ -7,7 +7,7 @@ import * as z from "zod";
 import { DEFAULT_PULL_TIMEOUT_SECONDS } from "../config.js";
 import {
   endpointParam, errorResult, executionPreferenceParam, messagesParam, minPlacementEvidenceParam, ollamaEndpointParam,
-  ollamaFetch, parsedResult, structuredResult, systemPromptParam, taskMessages, taskParam,
+  isStructuredSuccess, lifecycleText, ollamaFetch, parsedResult, structuredResult, systemPromptParam, taskMessages, taskParam,
 } from "../helpers.js";
 import { progressSink, type ToolExtra } from "../progress.js";
 import { serveUnload } from "../serve-http.js";
@@ -150,9 +150,9 @@ export function registerOllamaLifecycleTools(server: McpServer): void {
     "ollama_manage",
     {
       description:
-        "Use when: loading or freeing a model. pull = download one exact tag a human approved with its size; " +
-        "warm = load an installed model before a burst of run_task calls; an optional systemPrompt/messages is evaluated into the runner's prompt cache, so later calls that send the same prefix skip that work (they still send it; put it once at the batch top level); " +
-        "unload = free a model's memory once its work is done (a model you warmed, or one the user named; waits for its running tasks). " +
+        "Use when: loading or freeing a model. pull downloads one exact tag the user approved with its size; " +
+        "warm loads an installed model before a burst and evaluates an optional systemPrompt/messages into the prompt cache; " +
+        "unload frees memory (a model you warmed or the user named). " +
         "Do not use when: deleting (ollama_delete) or searching (models). Returns: a receipt with status.",
       inputSchema: z.object({
         action: z.enum(["pull", "warm", "unload"]),
@@ -160,15 +160,15 @@ export function registerOllamaLifecycleTools(server: McpServer): void {
         ollamaEndpoint: ollamaEndpointParam,
         endpoint: endpointParam.describe("serve endpoint (warm, unload)"),
         timeoutSeconds: z.number().int().positive().optional().describe("pull and warm"),
-        task: taskParam.removeDefault().optional().describe("warm: the task the model will serve; embedding and decision models load as what they are"),
-        contextTokens: z.number().int().positive().optional().describe("warm: num_ctx later calls will use, so they reuse this runner"),
+        task: taskParam.removeDefault().exclude(["decision"]).optional().describe('warm: runner profile; embedding-only models need none, "embedding" for ones that also complete'),
+        contextTokens: z.number().int().positive().optional().describe("warm: the num_ctx later calls use"),
         systemPrompt: systemPromptParam,
         messages: messagesParam,
-        keepAlive: z.string().min(1).optional().describe('warm: "-1" pins; omitted = adaptive finite TTL'),
+        keepAlive: z.string().min(1).optional().describe('warm: "-1" pins; omitted: adaptive TTL'),
         executionPreference: executionPreferenceParam,
         minPlacementEvidence: minPlacementEvidenceParam,
         priority: z.enum(["interactive", "normal", "background"]).optional(),
-        maxWaitSeconds: z.number().int().positive().optional(),
+        maxWaitSeconds: z.number().int().positive().optional().describe("capped by the operator's max_queue_wait_seconds (default 120); lowered waits show as wait_limit"),
         defer: z.boolean().optional(),
       }).strict(),
       outputSchema: manageResultSchema,
@@ -188,15 +188,18 @@ export function registerOllamaLifecycleTools(server: McpServer): void {
         }
         if (action === "warm") {
           if (ollamaEndpoint !== undefined) return errorResult(new Error('warm runs through serve; pass `endpoint`, not `ollamaEndpoint`.'));
-          if (task === "decision") return errorResult(new Error("decision models load on their first question; run the decision task instead of warming."));
           const prefix = taskMessages({ systemPrompt, messages });
           // Loaded on use: the serve client needs the native addon, which pull and unload do not.
           const { warmModelRequest } = await import("../serve-client.js");
-          return parsedResult(await warmModelRequest(endpoint, {
+          const warmed = parsedResult(await warmModelRequest(endpoint, {
             model, task, context_tokens: contextTokens, messages: prefix.length === 0 ? undefined : prefix,
             execution_preference: executionPreference, min_placement_evidence: minPlacementEvidence,
             priority, keep_alive: keepAlive, max_wait_seconds: maxWaitSeconds, timeout_seconds: timeoutSeconds, defer,
           }));
+          // One line for the model; the receipt with its execution diagnostics stays structured.
+          return isStructuredSuccess(warmed)
+            ? structuredResult(warmed.structuredContent, { text: lifecycleText("warm", model, warmed.structuredContent) })
+            : warmed;
         }
         if (action === "unload" && timeoutSeconds !== undefined) {
           return errorResult(new Error('`timeoutSeconds` is valid only for actions "pull" and "warm".'));
@@ -215,7 +218,7 @@ export function registerOllamaLifecycleTools(server: McpServer): void {
         if (typeof payload.error === "string" && payload.error) {
           return errorResult(new Error(`${action} ${model} failed: ${payload.error}`));
         }
-        return structuredResult(payload);
+        return structuredResult(payload, { text: lifecycleText(action, model, payload) });
       } catch (error) {
         return errorResult(error);
       }

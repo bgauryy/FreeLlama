@@ -42,7 +42,43 @@ fn resolve_operator_files(
     (policy_file, benchmark_report)
 }
 
+/// Refuse an unusable listen/auth/upstream combination before anything is printed or opened:
+/// a refused start must not create the SQLite store or announce files it will never use.
+fn validate_listener(
+    listen: &str,
+    upstream: &str,
+    auth_token: Option<&str>,
+    allow_remote: bool,
+) -> Result<()> {
+    let mut probe =
+        PlatformConfig::new(listen, upstream, None, None).with_remote_access(allow_remote);
+    if let Some(token) = auth_token {
+        probe = probe.with_auth_token(token.to_owned());
+    }
+    probe.validate()
+}
+
+/// The bearer token file and its token, with the listener validated against them first.
+fn authenticated_listener(args: &PlatformStartArgs) -> Result<Option<(PathBuf, String)>> {
+    let token_file = args
+        .production
+        .auth_token_file
+        .clone()
+        .or_else(|| std::env::var_os("FREELLAMA_AUTH_TOKEN_FILE").map(PathBuf::from));
+    let credentials = token_file
+        .map(|path| freellama::auth::read_token_file(&path).map(|token| (path, token)))
+        .transpose()?;
+    validate_listener(
+        &args.listen,
+        &args.backends.upstream,
+        credentials.as_ref().map(|(_, token)| token.as_str()),
+        args.production.allow_remote,
+    )?;
+    Ok(credentials)
+}
+
 pub(crate) async fn start_platform(args: PlatformStartArgs) -> Result<()> {
+    let credentials = authenticated_listener(&args)?;
     let home = args
         .production
         .home
@@ -114,12 +150,7 @@ pub(crate) async fn start_platform(args: PlatformStartArgs) -> Result<()> {
     if let Some(seconds) = args.admission.session_ttl_seconds {
         config = config.with_session_ttl(Duration::from_secs(seconds));
     }
-    let token_file = args
-        .production
-        .auth_token_file
-        .or_else(|| std::env::var_os("FREELLAMA_AUTH_TOKEN_FILE").map(PathBuf::from));
-    if let Some(path) = token_file {
-        let token = freellama::auth::read_token_file(&path)?;
+    if let Some((path, token)) = credentials {
         eprintln!(
             "freellama: bearer authentication enabled from {}",
             path.display()
@@ -262,4 +293,22 @@ fn discover_config(name: &str, home: Option<&Path>) -> Option<PathBuf> {
     }
     home.map(|home| home.join(name))
         .filter(|path| path.is_file())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_listener;
+
+    const UPSTREAM: &str = "http://127.0.0.1:11434";
+
+    #[test]
+    fn a_remote_listener_without_authentication_is_refused_up_front() {
+        let error = validate_listener("0.0.0.0:11499", UPSTREAM, None, false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("non-loopback"), "{error}");
+        assert!(validate_listener("127.0.0.1:11499", UPSTREAM, None, false).is_ok());
+        assert!(validate_listener("not-an-address", UPSTREAM, None, false).is_err());
+        assert!(validate_listener("127.0.0.1:11499", UPSTREAM, None, true).is_err());
+    }
 }

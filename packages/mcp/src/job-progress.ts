@@ -9,8 +9,11 @@ export type JobCalls = {
   submit: () => Promise<string>;
   get: (id: string) => Promise<string>;
   cancel: (id: string) => Promise<string>;
-  /** The unchanged synchronous call, used only when submission was refused before execution. */
-  sync: () => Promise<string>;
+  /**
+   * The unchanged synchronous call, used only when submission was refused before execution;
+   * `refusal` is serve's error body for that refusal.
+   */
+  sync: (refusal?: Fields) => Promise<string>;
 };
 
 type Wait = (ms: number, signal?: AbortSignal) => Promise<void>;
@@ -48,7 +51,7 @@ export type JobOptions = {
 
 const TERMINAL = new Set(["completed", "failed", "cancelled", "expired"]);
 /** Submission refusals that establish no worker was started. */
-const SUBMIT_FALLBACK_CODES = new Set(["task_job_input_too_large", "task_jobs_full"]);
+const SUBMIT_FALLBACK_CODES = new Set(["task_job_input_too_large", "task_jobs_full", "task_jobs_input_budget"]);
 /** The worker already ran, but the registry could not retain its result or error. */
 const RETENTION_FAILURE_CODES = new Set(["task_job_result_too_large", "task_job_error_too_large"]);
 const FIRST_POLL_MS = 250;
@@ -214,7 +217,7 @@ export async function runWithJobProgress(
   } catch (error) {
     if (signal?.aborted) throw aborted();
     const described = describe(error);
-    if (submissionRefused(described)) return calls.sync();
+    if (submissionRefused(described)) return calls.sync(described.body);
     // No job handle came back, so the task may have run. Say so, and never replay it.
     throw options.unconfirmed?.(error, described.body) ?? unconfirmedSubmission(error, described.body);
   }

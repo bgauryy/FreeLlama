@@ -8,7 +8,7 @@ use std::{
 use axum::{Json, extract::State, http::StatusCode};
 use serde_json::{Value, json};
 
-use super::super::error::ApiError;
+use super::super::error::{ApiError, MemoryFigures};
 use super::super::{
     PlatformState, TaskInput, TaskKind, host_has_unified_memory, require_active_session, resources,
 };
@@ -20,11 +20,138 @@ use super::{
     select_managed_route, task_cost_for, task_has_images, transition_timeout,
 };
 
+/// The caller's wait and the operator cap when the cap lowered it (`None` otherwise).
+pub(super) fn wait_limit(
+    requested_seconds: Option<u64>,
+    cap: Duration,
+    source: &str,
+) -> Option<Value> {
+    let requested = requested_seconds?;
+    let cap_seconds = cap.as_secs_f64();
+    (Duration::from_secs(requested.max(1)) > cap).then(|| {
+        json!({
+            "requested_seconds": requested,
+            "effective_seconds": cap_seconds,
+            "cap": "max_queue_wait_seconds",
+            "cap_source": source,
+            "note": format!(
+                "waited at most {cap_seconds} s: the operator cap max_queue_wait_seconds ({source}; FREELLAMA_MAX_QUEUE_WAIT_SECONDS) lowered the requested {requested} s"
+            ),
+        })
+    })
+}
+
+pub(super) async fn run_session_task(
+    State(state): State<PlatformState>,
+    Json(input): Json<TaskInput>,
+) -> Result<Json<Value>, ApiError> {
+    let limit = {
+        let tunables = state.tunables();
+        let source = tunables
+            .sources
+            .get("max_queue_wait_ms")
+            .copied()
+            .unwrap_or("default");
+        wait_limit(input.max_wait_seconds, tunables.max_queue_wait(), source)
+    };
+    let route = input.route.clone();
+    // Boxed: the pipeline future is large, and callers (nearest slices, jobs) hold this one.
+    let outcome = match Box::pin(run_admitted_task(State(state.clone()), Json(input))).await {
+        Err(error) => Err(refusal_guidance(&state, &route, error).await),
+        ok => ok,
+    };
+    let Some(limit) = limit else {
+        return outcome;
+    };
+    match outcome {
+        Ok(Json(mut receipt)) => {
+            if let Some(execution) = receipt.get_mut("execution").and_then(Value::as_object_mut) {
+                execution.insert("wait_limit".into(), limit);
+            }
+            Ok(Json(receipt))
+        }
+        Err(error) if error.is_wait_deadline() => Err(error.with_wait_limit(limit)),
+        Err(error) => Err(error),
+    }
+}
+
+/// A memory refusal tells an agent what to do: the figures, who holds the memory, and which
+/// installed models with the same task capability would fit the free memory now (or that none
+/// does). Other errors pass through unchanged.
+async fn refusal_guidance(
+    state: &PlatformState,
+    route: &super::super::RouteInput,
+    error: ApiError,
+) -> ApiError {
+    if !error.is_resource_wait() || !error.memory_held() {
+        return error;
+    }
+    let snapshot = state.resources.snapshot().await;
+    let figures = error.assessed_memory().or_else(|| {
+        error
+            .deadline_required_bytes()
+            .map(|required| MemoryFigures {
+                required_with_reserve: required.saturating_add(snapshot.hold_reserve_bytes),
+                reserve: snapshot.hold_reserve_bytes,
+                free: snapshot.effective_available_bytes,
+            })
+    });
+    let free = figures
+        .and_then(|figures| figures.free)
+        .or(snapshot.effective_available_bytes);
+    let reserve = figures.map_or(snapshot.hold_reserve_bytes, |figures| figures.reserve);
+    let alternatives = match (free, super::super::catalog::discover_models(state).await) {
+        (Some(free), Ok(models)) => Some(fitting_models_hint(route, &models, free, reserve)),
+        _ => None,
+    };
+    let holders = resources::memory_holders_now().await;
+    error.with_memory_guidance(figures, holders, alternatives)
+}
+
+/// Installed models that satisfy the route's task capability and whose file size plus the
+/// reserve fits `free`. File size is a lower bound (context memory comes on top), so the hint
+/// says "by file size".
+fn fitting_models_hint(
+    route: &super::super::RouteInput,
+    models: &[super::super::CatalogModel],
+    free: u64,
+    reserve: u64,
+) -> String {
+    let mut request = route.clone();
+    request.model = None;
+    let task = serde_json::to_value(request.task)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_default();
+    let mut fitting = super::super::routing::eligible_models(&request, models)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|model| model.size.saturating_add(reserve) <= free)
+        .collect::<Vec<_>>();
+    fitting.sort_by_key(|model| std::cmp::Reverse(model.size));
+    if fitting.is_empty() {
+        return format!(
+            "no installed `{task}` model fits {} free after the reserve; free memory (close the programs listed) or retry later",
+            resources::gb(free)
+        );
+    }
+    let names = fitting
+        .iter()
+        .take(5)
+        .map(|model| format!("{} ({})", model.name, resources::gb(model.size)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "installed `{task}` models that fit {} free by file size (context memory is extra): {names}; pin one with `model`",
+        resources::gb(free)
+    )
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "explicit RAII lifetime across admission, revalidation and forwarding"
 )]
-pub(super) async fn run_session_task(
+async fn run_admitted_task(
     State(state): State<PlatformState>,
     Json(mut input): Json<TaskInput>,
 ) -> Result<Json<Value>, ApiError> {
@@ -246,8 +373,14 @@ pub(super) async fn run_session_task(
         .await
     };
     let mut readmission_elapsed = Duration::ZERO;
+    let sized_bytes = sized["required_available_bytes"].as_u64();
     if let Some(progress) = &progress {
         let snapshot = state.resources.snapshot().await;
+        let memory_holders = if snapshot.reasons.iter().any(|reason| reason.is_memory()) {
+            Some(resources::memory_holders_now().await).filter(|holders| !holders.is_empty())
+        } else {
+            None
+        };
         progress.update(
             super::super::jobs::JobStatus::WaitingForResources,
             "waiting_for_safe_memory_and_pressure",
@@ -257,11 +390,7 @@ pub(super) async fn run_session_task(
                 "reserve_bytes": snapshot.hold_reserve_bytes,
                 "pressure_reasons": snapshot.reasons,
                 // Who holds the memory, while a memory signal holds the host: what to close.
-                "memory_holders": snapshot
-                    .reasons
-                    .iter()
-                    .any(|reason| reason.is_memory())
-                    .then(resources::memory_holders),
+                "memory_holders": memory_holders,
             })),
         );
     }
@@ -294,6 +423,7 @@ pub(super) async fn run_session_task(
                 .with_resource_deadline(
                     "initial_reservation",
                     resource_started.elapsed().as_millis(),
+                    sized_bytes,
                 )
                 .with_holds(state.resources.snapshot().await.reasons));
             }
@@ -323,6 +453,7 @@ pub(super) async fn run_session_task(
                     .with_resource_deadline(
                         "initial_reservation",
                         resource_started.elapsed().as_millis(),
+                        sized_bytes,
                     )
                     .with_holds(state.resources.snapshot().await.reasons)),
                 };
@@ -476,6 +607,7 @@ pub(super) async fn run_session_task(
                     .with_resource_deadline(
                         "reservation_revalidation",
                         recheck_started.elapsed().as_millis(),
+                        sized_bytes,
                     )
                     .with_holds(state.resources.snapshot().await.reasons));
             }
@@ -818,5 +950,73 @@ mod lifecycle_tests {
         assert!(lock.try_lock().is_err());
         drop(transition); // The request was cancelled before its runner became ready.
         assert!(lock.try_lock().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod wait_limit_tests {
+    use super::{Duration, wait_limit};
+
+    #[test]
+    fn a_wait_lowered_by_the_operator_cap_is_reported_and_others_are_not() {
+        let cap = Duration::from_secs(120);
+        let limit = wait_limit(Some(1800), cap, "default").expect("1800 s exceeds the cap");
+        assert_eq!(limit["requested_seconds"], 1800);
+        assert_eq!(limit["effective_seconds"], 120.0);
+        assert_eq!(limit["cap_source"], "default");
+        assert!(
+            limit["note"]
+                .as_str()
+                .unwrap()
+                .contains("lowered the requested 1800 s")
+        );
+        assert!(wait_limit(Some(120), cap, "default").is_none());
+        assert!(wait_limit(Some(30), cap, "env").is_none());
+        assert!(wait_limit(None, cap, "default").is_none());
+    }
+}
+
+#[cfg(test)]
+mod memory_refusal_tests {
+    use super::fitting_models_hint;
+    use crate::platform::{CatalogModel, RouteInput};
+    use serde_json::json;
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    fn model(name: &str, capability: &str, size: u64) -> CatalogModel {
+        serde_json::from_value(json!({
+            "name":name,"digest":name,"size":size,"capabilities":[capability],
+            "advertised_context":32768,"resident":false,"benchmark":{},"policy_rank":{}
+        }))
+        .unwrap()
+    }
+
+    fn route(task: &str) -> RouteInput {
+        serde_json::from_value(json!({"task": task})).unwrap()
+    }
+
+    #[test]
+    fn the_hint_lists_same_capability_models_that_fit_and_skips_the_rest() {
+        let models = [
+            model("big-decider", "decision", 9 * GIB),
+            model("small-decider", "decision", GIB),
+            model("chat", "completion", GIB),
+        ];
+        let hint = fitting_models_hint(&route("decision"), &models, 4 * GIB, GIB);
+        assert!(hint.contains("`decision`"), "{hint}");
+        assert!(hint.contains("small-decider (1.0 GB)"), "{hint}");
+        assert!(!hint.contains("big-decider"), "{hint}");
+        assert!(!hint.contains("chat"), "{hint}");
+    }
+
+    #[test]
+    fn the_hint_says_none_fits_when_nothing_does() {
+        let models = [model("big-decider", "decision", 9 * GIB)];
+        let hint = fitting_models_hint(&route("decision"), &models, 4 * GIB, GIB);
+        assert!(
+            hint.starts_with("no installed `decision` model fits 4.0 GB free"),
+            "{hint}"
+        );
     }
 }

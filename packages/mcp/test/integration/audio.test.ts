@@ -89,4 +89,13 @@ describe("audio refusals", () => {
     expect(line).toBe('host resource admission deadline exceeded (held by active_swapping): 4.3 GB available, 3.3 GB needed with reserve; retry once the host frees memory (doctor{view:"status"} shows what holds it)');
     expect(refusalLine("plain failure", 500)).toBe("plain failure");
   });
+
+  it("keeps a core refusal that already states its memory figures as is", async () => {
+    const { refusalLine } = await import("../../src/helpers.js");
+    const error = "host resource admission deadline exceeded: needs 15.6 GB incl. 5.2 GB reserve, 4.2 GB free";
+    const body = JSON.stringify({ error, code: "resource_admission_unavailable", resource_admission: { assessment: {
+      effective_available_bytes: 4_200_000_000, required_with_reserve_bytes: 15_600_000_000,
+    } } });
+    expect(refusalLine(body, 503)).toBe(`${error} [resource_admission_unavailable]`);
+  });
 });

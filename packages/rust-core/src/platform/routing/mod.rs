@@ -357,6 +357,58 @@ pub fn installed_model<'a>(
     )
 }
 
+/// Which gate of [`eligible_models`] rejected `model`: the failed requirement, named, so a caller
+/// can fix the request or pick another model instead of guessing.
+fn ineligibility_reason(
+    input: &RouteInput,
+    model: &CatalogModel,
+    required: &BTreeSet<Capability>,
+) -> String {
+    let missing: Vec<String> = required
+        .difference(&model.capabilities)
+        .map(|capability| format!("{capability:?}").to_lowercase())
+        .collect();
+    if !missing.is_empty() {
+        let task = serde_json::to_value(input.task)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .unwrap_or_default();
+        return format!(
+            "task {task} requires capability {} that the model lacks",
+            missing.join(", ")
+        );
+    }
+    if let Some(requested) = input.context_tokens {
+        match model.advertised_context {
+            Some(available) if requested > available => {
+                return format!(
+                    "requested context {requested} tokens exceeds the {available} the model advertises"
+                );
+            }
+            None => {
+                return format!(
+                    "requested context {requested} tokens cannot be checked: the model advertises no context window"
+                );
+            }
+            Some(_) => {}
+        }
+    }
+    "it failed the objective's quality gate for this task".to_owned()
+}
+
+/// Up to three eligible models to name as alternatives, or nothing when none qualifies.
+fn alternatives_hint(eligible: &[&CatalogModel]) -> String {
+    if eligible.is_empty() {
+        return "; no installed model is eligible".to_owned();
+    }
+    let names: Vec<&str> = eligible
+        .iter()
+        .take(3)
+        .map(|model| model.name.as_str())
+        .collect();
+    format!("; eligible alternatives: {}", names.join(", "))
+}
+
 /// Apply capability, context and objective gates once across the complete catalog before
 /// backend partitioning. A backend with no qualified model cannot relax a global quality gate.
 pub(crate) fn eligible_models<'a>(
@@ -396,8 +448,10 @@ pub fn select_route(
             eligible
                 .iter()
                 .any(|candidate| candidate.name == model.name),
-            "model is not eligible for the request: {}",
-            model.name
+            "model is not eligible for the request: {} ({}{})",
+            model.name,
+            ineligibility_reason(input, model, &required),
+            alternatives_hint(&eligible)
         );
         model
     } else if let Some(affine) = input

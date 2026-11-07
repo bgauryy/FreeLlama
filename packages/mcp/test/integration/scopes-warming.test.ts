@@ -13,6 +13,7 @@ describe("scope and warming client contracts", () => {
   let client: Client;
   const requests: { method: string; path: string; body: any }[] = [];
   let refusal: Record<string, unknown> | undefined;
+  let acknowledgeDeferred = false;
   beforeAll(async () => {
     server = createServer(async (request, response) => {
       let raw = "";
@@ -20,6 +21,12 @@ describe("scope and warming client contracts", () => {
       requests.push({ method: request.method!, path: request.url!, body: raw ? JSON.parse(raw) : undefined });
       response.setHeader("content-type", "application/json");
       if (refusal) { response.writeHead(404).end(JSON.stringify(refusal)); return; }
+      if (acknowledgeDeferred && request.url?.includes("tasks") && requests.at(-1)!.body?.defer === true) {
+        const item = requests.length;
+        if (requests.at(-1)!.body?.prompt === "refused") { response.writeHead(429).end(JSON.stringify({ error: "deferred task registry is full", code: "task_jobs_full" })); return; }
+        response.end(JSON.stringify({ deferred: true, job: { id: `00000000-0000-4000-8000-${String(item).padStart(12, "0")}`, status: "queued" } }));
+        return;
+      }
       if (request.method === "DELETE") { response.writeHead(204).end(); return; }
       response.end(JSON.stringify(request.url?.includes("tasks")
         ? { response: { message: { role: "assistant", content: "ok" }, done: true } }
@@ -31,7 +38,7 @@ describe("scope and warming client contracts", () => {
     endpoint = `http://127.0.0.1:${address.port}`;
     client = await connectClient({ FREELLAMA_MCP_AUTOSTART_SERVE: "0" });
   });
-  beforeEach(() => { requests.length = 0; refusal = undefined; });
+  beforeEach(() => { requests.length = 0; refusal = undefined; acknowledgeDeferred = false; });
   afterAll(async () => {
     await client?.close();
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
@@ -103,7 +110,6 @@ describe("scope and warming client contracts", () => {
   const batch = [{ id: "a", independent: true, task: { prompt: "x" } }];
   it.each([
     { args: { prompt: "p", tasks: batch }, message: "With `tasks`, put `prompt` inside each item's `task`; only `task`, `model`," },
-    { args: { defer: true, tasks: batch }, message: "`defer` is not supported with `tasks`." },
     { args: { returnEmbeddings: true, preview: true, nearest: { top: 2 }, tasks: batch },
       message: "`returnEmbeddings`, `nearest`, `preview` are not supported with `tasks`." },
   ])("names the right fix for a stray batch field ($message)", async ({ args, message }) => {
@@ -111,6 +117,36 @@ describe("scope and warming client contracts", () => {
     expect(result.isError).toBe(true);
     expect(JSON.stringify(result.content)).toContain(JSON.stringify(message).slice(1, -1));
     expect(requests).toHaveLength(0);
+  });
+  it("defer with tasks submits each item as its own deferred job and reports every job id", async () => {
+    acknowledgeDeferred = true;
+    const result = await call("run_task", { defer: true, model: "m:1", maxParallelism: 1, tasks: [
+      { id: "a", independent: true, task: { prompt: "first" } },
+      { id: "b", independent: true, task: { prompt: "refused" } },
+      { id: "c", independent: true, task: { prompt: "third" } },
+    ] });
+    expect(result.isError, JSON.stringify(result)).not.toBe(true);
+    const jobs = (result.structuredContent as any).jobs;
+    expect(result.structuredContent).toMatchObject({ deferred: true });
+    expect(jobs.map((row: any) => row.id)).toEqual(["a", "b", "c"]);
+    expect(jobs[0].job).toMatchObject({ status: "queued" });
+    expect(jobs[1]).toMatchObject({ error: { code: "task_jobs_full" } });
+    expect(jobs[2].job.id).not.toBe(jobs[0].job.id);
+    expect(requests.map((r) => r.body)).toMatchObject([
+      { model: "m:1", defer: true, prompt: "first" }, { defer: true, prompt: "refused" }, { defer: true, prompt: "third" },
+    ]);
+    expect(requests.every((r) => r.path === "/_freellama/v1/tasks")).toBe(true);
+  });
+  it("sends a nearest ranking request to serve instead of ranking locally, also with defer", async () => {
+    acknowledgeDeferred = true;
+    const result = await call("run_task", { task: "embedding", input: ["x", "y"], defer: true,
+      nearest: { query: "q", top: 3, minScore: 0.2 }, returnEmbeddings: true });
+    expect(result.isError, JSON.stringify(result)).not.toBe(true);
+    expect(result.structuredContent).toMatchObject({ deferred: true });
+    expect(requests[0]!.body).toMatchObject({
+      task: "embedding", defer: true, input: ["x", "y"], return_embeddings: true,
+      nearest: { query: "q", top: 3, min_score: 0.2, labels: ["input[0]", "input[1]"] },
+    });
   });
   it("sends shared batch fields once as defaults that each item may override", async () => {
     const questions = { kind: { type: "choice", instructions: "Which kind?", criteria: { bug: "Broken", feature: "New" } } };
@@ -123,6 +159,20 @@ describe("scope and warming client contracts", () => {
     const b = requests.find((item) => item.body?.state === "Add dark mode")!.body;
     expect(a).toMatchObject({ task: "decision", model: "d:1", questions, state: "Crash on save" });
     expect(b).toMatchObject({ task: "decision", model: "d:2", questions, state: "Add dark mode" });
+  });
+  it("sends a shared `tools` list to every item and lets an item's own list replace it", async () => {
+    const shared = [{ type: "function", function: { name: "lookup", parameters: { type: "object" } } }];
+    const own = [{ type: "function", function: { name: "other" } }];
+    const result = await call("run_task", { model: "t:1", tools: shared, tasks: [
+      { id: "a", independent: true, task: { prompt: "first" } },
+      { id: "b", independent: true, task: { prompt: "second" } },
+      { id: "c", independent: true, task: { prompt: "third", tools: own } },
+    ] });
+    expect(result.isError, JSON.stringify(result)).not.toBe(true);
+    const body = (prompt: string) => requests.find((item) => item.body?.prompt === prompt)!.body;
+    expect(body("first").tools).toEqual(shared);
+    expect(body("second").tools).toEqual(shared);
+    expect(body("third").tools).toEqual(own);
   });
   it("forwards warming controls with no prompt/history and no invented TTL", async () => {
     const result = await call("ollama_manage", { action: "warm", model: "test:latest", contextTokens: 4096, defer: true, priority: "background", timeoutSeconds: 10 });

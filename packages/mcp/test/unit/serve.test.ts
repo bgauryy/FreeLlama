@@ -63,6 +63,22 @@ it.skipIf(process.platform === "win32")("reports an unexecutable binary without 
   expect((await fetch(`${endpoint}/_freellama/v1/health`)).status).toBe(200);
 }, 10_000);
 
+it.skipIf(process.platform === "win32")("includes the bounded stderr tail when serve exits before ready", async () => {
+  const { binary } = await fixture();
+  await writeFile(binary, `#!${process.execPath}\nfor (let i = 0; i < 40; i++) process.stderr.write('noise line ' + i + '\\n');\nprocess.stderr.write('Error: unsupported feedback snapshot schema 7\\n');\nprocess.exit(1);\n`);
+  await chmod(binary, 0o700);
+  fixtureLaunch.script = binary;
+  const error = await serve!.ensureServe(undefined).then(
+    () => undefined,
+    (caught: unknown) => caught as Error,
+  );
+  expect(error?.message).toMatch(/exited before becoming ready.*exit 1/);
+  expect(error?.message).toContain("unsupported feedback snapshot schema 7");
+  expect(error?.message).toContain("noise line 39");
+  expect(error?.message).not.toContain("noise line 5\n");
+  expect(error?.message.split("\n").length).toBeLessThanOrEqual(22);
+}, 10_000);
+
 it.skipIf(process.platform === "win32")("keeps a new child tracked when an older stopped child exits", async () => {
   const { binary, endpoint } = await fixture();
   await writeFile(binary, `#!${process.execPath}\nimport('node:http').then(({createServer}) => {

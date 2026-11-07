@@ -47,6 +47,12 @@ pub(crate) struct TaskInput {
     /// path.
     pub(crate) images: Option<Vec<String>>,
     pub(crate) input: Option<Value>,
+    /// Embedding tasks: rank the items (the query first) in the core and return the ranking
+    /// instead of vectors, for synchronous calls and deferred jobs alike.
+    pub(crate) nearest: Option<execution::nearest::NearestRequest>,
+    /// With `nearest`: also return the vectors.
+    #[serde(default)]
+    pub(crate) return_embeddings: bool,
     /// Strict artifact/backend contract for continued work such as sliced embeddings.
     /// These fields reject a changed selection; they never authorize moving an operator's model.
     pub(crate) expected_model_digest: Option<String>,

@@ -4,6 +4,11 @@ use anyhow::{Context, Result};
 use freellama::serve_client;
 use serde_json::Value;
 
+/// Subcommands that never need the control plane (`doctor` and `init` probe Ollama directly,
+/// `catalog` degrades to the shipped catalog, `auth-token` only writes a file). Keep in step with
+/// the dispatch in `main.rs`.
+const OFFLINE_SUBCOMMANDS: &str = "`doctor`, `init`, `catalog` and `auth-token`";
+
 /// Turn a transport failure into an actionable message.
 ///
 /// Every control-plane subcommand needs a running `freellama serve`, and the raw reqwest error
@@ -14,7 +19,7 @@ fn explain_transport(endpoint: &str, error: reqwest::Error) -> anyhow::Error {
         return anyhow::anyhow!(
             "cannot reach the FreeLlama control plane at {endpoint}.\n\
              Start it with:\n  freellama serve\n\
-             (`doctor` is the one subcommand that works without it.)\n\
+             ({OFFLINE_SUBCOMMANDS} work without it.)\n\
              Underlying error: {error}"
         );
     }
@@ -109,4 +114,29 @@ pub(crate) async fn post_json(endpoint: &str, path: &str, body: &Value) -> Resul
         .await
         .map_err(|e| explain_transport(endpoint, e))?;
     response_json(response).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn unreachable_control_plane_names_every_offline_subcommand() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let endpoint = format!("http://127.0.0.1:{port}");
+        let error = serve_client::client()
+            .get(&endpoint)
+            .send()
+            .await
+            .unwrap_err();
+        let message = explain_transport(&endpoint, error).to_string();
+        for name in ["doctor", "init", "catalog", "auth-token"] {
+            assert!(message.contains(&format!("`{name}`")), "{message}");
+        }
+        assert!(!message.contains("the one subcommand"), "{message}");
+    }
 }

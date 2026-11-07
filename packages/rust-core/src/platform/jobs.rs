@@ -21,7 +21,12 @@ use super::{PlatformState, TaskInput, TaskKind, TaskPriority, error::ApiError, e
 pub(super) const MAX_JOBS: usize = 64;
 pub(super) const RESULT_TTL: Duration = Duration::from_secs(600);
 const MAX_RESULT_BYTES: usize = 2 * 1024 * 1024;
-const MAX_INPUT_BYTES: usize = 1024 * 1024;
+/// One job's encoded input. Every managed MCP task runs as a job, so this bounds an embedding
+/// over a whole file set or a screenshot, not only deferred work; 1 MiB refused both.
+const MAX_INPUT_BYTES: usize = 16 * 1024 * 1024;
+/// Input held by queued and running jobs together; a terminal job has dropped its input. This,
+/// not the per-job limit, bounds the memory that 64 accepted jobs can pin.
+const MAX_PENDING_INPUT_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -69,6 +74,8 @@ struct Job {
     completion_committed: bool,
     persistence_error: Option<Value>,
     persistence_state: &'static str,
+    /// Encoded input size, counted against [`MAX_PENDING_INPUT_BYTES`] until the job finishes.
+    input_bytes: usize,
 }
 
 impl Job {
@@ -121,8 +128,25 @@ impl JobRegistry {
         });
     }
 
-    fn make_room(&mut self) -> Result<(), ApiError> {
+    fn make_room(&mut self, input_bytes: usize) -> Result<(), RegistryFull> {
         self.prune();
+        let pending: usize = self
+            .entries
+            .values()
+            .map(|job| {
+                let job = job
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if job.finished.is_none() {
+                    job.input_bytes
+                } else {
+                    0
+                }
+            })
+            .sum();
+        if pending.saturating_add(input_bytes) > MAX_PENDING_INPUT_BYTES {
+            return Err(RegistryFull::PendingInput);
+        }
         if self.entries.len() >= MAX_JOBS {
             let oldest = self
                 .entries
@@ -140,14 +164,37 @@ impl JobRegistry {
             }
         }
         if self.entries.len() >= MAX_JOBS {
-            return Err(ApiError::new(
-                StatusCode::TOO_MANY_REQUESTS,
-                "deferred task registry is full",
-            )
-            .with_code("task_jobs_full")
-            .with_retry_after(5));
+            return Err(RegistryFull::Jobs);
         }
         Ok(())
+    }
+}
+
+/// Why the registry refused a job; both refusals happen before any work starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegistryFull {
+    Jobs,
+    PendingInput,
+}
+
+impl RegistryFull {
+    fn error(self, suffix: &str) -> ApiError {
+        let (message, code) = match self {
+            Self::Jobs => (
+                "deferred task registry is full".to_owned(),
+                "task_jobs_full",
+            ),
+            Self::PendingInput => (
+                format!(
+                    "queued and running jobs already hold the {} MiB input budget",
+                    MAX_PENDING_INPUT_BYTES / (1024 * 1024)
+                ),
+                "task_jobs_input_budget",
+            ),
+        };
+        ApiError::new(StatusCode::TOO_MANY_REQUESTS, format!("{message}{suffix}"))
+            .with_code(code)
+            .with_retry_after(5)
     }
 }
 
@@ -300,6 +347,7 @@ fn prepare(
     journal: Option<&super::job_journal::JobJournal>,
 ) -> Result<PreparedSubmission, ApiError> {
     let durable = journal.is_some();
+    execution::nearest::validate(input)?;
     let timeout = execution::task_deadline(input.timeout_seconds)?;
     let deadline = tokio::time::Instant::now() + timeout;
     let key = input.idempotency_key.take();
@@ -318,8 +366,15 @@ fn prepare(
     }
     let input_bytes = serde_json::to_vec(&input).map_err(ApiError::bad_request)?;
     if input_bytes.len() > MAX_INPUT_BYTES {
-        return Err(ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "deferred input exceeds the 1 MiB retention limit; use synchronous execution or a smaller input")
-            .with_code("task_job_input_too_large"));
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "job input is {} bytes, over the {} MiB limit; split it into smaller jobs",
+                input_bytes.len(),
+                MAX_INPUT_BYTES / (1024 * 1024)
+            ),
+        )
+        .with_code("task_job_input_too_large"));
     }
     let (cancel, cancellation) = watch::channel(false);
     let (done, done_receiver) = watch::channel(false);
@@ -357,6 +412,7 @@ fn prepare(
         completion_committed: false,
         persistence_error: None,
         persistence_state: if durable { "confirmed" } else { "disabled" },
+        input_bytes: input_bytes.len(),
     };
     Ok(PreparedSubmission {
         id,
@@ -402,8 +458,8 @@ pub(super) fn validate_synchronous(input: &TaskInput) -> Result<(), ApiError> {
     Ok(())
 }
 
-async fn refuse_registration(progress: &JobProgress, error: ApiError) -> ApiError {
-    progress.finish(Err(error));
+async fn refuse_registration(progress: &JobProgress, refusal: RegistryFull) -> ApiError {
+    progress.finish(Err(refusal.error("")));
     if let Some(error) = progress
         .job
         .lock()
@@ -415,12 +471,7 @@ async fn refuse_registration(progress: &JobProgress, error: ApiError) -> ApiErro
         error["retry_safe"] = json!(true);
     }
     progress.persist_terminal().await;
-    ApiError::new(
-        StatusCode::TOO_MANY_REQUESTS,
-        "deferred task registry is full; this submission did not execute",
-    )
-    .with_code("task_jobs_full")
-    .with_retry_after(5)
+    refusal.error("; this submission did not execute")
 }
 
 pub(super) async fn submit(
@@ -473,7 +524,11 @@ pub(super) async fn submit(
             .jobs
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        registry.make_room().map(|()| {
+        let input_bytes = job
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .input_bytes;
+        registry.make_room(input_bytes).map(|()| {
             registry.entries.insert(id.clone(), job);
         })
     };
@@ -530,7 +585,7 @@ fn retention(durable: bool) -> Value {
         "max_durable_records":if durable { Some(crate::store::jobs::MAX_DURABLE_JOBS) } else {None},
         "max_durable_receipt_bytes":if durable {Some(crate::store::jobs::MAX_DURABLE_BYTES)} else {None},
         "durable_sync":if durable {Some("sqlite_wal_full")}else{None},
-        "max_input_bytes":MAX_INPUT_BYTES,"restart":if durable { "receipts_recover_unfinished_outcomes_unknown_no_replay" } else { "jobs_are_not_resumed" }})
+        "max_input_bytes":MAX_INPUT_BYTES,"max_pending_input_bytes":MAX_PENDING_INPUT_BYTES,"restart":if durable { "receipts_recover_unfinished_outcomes_unknown_no_replay" } else { "jobs_are_not_resumed" }})
 }
 
 fn journal(state: &PlatformState) -> Option<super::job_journal::JobJournal> {
@@ -1053,7 +1108,47 @@ mod tests {
             completion_committed: false,
             persistence_error: None,
             persistence_state: "disabled",
+            input_bytes: 0,
         }
+    }
+
+    #[test]
+    fn pending_input_is_budgeted_across_unfinished_jobs_only() {
+        let mut registry = JobRegistry::default();
+        let mut held = job(None);
+        held.input_bytes = MAX_PENDING_INPUT_BYTES - 10;
+        let held_id = held.id.clone();
+        registry
+            .entries
+            .insert(held_id.clone(), Arc::new(Mutex::new(held)));
+        registry.make_room(10).unwrap();
+        let refusal = registry.make_room(11).unwrap_err();
+        assert_eq!(refusal, RegistryFull::PendingInput);
+        let error = refusal.error("").into_batch_result("new".into());
+        assert_eq!(error["code"], "task_jobs_input_budget");
+        assert_eq!(error["retry_after_seconds"], 5);
+        // A finished job has dropped its input, so it no longer counts.
+        registry.entries[&held_id].lock().unwrap().finished = Some(Instant::now());
+        registry.make_room(MAX_INPUT_BYTES).unwrap();
+    }
+
+    #[test]
+    fn a_job_input_over_the_limit_is_refused_with_its_size() {
+        let mut input: TaskInput = serde_json::from_value(json!({
+            "task":"embedding", "defer":true, "input":["x".repeat(MAX_INPUT_BYTES)],
+        }))
+        .unwrap();
+        let Err(error) = prepare(&mut input, None) else {
+            panic!("an oversized input must be refused");
+        };
+        let error = error.into_batch_result("big".into());
+        assert_eq!(error["code"], "task_job_input_too_large");
+        assert!(error["error"].as_str().unwrap().contains("16 MiB"));
+        let mut fits: TaskInput = serde_json::from_value(json!({
+            "task":"embedding", "defer":true, "input":["x".repeat(2 * 1024 * 1024)],
+        }))
+        .unwrap();
+        assert!(prepare(&mut fits, None).is_ok());
     }
 
     #[test]
@@ -1066,8 +1161,9 @@ mod tests {
                 .insert(job.id.clone(), Arc::new(Mutex::new(job)));
         }
         let error = registry
-            .make_room()
+            .make_room(0)
             .unwrap_err()
+            .error("")
             .into_batch_result("new".into());
         assert_eq!(error["code"], "task_jobs_full");
         let evicted = registry.entries.keys().next().unwrap().clone();
@@ -1075,7 +1171,7 @@ mod tests {
         oldest.finished = Some(Instant::now());
         oldest.status = JobStatus::Completed;
         drop(oldest);
-        registry.make_room().unwrap();
+        registry.make_room(0).unwrap();
         assert_eq!(registry.entries.len(), MAX_JOBS - 1);
         assert!(!registry.entries.contains_key(&evicted));
         assert!(

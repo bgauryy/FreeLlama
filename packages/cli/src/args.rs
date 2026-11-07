@@ -8,10 +8,23 @@ use freellama::platform::{
 };
 use uuid::Uuid;
 
+/// Reject an endpoint that is not `http(s)://host[:port]` at argument parsing, so a typo is named
+/// instead of surfacing later as a transport "builder error".
+pub(crate) fn parse_endpoint_url(value: &str) -> Result<String, String> {
+    let invalid = || format!("invalid endpoint URL {value}: expected http(s)://host:port");
+    let url = reqwest::Url::parse(value).map_err(|_| invalid())?;
+    if matches!(url.scheme(), "http" | "https") && url.host_str().is_some() {
+        Ok(value.to_owned())
+    } else {
+        Err(invalid())
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "freellama",
     version,
+    long_version = freellama::LONG_VERSION,
     about = "Run and route local models through Ollama"
 )]
 pub(crate) struct Cli {
@@ -119,6 +132,27 @@ mod telemetry_cli_tests {
         assert_eq!(initialization_status(true, false, true), "setup_required");
         assert_eq!(initialization_status(true, true, false), "setup_required");
         assert_eq!(initialization_status(true, true, true), "ready");
+    }
+
+    #[test]
+    fn endpoint_flags_reject_non_http_urls_with_a_named_message() {
+        for args in [
+            ["freellama", "doctor", "--endpoint", "not-a-url"],
+            ["freellama", "models", "--endpoint", "ftp://host:1"],
+            ["freellama", "serve", "--upstream", "localhost:11434"],
+            ["freellama", "proxy", "--upstream", "nope"],
+        ] {
+            let error = Cli::try_parse_from(args).unwrap_err().to_string();
+            assert!(
+                error.contains("expected http(s)://host:port")
+                    && error.contains("invalid endpoint URL"),
+                "{error}"
+            );
+        }
+        assert!(
+            Cli::try_parse_from(["freellama", "doctor", "--endpoint", "http://127.0.0.1:1"])
+                .is_ok()
+        );
     }
 
     #[test]
@@ -280,12 +314,13 @@ pub(crate) struct BackendArgs {
     #[arg(
         long,
         env = "FREELLAMA_OLLAMA_ENDPOINT",
-        default_value = freellama::DEFAULT_OLLAMA_ENDPOINT
+        default_value = freellama::DEFAULT_OLLAMA_ENDPOINT,
+        value_parser = parse_endpoint_url
     )]
     pub(crate) upstream: String,
     /// Optional second Ollama process forced to CPU (keep it on loopback). Managed tasks using a
     /// model named by --cpu-model are sent here; raw Ollama-compatible endpoints stay on --upstream.
-    #[arg(long, group = "cpu_backend")]
+    #[arg(long, group = "cpu_backend", value_parser = parse_endpoint_url)]
     pub(crate) cpu_upstream: Option<String>,
     /// Start and own a CPU-only Ollama on 127.0.0.1:--cpu-backend-port for the --cpu-model models,
     /// stopped when `serve` exits. A port that already answers is refused, not adopted.
@@ -370,13 +405,15 @@ pub(crate) enum Command {
         #[arg(
             long,
             env = "FREELLAMA_OLLAMA_ENDPOINT",
-            default_value = freellama::DEFAULT_OLLAMA_ENDPOINT
+            default_value = freellama::DEFAULT_OLLAMA_ENDPOINT,
+            value_parser = parse_endpoint_url
         )]
         ollama_endpoint: String,
         #[arg(
             long,
             env = "FREELLAMA_SERVE_ENDPOINT",
-            default_value = freellama::DEFAULT_SERVE_ENDPOINT
+            default_value = freellama::DEFAULT_SERVE_ENDPOINT,
+            value_parser = parse_endpoint_url
         )]
         serve_endpoint: String,
     },
@@ -409,7 +446,8 @@ pub(crate) enum Command {
         #[arg(
             long,
             env = "FREELLAMA_SERVE_ENDPOINT",
-            default_value = freellama::DEFAULT_SERVE_ENDPOINT
+            default_value = freellama::DEFAULT_SERVE_ENDPOINT,
+            value_parser = parse_endpoint_url
         )]
         endpoint: String,
     },
@@ -418,7 +456,8 @@ pub(crate) enum Command {
         #[arg(
             long,
             env = "FREELLAMA_SERVE_ENDPOINT",
-            default_value = freellama::DEFAULT_SERVE_ENDPOINT
+            default_value = freellama::DEFAULT_SERVE_ENDPOINT,
+            value_parser = parse_endpoint_url
         )]
         endpoint: String,
         /// Show one job, such as `classify`, `ocr` or `speech-to-text`.
@@ -430,7 +469,8 @@ pub(crate) enum Command {
         #[arg(
             long,
             env = "FREELLAMA_SERVE_ENDPOINT",
-            default_value = freellama::DEFAULT_SERVE_ENDPOINT
+            default_value = freellama::DEFAULT_SERVE_ENDPOINT,
+            value_parser = parse_endpoint_url
         )]
         endpoint: String,
     },
@@ -440,7 +480,8 @@ pub(crate) enum Command {
         #[arg(
             long,
             env = "FREELLAMA_SERVE_ENDPOINT",
-            default_value = freellama::DEFAULT_SERVE_ENDPOINT
+            default_value = freellama::DEFAULT_SERVE_ENDPOINT,
+            value_parser = parse_endpoint_url
         )]
         endpoint: String,
     },
@@ -450,7 +491,8 @@ pub(crate) enum Command {
         #[arg(
             long,
             env = "FREELLAMA_SERVE_ENDPOINT",
-            default_value = freellama::DEFAULT_SERVE_ENDPOINT
+            default_value = freellama::DEFAULT_SERVE_ENDPOINT,
+            value_parser = parse_endpoint_url
         )]
         endpoint: String,
     },
@@ -460,7 +502,8 @@ pub(crate) enum Command {
         #[arg(
             long,
             env = "FREELLAMA_SERVE_ENDPOINT",
-            default_value = freellama::DEFAULT_SERVE_ENDPOINT
+            default_value = freellama::DEFAULT_SERVE_ENDPOINT,
+            value_parser = parse_endpoint_url
         )]
         endpoint: String,
         #[arg(long)]
@@ -474,7 +517,8 @@ pub(crate) enum Command {
         #[arg(
             long,
             env = "FREELLAMA_SERVE_ENDPOINT",
-            default_value = freellama::DEFAULT_SERVE_ENDPOINT
+            default_value = freellama::DEFAULT_SERVE_ENDPOINT,
+            value_parser = parse_endpoint_url
         )]
         endpoint: String,
         #[arg(long, default_value_t = 7)]
@@ -485,7 +529,8 @@ pub(crate) enum Command {
         #[arg(
             long,
             env = "FREELLAMA_SERVE_ENDPOINT",
-            default_value = freellama::DEFAULT_SERVE_ENDPOINT
+            default_value = freellama::DEFAULT_SERVE_ENDPOINT,
+            value_parser = parse_endpoint_url
         )]
         endpoint: String,
         #[arg(long)]
@@ -496,7 +541,8 @@ pub(crate) enum Command {
         #[arg(
             long,
             env = "FREELLAMA_SERVE_ENDPOINT",
-            default_value = freellama::DEFAULT_SERVE_ENDPOINT
+            default_value = freellama::DEFAULT_SERVE_ENDPOINT,
+            value_parser = parse_endpoint_url
         )]
         endpoint: String,
     },
@@ -506,7 +552,8 @@ pub(crate) enum Command {
             long,
             global = true,
             env = "FREELLAMA_SERVE_ENDPOINT",
-            default_value = freellama::DEFAULT_SERVE_ENDPOINT
+            default_value = freellama::DEFAULT_SERVE_ENDPOINT,
+            value_parser = parse_endpoint_url
         )]
         endpoint: String,
         #[command(subcommand)]
@@ -524,7 +571,8 @@ pub(crate) enum Command {
         #[arg(
             long,
             env = "FREELLAMA_SERVE_ENDPOINT",
-            default_value = freellama::DEFAULT_SERVE_ENDPOINT
+            default_value = freellama::DEFAULT_SERVE_ENDPOINT,
+            value_parser = parse_endpoint_url
         )]
         endpoint: String,
         #[arg(long)]
@@ -542,7 +590,8 @@ pub(crate) enum Command {
         #[arg(
             long,
             env = "FREELLAMA_OLLAMA_ENDPOINT",
-            default_value = freellama::DEFAULT_OLLAMA_ENDPOINT
+            default_value = freellama::DEFAULT_OLLAMA_ENDPOINT,
+            value_parser = parse_endpoint_url
         )]
         upstream: String,
         /// Required local telemetry; defaults to require-memory like managed execution.
@@ -571,7 +620,8 @@ pub(crate) enum Command {
         #[arg(
             long,
             env = "FREELLAMA_OLLAMA_ENDPOINT",
-            default_value = freellama::DEFAULT_OLLAMA_ENDPOINT
+            default_value = freellama::DEFAULT_OLLAMA_ENDPOINT,
+            value_parser = parse_endpoint_url
         )]
         endpoint: String,
         /// Restrict the run to exact installed model names; repeat the flag as needed.
@@ -592,7 +642,8 @@ pub(crate) enum Command {
         #[arg(
             long,
             env = "FREELLAMA_OLLAMA_ENDPOINT",
-            default_value = freellama::DEFAULT_OLLAMA_ENDPOINT
+            default_value = freellama::DEFAULT_OLLAMA_ENDPOINT,
+            value_parser = parse_endpoint_url
         )]
         endpoint: String,
     },
@@ -633,7 +684,8 @@ pub(crate) struct PolicyFromEvalArgs {
     #[arg(
         long,
         env = "FREELLAMA_OLLAMA_ENDPOINT",
-        default_value = freellama::DEFAULT_OLLAMA_ENDPOINT
+        default_value = freellama::DEFAULT_OLLAMA_ENDPOINT,
+        value_parser = parse_endpoint_url
     )]
     pub(crate) ollama_endpoint: String,
 }
@@ -653,7 +705,8 @@ pub(crate) struct RouteArgs {
     #[arg(
         long,
         env = "FREELLAMA_SERVE_ENDPOINT",
-        default_value = freellama::DEFAULT_SERVE_ENDPOINT
+        default_value = freellama::DEFAULT_SERVE_ENDPOINT,
+        value_parser = parse_endpoint_url
     )]
     pub(crate) endpoint: String,
     #[arg(long, value_enum, default_value_t = TaskKind::Completion)]
@@ -693,7 +746,8 @@ pub(crate) struct TaskArgs {
     #[arg(
         long,
         env = "FREELLAMA_SERVE_ENDPOINT",
-        default_value = freellama::DEFAULT_SERVE_ENDPOINT
+        default_value = freellama::DEFAULT_SERVE_ENDPOINT,
+        value_parser = parse_endpoint_url
     )]
     pub(crate) endpoint: String,
     #[arg(long, value_enum)]

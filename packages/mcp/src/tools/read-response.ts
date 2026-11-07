@@ -136,11 +136,9 @@ export function registerReadResponseTool(server: McpServer): void {
     "read_response",
     {
       description:
-        "Use when: a result's response_file holds what you need beyond the inline view (its `sections`). " +
-        "Do not use when: the inline result already answers. " +
-        "Returns: one section — a sections name, a top-level structuredContent field, or a JSON pointer such as /result/structuredContent/route — " +
-        "paged by offset/limit (characters of a string, items of an array, JSON text of a large object; next_offset continues). " +
-        "Omit section for an outline.",
+        "Use when: a result's response_file holds what the inline view lacks. Do not use when: the inline result answers. " +
+        "Returns: one section (a `sections` name, a structuredContent field or a JSON pointer such as /result/structuredContent/route), paged by offset/limit " +
+        "(characters, array items or JSON text; next_offset continues); omit section for an outline.",
       inputSchema: z.object({
         file: z.string().min(1),
         section: z.string().min(1).optional(),

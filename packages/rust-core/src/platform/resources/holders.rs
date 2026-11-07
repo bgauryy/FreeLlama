@@ -99,6 +99,24 @@ pub fn memory_holders() -> Vec<MemoryHolder> {
     holders
 }
 
+/// Like [`memory_holders`], for a refusal that is about to be returned: a cold or stale cache
+/// is sampled now (two bounded `ps` calls off the async threads) instead of returning empty, so
+/// the first refusal after startup still names who holds the memory.
+pub async fn memory_holders_now() -> Vec<MemoryHolder> {
+    let cached = memory_holders();
+    if !cached.is_empty() {
+        return cached;
+    }
+    let Ok(sampled) = tokio::task::spawn_blocking(sample).await else {
+        return Vec::new();
+    };
+    CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .sample = Some((Instant::now(), sampled.clone()));
+    sampled
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn sample() -> Vec<MemoryHolder> {
     // `-A` lists every process on both macOS and Linux (`-e` means environment on macOS). Sorted
@@ -208,6 +226,13 @@ fn parse(executables: &str, command_lines: &str) -> Vec<MemoryHolder> {
     holders.sort_by_key(|holder| std::cmp::Reverse(holder.resident_bytes));
     holders.truncate(LIMIT);
     holders
+}
+
+/// One decimal of GB (1024³ bytes, the unit [`describe`] uses): "15.6 GB".
+#[must_use]
+pub fn gb(bytes: u64) -> String {
+    let tenths = bytes.saturating_mul(10) / (1024 * 1024 * 1024);
+    format!("{}.{} GB", tenths / 10, tenths % 10)
 }
 
 /// "node: tsserver.js ×4 5.3 GB, rustc 2.7 GB" for a human-readable message.

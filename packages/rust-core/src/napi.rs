@@ -124,6 +124,10 @@ pub fn version() -> String {
 #[used]
 static EMBEDDED_VERSION: &str = concat!("freellama-version:", env!("CARGO_PKG_VERSION"));
 
+/// Keeps the source marker in the compiled addon for `scripts/verify-release-packages.mjs`.
+#[used]
+static EMBEDDED_SOURCE: &str = crate::SOURCE_MARKER;
+
 /// Runs `freellama doctor` against Ollama directly — no running `freellama serve` required.
 /// Cross-checks the Ollama CLI and server versions and confirms the endpoint is reachable.
 ///

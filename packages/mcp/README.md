@@ -46,10 +46,17 @@ prove that physical computation has stopped. Receipts are bounded and lost on se
 see [retention and task states](https://github.com/bgauryy/FreeLlama/blob/main/docs/MONITORING.md#read-the-live-status).
 
 Follow this workflow. The server's initialization instructions carry a compressed form of the
-same contract (inventory first, preview semantics, evidence levels, ownership, and pull approval):
+same contract (start step, offload rules, memory and pull approval, ownership and verification);
+tool descriptions carry per-tool limits such as the `preview:true` rule; evidence levels
+(`confidence`, `evidence`) are in the tool results:
 
-1. Start with `models {view:"installed"}`, then `models {view:"resident"}`. This gives a routing
-   agent the smallest current inventory first.
+1. Start with `models {view:"catalog"}` (tested picks per job, what is installed and fits now), then
+   `models {view:"installed"}` and `models {view:"resident"}` for the full inventory. Name the
+   catalog's pick for the job as `model` (`job:` narrows the catalog): routing without `model` uses
+   capability metadata only and may choose a model that does not fit now. Keep one model per batch;
+   each extra model is a cold load and may evict another. Capability metadata is not evidence of
+   quality: small models call a tool when none is needed (check `tool_calls`), and text in images
+   needs the catalog's `ocr` pick.
 2. Call `doctor` only for runtime or configuration diagnosis. It returns `summary` by default;
    use `view:"status"` for live queues and limits or `view:"full"` for the complete diagnostic. If Ollama is missing or unreachable, ask the operator to install or start it.
 3. Classify the task. Offload embeddings, OCR/vision, bulk transforms, and sufficiently large
@@ -66,8 +73,9 @@ same contract (inventory first, preview semantics, evidence levels, ownership, a
 ### Use context and delegation deliberately
 
 FreeLlama reduces the **calling agent's context burden**. It does not make an Ollama response more
-accurate or eliminate the local model tokens needed to produce it. Its compact text cue avoids a
-second serialized copy of the canonical `structuredContent`; its delegated adapter keeps full tool
+accurate or eliminate the local model tokens needed to produce it. Results without a
+`summary` carry the same object as compact JSON text (capped at 4,000 characters, with a note
+pointing at `structuredContent`) so text-only clients see the data; its delegated adapter keeps full tool
 observations on disk and presents them in pages when requested.
 
 Use this economical sequence:
@@ -83,8 +91,8 @@ Use this economical sequence:
    difficult answer.
 4. Use `delegate_research` only for a self-contained question requiring files under
    `workspacePath`. Bound `agent.maxTurns`, `agent.contextTokens`, and `agent.outputTokens`.
-5. Keep the compact text cue in the active conversation; inspect `structuredContent`, a paged tool
-   result, or a bundled documentation resource only when its detail changes the next action.
+5. Read the result text first; inspect `structuredContent`, a paged tool result, or a bundled
+   documentation resource when the text is truncated or its detail changes the next action.
 
 For a delegated agent, estimated usable input is `contextTokens - outputTokens - safetyMarginTokens`
 (the default margin is 256). The adapter pins the system instruction and question, preserves the
@@ -113,7 +121,7 @@ the local model still spends tokens, power, and time. Per-call rows below come f
 | 1 image, OCR, byte-exact | 1,970 | 37 | **98.1%** |
 
 A dated MCP-envelope audit (2026-09-03, `characters / 4` as a rough token estimate) measured the
-duplicate text copy FreeLlama does not emit beside `structuredContent`: `doctor {view:"summary"}`
+duplicate text copy that summary-bearing tools such as `doctor` avoid beside `structuredContent`: `doctor {view:"summary"}`
 avoids ~3,064 chars, `doctor {view:"full"}` ~10,651, `models {view:"raw", limit:1}` ~404. These
 are **not billed-token savings** unless the host would otherwise feed both representations to a
 model. The tool schema itself is per-turn rent, bounded by the
@@ -275,7 +283,7 @@ catalog loading; a server without `/ready` counts as ready once it answers. See
 |---|---|---|
 | `doctor` | No (except `status`/`usage`) | Runtime/configuration diagnostic. Target another Ollama with `ollamaEndpoint` and serve with `serveEndpoint`. `summary` (default) returns `status` (`ok`, or `degraded` with `problems` when serve is unreachable or `/ready` reports what it waits for), endpoint, version, resident count, `platform_health` with readiness, host/profile signals, and next step; `full` adds all non-duplicated diagnostics, including admission and categorized Ollama settings; `status` returns serve's live view (per-backend queues, current and adaptive limits, circuit breakers, loaded models, host memory, Ollama's effective settings, today's usage); `usage` returns task and token totals per day and model (`days`, default 7). The report distinguishes an observed same-user macOS process from configuration hints and never claims remote process visibility. |
 | `models` | `installed` (default) and `resident` do; `detail`/`raw`/`library` don't | Views: `installed` (capabilities, use explanations, derived `model_type`, VRAM, context, policy_rank), `resident` (loaded now + managed GPU/CPU split), `detail` (one model, maximum context), paged `raw` (`GET /api/tags`), `library` (two-step public search: omit `model` to search ollama.com families and, for a `query`, Hugging Face GGUF repos (`source` limits it to one; `limit` applies per source); pass `model:"<family>"` or `model:"hf.co/<owner>/<repo>"` for every pullable tag with its size and `fitsInMemory`). `includeLibrary:true` enriches installed/detail views with sourced public guidance; `includeReadme:true` returns the README text in library step 2 or enriched detail. |
-| `run_task` | Yes | **Routes or executes** a chat/generate/embed call. `preview: true` accepts routing fields only and returns a decision without generation. Execution omits preview and supplies the payload. Embedding results withhold raw vectors inline by default; the response file keeps them (`read_response` section `embeddings`, or `returnEmbeddings: true`). A caller cancellation signal uses an addressable job even without progress notifications. An MCP `progressToken` additionally reports phases (queued, waiting for memory, loading, running) as `notifications/progress`; accepted jobs are never replayed when polling or result retrieval fails. A client cancellation retries the cancel request up to 3 times and returns `cancellation_state`: `acknowledged` (serve reports the job terminal), `requested`, or `unknown`; none confirms that Ollama stopped work. A typed refusal from serve (HTTP 429, 502 or 503 with a `code`) is returned whole and ran nothing; a submission that gets no answer from serve returns `execution_outcome:"unknown"` and `retry_safe:false`. `tasks: [{id, independent:true, task}]` (max 64, `maxParallelism` bounds fan-out) runs a batch whose nested `task` takes the same fields; it is not a dependency scheduler. Decision tasks take `state` + `questions` and answer one line per question; `files` names inputs by path or glob (the server reads them; roots: working directory, temp directory, `FREELLAMA_FILE_ROOTS`); with `tasks`, top-level `task`, `model`, `systemPrompt`, `questions`, `format`, `options` and routing fields are sent once as defaults for every item; `nearest` ranks embeddings against a `query`, or finds the most similar pairs, and returns labels with scores instead of vectors. |
+| `run_task` | Yes | **Routes or executes** a chat/generate/embed call. `preview: true` accepts routing fields only and returns a decision without generation. Execution omits preview and supplies the payload. Embedding results withhold raw vectors inline by default; the response file keeps them (`read_response` section `embeddings`, or `returnEmbeddings: true`). A caller cancellation signal uses an addressable job even without progress notifications. An MCP `progressToken` additionally reports phases (queued, waiting for memory, loading, running) as `notifications/progress`; accepted jobs are never replayed when polling or result retrieval fails. A client cancellation retries the cancel request up to 3 times and returns `cancellation_state`: `acknowledged` (serve reports the job terminal), `requested`, or `unknown`; none confirms that Ollama stopped work. A typed refusal from serve (HTTP 429, 502 or 503 with a `code`) is returned whole and ran nothing; a submission that gets no answer from serve returns `execution_outcome:"unknown"` and `retry_safe:false`. `tasks: [{id, independent:true, task}]` (max 64, `maxParallelism` bounds fan-out) runs a batch whose nested `task` takes the same fields (the tool schema lists only those that usually differ per item: `prompt`, `systemPrompt`, `messages`, `state`, `input`, `files`, `images`, `model`, `task`, `questions`, `options`, `keepAlive`, `format`, `think`, `tools`; every other `run_task` field is still accepted, and a misspelled or mistyped one fails the call naming the item); it is not a dependency scheduler. Decision tasks take `state` + `questions` and answer one line per question; `files` names inputs by path or glob (the server reads them; roots: working directory, temp directory, `FREELLAMA_FILE_ROOTS`); with `tasks`, top-level `task`, `model`, `systemPrompt`, `questions`, `tools`, `format`, `options` and routing fields are sent once as defaults for every item (an item's own value, `tools` included, replaces the default); `nearest` ranks embeddings in the core against a `query`, or finds the most similar pairs, and returns labels with scores instead of vectors (also with `defer`). `defer` with `tasks` submits one job per item. |
 | `scope` | Yes | Creates, inspects, forks, or deletes process-local message history; history inclusion requires `includeMessages:true`. |
 | `session` | Yes | Creates, deletes, or kills model affinity without storing messages or KV; `kill` cancels the session's in-flight work. |
 | `task_jobs` | Yes | Inspects, cancels, or removes a deferred task or warming operation. |
@@ -322,8 +330,11 @@ custom models, and variant limitations.
 
 The tools declare an MCP object `outputSchema`. Schemas type the stable fields FreeLlama owns
 (such as route decision, page, answer, and session identifiers) while leaving Ollama-owned nested
-payloads forward-compatible. `structuredContent` is canonical; normal text is a concise cue
-(`run_task` and `delegate_research` return the answer text).
+payloads forward-compatible. `structuredContent` is canonical; normal text is the explicit
+`summary` when a tool has one, else the same object as compact JSON capped at 4,000 characters
+with a truncation note. `run_task` and `delegate_research` return the answer text; `doctor` status/usage/full,
+`models` installed/resident/detail, `run_task` previews and `defer` acknowledgements return compact text
+(one line per job or model), and their whole object stays in `structuredContent`.
 
 Use `models {view:"raw", limit:20}` and continue with its opaque `page.next_cursor`; a cursor
 refuses continuation if the live model list changed. Library tag responses use the same paging
@@ -350,15 +361,15 @@ Memory admission, authentication, and capability requirements apply in every mod
 - Execution: omit `preview` (or set it to `false`) and pass `prompt`, `systemPrompt`, or `messages` for generative
   tasks or `input` for embeddings, plus any applicable Ollama runtime controls.
 
-Preview rejects `prompt`, `systemPrompt`, `messages`, `input`, `images`, `tools`, `keepAlive`, `format`, `think`,
+Preview rejects `prompt`, `systemPrompt`, `messages`, `input`, `images`, `files`, `state`, `questions`, `nearest`, `tools`, `keepAlive`, `format`, `think`,
 `options`, `logprobs`, `topLogprobs`, `returnEmbeddings`, `priority`, `maxWaitSeconds`, `timeoutSeconds`,
 `stopOnRepetition`, `defer`, `scopeId`, and `scopeRevision`. This prevents a client from attaching
 work to a decision-only call and mistakenly assuming it ran.
 
 `run_task.messages` preserves Ollama message fields beyond `role` and `content`, including images,
 thinking, tool calls, and tool names. Managed requests also accept `format`, `think`, `options`,
-`logprobs`, and `topLogprobs`. Use `contextTokens` for `num_ctx`; placement owns `num_gpu`, so both
-keys are rejected inside `options`. The raw proxy remains available when a caller needs an Ollama
+`logprobs`, and `topLogprobs`. Use `contextTokens` for `num_ctx`; placement owns `num_gpu` and `num_ctx`;
+neither belongs in `options`. The raw proxy remains available when a caller needs an Ollama
 endpoint or feature that the managed MCP tool does not expose, including streaming.
 
 Managed execution waits for a slot and safe host capacity within the server's waiting budget
@@ -373,7 +384,13 @@ metadata, `{action:"get", jobId}` for a retained result, and `{action:"cancel", 
 that task and wait for local permits to be released. `get` summarizes embedding vectors by default;
 set `returnEmbeddings:true` to include them. Cancellation does not unload a shared model or confirm
 physical runner shutdown. Jobs expire on restart; see [CLI controls](https://github.com/bgauryy/FreeLlama/blob/main/docs/CLI.md#execute-tasks)
-for input, result, registry, and retention limits. Batch items cannot defer.
+for input, result, registry, and retention limits. With `tasks`, `defer:true` submits each item as its own
+deferred job (`maxParallelism` bounds only submissions in flight) and returns
+`{deferred:true, jobs:[{id: <item id>, job}]}`; an item whose submission failed carries `error` in its row.
+`nearest` runs in the core, so it also works deferred: `task_jobs get` returns `nearest` instead of vectors
+(`nearest.labels` names the items; one job holds the whole input, within the 16 MiB job input limit). The text
+of `task_jobs` is the job's status line, then its answer, ranking or error; `list` prints one line per job. The full receipt is in
+`structuredContent`. `ollama_manage` warm/unload text is one line (model, residency, keep-alive, load time, waits).
 
 Set `timeoutSeconds` on a task or batch item for a total deadline covering discovery, queueing,
 loading, and inference. The server caps it at its task timeout. The admission wait budget remains
@@ -414,8 +431,8 @@ revision as `scopeId` and `scopeRevision` with only the new input to `run_task`;
 returns the next scope revision. Fork a snapshot before parallel branches. `sessionId` continues to
 mean model affinity only.
 
-Use `ollama_manage {action:"warm",model,contextTokens,keepAlive?}` for a matching runner profile; add
-`task:"embedding"` for an embedding model. Add `systemPrompt` or `messages` to evaluate a long,
+Use `ollama_manage {action:"warm",model,contextTokens,keepAlive?}` for a matching runner profile; an embedding-only model
+loads as embedding by itself; add `task:"embedding"` for one that also does completion (`task:"decision"` is refused). Add `systemPrompt` or `messages` to evaluate a long,
 stable prefix into the runner's prompt cache: later calls that start with it report
 `cached_prompt_tokens` and skip that work. It accepts no other task payload and does not pull a model. Add `defer:true` to inspect its progress through `task_jobs`.
 Explicit `keepAlive` wins over finite adaptive retention. See the canonical

@@ -437,3 +437,20 @@ fn actual_catalog_constructor_only_attaches_policy_quality_to_the_measured_revis
             .is_empty()
     );
 }
+
+#[tokio::test]
+async fn pinning_an_uninstalled_model_returns_the_real_catalog_not_an_empty_one() {
+    let gpu = mock("real:latest", Some("revision-a")).await;
+    let state = state(&gpu, None);
+    let models = discover_for_route(&state, Some("not-a-real-model:latest"))
+        .await
+        .unwrap();
+    // The router can then say "installed: real:latest" instead of "installed: none".
+    assert_eq!(
+        models
+            .iter()
+            .map(|model| model.name.as_str())
+            .collect::<Vec<_>>(),
+        ["real:latest"]
+    );
+}

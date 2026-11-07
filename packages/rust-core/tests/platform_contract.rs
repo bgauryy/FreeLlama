@@ -3781,27 +3781,58 @@ async fn verified_feedback_survives_a_platform_restart() {
     mock_task.abort();
 }
 
-#[test]
-fn corrupt_or_unsupported_feedback_refuses_startup() {
+async fn health_after_startup_with(store: freellama::store::Store) -> Value {
+    let app =
+        app(
+            &crate::support::platform_config("127.0.0.1:11435", "http://127.0.0.1:9", None, None)
+                .with_store(store),
+        )
+        .expect("stored feedback of any version must not abort startup");
+    let health = app
+        .oneshot(
+            Request::get("/_freellama/v1/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    serde_json::from_slice(&to_bytes(health.into_body(), usize::MAX).await.unwrap()).unwrap()
+}
+
+#[tokio::test]
+async fn startup_migrates_a_schema_1_feedback_snapshot() {
+    let store = freellama::store::Store::in_memory().unwrap();
+    let old = r#"{"schema_version":1,"feedback":{"gpu":{"completion":{"model":"m","completed":47,"duration_samples":36,"total_work_unit_ns":1176609970,"total_queue_wait_ms":0,"last_work_unit_ns":34496722,"profile":null,"profile_duration_samples":0,"profile_total_work_unit_ns":0}},"cpu":{}}}"#;
+    store.put_snapshot("placement_feedback", old).unwrap();
+    let health = health_after_startup_with(store.clone()).await;
+    assert_eq!(health["feedback"]["gpu"]["completed"], 47);
+    assert_eq!(health["feedback"]["persistence"]["last_error"], Value::Null);
+    assert_eq!(
+        store
+            .snapshot("placement_feedback_v1_backup")
+            .unwrap()
+            .as_deref(),
+        Some(old)
+    );
+}
+
+#[tokio::test]
+async fn startup_survives_corrupt_or_unknown_feedback_and_keeps_the_evidence() {
     for contents in [
         "not-json",
         r#"{"schema_version":999,"feedback":{"gpu":{},"cpu":{}}}"#,
     ] {
         let store = freellama::store::Store::in_memory().unwrap();
         store.put_snapshot("placement_feedback", contents).unwrap();
-        let error = app(&crate::support::platform_config(
-            "127.0.0.1:11435",
-            "http://127.0.0.1:9",
-            None,
-            None,
-        )
-        .with_store(store))
-        .expect_err("invalid persisted routing evidence must not be silently discarded");
-        let message = format!("{error:#}");
-        assert!(
-            message.contains("parse the stored feedback snapshot")
-                || message.contains("unsupported feedback snapshot schema"),
-            "unexpected startup error: {message}"
+        let health = health_after_startup_with(store.clone()).await;
+        assert_eq!(health["feedback"]["gpu"]["completed"], 0);
+        let warning = health["feedback"]["persistence"]["last_error"]
+            .as_str()
+            .expect("the skipped snapshot is visible in health");
+        assert!(warning.contains("placement_feedback"), "{warning}");
+        assert_eq!(
+            store.snapshot("placement_feedback").unwrap().as_deref(),
+            Some(contents)
         );
     }
 }

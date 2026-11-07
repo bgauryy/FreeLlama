@@ -212,7 +212,8 @@ They remain records of those runs and do not qualify a release.
 # Collect each target's `freellama` executable and `freellama.<target>.node`
 # under release-artifacts/<target>/, then stage all eight platform packages.
 node scripts/assemble-release.mjs release-artifacts release
-yarn release:verify:publish
+yarn release:verify:publish   # also requires each artifact's embedded commit == HEAD, clean tree
+yarn release:smoke            # packed-install smoke of the host platform package
 ```
 
 Build every claimed CLI/native target in a clean environment, assemble `SHA256SUMS`, run the full

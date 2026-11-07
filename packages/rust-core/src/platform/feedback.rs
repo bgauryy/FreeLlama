@@ -377,22 +377,64 @@ pub(crate) struct FeedbackSnapshot {
 /// The name of the placement-feedback snapshot in the shared database.
 const FEEDBACK_SNAPSHOT: &str = "placement_feedback";
 
+/// Where the original schema-1 body is kept once it has been migrated, so nothing is lost.
+const FEEDBACK_V1_BACKUP: &str = "placement_feedback_v1_backup";
+
 pub(crate) fn load_feedback(store: &Store) -> Result<PlacementFeedback> {
     let Some(body) = store.snapshot(FEEDBACK_SNAPSHOT)? else {
         return Ok(PlacementFeedback::default());
     };
-    parse_snapshot(&body)
+    let (feedback, migrated) = parse_snapshot(&body)?;
+    if migrated {
+        backup_v1(store, &body)?;
+        eprintln!(
+            "placement feedback migrated from schema 1 to {FEEDBACK_SCHEMA_VERSION}; aggregate \
+             counters kept as diagnostics, original saved as snapshot `{FEEDBACK_V1_BACKUP}`"
+        );
+    }
+    Ok(feedback)
 }
 
-fn parse_snapshot(body: &str) -> Result<PlacementFeedback> {
-    let raw: Value = serde_json::from_str(body).context("parse the stored feedback snapshot")?;
+/// Startup never aborts on stored feedback it cannot read: the process learns from empty history,
+/// and the returned warning says which snapshot was skipped. Persistence still refuses to replace
+/// that evidence, so a later build that understands it can use it.
+pub(crate) fn load_feedback_or_empty(store: &Store) -> (PlacementFeedback, Option<String>) {
+    match load_feedback(store) {
+        Ok(feedback) => (feedback, None),
+        Err(error) => {
+            let warning = format!(
+                "placement feedback snapshot `{FEEDBACK_SNAPSHOT}` was not loaded ({error:#}); \
+                 starting with empty feedback and leaving the stored snapshot untouched"
+            );
+            eprintln!("{warning}");
+            (PlacementFeedback::default(), Some(warning))
+        }
+    }
+}
+
+fn backup_v1(store: &Store, body: &str) -> Result<()> {
+    if store.snapshot(FEEDBACK_V1_BACKUP)?.is_none() {
+        store.put_snapshot(FEEDBACK_V1_BACKUP, body)?;
+    }
+    Ok(())
+}
+
+/// Parse a stored body; the flag is true when it was schema 1 and was migrated in memory.
+fn parse_snapshot(body: &str) -> Result<(PlacementFeedback, bool)> {
+    let mut raw: Value =
+        serde_json::from_str(body).context("parse the stored feedback snapshot")?;
     let version = raw["schema_version"].as_u64();
-    ensure!(
-        version == Some(u64::from(FEEDBACK_SCHEMA_VERSION)),
-        "unsupported feedback snapshot schema {}; this build reads schema {FEEDBACK_SCHEMA_VERSION}. \
-         Move or delete the FreeLlama database to start new feedback",
-        version.map_or_else(|| "(missing)".to_owned(), |version| version.to_string())
-    );
+    let migrated = version == Some(1);
+    if migrated {
+        migrate_v1(&mut raw);
+    } else {
+        ensure!(
+            version == Some(u64::from(FEEDBACK_SCHEMA_VERSION)),
+            "unsupported feedback snapshot schema {}; this build reads schemas 1 and \
+             {FEEDBACK_SCHEMA_VERSION}",
+            version.map_or_else(|| "(missing)".to_owned(), |version| version.to_string())
+        );
+    }
     let mut snapshot: FeedbackSnapshot =
         serde_json::from_value(raw).context("parse the stored feedback snapshot")?;
     for stats in snapshot
@@ -404,14 +446,40 @@ fn parse_snapshot(body: &str) -> Result<PlacementFeedback> {
         stats.prune_profiles();
         stats.refresh_profile_diagnostics();
     }
-    Ok(snapshot.feedback)
+    Ok((snapshot.feedback, migrated))
+}
+
+/// Schema 1 kept only aggregate counters and one running profile average. Keep the counters as
+/// diagnostics; the profile average was never per-sample evidence, so v2 evidence starts empty.
+fn migrate_v1(raw: &mut Value) {
+    raw["schema_version"] = json!(FEEDBACK_SCHEMA_VERSION);
+    for backend in ["gpu", "cpu"] {
+        let Some(tasks) = raw["feedback"][backend].as_object_mut() else {
+            continue;
+        };
+        for stats in tasks.values_mut().filter_map(Value::as_object_mut) {
+            stats.remove("profile_total_work_unit_ns");
+            stats.insert("profile".into(), Value::Null);
+            stats.insert("profile_duration_samples".into(), json!(0));
+            stats.insert("profiles".into(), json!({}));
+            stats.insert("last_observed_ns".into(), json!(0));
+        }
+    }
 }
 
 /// Merge independent profile observations, rather than letting one model's longer history replace
 /// every other model. Sample ids make repeated writes and forked process snapshots idempotent.
 pub(crate) fn persist_feedback(store: &Store, feedback: &PlacementFeedback) -> Result<()> {
+    if let Some(body) = store.snapshot(FEEDBACK_SNAPSHOT)?
+        && parse_snapshot(&body).is_ok_and(|(_, migrated)| migrated)
+    {
+        backup_v1(store, &body)?;
+    }
     store.update_snapshot(FEEDBACK_SNAPSHOT, |current| {
-        let stored = current.map(parse_snapshot).transpose()?.unwrap_or_default();
+        let stored = current
+            .map(|body| parse_snapshot(body).map(|(feedback, _)| feedback))
+            .transpose()?
+            .unwrap_or_default();
         serde_json::to_string(&FeedbackSnapshot {
             schema_version: FEEDBACK_SCHEMA_VERSION,
             feedback: merged(stored, feedback),
@@ -798,25 +866,76 @@ mod feedback_tests {
         assert_eq!(stats.average_for_profile(&b), Some(90));
     }
 
-    #[test]
-    fn a_v1_snapshot_is_refused_with_the_way_out() {
-        let store = crate::store::Store::in_memory().unwrap();
-        let a = profile("a");
-        let old = json!({
+    fn v1_body() -> String {
+        json!({
             "schema_version":1,
             "feedback":{"gpu":{"completion":{
                 "model":"a","completed":100,"duration_samples":100,
-                "total_work_unit_ns":10000,"total_queue_wait_ms":0,"last_work_unit_ns":100,
-                "profile":a,"profile_duration_samples":100,"profile_total_work_unit_ns":10000
+                "total_work_unit_ns":10000,"total_queue_wait_ms":7,"last_work_unit_ns":100,
+                "profile":profile("a"),"profile_duration_samples":100,
+                "profile_total_work_unit_ns":10000
             }},"cpu":{}}
-        });
-        store
-            .put_snapshot(super::FEEDBACK_SNAPSHOT, &old.to_string())
-            .unwrap();
-        let message = super::load_feedback(&store).unwrap_err().to_string();
-        assert!(message.contains("unsupported feedback snapshot schema 1"));
-        assert!(message.contains("Move or delete the FreeLlama database"));
-        assert!(super::persist_feedback(&store, &super::PlacementFeedback::default()).is_err());
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn a_v1_snapshot_migrates_keeps_aggregates_and_is_backed_up() {
+        let store = crate::store::Store::in_memory().unwrap();
+        let old = v1_body();
+        store.put_snapshot(super::FEEDBACK_SNAPSHOT, &old).unwrap();
+        let loaded = super::load_feedback(&store).unwrap();
+        let stats = &loaded.gpu[&TaskKind::Completion];
+        assert_eq!(stats.completed, 100);
+        assert_eq!(stats.duration_samples, 100);
+        assert_eq!(stats.total_work_unit_ns, 10000);
+        assert_eq!(stats.total_queue_wait_ms, 7);
+        // Diagnostics only: no profile evidence is invented from the v1 running average.
+        assert!(stats.profile.is_none());
+        assert_eq!(stats.average_for_profile(&profile("a")), None);
+        assert_eq!(
+            store
+                .snapshot(super::FEEDBACK_V1_BACKUP)
+                .unwrap()
+                .as_deref(),
+            Some(old.as_str())
+        );
+        // Until something is learned the stored body stays schema 1; the next persist writes v2
+        // and the backup keeps the original.
+        super::persist_feedback(&store, &loaded).unwrap();
+        let written: serde_json::Value =
+            serde_json::from_str(&store.snapshot(super::FEEDBACK_SNAPSHOT).unwrap().unwrap())
+                .unwrap();
+        assert_eq!(written["schema_version"], 2);
+        assert_eq!(written["feedback"]["gpu"]["completion"]["completed"], 100);
+        assert_eq!(
+            store
+                .snapshot(super::FEEDBACK_V1_BACKUP)
+                .unwrap()
+                .as_deref(),
+            Some(old.as_str())
+        );
+        assert_eq!(super::load_feedback(&store).unwrap().gpu.len(), 1);
+    }
+
+    #[test]
+    fn unknown_or_corrupt_feedback_starts_empty_and_is_not_overwritten() {
+        for body in [
+            "not-json",
+            r#"{"schema_version":999,"feedback":{"gpu":{},"cpu":{}}}"#,
+        ] {
+            let store = crate::store::Store::in_memory().unwrap();
+            store.put_snapshot(super::FEEDBACK_SNAPSHOT, body).unwrap();
+            let (feedback, warning) = super::load_feedback_or_empty(&store);
+            assert!(feedback.gpu.is_empty() && feedback.cpu.is_empty());
+            let warning = warning.expect("a warning names the skipped snapshot");
+            assert!(warning.contains("placement_feedback"), "{warning}");
+            assert!(super::persist_feedback(&store, &feedback).is_err());
+            assert_eq!(
+                store.snapshot(super::FEEDBACK_SNAPSHOT).unwrap().as_deref(),
+                Some(body)
+            );
+        }
     }
 
     #[test]

@@ -88,16 +88,22 @@ pub(crate) async fn discover_for_route(
     } else {
         &state.upstream
     };
-    model_from_endpoint(state, upstream, &name, true)
+    let pinned = model_from_endpoint(state, upstream, &name, true)
         .await
-        .map(|model| model.into_iter().collect())
         .map_err(|error| {
             if error.status().is_client_error() {
                 error
             } else {
                 endpoint_error(upstream, &error)
             }
-        })
+        })?;
+    match pinned {
+        Some(model) => Ok(vec![model]),
+        // The endpoint has no such model. Returning an empty list would make the router report
+        // "installed: none" on a machine with many models; hand it the real catalog so the
+        // refusal names what is installed (or truthfully reports that nothing is).
+        None => discover_models(state).await,
+    }
 }
 
 /// Operator assignments use installed tags. Resolve an omitted `:latest` before selecting the

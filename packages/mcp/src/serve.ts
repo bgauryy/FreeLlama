@@ -164,6 +164,9 @@ export async function ensureServe(
   }
 }
 
+const STDERR_TAIL_BYTES = 4096;
+const STDERR_TAIL_LINES = 20;
+
 function startServe(target: string, listen: string): Promise<void> {
   starting ??= (async () => {
     try {
@@ -176,7 +179,11 @@ function startServe(target: string, listen: string): Promise<void> {
         stdio: ["ignore", "ignore", "pipe"],
       });
       child = spawned;
+      // The agent never sees the child's stderr, so keep its tail for the exit error.
+      let stderrTail = "";
+      const closed = new Promise<void>((resolve) => spawned.once("close", () => resolve()));
       spawned.stderr?.on("data", (chunk: Buffer) => {
+        stderrTail = (stderrTail + chunk).slice(-STDERR_TAIL_BYTES);
         process.stderr.write(`[freellama serve] ${chunk}`);
         // The child's startup phases, one line at a time, for callers watching the start.
         const line = String(chunk).trim().split("\n").at(-1)?.trim();
@@ -214,7 +221,13 @@ function startServe(target: string, listen: string): Promise<void> {
         stopAutostartedServe();
         throw new Error(`freellama serve stayed alive but did not become ready at ${target} within ${STARTUP_CEILING_MS}ms; it was stopped.`);
       }
-      throw new Error(`freellama serve exited before becoming ready at ${target} (exit ${spawned.exitCode}, signal ${spawned.signalCode}).`);
+      // Let the pipe drain so the final lines (usually the cause) are included.
+      await Promise.race([closed, new Promise((resolve) => setTimeout(resolve, 500))]);
+      const lines = stderrTail.trim().split("\n").slice(-STDERR_TAIL_LINES).join("\n");
+      throw new Error(
+        `freellama serve exited before becoming ready at ${target} (exit ${spawned.exitCode}, signal ${spawned.signalCode}).` +
+          (lines ? ` Last stderr:\n${lines}` : ""),
+      );
     } finally {
       starting = null;
     }

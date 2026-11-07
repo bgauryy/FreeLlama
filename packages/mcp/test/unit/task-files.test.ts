@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { applyTaskFiles, chunkLines, expandFileEntries, fileRoots, inputLabels } from "../../src/task-files.js";
-import { nearest, nearestText } from "../../src/nearest.js";
+import { nearestText } from "../../src/nearest.js";
 
 const root = mkdtempSync(path.join(tmpdir(), "freellama-files-"));
 const file = (name: string, content: string | Buffer) => {
@@ -113,28 +113,14 @@ describe("files on run_task", () => {
   });
 });
 
-describe("nearest", () => {
-  const vectors = [[1, 0], [0.9, 0.1], [0, 1], [0.95, 0.05]];
-
-  it("ranks items against a query embedded first", () => {
-    const ranked = nearest(vectors, ["a", "b", "c"], { query: "q", top: 2 });
-    expect(ranked).toEqual({ mode: "query", matches: [
-      { index: 2, label: "c", score: 0.999 },
-      { index: 0, label: "a", score: 0.994 },
-    ] });
-    expect(nearestText(ranked)).toBe("0.999  c\n0.994  a");
-  });
-
-  it("never pairs two chunks of one file as duplicates", () => {
-    const ranked = nearest([[1, 0], [1, 0], [0.99, 0.01]], ["a.rs:L1-9", "a.rs:L10-20", "b.rs:L1-5"], { top: 1 });
-    expect(ranked.mode === "pairs" && ranked.pairs[0]!.b.label).toBe("b.rs:L1-5");
-  });
-
-  it("finds the most similar pairs without a query", () => {
-    const ranked = nearest(vectors, ["w", "x", "y", "z"], { top: 1 });
-    expect(ranked.mode).toBe("pairs");
-    if (ranked.mode !== "pairs") return;
-    expect(ranked.pairs).toEqual([{ a: { index: 0, label: "w" }, b: { index: 3, label: "z" }, score: 0.999 }]);
-    expect(nearestText(nearest(vectors, ["w", "x", "y", "z"], { top: 3, minScore: 1.01 }))).toBe("no pair reached minScore");
+describe("nearest text", () => {
+  // The ranking itself is the core's (rust-core platform/execution/nearest_tests.rs).
+  it("prints one line per match or pair, and says when nothing reached minScore", () => {
+    expect(nearestText({ mode: "query", matches: [{ index: 2, label: "c", score: 0.999 }, { index: 0, label: "a", score: 0.994 }] }))
+      .toBe("0.999  c\n0.994  a");
+    expect(nearestText({ mode: "query", matches: [] })).toBe("no item reached minScore");
+    expect(nearestText({ mode: "pairs", pairs: [{ a: { index: 0, label: "w" }, b: { index: 3, label: "z" }, score: 0.999 }] }))
+      .toBe("0.999  w  ~  z");
+    expect(nearestText({ mode: "pairs", pairs: [] })).toBe("no pair reached minScore");
   });
 });

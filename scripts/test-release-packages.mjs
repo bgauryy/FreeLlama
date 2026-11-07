@@ -9,10 +9,14 @@ import { PLATFORM_PACKAGES, addonName, executableName } from "./release-platform
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const heroImage = readFileSync(path.join(repo, "assets/logo.jpg"));
-const untouchedBinary = `binary ${JSON.parse(readFileSync(path.join(repo, "package.json"), "utf8")).version}\n`;
+const workspaceVersion = JSON.parse(readFileSync(path.join(repo, "package.json"), "utf8")).version;
+const untouchedBinary = `binary ${workspaceVersion}\nfreellama-source-commit=${"a".repeat(40)}\n`;
 const scratch = path.join(repo, ".octocode/tmp/prepublish/packaging");
 mkdirSync(scratch, { recursive: true });
 const adapters = ["bash-agent.js", "octocode-agent.js"];
+
+const commit = "a".repeat(40);
+const marker = `freellama-source-commit=${commit}`;
 
 function fixture() {
   const directory = mkdtempSync(path.join(scratch, "verify-"));
@@ -30,8 +34,8 @@ function fixture() {
   }
   for (const file of ["packages/cli/bin/freellama.js", "packages/mcp/dist/index.js", "packages/mcp/native/index.js", "packages/mcp/native/index.d.ts", "packages/mcp/native/package.json", ...adapters.map((name) => `packages/mcp/dist/research/${name}`)]) put(file);
   for (const { id } of PLATFORM_PACKAGES) {
-    put(`packages/native/${id}/${addonName(id)}`, `addon ${version}\n`);
-    put(`packages/native/${id}/${executableName(id)}`, `binary ${version}\n`);
+    put(`packages/native/${id}/${addonName(id)}`, `addon ${version}\n${marker}\n`);
+    put(`packages/native/${id}/${executableName(id)}`, `binary ${version}\n${marker}\n`);
   }
   const toolDirectory = path.join(directory, "tools");
   put("tools/package.json", '{"type":"commonjs"}');
@@ -43,7 +47,8 @@ function fixture() {
   put("cargo-metadata.json", JSON.stringify(metadata));
   return {
     directory, put, metadata,
-    run(env = {}) { return spawnSync(process.execPath, [path.join(repo, "scripts/verify-release-packages.mjs")], { cwd: directory, encoding: "utf8", env: { ...process.env, PATH: `${toolDirectory}${path.delimiter}${process.env.PATH}`, FREELLAMA_REQUIRE_ALL_PLATFORMS: "1", ...env } }); },
+    run(env = {}) {  // FREELLAMA_RELEASE_COMMIT replaces git: the fixture is not a repository.
+     env = { FREELLAMA_RELEASE_COMMIT: commit, ...env }; return spawnSync(process.execPath, [path.join(repo, "scripts/verify-release-packages.mjs")], { cwd: directory, encoding: "utf8", env: { ...process.env, PATH: `${toolDirectory}${path.delimiter}${process.env.PATH}`, FREELLAMA_REQUIRE_ALL_PLATFORMS: "1", ...env } }); },
     cleanup() { rmSync(directory, { recursive: true, force: true }); },
   };
 }
@@ -87,7 +92,7 @@ test("runtime file present on disk but excluded from tarball is refused", () => 
 test("native artifact built at another version is refused", () => {
   const f = fixture();
   try {
-    f.put("packages/native/linux-x64-gnu/freellama", "binary 9.8.7\n");
+    f.put("packages/native/linux-x64-gnu/freellama", `binary 9.8.7\n${marker}\n`);
     const result = f.run();
     assert.notEqual(result.status, 0);
     assert.match(result.stderr, /linux-x64-gnu\/freellama: does not embed version/);
@@ -244,5 +249,50 @@ test("release tag must match package version", () => {
     const result = f.run({ FREELLAMA_RELEASE_TAG: "v9.8.7" });
     assert.notEqual(result.status, 0);
     assert.match(result.stderr, /release tag v9\.8\.7 must match workspace version/);
+  } finally { f.cleanup(); }
+});
+
+for (const [name, content, expected] of [
+  ["built from another commit", `binary\nfreellama-source-commit=${"b".repeat(40)}\n`, /linux-x64-gnu\/freellama: stale artifact, built from commit b{40} but the release commit is a{40}.*yarn release:build/],
+  ["built from a dirty tree", `binary\n${marker}-dirty\n`, /linux-x64-gnu\/freellama: stale artifact, built from a dirty tree/],
+  ["without a source marker", "binary\n", /linux-x64-gnu\/freellama: stale artifact, no freellama-source-commit= marker/],
+  ["built without git", "binary\nfreellama-source-commit=unknown\n", /built from commit unknown/],
+]) {
+  test(`executable ${name} is refused`, () => {
+    const f = fixture();
+    try {
+      f.put("packages/native/linux-x64-gnu/freellama", `binary ${workspaceVersion}\n${content}`);
+      const result = f.run();
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, expected);
+    } finally { f.cleanup(); }
+  });
+}
+
+test("addon built from another commit is refused", () => {
+  const f = fixture();
+  try {
+    f.put("packages/native/darwin-arm64/freellama.darwin-arm64.node", `addon ${workspaceVersion}\nfreellama-source-commit=${"c".repeat(40)}\n`);
+    const result = f.run();
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /darwin-arm64\.node: stale artifact, built from commit c{40}/);
+  } finally { f.cleanup(); }
+});
+
+test("release commit override must be a full SHA", () => {
+  const f = fixture();
+  try {
+    const result = f.run({ FREELLAMA_RELEASE_COMMIT: "abc" });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /FREELLAMA_RELEASE_COMMIT must be a full 40-character commit SHA/);
+  } finally { f.cleanup(); }
+});
+
+test("without an override a dirty or non-git tree is refused", () => {
+  const f = fixture();
+  try {
+    const result = f.run({ FREELLAMA_RELEASE_COMMIT: "" });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /not a git repository|uncommitted changes/);
   } finally { f.cleanup(); }
 });

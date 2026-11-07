@@ -231,6 +231,13 @@ mod tests {
     }
 
     #[test]
+    fn a_blocked_init_reaches_main_as_a_plain_failure() {
+        let error = crate::init::exit_for_status("blocked").unwrap_err();
+        assert!(error.is::<super::PlainError>());
+        assert!(error.to_string().contains("blocked"));
+    }
+
+    #[test]
     fn other_io_errors_still_fail() {
         let error = anyhow::Error::from(Error::from(ErrorKind::PermissionDenied));
         assert!(!is_broken_pipe(&error));

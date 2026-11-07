@@ -7,14 +7,15 @@ import { withBatchTelemetry, withTaskTelemetry } from "../telemetry.js";
 import { runWithJobProgress, type CancellationState } from "../job-progress.js";
 import { notice, progressSink, taskNotices, type ToolExtra } from "../progress.js";
 import { ensureServe } from "../serve.js";
+import { deferText, routeText, withText } from "../result-text.js";
 import {
-  BATCH_TASK_FIELDS, batchItemParam, embeddingInputParam, endpointParam, errorResult, executionPreferenceParam, filesParam,
+  BATCH_TASK_FIELDS, type BatchItem, batchItemParam, embeddingInputParam, endpointParam, errorResult, executionPreferenceParam, filesParam,
   isStructuredSuccess, localToolsParam, messagesParam, minConfidenceParam, minPlacementEvidenceParam, objectiveParam,
   parsedResult, questionsParam, requiredCapabilitiesParam, stateParam, summarizeEmbeddings, systemPromptParam,
-  taskAnswerText, taskMessages, taskParam, withRequiredCapability,
+  parseBatchTask, taskAnswerText, taskMessages, taskParam, withRequiredCapability,
 } from "../helpers.js";
 import { applyTaskFiles, inputLabels, type FileReceipt } from "../task-files.js";
-import { nearest, nearestText, validateEmbeddingVectors, type NearestRequest } from "../nearest.js";
+import { nearestText, validateEmbeddingVectors, type NearestRequest } from "../nearest.js";
 
 // Typed where the agent acts on a field; Ollama-owned payloads (`response`) stay open.
 const taskResultSchema = z.object({
@@ -41,10 +42,15 @@ const batchResultSchema = z.object({
     response: z.unknown().optional(),
     error: z.unknown().optional(),
   }).loose()).optional(),
+  deferred: z.boolean().optional(),
+  jobs: z.array(z.object({
+    id: z.string(),
+    job: z.object({ id: z.string(), status: z.string() }).loose().optional(),
+    error: z.unknown().optional(),
+  }).loose()).optional(),
   telemetry: z.unknown().optional(),
 }).loose();
 
-type BatchItem = z.infer<typeof batchItemParam>;
 type TaskPayload = Pick<BatchItem["task"],
   "task" | "scopeId" | "scopeRevision" | "prompt" | "systemPrompt" | "messages" | "images" | "input" | "tools" |
   "format" | "think" | "logprobs" | "topLogprobs" | "options" | "state" | "questions"> &
@@ -115,7 +121,7 @@ function withFiles<T extends TaskPayload & { files?: string[] }>(task: T, label?
  */
 export const BATCH_SHARED_FIELDS: ReadonlySet<string> = new Set([
   "task", "model", "objective", "sessionId", "contextTokens", "executionPreference", "systemPrompt", "questions",
-  "format", "think", "options", "keepAlive", "priority", "timeoutSeconds", "maxWaitSeconds", "stopOnRepetition",
+  "format", "think", "options", "keepAlive", "priority", "timeoutSeconds", "maxWaitSeconds", "stopOnRepetition", "tools",
 ]);
 
 function withoutUndefined<T extends object>(value: T): Partial<T> {
@@ -158,11 +164,14 @@ async function runManagedTask(
       submit: () => runTaskRequest(target, { ...request, defer: true }),
       get: (id) => getTaskJob(target, id),
       cancel: (id) => cancelTaskJob(target, id),
-      sync: () => {
+      sync: (refusal) => {
         // This callback is reached only for a definitive pre-execution job refusal. The request
         // must stay cancellable; switching to an uninterruptible native request is unsafe.
+        // Serve's own refusal says which limit applied (input size, job count, input budget).
         throw new Error(JSON.stringify({
-          code: "cancellable_task_unavailable", error: "Serve refused job submission before execution; cancellable execution requires available job capacity and a supported request size.",
+          ...refusal,
+          error: `Serve refused the job before execution: ${typeof refusal?.error === "string" ? refusal.error : "no job capacity or unsupported request size"}`,
+          code: typeof refusal?.code === "string" ? refusal.code : "cancellable_task_unavailable",
           execution_outcome: "not_started", retry_safe: true,
         }));
       },
@@ -373,6 +382,7 @@ async function runBatch(
   maxParallelism: number | undefined,
   endpoint: string | undefined,
   extra: ToolExtra,
+  defer: boolean,
 ) {
   const ids = tasks.map((item) => item.id.trim());
   if (ids.some((id) => !id) || new Set(ids).size !== ids.length) return errorResult(new Error("every batch item needs a distinct, non-empty id"));
@@ -381,7 +391,6 @@ async function runBatch(
     const problem = validateTaskPayload(item.task, `batch item ${item.id}`);
     if (problem) return errorResult(new Error(problem));
   }
-  const report = progressSink(extra);
   const payload = {
     tasks: tasks.map(({ id, independent, task }) => ({
       id,
@@ -422,8 +431,43 @@ async function runBatch(
       },
     })),
   };
-  const raw = await runCancellableBatch(endpoint ?? DEFAULT_SERVE_ENDPOINT, payload.tasks, maxParallelism, extra.signal, report);
+  const target = endpoint ?? DEFAULT_SERVE_ENDPOINT;
+  if (defer) return withText(parsedResult(await submitDeferredBatch(target, payload.tasks, maxParallelism, extra.signal)), deferText);
+  const raw = await runCancellableBatch(target, payload.tasks, maxParallelism, extra.signal, progressSink(extra));
   return withBatchTelemetry(parsedResult(raw));
+}
+
+/**
+ * `defer` with `tasks`: every item becomes its own deferred job, so no call outlives a client's
+ * request timeout. `maxParallelism` bounds only how many submissions are in flight; admission
+ * and priority stay with the core. An item whose submission fails is reported in its row and
+ * does not stop the others.
+ */
+async function submitDeferredBatch(
+  target: string, tasks: { id: string; independent: boolean; task: Fields }[], maxParallelism: number | undefined, signal: AbortSignal,
+): Promise<string> {
+  const rows: Fields[] = new Array(tasks.length);
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.max(1, Math.min(maxParallelism ?? 8, tasks.length, 64)) }, async () => {
+    while (next < tasks.length) {
+      const index = next++;
+      const item = tasks[index]!;
+      try {
+        if (signal.aborted) throw cancellationError();
+        const accepted = object(JSON.parse(await runTaskRequest(target, { ...item.task, defer: true })));
+        const job = object(accepted?.job);
+        if (accepted?.deferred !== true || typeof job?.id !== "string") {
+          throw new Error(typeof accepted?.error === "string" ? JSON.stringify(accepted) : "serve returned no deferred job acknowledgement");
+        }
+        rows[index] = { id: item.id, job };
+      } catch (error) {
+        let body: Fields | undefined;
+        try { body = object(JSON.parse(error instanceof Error ? error.message : String(error))); } catch { /* plain transport failure */ }
+        rows[index] = { id: item.id, error: body ?? { error: error instanceof Error ? error.message : String(error) } };
+      }
+    }
+  }));
+  return JSON.stringify({ deferred: true, jobs: rows });
 }
 
 export function registerRunTaskTool(server: McpServer): void {
@@ -431,22 +475,22 @@ export function registerRunTaskTool(server: McpServer): void {
     "run_task",
     {
       description:
-        "Use when: a local model can do bounded work so you do not spend your own tokens on it — label or triage many items (decision), " +
-        "find related files or duplicates (embedding + `nearest`), read a screenshot or scan (vision), or rewrite, summarize or extract from many short texts (completion batch). " +
-        "Name inputs with `files` instead of pasting them: the server reads the paths, so a log, image or source file never passes through your output. " +
-        "Modes: single; `tasks` = up to 64 independent items, ordered results, `maxParallelism` caps dispatch; `preview:true` routes only. " +
-        "Do not use when: the answer needs judgment you must stand behind (security, design, a merge decision), edits across files, or work shorter than describing it. " +
-        "Returns: the answer text (decision: one line per question; nearest: ranked labels with scores); receipts in structuredContent. " +
-        "Next: spot-check a sample; load or unload models with ollama_manage.",
+        "Use when: bounded work for a local model: decision, embedding + `nearest`, vision, tools (returns tool_calls you run), completion batches. " +
+        "Do not use when: you must stand behind the judgment, need edits across files, or the work is shorter than describing it. " +
+        "`tasks` = up to 64 independent items; per-item fields override top-level defaults; one `model` per batch avoids a cold load per model; `maxParallelism` caps dispatch; `preview:true` routes only. " +
+        "MCP clients time out near 60 s: for long work pass `defer:true` (with `tasks`, one job per item) and poll task_jobs get. " +
+        "Returns: the answer text (decision: one line per question; nearest: ranked labels); receipts in structuredContent.",
       inputSchema: z.object({
         endpoint: endpointParam,
-        task: taskParam.removeDefault().optional().describe("caller owns prompts and output format."),
+        task: taskParam.removeDefault().optional(),
         objective: objectiveParam,
-        model: z.string().min(1).optional(),
+        model: z.string().min(1).optional().describe(
+          "exact tag; omitted: routing picks by capability only and may choose one that does not fit now, so name the catalog's pick for the job",
+        ),
         sessionId: z.string().uuid().optional(),
         scopeId: z.string().uuid().optional(),
         scopeRevision: z.number().int().nonnegative().optional(),
-        contextTokens: z.number().int().positive().optional().describe("Total input + output window (num_ctx)."),
+        contextTokens: z.number().int().positive().optional().describe("Input + output window (num_ctx)."),
         executionPreference: executionPreferenceParam,
         minPlacementEvidence: minPlacementEvidenceParam,
         requiredCapabilities: requiredCapabilitiesParam,
@@ -456,23 +500,22 @@ export function registerRunTaskTool(server: McpServer): void {
           .array(z.string().min(1))
           .min(1)
           .optional()
-          .describe("base64, no data-URI prefix, with `prompt` or a decision `state`; prefer `files` for images on disk"),
+          .describe("base64 without data-URI prefix, with `prompt` or a decision `state` (prefer `files`). Needs an explicit vision `model`; text in images: the catalog's ocr pick"),
         files: filesParam.describe(
-          "Paths or globs (src/**/*.rs, from the server's working directory) read by the server; allowed under its working directory, the temp directory and FREELLAMA_FILE_ROOTS (a refused path lists them). " +
-            "embedding: each text file in ~1.5 KB line chunks headed by its path; an image or .wav is one item for a multimodal embedding model. decision: one text file is the state (JSON stays JSON); images and .wav join images. Other tasks: images join images; text is appended to `prompt` under `--- file: <path> ---`.",
+          "Paths or globs the server reads (a refused path lists the allowed roots); 4 MiB per text file, 8 MiB per image, 32 MiB total. " +
+            "embedding: ~1.5 KB chunks, an image or .wav is one item. decision: one text file is the state; images and .wav join images. Other tasks: images join images, text goes under `prompt`.",
         ),
-        state: stateParam.describe("decision: the text or JSON the questions are about; questions may name JSON fields in backticks"),
+        state: stateParam.describe("decision: what the questions ask about; they may name JSON fields in backticks"),
         questions: questionsParam.describe(
-          'decision: {"<name>":{"type":"choice","instructions":"Which kind?","criteria":{"bug":"Broken","feature":"New"}}}; ' +
-            'choice picks one option; noul is a yes/no question answered with the probability of yes (criteria {"false":"...","true":"..."} optional); ' +
-            'score rates on a scale (criteria = level descriptions, lowest first). Each answer has probabilities and a confidence. Up to 64.',
+          'decision: choice picks one criteria option; noul is yes/no, answered as the probability of yes (criteria {"false","true"} optional); ' +
+            "score gives a level from 2-10 criteria descriptions, lowest first (unreliable for severity).",
         ),
-        messages: messagesParam.describe(
-            "Caller system prompts; no injected task instructions. Overrides prompt; extra fields preserved.",
-          ),
+        messages: messagesParam.describe("Caller system prompts; no injected task instructions. Overrides prompt."),
         input: embeddingInputParam,
-        tools: localToolsParam,
-        keepAlive: z.string().min(1).optional().describe('"0" unloads now, "-1" pins; omitted = adaptive finite TTL'),
+        tools: localToolsParam.describe(
+          "Returns tool_calls for you to run; check them, since small models call a tool when none is needed. With `tasks`: a shared default, an item's own `tools` replaces it",
+        ),
+        keepAlive: z.string().min(1).optional().describe('"0" unloads now, "-1" pins; omitted: adaptive TTL'),
         format: z
           .union([z.literal("json"), z.record(z.string(), z.unknown())])
           .optional(),
@@ -482,12 +525,12 @@ export function registerRunTaskTool(server: McpServer): void {
         options: z
           .record(z.string(), z.unknown())
           .optional()
-          .describe("num_ctx/num_gpu are routing-owned; num_predict caps output (unset: no cap)."),
+          .describe("num_ctx/num_gpu are routing-owned; num_predict caps output."),
         logprobs: z.boolean().optional(),
         topLogprobs: z.number().int().nonnegative().optional(),
         minConfidence: minConfidenceParam,
         priority: z.enum(["interactive", "normal", "background"]).optional(),
-        maxWaitSeconds: z.number().int().positive().optional(),
+        maxWaitSeconds: z.number().int().positive().optional().describe("capped by the operator's max_queue_wait_seconds (default 120); a lowered waits show as wait_limit"),
         timeoutSeconds: z.number().int().positive().optional(),
         stopOnRepetition: z
           .boolean()
@@ -496,7 +539,7 @@ export function registerRunTaskTool(server: McpServer): void {
         receipt: z
           .enum(["compact", "full"])
           .optional()
-          .describe("compact (default): whole answer + key fields; full receipt at response_file. full: all inline"),
+          .describe("compact (default): full receipt at response_file; full: inline"),
         defer: z.boolean().optional(),
         returnEmbeddings: z.boolean().optional(),
         nearest: z
@@ -509,25 +552,19 @@ export function registerRunTaskTool(server: McpServer): void {
           .strict()
           .optional()
           .describe(
-            "embedding: rank instead of returning vectors. With `query`: the `top` (default 5, max 100) items closest to it; " +
-              "without: the `top` most similar pairs (duplicates). Scores are cosine similarity from -1 to 1; related texts usually score above 0.7. Files are split into ~1.5 KB line chunks labelled path:Lstart-Lend, so read only that range. " +
-              "Prefixes are the model's own (nomic: query \"search_query: ...\", documentPrefix \"search_document: \" for files).",
+            "embedding: rank instead of returning vectors (works with `defer`). With `query`: the `top` (default 5, max 100) closest items; " +
+              "without: the `top` most similar pairs. Chunks are labelled path:Lstart-Lend: read only that range. documentPrefix is the model's own (see its cookbook).",
           ),
         preview: z
           .boolean()
           .optional()
-          .describe(
-            "true = routing fields only; rejects payloads and runtime controls; never executes",
-          ),
+          .describe("Routing only: payload fields and runtime controls are refused; never executes."),
         tasks: z
           .array(batchItemParam)
           .min(1)
           .max(64)
           .optional()
-          .describe(
-            "Batch mode: independent items, each {id, independent:true, task:{...}}. Top-level task, model, systemPrompt, questions, format, options and other routing fields are sent once as defaults for every item; " +
-              "prompt, state, input, files and images stay per item. Result text: one `## <id>` section per item.",
-          ),
+          .describe("Result text: one `## <id>` section per item."),
         maxParallelism: z.number().int().positive().max(64).optional().describe("Batch mode only"),
       }).strict(),
       outputSchema: taskResultSchema.extend(batchResultSchema.shape),
@@ -580,7 +617,8 @@ export function registerRunTaskTool(server: McpServer): void {
           timeoutSeconds, stopOnRepetition, defer, returnEmbeddings, nearest: nearestRequest, preview,
         };
         if (tasks !== undefined) {
-          const stray = Object.entries(singleFields).filter(([, value]) => value !== undefined).map(([name]) => name);
+          // `defer` is the one single-call field a batch accepts: it submits every item as its own job.
+          const stray = Object.entries(singleFields).filter(([name, value]) => value !== undefined && name !== "defer").map(([name]) => name);
           const unsupported = stray.filter((name) => !BATCH_TASK_FIELDS.has(name)).map((name) => `\`${name}\``);
           if (unsupported.length > 0) {
             return errorResult(new Error(`${unsupported.join(", ")} ${unsupported.length === 1 ? "is" : "are"} not supported with \`tasks\`.`));
@@ -593,8 +631,8 @@ export function registerRunTaskTool(server: McpServer): void {
           }
           // Shared fields are sent once and apply to every item that does not set its own.
           const shared = Object.fromEntries(stray.map((name) => [name, singleFields[name as keyof typeof singleFields]]));
-          const items = tasks.map((item) => ({ ...item, task: { ...shared, ...withoutUndefined(item.task) } as BatchItem["task"] }));
-          return await runBatch(items, maxParallelism, endpoint, extra);
+          const items: BatchItem[] = tasks.map((item) => ({ ...item, task: { ...shared, ...withoutUndefined(parseBatchTask(item)) } as BatchItem["task"] }));
+          return await runBatch(items, maxParallelism, endpoint, extra, defer === true);
         }
         if (maxParallelism !== undefined) return errorResult(new Error("`maxParallelism` is valid only with `tasks`."));
         const canonicalTask = task ?? "completion";
@@ -628,11 +666,14 @@ export function registerRunTaskTool(server: McpServer): void {
             .filter(([, value]) => value !== undefined)
             .map(([name]) => `\`${name}\``);
           if (executionOnlyFields.length > 0) {
+            // Only a rejected `tools` has a routing-field equivalent to suggest.
+            const next = executionOnlyFields.includes("`tools`")
+              ? " Use `requiredCapabilities:[\"tools\"]` to preview tool capability, then make a separate execution call with the payload."
+              : " Make a separate execution call with the payload.";
             return errorResult(
               new Error(
                 "`preview:true` accepts routing fields only; remove execution-only fields " +
-                  `${executionOnlyFields.join(", ")}. Use \`requiredCapabilities:[\"tools\"]\` ` +
-                  "to preview tool capability, then make a separate execution call with the payload.",
+                  `${executionOnlyFields.join(", ")}.${next}`,
               ),
             );
           }
@@ -644,9 +685,9 @@ export function registerRunTaskTool(server: McpServer): void {
         // The core enforces minConfidence inside route(), so preview and synchronous execution
         // refuse there, with the core's actionable message, before any generation.
         if (preview) {
-          return parsedResult(
+          return withText(parsedResult(
             await route(endpoint, canonicalTask, objective, model, sessionId, contextTokens, effectiveRequiredCapabilities, minConfidence, executionPreference, minPlacementEvidence),
-          );
+          ), routeText);
         }
         const filled = withFiles({ task, files, prompt, images, input, state, documentPrefix: nearestRequest?.documentPrefix });
         ({ prompt, images, input, state } = filled.task);
@@ -655,12 +696,8 @@ export function registerRunTaskTool(server: McpServer): void {
           topLogprobs, options, returnEmbeddings, state, questions, nearest: nearestRequest,
         });
         if (problem) return errorResult(new Error(problem));
-        if (nearestRequest !== undefined && defer) {
-          return errorResult(new Error("`nearest` ranks the vectors as they return; it cannot run as a deferred job. Remove `defer`."));
-        }
-        // `nearest` with a query embeds it first, at index 0, so one request ranks every item.
         const items = input === undefined ? [] : Array.isArray(input) ? input : [input];
-        if (nearestRequest?.query !== undefined) input = [nearestRequest.query, ...items];
+        const labels = nearestRequest === undefined ? undefined : inputLabels(items.length, filled.files);
         // A deferred job is accepted before it routes, so a floor would otherwise surface only as a
         // failed job. Route first (no generation) so the refusal returns synchronously.
         if (minConfidence && defer && scopeId === undefined) {
@@ -682,6 +719,11 @@ export function registerRunTaskTool(server: McpServer): void {
           images,
           messages: taskMessages({ systemPrompt, messages, prompt, images }),
           input,
+          // The core embeds the query first and ranks every item, so sync and deferred runs agree.
+          nearest: nearestRequest === undefined ? undefined : {
+            query: nearestRequest.query, top: nearestRequest.top, min_score: nearestRequest.minScore, labels,
+          },
+          return_embeddings: nearestRequest === undefined ? undefined : returnEmbeddings,
           state,
           questions,
           tools,
@@ -706,7 +748,8 @@ export function registerRunTaskTool(server: McpServer): void {
         // A progressToken asks for messages. The cancellation signal independently asks for
         // addressable jobs, including when the client did not subscribe to progress.
         const report = defer ? undefined : progressSink(extra);
-        const slicedEmbedding = request.task === "embedding" && Array.isArray(input) && input.length > EMBEDDINGS_PER_JOB && !defer;
+        const slicedEmbedding = request.task === "embedding" && Array.isArray(input) && input.length > EMBEDDINGS_PER_JOB && !defer
+          && nearestRequest === undefined;
         // A serve this server is still starting reports its phases too.
         if (report) await ensureServe(endpoint, { signal: extra.signal, report });
         // Slices bound retained job results. If the engine returns larger vectors than its job
@@ -714,8 +757,8 @@ export function registerRunTaskTool(server: McpServer): void {
         const result = parsedResult(slicedEmbedding
           ? await embedInSlices(target, request, input as unknown[], report, extra.signal)
           : await runManagedTask(target, request, report, extra.signal));
-        if (isStructuredSuccess(result) && result.structuredContent.deferred === true) return result;
-        if (request.task === "embedding" && isStructuredSuccess(result)) {
+        if (isStructuredSuccess(result) && result.structuredContent.deferred === true) return withText(result, deferText);
+        if (request.task === "embedding" && nearestRequest === undefined && isStructuredSuccess(result)) {
           validateEmbeddingVectors(object(result.structuredContent.response)?.embeddings, Array.isArray(input) ? input.length : 1);
         }
         // Long loads, evictions and waits are worth a notice even to a client that asked for no
@@ -727,11 +770,11 @@ export function registerRunTaskTool(server: McpServer): void {
           if (/resource admission|memory/i.test(text)) notice(extra, "warning", `FreeLlama could not load the model: ${text.slice(0, 400)}`);
         }
         const finished = withTaskTelemetry(result);
-        if (nearestRequest !== undefined && isStructuredSuccess(finished)) {
-          return rankedResult(finished, nearestRequest, inputLabels(items.length, filled.files), returnEmbeddings === true);
-        }
         if (filled.files.length > 0 && isStructuredSuccess(finished)) {
           finished.structuredContent.files_read = filled.files;
+        }
+        if (nearestRequest !== undefined && isStructuredSuccess(finished)) {
+          return rankedResult(finished, nearestRequest.query !== undefined, items.length);
         }
         // The vectors stay in the saved response; the inline result and its text omit them.
         if (!returnEmbeddings && isStructuredSuccess(finished)) {
@@ -746,24 +789,14 @@ export function registerRunTaskTool(server: McpServer): void {
   );
 }
 
-/** An embedding result ranked by `nearest`: labelled matches inline, vectors only on request. */
+/** An embedding result the core ranked by `nearest`: labelled matches inline, vectors only on request. */
 function rankedResult(
   finished: { structuredContent: Record<string, unknown>; content?: unknown },
-  request: NearestRequest,
-  labels: string[],
-  returnEmbeddings: boolean,
+  withQuery: boolean,
+  itemCount: number,
 ) {
-  const response = finished.structuredContent.response as { embeddings?: unknown } | undefined;
-  const vectors = Array.isArray(response?.embeddings) ? (response.embeddings as number[][]) : [];
-  if (vectors.length === 0) return errorResult(new Error("the embedding response carried no vectors to rank"));
-  const ranked = nearest(vectors, labels, request);
-  const structured = returnEmbeddings ? finished.structuredContent : (summarizeEmbeddings(finished.structuredContent) ?? finished.structuredContent);
-  const header = request.query === undefined
-    ? `most similar pairs among ${labels.length} items:`
-    : `closest of ${labels.length} items to the query:`;
-  return {
-    ...finished,
-    structuredContent: { ...structured, nearest: ranked },
-    content: [{ type: "text" as const, text: `${header}\n${nearestText(ranked)}` }],
-  };
+  const ranked = finished.structuredContent.nearest as Parameters<typeof nearestText>[0] | undefined;
+  if (!ranked) return errorResult(new Error("serve returned no nearest ranking for the embedding task"));
+  const header = withQuery ? `closest of ${itemCount} items to the query:` : `most similar pairs among ${itemCount} items:`;
+  return { ...finished, content: [{ type: "text" as const, text: `${header}\n${nearestText(ranked)}` }] };
 }

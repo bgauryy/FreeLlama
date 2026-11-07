@@ -537,3 +537,45 @@ fn model_names_resolve_to_installed_tags_like_ollama() {
     .unwrap();
     assert_eq!(route.selected_model, "glm-ocr:latest");
 }
+
+/// A refusal must name the requirement that failed and offer eligible alternatives.
+#[test]
+fn an_ineligible_explicit_model_names_the_failed_requirement_and_alternatives() {
+    let text_only = model("text:7b", 7_000_000_000, &[Capability::Completion]);
+    let seer = model(
+        "seer:7b",
+        7_000_000_000,
+        &[Capability::Completion, Capability::Vision],
+    );
+    let error = select_route(
+        &RouteInput {
+            task: TaskKind::Vision,
+            model: Some("text:7b".to_owned()),
+            ..RouteInput::default()
+        },
+        &[text_only.clone(), seer],
+        &SessionAffinity::default(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("not eligible"), "{error}");
+    assert!(
+        error.contains("task vision requires capability vision"),
+        "{error}"
+    );
+    assert!(error.contains("eligible alternatives: seer:7b"), "{error}");
+
+    let error = select_route(
+        &RouteInput {
+            model: Some("text:7b".to_owned()),
+            context_tokens: Some(1_000_000),
+            ..RouteInput::default()
+        },
+        &[text_only],
+        &SessionAffinity::default(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("exceeds the 32768"), "{error}");
+    assert!(error.contains("no installed model is eligible"), "{error}");
+}

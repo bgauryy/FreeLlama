@@ -20,6 +20,7 @@ mod feedback;
 mod forward;
 mod identity;
 mod memory;
+pub(super) mod nearest;
 mod observe;
 mod pipeline;
 mod request;
@@ -332,7 +333,7 @@ pub(super) async fn execute_task(
         super::with_session_cancellation(
             &state,
             session_id.as_deref(),
-            Box::pin(run_session_task(State(state.clone()), Json(input))),
+            Box::pin(nearest::run(state.clone(), input)),
         )
         .await
     };

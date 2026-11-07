@@ -13,7 +13,9 @@ mod sampling;
 mod tests;
 
 pub use governor::{ResourceGovernor, ResourcePermit};
-pub use holders::{MemoryHolder, describe as describe_holders, memory_holders};
+pub use holders::{
+    MemoryHolder, describe as describe_holders, gb, memory_holders, memory_holders_now,
+};
 
 pub(crate) use sampling::bounded_output;
 pub(crate) use sampling::run_bounded;

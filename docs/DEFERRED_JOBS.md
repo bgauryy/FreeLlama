@@ -14,6 +14,8 @@ The journal persists receipts, bounded results/errors, and keyed hashes of reque
 
 `POST /_freellama/v1/tasks` with `defer:true` returns `deferred:true`, a `job` containing its `id`, and `retention` limits. Use `GET /_freellama/v1/jobs/{id}` for its result and `GET /_freellama/v1/jobs` for a metadata-only list. The list strips result/error payloads in SQLite before loading recovered records into the control plane.
 
+An embedding task may carry `nearest` (`{query?, top?, min_score?, labels?}`, with `return_embeddings` to keep the vectors). The core embeds the items (the query first, in slices of 32 pinned to one verified runner identity), ranks them by cosine similarity and stores `nearest: {mode, matches|pairs}` in place of vectors, so a deferred job's result is ranked and small. The whole input is one job and must fit the 16 MiB job input limit; without a query at most 4,000 items are compared pairwise. A malformed `nearest` is refused at submission. Through MCP, `run_task {defer:true, tasks:[...]}` submits every item as its own job and returns `{deferred:true, jobs:[{id, job}]}`; the HTTP `/tasks/batch` endpoint still refuses deferred items.
+
 `POST /_freellama/v1/jobs/{id}/cancel` requests cancellation and waits for the attached worker to settle and release local permits. It also waits for pending terminal persistence. A result already committed by the execution path retains its completed status. Acknowledged local cancellation is not proof that Ollama physically stopped accepted work.
 
 `DELETE /_freellama/v1/jobs/{id}` first settles locally owned work, then hides the record and removes its retained payload. With persistence enabled, its idempotency tombstone remains until expiry. An unattached worker with an unknown outcome cannot be removed early. A failed terminal database commit also prevents removal of its still-unfinished durable record.
@@ -63,7 +65,7 @@ Consumers requiring restart recovery must check terminal persistence confirmatio
 | Durable receipt budget | 32 MiB of serialized receipts across that database |
 | Durable metadata | 16 KiB per accepted/terminal receipt excluding terminal result/error payloads |
 | Individual result or error | 2 MiB of encoded JSON |
-| Deferred input | 1 MiB of encoded JSON; executable input is not retained in the journal |
+| Job input | 16 MiB of encoded JSON per job and 64 MiB across queued and running jobs (`task_jobs_input_budget`, retry after 5 s); executable input is not retained in the journal |
 | Terminal retention | 600 seconds after terminal commit; local retention starts when the worker settles |
 | Unfinished retention | Accepted timeout plus 600 seconds from claim |
 | Database workers | At most four blocking journal operations per process; canceled awaiters do not release a running operation's permit early |

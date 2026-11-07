@@ -14,7 +14,7 @@
       },
       "url": "http://127.0.0.1:11434/api/tags",
       "result": {
-        "identity": "65d218ba16b736e3c94892b909ee32ff83210f040a481f8313f5c06db01ab4a7",
+        "identity": "a19d3c4597325334e6445f50944253dd5d3e9ed8ee6e97e5cb29a26f6236c82f",
         "verified": true,
         "scope": "manifest_digest_and_system_prompt",
         "digest": "abcdef0000000000000000000000000000000000000000000000000000000000"
@@ -34,7 +34,7 @@
       },
       "url": "http://127.0.0.1:11435/_freellama/v1/models",
       "result": {
-        "identity": "0f8e66efc2535d957b2140ddb53f40280484e70c110f2452a363a01b7d55458b",
+        "identity": "0c90cdced074a5a35aeab55e13f0c368b31266b28ce727da914f00a7ec2fbec3",
         "verified": true,
         "scope": "manifest_digest_and_system_prompt",
         "digest": "abcdef0000000000000000000000000000000000000000000000000000000000"

@@ -158,3 +158,30 @@ fn image_embeddings_are_not_chat_models_and_unused_embedding_fields_are_rejected
     let request = input(json!({"task":"embedding","input":"text","images":["cG5n"]}));
     assert!(require_payload(&request).is_err());
 }
+
+#[test]
+fn vision_without_an_image_is_refused_before_admission() {
+    let error = require_payload(&input(json!({"task":"vision","prompt":"describe"}))).unwrap_err();
+    assert!(
+        error.body.error.contains("vision task requires an image"),
+        "{}",
+        error.body.error
+    );
+    // A WAV in `images` is audio, not an image.
+    let wav = "UklGRjAwMDBXQVZF";
+    assert!(require_payload(&input(json!({"task":"vision","prompt":"x","images":[wav]}))).is_err());
+    assert!(
+        require_payload(&input(
+            json!({"task":"vision","prompt":"x","images":["cG5n"]})
+        ))
+        .is_ok()
+    );
+    assert!(
+        require_payload(&input(
+            json!({"task":"vision","messages":[{"role":"user","content":"x","images":["cG5n"]}]})
+        ))
+        .is_ok()
+    );
+    // Completion needs no image.
+    assert!(require_payload(&input(json!({"prompt":"describe"}))).is_ok());
+}

@@ -130,8 +130,9 @@ pub(crate) async fn initialize(ollama_endpoint: String, serve_endpoint: String) 
             "instruction": "Build packages/mcp, launch packages/mcp/dist/index.js over stdio, call doctor, then list installed/resident models before delegating."
         }));
     }
+    let status = initialization_status(ollama_ready, serve_ready, !installed_models.is_empty());
     crate::emit(serde_json::to_string_pretty(&json!({
-            "status": initialization_status(ollama_ready, serve_ready, !installed_models.is_empty()),
+            "status": status,
             "readiness": {"ollama":ollama_ready,"managed_service":serve_ready,"installed_models":!installed_models.is_empty()},
             "ollama_endpoint": ollama_endpoint,
             "serve_endpoint": serve_endpoint,
@@ -141,11 +142,39 @@ pub(crate) async fn initialize(ollama_endpoint: String, serve_endpoint: String) 
             "next_steps": next_steps,
             "side_effects_performed": false,
             "model_pull_requires_exact_tag_approval": true
-    }))?)
+    }))?)?;
+    exit_for_status(status)
+}
+
+/// The receipt is printed either way; `blocked` (Ollama unreachable or unusable) also fails the
+/// command so scripts do not read it as success. `setup_required` and `ready` exit 0: the host
+/// works, the receipt lists what is left to do.
+pub(crate) fn exit_for_status(status: &str) -> Result<()> {
+    if status == "blocked" {
+        return Err(crate::PlainError(
+            "init is blocked: Ollama is not reachable or not usable; see `diagnostics` and `next_steps` above"
+                .to_owned(),
+        )
+        .into());
+    }
+    Ok(())
 }
 
 pub(crate) async fn print_doctor(endpoint: &str) -> Result<()> {
     crate::emit(serde_json::to_string_pretty(&doctor(endpoint).await?)?)
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::{exit_for_status, initialization_status};
+
+    #[test]
+    fn only_a_blocked_init_fails_the_command() {
+        assert!(exit_for_status(initialization_status(false, false, false)).is_err());
+        assert!(exit_for_status(initialization_status(true, false, true)).is_ok());
+        assert!(exit_for_status(initialization_status(true, true, false)).is_ok());
+        assert!(exit_for_status(initialization_status(true, true, true)).is_ok());
+    }
 }
 
 #[cfg(all(test, unix))]

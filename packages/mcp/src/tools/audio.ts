@@ -22,16 +22,15 @@ export function registerAudioTool(server: McpServer): void {
     "audio",
     {
       description:
-        "Use when: a WAV recording must become text (transcribe; translate = into another language), or text must become speech for the user (speak). " +
-        "The server reads `file` by path. Needs a model with audio input, or a speech model for speak. " +
-        "Do not use when: a yes/no about the audio is enough (run_task decision with the .wav in files). " +
-        "Returns: the text, or the path of the WAV written.",
+        "Use when: a WAV recording must become text (transcribe, or translate into another language) or text must become speech (speak). " +
+        "`file` is a WAV under the run_task files roots; the model needs audio input (speech for speak). " +
+        "Do not use when: a yes/no about the audio is enough (run_task decision with the .wav in files). Returns: the text, or the WAV path written.",
       inputSchema: z.object({
         action: z.enum(["transcribe", "translate", "speak"]),
         model: z.string().min(1).describe("exact tag"),
         file: z.string().min(1).optional().describe("WAV path (transcribe, translate)"),
         text: z.string().min(1).max(4_096).optional().describe("speak"),
-        voice: z.string().min(1).optional().describe("speak; omit for the default"),
+        voice: z.string().min(1).optional().describe("speak"),
         language: z.string().min(1).optional().describe("spoken language, ISO 639-1"),
         toLanguage: z.string().min(1).optional().describe("translate; default en"),
         prompt: z.string().min(1).optional().describe("context words"),

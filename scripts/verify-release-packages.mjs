@@ -6,13 +6,28 @@ import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import { PLATFORM_PACKAGES, addonName, executableName, nativePackageName } from "./release-platforms.mjs";
-import { requireEmbeddedVersion } from "./release-version.mjs";
+import { requireEmbeddedVersion, requireSourceCommit } from "./release-version.mjs";
 
 const requireAllPlatforms = process.env.FREELLAMA_REQUIRE_ALL_PLATFORMS === "1";
 const root = JSON.parse(readFileSync("package.json", "utf8"));
 const version = root.version;
 const releaseTag = process.env.FREELLAMA_RELEASE_TAG;
 if (releaseTag && releaseTag !== `v${version}`) throw new Error(`release tag ${releaseTag} must match workspace version v${version}`);
+// Publish gate only: artifacts must embed the release commit. CI checkouts that cannot run git
+// set FREELLAMA_RELEASE_COMMIT to the commit under release.
+function releaseCommit() {
+  const git = (...args) => execFileSync("git", args, { encoding: "utf8" }).trim();
+  const override = process.env.FREELLAMA_RELEASE_COMMIT;
+  if (override) {
+    if (!/^[0-9a-f]{40}$/.test(override)) throw new Error("FREELLAMA_RELEASE_COMMIT must be a full 40-character commit SHA");
+    return override;
+  }
+  if (git("status", "--porcelain", "--untracked-files=no")) {
+    throw new Error("tracked files have uncommitted changes; commit them and rebuild (yarn release:build) so artifacts match the release commit");
+  }
+  return git("rev-parse", "HEAD");
+}
+const expectedCommit = requireAllPlatforms ? releaseCommit() : null;
 const publicPackages = new Map([
   ["packages/cli", "@octocodeai/freellama"],
   ["packages/mcp", "@octocodeai/freellama-mcp-server"],
@@ -120,6 +135,7 @@ for (const target of PLATFORM_PACKAGES) {
     for (const file of [addonName(target.id), executableName(target.id)]) {
       requirePackedFile(directory, paths, file);
       requireEmbeddedVersion(path.join(directory, file), version);
+      requireSourceCommit(path.join(directory, file), expectedCommit);
     }
   }
   console.log(`${directory}: ${requireAllPlatforms ? "publishable artifacts verified" : "manifest verified"}`);

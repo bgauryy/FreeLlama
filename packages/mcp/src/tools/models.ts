@@ -11,6 +11,7 @@ import {
 import { libraryTrialCandidate } from "../model-search.js";
 import { CATALOG_JOBS, catalogText, catalogView } from "../model-catalog.js";
 import { serveAuthHeaders } from "../serve-http.js";
+import { installedModelsText, modelDetailText, residentModelsText } from "../result-text.js";
 import { DEFAULT_SERVE_ENDPOINT } from "../config.js";
 import { HUB_EMBEDDING_TASKS, HuggingFaceClient, huggingFaceReference } from "../huggingface.js";
 import {
@@ -252,13 +253,13 @@ export function registerModelsTool(server: McpServer): void {
     "models",
     {
       description:
-        "Use when: choosing a model for a job (view:catalog: tested picks per job, what is installed and fits now, and a cookbook for each), listing installed or loaded models with capabilities, policy rank and memory fit, inspecting one model, or searching ollama.com and Hugging Face GGUF repos (view:library). " +
-        "Do not use when: running work (run_task) or pulling (ollama_manage). Returns: models; library lists families first, then one family's tags.",
+        "Use when: choosing a model (view:catalog: tested picks per job, what is installed and fits now), listing installed or loaded models, inspecting one, or searching ollama.com and Hugging Face GGUF repos (view:library). " +
+        "Do not use when: running work (run_task) or pulling (ollama_manage). Returns: models; library lists families, then one family's tags.",
       inputSchema: z.object({
         view: z
           .enum(["catalog", "installed", "resident", "detail", "raw", "library"])
           .optional(),
-        job: z.enum(CATALOG_JOBS as [string, ...string[]]).optional().describe("catalog: one job's picks"),
+        job: z.enum(CATALOG_JOBS as [string, ...string[]]).optional().describe("catalog: one job's measured picks that fit now"),
         model: z.string().min(1).optional(),
         includeVerbose: z
           .boolean()
@@ -267,7 +268,7 @@ export function registerModelsTool(server: McpServer): void {
         includeReadme: z.boolean().optional(),
         query: z.string().min(1).optional(),
         capabilities: z
-          .array(z.string().regex(/^[a-z][a-z-]*$/).describe("ollama.com capability word, e.g. vision, tools, thinking, embedding, audio, decision, cloud"))
+          .array(z.string().regex(/^[a-z][a-z-]*$/).describe("e.g. vision, tools, embedding, cloud"))
           .min(1)
           .max(8)
           .optional(),
@@ -303,7 +304,7 @@ export function registerModelsTool(server: McpServer): void {
           return errorResult(new Error(`view "${selectedView}" does not accept library search fields.`));
         }
         if (selectedView !== "library" && selectedView !== "raw" && [limit, cursor].some((value) => value !== undefined)) {
-          return errorResult(new Error(`view "${selectedView}" accepts neither pagination nor library search fields.`));
+          return errorResult(new Error(`\`limit\` and \`cursor\` apply only to views "library" and "raw", not "${selectedView}".`));
         }
         if (selectedView !== "detail" && includeVerbose !== undefined) {
           return errorResult(new Error('`includeVerbose` is valid only for view "detail".'));
@@ -352,7 +353,7 @@ export function registerModelsTool(server: McpServer): void {
                 },
               };
             });
-            return structuredResult({ ...data, models });
+            return structuredResult({ ...data, models }, { text: residentModelsText({ models }) });
           }
 
           case "detail": {
@@ -382,12 +383,13 @@ export function registerModelsTool(server: McpServer): void {
             const contextEntry = Object.entries(modelInfo).find(
               ([key, value]) => key.endsWith(".context_length") && typeof value === "number",
             );
-            return structuredResult({
+            const detail = {
               ...rest,
               max_context_length: (contextEntry?.[1] as number) ?? null,
               knowledge: modelKnowledge(model, local, library, includeReadme),
               ...(includeVerbose ? { license, modelfile } : {}),
-            });
+            };
+            return structuredResult(detail, { text: modelDetailText(model, detail) });
           }
 
           case "library":
@@ -397,8 +399,9 @@ export function registerModelsTool(server: McpServer): void {
             const result = parsedResult(await listModels(endpoint));
             if (!isStructuredSuccess(result)) return result;
             const data = result.structuredContent as { models?: Array<Record<string, unknown>> };
-            return structuredResult({ ...data, models: await enrichInstalledModels(data.models ?? [], ollamaLibrary, includeLibrary ?? false,
-              async (upstream) => (await ollamaFetch(upstream ?? ollamaEndpoint, "/api/tags") as { models?: Array<Record<string, unknown>> }).models ?? []) });
+            const installed = { ...data, models: await enrichInstalledModels(data.models ?? [], ollamaLibrary, includeLibrary ?? false,
+              async (upstream) => (await ollamaFetch(upstream ?? ollamaEndpoint, "/api/tags") as { models?: Array<Record<string, unknown>> }).models ?? []) };
+            return structuredResult(installed, { text: installedModelsText(installed) });
           }
         }
       } catch (error) {

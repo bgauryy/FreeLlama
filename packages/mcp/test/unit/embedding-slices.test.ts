@@ -11,7 +11,7 @@ vi.mock("../../src/serve-client.js", () => ({
 }));
 
 import { embedInSlices, registerRunTaskTool } from "../../src/tools/run-task.js";
-import { nearest, validateEmbeddingVectors } from "../../src/nearest.js";
+import { validateEmbeddingVectors } from "../../src/nearest.js";
 import { embeddingInputParam } from "../../src/helpers.js";
 
 const live = () => new AbortController().signal;
@@ -198,7 +198,9 @@ describe("cancellation without a progress subscription", () => {
     fixture.run.mockRejectedValue(new Error(JSON.stringify({ error: "full", code: "task_jobs_full" })));
     const result = await fixture.handlers.get("run_task")!({ task: "completion", prompt: "hello" }, { signal: new AbortController().signal });
     expect(result.isError).toBe(true);
-    expect(result.structuredContent).toMatchObject({ code: "cancellable_task_unavailable", execution_outcome: "not_started", retry_safe: true });
+    // Serve's own code and reason reach the caller, so it knows which limit refused the job.
+    expect(result.structuredContent).toMatchObject({ code: "task_jobs_full", execution_outcome: "not_started", retry_safe: true });
+    expect(String(result.structuredContent?.error)).toContain("Serve refused the job before execution: full");
     expect(fixture.run).toHaveBeenCalledTimes(1);
     expect(fixture.run.mock.calls[0]![1].defer).toBe(true);
   });
@@ -279,17 +281,10 @@ describe("cancellation without a progress subscription", () => {
   });
 });
 
-describe("nearest validates embedding geometry", () => {
+describe("embedding vector validation", () => {
   it.each([[[1, 2]], [[1, 2], [1]], [[1, 2], []], [[1, 2], [NaN, 1]], [[1, 2], [Infinity, 1]], [[1, 2], [null, 1]]].map((vectors) => [vectors] as const))(
-    "rejects malformed vectors %j", (vectors) => expect(() => nearest(vectors as number[][], ["a", "b"], {})).toThrow(),
+    "rejects malformed vectors %j", (vectors) => expect(() => validateEmbeddingVectors(vectors, 3)).toThrow(),
   );
-  it("requires the query vector in addition to exactly one vector per label", () => {
-    expect(() => nearest([[1, 0]], ["a"], { query: "q" })).toThrow("cardinality");
-  });
-  it("computes finite cosine scores for extreme finite values", () => {
-    expect(nearest([[1e308, 1e308], [1e308, 1e308]], ["same"], { query: "q" })).toMatchObject({ matches: [{ score: 1 }] });
-    expect(nearest([[1e-300, 0], [-1e-300, 0]], ["opposite"], { query: "q" })).toMatchObject({ matches: [{ score: -1 }] });
-  });
   it("rejects sparse numeric vectors", () => expect(() => validateEmbeddingVectors([new Array(2)], 1)).toThrow("nonnumeric"));
   it("accepts explicit mixed modalities while rejecting unknown embedding fields", () => {
     expect(embeddingInputParam.parse([{ text: "caption", image: "bytes" }, { audio: "wav" }, "plain"])).toHaveLength(3);

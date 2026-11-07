@@ -3,6 +3,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as z from "zod";
 import { DEFAULT_SERVE_ENDPOINT } from "../config.js";
 import { doctor, health, machine, usage, status } from "../native.js";
+import { doctorFullText, statusText, usageText, withText } from "../result-text.js";
 import {
   endpointParam, errorResult, isStructuredSuccess, ollamaEndpointParam, parsedResult, structuredResult,
 } from "../helpers.js";
@@ -47,7 +48,7 @@ export function registerDoctorTool(server: McpServer): void {
   server.registerTool(
     "doctor",
     {
-      description: "Use when: checking whether Ollama/FreeLlama are healthy, reading live queues/limits (view:status) or token usage (view:usage). Do not use when: choosing a model (models). Returns: a short summary; pick a view for detail.",
+      description: "Use when: checking Ollama/FreeLlama health, live queues and limits (view:status) or token usage (view:usage). Do not use when: choosing a model (models). Returns: a short summary; a view gives detail.",
       inputSchema: z.object({
         ollamaEndpoint: ollamaEndpointParam,
         serveEndpoint: endpointParam,
@@ -61,8 +62,8 @@ export function registerDoctorTool(server: McpServer): void {
       try {
         if (days !== undefined && view !== "usage") return errorResult(new Error("days is only valid with view: usage."));
         // Live views come from serve alone; they do not need the Ollama half of the diagnostic.
-        if (view === "status") return parsedResult(await status(serveEndpoint));
-        if (view === "usage") return parsedResult(await usage(serveEndpoint, days));
+        if (view === "status") return withText(parsedResult(await status(serveEndpoint)), statusText);
+        if (view === "usage") return withText(parsedResult(await usage(serveEndpoint, days)), usageText);
         const report = parsedResult(await doctor(ollamaEndpoint));
         if (!isStructuredSuccess(report)) return report;
         // Absorbed the former `machine` tool. Attempted, not required: `doctor` must keep working
@@ -88,14 +89,15 @@ export function registerDoctorTool(server: McpServer): void {
             `freellama serve unreachable: ${error instanceof Error ? error.message : String(error)}`;
         }
         const full = { ...report.structuredContent };
-        if ((view ?? "summary") === "full") return structuredResult(full);
         const running = (full.running as { models?: unknown[] } | undefined)?.models ?? [];
         const { status: overall, problems } = doctorStatus(full);
+        const headline = `Ollama ${String((full.version as Record<string, unknown> | undefined)?.version ?? "unknown")}; ${running.length} resident model(s); ` +
+          (problems.length > 0 ? problems.join("; ") : "freellama serve ready") + ".";
+        if ((view ?? "summary") === "full") return structuredResult(full, { text: doctorFullText(full, headline) });
         const platform = full.platform_health as Fields | undefined;
         const compact = {
           status: overall,
-          summary: `Ollama ${String((full.version as Record<string, unknown> | undefined)?.version ?? "unknown")}; ${running.length} resident model(s); ` +
-            (problems.length > 0 ? problems.join("; ") : "freellama serve ready") + ".",
+          summary: headline,
           ...(problems.length > 0 ? { problems } : {}),
           endpoint: full.endpoint,
           ollama: { endpoint: full.endpoint, version: full.version, resident_model_count: running.length },

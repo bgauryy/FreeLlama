@@ -365,7 +365,7 @@ async fn synchronous_total_deadline_includes_inference_and_releases_permits() {
 async fn deferred_inputs_are_bounded_and_cannot_be_nested_in_batches() {
     let (platform, _, calls, server) = fixture().await;
     let mut large = task();
-    large["prompt"] = json!("x".repeat(1024 * 1024));
+    large["prompt"] = json!("x".repeat(16 * 1024 * 1024));
     let (status, refusal) = request(&platform, "POST", "tasks", large).await;
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{refusal}");
     assert_eq!(refusal["code"], "task_job_input_too_large");

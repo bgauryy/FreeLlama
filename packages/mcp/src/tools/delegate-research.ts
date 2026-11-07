@@ -49,14 +49,14 @@ export function registerDelegateResearchTool(server: McpServer): void {
     "delegate_research",
     {
       description:
-        "Use when: a bounded read-only question about files under workspacePath (where is X, what calls Y) that would take you several searches and reads; " +
-        "a local tool-calling chat model does the searching, so it needs one installed and room to load it. " +
-        "Do not use when: editing, facts outside the workspace or GitHub, final judgment, or a question one search answers; to find files that match a text, run_task embedding with `nearest` is faster. " +
+        "Use when: a read-only question about files under workspacePath (where is X, what calls Y) would take several searches; it needs a local model that calls tools well: tools metadata does not prove it, so take the catalog's research-agent pick. " +
+        "Do not use when: editing, facts outside the workspace (GitHub excepted: adapter:\"github\", which still needs a `workspacePath`), final judgment, or a question one search answers; run_task embedding with `nearest` finds files faster. " +
+        "Up to 8 turns, killed after 180 s by default; no defer (a host that cuts calls near 60 s may drop it). " +
         "Returns: citations/answer; discard verification.recommendation=escalate, otherwise verify citations.",
       inputSchema: z.object({
         question: z.string().min(1),
         workspacePath: z.string().min(1),
-        adapter: z.enum(["bash", "octocode", "github"]).optional().describe("bash (default) or octocode search workspacePath; github searches GitHub repositories and packages instead"),
+        adapter: z.enum(["bash", "octocode", "github"]).optional().describe("bash (default) or octocode search workspacePath; github searches GitHub"),
         model: z.string().min(1).optional(),
         endpoint: endpointParam,
         agent: z
@@ -70,7 +70,7 @@ export function registerDelegateResearchTool(server: McpServer): void {
         receipt: z
           .enum(["compact", "full"])
           .optional()
-          .describe("compact (default): answer, verification, citations; trail and observations at response_file. full: all inline"),
+          .describe("compact (default): trail at response_file; full: inline"),
       }).strict(),
       outputSchema: researchResultSchema,
       annotations: { destructiveHint: false },

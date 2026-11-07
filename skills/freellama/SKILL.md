@@ -5,7 +5,7 @@ description: "Use when delegating token-heavy work to local Ollama models throug
 
 # FreeLlama
 
-Operate FreeLlama as governed local-model delegation, not as a frontier-model replacement. The ten MCP tools and their request shapes are listed in the [MCP reference](https://github.com/bgauryy/FreeLlama/blob/main/packages/mcp/README.md#tools).
+Operate FreeLlama as governed local-model delegation, not as a frontier-model replacement. The eleven MCP tools and their request shapes are listed in the [MCP reference](https://github.com/bgauryy/FreeLlama/blob/main/packages/mcp/README.md#tools).
 
 Flow: `PREREQUISITE → DIAGNOSE → DECIDE → EXECUTE → VERIFY`
 
@@ -15,8 +15,9 @@ Prefer the MCP server when the host has it; the same operations run from a shell
 
 - **MCP:** `claude mcp add freellama -- npx -y @octocodeai/freellama-mcp-server` (other hosts: the same
   `npx` command in their JSON config). It starts `freellama serve` on `127.0.0.1:11435` at launch.
-- **CLI:** `npx -y @octocodeai/freellama <command>`, JSON on stdout. Every command except `doctor`
-  needs a running serve: the MCP server's, or `npx -y @octocodeai/freellama serve` kept running in
+- **CLI:** `npx -y @octocodeai/freellama <command>`, JSON on stdout. `doctor`, `init`, `catalog`, `auth-token`,
+  `serve`, `proxy`, `bench-all` and `policy` need no running serve; the managed commands (models, route, task,
+  jobs, warm, unload, status, usage, session, scope, ready, config, machine) need one: the MCP server's, or `npx -y @octocodeai/freellama serve` kept running in
   the background. `--endpoint` or `FREELLAMA_SERVE_ENDPOINT` selects another one. The CLI has no
   decoding options (`num_predict`, `temperature`); use MCP or the HTTP API when you need them.
 
@@ -47,7 +48,7 @@ A CPU preference cannot move an arbitrary tag, and one managed call contains one
 
 ## Prerequisite and diagnose
 
-1. Call `models{view:"installed"}`, then `models{view:"resident"}`. Call `doctor` when `models` errors or Ollama is unreachable. FreeLlama does not install or replace Ollama; if Ollama is missing or unreachable, direct the operator to `https://ollama.com/download` or `ollama serve`, then stop—do not recommend or pull a model.
+1. Call `models{view:"catalog"}` (tested picks per job, what is installed and fits now), then `models{view:"installed"}` and `models{view:"resident"}`. Call `doctor` when `models` errors or Ollama is unreachable. FreeLlama does not install or replace Ollama; if Ollama is missing or unreachable, direct the operator to `https://ollama.com/download` or `ollama serve`, then stop—do not recommend or pull a model.
 2. When memory fit matters, read `doctor.machine.memory_bytes` (total RAM; `memory_kind` is `unified` only when RAM is shared with the accelerator; on discrete GPUs read VRAM from `/api/ps`, never derive it from RAM). Treat `execution.backend` as configuration and `execution.observation.processor` as physical evidence. A mismatch or partial placement warning invalidates feedback. For authenticated serve, set `FREELLAMA_AUTH_TOKEN_FILE` to the same permission-restricted file used at startup.
 3. Check admission slots with `doctor{view:"status"}` (HTTP clients: `/_freellama/v1/health`). Zero slots means queueing up to the configured wait, not a reservation.
 4. `run_task`, `delegate_research`, installed/resident models and health need `freellama serve` (the MCP server starts it on `127.0.0.1:11435`). `freellama proxy` only retries raw `/api/*` calls; a 404 on a control route means a proxy is answering, not serve.
@@ -71,11 +72,11 @@ qualified installed model; never infer inventory from a model family name or thi
 
 Call `delegate_research{question,workspacePath,model?,adapter?,agent?}` with one narrow lookup over 1–5 source files. It needs `serve`: every model turn is a managed `coding` task with admission and physical-placement receipts. Keep the path inside `FREELLAMA_MCP_ALLOWED_ROOTS`; never widen it to `$HOME` or `/` for convenience. Bash is the measured default adapter, Octocode is opt-in for structural/LSP search. Read `verification`, successful call counts and full `citations[]` inline; `contextManagement`, `execution.receipts`, the evidence trail and every observation the model saw are in `response_file` (read one with `read_response{file,section}`, or pass `receipt:"full"`). Failed calls do not ground a claim. Retry `isError` once, then do the work yourself.
 
-Context: the adapter budget is `contextTokens - outputTokens - safetyMarginTokens`. Older observations compact first and full tool output stays retrievable through pages. Tokens are estimated from the model's own bytes-per-token ratio that FreeLlama learns from Ollama's real counts (`token_counting:"platform_learned_ratio"`, `bytes_per_token_milli`); until a model has been measured the estimate falls back to `charsPerToken` with local calibration (`"local_chars_per_token"`). Either way it is an estimate, not an exact count. Keep `pinnedOverflow:"error"` (system prompt and question are byte-preserved); `"clip"` needs explicit human acceptance, and raising `contextTokens` or narrowing the task is safer. Tune per call with `agent`, deployment defaults with `FREELLAMA_AGENT_*`; confinement and read-only actions are not knobs.
+Context: the adapter budget is `contextTokens - outputTokens - safetyMarginTokens`. Older observations compact first and full tool output stays retrievable through pages. Tokens are estimated from the model's own bytes-per-token ratio that FreeLlama learns from Ollama's real counts (`token_counting:"platform_learned_ratio"`, `bytes_per_token_milli`); until a model has been measured the estimate falls back to `charsPerToken` with local calibration (`"local_chars_per_token"`). Either way it is an estimate, not an exact count. Keep `FREELLAMA_AGENT_PINNED_OVERFLOW` unset (error; system prompt and question are byte-preserved); `clip` is an operator env choice, never a call argument, and raising `contextTokens` or narrowing the task is safer. Tune per call with `agent`, deployment defaults with `FREELLAMA_AGENT_*`; confinement and read-only actions are not knobs.
 
 ### B — supplied content or vision
 
-Preview with `run_task{preview:true,task?,model?,executionPreference?,minPlacementEvidence?,minConfidence?}` and routing constraints only. Execute separately with `prompt` or `messages`, plus applicable runtime controls. `run_task` has no file access; `minConfidence` gates quality evidence. `minPlacementEvidence:"observed"` refuses cold, mixed, or mismatched processor placement. Warm once with `"configured"`, inspect the receipt, then require `"observed"`. Images are base64 without a data-URI prefix and need an explicit trialled vision `model` or an operator `[policies.vision]` model; a capability tag alone is refused, and vision claims need a real image trial. If `output_check.repetition_loop` appears, the model looped: the answer text shows one copy, treat it as low confidence. For a model known to loop, set `stopOnRepetition:true` to stop as soon as the output repeats (all generated text is kept, `output_check.stopped_early:true`); routing also ranks a model last for task kinds it keeps looping on. Choose output limits and stop sequences from the tested output contract.
+Preview with `run_task{preview:true,task?,model?,executionPreference?,minPlacementEvidence?,minConfidence?}` and routing constraints only. Execute separately with `prompt` or `messages`, plus applicable runtime controls. `run_task` reads local files only through `files` (under the server cwd, temp dir or `FREELLAMA_FILE_ROOTS`); `minConfidence` gates quality evidence. `minPlacementEvidence:"observed"` refuses cold, mixed, or mismatched processor placement. Warm once with `"configured"`, inspect the receipt, then require `"observed"`. Images are base64 without a data-URI prefix and need an explicit trialled vision `model` or an operator `[policies.vision]` model; a capability tag alone is refused, and vision claims need a real image trial. If `output_check.repetition_loop` appears, the model looped: the answer text shows one copy, treat it as low confidence. For a model known to loop, set `stopOnRepetition:true` to stop as soon as the output repeats (all generated text is kept, `output_check.stopped_early:true`); routing also ranks a model last for task kinds it keeps looping on. Choose output limits and stop sequences from the tested output contract.
 
 ### C — embeddings
 

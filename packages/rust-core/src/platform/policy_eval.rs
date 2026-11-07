@@ -55,7 +55,7 @@ pub fn parse_task_kind(value: &str) -> Result<TaskKind, String> {
                 .map(|kind| kind.as_str())
                 .collect();
             format!(
-                "unknown task {}; choose one of {}",
+                "unknown task {}; choose one of {} (`-` and `_` are interchangeable: code-repair = code_repair)",
                 python_repr_str(value),
                 names.join(", ")
             )
@@ -585,7 +585,7 @@ mod tests {
         assert_eq!(parse_task_kind("long_context"), Ok(TaskKind::LongContext));
         assert_eq!(
             parse_task_kind("poetry").unwrap_err(),
-            "unknown task 'poetry'; choose one of completion, coding, code_repair, tools, browser, vision, embedding, long_context, decision"
+            "unknown task 'poetry'; choose one of completion, coding, code_repair, tools, browser, vision, embedding, long_context, decision (`-` and `_` are interchangeable: code-repair = code_repair)"
         );
     }
 

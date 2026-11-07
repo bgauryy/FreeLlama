@@ -2,7 +2,7 @@
 
 FreeLlama helps agents offload bounded work to local models through Ollama. The calling agent owns
 the task and verifies the answer; FreeLlama manages model selection and resources around execution.
-Start with the [repository MCP setup](https://github.com/bgauryy/FreeLlama/blob/main/README.md#mcp-server) to run one managed task.
+Start with the [repository README](https://github.com/bgauryy/FreeLlama/blob/main/README.md#install) to install and run one managed task.
 
 ## Choose a guide
 
@@ -15,6 +15,11 @@ Start with the [repository MCP setup](https://github.com/bgauryy/FreeLlama/blob/
 | Follow a recipe for one job | [Cookbooks](cookbooks/README.md) |
 | Teach an agent the Octocode CLI in under 30 lines | [Local tools](octocode/LOCAL.md), [GitHub tools](octocode/GITHUB.md) |
 | Understand task and resource ownership | [Architecture](ARCHITECTURE.md) |
+| See every feature, routing and admission in depth, and why FreeLlama exists | [Features](FEATURES.md) |
+| Compare FreeLlama with Ollama, llama.cpp, llama-swap and LocalAI | [Comparison](COMPARISON.md) |
+| See supported model forms and dated measured results | [Model forms and results](MODEL_FORMS_AND_RESULTS.md) |
+| Reduce reloads, prompt cost and memory; tune Ollama settings | [Tuning](TUNING.md) |
+| Build from source; read operating notes (response store, port 11435, certificates) | [Build and notes](BUILD_AND_NOTES.md) |
 | Choose a model and interpret its metadata | [Model selection](MODEL_SELECTION.md), [model metadata](MODEL_SELECTION.md#model-metadata) |
 | Inspect quantization, placement, or neuron activations | [Model introspection](MODEL_INTROSPECTION.md) |
 | Configure CPU helpers alongside GPU work | [CPU/GPU routing](CPU_GPU_ROUTING.md) |

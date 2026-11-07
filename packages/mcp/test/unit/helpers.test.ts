@@ -5,6 +5,9 @@ import {
   costTelemetry,
   errorResult,
   parsedResult,
+  jobsText,
+  lifecycleText,
+  RESULT_TEXT_LIMIT,
   structuredResult,
   taskAnswerText,
   batchAnswerText,
@@ -189,10 +192,64 @@ describe("summarizeOllamaPullStream", () => {
 });
 
 describe("result shapes", () => {
-  it("structuredResult keeps the object canonical and emits a compact text cue", () => {
-    const result = structuredResult({ hello: "world" });
-    expect(result.structuredContent).toEqual({ hello: "world" });
-    expect(result.content[0].text).toBe("Structured result available (hello).");
+  it("structuredResult keeps the object canonical and mirrors it as compact JSON text", () => {
+    const result = structuredResult({ hello: "world", n: [1, 2] });
+    expect(result.structuredContent).toEqual({ hello: "world", n: [1, 2] });
+    expect(result.content[0].text).toBe('{"hello":"world","n":[1,2]}');
+  });
+
+  it("structuredResult keeps an explicit summary as the text", () => {
+    expect(structuredResult({ summary: " Done. ", x: 1 }).content[0].text).toBe("Done.");
+  });
+
+  it("structuredResult caps the JSON text and points at structuredContent", () => {
+    const big = { blob: "x".repeat(RESULT_TEXT_LIMIT * 2) };
+    const { content, structuredContent } = structuredResult(big);
+    expect(structuredContent).toEqual(big);
+    expect(content[0].text.startsWith('{"blob":"xxx')).toBe(true);
+    expect(content[0].text).toMatch(/JSON truncated at 4000 of \d+ characters.*structuredContent/s);
+    expect(content[0].text.length).toBeLessThan(RESULT_TEXT_LIMIT + 400);
+  });
+
+  const diagnostics = { blob: "x".repeat(20_000), nested: { more: "y".repeat(5_000) } };
+  const finishedJob = (result: Record<string, unknown>) => ({ job: { id: "29953a64-0000-4000-8000-000000000000", status: "completed", task: "completion",
+    selected_model: "lfm3:1.7b", reason: "completed", result: { route: { selected_model: "lfm3:1.7b" }, execution: diagnostics, ...result } } });
+
+  it("a deferred job get shows its answer in the text, ahead of any diagnostics", () => {
+    const text = jobsText(finishedJob({ response: { message: { role: "assistant", content: "The answer is 42." } } }))!;
+    expect(text.split("\n")[0]).toBe("29953a64-0000-4000-8000-000000000000  completion  lfm3:1.7b  completed");
+    expect(text).toContain("The answer is 42.");
+    expect(text.length).toBeLessThan(500);
+  });
+
+  it("a job get shows a nearest ranking, decision answers, or the error", () => {
+    const ranked = jobsText(finishedJob({ response: { embeddings_omitted: { count: 3 } },
+      nearest: { mode: "query", matches: [{ index: 1, label: "b", score: 0.9 }, { index: 0, label: "a", score: 0.5 }] } }))!;
+    expect(ranked).toContain("0.900  b\n0.500  a");
+    const decided = jobsText(finishedJob({ response: { answers: { kind: { type: "choice", choice: "bug", probabilities: { bug: 0.97 } } } } }))!;
+    expect(decided).toContain("kind: bug (p 0.97");
+    const failed = jobsText({ job: { id: "j", status: "failed", task: "completion", error: { error: "model not found", code: "x" } } })!;
+    expect(failed).toContain("error: model not found [x]");
+  });
+
+  it("a job list is one line per job", () => {
+    const text = jobsText({ jobs: [
+      { id: "a", task: "completion", selected_model: "m:1", status: "running", reason: "generating" },
+      { id: "b", task: "embedding", requested_model: "e:1", status: "queued", reason: "discovering_model" },
+    ] })!;
+    expect(text).toBe("a  completion  m:1  running (generating)\nb  embedding  e:1  queued (discovering_model)");
+    expect(jobsText({ jobs: [] })).toBe("no jobs");
+  });
+
+  it("warm and unload are one short line; a deferred warm names its job", () => {
+    const warm = lifecycleText("warm", "lfm3:1.7b", { route: { selected_model: "lfm3:1.7b" }, execution: { ...diagnostics, keep_alive: "5m" },
+      warm: { loaded: true }, metrics: { load_duration_ns: 8.9e9 }, admission: { total_wait_ms: 12 } })!;
+    expect(warm).toBe("lfm3:1.7b: resident, keep_alive 5m, load 8.9 s, waited 12 ms");
+    expect(warm.length).toBeLessThan(500);
+    const adaptive = lifecycleText("warm", "m:1", { execution: { keep_alive: { mode: "adaptive", value: "31s", bounds: { max_seconds: 900 }, pressure_reasons: ["x"] } }, warm: { loaded: true } })!;
+    expect(adaptive).toBe("m:1: resident, keep_alive 31s (adaptive)");
+    expect(lifecycleText("unload", "m:1", { model: "m:1", unloaded: true, via: "freellama_serve", unload_ms: 40 })).toBe("m:1: unloaded, via freellama_serve, 40 ms");
+    expect(lifecycleText("warm", "m:1", { deferred: true, job: { id: "j", status: "queued", task: "completion" } })).toContain("deferred: j  completion");
   });
 
   it("parsedResult parses upstream JSON once", () => {

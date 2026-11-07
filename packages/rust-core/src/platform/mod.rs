@@ -66,7 +66,8 @@ pub use config::PlatformConfig;
 use config::{platform_task_timeout, report_admission_budgets};
 use feedback::{
     FEEDBACK_SCHEMA_VERSION, MIN_FEEDBACK_IMPROVEMENT_PERCENT, MIN_FEEDBACK_SAMPLES,
-    PlacementFeedback, PlacementSignals, desired_placement, load_feedback, persist_feedback,
+    PlacementFeedback, PlacementSignals, desired_placement, load_feedback_or_empty,
+    persist_feedback,
 };
 use sessions::{
     create_session, delete_session, kill_session, require_active_session, with_session_cancellation,
@@ -285,12 +286,10 @@ fn build(config: &PlatformConfig) -> Result<(Router, PlatformState)> {
         tunables.raw_max_concurrent_requests,
         tunables.raw_queue_wait(),
     );
-    let feedback = config
+    let (feedback, feedback_load_warning) = config
         .store
         .as_ref()
-        .map(load_feedback)
-        .transpose()?
-        .unwrap_or_default();
+        .map_or_else(Default::default, load_feedback_or_empty);
     let state = PlatformState {
         resources: config.resource_governor.clone(),
         footprints: Arc::new(Mutex::new({
@@ -341,7 +340,7 @@ fn build(config: &PlatformConfig) -> Result<(Router, PlatformState)> {
         ),
         feedback: Arc::new(RwLock::new(feedback)),
         store: config.store.clone(),
-        feedback_persistence_error: Arc::new(RwLock::new(None)),
+        feedback_persistence_error: Arc::new(RwLock::new(feedback_load_warning)),
         auth_required: config.authenticates(),
         clients: Arc::from(config.client_keys.clone()),
         remote_access: config.allow_remote,

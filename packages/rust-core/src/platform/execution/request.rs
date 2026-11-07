@@ -307,6 +307,11 @@ pub(crate) fn require_payload(input: &TaskInput) -> Result<(), ApiError> {
             "task requires messages, or a prompt with text or images; use warm to load a model without generating"
         )));
     }
+    if matches!(input.route.task, TaskKind::Vision) && !task_has_images(input) {
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "vision task requires an image (CLI: --image <file>; request: `images`); use a completion task for text only"
+        )));
+    }
     Ok(())
 }
 

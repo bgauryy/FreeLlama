@@ -32,7 +32,8 @@ npx @octocodeai/freellama auth-token --out ~/.octocode/freellama/auth.token
 npx @octocodeai/freellama serve --auth-token-file ~/.octocode/freellama/auth.token
 ```
 
-`doctor` works without the control plane. It reports Ollama reachability, CLI/server version drift,
+`doctor`, `init`, `catalog` and `auth-token` work without the control plane (`catalog` then omits
+what is installed). `doctor` reports Ollama reachability, CLI/server version drift,
 portable host hardware and disk discovery, effective settings, a non-mutating
 `local_conservative_config_posture`, and source/permission-aware runtime signals. `memory_bytes`
 is total host RAM; `memory_kind` is `unified` only when the memory is known to be shared with
