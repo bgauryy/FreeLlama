@@ -47,8 +47,11 @@ function fixture() {
   put("cargo-metadata.json", JSON.stringify(metadata));
   return {
     directory, put, metadata,
-    run(env = {}) {  // FREELLAMA_RELEASE_COMMIT replaces git: the fixture is not a repository.
-     env = { FREELLAMA_RELEASE_COMMIT: commit, ...env }; return spawnSync(process.execPath, [path.join(repo, "scripts/verify-release-packages.mjs")], { cwd: directory, encoding: "utf8", env: { ...process.env, PATH: `${toolDirectory}${path.delimiter}${process.env.PATH}`, FREELLAMA_REQUIRE_ALL_PLATFORMS: "1", ...env } }); },
+    // FREELLAMA_RELEASE_COMMIT replaces git: the fixture is not a repository. The scratch directory
+    // sits inside this checkout, so GIT_CEILING_DIRECTORIES keeps git from finding the real one and
+    // making results depend on whether the developer's tree is clean.
+    run(env = {}) {
+     env = { FREELLAMA_RELEASE_COMMIT: commit, ...env }; return spawnSync(process.execPath, [path.join(repo, "scripts/verify-release-packages.mjs")], { cwd: directory, encoding: "utf8", env: { ...process.env, PATH: `${toolDirectory}${path.delimiter}${process.env.PATH}`, GIT_CEILING_DIRECTORIES: scratch, FREELLAMA_REQUIRE_ALL_PLATFORMS: "1", ...env } }); },
     cleanup() { rmSync(directory, { recursive: true, force: true }); },
   };
 }
