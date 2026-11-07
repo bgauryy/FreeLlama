@@ -6,8 +6,9 @@
 //! learns it: every switch from one model to another within `follow_window_seconds` is counted
 //! in the shared database, and once a model's successor is clear (`min_probability` of at least
 //! `min_observations` switches), finishing work on it loads that successor in the background.
-//! A guess never costs anyone else: a predicted load only runs when it fits without unloading
-//! anything, the host is under no pressure, and nothing else is waiting for the backend.
+//! Predicted loads never queue or request eviction: managed execution atomically claims idle
+//! capacity and rechecks memory before forwarding. Loading still consumes host resources, so a
+//! later foreground arrival can overlap an already-started engine load.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -17,7 +18,13 @@ use axum::{Json, extract::State};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{Backend, PlatformState, TaskPriority, audit, catalog, execution, warming};
+use super::{
+    ApiError, Backend, PlatformState, TaskInput, TaskPriority, audit, catalog, execution, warming,
+};
+
+#[cfg(test)]
+#[path = "preload_tests.rs"]
+mod lifecycle_tests;
 
 const NEXT_PREFIX: &str = "next:";
 
@@ -122,6 +129,24 @@ pub(crate) struct Preloader {
     started: Arc<Mutex<Vec<PreloadModel>>>,
 }
 
+/// Releasing this guard, including cancellation or panic, allows another prediction.
+struct PredictionLease(Arc<AtomicBool>);
+
+impl Drop for PredictionLease {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+impl Preloader {
+    fn try_prediction(&self) -> Option<PredictionLease> {
+        self.predicting
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| PredictionLease(Arc::clone(&self.predicting)))
+    }
+}
+
 /// The successor of `model` when the switches seen so far make it clear.
 pub(super) fn predicted_next(
     facts: &[(String, u64)],
@@ -168,21 +193,21 @@ pub(super) fn served(state: &PlatformState, backend: &str, model: &str) {
     else {
         return;
     };
-    if state.preload.predicting.swap(true, Ordering::AcqRel) {
+    let Some(prediction) = state.preload.try_prediction() else {
         return;
-    }
+    };
     let state = state.clone();
     let after = model.to_owned();
     tokio::spawn(async move {
+        let _prediction = prediction;
         let outcome = predicted_load(&state, &next).await;
-        state.preload.predicting.store(false, Ordering::Release);
         if let Some(outcome) = outcome {
             record(&state, &next, "predicted", &after, outcome);
         }
     });
 }
 
-/// Load `model` when that costs nobody anything; `None` when it was skipped.
+/// Skip a prediction when useful work or resource limits prevent an immediate load.
 async fn predicted_load(state: &PlatformState, model: &str) -> Option<Result<u64, String>> {
     if state.cpu_models.contains(model) {
         return None;
@@ -198,19 +223,15 @@ async fn predicted_load(state: &PlatformState, model: &str) -> Option<Result<u64
     {
         return None;
     }
-    Some(
-        warm(
-            state,
-            PreloadSpec {
-                model: model.to_owned(),
-                context_tokens: None,
-                keep_alive: None,
-                messages: None,
-            },
-            false,
-        )
-        .await,
-    )
+    let input = match warming::predicted_task(model.to_owned()) {
+        Ok(input) => input,
+        Err(error) => return Some(Err(error.body.error)),
+    };
+    match run_warm(state, input).await {
+        Ok(ms) => Some(Ok(ms)),
+        Err(error) if error.is_opportunistic_warm_skip() => None,
+        Err(error) => Some(Err(error.body.error)),
+    }
 }
 
 /// Load the startup list once the server is up, then again for entries a reloaded runtime file
@@ -259,7 +280,7 @@ pub(super) fn start(state: &PlatformState) {
         }
         for entry in pending {
             let model = entry.model().to_owned();
-            let outcome = warm(&state, entry.spec(), true).await;
+            let outcome = warm(&state, entry.spec()).await;
             match &outcome {
                 Ok(ms) => eprintln!("preloaded {model} in {ms} ms"),
                 Err(error) => eprintln!("preload of {model} failed: {error}"),
@@ -269,11 +290,10 @@ pub(super) fn start(state: &PlatformState) {
     });
 }
 
-async fn warm(state: &PlatformState, spec: PreloadSpec, startup: bool) -> Result<u64, String> {
-    let started = Instant::now();
+async fn warm(state: &PlatformState, spec: PreloadSpec) -> Result<u64, String> {
     let keep_alive = spec
         .keep_alive
-        .or_else(|| startup.then(|| format!("{}s", state.tunables().warming.max_seconds)));
+        .or_else(|| Some(format!("{}s", state.tunables().warming.max_seconds)));
     let input = warming::preload_task(
         spec.model,
         spec.context_tokens,
@@ -282,10 +302,16 @@ async fn warm(state: &PlatformState, spec: PreloadSpec, startup: bool) -> Result
         TaskPriority::Background,
     )
     .map_err(|error| error.body.error)?;
+    run_warm(state, input)
+        .await
+        .map_err(|error| error.body.error)
+}
+
+async fn run_warm(state: &PlatformState, input: TaskInput) -> Result<u64, ApiError> {
+    let started = Instant::now();
     execution::execute_task(State(state.clone()), Json(input))
         .await
         .map(|_| u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX))
-        .map_err(|error| error.body.error)
 }
 
 fn record(
@@ -323,6 +349,23 @@ mod tests {
             .iter()
             .map(|(name, count)| ((*name).to_owned(), *count))
             .collect()
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_prediction_releases_its_single_flight_guard() {
+        let preloader = Preloader::default();
+        let prediction = preloader.try_prediction().unwrap();
+        assert!(preloader.try_prediction().is_none());
+        let (started, observed) = tokio::sync::oneshot::channel();
+        let worker = tokio::spawn(async move {
+            let _prediction = prediction;
+            let _ = started.send(());
+            std::future::pending::<()>().await;
+        });
+        observed.await.unwrap();
+        worker.abort();
+        assert!(worker.await.unwrap_err().is_cancelled());
+        assert!(preloader.try_prediction().is_some());
     }
 
     #[test]

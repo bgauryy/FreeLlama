@@ -59,6 +59,44 @@ describe("tool timing", () => {
     expect((preview.structuredContent as Record<string, any>).route.rejected).toEqual([{ model: "n" }]);
   });
 
+  it.each([false, true])("keeps routing reasons and completion totals compact (batch=%s)", async (batch) => {
+    const root = await mkdtemp(path.join(tmpdir(), "responses-"));
+    const store = new ResponseStore(root, 1024 * 1024);
+    const planning = {
+      mode: "qualified_resident_idle", applied: false, snapshot_only: true,
+      candidates: [
+        { model: "gpu", backend: "gpu", status: "qualified_resident_idle_estimate", estimated_completion_ns: 0,
+          profile_id: "gpu-profile", queue_ns: 0, prefill_ns: 0, decode_ns: 0 },
+        { model: "cpu", backend: "cpu", status: "insufficient_phase_history", estimated_completion_ns: null,
+          profile_id: null, queue_ns: null, prefill_ns: null, decode_ns: null },
+      ],
+      payload_fit_rejections: [{ model: "small", reason: "execution_payload_context_does_not_fit" }],
+      minimum_improvement_percent: 10, limitations: "full detail", fallback: "existing policy",
+    };
+    const receipt = {
+      selected_model: "gpu", response: { message: { content: "answer" } },
+      execution: { backend: "gpu", reason: "existing_policy", completion_planning: planning },
+    };
+    const payload = batch ? { results: [{ id: "item-1", ok: true, response: receipt }] } : receipt;
+    const result = await finishResult("run_task", {}, { structuredContent: payload }, 1, "t", store);
+    const content = result.structuredContent as Record<string, any>;
+    const inline = batch ? content.results[0].response : content;
+    expect(inline.execution).toEqual({
+      backend: "gpu", reason: "existing_policy",
+      completion_planning: {
+        mode: "qualified_resident_idle", applied: false, snapshot_only: true,
+        candidates: [
+          { model: "gpu", backend: "gpu", status: "qualified_resident_idle_estimate", estimated_completion_ns: 0 },
+          { model: "cpu", backend: "cpu", status: "insufficient_phase_history", estimated_completion_ns: null },
+        ],
+        payload_fit_rejections: planning.payload_fit_rejections,
+      },
+    });
+    const saved = JSON.parse(await readFile(content.response_file, "utf8")).result.structuredContent;
+    const fullReceipt = batch ? saved.results[0].response : saved;
+    expect(fullReceipt.execution.completion_planning).toEqual(planning);
+  });
+
   it("indexes once when saves race and counts files other sessions wrote", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "responses-"));
     const other = new ResponseStore(root, 10_000, new Date(0));
@@ -174,15 +212,21 @@ describe("smart responses", () => {
 
   it("saves embedding vectors and omits them only from the inline view", async () => {
     const vectors = [Array.from({ length: 16 }, (_, index) => index / 16)];
-    const receipt = { selected_model: "e", route: { selected_model: "e" }, response: { model: "e", embeddings: vectors } };
+    const embeddingIdentity = { model_digest: "sha256:exact", backend: "cpu", upstream: "http://cpu", dimensions: 16, status: "verified" };
+    const receipt = { selected_model: "e", route: { selected_model: "e" }, response: { model: "e", embeddings: vectors },
+      embedding_identity: embeddingIdentity, accepted_job_ids: ["job-one"], embedding_slices: [{ metrics: { prompt_tokens: 3 } }] };
     const result = await finishResult("run_task", { input: "x" }, { structuredContent: receipt }, 1, "t", await store());
     const content = result.structuredContent as Record<string, any>;
     expect(content.response.embeddings).toBeUndefined();
     expect(content.response.embeddings_omitted).toMatchObject({ count: 1, dimensions: 16 });
     expect(content.response.embeddings_omitted.note).toContain("read_response");
     expect(content.sections).toEqual(["receipt", "embeddings"]);
+    expect(content.embedding_identity).toEqual(embeddingIdentity);
+    expect(content.accepted_job_ids).toEqual(["job-one"]);
+    expect(content.embedding_slices).toBeUndefined();
     const savedRecord = JSON.parse(await readFile(content.response_file, "utf8"));
     expect(savedRecord.result.structuredContent.response.embeddings).toEqual(vectors);
+    expect(savedRecord.result.structuredContent.embedding_slices).toEqual(receipt.embedding_slices);
     const returned = await finishResult("run_task", { input: "x", returnEmbeddings: true }, { structuredContent: receipt }, 1, "t", await store());
     expect((returned.structuredContent as Record<string, any>).response.embeddings).toEqual(vectors);
   });

@@ -148,7 +148,7 @@ over the cap waits up to `--raw-queue-wait-seconds` (default 10) and is then ref
 All of these, plus pinned models, idle eviction, adaptive concurrency, the circuit breaker, and
 context sizing, can also live in a runtime file (`--runtime-config`) that `serve` re-reads when it
 changes. See [Monitoring and live tuning](MONITORING.md). The standalone
-`proxy` command keeps its cap opt-in for compatibility.
+`proxy` command leaves its cap off unless set.
 
 The local host-pressure gate reports low available RAM below 15% and clears it above 20% after two
 healthy samples; minimum reserves are 1 GiB and 2 GiB, respectively. Tune the percentages with
@@ -255,6 +255,10 @@ npx @octocodeai/freellama task --task completion --objective fastest "Reply with
 npx @octocodeai/freellama task --task coding --min-confidence medium "Explain this patch."
 ```
 
+`freellama catalog [--job JOB]` prints the shipped model picks for each job, with their evidence, what
+is installed and what fits now. Without a running `serve`, `installed` and `fits_now` stay null. Recipes
+are in the [cookbooks](cookbooks/README.md).
+
 Useful task options include:
 
 - `--model` for an exact installed model.
@@ -264,7 +268,9 @@ Useful task options include:
 - `--context-tokens` for the complete input and output context window (`num_ctx`).
 - repeatable `--required-capability` constraints.
 - repeatable `--image` paths for vision tasks.
-- `--input-file` reads the input from a file: one item per line for `--task embedding` (batched in one request), otherwise the whole file is the prompt.
+- `--input-file` reads the input from a file: one item per line for `--task embedding` (batched in one request), the state for `--task decision` (JSON stays JSON), otherwise the whole file is the prompt.
+- `--nearest QUERY [--top N]` for `--task embedding --input-file FILE`: ranks the file's lines against the query and prints the closest (line number, score, text) instead of vectors; use the model's own prefixes, such as `search_query: ` for nomic.
+- `--questions JSON|@FILE` for `--task decision`: named `noul`, `choice` or `score` questions answered by a decision model through `/v1/systemone`, for example `freellama task --task decision --questions '{"kind":{"type":"choice","instructions":"Which kind?","criteria":{"bug":"Broken","feature":"New"}}}' "Checkout returns 500 since 9am."`.
 - `--min-confidence low|medium` to refuse insufficiently evidenced routes before generation.
 - `--priority interactive|normal|background` for fair admission scheduling.
 - `--max-wait-seconds` for a shorter admission/resource wait budget.

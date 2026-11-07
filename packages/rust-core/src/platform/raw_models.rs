@@ -22,13 +22,58 @@ impl RawModelHooks for RawModels {
         Box::new(self.0.activity.begin(Backend::Gpu.as_str(), model))
     }
 
-    fn served(&self, model: &str, _loaded: bool) {
+    fn ready<'a>(&'a self, model: &'a str) -> HookFuture<'a> {
+        Box::pin(self.0.activity.ready(Backend::Gpu.as_str(), model))
+    }
+
+    fn acquire_unload<'a>(&'a self, model: &'a str) -> crate::proxy::LeaseFuture<'a> {
+        Box::pin(async move {
+            Box::new(
+                self.0
+                    .activity
+                    .evict_when_idle(Backend::Gpu.as_str(), model)
+                    .await,
+            ) as Box<dyn Send>
+        })
+    }
+
+    fn forecast<'a>(
+        &'a self,
+        model: &'a str,
+        context: Option<u64>,
+    ) -> crate::proxy::ForecastFuture<'a> {
+        Box::pin(async move {
+            let model = catalog::primary_model(&self.0, model).await?;
+            let context = match context {
+                Some(context) => context,
+                None => super::monitor::ollama_default_context(&self.0, Some(&model), Backend::Gpu)
+                    .await
+                    .map_or(0, |(tokens, _)| tokens),
+            };
+            let target = execution::primary_target(&self.0);
+            // This hook is called only for a load; unreported raw runtime controls cannot
+            // justify resident reuse, even if /api/ps happens to list the same name/context.
+            let footprint =
+                execution::cold_model_memory_requirement(&self.0, &target, &model, context).await;
+            Some(crate::proxy::RawForecast {
+                required_host_bytes: footprint["required_available_bytes"].as_u64()?,
+                context_tokens: (context > 0).then_some(context),
+                digest: model.digest.clone(),
+            })
+        })
+    }
+
+    fn served(&self, model: &str, _reuse_unverified: bool) {
         self.0.activity.completed(Backend::Gpu.as_str(), model, 0);
         super::preload::served(&self.0, Backend::Gpu.as_str(), model);
     }
 
+    fn runner_ready(&self) {
+        self.0.activity.runner_ready();
+    }
+
     /// The response streamed through untouched; its final counts, read on the way, become a
-    /// usage-ledger row, and a load it caused is audited with the time Ollama reported for it.
+    /// usage-ledger row. Ollama's timer is retained as reported timing, not physical-load proof.
     fn finished(&self, finished: crate::proxy::RawFinished<'_>) {
         let state = &self.0;
         let backend = finished.backend;
@@ -38,16 +83,18 @@ impl RawModelHooks for RawModels {
             .load_duration_ns
             .filter(|_| ollama)
             .map(|ns| ns / 1_000_000);
-        if let Some(load_ms) = load_ms {
-            state.activity.learn_load(backend, finished.model, load_ms);
-        }
-        if ollama && finished.loaded {
+        // `loaded` means initial reuse was not verified: absence, incompatibility, or unknown
+        // identity can all produce it. A quick raw response may finish before the watcher sees
+        // a compatible runner. Preserve reported timers but never promote them to reload-cost
+        // evidence without independently verified before/after identity.
+        let completed = finished.outcome == crate::proxy::RawOutcome::Complete;
+        if completed && ollama && finished.reuse_unverified {
             state.audit.record(&audit::Entry {
                 backend,
                 model: finished.model,
-                event: "load",
-                trigger: "raw_request",
-                duration_ms: load_ms.filter(|ms| super::residency::was_a_load(*ms)),
+                event: "load_reported",
+                trigger: "raw_transition_unverified",
+                duration_ms: load_ms.filter(|ms| *ms > 0),
                 bytes: None,
             });
         }
@@ -58,8 +105,14 @@ impl RawModelHooks for RawModels {
             backend: backend.to_owned(),
             task: "raw".into(),
             priority: finished.path.to_owned(),
-            outcome: "ok".into(),
-            status: 200,
+            outcome: match finished.outcome {
+                crate::proxy::RawOutcome::Complete => "ok",
+                crate::proxy::RawOutcome::UpstreamError => "upstream_error",
+                crate::proxy::RawOutcome::Incomplete => "incomplete",
+                crate::proxy::RawOutcome::ClientDropped => "client_dropped",
+            }
+            .into(),
+            status: if completed { 200 } else { 0 },
             prompt_tokens: finished.usage.prompt_tokens.unwrap_or(0),
             output_tokens,
             duration_ms: finished.elapsed_ms,
@@ -71,19 +124,31 @@ impl RawModelHooks for RawModels {
         });
     }
 
-    fn unloaded(&self, model: &str) {
+    fn unload_accepted(&self, model: &str) {
+        self.0.audit.record(&audit::Entry {
+            backend: Backend::Gpu.as_str(),
+            model,
+            // Byte-preserving raw forwarding observes HTTP acceptance, not runner absence.
+            event: "unload_requested",
+            trigger: "raw_caller_unload_accepted",
+            duration_ms: None,
+            bytes: None,
+        });
+    }
+
+    fn unload_confirmed(&self, model: &str) {
         self.0.audit.record(&audit::Entry {
             backend: Backend::Gpu.as_str(),
             model,
             event: "unload",
-            trigger: "caller_unload",
+            trigger: "raw_caller_unload_observed",
             duration_ms: None,
             bytes: None,
         });
     }
 }
 
-/// Size a raw load and run the same room-making steps as a managed load (GPU fit, memory budget,
+/// Size a raw load and run the same room-making steps as a managed load (memory budget,
 /// host pressure). The whole preparation is bounded by [`ROOM_WAIT`]: it runs while the request
 /// holds the backend's transition lock, so a slow backend must not stall managed work behind it.
 /// A model the primary backend does not list is forwarded unchanged: Ollama reports the error.
@@ -95,9 +160,6 @@ async fn make_room(state: &PlatformState, model: &str, context: Option<u64>) {
     let prepared = tokio::time::timeout_at(deadline, async {
         let target = execution::primary_target(state);
         let model = catalog::primary_model(state, model).await?;
-        if !may_need_room(state, &target, &model).await {
-            return Some(());
-        }
         // Without an explicit `num_ctx`, Ollama loads at its own default context; size for that.
         let context = match context {
             Some(context) => context,
@@ -121,10 +183,8 @@ async fn make_room(state: &PlatformState, model: &str, context: Option<u64>) {
     }
 }
 
-/// A cheap check before sizing a raw load properly: is room plausibly needed? Yes while the host
-/// holds for pressure; on a discrete GPU when the model file alone exceeds free VRAM; where models
-/// share host memory, when the file plus the usual margins would leave less than the host reserve
-/// or pass the memory budget.
+/// A cheap early refusal for speculative preload; final admission still sizes the full context.
+/// A negative result cannot prove a foreground load fits: KV memory can exceed file-only margins.
 pub(super) async fn may_need_room(
     state: &PlatformState,
     target: &execution::ExecutionTarget,
@@ -135,12 +195,6 @@ pub(super) async fn may_need_room(
         return true;
     }
     let estimate = footprint::file_only_estimate(model.size);
-    if !execution::host_memory_relevant(&target.upstream, target.placement) {
-        return snapshot
-            .observation
-            .gpu_memory_free_bytes
-            .is_some_and(|free| estimate > free);
-    }
     let assessment = snapshot.assess_capacity(estimate, false);
     if !assessment.admissible || assessment.memory_advisory.is_some() {
         return true;

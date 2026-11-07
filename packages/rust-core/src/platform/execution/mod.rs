@@ -8,19 +8,22 @@ use std::{
 use anyhow::Result;
 use axum::{Json, extract::State, http::StatusCode};
 use serde_json::Value;
-use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use super::admission::AdmissionPool;
 use super::error::ApiError;
 use super::{Backend, PlatformState, TaskInput};
 
 mod admit;
+mod completion;
 mod feedback;
 mod forward;
+mod identity;
 mod memory;
 mod observe;
 mod pipeline;
 mod request;
+pub(super) mod runner;
 mod select;
 mod upstream;
 
@@ -28,16 +31,17 @@ pub(super) use admit::{admit, transition_timeout};
 #[cfg(test)]
 pub(super) use feedback::feedback_work_unit_ns;
 pub use feedback::runtime_metrics;
-use feedback::{record_completion, task_record};
+use feedback::{qualified_load_ms, record_completion, task_record};
 use forward::{AdmissionTimings, ForwardRequest, forward_managed_task};
 #[cfg(test)]
 pub(super) use memory::memory_kv_preflight_with_memory;
+use memory::{Forecast, memory_kv_preflight, reserve_task_resources};
 pub(super) use memory::{
-    evict_idle_models, host_memory_relevant, make_room, model_memory_requirement, requested_context,
+    cold_model_memory_requirement, evict_idle_models, host_memory_relevant, make_room,
+    model_memory_requirement, requested_context,
 };
-use memory::{memory_kv_preflight, reserve_task_resources};
 pub(super) use observe::physical_placement_observation;
-use observe::{model_is_resident, resident_entry};
+use observe::resident_entry;
 use pipeline::run_session_task;
 pub(super) use request::apply_execution_options;
 pub(super) use request::requests_immediate_unload;
@@ -53,20 +57,27 @@ const SLOT_HELD_RESOURCE_WAIT: Duration = Duration::from_secs(2);
 pub(super) struct ExecutionTarget {
     pub(super) placement: Backend,
     pub(super) upstream: String,
-    pub(super) transition: Arc<RwLock<()>>,
+    /// The backend's load lock: it serializes loads and managed explicit unloads. A resident runner is
+    /// protected from eviction by its per-model use lease (`ModelActivity`), never by this lock,
+    /// so decoding on one model does not delay another model's load.
+    pub(super) transition: Arc<Mutex<()>>,
     pub(super) admission: AdmissionPool,
 }
 
+/// How a managed task reaches its runner. Either way the task also holds its model's use lease.
 enum TransitionPermit {
-    Shared(OwnedRwLockReadGuard<()>),
-    Exclusive(OwnedRwLockWriteGuard<()>),
+    /// A compatible runner is resident: no backend lock is held while it generates.
+    Resident,
+    /// This task loads or reloads its runner and owns the backend load lock until the runner is
+    /// observed ready, so loads queue behind each other and same-model arrivals wait here.
+    Loading(OwnedMutexGuard<()>),
 }
 
 impl TransitionPermit {
     fn admission_mode(&self) -> &'static str {
         match self {
-            Self::Shared(_guard) => "resident_shared",
-            Self::Exclusive(_guard) => "nonresident_transition_exclusive",
+            Self::Resident => "resident_shared",
+            Self::Loading(_guard) => "nonresident_transition_exclusive",
         }
     }
 }
@@ -78,7 +89,7 @@ pub(super) fn execution_target(state: &PlatformState, model: &str) -> ExecutionT
         return ExecutionTarget {
             placement: Backend::Cpu,
             upstream: upstream.clone(),
-            transition: Arc::clone(&state.cpu_managed_execution),
+            transition: Arc::clone(&state.cpu_load_lock),
             admission: state.cpu_admission.clone(),
         };
     }
@@ -95,7 +106,7 @@ pub(super) fn primary_target(state: &PlatformState) -> ExecutionTarget {
     ExecutionTarget {
         placement: Backend::Gpu,
         upstream: state.upstream.clone(),
-        transition: Arc::clone(&state.managed_execution),
+        transition: Arc::clone(&state.load_lock),
         admission: state.gpu_admission.clone(),
     }
 }
@@ -103,8 +114,8 @@ pub(super) fn primary_target(state: &PlatformState) -> ExecutionTarget {
 /// Unload a resident `model` from the backend it runs on once no task is using it, or `None`
 /// when it is not resident (the caller then decides whether to probe it). An unload names a
 /// model, not a task, so it skips routing and task eligibility: an embedding model unloads
-/// without `task: "embedding"`. The exclusive transition side waits for tasks already running
-/// on the resident runner, bounded by `wait`.
+/// without `task: "embedding"`. The model's lifecycle claim waits for tasks already running on
+/// the resident runner, bounded by `wait`; the backend load lock then serializes the unload.
 pub(super) async fn unload_resident_model(
     state: &PlatformState,
     model: &str,
@@ -112,20 +123,115 @@ pub(super) async fn unload_resident_model(
 ) -> Result<Option<Value>, ApiError> {
     let execution = execution_target(state, model);
     let backend = execution.placement.as_str();
-    if !model_is_resident(&state.client, &execution.upstream, model).await {
+    let deadline = tokio::time::Instant::now() + wait;
+    // Lifecycle first, then the backend load lock. Arriving tasks wait for this claim before
+    // acquiring the load lock, so a claim holder never waits behind a task that waits for it.
+    let lifecycle =
+        tokio::time::timeout_at(deadline, state.activity.evict_when_idle(backend, model))
+            .await
+            .map_err(|_| {
+                ApiError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("{model} is still serving tasks; retry the unload when they finish"),
+                )
+                .with_code("unload_wait_exceeded")
+            })?;
+    let ps = tokio::time::timeout_at(
+        deadline,
+        super::get_json(&state.client, &execution.upstream, "/api/ps"),
+    )
+    .await
+    .map_err(|_| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Ollama residency observation timed out",
+        )
+        .with_code("unload_observation_unavailable")
+    })??;
+    if !unload_residency(&ps, model)? {
         return Ok(None);
     }
     let started = Instant::now();
-    let _transition = tokio::time::timeout(wait, Arc::clone(&execution.transition).write_owned())
-        .await
-        .map_err(|_| {
+    let transition =
+        tokio::time::timeout_at(deadline, Arc::clone(&execution.transition).lock_owned())
+            .await
+            .map_err(|_| {
+                ApiError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("{model} is still serving tasks; retry the unload when they finish"),
+                )
+                .with_code("unload_wait_exceeded")
+            })?;
+    let state = state.clone();
+    let model = model.to_owned();
+    // Cancellation before dispatch releases the claim. Once dispatched, cleanup owns both
+    // leases independently of the caller and finishes within the request/confirmation bounds.
+    tokio::spawn(async move {
+        let _leases = (lifecycle, transition);
+        let outcome = finish_explicit_unload(&state, &execution, &model, started).await;
+        state.resources.invalidate().await;
+        outcome
+    })
+    .await
+    .map_err(|error| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("unload supervisor failed: {error}"),
+        )
+        .with_code("unload_supervisor_failed")
+    })?
+}
+
+fn unload_residency(ps: &Value, model: &str) -> Result<bool, ApiError> {
+    let models = ps["models"]
+        .as_array()
+        .filter(|models| {
+            models
+                .iter()
+                .all(|entry| crate::ollama_http::ps_entry_name(entry).is_some())
+        })
+        .ok_or_else(|| {
             ApiError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
-                format!("{model} is still serving tasks; retry the unload when they finish"),
+                "Ollama residency observation is unavailable or malformed",
             )
-            .with_code("unload_wait_exceeded")
+            .with_code("unload_observation_unavailable")
         })?;
-    let (status, body) = observe::request_unload(state, &execution.upstream, model).await?;
+    Ok(models
+        .iter()
+        .any(|entry| crate::ollama_http::ps_entry_name(entry) == Some(model)))
+}
+
+async fn finish_explicit_unload(
+    state: &PlatformState,
+    execution: &ExecutionTarget,
+    model: &str,
+    started: Instant,
+) -> Result<Option<Value>, ApiError> {
+    let backend = execution.placement.as_str();
+    let posted = tokio::time::timeout(
+        Duration::from_secs(5),
+        observe::request_unload(state, &execution.upstream, model),
+    )
+    .await
+    .map_err(|_| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unload request timed out; upstream outcome is unknown",
+        )
+        .with_code("unload_outcome_unknown")
+    })
+    .and_then(std::convert::identity);
+    // A failed observation is unknown, not absence. Keep lifecycle ownership through the
+    // same bounded confirmation used by idle eviction.
+    let confirmation =
+        memory::confirm_unloads(&[model.to_owned()], Duration::from_secs(5), || async {
+            super::get_json(&state.client, &execution.upstream, "/api/ps")
+                .await
+                .ok()
+        })
+        .await;
+    let (status, body) = posted?;
     if !status.is_success() {
         return Err(ApiError::new(
             StatusCode::BAD_GATEWAY,
@@ -133,15 +239,9 @@ pub(super) async fn unload_resident_model(
         )
         .with_code("unload_refused"));
     }
-    // Ollama answers before the runner has exited; confirm from /api/ps.
-    let confirm_by = Instant::now() + Duration::from_secs(5);
-    let mut resident = model_is_resident(&state.client, &execution.upstream, model).await;
-    while resident && Instant::now() < confirm_by {
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        resident = model_is_resident(&state.client, &execution.upstream, model).await;
-    }
+    let unloaded = !confirmation.confirmed.is_empty();
     let unload_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    if !resident {
+    if unloaded {
         state.audit.record(&super::audit::Entry {
             backend,
             model,
@@ -154,8 +254,8 @@ pub(super) async fn unload_resident_model(
     Ok(Some(serde_json::json!({
         "model": model,
         "backend": backend,
-        "unloaded": !resident,
-        "status": if resident { "still_resident" } else { "unloaded" },
+        "unloaded": unloaded,
+        "status": if unloaded { "unloaded" } else if confirmation.observation_failed.is_empty() { "still_resident" } else { "observation_unavailable" },
         "unload_ms": unload_ms,
     })))
 }
@@ -190,6 +290,7 @@ pub(super) async fn execute_task(
     State(state): State<PlatformState>,
     Json(mut input): Json<TaskInput>,
 ) -> Result<Json<Value>, ApiError> {
+    super::jobs::validate_synchronous(&input)?;
     let timeout = input
         .timeout_seconds
         .map(|seconds| task_deadline(Some(seconds)))
@@ -304,6 +405,7 @@ fn finish_task(
         record,
         started,
         matches!(operation, super::ManagedOperation::Generate),
+        qualified_load_ms(result),
     );
     if let Some((backend, model)) = served {
         super::preload::served(state, &backend, &model);
@@ -346,4 +448,27 @@ async fn commit_scoped_completion(
         sessions.bind(id, model);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod unload_tests {
+    use super::*;
+
+    #[test]
+    fn unavailable_residency_is_not_reported_as_an_absent_runner() {
+        for ps in [
+            serde_json::json!({"error":"unavailable"}),
+            serde_json::json!({"models":[{}]}),
+        ] {
+            assert!(unload_residency(&ps, "m:latest").is_err());
+        }
+        assert!(!unload_residency(&serde_json::json!({"models":[]}), "m:latest").unwrap());
+        assert!(
+            unload_residency(
+                &serde_json::json!({"models":[{"name":"m:latest"}]}),
+                "m:latest"
+            )
+            .unwrap()
+        );
+    }
 }

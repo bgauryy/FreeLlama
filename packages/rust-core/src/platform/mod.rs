@@ -20,13 +20,12 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::{
-    capability::{Capability, ModelType},
+    capability::ModelType,
     proxy::{self, ProxyConfig},
 };
 
 mod admission;
 mod audit;
-mod batch_progress;
 mod bearer;
 mod budget;
 mod catalog;
@@ -39,6 +38,7 @@ mod error;
 mod execution;
 mod feedback;
 mod footprint;
+mod job_journal;
 mod jobs;
 mod model_facts;
 mod monitor;
@@ -74,9 +74,10 @@ use sessions::{
 use tasks_api::{ManagedOperation, OllamaRequestOptions, TaskInput, run_task_batch};
 
 use discovery::MachineProfile;
+pub(crate) use discovery::host_has_unified_memory;
+use discovery::host_total_memory_bytes;
 pub use discovery::machine_profile;
 pub(crate) use discovery::machine_profile_off_runtime;
-use discovery::{host_has_unified_memory, host_total_memory_bytes};
 pub use preload::{PreloadModel, PreloadPolicy, PreloadSpec};
 pub use routing::{
     Backend, CatalogModel, ExecutionPreference, LoopRecord, ModelRequestDefaults, Objective,
@@ -91,6 +92,7 @@ pub(crate) use warming::WarmingPolicy;
 
 use admission::{AdmissionPool, MAX_CAPACITY_BYPASSES};
 use error::ApiError;
+pub(crate) use execution::runner::PlacementRule;
 pub use execution::runtime_metrics;
 use execution::{execution_target, physical_placement_observation, run_task, select_managed_route};
 #[cfg(test)]
@@ -129,14 +131,16 @@ struct PlatformState {
     upstream: String,
     cpu_upstream: Option<String>,
     cpu_models: Arc<BTreeSet<String>>,
-    benchmark: Arc<BTreeMap<String, BTreeMap<Capability, f64>>>,
+    benchmark: Arc<discovery::BenchmarkEvidence>,
     policies: Arc<discovery::Policies>,
     sessions: Arc<RwLock<SessionAffinity>>,
     scopes: scopes::ScopeStore,
     catalog_cache: CatalogCache,
+    catalog_metadata: catalog::MetadataCache,
     catalog_refresh: Arc<Mutex<()>>,
-    managed_execution: Arc<RwLock<()>>,
-    cpu_managed_execution: Arc<RwLock<()>>,
+    /// Per-backend load locks (primary and CPU): they serialize loads and unloads only.
+    load_lock: Arc<Mutex<()>>,
+    cpu_load_lock: Arc<Mutex<()>>,
     gpu_admission: AdmissionPool,
     cpu_admission: AdmissionPool,
     feedback: Arc<RwLock<PlacementFeedback>>,
@@ -161,7 +165,6 @@ struct PlatformState {
     ollama_refresh: Arc<Mutex<Instant>>,
     raw_admission: proxy::RawAdmission,
     jobs: Arc<std::sync::Mutex<jobs::JobRegistry>>,
-    batch_progress: Arc<batch_progress::BatchProgress>,
 }
 
 impl PlatformState {
@@ -311,10 +314,10 @@ fn build(config: &PlatformConfig) -> Result<(Router, PlatformState)> {
         model_facts: model_facts::ModelFacts::loaded(config.store.clone()),
         preload: preload::Preloader::default(),
         last_eviction: Arc::default(),
-        // A client-level backstop, not a nicety. `forward_managed_task` holds the
-        // `managed_execution` write lock across its upstream call, so an untimed request against
-        // a wedged Ollama would hold that exclusive lock forever and block every subsequent
-        // managed task — one hung request deadlocking the whole managed plane. Generous enough
+        // A client-level backstop, not a nicety. A cold load holds the backend load lock across
+        // its upstream call, so an untimed request against a wedged Ollama would hold that lock
+        // forever and block every subsequent load — one hung request deadlocking the managed
+        // plane's cold path. Generous enough
         // for a real generation (Ollama's own OLLAMA_LOAD_TIMEOUT is 5m for the load alone);
         // cheap discovery calls take a much shorter per-request timeout below.
         client: crate::net::build_http_client(|builder| builder.timeout(platform_task_timeout()))
@@ -327,9 +330,10 @@ fn build(config: &PlatformConfig) -> Result<(Router, PlatformState)> {
         sessions: Arc::new(RwLock::new(SessionAffinity::default())),
         scopes: scopes::ScopeStore::default(),
         catalog_cache: Arc::new(RwLock::new(None)),
+        catalog_metadata: catalog::MetadataCache::default(),
         catalog_refresh: Arc::new(Mutex::new(())),
-        managed_execution: Arc::new(RwLock::new(())),
-        cpu_managed_execution: Arc::new(RwLock::new(())),
+        load_lock: Arc::new(Mutex::new(())),
+        cpu_load_lock: Arc::new(Mutex::new(())),
         gpu_admission: AdmissionPool::new(tunables.max_concurrent_tasks, tunables.max_queued_tasks),
         cpu_admission: AdmissionPool::new(
             tunables.cpu_max_concurrent_tasks,
@@ -352,13 +356,14 @@ fn build(config: &PlatformConfig) -> Result<(Router, PlatformState)> {
         cpu_ollama: cpu_ollama.map(|settings| Arc::new(RwLock::new(settings))),
         ollama_refresh: Arc::new(Mutex::new(Instant::now())),
         raw_admission: raw_admission.clone(),
-        jobs: Arc::default(),
-        batch_progress: Arc::default(),
+        jobs: Arc::new(std::sync::Mutex::new(jobs::JobRegistry::configured(
+            config,
+        )?)),
     };
     let fallback_config = ProxyConfig::new(&config.listen, &config.upstream, config.allow_remote)
         .with_raw_admission(raw_admission)
         .with_telemetry(telemetry)
-        .with_execution_lock(Arc::clone(&state.managed_execution))
+        .with_load_lock(Arc::clone(&state.load_lock))
         .with_resource_governor(state.resources.clone())
         .with_hooks(Arc::new(raw_models::RawModels(state.clone())))
         .with_upstreams(config.upstreams.clone());
@@ -399,10 +404,6 @@ fn build(config: &PlatformConfig) -> Result<(Router, PlatformState)> {
             post(jobs::cancel),
         )
         .route(&format!("{API_ROOT}/task-batches"), post(run_task_batch))
-        .route(
-            &format!("{API_ROOT}/task-batches/{{id}}"),
-            get(batch_progress::get),
-        )
         .route(&format!("{API_ROOT}/metrics"), get(monitor::metrics))
         .route(&format!("{API_ROOT}/status"), get(monitor::status))
         .route(&format!("{API_ROOT}/usage"), get(monitor::usage))
@@ -615,7 +616,7 @@ async fn health(State(state): State<PlatformState>) -> Json<Value> {
             "placement_evidence_gate": "configured_or_observed",
             "placement_feedback": "three_sample_runtime",
             "placement_feedback_metric": "normalized_work_unit_10_percent",
-            "placement_feedback_persistence": "shared_database_snapshot_v1",
+            "placement_feedback_persistence": "shared_database_snapshot_v2",
             "authentication": "optional_bearer_all_routes",
             "immediate_unload_observation": "observe_then_unload",
             "task_batches": "independent_only_bounded_priority_fair",
@@ -729,7 +730,7 @@ async fn route(
     Json(input): Json<RouteInput>,
 ) -> Result<Json<Value>, ApiError> {
     require_active_session(&state, input.session_id.as_deref()).await?;
-    let models = discover_models(&state).await?;
+    let models = catalog::discover_for_route(&state, input.model.as_deref()).await?;
     let sessions = state.sessions.read().await;
     let requested_cost = state.tunables().task_cost(input.task);
     let managed =

@@ -9,6 +9,9 @@ import {
   structuredResult,
 } from "../helpers.js";
 import { libraryTrialCandidate } from "../model-search.js";
+import { CATALOG_JOBS, catalogText, catalogView } from "../model-catalog.js";
+import { serveAuthHeaders } from "../serve-http.js";
+import { DEFAULT_SERVE_ENDPOINT } from "../config.js";
 import { HUB_EMBEDDING_TASKS, HuggingFaceClient, huggingFaceReference } from "../huggingface.js";
 import {
   enrichInstalledModels, isRemoteModel, libraryReference, modelKnowledge, OllamaLibraryClient, publicModelGuidance,
@@ -99,7 +102,7 @@ async function libraryLookup({
     }
     try {
       const profile = JSON.parse(await machine(endpoint));
-      memoryBytes = profile.memory_bytes ?? profile.unified_memory_bytes ?? null;
+      memoryBytes = profile.memory_bytes ?? null;
     } catch {
       // serve unreachable: recommendationUnavailable below explains the missing fit check.
     }
@@ -228,17 +231,34 @@ async function libraryLookup({
   }
 }
 
+/** What is installed and how much memory is available; unknown stays null rather than "no". */
+async function catalogLiveState(endpoint: string | undefined, ollamaEndpoint: string | undefined): Promise<[ReadonlySet<string> | null, number | null]> {
+  let installed: ReadonlySet<string> | null = null;
+  let available: number | null = null;
+  try {
+    const tags = (await ollamaFetch(ollamaEndpoint, "/api/tags")) as { models?: Array<{ name?: string }> };
+    installed = new Set((tags.models ?? []).map((m) => m.name ?? ""));
+  } catch { /* reported as null */ }
+  try {
+    const response = await fetch(`${(endpoint ?? DEFAULT_SERVE_ENDPOINT).replace(/\/$/, "")}/_freellama/v1/status`, { headers: await serveAuthHeaders(), signal: AbortSignal.timeout(3000) });
+    const status = await response.json() as { host?: { available_memory_bytes?: number } };
+    available = status.host?.available_memory_bytes ?? null;
+  } catch { /* reported as null */ }
+  return [installed, available];
+}
+
 export function registerModelsTool(server: McpServer): void {
   server.registerTool(
     "models",
     {
       description:
-        "Use when: listing installed or loaded models with capabilities, policy rank and memory fit, inspecting one model, or searching ollama.com and Hugging Face GGUF repos (view:library). " +
+        "Use when: choosing a model for a job (view:catalog: tested picks per job, what is installed and fits now, and a cookbook for each), listing installed or loaded models with capabilities, policy rank and memory fit, inspecting one model, or searching ollama.com and Hugging Face GGUF repos (view:library). " +
         "Do not use when: running work (run_task) or pulling (ollama_manage). Returns: models; library lists families first, then one family's tags.",
       inputSchema: z.object({
         view: z
-          .enum(["installed", "resident", "detail", "raw", "library"])
+          .enum(["catalog", "installed", "resident", "detail", "raw", "library"])
           .optional(),
+        job: z.enum(CATALOG_JOBS as [string, ...string[]]).optional().describe("catalog: one job's picks"),
         model: z.string().min(1).optional(),
         includeVerbose: z
           .boolean()
@@ -263,9 +283,16 @@ export function registerModelsTool(server: McpServer): void {
       outputSchema: modelsResultSchema,
       annotations: { readOnlyHint: true },
     },
-    async ({ view, model, includeVerbose, includeLibrary, includeReadme, query, capabilities, order, source, limit, cursor, endpoint, ollamaEndpoint }) => {
+    async ({ view, job, model, includeVerbose, includeLibrary, includeReadme, query, capabilities, order, source, limit, cursor, endpoint, ollamaEndpoint }) => {
       try {
         const selectedView = view ?? "installed";
+        if (selectedView === "catalog") {
+          const stray = Object.entries({ model, includeVerbose, includeLibrary, includeReadme, query, capabilities, order, source, limit, cursor }).filter(([, value]) => value !== undefined).map(([name]) => `\`${name}\``);
+          if (stray.length > 0) return errorResult(new Error(`view "catalog" takes only \`job\`; remove ${stray.join(", ")}.`));
+          const shown = catalogView(job, ...await catalogLiveState(endpoint, ollamaEndpoint));
+          return structuredResult(shown, { text: catalogText(shown) });
+        }
+        if (job !== undefined) return errorResult(new Error('`job` is valid only for view "catalog".'));
         if (includeLibrary !== undefined && selectedView !== "installed" && selectedView !== "detail") {
           return errorResult(new Error('`includeLibrary` is valid only for views "installed" and "detail".'));
         }

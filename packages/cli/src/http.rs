@@ -31,6 +31,12 @@ fn explain_transport(endpoint: &str, error: reqwest::Error) -> anyhow::Error {
 /// A success whose body is not JSON is an error, not silence: printing nothing and exiting 0 would
 /// tell the caller the command worked when nothing was reported.
 pub(crate) async fn print_response(response: reqwest::Response) -> Result<()> {
+    let value = response_json(response).await?;
+    crate::emit(serde_json::to_string_pretty(&value)?)
+}
+
+/// The JSON body of a successful response, or the server's own refusal as the error.
+async fn response_json(response: reqwest::Response) -> Result<Value> {
     let status = response.status();
     let body = response.text().await.context("read response body")?;
     let payload = serde_json::from_str::<Value>(&body).ok();
@@ -51,13 +57,24 @@ pub(crate) async fn print_response(response: reqwest::Response) -> Result<()> {
             );
         anyhow::bail!("{detail}");
     }
-    let value = payload.with_context(|| {
+    payload.with_context(|| {
         format!(
             "{status} response from the platform was not JSON: {}",
             body.trim()
         )
-    })?;
-    crate::emit(serde_json::to_string_pretty(&value)?)
+    })
+}
+
+/// GET a JSON document, or `None` when the server cannot be reached or refuses.
+pub(crate) async fn try_get_json(endpoint: &str, path: &str) -> Option<Value> {
+    let request = serve_client::client().get(freellama::endpoint_url(endpoint, path));
+    let response = serve_client::authenticate(request)
+        .ok()?
+        .timeout(serve_client::control_timeout())
+        .send()
+        .await
+        .ok()?;
+    response_json(response).await.ok()
 }
 
 pub(crate) async fn print_get(endpoint: &str, path: &str) -> Result<()> {
@@ -71,6 +88,12 @@ pub(crate) async fn print_get(endpoint: &str, path: &str) -> Result<()> {
 }
 
 pub(crate) async fn print_post(endpoint: &str, path: &str, body: &Value) -> Result<()> {
+    let value = post_json(endpoint, path, body).await?;
+    crate::emit(serde_json::to_string_pretty(&value)?)
+}
+
+/// POST `body` and return the JSON result, for commands that reshape it before printing.
+pub(crate) async fn post_json(endpoint: &str, path: &str, body: &Value) -> Result<Value> {
     // `/tasks` and `/warm` run a model; everything else is a decision.
     let timeout = if path.ends_with("/tasks") || path.ends_with("/warm") {
         serve_client::task_timeout()
@@ -85,5 +108,5 @@ pub(crate) async fn print_post(endpoint: &str, path: &str, body: &Value) -> Resu
         .send()
         .await
         .map_err(|e| explain_transport(endpoint, e))?;
-    print_response(response).await
+    response_json(response).await
 }

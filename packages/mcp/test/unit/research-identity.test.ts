@@ -78,6 +78,6 @@ describe("frozen identity vectors", () => {
     const { createHash } = await import("node:crypto");
     const sha = (text: string) => createHash("sha256").update(text, "utf8").digest("hex");
     expect(sha(BASH_SYSTEM_PROMPT)).toBe("412f3f9f64dd210cb1d2b7cd5d61ede25417934e3ebfe880c337ce7e1f8a0049");
-    expect(sha(octocodeSystemPrompt("/w"))).toBe("2b9c25f86aa987af6c50d4e88e4c876ff3a508dacb0036ce0569d0aec02323a7");
+    expect(sha(octocodeSystemPrompt("/w"))).toBe("9b3b7678ade92ed668ad4ab74b99d1456f4689242d87a039ffe71cdee0087ec7");
   });
 });

@@ -213,8 +213,8 @@ fn ollama_env_advisories_report_the_configured_value() {
     );
 }
 
-/// `ollama_env_config` remains the stable flat memory view, while the categorized view covers the
-/// rest of the production settings exposed by the detected Ollama generation.
+/// The categorized view covers the memory controls and the rest of the production settings
+/// exposed by the detected Ollama generation.
 #[test]
 fn categorized_ollama_config_covers_installed_production_settings() {
     let report = ollama_config_diagnostics("0.33.2", |_| None);

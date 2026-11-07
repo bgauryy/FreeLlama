@@ -19,8 +19,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 /// The database file inside the home directory.
 pub const DATABASE_FILE: &str = "freellama.sqlite";
-/// Bumped when a table changes shape; older files are migrated in [`migrate`].
-const SCHEMA_VERSION: i64 = 2;
+/// Bumped when a table changes shape. A file of any other version is refused, never migrated.
+const SCHEMA_VERSION: i64 = 3;
 /// Another process holding the write lock is waited for this long before a write fails.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -87,8 +87,8 @@ fn unsigned(value: i64) -> u64 {
 impl Store {
     /// Open (creating if needed) the database at `path`.
     /// # Errors
-    /// Returns an error when the directory or file cannot be created, or the schema is newer
-    /// than this build understands.
+    /// Returns an error when the directory or file cannot be created, or the file's schema
+    /// version is not this build's.
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path
             .parent()
@@ -115,7 +115,7 @@ impl Store {
     fn configure(connection: Connection, path: Option<PathBuf>) -> Result<Self> {
         connection.busy_timeout(BUSY_TIMEOUT)?;
         connection.pragma_update(None, "synchronous", "NORMAL")?;
-        migrate(&connection)?;
+        create_schema(&connection, path.as_deref())?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
             path,
@@ -247,13 +247,16 @@ impl Store {
     }
 }
 
-/// Create or upgrade the tables. A file from a newer build is refused rather than rewritten.
-fn migrate(connection: &Connection) -> Result<()> {
+/// Create the tables in a new database. A file with any other schema version is refused rather
+/// than read or rewritten: move or delete it and `FreeLlama` starts a new one.
+fn create_schema(connection: &Connection, path: Option<&Path>) -> Result<()> {
     let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     anyhow::ensure!(
-        version <= SCHEMA_VERSION,
-        "the FreeLlama database has schema {version}, newer than this build's {SCHEMA_VERSION}; \
-         upgrade FreeLlama or point FREELLAMA_HOME elsewhere"
+        version == 0 || version == SCHEMA_VERSION,
+        "the FreeLlama database{} has schema {version}, but this build uses schema \
+         {SCHEMA_VERSION}; move or delete the file to start a new one, or point FREELLAMA_HOME \
+         elsewhere",
+        path.map_or_else(String::new, |path| format!(" {}", path.display())),
     );
     connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS snapshots (
@@ -276,7 +279,13 @@ fn migrate(connection: &Connection) -> Result<()> {
          CREATE TABLE IF NOT EXISTS model_facts (
              model TEXT NOT NULL, digest TEXT NOT NULL, fact TEXT NOT NULL,
              value INTEGER NOT NULL, updated_at INTEGER NOT NULL,
-             PRIMARY KEY (model, digest, fact));",
+             PRIMARY KEY (model, digest, fact));
+         CREATE TABLE IF NOT EXISTS task_jobs (
+             namespace TEXT NOT NULL, id TEXT NOT NULL, request_key TEXT NOT NULL,
+             input_hash TEXT NOT NULL, owner TEXT NOT NULL, receipt TEXT NOT NULL,
+             terminal INTEGER NOT NULL, expires_at INTEGER NOT NULL,
+             PRIMARY KEY (namespace, id), UNIQUE (namespace, request_key));
+         CREATE INDEX IF NOT EXISTS task_jobs_expiry ON task_jobs (expires_at);",
     )?;
     connection.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
@@ -284,11 +293,10 @@ fn migrate(connection: &Connection) -> Result<()> {
 
 mod events;
 mod facts;
-mod legacy;
+pub(crate) mod jobs;
 mod usage;
 
 pub use events::{EventSummary, MeasuredLoads, ResidencyEvent};
-pub use legacy::LegacyImport;
 pub use usage::DailyUsage;
 
 #[cfg(test)]

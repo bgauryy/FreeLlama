@@ -55,12 +55,24 @@ pub(super) fn start(state: &PlatformState) {
                     snapshot.hold_reserve_bytes,
                 );
                 if shortfall > 0 {
+                    // FreeLlama's own low-memory estimate alone is no distress: release only
+                    // runners that have gone idle, not one serving requests a few seconds apart.
+                    // Swapping or OS pressure releases any idle runner at once.
+                    let distress = snapshot.reasons.iter().any(|reason| {
+                        matches!(
+                            reason,
+                            PressureReason::ActiveSwapping | PressureReason::OsMemoryPressure
+                        )
+                    });
+                    let min_idle_seconds =
+                        (!distress).then(|| super::float(state.tunables().warming.base_seconds));
                     let receipt = execution::evict_idle_models(
                         &state,
                         &execution,
                         "",
                         residency::Freed::Total,
                         shortfall,
+                        min_idle_seconds,
                         "pressure_sweep",
                     )
                     .await;

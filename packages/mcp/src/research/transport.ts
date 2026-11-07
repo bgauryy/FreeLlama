@@ -133,13 +133,23 @@ export function isTransportError(error: unknown): error is HTTPError | URLError 
 
 /** Retry known refusals only; a timeout may leave inference running upstream. */
 export function retryableChatError(error: unknown): boolean {
-  if (error instanceof HTTPError) return error.code === 503;
+  if (error instanceof HTTPError) {
+    if (error.code !== 503 || error.body.length > RECEIPT_BODY_LIMIT) return false;
+    try {
+      const body = parseJsonBody(error.body, "retry receipt");
+      if (!isRecord(body) || body.retry_safe === false
+        || (body.execution_outcome !== undefined && body.execution_outcome !== "not_started")) return false;
+      return (body.retry_safe === true && body.execution_outcome === "not_started")
+        || ["admission_timeout", "resource_admission_unavailable", "upstream_circuit_open", "model_lifecycle_busy"].includes(String(body.code));
+    } catch { return false; }
+  }
   return error instanceof URLError && (error.reason as NodeJS.ErrnoException).code === "ECONNREFUSED";
 }
 
 const RECEIPT_FIELDS = new Set([
   "error", "code", "reason", "retry_after_seconds", "resource_admission", "lifecycle",
   "placement", "execution", "admission", "route", "decision", "quality", "feedback",
+  "execution_outcome", "retry_safe", "result_recoverable", "job_id", "last_observed_status",
 ]);
 const PAYLOAD_FIELDS = new Set([
   "prompt", "system", "system_prompt", "messages", "content", "input", "images", "tools",

@@ -10,7 +10,7 @@ import type { AdapterHooks, AdapterSession, AdapterSpec } from "./adapter.js";
 import { canonicalJson, isRecord } from "./canonical-json.js";
 import { AgentContextManager, writeFailureResult } from "./context-manager.js";
 import { AgentRuntimeConfig, type Env, type Message } from "./context-policy.js";
-import { ValidationError, isToolError } from "./errors.js";
+import { ToolExitError, ValidationError, isToolError } from "./errors.js";
 import { ObservationStore } from "./observations.js";
 import { progressEmitter } from "./progress-events.js";
 import { cpSlice, decodeUtf8, normalizeNewlines, trimSpace } from "./text.js";
@@ -84,12 +84,12 @@ async function runLoop(spec: AdapterSpec, hooks: AdapterHooks, env: Env, inputs:
   const managedEndpoint = (env.FREELLAMA_AGENT_MANAGED_ENDPOINT ?? "").replace(/\/+$/, "");
   // The turn (or the final answer, without `turn`) a managed job's phases are reported under.
   let phaseAt: { turn?: number; maxTurns: number } = { maxTurns: 0 };
-  // With progress on, a managed turn runs as a deferred job so its admission, memory and load
-  // waits are reported; its result and errors are the synchronous call's.
-  const sendJson = hooks.requestJson ?? (progress && managedEndpoint
+  // Every managed turn has a job identity for timeout and outer-process cleanup. Progress is
+  // only a view of that lifecycle; omitting it must not change cancellation behavior.
+  const sendJson = hooks.requestJson ?? (managedEndpoint
     ? (url: string, payload: Record<string, unknown>, timeoutSeconds: number) => requestJsonAsJob(url, payload, timeoutSeconds, {
-      report: (message) => progress({ event: "job_phase", ...phaseAt, message }),
-      onJob: (id, open) => progress({ event: open ? "job_open" : "job_closed", id }),
+      report: (message) => progress?.({ event: "job_phase", ...phaseAt, message }),
+      onJob: (id, open) => progress?.({ event: open ? "job_open" : "job_closed", id }),
       request: hooks.httpRequest,
     })
     : requestJson);
@@ -161,7 +161,11 @@ async function runLoop(spec: AdapterSpec, hooks: AdapterHooks, env: Env, inputs:
           transportEndpoint, model, messages, chatOptions, runtime.think, runtime.keep_alive,
           executionPreference, minPlacementEvidence,
         );
+        const recorded = executionReceipts.length;
         response = unwrapChatResponse(await sendJson(url, payload, runtime.request_timeout_seconds), executionReceipts);
+        if (managedEndpoint && executionReceipts.length === recorded) {
+          executionReceipts.push({ model: null, execution: null, reason: "managed_execution_receipt_missing" });
+        }
         break;
       } catch (error) {
         if (!isTransportError(error) || !retryableChatError(error)) throw error;
@@ -275,6 +279,7 @@ async function runLoop(spec: AdapterSpec, hooks: AdapterHooks, env: Env, inputs:
       const signature = callSignature(call.signature);
       let observation: string;
       let status: string;
+      let exitCode: number | undefined;
       if (seenCalls.has(signature)) {
         progress?.({ event: "action", ...at, action, repeat: true });
         observation = REPEAT_NOTICE;
@@ -286,14 +291,16 @@ async function runLoop(spec: AdapterSpec, hooks: AdapterHooks, env: Env, inputs:
           status = "ok";
         } catch (error) {
           if (!isToolError(error)) throw error;
-          observation = `tool error: ${error.message}`;
-          status = "error";
+          status = error instanceof ToolExitError ? error.status : "error";
+          exitCode = error instanceof ToolExitError ? error.exitCode : undefined;
+          observation = `${status === "empty" ? "tool search" : "tool error"}: ${error.message}`;
         }
         seenCalls.set(signature, calls.length + 1);
       }
       calls.push({
         ...call.record,
         status,
+        ...(exitCode === undefined ? {} : { exit_code: exitCode }),
         duration_ms: Math.round((performance.now() - started) * 1000) / 1000,
       });
       messages.push({ role: "assistant", content: echo(action) });

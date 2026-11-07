@@ -18,34 +18,50 @@ pub(crate) fn record_completion(
     mut record: super::super::telemetry::TaskRecord,
     started: Instant,
     served_a_caller: bool,
+    observed_load_ms: Option<u64>,
 ) {
     record.duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     if record.outcome == "ok" {
         if served_a_caller {
+            state.activity.completed(
+                &record.backend,
+                &record.model,
+                observed_load_ms.unwrap_or(0),
+            );
+        } else if let Some(load_ms) = observed_load_ms {
             state
                 .activity
-                .completed(&record.backend, &record.model, record.load_ms);
-        } else {
-            state
-                .activity
-                .learn_load(&record.backend, &record.model, record.load_ms);
+                .learn_load(&record.backend, &record.model, load_ms);
         }
-        if super::super::residency::was_a_load(record.load_ms) {
+        if let Some(load_ms) = observed_load_ms.filter(|ms| *ms > 0) {
             state.audit.record(&super::super::audit::Entry {
                 backend: &record.backend,
                 model: &record.model,
                 event: "load",
                 trigger: if served_a_caller {
-                    "managed_task"
+                    "managed_transition_observed"
                 } else {
-                    "warm"
+                    "warm_transition_observed"
                 },
-                duration_ms: Some(record.load_ms),
+                duration_ms: Some(load_ms),
                 bytes: None,
             });
         }
     }
     state.telemetry.record_task(record);
+}
+
+/// Keep Ollama's original timer in telemetry; use it for reload-cost learning only after an
+/// absent runner became the expected digest/context. A long timer alone proves no disk read.
+pub(crate) fn qualified_load_ms(result: &Result<Json<Value>, ApiError>) -> Option<u64> {
+    let Ok(Json(value)) = result else {
+        return None;
+    };
+    (value["execution"]["runner_ready"]["learning_eligible"] == true)
+        .then(|| value["metrics"]["load_duration_ns"].as_u64())
+        .flatten()
+        .map(|ns| ns / 1_000_000)
+        .filter(|ms| *ms > 0)
 }
 
 /// Usage-ledger row for a finished managed call, successful or not.
@@ -85,7 +101,7 @@ pub(crate) fn task_record(
             if let Some(model) = value["route"]["selected_model"].as_str() {
                 model.clone_into(&mut record.model);
             }
-            if let Some(backend) = value["execution"]["placement"].as_str() {
+            if let Some(backend) = value["execution"]["requested_processor"].as_str() {
                 backend.clone_into(&mut record.backend);
             }
             let metrics = &value["metrics"];
@@ -186,7 +202,17 @@ pub(crate) fn adaptive_throughput_metric(
 /// Extract prompt-free performance fields from an Ollama response.
 #[must_use]
 pub fn runtime_metrics(response: &Value) -> Value {
-    let prompt_count = response.get("prompt_eval_count").and_then(Value::as_u64);
+    // `/v1/systemone` reports `usage.input_tokens`/`output_tokens` instead of eval counts.
+    let usage = |field: &str| {
+        response
+            .get("usage")
+            .and_then(|usage| usage.get(field))
+            .and_then(Value::as_u64)
+    };
+    let prompt_count = response
+        .get("prompt_eval_count")
+        .and_then(Value::as_u64)
+        .or_else(|| usage("input_tokens"));
     let cached_count = response
         .get("prompt_eval_cached_count")
         .and_then(Value::as_u64)
@@ -195,7 +221,10 @@ pub fn runtime_metrics(response: &Value) -> Value {
         .zip(cached_count)
         .map(|(total, cached)| total - cached);
     let prompt_duration = response.get("prompt_eval_duration").and_then(Value::as_u64);
-    let output_count = response.get("eval_count").and_then(Value::as_u64);
+    let output_count = response
+        .get("eval_count")
+        .and_then(Value::as_u64)
+        .or_else(|| usage("output_tokens"));
     let output_duration = response.get("eval_duration").and_then(Value::as_u64);
     json!({
         "total_duration_ns": response.get("total_duration").and_then(Value::as_u64),
@@ -442,7 +471,6 @@ mod execution_profile_tests {
             "input_tokens_per_second"
         );
         assert_eq!(receipt["profile_windows"]["embedding"]["rate"], 100.0);
-        assert_eq!(receipt["baseline_output_tokens_per_second"], json!({}));
         let slow = json!({"prompt_eval_count":20,"total_duration":2_000_000_000_u64});
         assert_eq!(
             limiter.observe(

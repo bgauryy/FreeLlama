@@ -1,5 +1,5 @@
 // Managed research turns as deferred jobs: phase messages, results and errors equal to the
-// synchronous call, every fallback to it, cancellation, and the MCP server's cleanup of open jobs.
+// synchronous call, refusal without losing cancellation, and the MCP server's cleanup of open jobs.
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -128,7 +128,7 @@ describe("managed research turns as jobs", () => {
   });
 
   it("throws the synchronous call's HTTP error for a failed job, so busy refusals still retry", async () => {
-    const refusal = { error: "backend capacity is full", code: "backend_capacity_unavailable", retry_after_seconds: 5 };
+    const refusal = { error: "backend capacity is full", code: "admission_timeout", retry_after_seconds: 5 };
     const serve = fakeServe({ polls: [poll({ status: "failed", reason: "failed", error: { ...refusal, id: ID, ok: false, status: 503 } })] });
     const error = await run(serve).result.catch((failure: unknown) => failure);
     expect(error).toBeInstanceOf(HTTPError);
@@ -144,38 +144,84 @@ describe("managed research turns as jobs", () => {
     expect([(thrown as HTTPError).code, busy.syncs(), busy.polls()]).toEqual([503, 0, 0]);
   });
 
+  it.each(["submission", "accepted-job"])("never retries an explicit unsafe 503 from %s", async (phase) => {
+    const body = { error: "execution outcome unknown", code: "admission_timeout", retry_safe: false, execution_outcome: "unknown" };
+    const serve = fakeServe(phase === "submission"
+      ? { submit: { status: 503, body } }
+      : { polls: [poll({ status: "failed", error: { ...body, status: 503 } })] });
+    const error = await run(serve).result.catch((failure: unknown) => failure);
+    expect(error).toBeInstanceOf(HTTPError);
+    expect(retryableChatError(error)).toBe(false);
+    expect(chatErrorDetails(error)[1]).toMatchObject({ receipt: { retry_safe: false, execution_outcome: "unknown" } });
+    expect([serve.submits(), serve.syncs()]).toEqual([1, 0]);
+  });
+
+  it("marks an untyped submission 503 unknown instead of treating it as a safe overload refusal", async () => {
+    const serve = fakeServe({ submit: { status: 503, body: { error: "proxy failed after forwarding" } } });
+    const error = await run(serve).result.catch((failure: unknown) => failure);
+    expect(retryableChatError(error)).toBe(false);
+    expect(chatErrorDetails(error)[1]).toMatchObject({ receipt: { retry_safe: false, execution_outcome: "unknown" } });
+  });
+
   it.each([
-    ["jobs unavailable", { submit: { status: 404, body: { error: "Not Found" } } }],
     ["the job registry is full", { submit: { status: 429, body: { error: "deferred task registry is full", code: "task_jobs_full" } } }],
     ["the input is too large to retain", { submit: { status: 413, body: { error: "too large", code: "task_job_input_too_large" } } }],
-  ] as const)("runs the turn synchronously, once, when %s", async (_name, setup) => {
+  ] as const)("preserves cancellability by refusing before execution when %s", async (_name, setup) => {
     const serve = fakeServe(setup);
-    expect(await run(serve).result).toEqual(SYNC_RESULT);
-    expect([serve.submits(), serve.syncs(), serve.polls()]).toEqual([1, 1, 0]);
+    const error = await run(serve).result.catch((failure: unknown) => failure);
+    expect(error).toBeInstanceOf(HTTPError);
+    expect((error as HTTPError).code).toBe(409);
+    expect(chatErrorDetails(error)[1]).toMatchObject({ receipt: {
+      code: "cancellable_task_unavailable", execution_outcome: "not_started", retry_safe: true,
+    } });
+    expect([serve.submits(), serve.syncs(), serve.polls(), serve.cancels()]).toEqual([1, 0, 0, 0]);
   });
 
-  it.each(["task_job_result_too_large", "task_job_error_too_large"])("re-runs synchronously when the job ends %s", async (code) => {
+  it("does not interpret a submit 404 as proof that no work ran", async () => {
+    const serve = fakeServe({ submit: { status: 404, body: { error: "Not Found" } } });
+    const error = await run(serve).result.catch((failure: unknown) => failure);
+    expect(error).toBeInstanceOf(HTTPError);
+    expect((error as HTTPError).code).toBe(404);
+    expect(retryableChatError(error)).toBe(false);
+    expect([serve.submits(), serve.syncs(), serve.polls()]).toEqual([1, 0, 0]);
+  });
+
+  it.each(["task_job_result_too_large", "task_job_error_too_large"])("does not replay the turn when the job ends %s", async (code) => {
     const serve = fakeServe({ polls: [poll({ status: "failed", error: { code, error: "too large", ...(code.includes("result") ? { id: ID, ok: false, status: 413 } : {}) } })] });
     const { result, messages, jobs } = run(serve);
-    expect(await result).toEqual(SYNC_RESULT);
-    expect(messages.at(-1)).toMatch(/running synchronously/);
-    expect([serve.submits(), serve.syncs()]).toEqual([1, 1]);
+    const error = await result.catch((failure: unknown) => failure);
+    expect(error).toBeInstanceOf(HTTPError);
+    expect(retryableChatError(error)).toBe(false);
+    const body = JSON.parse((error as HTTPError).body.toString("utf8"));
+    expect(body).toMatchObject({ code, job_id: ID, result_recoverable: false, retry_safe: false });
+    expect(body.error).toMatch(/not run again.*not retained/);
+    expect(messages.at(-1)).toBe("failed");
+    expect([serve.submits(), serve.syncs(), serve.cancels()]).toEqual([1, 0, 0]);
     expect(jobs).toEqual([[ID, true], [ID, false]]);
   });
 
-  it("runs synchronously when the job disappears", async () => {
-    const serve = fakeServe({ polls: [{ status: 404, body: { error: "job does not exist or has expired" } }] });
+  it("preserves the missing job identity without replaying its unknown execution", async () => {
+    const serve = fakeServe({ polls: [poll({ status: "running" }), { status: 404, body: { error: "job does not exist or has expired" } }] });
     const { result, jobs } = run(serve);
-    expect(await result).toEqual(SYNC_RESULT);
-    expect([serve.submits(), serve.syncs(), serve.cancels()]).toEqual([1, 1, 0]);
+    const error = await result.catch((failure: unknown) => failure);
+    expect(error).toBeInstanceOf(HTTPError);
+    expect((error as HTTPError).code).toBe(404);
+    expect(retryableChatError(error)).toBe(false);
+    expect(JSON.parse((error as HTTPError).body.toString("utf8"))).toMatchObject({
+      code: "task_job_unavailable", job_id: ID, last_observed_status: "running", execution_outcome: "unknown",
+      result_recoverable: false, retry_safe: false,
+    });
+    expect([serve.submits(), serve.syncs(), serve.cancels()]).toEqual([1, 0, 0]);
     expect(jobs).toEqual([[ID, true], [ID, false]]);
   });
 
-  it("cancels the job and times out the turn when its deadline passes", async () => {
+  it("requests cancellation on the turn deadline and keeps an unconfirmed job open", async () => {
     const serve = fakeServe({ polls: [poll({ status: "loading", selected_model: "gpt-oss:20b" })] });
     const { result, jobs } = run(serve, { timeoutSeconds: 0.05, wait: () => new Promise((resolve) => setTimeout(resolve, 20)) });
     await expect(result).rejects.toBeInstanceOf(RequestTimeoutError);
-    await vi.waitFor(() => expect(jobs).toEqual([[ID, true], [ID, false]]));
+    // This server acknowledges only `cancelling`, not a terminal state. The outer adapter
+    // cleanup must retain the handle so it can retry cancellation after the subprocess exits.
+    expect(jobs).toEqual([[ID, true]]);
     expect([serve.cancels(), serve.syncs()]).toEqual([1, 0]);
     expect(serve.calls.filter((call) => call.method === "GET").every((call) => call.signal !== undefined)).toBe(true);
   });
@@ -187,13 +233,13 @@ describe("managed research turns as jobs", () => {
   });
 });
 
-describe("research loop with progress on", () => {
+describe("research loop managed lifecycle", () => {
   const roots: string[] = [];
   afterEach(() => {
     for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
   });
 
-  it("reports a turn's job phases under its turn and records the synchronous receipts", async () => {
+  it.each([true, false])("tracks jobs and preserves receipts with progress enabled=%s", async (progressEnabled) => {
     const root = mkdtempSync(path.join(tmpdir(), "freellama-jobs-loop-"));
     roots.push(root);
     writeFileSync(path.join(root, "prompt.txt"), "Where is foo?", "utf8");
@@ -206,14 +252,16 @@ describe("research loop with progress on", () => {
       FREELLAMA_AGENT_RESULT: path.join(root, "result.json"), FREELLAMA_AGENT_MAX_TURNS: "8", FREELLAMA_AGENT_MANAGED_ENDPOINT: SERVE,
     };
     const code = await runAdapter(BASH_ADAPTER, {
-      env, httpRequest: serve.request, print: () => undefined, progress: (event) => events.push(event),
+      env, httpRequest: serve.request, print: () => undefined,
+      ...(progressEnabled ? { progress: (event: ResearchProgressEvent) => events.push(event) } : {}),
     });
     expect(code).toBe(0);
-    expect(events.map((event) => researchProgressMessage(event, root)).filter(Boolean)).toEqual([
+    expect(events.map((event) => researchProgressMessage(event, root)).filter(Boolean)).toEqual(progressEnabled ? [
       "turn 1/8: model thinking", "turn 1/8: queued", "turn 1/8: loading gpt-oss:20b (~8.7 s)", "turn 1/8: completed", "finishing answer",
-    ]);
+    ] : []);
     expect(events.filter((event) => event.event === "job_open" || event.event === "job_closed"))
-      .toEqual([{ event: "job_open", id: ID }, { event: "job_closed", id: ID }]);
+      .toEqual(progressEnabled ? [{ event: "job_open", id: ID }, { event: "job_closed", id: ID }] : []);
+    expect([serve.submits(), serve.syncs()]).toEqual([1, 0]);
     const result = JSON.parse(readFileSync(path.join(root, "result.json"), "utf8"));
     expect(result.final_answer).toBe("src/a.ts");
     expect(result.model_metadata.execution_receipts).toEqual([{ model: "gpt-oss:20b", execution: { backend: "metal" }, admission: null, feedback: null }]);

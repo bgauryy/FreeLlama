@@ -25,10 +25,6 @@ pub struct MachineProfile {
     /// systems report `system`; GPU VRAM remains Ollama's responsibility and is observed through
     /// `/api/ps` rather than guessed from host RAM.
     pub memory_kind: &'static str,
-    /// Backward-compatible Apple-silicon unified-memory field. Consumers should prefer
-    /// `memory_bytes`.
-    /// It is `None` on hosts where system RAM and accelerator memory are not known to be unified.
-    pub unified_memory_bytes: Option<u64>,
     pub available_disk_bytes: Option<u64>,
     pub ollama_endpoint: String,
     /// The host GPU as the OS reports it: Apple accelerator model and core count from the I/O
@@ -54,23 +50,57 @@ pub struct GpuProfile {
     pub memory_bytes: Option<u64>,
 }
 
-pub(super) fn load_benchmark(
-    path: Option<&PathBuf>,
-) -> Result<BTreeMap<String, BTreeMap<Capability, f64>>> {
+/// Measured scores are evidence about an artifact, never about a mutable tag alone.
+#[derive(Debug, Default)]
+pub(super) struct BenchmarkEvidence {
+    models: BTreeMap<String, (String, BTreeMap<Capability, f64>)>,
+}
+
+impl BenchmarkEvidence {
+    pub(super) fn for_model(&self, name: &str, digest: Option<&str>) -> BTreeMap<Capability, f64> {
+        self.models
+            .get(name)
+            .filter(|(measured, _)| {
+                digest.is_some_and(|current| !current.is_empty() && current == measured)
+            })
+            .map(|(_, scores)| scores.clone())
+            .unwrap_or_default()
+    }
+}
+
+pub(super) fn load_benchmark(path: Option<&PathBuf>) -> Result<BenchmarkEvidence> {
     let Some(path) = path else {
-        return Ok(BTreeMap::new());
+        return Ok(BenchmarkEvidence::default());
     };
     let bytes =
         std::fs::read(path).with_context(|| format!("read benchmark report {}", path.display()))?;
     let report: AllModelsReport = serde_json::from_slice(&bytes)
         .with_context(|| format!("parse benchmark report {}", path.display()))?;
-    let mut output: BTreeMap<String, BTreeMap<Capability, f64>> = BTreeMap::new();
+    let mut output = BenchmarkEvidence::default();
+    // Old reports remain readable, but cannot establish which artifact was measured. Duplicate
+    // metadata for a tag is ambiguous even when a ranking happens to name that tag only once.
+    let mut digests = BTreeMap::<String, Option<String>>::new();
+    for model in report.models {
+        let metadata = model.metadata;
+        let digest = metadata.digest.filter(|digest| !digest.trim().is_empty());
+        digests
+            .entry(metadata.name)
+            .and_modify(|known| *known = None)
+            .or_insert(digest);
+    }
     for (capability, rankings) in report.rankings {
         for entry in rankings {
-            if entry.attempted > 0 && entry.passed == entry.attempted {
+            if entry.attempted > 0
+                && entry.passed == entry.attempted
+                && entry.useful_cases_per_hour.is_finite()
+                && entry.useful_cases_per_hour >= 0.0
+                && let Some(Some(digest)) = digests.get(&entry.model)
+            {
                 output
+                    .models
                     .entry(entry.model)
-                    .or_default()
+                    .or_insert_with(|| (digest.clone(), BTreeMap::new()))
+                    .1
                     .insert(capability, entry.useful_cases_per_hour);
             }
         }
@@ -93,6 +123,11 @@ struct PolicyFile {
 #[serde(deny_unknown_fields)]
 struct TaskPolicy {
     qualified_models: Vec<String>,
+    /// Digest recorded by the evaluation that qualified each exact tag. A tag without a digest
+    /// is unqualified for every installed artifact; the runtime never fills one in from today's
+    /// installed artifact.
+    #[serde(default)]
+    model_digests: BTreeMap<String, String>,
     /// Request defaults per exact model tag, applied when routing picks that model for the task.
     #[serde(default)]
     model_options: BTreeMap<String, ModelRequestDefaults>,
@@ -103,8 +138,34 @@ struct TaskPolicy {
 pub(super) struct Policies {
     /// Quality-qualified models per task, best first.
     pub(super) qualified: BTreeMap<TaskKind, Vec<String>>,
+    pub(super) model_digests: BTreeMap<TaskKind, BTreeMap<String, String>>,
     /// Request defaults per task and exact model tag.
     pub(super) model_options: BTreeMap<TaskKind, BTreeMap<String, ModelRequestDefaults>>,
+}
+
+impl Policies {
+    pub(super) fn ranks_for_model(
+        &self,
+        name: &str,
+        digest: Option<&str>,
+    ) -> BTreeMap<TaskKind, usize> {
+        let Some(digest) = digest.filter(|digest| !digest.is_empty()) else {
+            return BTreeMap::new();
+        };
+        self.qualified
+            .iter()
+            .filter_map(|(task, models)| {
+                (self.model_digests.get(task)?.get(name)? == digest)
+                    .then(|| {
+                        models
+                            .iter()
+                            .position(|model| model == name)
+                            .map(|rank| (*task, rank))
+                    })
+                    .flatten()
+            })
+            .collect()
+    }
 }
 
 pub(super) fn load_policies(path: Option<&PathBuf>) -> Result<Policies> {
@@ -138,6 +199,14 @@ pub(super) fn load_policies(path: Option<&PathBuf>) -> Result<Policies> {
         );
         ensure!(
             policy
+                .model_digests
+                .iter()
+                .all(|(model, digest)| policy.qualified_models.contains(model)
+                    && !digest.trim().is_empty()),
+            "policy {task:?} model_digests must bind qualified models to non-empty measured digests"
+        );
+        ensure!(
+            policy
                 .model_options
                 .keys()
                 .all(|model| !model.trim().is_empty()),
@@ -154,6 +223,7 @@ pub(super) fn load_policies(path: Option<&PathBuf>) -> Result<Policies> {
     let mut policies = Policies::default();
     for (task, policy) in file.policies {
         policies.qualified.insert(task, policy.qualified_models);
+        policies.model_digests.insert(task, policy.model_digests);
         if !policy.model_options.is_empty() {
             policies.model_options.insert(task, policy.model_options);
         }
@@ -161,22 +231,14 @@ pub(super) fn load_policies(path: Option<&PathBuf>) -> Result<Policies> {
     Ok(policies)
 }
 
+/// A capability the platform routes on, `None` for a word it does not know (kept as text).
 pub(super) fn parse_capability(value: &str) -> Option<Capability> {
-    match value {
-        "completion" => Some(Capability::Completion),
-        "tools" => Some(Capability::Tools),
-        "vision" => Some(Capability::Vision),
-        "audio" => Some(Capability::Audio),
-        "thinking" => Some(Capability::Thinking),
-        "embedding" => Some(Capability::Embedding),
-        _ => None,
-    }
+    Some(Capability::parse(value)).filter(|capability| *capability != Capability::Other)
 }
 
 pub fn machine_profile(upstream: &str) -> MachineProfile {
     let memory_bytes = host_total_memory_bytes();
-    let (memory_kind, unified_memory) =
-        memory_semantics(std::env::consts::OS, std::env::consts::ARCH);
+    let (memory_kind, _) = memory_semantics(std::env::consts::OS, std::env::consts::ARCH);
     MachineProfile {
         os: std::env::consts::OS.to_owned(),
         architecture: std::env::consts::ARCH.to_owned(),
@@ -184,7 +246,6 @@ pub fn machine_profile(upstream: &str) -> MachineProfile {
         logical_cpus: std::thread::available_parallelism().map_or(1, usize::from),
         memory_bytes,
         memory_kind,
-        unified_memory_bytes: unified_memory.then_some(memory_bytes).flatten(),
         available_disk_bytes: available_disk_bytes(),
         ollama_endpoint: upstream.to_owned(),
         gpu: cached_gpu(),
@@ -287,7 +348,6 @@ pub(crate) async fn machine_profile_off_runtime(upstream: &str) -> MachineProfil
                 logical_cpus: std::thread::available_parallelism().map_or(1, usize::from),
                 memory_bytes: None,
                 memory_kind,
-                unified_memory_bytes: None,
                 available_disk_bytes: None,
                 ollama_endpoint: upstream.to_owned(),
                 gpu: None,
@@ -449,6 +509,102 @@ mod tests {
     };
 
     #[test]
+    fn policy_quality_is_bound_to_measured_digest_but_operator_defaults_survive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("policy.toml");
+        std::fs::write(
+            &path,
+            r#"
+schema_version = 1
+[policies.completion]
+qualified_models = ["model:latest"]
+model_digests = { "model:latest" = "sha256:measured" }
+[policies.completion.model_options."model:latest"]
+num_predict = 64
+"#,
+        )
+        .unwrap();
+        let policies = super::load_policies(Some(&path)).unwrap();
+        assert_eq!(
+            policies
+                .ranks_for_model("model:latest", Some("sha256:measured"))
+                .get(&super::TaskKind::Completion),
+            Some(&0)
+        );
+        assert!(
+            policies
+                .ranks_for_model("model:latest", Some("sha256:replaced"))
+                .is_empty()
+        );
+        assert!(policies.ranks_for_model("model:latest", None).is_empty());
+        assert_eq!(
+            policies.model_options[&super::TaskKind::Completion]["model:latest"].num_predict,
+            Some(64)
+        );
+        std::fs::write(
+            &path,
+            "schema_version=1\n[policies.completion]\nqualified_models=['model:latest']\n",
+        )
+        .unwrap();
+        let undigested = super::load_policies(Some(&path)).unwrap();
+        assert_eq!(
+            undigested.qualified[&super::TaskKind::Completion],
+            ["model:latest"]
+        );
+        assert!(
+            undigested
+                .ranks_for_model("model:latest", Some("sha256:current"))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn benchmark_replacement_and_duplicate_metadata_never_reuse_scores() {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("benchmark.json");
+        let mut report = json!({
+            "schema_version":1,"endpoint":"http://local:11434","server_version":"test","profile":"test","methodology":[],
+            "models":[{"metadata":{"name":"model:latest","digest":"sha256:measured","size":1,"format":"gguf","family":"test","parameter_size":"1B","quantization":"Q4","capabilities":["completion"],"advertised_context":2048},"cold_start":null,"cases":[],"resident_size":null,"resident_vram":null}],
+            "rankings":{"completion":[{"model":"model:latest","passed":3,"attempted":3,"quality_rate":1.0,"useful_cases_per_hour":42.0,"mean_decode_tokens_per_second":null}]}
+        });
+        std::fs::write(&path, serde_json::to_vec(&report).unwrap()).unwrap();
+        let bound = super::load_benchmark(Some(&path)).unwrap();
+        assert_eq!(
+            bound.for_model("model:latest", Some("sha256:measured"))
+                [&super::Capability::Completion],
+            42.0
+        );
+        assert!(
+            bound
+                .for_model("model:latest", Some("sha256:replacement"))
+                .is_empty()
+        );
+        assert!(bound.for_model("model:latest", None).is_empty());
+        report["models"][0]["metadata"]
+            .as_object_mut()
+            .unwrap()
+            .remove("digest");
+        std::fs::write(&path, serde_json::to_vec(&report).unwrap()).unwrap();
+        assert!(
+            super::load_benchmark(Some(&path))
+                .unwrap()
+                .for_model("model:latest", Some("sha256:measured"))
+                .is_empty()
+        );
+        report["models"][0]["metadata"]["digest"] = json!("sha256:measured");
+        let duplicate = report["models"][0].clone();
+        report["models"].as_array_mut().unwrap().push(duplicate);
+        std::fs::write(&path, serde_json::to_vec(&report).unwrap()).unwrap();
+        assert!(
+            super::load_benchmark(Some(&path))
+                .unwrap()
+                .for_model("model:latest", Some("sha256:measured"))
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn gpu_profiles_parse_apple_registry_and_nvidia_smi() {
         let ioreg = "+-o AGXAcceleratorG14X  <class AGXAcceleratorG14X, id 0x1000003f8>\n    {\n      \"gpu-core-count\" = 19\n      \"model\" = \"Apple M2 Pro\"\n    }\n";
         assert_eq!(
@@ -479,10 +635,8 @@ mod tests {
         assert!(profile.available_disk_bytes.is_some_and(|bytes| bytes > 0));
         if cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64" {
             assert_eq!(profile.memory_kind, "unified");
-            assert_eq!(profile.unified_memory_bytes, profile.memory_bytes);
         } else {
             assert_eq!(profile.memory_kind, "system");
-            assert_eq!(profile.unified_memory_bytes, None);
         }
     }
 

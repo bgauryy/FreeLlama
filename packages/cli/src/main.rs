@@ -105,6 +105,9 @@ async fn run() -> Result<()> {
         Command::Models { endpoint } => {
             print_get(&endpoint, "/_freellama/v1/models").await?;
         }
+        Command::Catalog { endpoint, job } => {
+            requests::request_catalog(&endpoint, job.as_deref()).await?;
+        }
         Command::Machine { endpoint } => {
             print_get(&endpoint, "/_freellama/v1/machine").await?;
         }

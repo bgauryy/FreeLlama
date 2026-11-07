@@ -13,13 +13,15 @@ export function registerDocsResources(server: McpServer): void {
   if (!existsSync(path.join(PACKAGED_DOCS_DIR, "README.md"))) {
     throw new Error(`FreeLlama MCP documentation index is missing at ${PACKAGED_DOCS_DIR}/README.md; run the package build.`);
   }
-  const packagedDocs = readdirSync(PACKAGED_DOCS_DIR).filter((name) => name.endsWith(".md")).sort();
+  // Includes subfolders: freellama://docs/cookbooks/classify, freellama://docs/octocode/LOCAL.
+  const packagedDocs = readdirSync(PACKAGED_DOCS_DIR, { recursive: true, encoding: "utf8" })
+    .map((name) => name.split(path.sep).join("/")).filter((name) => name.endsWith(".md")).sort();
   for (const name of packagedDocs) {
     const isIndex = name === "README.md";
     const slug = isIndex ? "index" : name.replace(/\.md$/, "");
     const uri = `freellama://docs/${slug}`;
     server.registerResource(
-      `freellama-docs-${slug.toLowerCase()}`,
+      `freellama-docs-${slug.toLowerCase().replaceAll("/", "-")}`,
       uri,
       {
         mimeType: "text/markdown",

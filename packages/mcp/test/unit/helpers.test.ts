@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
-  canonicalTaskKind,
   configuredExternalCost,
+  decisionAnswerText,
   costTelemetry,
   errorResult,
   parsedResult,
@@ -28,10 +28,23 @@ describe("extractExistingWorkspacePath", () => {
   });
 });
 
-describe("managed task aliases", () => {
-  it("normalizes the natural code-review alias at the MCP boundary", () => {
-    expect(canonicalTaskKind("code_review")).toBe("coding");
-    expect(canonicalTaskKind("code_repair")).toBe("code_repair");
+describe("decision answers", () => {
+  it("print one line per question, using the fields /v1/systemone returns", () => {
+    expect(decisionAnswerText({
+      kind: { type: "choice", choice: "bug", probabilities: { bug: 0.978, feature: 0.022 }, confidence: 0.89 },
+      refund: { type: "noul", noul: 0.9989 },
+      urgency: { type: "score", score: 0.83, legend: { "0": "Routine", "1": "Soon", "2": "Immediate" },
+        probabilities: { "0": 0.3, "1": 0.57, "2": 0.13 }, confidence: 0.4 },
+    })).toBe([
+      "kind: bug (p 0.98, confidence 0.89)",
+      "refund: true (p(true) 1.00)",
+      'urgency: 0.83 of 0-2, likeliest "Soon" (confidence 0.40)',
+    ].join("\n"));
+  });
+
+  it("is the answer text of a decision task", () => {
+    expect(taskAnswerText({ route: { selected_model: "d:1" }, response: { answers: { a: { type: "noul", noul: 0.2 } } } }))
+      .toBe("[d:1] a: false (p(true) 0.20)");
   });
 });
 

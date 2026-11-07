@@ -1,5 +1,8 @@
 //! Local Ollama gateway, evidence-aware router, benchmark harness, and server library.
 
+/// The shipped model catalog: tested picks per job with their evidence. MCP bundles the same file.
+pub const MODEL_CATALOG: &str = include_str!("model_catalog.json");
+
 pub mod auth;
 pub mod capability;
 mod doctor;

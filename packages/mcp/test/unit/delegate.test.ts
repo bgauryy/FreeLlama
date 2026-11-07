@@ -1,14 +1,48 @@
-import { describe, expect, it } from "vitest";
-import { assessDelegatedAnswer, MODEL_EVIDENCE } from "../../src/delegate.js";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { assessDelegatedAnswer as assessArtifact, MODEL_EVIDENCE, parseModelEvidence, verifiedResearchDigest } from "../../src/delegate.js";
 
-// The evidence table is loaded from packages/mcp/evidence/model-evidence.json at import time; these
-// tests run inside the repo, so the real table is present. If a model named here is removed from
-// the evidence file, the first test fails loudly instead of the verdicts silently degrading.
+const DIGEST = "a".repeat(64);
+const saved = { ...MODEL_EVIDENCE };
+beforeEach(() => Object.assign(MODEL_EVIDENCE, parseModelEvidence({ models: {
+  "qwen3.8:27b-mlx": { grade: "strong", note: "fixture measured strong", model_digest: DIGEST },
+  "gemma4:12b-mlx": { grade: "weak", note: "fixture measured weak", model_digest: DIGEST },
+  "qwen2.5:0.5b": { grade: "unusable", note: "fixture measured unusable", model_digest: DIGEST },
+} })));
+afterEach(() => {
+  for (const name of Object.keys(MODEL_EVIDENCE)) delete MODEL_EVIDENCE[name];
+  Object.assign(MODEL_EVIDENCE, saved);
+});
+const assessDelegatedAnswer = (question: string, count: number, model: string) => assessArtifact(question, count, model, DIGEST);
+
+// Deterministic measured-artifact fixtures; never assign today's digest to historical evidence.
 describe("MODEL_EVIDENCE", () => {
-  it("loads the on-disk evidence table (not compiled in, not empty)", () => {
+  it("accepts only validated evidence records", () => {
     expect(Object.keys(MODEL_EVIDENCE).length).toBeGreaterThan(0);
     expect(MODEL_EVIDENCE["qwen3.8:27b-mlx"]?.grade).toBe("strong");
     expect(MODEL_EVIDENCE["qwen2.5:0.5b"]?.grade).toBe("unusable");
+  });
+
+  it("does not qualify old records or invalid grade strings", () => {
+    expect(parseModelEvidence({ models: {
+      old: { grade: "strong", note: "name only" },
+      invalid: { grade: "strnog", note: "typo", model_digest: DIGEST },
+      guessed: { grade: "strong", note: "no identity", model_digest: "guess" },
+      valid: { grade: "weak", note: "measured", model_digest: `sha256:${DIGEST}` },
+    } })).toEqual({ valid: { grade: "weak", note: "measured", model_digest: DIGEST } });
+    expect(() => parseModelEvidence({ models: "invalid" })).toThrow();
+  });
+
+  it("requires the same executed artifact on every managed turn", () => {
+    const model = "qwen3.8:27b-mlx";
+    const receipt = (digest = DIGEST) => ({ model, execution: {
+      model_digest: digest, observation: { resident: true, digest },
+    } });
+    expect(verifiedResearchDigest([receipt(), receipt()], model)).toBe(DIGEST);
+    for (const records of [[], [receipt(), receipt("b".repeat(64))], [receipt(), { model, execution: { model_digest: DIGEST } }],
+      [{ ...receipt(), model: "other:tag" }]]) expect(verifiedResearchDigest(records, model)).toBeUndefined();
+    for (const digest of [undefined, "b".repeat(64)]) {
+      expect(assessArtifact("Where is x declared?", 2, model, digest).recommendation).toBe("verify");
+    }
   });
 });
 

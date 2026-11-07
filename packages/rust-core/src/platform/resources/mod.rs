@@ -6,12 +6,14 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 mod governor;
+mod holders;
 mod pressure;
 mod sampling;
 #[cfg(test)]
 mod tests;
 
 pub use governor::{ResourceGovernor, ResourcePermit};
+pub use holders::{MemoryHolder, describe as describe_holders, memory_holders};
 
 pub(crate) use sampling::bounded_output;
 pub(crate) use sampling::run_bounded;
@@ -22,6 +24,8 @@ pub use sampling::sample_host_resources;
 pub(crate) use sampling::{apply_thermal_pressure, bounded_command_with};
 
 const GIB: u64 = 1024 * 1024 * 1024;
+/// A load smaller than this is not held by active swapping alone (it still needs its own reserve).
+const SMALL_LOAD_BYTES: u64 = GIB;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -236,6 +240,17 @@ pub enum PressureReason {
     ActiveSwapping,
 }
 
+impl PressureReason {
+    /// A shortage of memory, which closing other programs relieves (unlike CPU load or heat).
+    #[must_use]
+    pub const fn is_memory(self) -> bool {
+        matches!(
+            self,
+            Self::LowAvailableMemory | Self::OsMemoryPressure | Self::ActiveSwapping
+        )
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ResourceSnapshot {
     pub status: &'static str,
@@ -243,6 +258,8 @@ pub struct ResourceSnapshot {
     pub reasons: Vec<PressureReason>,
     pub healthy_samples: u32,
     pub sample_count: u64,
+    /// Accounting generation when this observation began; invalidated by forecast releases.
+    pub sample_generation: u64,
     pub sample_age_ms: u128,
     pub reserved_bytes: u64,
     pub effective_available_bytes: Option<u64>,
@@ -257,6 +274,7 @@ pub struct ResourceSnapshot {
 pub enum CapacityDenialReason {
     HostPressure,
     TelemetryUnavailable,
+    StaleObservation,
     /// [`LowMemoryMode::Refuse`]: the load does not fit the available-memory reserve.
     InsufficientCapacity,
     ArithmeticOverflow,
@@ -370,6 +388,7 @@ impl ResourceSnapshot {
             Some(CapacityDenialReason::TelemetryUnavailable) => "held_telemetry_unavailable",
             Some(CapacityDenialReason::InsufficientCapacity) => "held_insufficient_capacity",
             Some(CapacityDenialReason::ArithmeticOverflow) => "held_arithmetic_overflow",
+            Some(CapacityDenialReason::StaleObservation) => "held_stale_observation",
             None if memory_advisory.is_some() => "ready_low_memory_estimate",
             None if self.observation.available_memory_bytes.is_none() => "ready_telemetry_unknown",
             None => "ready",
@@ -432,10 +451,10 @@ impl ResourceDemand {
         self.resident && self.bytes == 0
     }
 
-    /// Whether a host pressure hold applies to this demand. Memory-capacity holds (low available
-    /// memory, active swapping) never apply to a resident runner: the load that caused them must
-    /// stay reusable or the host deadlocks on its own model, and low available memory is only
-    /// advisory under [`LowMemoryMode::Advisory`]. A CPU-load hold applies only to CPU-bound
+    /// Whether a host pressure hold applies to this demand. Active swapping never applies to a
+    /// resident runner: the load that caused it must stay reusable or the host deadlocks on its own
+    /// model. Low available memory holds nothing by itself; whether a new load fits its own reserve
+    /// is decided by the capacity check ([`ResourceSnapshot::assess_demand`]). A CPU-load hold applies only to CPU-bound
     /// work: saturated cores slow decoding on them, not a GPU load or GPU inference. A thermal
     /// hold applies to CPU-bound work and to cold loads, a new heat source while the OS reports
     /// throttling; a bounded request on a loaded GPU runner is not held, as waiting only delays
@@ -450,8 +469,21 @@ impl ResourceDemand {
         os_critical: bool,
     ) -> bool {
         match reason {
-            PressureReason::LowAvailableMemory => !advisory_low_memory && !self.resident_only(),
-            PressureReason::ActiveSwapping => !self.resident_only(),
+            // Low available memory is judged per load, not host-wide: the capacity check admits
+            // a load that still leaves its own reserve (at least 1 GiB, up to the host reserve
+            // for a large one) and holds one that does not. A host-wide hold here kept a 300 MB
+            // embedding model out while 4 GB were free.
+            PressureReason::LowAvailableMemory => {
+                let _ = advisory_low_memory;
+                false
+            }
+            // A small load of known size (under the 1 GiB minimum reserve) adds too little to
+            // matter while the OS pages, and still has to fit its own reserve; anything larger, or
+            // of unknown size, waits until swapping stops. Without this a build that keeps the
+            // machine swapping blocked even a 300 MB embedding model.
+            PressureReason::ActiveSwapping => {
+                !self.resident_only() && (self.bytes == 0 || self.bytes >= SMALL_LOAD_BYTES)
+            }
             // Saturated host cores slow work that decodes on them; they say nothing about a GPU
             // load or GPU inference, so a busy compiler never blocks a GPU model.
             PressureReason::HighCpuLoad => self.cpu_bound,

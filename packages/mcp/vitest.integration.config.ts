@@ -1,3 +1,4 @@
+import { fileURLToPath } from "node:url";
 import { defineConfig } from "vitest/config";
 
 // Integration tier: drives the built server (dist/index.js) through the real MCP protocol over
@@ -10,7 +11,7 @@ export default defineConfig({
     name: "mcp-integration",
     environment: "node",
     include: ["test/integration/**/*.test.ts"],
-    globalSetup: ["test/setup/global.ts"],
+    globalSetup: ["test/setup/global.ts", fileURLToPath(new URL("../../vitest.tmp.global.ts", import.meta.url))],
     fileParallelism: false,
     testTimeout: 120_000,
     hookTimeout: 60_000,

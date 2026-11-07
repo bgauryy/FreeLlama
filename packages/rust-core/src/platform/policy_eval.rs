@@ -26,6 +26,8 @@ pub const PUBLISHABLE_TRIALS: i64 = 3;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Qualified {
     pub model: String,
+    /// Only evidence recorded by the evaluation itself. Never inferred from today's tag.
+    pub model_digest: Option<String>,
     pub pass_at_1: f64,
     pub agent: Option<String>,
     pub trials: i64,
@@ -146,6 +148,11 @@ pub fn qualify(
         }
         qualified.push(Qualified {
             model: finalists[0].to_owned(),
+            model_digest: entry
+                .get("model_digest")
+                .and_then(Value::as_str)
+                .filter(|digest| !digest.trim().is_empty())
+                .map(str::to_owned),
             pass_at_1: passed,
             agent: entry
                 .get("agent")
@@ -202,9 +209,8 @@ pub fn render_policy(
     if smoke {
         out.push_str(
             "#\n# SMOKE-ONLY: generated from a run with fewer than three trials. The harness treats\n\
-             # that as a smoke result, not publishable evidence. Routes qualified by this file will\n\
-             # report medium confidence on thin evidence — re-run with more trials before relying\n\
-             # on it for anything quality-sensitive.\n",
+             # that as a smoke result, not publishable evidence. The runtime refuses this file;\n\
+             # re-run with more trials before using it as a quality contract.\n",
         );
     }
     out.push('\n');
@@ -212,6 +218,17 @@ pub fn render_policy(
         let _ = writeln!(out, "[policies.{}]", task.as_str());
         let quoted: Vec<String> = models.iter().map(|q| json_ascii(&q.model)).collect();
         let _ = writeln!(out, "qualified_models = [{}]", quoted.join(", "));
+        let bindings: Vec<String> = models
+            .iter()
+            .filter_map(|q| {
+                q.model_digest
+                    .as_ref()
+                    .map(|digest| format!("{} = {}", json_ascii(&q.model), json_ascii(digest)))
+            })
+            .collect();
+        if !bindings.is_empty() {
+            let _ = writeln!(out, "model_digests = {{ {} }}", bindings.join(", "));
+        }
         for q in models {
             let agent = q
                 .agent
@@ -224,6 +241,13 @@ pub fn render_policy(
                 "# {} — pass_at_1 {:.3} over {} trial(s){agent}",
                 q.model, q.pass_at_1, q.trials
             );
+            if q.model_digest.is_none() {
+                let _ = writeln!(
+                    out,
+                    "# {} has no measured model_digest; re-evaluation is required before runtime qualification.",
+                    q.model
+                );
+            }
         }
         out.push('\n');
     }
@@ -367,7 +391,7 @@ mod tests {
     fn aggregate(trials: i64, passed: f64, fresh: bool) -> Value {
         json!({
             "suite": {"id": "s", "benchmark_date": "2026-08-27", "review": {"fresh": fresh, "review_due_at": "2026-09-27"}},
-            "models": [{"id": "qwen3.8-27b-mlx-bash", "agent": "bash", "pass_at_1": passed, "trial_budget": trials}],
+            "models": [{"id": "qwen3.8-27b-mlx-bash", "agent": "bash", "pass_at_1": passed, "trial_budget": trials, "model_digest":"sha256:measured"}],
         })
     }
 
@@ -561,7 +585,7 @@ mod tests {
         assert_eq!(parse_task_kind("long_context"), Ok(TaskKind::LongContext));
         assert_eq!(
             parse_task_kind("poetry").unwrap_err(),
-            "unknown task 'poetry'; choose one of completion, coding, code_repair, tools, browser, vision, embedding, long_context"
+            "unknown task 'poetry'; choose one of completion, coding, code_repair, tools, browser, vision, embedding, long_context, decision"
         );
     }
 
@@ -658,6 +682,7 @@ mod tests {
              # threshold     = pass_at_1 >= 0.80\n\n\
              [policies.coding]\n\
              qualified_models = [\"qwen3.8:27b-mlx\"]\n\
+             model_digests = { \"qwen3.8:27b-mlx\" = \"sha256:measured\" }\n\
              # qwen3.8:27b-mlx — pass_at_1 0.900 over 3 trial(s), agent bash\n\n"
         );
     }
@@ -686,6 +711,43 @@ mod tests {
                 TaskKind::LongContext,
                 vec!["gemma4:e4b".to_owned(), INSTALLED.to_owned()]
             )])
+        );
+        assert_eq!(
+            policies
+                .ranks_for_model(INSTALLED, Some("sha256:measured"))
+                .get(&TaskKind::LongContext),
+            Some(&1)
+        );
+        assert!(
+            policies
+                .ranks_for_model(INSTALLED, Some("sha256:replacement"))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn aggregate_without_a_digest_never_borrows_the_installed_digest() {
+        let mut data = aggregate(3, 0.9, true);
+        data["models"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("model_digest");
+        let (qualified, benchmark_date) =
+            qualify(&data, &installed(&[INSTALLED]), 0.8, false).unwrap();
+        assert_eq!(qualified[0].model_digest, None);
+        let rendered = render_policy(
+            &BTreeMap::from([(TaskKind::Coding, qualified)]),
+            "aggregate.json",
+            &benchmark_date,
+            0.8,
+            false,
+        );
+        assert!(rendered.contains("re-evaluation is required"));
+        let policies = round_trip(&rendered).unwrap();
+        assert!(
+            policies
+                .ranks_for_model(INSTALLED, Some("sha256:current"))
+                .is_empty()
         );
     }
 

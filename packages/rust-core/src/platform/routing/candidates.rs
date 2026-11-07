@@ -6,6 +6,9 @@ use super::{
 pub(super) fn requirements(input: &RouteInput) -> BTreeSet<Capability> {
     let mut required = input.required_capabilities.clone();
     required.insert(ranking_capability(input.task));
+    if matches!(input.task, TaskKind::Vision) {
+        required.insert(Capability::Completion);
+    }
     if matches!(
         input.task,
         TaskKind::Tools | TaskKind::Browser | TaskKind::CodeRepair
@@ -21,6 +24,7 @@ pub(super) fn ranking_capability(task: TaskKind) -> Capability {
         TaskKind::Tools | TaskKind::Browser => Capability::Tools,
         TaskKind::Vision => Capability::Vision,
         TaskKind::Embedding => Capability::Embedding,
+        TaskKind::Decision => Capability::Decision,
         TaskKind::Completion | TaskKind::Coding | TaskKind::CodeRepair | TaskKind::LongContext => {
             Capability::Completion
         }

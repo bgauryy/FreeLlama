@@ -16,7 +16,7 @@ import { connectClient, REPO_ROOT, serveAuthHeaders, serveIsUp, SERVE_ENDPOINT }
 type Tool = { name: string; description?: string; annotations?: any; outputSchema?: any; inputSchema?: any; title?: string };
 type ToolResult = { isError?: boolean; content: { text: string }[]; structuredContent?: any };
 
-const EXPECTED_TOOLS = ["doctor", "models", "run_task", "task_jobs", "session", "ollama_manage", "ollama_delete", "delegate_research", "scope", "read_response"];
+const EXPECTED_TOOLS = ["doctor", "models", "run_task", "task_jobs", "session", "ollama_manage", "ollama_delete", "delegate_research", "scope", "read_response", "audio"];
 
 // Whether `freellama serve` is up decides which half of the contract is checkable.
 const serveUp = await serveIsUp();
@@ -53,23 +53,27 @@ describe("tool contract", () => {
 
   it("teaches clients execution ownership and the model-installation approval gate", () => {
     const instructions = client.getInstructions() ?? "";
-    expect(instructions).toMatch(/caller owns task decomposition/);
-    expect(instructions).toMatch(/operator owns.*endpoints, exact --cpu-model assignments/s);
-    expect(instructions).toMatch(/Ollama plus the.*OS\/driver.*physical CPU\/GPU/s);
-    expect(instructions).toMatch(/models\{view:"installed"\}.*models\{view:"resident"\}/s);
-    expect(instructions).toMatch(/ask approval.*for one exact tag and reported size before ollama_manage/s);
-    expect(instructions).toMatch(/search or recommendation\s+is never download permission/i);
-    expect(instructions).toMatch(/run_task preview never executes; code_review aliases coding/);
-    expect(instructions).toMatch(/findings are candidates, not accepted defects/);
-    expect(instructions).toMatch(/requiredCapabilities:\["tools"\].*omit preview and supply the payload/s);
+    expect(instructions).toMatch(/so you spend fewer of your own tokens/);
+    expect(instructions).toMatch(/Offload when what you send plus what you read back costs less/);
+    expect(instructions).toContain('run_task {task:"decision", state, questions}');
+    expect(instructions).toContain("nearest:{query}");
+    expect(instructions).toMatch(/Name inputs with files \(paths or globs such as src\/\*\*\/\*\.rs, under the server's working directory or the temp directory\); pasted text and base64 images are your own output tokens/);
+    expect(instructions).toMatch(/or use a smaller installed model with the same capability/);
+    expect(instructions).toMatch(/what the items share \(task, model, systemPrompt, questions\) set once at the top level/);
+    expect(instructions).toMatch(/it saves local time, not your tokens/);
+    expect(instructions).toMatch(/offload 10 or more similar items, or an input over about 2,000 tokens/);
+    expect(instructions).toMatch(/Do it yourself: judgment you must stand behind/);
+    expect(instructions).toMatch(/You own the prompts, output format and verification: local answers are candidates/);
+    expect(instructions).toMatch(/models\{view:"installed"\}.*doctor\{view:"status"\}/s);
+    expect(instructions).toMatch(/before ollama_manage pull, ask the user for one exact tag and its reported size; search results are not permission/);
+    expect(instructions).toMatch(/Unload only a model you warmed or one the user named; delete only a tag the user names/);
     expect(instructions).toContain("Docs: freellama://docs/index");
-    expect(instructions).toContain("Scoped run_task needs scopeId+scopeRevision");
+    expect(byName.get("scope")!.description).toContain("run_task {scopeId, scopeRevision}");
     const requiredTaskFields = byName.get("run_task")!.inputSchema.required ?? [];
     expect(requiredTaskFields).not.toContain("scopeId");
     expect(requiredTaskFields).not.toContain("scopeRevision");
-    expect(instructions).toContain("Check isError first; prefer structuredContent, else content[].text");
-    expect(instructions).toContain("page.next_cursor→cursor unchanged");
-    expect(instructions).toContain("default-endpoint autostart optional");
+    expect(instructions).toContain("check isError first; prefer structuredContent");
+    expect(instructions).toContain("Pass page.next_cursor back unchanged");
     expect(byName.get("delegate_research")!.description).toContain("discard verification.recommendation=escalate");
   });
 
@@ -84,7 +88,7 @@ describe("tool contract", () => {
       "vision",
       "embedding",
       "long_context",
-      "code_review",
+      "decision",
     ]);
     expect(schema.properties.requiredCapabilities.items.enum).toEqual([
       "completion",
@@ -93,6 +97,8 @@ describe("tool contract", () => {
       "audio",
       "thinking",
       "embedding",
+      "decision",
+      "speech",
     ]);
     expect(schema.properties.executionPreference.enum).toEqual(["auto", "prefer_cpu", "prefer_gpu"]);
     expect(schema.properties.minPlacementEvidence.enum).toEqual(["configured", "observed"]);
@@ -142,12 +148,15 @@ describe("tool contract", () => {
     expect(mixedLibrarySteps.content[0].text).toMatch(/step 2 accepts only/);
 
     const stopTimeout = await call("ollama_manage", {
-      action: "stop",
+      action: "unload",
       model: "not-loaded:latest",
       timeoutSeconds: 1,
     });
     expect(stopTimeout.isError).toBe(true);
-    expect(stopTimeout.content[0].text).toMatch(/valid only for action "pull"/);
+    expect(stopTimeout.content[0].text).toMatch(/valid only for actions "pull" and "warm"/);
+    const warmField = await call("ollama_manage", { action: "pull", model: "x:1", systemPrompt: "s" });
+    expect(warmField.isError).toBe(true);
+    expect(warmField.content[0].text).toMatch(/`systemPrompt` applies to action "warm" only/);
 
     const createWithId = await call("session", { action: "create", sessionId: "00000000-0000-4000-8000-000000000000" });
     expect(createWithId.isError).toBe(true);
@@ -323,7 +332,7 @@ describe("tool contract", () => {
       expect(result.content[0].text).toMatch(/Structured result available|Ollama/);
       expect(result.content[0].text.length).toBeLessThan(500);
       if (name === "run_task") {
-        expect(result.structuredContent.execution?.placement).toMatch(/^(cpu|gpu)$/);
+        expect(result.structuredContent.execution?.requested_processor).toMatch(/^(cpu|gpu)$/);
         expect(result.structuredContent.execution?.preference).toBe("auto");
         expect(typeof result.structuredContent.execution?.reason).toBe("string");
       }
@@ -360,7 +369,7 @@ describe("tool contract", () => {
     expect(withheld.count).toBe(1);
     expect(typeof withheld.dimensions).toBe("number");
     expect(embed.structuredContent.route?.context_window_fit).toBe("fits_advertised_window");
-    expect(embed.structuredContent.route?.hardware_fit).toBe("context_window_only");
+    expect(embed.structuredContent.route?.hardware_fit).toBeUndefined();
 
     const full = await call("run_task", {
       task: "embedding",
@@ -471,9 +480,9 @@ describe("tool contract", () => {
     expect(Date.now() - started).toBeLessThan(5000);
   });
 
-  it("delegate_research offers exactly the two adapters", () => {
+  it("delegate_research offers exactly its three adapters", () => {
     const adapterTool = byName.get("delegate_research")!;
-    expect([...adapterTool.inputSchema.properties.adapter.enum].sort()).toEqual(["bash", "octocode"]);
+    expect([...adapterTool.inputSchema.properties.adapter.enum].sort()).toEqual(["bash", "github", "octocode"]);
   });
 
   it("delegate_research exposes typed budgets and keeps deployment tuning out of requests", () => {
@@ -504,12 +513,20 @@ describe("tool contract", () => {
   });
 
   it("keeps the schema surface within the token budget", () => {
-    // Paid on EVERY request, so it is a real running cost. Measured 7,431 tokens across 13 tools
-    // before the read-only merge and the de-duplication of RouteDecision.
+    // What the model reads on every request (cached by most clients): the instructions and each
+    // tool's name, description and input schema. Output schemas validate structuredContent for the
+    // client and are not sent to the model. Measured 7,431 tokens across 13 tools before the
+    // read-only merge and RouteDecision de-duplication; ~4,470 after it; 6,971 on 2026-11-01 with
+    // the offload instructions, shared batch fields, the decision/files/nearest fields, audio and the
+    // catalog, which replace pasted inputs, per-item repetition and returned vectors worth far more.
+    const modelFacing = tools.map(({ name, description, inputSchema }) => ({ name, description, inputSchema }));
     const surfaceTokens = Math.round(
-      (JSON.stringify(tools).length + (client.getInstructions() ?? "").length) / 4,
+      (JSON.stringify(modelFacing).length + (client.getInstructions() ?? "").length) / 4,
     );
-    expect(surfaceTokens, `schema surface grew to ~${surfaceTokens} tokens`).toBeLessThan(4500);
+    expect(surfaceTokens, `model-facing surface grew to ~${surfaceTokens} tokens`).toBeLessThan(7200);
+    // The whole tools/list payload, output schemas included (7,522 tokens on 2026-11-01).
+    const wireTokens = Math.round((JSON.stringify(tools).length + (client.getInstructions() ?? "").length) / 4);
+    expect(wireTokens, `tools/list grew to ~${wireTokens} tokens`).toBeLessThan(8200);
   });
 
   it("lists self-contained schemas with no $ref and no $schema dialect key", () => {

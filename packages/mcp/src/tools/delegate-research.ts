@@ -10,18 +10,20 @@ import {
   DEFAULT_SERVE_ENDPOINT, DEFAULT_TOKEN_CALIBRATION_DIR, RESEARCH_ADAPTERS, type ResearchAdapter, assertAllowedWorkspace,
   delegateEnvironment,
 } from "../config.js";
-import { cancelTaskJob, route } from "../serve-client.js";
+import { cancelTaskJob, listModels, route } from "../serve-client.js";
 import { killDelegateTree, liveDelegates, runDelegate } from "../lifecycle.js";
 import { progressSink } from "../progress.js";
 import { cancelOpenJobs, researchProgressFilter } from "../research-progress.js";
 import { PROGRESS_ENV } from "../research/progress-events.js";
+import { sourceBearingLookup } from "../research/source-evidence.js";
 import { EXTERNAL_COST } from "../telemetry.js";
 import {
   costTelemetry, endpointParam,
   structuredResult,
 } from "../helpers.js";
 import {
-  MODEL_EVIDENCE, STRONG_MODEL_HINT, assessDelegatedAnswer, extractExistingWorkspacePath, parseAdapterResult, researchErrorResult,
+  MODEL_EVIDENCE, STRONG_MODEL_HINT, assessDelegatedAnswer, extractExistingWorkspacePath, parseAdapterResult, qualifiedModelGrade,
+  researchErrorResult, verifiedResearchDigest,
 } from "../delegate.js";
 
 const researchResultSchema = z.object({
@@ -47,12 +49,14 @@ export function registerDelegateResearchTool(server: McpServer): void {
     "delegate_research",
     {
       description:
-        "Use when: a bounded read-only question about files under workspacePath (where is X, what calls Y). Do not use when: editing, external facts, or final judgment. " +
+        "Use when: a bounded read-only question about files under workspacePath (where is X, what calls Y) that would take you several searches and reads; " +
+        "a local tool-calling chat model does the searching, so it needs one installed and room to load it. " +
+        "Do not use when: editing, facts outside the workspace or GitHub, final judgment, or a question one search answers; to find files that match a text, run_task embedding with `nearest` is faster. " +
         "Returns: citations/answer; discard verification.recommendation=escalate, otherwise verify citations.",
       inputSchema: z.object({
         question: z.string().min(1),
         workspacePath: z.string().min(1),
-        adapter: z.enum(["bash", "octocode"]).optional(),
+        adapter: z.enum(["bash", "octocode", "github"]).optional().describe("bash (default) or octocode search workspacePath; github searches GitHub repositories and packages instead"),
         model: z.string().min(1).optional(),
         endpoint: endpointParam,
         agent: z
@@ -82,13 +86,20 @@ export function registerDelegateResearchTool(server: McpServer): void {
       } catch (error) {
         return researchErrorResult(error);
       }
-      // Pre-flight, not post-hoc: a model this repo measured at 0-38% will not become right by
-      // running it, so refuse before spending a model load and 10-40s of wall time on it.
-      const known = MODEL_EVIDENCE[chosenModel];
+      // Only an artifact-matched measurement can refuse before execution. A mutable tag's old
+      // grade must not silently apply to replacement weights.
+      let known;
+      if (MODEL_EVIDENCE[chosenModel]?.grade === "unusable") {
+        try {
+          const catalog = z.object({ models: z.array(z.object({ name: z.string(), digest: z.string().optional() }).loose()) })
+            .parse(JSON.parse(await listModels(endpoint)));
+          known = qualifiedModelGrade(chosenModel, catalog.models.find((entry) => entry.name === chosenModel)?.digest);
+        } catch { /* Unknown current identity leaves the old measurement unqualified. */ }
+      }
       if (known?.grade === "unusable") {
         return structuredResult({
           adapter: chosenAdapter,
-          verification: assessDelegatedAnswer(question, 0, chosenModel),
+          verification: assessDelegatedAnswer(question, 0, chosenModel, known.model_digest),
           answer: "",
           toolCallCount: 0,
           usage: { inputTokens: null, outputTokens: null },
@@ -113,8 +124,8 @@ export function registerDelegateResearchTool(server: McpServer): void {
             ),
           );
         }
-        // With a client progressToken the adapter reports each step as a prefixed stderr line; the
-        // filter turns those into progress notifications and keeps them out of captured stderr.
+        // The adapter always reports lifecycle events for cleanup. A client progressToken only
+        // controls whether the filter also forwards human-facing notifications.
         const report = progressSink(extra);
         report?.(`starting ${chosenAdapter} research with ${chosenModel}`);
         const environment: NodeJS.ProcessEnv = {
@@ -129,17 +140,15 @@ export function registerDelegateResearchTool(server: McpServer): void {
           ...(agent?.contextTokens !== undefined ? { FREELLAMA_AGENT_NUM_CTX: String(agent.contextTokens) } : {}),
           ...(agent?.outputTokens !== undefined ? { FREELLAMA_AGENT_NUM_PREDICT: String(agent.outputTokens) } : {}),
         };
-        // Never inherited from this server's environment: unfiltered progress lines would land in
-        // the stderr that failure diagnostics quote.
-        delete environment[PROGRESS_ENV];
-        if (report) environment[PROGRESS_ENV] = "stderr";
-        // With progress on, each managed turn is a deferred job; one still open when the adapter
-        // has exited (it was killed) is cancelled here so it does not keep a runner busy.
+        // Explicit and always filtered, independent of the parent server's environment.
+        environment[PROGRESS_ENV] = "stderr";
+        // Every managed turn is a deferred job; one still open when the adapter has exited
+        // (it was killed) is cancelled here so it does not keep a runner busy.
         const openJobs = new Set<string>();
         const running = runDelegate(process.execPath, [adapter], {
           signal: extra.signal,
           env: environment,
-          ...(report ? { stderrFilter: researchProgressFilter(report, resolvedWorkspace, openJobs) } : {}),
+          stderrFilter: researchProgressFilter(report ?? (() => undefined), resolvedWorkspace, openJobs),
           timeoutMs: DEFAULT_DELEGATE_TIMEOUT_SECONDS * 1000,
           // The answer is read from `resultFile`, never from stdout — but execFile's usual 1 MB
           // maxBuffer still applies to the agent's own progress logging, and overflowing it kills
@@ -196,18 +205,21 @@ export function registerDelegateResearchTool(server: McpServer): void {
         // command line in `arguments.command`. Normalize both so the evidence trail reads the same
         // whichever adapter ran.
         const evidence = result.tool_calls.map((call, index) => {
-          const target = call.arguments?.queries?.path;
+          const queries = call.arguments?.queries;
+          const target = Array.isArray(queries) ? queries[0]?.path : queries?.path;
           const rawDetail = call.arguments?.command ?? null;
           const detail = rawDetail ?? null;
           return {
             step: index + 1,
             tool: call.arguments?.tool ?? call.raw_name ?? "?",
-            // The adapters record "ok" | "error" | "repeat" per call. Carrying it through is what
+            // The adapters distinguish successful, empty, failed and repeated calls. Carrying it through is what
             // lets a reader tell a run that read three files from one that failed three commands —
             // indistinguishable in the trail before, and graded identically.
-            status: call.status ?? "ok",
+            status: call.status,
+            source_lookup: sourceBearingLookup(call, resolvedWorkspace),
+            ...(typeof call.exit_code === "number" ? { exit_code: call.exit_code } : {}),
             path: target
-              ? path.relative(resolvedWorkspace, target)
+              ? path.relative(resolvedWorkspace, path.resolve(resolvedWorkspace, target))
               : detail
                 ? extractExistingWorkspacePath(detail, resolvedWorkspace)
                 : null,
@@ -215,6 +227,7 @@ export function registerDelegateResearchTool(server: McpServer): void {
           };
         });
         const succeeded = evidence.filter((step) => step.status === "ok");
+        const sources = evidence.filter((step) => step.source_lookup);
         const failed = evidence.length - succeeded.length;
         // Each step's command is reported whole, with the cited path and tool, to spot-check source.
         const evidenceText = evidence
@@ -229,13 +242,14 @@ export function registerDelegateResearchTool(server: McpServer): void {
         // this shape — recommendation, why, citations — rather than parsing it back out of the prose.
         // Successful steps only: a failed command is not a citation for anything.
         // Citations point into `evidence` by step instead of repeating each command a second time.
-        const citations = succeeded.map((step) => ({ step: step.step, tool: step.tool, path: step.path }));
+        const citations = sources.map((step) => ({ step: step.step, tool: step.tool, path: step.path }));
         // Every observation the model saw, whole: the adapter's store is deleted with `dir` below,
         // so the saved response is the only place they survive.
         const observations = result.tool_calls.map((call, index) => ({
           step: index + 1,
           tool: evidence[index]?.tool ?? "?",
-          status: call.status ?? "ok",
+          status: call.status,
+          ...(typeof call.exit_code === "number" ? { exit_code: call.exit_code } : {}),
           arguments: call.arguments ?? null,
           result: typeof call.result === "string" ? call.result : (call.result ?? null),
         }));
@@ -253,7 +267,8 @@ export function registerDelegateResearchTool(server: McpServer): void {
         }
         // Grade on what actually read something. A run of failed commands is ungrounded no matter
         // how many of them there were.
-        const verification = assessDelegatedAnswer(question, succeeded.length, chosenModel);
+        const digest = verifiedResearchDigest(result.model_metadata?.execution_receipts, chosenModel);
+        const verification = assessDelegatedAnswer(question, sources.length, chosenModel, digest);
         const summary =
           `Delegated answer ready: ${result.tool_calls.length} tool call(s)` +
           (failed > 0 ? `, ${failed} of which did not succeed` : "") +
@@ -268,6 +283,7 @@ export function registerDelegateResearchTool(server: McpServer): void {
             citations,
             toolCallCount: result.tool_calls.length,
             successfulToolCallCount: succeeded.length,
+            sourceLookupCount: sources.length,
             usage: {
               inputTokens: result.usage.input_tokens,
               outputTokens: result.usage.output_tokens,

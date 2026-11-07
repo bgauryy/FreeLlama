@@ -48,10 +48,6 @@ pub(crate) async fn start_platform(args: PlatformStartArgs) -> Result<()> {
         .home
         .clone()
         .or_else(freellama::store::default_home);
-    // An ephemeral server writes nothing, not even the one-time copy of older operator files.
-    if let Some(home) = home.as_deref().filter(|_| !args.production.ephemeral) {
-        adopt_legacy_config(home);
-    }
     let (policy_file, benchmark_report) =
         resolve_operator_files(args.policy_file, args.benchmark_report, home.as_deref());
     let mut config = PlatformConfig::new(
@@ -191,22 +187,6 @@ fn with_runtime_and_store(
     let home = home.context("cannot determine the FreeLlama home; pass --home or --ephemeral")?;
     let path = home.join(freellama::store::DATABASE_FILE);
     let store = freellama::store::Store::open(&path)?;
-    if let Some(legacy) = legacy_data_dir()
-        && let Some(imported) = store.import_legacy(&legacy)?
-        && (imported.feedback || imported.footprints > 0 || imported.usage > 0)
-    {
-        eprintln!(
-            "freellama: imported {} usage records, {} footprints{} from {}",
-            imported.usage,
-            imported.footprints,
-            if imported.feedback {
-                " and placement feedback"
-            } else {
-                ""
-            },
-            legacy.display()
-        );
-    }
     eprintln!(
         "freellama: keeping footprints, feedback, usage and the residency audit in {}",
         path.display()
@@ -270,50 +250,6 @@ fn report_admission_config() {
         "freellama: without an explicit GPU budget the default follows the Ollama server's \
          OLLAMA_NUM_PARALLEL (2 units per parallel slot)"
     );
-}
-
-/// Where versions before the shared database kept their data files.
-fn legacy_data_dir() -> Option<PathBuf> {
-    if cfg!(target_os = "windows") {
-        return std::env::var_os("LOCALAPPDATA").map(|path| PathBuf::from(path).join("FreeLlama"));
-    }
-    std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
-        .map(|path| path.join("freellama"))
-}
-
-/// Where versions before the home directory kept their operator files.
-fn legacy_config_dir() -> Option<PathBuf> {
-    if cfg!(target_os = "windows") {
-        return std::env::var_os("APPDATA").map(|path| PathBuf::from(path).join("FreeLlama"));
-    }
-    std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-        .map(|path| path.join("freellama"))
-}
-
-/// Copy operator files from the old per-user config directory into the home once, so an upgrade
-/// keeps its policy. The old files stay where they were.
-fn adopt_legacy_config(home: &Path) {
-    let Some(legacy) = legacy_config_dir() else {
-        return;
-    };
-    for name in ["platform.toml", "benchmark-report.json", "runtime.toml"] {
-        let (from, to) = (legacy.join(name), home.join(name));
-        if from.is_file() && !to.exists() {
-            let copied = std::fs::create_dir_all(home).and_then(|()| std::fs::copy(&from, &to));
-            match copied {
-                Ok(_) => eprintln!(
-                    "freellama: copied {} into {}",
-                    from.display(),
-                    home.display()
-                ),
-                Err(error) => eprintln!("freellama: could not copy {}: {error}", from.display()),
-            }
-        }
-    }
 }
 
 /// Look for a conventional config file in the working directory (a project-local policy), then

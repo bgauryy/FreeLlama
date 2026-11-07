@@ -166,35 +166,59 @@ export function describeShellCommand(command: string): string {
 }
 
 /** A readable form of one octocode tool call, paths shown relative to the workspace. */
-export function describeOctocodeCall(tool: string, queries: Fields, workspace: string): string {
-  const where = shown(queries.path ?? queries.uri, workspace);
+export function describeOctocodeCall(tool: string, input: unknown, workspace: string): string {
+  const list = Array.isArray(input) ? (input as Fields[]) : [input as Fields];
+  const first = list[0] ?? {};
+  const more = list.length > 1 ? ` (+${list.length - 1} more)` : "";
+  return describeOctocodeQuery(tool, first, workspace) + more;
+}
+
+function describeOctocodeQuery(tool: string, queries: Fields, workspace: string): string {
+  const where = shown(queries.path, workspace);
+  const repo = typeof queries.repo === "string" ? `${String(queries.owner ?? "?")}/${queries.repo}` : undefined;
+  const words = (value: unknown) => (Array.isArray(value) ? value.filter((word) => typeof word === "string").join(", ") : text(value));
   switch (tool) {
-    case "localSearchCode": {
-      const term = text(queries.keywords) ?? text(queries.pattern);
+    case "localSearch": {
+      const term = words(queries.matchString);
       return term ? `grep ${quoted(term)} in ${where}` : `search ${where}`;
     }
-    case "localGetFileContent": {
-      const start = integer(queries.startLine);
-      const end = integer(queries.endLine);
-      const match = text(queries.matchString);
+    case "localFetch": {
+      const range = Array.isArray(queries.ranges) ? (queries.ranges[0] as Fields | undefined) : undefined;
+      const start = integer(range?.startLine);
+      const end = integer(range?.endLine);
+      const match = words(queries.matchString);
       const detail = start !== undefined && end !== undefined ? ` (lines ${start}-${end})`
         : match ? ` (around ${quoted(match)})`
-          : queries.minify === "symbols" ? " (outline)" : "";
+          : queries.view === "symbols" ? " (outline)" : "";
       return `read ${where}${detail}`;
     }
-    case "localViewStructure": {
+    case "structureSearch": {
       const depth = integer(queries.maxDepth);
-      return `list ${where}${depth !== undefined ? ` (depth ${depth})` : ""}`;
+      const include = words(queries.include);
+      return include ? `find ${include} in ${where}` : `list ${where}${depth !== undefined ? ` (depth ${depth})` : ""}`;
     }
-    case "localFindFiles": {
-      const names = Array.isArray(queries.names) ? queries.names.filter((name) => typeof name === "string") : [];
-      const what = names.length > 0 ? names.join(", ") : text(queries.pathPattern) ?? text(queries.regex);
-      return what ? `find ${what} in ${where}` : `find files in ${where}`;
+    case "astSearch": {
+      const terms = words((queries.symbolFilter as Fields | undefined)?.terms);
+      return terms ? `find declarations ${quoted(terms)} in ${where}` : `ast ${text(queries.operation) ?? "match"} in ${where}`;
     }
-    case "lspGetSemantics": {
+    case "lspSearch": {
       const symbol = text(queries.symbolName);
-      return `lsp ${text(queries.type) ?? "query"}${symbol ? ` ${quoted(symbol)}` : ""} in ${where}`;
+      return `lsp ${text(queries.operation) ?? "definition"}${symbol ? ` ${quoted(symbol)}` : ""} in ${where}`;
     }
+    case "ghSearchCode":
+      return `search ${repo ?? "GitHub"} for ${quoted(words(queries.keywords) ?? "?")}`;
+    case "ghGetFileContent":
+      return `read ${repo ?? "?"}:${String(queries.path ?? "?")}`;
+    case "ghStructure":
+      return `list ${repo ?? "?"}${queries.path ? `/${String(queries.path)}` : ""}`;
+    case "ghSearchRepo":
+      return repo ? `read repo ${repo}` : `find repos ${quoted(words(queries.keywords) ?? "?")}`;
+    case "ghSearchHistory":
+      return `search ${repo ?? "GitHub"} ${text(queries.operation) ?? "history"} for ${quoted(words(queries.keywords) ?? "?")}`;
+    case "ghGetHistoryItem":
+      return `read ${repo ?? "?"} ${text(queries.operation) ?? "item"} ${String(queries.number ?? queries.ref ?? "")}`.trimEnd();
+    case "artifactSearch":
+      return `resolve package ${String(queries.packageName ?? words(queries.keywords) ?? "?")}`;
     default:
       return `${tool} ${JSON.stringify(queries)}`;
   }

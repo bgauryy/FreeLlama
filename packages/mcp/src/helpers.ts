@@ -84,35 +84,32 @@ export const TASK_KINDS = [
   "vision",
   "embedding",
   "long_context",
+  "decision",
 ] as const;
-const MCP_TASK_KINDS = [...TASK_KINDS, "code_review"] as const;
-type McpTaskKind = (typeof MCP_TASK_KINDS)[number];
 export const taskParam = z
-  .enum(MCP_TASK_KINDS)
+  .enum(TASK_KINDS)
   .default("completion")
-  .describe("caller owns prompts and output format.");
-
-/**
- * MCP accepts the name humans and agents naturally use for a review, while the Rust routing
- * contract deliberately keeps one coding profile. Normalize at the boundary so every downstream
- * policy, receipt, and benchmark continues to use the canonical task kind.
- */
-export function canonicalTaskKind(task: McpTaskKind): (typeof TASK_KINDS)[number] {
-  return task === "code_review" ? "coding" : task;
-}
+  .describe(
+    "completion: chat; coding / code_repair: write or fix code; tools: returns tool_calls you run; browser: one short tool action; " +
+      "vision: images; embedding: vectors (rank with nearest); long_context: one input over ~16k tokens; " +
+      "decision: typed questions about a state, answered with probabilities. You own prompts and output format.",
+  );
 export const objectiveParam = z
   .enum(["fastest", "balanced", "quality"])
-  .optional();
+  .optional()
+  .describe("quality needs a task policy or an explicit model");
 export const executionPreferenceParam = z
   .enum(["auto", "prefer_cpu", "prefer_gpu"])
   .optional();
 export const minPlacementEvidenceParam = z
   .enum(["configured", "observed"])
+  .describe("observed = refuse unless /api/ps proves where the model runs")
   .optional();
 // Router grades only "low" | "medium"; the Rust core enforces the floor (`enforce_min_confidence`).
 export const minConfidenceParam = z
   .enum(["low", "medium"])
-  .optional();
+  .optional()
+  .describe("refuse a route graded below this; medium needs a task policy plus a benchmark");
 
 export const REQUIRED_CAPABILITIES = [
   "completion",
@@ -121,6 +118,8 @@ export const REQUIRED_CAPABILITIES = [
   "audio",
   "thinking",
   "embedding",
+  "decision",
+  "speech",
 ] as const;
 export const requiredCapabilitiesParam = z
   .array(z.enum(REQUIRED_CAPABILITIES))
@@ -143,6 +142,28 @@ export const localToolsParam = z.array(z.object({
     parameters: z.record(z.string(), z.unknown()).optional(),
   }).loose(),
 }).loose()).min(1).optional();
+
+/** Decision state: the text or JSON the questions are about. */
+export const stateParam = z.union([z.string().min(1), z.record(z.string(), z.unknown()), z.array(z.unknown()).min(1)]).optional();
+/** Decision questions, answered in order: noul = probability of true, choice = one option, score = a 0-based level. */
+export const questionsParam = z.record(
+  z.string().min(1).max(100),
+  z.object({
+    type: z.enum(["noul", "choice", "score"]),
+    instructions: z.union([z.string().min(1), z.record(z.string(), z.unknown()), z.array(z.unknown())]),
+    criteria: z.union([z.record(z.string(), z.string().nullable()), z.array(z.string()).min(2).max(10)]).optional(),
+  }).strict(),
+).optional();
+/** Paths the server reads into the task, so the caller does not paste file content. */
+export const filesParam = z.array(z.string().min(1)).min(1).max(2_000).optional();
+
+const embeddingItemParam = z.union([
+  z.string().min(1),
+  z.object({ text: z.string().optional(), image: z.string().min(1).optional(), audio: z.string().min(1).optional() })
+    .strict().refine((value) => value.text !== undefined || value.image !== undefined || value.audio !== undefined, "embedding input needs text, image or audio"),
+]);
+/** Ollama embedding inputs can be text or explicit modality objects, singly or mixed. */
+export const embeddingInputParam = z.union([embeddingItemParam, z.array(embeddingItemParam).min(1)]).optional();
 
 /** Only explicitly supplied instructions become a system message; existing messages stay intact. */
 export function taskMessages({ systemPrompt, messages, prompt, images }: {
@@ -180,11 +201,15 @@ const batchTaskParam = z.object({
   systemPrompt: systemPromptParam,
   messages: messagesParam,
   images: z.array(z.string().min(1)).min(1).optional(),
-  input: z.union([z.string().min(1), z.array(z.string().min(1)).min(1)]).optional(),
+  input: embeddingInputParam,
+  state: stateParam,
+  // Same shape as the top-level `questions`; the server validates it, so the schema is not repeated per item.
+  questions: z.record(z.string(), z.record(z.string(), z.unknown())).optional(),
+  files: filesParam,
   tools: localToolsParam,
   keepAlive: z.string().min(1).optional(),
   format: z.union([z.literal("json"), z.record(z.string(), z.unknown())]).optional(),
-  think: z.union([z.boolean(), z.enum(["low", "medium", "high"])]).optional(),
+  think: z.union([z.boolean(), z.string().min(1)]).optional(),
   options: z.record(z.string(), z.unknown()).optional(),
   logprobs: z.boolean().optional(),
   topLogprobs: z.number().int().nonnegative().optional(),
@@ -273,7 +298,7 @@ export function withRequiredCapability<T extends string>(
   return [...new Set([...(required ?? []), capability])];
 }
 
-/** A short human/backward-client cue; canonical result data stays in structuredContent. */
+/** A short human cue; canonical result data stays in structuredContent. */
 function resultSummary(value: Record<string, unknown>): string {
   const explicit = value.summary;
   if (typeof explicit === "string" && explicit.trim()) return explicit.trim();
@@ -306,6 +331,8 @@ export function taskAnswerText(payload: Record<string, unknown>): string | undef
     return header + parts.join("\n");
   }
   if (typeof response.response === "string") return header + response.response.trim();
+  const answers = record(response.answers);
+  if (answers) return header + decisionAnswerText(answers);
   const omitted = record(response.embeddings_omitted);
   if (Array.isArray(response.embeddings) || omitted) {
     const count = Array.isArray(response.embeddings) ? response.embeddings.length : omitted?.count;
@@ -313,6 +340,32 @@ export function taskAnswerText(payload: Record<string, unknown>): string | undef
     return `${header}embedding complete (${String(count ?? "?")} vectors); ${where}.`;
   }
   return undefined;
+}
+
+/** One line per decision answer: `kind: bug (p 0.97, confidence 0.94)`, `refund: true (p 0.99)`, `urgency: 1.20 of 0-2, likeliest "Soon" (confidence 0.40)`. */
+export function decisionAnswerText(answers: Record<string, unknown>): string {
+  const fixed = (value: unknown) => (typeof value === "number" ? value.toFixed(2) : "?");
+  return Object.entries(answers).map(([name, raw]) => {
+    const answer = record(raw) ?? {};
+    const confidence = typeof answer.confidence === "number" ? `, confidence ${fixed(answer.confidence)}` : "";
+    if (answer.type === "choice") {
+      const choice = String(answer.choice ?? "?");
+      return `${name}: ${choice} (p ${fixed(record(answer.probabilities)?.[choice])}${confidence})`;
+    }
+    if (answer.type === "noul" && typeof answer.noul === "number") {
+      return `${name}: ${answer.noul >= 0.5 ? "true" : "false"} (p(true) ${fixed(answer.noul)})`;
+    }
+    if (answer.type === "score") {
+      const legend = record(answer.legend) ?? {};
+      const probabilities = Object.entries(record(answer.probabilities) ?? {})
+        .filter((entry): entry is [string, number] => typeof entry[1] === "number");
+      const likeliest = probabilities.sort((left, right) => right[1] - left[1])[0]?.[0];
+      const top = Math.max(0, Object.keys(legend).length - 1);
+      const label = likeliest === undefined ? "" : `, likeliest ${JSON.stringify(legend[likeliest] ?? likeliest)}`;
+      return `${name}: ${fixed(answer.score)} of 0-${top}${label} (${confidence.slice(2) || "no confidence"})`;
+    }
+    return `${name}: ${JSON.stringify(raw)}`;
+  }).join("\n");
 }
 
 /** A cold load costs at least this much before the answer line mentions it. */
@@ -417,6 +470,28 @@ const SERVE_ADDRESS_PATTERN = (() => {
   return new RegExp(`(?:_freellama|${addresses.join("|")})`, "i");
 })();
 
+/**
+ * One line from a FreeLlama refusal body: the receipt behind a memory refusal is several KB, and
+ * says no more to an agent than why it waited and what would let it run. The full receipt stays
+ * in `structuredContent`.
+ */
+export function refusalLine(body: string, status?: number): string {
+  let parsed: { error?: unknown; code?: unknown; resource_admission?: { assessment?: Record<string, unknown> } };
+  try {
+    parsed = JSON.parse(body) as typeof parsed;
+  } catch {
+    return body.trim().slice(0, 400) || `HTTP ${status ?? "error"}`;
+  }
+  const error = typeof parsed.error === "string" ? parsed.error : `HTTP ${status ?? "error"}`;
+  const code = typeof parsed.code === "string" ? ` [${parsed.code}]` : "";
+  const assessment = parsed.resource_admission?.assessment;
+  if (!assessment) return `${error}${code}`;
+  const gb = (value: unknown) => (typeof value === "number" ? `${(value / 1e9).toFixed(1)} GB` : "?");
+  const held = Array.isArray(assessment.held_by) && assessment.held_by.length > 0 ? ` (held by ${assessment.held_by.join(", ")})` : "";
+  return `${error}${code}${held}: ${gb(assessment.effective_available_bytes)} available, ${gb(assessment.required_with_reserve_bytes)} needed with reserve; ` +
+    "retry once the host frees memory (doctor{view:\"status\"} shows what holds it)";
+}
+
 export function errorResult(error: unknown) {
   const message = error instanceof Error ? error.message : String(error);
   let receipt: Record<string, unknown> | undefined;
@@ -445,7 +520,7 @@ export function errorResult(error: unknown) {
     ? `${message}\n\nFreeLlama managed serve is unreachable. Start it with \`freellama serve\`, or set \`FREELLAMA_SERVE_ENDPOINT\` to a running managed endpoint; then retry. Run \`doctor\` to inspect the configured endpoint.`
     : ollamaUnavailable
       ? `${message}\n\nOllama is not running at that address. Ask the user to start Ollama (the app, or \`ollama serve\`); retrying before that cannot succeed.`
-      : message;
+      : receipt && message.length > 600 ? refusalLine(message) : message;
   return { content: [{ type: "text" as const, text: actionableMessage }], isError: true,
     ...(receipt ? { structuredContent: receipt } : {}) };
 }

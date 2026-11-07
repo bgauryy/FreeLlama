@@ -145,7 +145,7 @@ Expired entries are removed during store operations.
 
 ## Warm API
 
-`POST /warm`, MCP `run_task {warm:true}`, and CLI `warm` load an exact installed model with a matching
+`POST /warm`, MCP `ollama_manage {action:"warm"}`, and CLI `warm` load an exact installed model with a matching
 task profile; `task: "embedding"` loads an embedding model with an empty `/api/embed` request. A
 chat warm may carry `messages` (MCP: `systemPrompt` and/or `messages`): the runner evaluates them
 into its prompt cache with `num_predict: 0` and generates nothing, so a later request that starts
@@ -167,6 +167,12 @@ first `/v1/systemone` call, and `keep_alive` on that call sets their residency.
 | `timeout_seconds` | `timeoutSeconds` | Total request deadline, capped by server policy. |
 | `defer` | `defer` | Return a job handle for the same managed operation. |
 | `messages` | `systemPrompt`, `messages` | A prompt prefix to evaluate into the runner's prompt cache. |
+
+A warm of a model that is not resident is a load. Like any load it takes the backend's load lock
+(see [Load lock and use lease](CPU_GPU_ROUTING.md#load-lock-and-use-lease)) until its runner is
+observed in `/api/ps`, so it queues behind another load on the same backend but never waits for
+another model's decoding. It makes room only by unloading idle runners: a model with a running
+task is never evicted for a warm.
 
 Synchronous warming returns HTTP `200`; deferred warming returns HTTP `202`. Inspect deferred
 work through `task_jobs` or `jobs` using its returned ID. Warming reuses ordinary routing,
@@ -215,6 +221,14 @@ The runtime file's `[preload]` table loads models without a caller asking:
   is not loaded, fits without unloading anything (budget, GPU and host memory), the host is under no
   pressure, and nothing is running or queued on the backend. Only the primary backend predicts.
   `FREELLAMA_PREDICTIVE_PRELOAD=0` turns it off.
+
+  Predictive warm is refused on a discrete-GPU or remote backend. Vendor-wide free VRAM does not
+  say which devices that Ollama process may allocate on, and nothing in FreeLlama verifies it
+  (`gpu_capacity_scope` stays `host_aggregate_not_verified_for_backend`), so a speculative load
+  could displace work on a pool it cannot see. The skip reason is `GPU device eligibility for this
+  Ollama backend is unverified` (`opportunistic_warm_skipped`). Unified-memory hosts and the CPU
+  backend, where host memory is the budget, still predict. Explicit warms, startup preloads and
+  managed tasks on a discrete GPU run through ordinary admission.
 
 Each preload is a background warm under the usual admission, memory and pressure rules, and the
 residency audit records it as `preload` (or `preload_failed`) with trigger `startup` or

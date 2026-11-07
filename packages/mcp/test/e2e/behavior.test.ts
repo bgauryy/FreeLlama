@@ -3,6 +3,7 @@
 // the default ~27B model. Needs serve + Ollama + installed models; the slowest, truest tier.
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { MODEL_EVIDENCE, qualifiedModelGrade } from "../../src/delegate.js";
 import {
   connectClient,
   type IsolatedServe,
@@ -146,7 +147,11 @@ describe.runIf(releaseServeAvailable)("behavior: every tool against the live sys
     expect(tags.tags.some((entry: any) => (entry.sizeBytes ?? 0) > 100e9 && entry.fitsInMemory === false)).toBe(true);
   });
 
-  it("delegate_research: pre-flight refuses an unusable model with zero tool calls", async () => {
+  it("delegate_research: pre-flight refuses an unusable artifact with zero tool calls", async ({ skip }) => {
+    if (MODEL_EVIDENCE["qwen2.5:0.5b"]?.grade !== "unusable") skip("No artifact-bound unusable measurement.");
+    const installed = (await call("models", { view: "installed" })).structuredContent;
+    const current = installed?.models?.find((entry: { name?: string }) => entry.name === "qwen2.5:0.5b");
+    if (!qualifiedModelGrade("qwen2.5:0.5b", current?.digest)) skip("Current artifact is unqualified; do not start inference.");
     const escalated = (await call("delegate_research", {
       question: "unanswerable from files", workspacePath: REPO_ROOT, model: "qwen2.5:0.5b",
     })).structuredContent;
@@ -179,7 +184,9 @@ describe.runIf(releaseServeAvailable)("behavior: every tool against the live sys
     expect(groundedResult.isError ?? false, groundedResult.content?.[0]?.text).toBe(false);
     const grounded = groundedResult.structuredContent;
     expect(grounded.answer).toMatch(/napi/i);
-    expect(grounded.verification.recommendation).toBe("accept");
+    // Historical name-only grades cannot turn a correct live answer into qualified evidence.
+    expect(["accept", "verify"]).toContain(grounded.verification.recommendation);
+    expect(grounded.verification.grounded).toBe(true);
     expect(grounded.adapter).toBe("bash");
     expect(grounded.contextManagement.chars_per_token).toBe(3.5);
     expect(grounded.contextManagement.observation_page_chars).toBe(2048);

@@ -245,7 +245,6 @@ async fn verified_baseline(fixture: &Fixture) -> Value {
     assert_eq!(baseline["limit"], 4);
     assert_eq!(baseline["healthy_streak"], 0);
     assert_eq!(baseline["current_profile_count"], 0);
-    assert_eq!(baseline["baseline_output_tokens_per_second"], json!({}));
     baseline
 }
 
@@ -319,7 +318,7 @@ async fn upstream_failure_still_throttles_without_verified_placement() {
     let state = adaptive(&fixture).await;
     assert_eq!(state["limit"], 2);
     assert_eq!(state["last_decrease_reason"], "upstream_failure");
-    assert_eq!(state["baseline_output_tokens_per_second"], json!({}));
+    assert_eq!(state["current_profile_count"], 0);
 }
 
 #[tokio::test]
@@ -333,5 +332,5 @@ async fn host_pressure_still_throttles_without_verified_placement() {
     let state = adaptive(&fixture).await;
     assert_eq!(state["limit"], 2);
     assert_eq!(state["last_decrease_reason"], "host_memory_pressure");
-    assert_eq!(state["baseline_output_tokens_per_second"], json!({}));
+    assert_eq!(state["current_profile_count"], 0);
 }

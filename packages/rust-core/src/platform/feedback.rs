@@ -1,12 +1,109 @@
 //! Persisted placement feedback: per-backend latency stats and the CPU/GPU placement they suggest.
 
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    fmt::Write as _,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use super::{Backend, ExecutionPreference, Objective, TaskKind, runtime};
 use crate::store::Store;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+
+/// Limits apply independently to each task/backend, so many models cannot grow the cache forever.
+const MAX_PROFILE_WINDOWS: usize = 32;
+const MAX_PROFILE_SAMPLES: usize = 32;
+
+/// Prompt-free phases from a qualified execution. `upstream_setup_ns` is Ollama's reported setup
+/// time, not proof of a physical disk load. Unknown phases stay absent rather than becoming zero.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct PhaseSample {
+    pub(crate) queue_wait_ns: Option<u64>,
+    pub(crate) upstream_setup_ns: Option<u64>,
+    pub(crate) prefill_ns_per_token: Option<u64>,
+    pub(crate) decode_ns_per_token: Option<u64>,
+}
+
+/// Each phase qualifies independently after three observations under exactly the requested profile.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PhaseEstimate {
+    pub(crate) queue_wait_ns: Option<u128>,
+    pub(crate) upstream_setup_ns: Option<u128>,
+    pub(crate) prefill_ns_per_token: Option<u128>,
+    pub(crate) decode_ns_per_token: Option<u128>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+struct ProfileSample {
+    observed_at_ns: u64,
+    work_unit_ns: u64,
+    phases: PhaseSample,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProfileWindow {
+    profile: runtime::ExecutionProfile,
+    /// Unique observation ids make merging repeated or divergent process snapshots idempotent.
+    samples: BTreeMap<String, ProfileSample>,
+}
+
+impl ProfileWindow {
+    fn newest(&self) -> u64 {
+        self.samples
+            .values()
+            .map(|sample| sample.observed_at_ns)
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn prune(&mut self) {
+        self.samples.retain(|_, sample| sample.work_unit_ns > 0);
+        while self.samples.len() > MAX_PROFILE_SAMPLES {
+            let oldest = self
+                .samples
+                .iter()
+                .min_by_key(|(id, sample)| (sample.observed_at_ns, *id))
+                .map(|(id, _)| id.clone());
+            if let Some(oldest) = oldest {
+                self.samples.remove(&oldest);
+            }
+        }
+    }
+
+    fn average(&self, phase: impl Fn(&ProfileSample) -> Option<u64>) -> Option<u128> {
+        let (sum, count) = self
+            .samples
+            .values()
+            .filter_map(phase)
+            .fold((0_u128, 0_u64), |(sum, count), value| {
+                (sum.saturating_add(u128::from(value)), count + 1)
+            });
+        (count >= MIN_FEEDBACK_SAMPLES).then(|| sum / u128::from(count))
+    }
+}
+
+fn profile_key(profile: &runtime::ExecutionProfile) -> String {
+    // `id` already hashes the effective runtime controls. Include every exposed identity field
+    // as well, so neither a changed digest nor a mismatched deserialized profile can borrow it.
+    let bytes = serde_json::to_vec(profile).expect("execution profile serializes");
+    Sha256::digest(bytes)
+        .iter()
+        .fold(String::with_capacity(64), |mut hex, byte| {
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        })
+}
+
+fn observed_at_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
+        })
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct FeedbackStats {
@@ -16,12 +113,10 @@ pub(crate) struct FeedbackStats {
     total_work_unit_ns: u128,
     total_queue_wait_ms: u128,
     last_work_unit_ns: Option<u64>,
-    #[serde(default)]
     pub(crate) profile: Option<runtime::ExecutionProfile>,
-    #[serde(default)]
     profile_duration_samples: u64,
-    #[serde(default)]
-    profile_total_work_unit_ns: u128,
+    profiles: BTreeMap<String, ProfileWindow>,
+    last_observed_ns: u64,
 }
 
 impl FeedbackStats {
@@ -31,8 +126,13 @@ impl FeedbackStats {
             .as_deref()
             .is_some_and(|current| current != model)
         {
-            *self = Self::default();
+            let profiles = std::mem::take(&mut self.profiles);
+            *self = Self {
+                profiles,
+                ..Self::default()
+            };
         }
+        self.last_observed_ns = observed_at_ns();
         self.model = Some(model.to_owned());
         self.completed = self.completed.saturating_add(1);
         self.total_queue_wait_ms = self.total_queue_wait_ms.saturating_add(queue_wait_ms);
@@ -48,23 +148,97 @@ impl FeedbackStats {
             .then(|| self.total_work_unit_ns / u128::from(self.duration_samples))
     }
 
-    pub(crate) fn record_profile(&mut self, profile: &runtime::ExecutionProfile, duration: u64) {
-        if self.profile.as_ref() != Some(profile) {
-            self.profile = Some(profile.clone());
-            self.profile_duration_samples = 0;
-            self.profile_total_work_unit_ns = 0;
+    #[cfg(test)]
+    fn record_profile(&mut self, profile: &runtime::ExecutionProfile, duration: u64) {
+        self.record_profile_with_phases(profile, duration, PhaseSample::default());
+    }
+
+    pub(crate) fn record_profile_with_phases(
+        &mut self,
+        profile: &runtime::ExecutionProfile,
+        duration: u64,
+        phases: PhaseSample,
+    ) {
+        if duration == 0 {
+            return;
         }
-        self.profile_duration_samples = self.profile_duration_samples.saturating_add(1);
-        self.profile_total_work_unit_ns = self
-            .profile_total_work_unit_ns
-            .saturating_add(u128::from(duration));
+        let at = observed_at_ns();
+        let window = self
+            .profiles
+            .entry(profile_key(profile))
+            .or_insert_with(|| ProfileWindow {
+                profile: profile.clone(),
+                samples: BTreeMap::new(),
+            });
+        window.samples.insert(
+            uuid::Uuid::new_v4().to_string(),
+            ProfileSample {
+                observed_at_ns: at,
+                work_unit_ns: duration,
+                phases,
+            },
+        );
+        window.prune();
+        self.profile = Some(profile.clone());
+        self.last_observed_ns = at;
+        self.prune_profiles();
+        self.refresh_profile_diagnostics();
     }
 
     pub(crate) fn average_for_profile(&self, profile: &runtime::ExecutionProfile) -> Option<u128> {
-        (self.profile.as_ref() == Some(profile)
-            && self.profile_duration_samples >= MIN_FEEDBACK_SAMPLES
-            && self.profile_total_work_unit_ns > 0)
-            .then(|| self.profile_total_work_unit_ns / u128::from(self.profile_duration_samples))
+        self.profile_window(profile)?
+            .average(|sample| Some(sample.work_unit_ns))
+    }
+
+    pub(crate) fn phases_for_profile(
+        &self,
+        profile: &runtime::ExecutionProfile,
+    ) -> Option<PhaseEstimate> {
+        let window = self.profile_window(profile)?;
+        Some(PhaseEstimate {
+            queue_wait_ns: window.average(|sample| sample.phases.queue_wait_ns),
+            upstream_setup_ns: window.average(|sample| sample.phases.upstream_setup_ns),
+            prefill_ns_per_token: window
+                .average(|sample| sample.phases.prefill_ns_per_token.filter(|rate| *rate > 0)),
+            decode_ns_per_token: window
+                .average(|sample| sample.phases.decode_ns_per_token.filter(|rate| *rate > 0)),
+        })
+    }
+
+    fn profile_window(&self, profile: &runtime::ExecutionProfile) -> Option<&ProfileWindow> {
+        self.profiles
+            .get(&profile_key(profile))
+            .filter(|window| &window.profile == profile)
+    }
+
+    fn prune_profiles(&mut self) {
+        self.profiles.retain(|key, window| {
+            window.prune();
+            *key == profile_key(&window.profile) && !window.samples.is_empty()
+        });
+        while self.profiles.len() > MAX_PROFILE_WINDOWS {
+            let oldest = self
+                .profiles
+                .iter()
+                .min_by_key(|(key, window)| (window.newest(), *key))
+                .map(|(key, _)| key.clone());
+            if let Some(oldest) = oldest {
+                self.profiles.remove(&oldest);
+            }
+        }
+    }
+
+    fn refresh_profile_diagnostics(&mut self) {
+        if let Some(window) = self
+            .profile
+            .as_ref()
+            .and_then(|profile| self.profile_window(profile))
+        {
+            self.profile_duration_samples = window.samples.len() as u64;
+        } else {
+            self.profile = None;
+            self.profile_duration_samples = 0;
+        }
     }
 
     pub(crate) fn receipt(&self) -> Value {
@@ -75,7 +249,10 @@ impl FeedbackStats {
             "decision_ready": self.profile.as_ref().and_then(|profile| self.average_for_profile(profile)).is_some(),
             "learning_profile": self.profile,
             "profile_duration_samples": self.profile_duration_samples,
-            "profile_policy": "one_current_profile_per_task_serial_only",
+            "profile_policy": "bounded_exact_profiles_serial_only",
+            "retained_profiles": self.profiles.len(),
+            "profile_limit": MAX_PROFILE_WINDOWS,
+            "samples_per_profile_limit": MAX_PROFILE_SAMPLES,
             "decision_metric": "nanoseconds_per_work_unit",
             "average_work_unit_ns": self.average_work_unit_ns(),
             "average_queue_wait_ms": (self.completed > 0)
@@ -189,7 +366,7 @@ pub(crate) struct PlacementFeedback {
     pub(crate) cpu: BTreeMap<TaskKind, FeedbackStats>,
 }
 
-pub(crate) const FEEDBACK_SCHEMA_VERSION: u32 = 1;
+pub(crate) const FEEDBACK_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct FeedbackSnapshot {
@@ -204,25 +381,37 @@ pub(crate) fn load_feedback(store: &Store) -> Result<PlacementFeedback> {
     let Some(body) = store.snapshot(FEEDBACK_SNAPSHOT)? else {
         return Ok(PlacementFeedback::default());
     };
-    let snapshot: FeedbackSnapshot =
-        serde_json::from_str(&body).context("parse the stored feedback snapshot")?;
+    parse_snapshot(&body)
+}
+
+fn parse_snapshot(body: &str) -> Result<PlacementFeedback> {
+    let raw: Value = serde_json::from_str(body).context("parse the stored feedback snapshot")?;
+    let version = raw["schema_version"].as_u64();
     ensure!(
-        snapshot.schema_version == FEEDBACK_SCHEMA_VERSION,
-        "unsupported feedback snapshot schema {}",
-        snapshot.schema_version
+        version == Some(u64::from(FEEDBACK_SCHEMA_VERSION)),
+        "unsupported feedback snapshot schema {}; this build reads schema {FEEDBACK_SCHEMA_VERSION}. \
+         Move or delete the FreeLlama database to start new feedback",
+        version.map_or_else(|| "(missing)".to_owned(), |version| version.to_string())
     );
+    let mut snapshot: FeedbackSnapshot =
+        serde_json::from_value(raw).context("parse the stored feedback snapshot")?;
+    for stats in snapshot
+        .feedback
+        .gpu
+        .values_mut()
+        .chain(snapshot.feedback.cpu.values_mut())
+    {
+        stats.prune_profiles();
+        stats.refresh_profile_diagnostics();
+    }
     Ok(snapshot.feedback)
 }
 
-/// Save this process's feedback, merged with what other processes saved meanwhile: per backend and
-/// task the stats with more completed samples win, so no process erases another's longer history.
+/// Merge independent profile observations, rather than letting one model's longer history replace
+/// every other model. Sample ids make repeated writes and forked process snapshots idempotent.
 pub(crate) fn persist_feedback(store: &Store, feedback: &PlacementFeedback) -> Result<()> {
     store.update_snapshot(FEEDBACK_SNAPSHOT, |current| {
-        let stored = current
-            .and_then(|body| serde_json::from_str::<FeedbackSnapshot>(body).ok())
-            .filter(|snapshot| snapshot.schema_version == FEEDBACK_SCHEMA_VERSION)
-            .map(|snapshot| snapshot.feedback)
-            .unwrap_or_default();
+        let stored = current.map(parse_snapshot).transpose()?.unwrap_or_default();
         serde_json::to_string(&FeedbackSnapshot {
             schema_version: FEEDBACK_SCHEMA_VERSION,
             feedback: merged(stored, feedback),
@@ -234,15 +423,57 @@ pub(crate) fn persist_feedback(store: &Store, feedback: &PlacementFeedback) -> R
 fn merged(mut stored: PlacementFeedback, ours: &PlacementFeedback) -> PlacementFeedback {
     for (theirs, mine) in [(&mut stored.gpu, &ours.gpu), (&mut stored.cpu, &ours.cpu)] {
         for (task, stats) in mine {
-            let keep_ours = theirs
-                .get(task)
-                .is_none_or(|existing| stats.completed >= existing.completed);
-            if keep_ours {
-                theirs.insert(*task, stats.clone());
-            }
+            let joined = merge_stats(theirs.get(task).unwrap_or(&FeedbackStats::default()), stats);
+            theirs.insert(*task, joined);
         }
     }
     stored
+}
+
+fn merge_stats(stored: &FeedbackStats, ours: &FeedbackStats) -> FeedbackStats {
+    // Freshness wins over an old model's large completion count. The rest is only a
+    // deterministic tie-break for equal times.
+    let rank = |stats: &FeedbackStats| {
+        (
+            stats.last_observed_ns,
+            stats.completed,
+            stats.duration_samples,
+            stats.total_work_unit_ns,
+            stats.total_queue_wait_ms,
+            stats.last_work_unit_ns,
+            stats.model.clone(),
+            stats.profile.as_ref().map(|profile| profile.id.clone()),
+        )
+    };
+    let mut result = if rank(ours) > rank(stored) {
+        ours.clone()
+    } else {
+        stored.clone()
+    };
+    result.profiles.clone_from(&stored.profiles);
+    for (key, incoming) in &ours.profiles {
+        let window = result
+            .profiles
+            .entry(key.clone())
+            .or_insert_with(|| ProfileWindow {
+                profile: incoming.profile.clone(),
+                samples: BTreeMap::new(),
+            });
+        for (id, sample) in &incoming.samples {
+            let existing = window
+                .samples
+                .entry(id.clone())
+                .or_insert_with(|| sample.clone());
+            // Repeated snapshots contain identical samples. A conflicting id is resolved in
+            // the same conservative order whichever process saved first; it never counts twice.
+            if *sample > *existing {
+                existing.clone_from(sample);
+            }
+        }
+    }
+    result.prune_profiles();
+    result.refresh_profile_diagnostics();
+    result
 }
 
 #[cfg(test)]
@@ -434,10 +665,11 @@ mod feedback_tests {
     }
 
     #[test]
-    fn legacy_feedback_is_retained_as_diagnostics_without_becoming_profile_evidence() {
-        let legacy = json!({"model":"model-a","completed":7,"duration_samples":5,
-            "total_work_unit_ns":500,"total_queue_wait_ms":14,"last_work_unit_ns":100});
-        let mut stats: FeedbackStats = serde_json::from_value(legacy.clone()).unwrap();
+    fn aggregate_diagnostics_never_become_profile_evidence() {
+        let mut stats = FeedbackStats::default();
+        for _ in 0..5 {
+            stats.record("model-a", Some(100), 2);
+        }
         assert_eq!(stats.average_work_unit_ns(), Some(100));
         assert_eq!(stats.receipt()["decision_ready"], false);
         let profile = super::runtime::ExecutionProfile {
@@ -454,20 +686,248 @@ mod feedback_tests {
         }
         assert_eq!(stats.average_for_profile(&profile), Some(50));
         let stored = serde_json::to_value(&stats).unwrap();
-        for field in legacy.as_object().unwrap().keys() {
-            assert_eq!(
-                stored[field], legacy[field],
-                "legacy aggregate must survive additive profile learning"
-            );
-        }
+        assert_eq!(stored["completed"], 5);
+        assert_eq!(stored["total_work_unit_ns"], 500);
         let restarted: FeedbackStats = serde_json::from_value(stored).unwrap();
         assert_eq!(restarted.average_for_profile(&profile), Some(50));
         let mut changed = profile.clone();
         changed.id = "profile-b".into();
         stats.record_profile(&changed, 10);
-        assert_eq!(stats.average_for_profile(&profile), None);
+        assert_eq!(stats.average_for_profile(&profile), Some(50));
         assert_eq!(stats.average_for_profile(&changed), None);
         assert_eq!(stats.profile_duration_samples, 1);
+    }
+
+    fn profile(name: &str) -> super::runtime::ExecutionProfile {
+        super::runtime::ExecutionProfile {
+            id: format!("profile-{name}"),
+            task: TaskKind::Completion,
+            model: name.into(),
+            digest: format!("digest-{name}"),
+            context_tokens: 4096,
+            processor: "gpu".into(),
+            metric_kind: super::runtime::ThroughputMetricKind::OutputTokensPerSecond,
+        }
+    }
+
+    fn learn(stats: &mut FeedbackStats, profile: &super::runtime::ExecutionProfile, rate: u64) {
+        stats.record(&profile.model, Some(rate), 0);
+        stats.record_profile(profile, rate);
+    }
+
+    #[test]
+    fn alternating_models_keep_separate_exact_profile_evidence() {
+        let (a, b) = (profile("a"), profile("b"));
+        let mut stats = FeedbackStats::default();
+        for _ in 0..3 {
+            learn(&mut stats, &a, 100);
+            learn(&mut stats, &b, 200);
+        }
+        assert_eq!(stats.average_for_profile(&a), Some(100));
+        assert_eq!(stats.average_for_profile(&b), Some(200));
+        // Even an accidentally reused opaque id cannot transfer evidence across a revision,
+        // context, processor, model, task, or metric kind.
+        for field in [
+            "digest",
+            "context",
+            "processor",
+            "model",
+            "task",
+            "metric",
+            "id",
+        ] {
+            let mut changed = a.clone();
+            match field {
+                "digest" => changed.digest = "replacement".into(),
+                "context" => changed.context_tokens = 8192,
+                "processor" => changed.processor = "cpu".into(),
+                "model" => changed.model = "other".into(),
+                "task" => changed.task = TaskKind::Coding,
+                "metric" => {
+                    changed.metric_kind =
+                        super::runtime::ThroughputMetricKind::InputTokensPerSecond;
+                }
+                _ => changed.id = "other-runtime-controls".into(),
+            }
+            assert_eq!(stats.average_for_profile(&changed), None, "{field}");
+        }
+    }
+
+    #[test]
+    fn restarted_history_unions_process_samples_without_double_counting() {
+        let store = crate::store::Store::in_memory().unwrap();
+        let (a, b) = (profile("a"), profile("b"));
+        let mut initial = super::PlacementFeedback::default();
+        for _ in 0..12 {
+            learn(
+                initial.gpu.entry(TaskKind::Completion).or_default(),
+                &a,
+                100,
+            );
+        }
+        super::persist_feedback(&store, &initial).unwrap();
+        let mut first = super::load_feedback(&store).unwrap();
+        let mut second = first.clone();
+        learn(first.gpu.get_mut(&TaskKind::Completion).unwrap(), &a, 200);
+        for _ in 0..3 {
+            learn(second.gpu.get_mut(&TaskKind::Completion).unwrap(), &b, 50);
+        }
+        // A newer model has fewer diagnostic completions, but retains its evidence on restart.
+        super::persist_feedback(&store, &second).unwrap();
+        super::persist_feedback(&store, &first).unwrap();
+        super::persist_feedback(&store, &first).unwrap();
+        let saved = super::load_feedback(&store).unwrap();
+        let stats = &saved.gpu[&TaskKind::Completion];
+        assert_eq!(stats.average_for_profile(&a), Some(1400 / 13));
+        assert_eq!(stats.average_for_profile(&b), Some(50));
+        assert_eq!(stats.profile_window(&a).unwrap().samples.len(), 13);
+        assert_eq!(stats.profile_window(&b).unwrap().samples.len(), 3);
+        assert_eq!(stats.model.as_deref(), Some("b"));
+        assert_eq!(stats.completed, 3);
+
+        // Two processes branching from the same saved history contribute distinct observations.
+        let mut left = saved.clone();
+        let mut right = saved;
+        learn(left.gpu.get_mut(&TaskKind::Completion).unwrap(), &b, 100);
+        learn(right.gpu.get_mut(&TaskKind::Completion).unwrap(), &b, 200);
+        super::persist_feedback(&store, &left).unwrap();
+        super::persist_feedback(&store, &right).unwrap();
+        let final_state = super::load_feedback(&store).unwrap();
+        let stats = &final_state.gpu[&TaskKind::Completion];
+        assert_eq!(stats.profile_window(&b).unwrap().samples.len(), 5);
+        assert_eq!(stats.average_for_profile(&b), Some(90));
+    }
+
+    #[test]
+    fn a_v1_snapshot_is_refused_with_the_way_out() {
+        let store = crate::store::Store::in_memory().unwrap();
+        let a = profile("a");
+        let old = json!({
+            "schema_version":1,
+            "feedback":{"gpu":{"completion":{
+                "model":"a","completed":100,"duration_samples":100,
+                "total_work_unit_ns":10000,"total_queue_wait_ms":0,"last_work_unit_ns":100,
+                "profile":a,"profile_duration_samples":100,"profile_total_work_unit_ns":10000
+            }},"cpu":{}}
+        });
+        store
+            .put_snapshot(super::FEEDBACK_SNAPSHOT, &old.to_string())
+            .unwrap();
+        let message = super::load_feedback(&store).unwrap_err().to_string();
+        assert!(message.contains("unsupported feedback snapshot schema 1"));
+        assert!(message.contains("Move or delete the FreeLlama database"));
+        assert!(super::persist_feedback(&store, &super::PlacementFeedback::default()).is_err());
+    }
+
+    #[test]
+    fn phase_estimates_require_independent_valid_observations() {
+        let a = profile("a");
+        let mut stats = FeedbackStats::default();
+        for index in 0..3 {
+            stats.record_profile_with_phases(
+                &a,
+                200,
+                super::PhaseSample {
+                    queue_wait_ns: Some(0),
+                    upstream_setup_ns: (index < 2).then_some(10),
+                    prefill_ns_per_token: Some(100),
+                    decode_ns_per_token: Some(200),
+                },
+            );
+        }
+        assert_eq!(
+            stats.phases_for_profile(&a),
+            Some(super::PhaseEstimate {
+                queue_wait_ns: Some(0),
+                upstream_setup_ns: None,
+                prefill_ns_per_token: Some(100),
+                decode_ns_per_token: Some(200),
+            })
+        );
+        stats.record_profile_with_phases(
+            &a,
+            200,
+            super::PhaseSample {
+                upstream_setup_ns: Some(10),
+                prefill_ns_per_token: Some(0),
+                ..super::PhaseSample::default()
+            },
+        );
+        let estimate = stats.phases_for_profile(&a).unwrap();
+        assert_eq!(estimate.upstream_setup_ns, Some(10));
+        assert_eq!(estimate.prefill_ns_per_token, Some(100));
+        assert_eq!(stats.phases_for_profile(&profile("unknown")), None);
+    }
+
+    #[test]
+    fn history_bounds_keep_the_newest_samples_and_profiles() {
+        let a = profile("a");
+        let mut stats = FeedbackStats::default();
+        for index in 1..=40 {
+            stats.record_profile(&a, index);
+            let window = stats.profiles.get_mut(&super::profile_key(&a)).unwrap();
+            let sample = window
+                .samples
+                .values_mut()
+                .max_by_key(|sample| sample.observed_at_ns)
+                .unwrap();
+            sample.observed_at_ns = index;
+        }
+        assert_eq!(stats.profile_window(&a).unwrap().samples.len(), 32);
+        assert_eq!(stats.average_for_profile(&a), Some(24)); // mean of 9..=40
+        for index in 1..=40 {
+            let p = profile(&format!("model-{index:02}"));
+            stats.record_profile(&p, 100);
+            for sample in stats
+                .profiles
+                .get_mut(&super::profile_key(&p))
+                .unwrap()
+                .samples
+                .values_mut()
+            {
+                sample.observed_at_ns = 100 + index;
+            }
+        }
+        assert_eq!(stats.profiles.len(), super::MAX_PROFILE_WINDOWS);
+        assert!(stats.profile_window(&a).is_none());
+        assert!(stats.profile_window(&profile("model-08")).is_none());
+        assert!(stats.profile_window(&profile("model-09")).is_some());
+        assert!(stats.profile_window(&profile("model-40")).is_some());
+    }
+
+    #[test]
+    fn snapshot_merge_is_order_independent_even_for_conflicting_sample_ids() {
+        let a = profile("a");
+        let mut first = FeedbackStats::default();
+        learn(&mut first, &a, 100);
+        let mut second = first.clone();
+        let window = second.profiles.get_mut(&super::profile_key(&a)).unwrap();
+        window.samples.values_mut().next().unwrap().work_unit_ns = 200;
+        let forward = super::merge_stats(&first, &second);
+        let reverse = super::merge_stats(&second, &first);
+        assert_eq!(
+            serde_json::to_value(&forward).unwrap(),
+            serde_json::to_value(&reverse).unwrap()
+        );
+        let samples = &forward.profile_window(&a).unwrap().samples;
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples.values().next().unwrap().work_unit_ns, 200);
+    }
+
+    #[test]
+    fn persistence_does_not_replace_corrupt_or_unknown_version_evidence() {
+        let store = crate::store::Store::in_memory().unwrap();
+        for body in [
+            "not-json",
+            r#"{"schema_version":999,"feedback":{"gpu":{},"cpu":{}}}"#,
+        ] {
+            store.put_snapshot(super::FEEDBACK_SNAPSHOT, body).unwrap();
+            assert!(super::persist_feedback(&store, &super::PlacementFeedback::default()).is_err());
+            assert_eq!(
+                store.snapshot(super::FEEDBACK_SNAPSHOT).unwrap().as_deref(),
+                Some(body)
+            );
+        }
     }
 
     #[test]

@@ -1,4 +1,5 @@
-//! Installed-model catalog: Ollama tags, show metadata, residency and KV-cache estimates.
+//! Installed-model catalog: tags cached for 30s, endpoint/digest show metadata for five minutes,
+//! fresh residency, and KV-cache estimates. Metadata freshness is independent of LRU access.
 
 use std::{
     collections::BTreeSet,
@@ -7,6 +8,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use axum::http::StatusCode;
 use reqwest::Client;
 use serde_json::{Value, json};
 
@@ -16,6 +18,10 @@ use super::error::ApiError;
 use super::{Backend, CatalogModel, float, ollama_env};
 use super::{CatalogCache, PlatformState};
 use crate::capability::Capability;
+
+#[path = "catalog_metadata.rs"]
+mod metadata;
+pub(super) use metadata::MetadataCache;
 
 /// Ollama's `capabilities`: those routing uses, and the rest verbatim so none is silently dropped.
 fn split_capabilities(show: &Value) -> (BTreeSet<Capability>, Vec<String>) {
@@ -35,6 +41,15 @@ fn split_capabilities(show: &Value) -> (BTreeSet<Capability>, Vec<String>) {
             None => other.push(value.to_owned()),
         }
     }
+    if let Some(values) = show.pointer("/thinking/values").and_then(Value::as_array) {
+        if values.iter().any(|value| {
+            value == &Value::Bool(true) || value.as_str().is_some_and(|level| !level.is_empty())
+        }) {
+            routed.insert(Capability::Thinking);
+        } else if values.as_slice() == [Value::Bool(false)] {
+            routed.remove(&Capability::Thinking);
+        }
+    }
     (routed, other)
 }
 
@@ -45,6 +60,56 @@ pub(crate) async fn discover_models(state: &PlatformState) -> Result<Vec<Catalog
         return Ok(models);
     }
     fill_catalog(state).await
+}
+
+/// A pinned request needs evidence from its assigned endpoint only. An unrelated failed backend
+/// must neither prevent it from running nor add that backend's control timeout to its latency.
+pub(crate) async fn discover_for_route(
+    state: &PlatformState,
+    pinned_model: Option<&str>,
+) -> Result<Vec<CatalogModel>, ApiError> {
+    let Some(requested) = pinned_model else {
+        return discover_models(state).await;
+    };
+    state.refresh_ollama_settings().await;
+    let name = assigned_pin_name(&state.cpu_models, requested);
+    // Family-only aliases can span both backends; keep the router's global ambiguity rules.
+    if name == requested
+        && !requested.contains(':')
+        && state.cpu_models.iter().any(|name| {
+            name.split_once(':')
+                .is_some_and(|(family, _)| family == requested)
+        })
+    {
+        return discover_models(state).await;
+    }
+    let upstream = if state.cpu_models.contains(&name) {
+        state.cpu_upstream.as_deref().unwrap_or(&state.upstream)
+    } else {
+        &state.upstream
+    };
+    model_from_endpoint(state, upstream, &name, true)
+        .await
+        .map(|model| model.into_iter().collect())
+        .map_err(|error| {
+            if error.status().is_client_error() {
+                error
+            } else {
+                endpoint_error(upstream, &error)
+            }
+        })
+}
+
+/// Operator assignments use installed tags. Resolve an omitted `:latest` before selecting the
+/// endpoint; a family-only fallback needs a combined installed catalog, not configuration alone.
+fn assigned_pin_name(cpu_models: &BTreeSet<String>, requested: &str) -> String {
+    if !cpu_models.contains(requested) && !requested.contains(':') {
+        let latest = format!("{requested}:latest");
+        if cpu_models.contains(&latest) {
+            return latest;
+        }
+    }
+    requested.to_owned()
 }
 
 async fn snapshot_catalog(cache: &CatalogCache) -> Option<Vec<CatalogModel>> {
@@ -64,66 +129,103 @@ async fn fill_catalog(state: &PlatformState) -> Result<Vec<CatalogModel>, ApiErr
         refresh_residency(state, &mut models).await?;
         return Ok(models);
     }
-    let models = fetch_catalog(state).await?;
-    *state.catalog_cache.write().await = Some((Instant::now(), models.clone()));
+    let (models, cacheable) = fetch_catalog(state).await?;
+    *state.catalog_cache.write().await = cacheable.then(|| (Instant::now(), models.clone()));
     Ok(models)
 }
 
-async fn fetch_catalog(state: &PlatformState) -> Result<Vec<CatalogModel>, ApiError> {
+async fn fetch_catalog(state: &PlatformState) -> Result<(Vec<CatalogModel>, bool), ApiError> {
     let (gpu, cpu) = tokio::join!(fetch_catalog_from(state, &state.upstream), async {
         match &state.cpu_upstream {
             Some(upstream) => Some(fetch_catalog_from(state, upstream).await),
             None => None,
         }
     });
-    let mut models = gpu?;
-    models.retain(|model| !state.cpu_models.contains(&model.name));
-    if let Some(cpu) = cpu {
-        let mut cpu_models = cpu?;
-        cpu_models.retain(|model| state.cpu_models.contains(&model.name));
-        models.extend(cpu_models);
-    }
+    // A failed confirmation may serve this request once, but must not enter the longer-lived
+    // combined snapshot. Failed endpoints themselves contribute no metadata to that snapshot.
+    let cacheable = gpu.as_ref().map_or(true, |(_, cacheable)| *cacheable)
+        && cpu
+            .as_ref()
+            .is_none_or(|result| result.as_ref().map_or(true, |(_, cacheable)| *cacheable));
+    let mut models = merge_backends(
+        gpu.map(|(models, _)| models),
+        cpu.map(|result| result.map(|(models, _)| models)),
+        &state.cpu_models,
+    )?;
     models.sort_by(|left, right| left.name.cmp(&right.name));
-    Ok(models)
+    Ok((models, cacheable))
+}
+
+/// Failed endpoint observations are unavailable, never an invented empty running list.
+fn merge_backends(
+    gpu: Result<Vec<CatalogModel>, ApiError>,
+    cpu: Option<Result<Vec<CatalogModel>, ApiError>>,
+    cpu_models: &BTreeSet<String>,
+) -> Result<Vec<CatalogModel>, ApiError> {
+    match (gpu, cpu) {
+        (Ok(mut gpu), cpu) => {
+            gpu.retain(|model| !cpu_models.contains(&model.name));
+            match cpu {
+                Some(Ok(mut cpu)) => {
+                    cpu.retain(|model| cpu_models.contains(&model.name));
+                    gpu.extend(cpu);
+                }
+                Some(Err(error)) => eprintln!("CPU catalog unavailable: {}", error.body.error),
+                None => {}
+            }
+            Ok(gpu)
+        }
+        (Err(error), Some(Ok(mut cpu))) => {
+            eprintln!("primary catalog unavailable: {}", error.body.error);
+            cpu.retain(|model| cpu_models.contains(&model.name));
+            Ok(cpu)
+        }
+        (Err(error), _) => Err(error),
+    }
 }
 
 async fn fetch_catalog_from(
     state: &PlatformState,
     upstream: &str,
-) -> Result<Vec<CatalogModel>, ApiError> {
+) -> Result<(Vec<CatalogModel>, bool), ApiError> {
     let (tags, ps) = tokio::join!(
         get_json(&state.client, upstream, "/api/tags"),
         get_json(&state.client, upstream, "/api/ps")
     );
     let tags = tags?;
-    let ps = ps?;
-    let resident = ps
-        .get("models")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+    let resident = running_models(ps?)?;
     let entries = tags
         .get("models")
         .and_then(Value::as_array)
         .context("Ollama tags response has no models")
         .map_err(ApiError::upstream)?;
-    let names = entries
+    let entries = entries
         .iter()
-        .map(|entry| {
-            crate::ollama_http::ps_entry_name(entry)
-                .context("Ollama model has no name")
-                .map_err(ApiError::upstream)
+        .filter_map(|entry| {
+            let name = crate::ollama_http::ps_entry_name(entry).filter(|name| !name.is_empty());
+            if name.is_none() {
+                eprintln!("skipping malformed Ollama tag: model has no name");
+            }
+            name.map(|name| (entry, name))
         })
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut shows = show_models(state, upstream, &names).await?;
+        .collect::<Vec<_>>();
+    let shows = show_models(state, upstream, &entries).await;
     let mut models = Vec::with_capacity(entries.len());
-    for (index, (entry, name)) in entries.iter().zip(names).enumerate() {
-        let Some(show) = shows[index].take() else {
-            continue;
+    let mut cacheable = true;
+    for ((entry, name), show) in entries.into_iter().zip(shows) {
+        // An automatic pass may skip a tag without metadata or one replaced mid-pass; the next
+        // pass observes its new revision. Pinned requests surface the change as a typed error.
+        let show = match show {
+            ShowOutcome::Metadata(show) => show,
+            ShowOutcome::UnconfirmedMetadata(show) => {
+                cacheable = false;
+                show
+            }
+            ShowOutcome::Changed | ShowOutcome::Unavailable => continue,
         };
-        models.push(catalog_model(state, entry, name, &show, &resident));
+        models.push(catalog_model(state, entry, name, show.as_ref(), &resident));
     }
-    Ok(models)
+    Ok((models, cacheable))
 }
 
 /// One catalog entry from Ollama's `tags` entry, its `show` metadata and the running list.
@@ -142,13 +244,13 @@ fn catalog_model(
         .pointer("/model_info/general.architecture")
         .and_then(Value::as_str)
         .map(str::to_owned);
-    let running = resident
-        .iter()
-        .find(|running| crate::ollama_http::ps_entry_name(running) == Some(name));
     let digest = entry
         .get("digest")
         .and_then(Value::as_str)
         .map(str::to_owned);
+    let running = matching_resident(resident, name, digest.as_deref());
+    let benchmark = state.benchmark.for_model(name, digest.as_deref());
+    let policy_rank = state.policies.ranks_for_model(name, digest.as_deref());
     CatalogModel {
         observed_loops: state.model_facts.loops_for(name, digest.as_deref()),
         learned_output_tokens: state.model_facts.output_need(name, digest.as_deref()),
@@ -160,6 +262,7 @@ fn catalog_model(
             .model_facts
             .bytes_per_token(name, digest.as_deref())
             .map_or(0, |(_, samples)| samples),
+        vision_tokens: super::context::vision_token_bounds(show),
         digest,
         name: name.to_owned(),
         size: entry.get("size").and_then(Value::as_u64).unwrap_or(0),
@@ -169,6 +272,10 @@ fn catalog_model(
         kv_cache_bytes_per_token_f16,
         modelfile_num_ctx,
         architecture,
+        thinking: show
+            .get("thinking")
+            .filter(|value| value.is_object())
+            .cloned(),
         resident: running.is_some(),
         resident_size: running
             .and_then(|value| value.get("size"))
@@ -179,24 +286,14 @@ fn catalog_model(
         resident_context: running
             .and_then(|value| value.get("context_length"))
             .and_then(Value::as_u64),
-        benchmark: state.benchmark.get(name).cloned().unwrap_or_default(),
+        benchmark,
         policy_options: state
             .policies
             .model_options
             .iter()
             .filter_map(|(task, models)| models.get(name).map(|options| (*task, *options)))
             .collect(),
-        policy_rank: state
-            .policies
-            .qualified
-            .iter()
-            .filter_map(|(task, candidates)| {
-                candidates
-                    .iter()
-                    .position(|candidate| candidate == name)
-                    .map(|rank| (*task, rank))
-            })
-            .collect(),
+        policy_rank,
     }
 }
 
@@ -204,29 +301,105 @@ fn catalog_model(
 /// catalog while it is fresh, else from that backend alone (its tags, running list and one `show`),
 /// so a raw request never waits on the CPU backend or on every model's metadata.
 pub(crate) async fn primary_model(state: &PlatformState, name: &str) -> Option<CatalogModel> {
-    if let Some(models) = snapshot_catalog(&state.catalog_cache).await
-        && let Some(model) = models
-            .into_iter()
-            .find(|model| model.name == name && !state.cpu_models.contains(name))
-    {
-        return Some(model);
-    }
-    let (tags, ps) = tokio::join!(
-        get_json(&state.client, &state.upstream, "/api/tags"),
-        get_json(&state.client, &state.upstream, "/api/ps")
-    );
-    let (tags, ps) = (tags.ok()?, ps.ok()?);
-    let entry = tags["models"]
-        .as_array()?
-        .iter()
-        .find(|entry| crate::ollama_http::ps_entry_name(entry) == Some(name))?;
-    let show = show_model(state, &state.upstream, name).await.ok()??;
-    let resident = ps["models"].as_array().cloned().unwrap_or_default();
-    Some(catalog_model(state, entry, name, &show, &resident))
+    model_from_endpoint(state, &state.upstream, name, false)
+        .await
+        .ok()
+        .flatten()
 }
 
-/// Text context belongs to the declared architecture, not an auxiliary vision encoder. Legacy
-/// metadata without an architecture is usable only when there is one unambiguous context field.
+async fn model_from_endpoint(
+    state: &PlatformState,
+    upstream: &str,
+    requested: &str,
+    family_fallback: bool,
+) -> Result<Option<CatalogModel>, ApiError> {
+    if let Some(models) = snapshot_catalog(&state.catalog_cache).await {
+        let models: Vec<_> = models
+            .into_iter()
+            .filter(|model| {
+                state.cpu_models.contains(&model.name)
+                    == state
+                        .cpu_upstream
+                        .as_deref()
+                        .is_some_and(|cpu| cpu == upstream)
+            })
+            .collect();
+        let names: Vec<_> = models.iter().map(|model| model.name.as_str()).collect();
+        if let Some(name) = endpoint_name(&names, requested, family_fallback)?
+            && let Some(mut model) = models.iter().find(|model| model.name == name).cloned()
+        {
+            let resident = running_models(get_json(&state.client, upstream, "/api/ps").await?)?;
+            update_residency(state, &mut model, &resident);
+            return Ok(Some(model));
+        }
+    }
+    let (tags, ps) = tokio::join!(
+        get_json(&state.client, upstream, "/api/tags"),
+        get_json(&state.client, upstream, "/api/ps")
+    );
+    let tags = tags?;
+    let resident = running_models(ps?)?;
+    let entries = tags["models"]
+        .as_array()
+        .context("Ollama tags response has no models")
+        .map_err(ApiError::upstream)?;
+    let names: Vec<_> = entries
+        .iter()
+        .filter_map(crate::ollama_http::ps_entry_name)
+        .collect();
+    let Some(name) = endpoint_name(&names, requested, family_fallback)? else {
+        return Ok(None);
+    };
+    let Some(entry) = entries
+        .iter()
+        .find(|entry| crate::ollama_http::ps_entry_name(entry) == Some(name))
+    else {
+        return Ok(None);
+    };
+    match show_models(state, upstream, &[(entry, name)])
+        .await
+        .pop()
+        .unwrap_or(ShowOutcome::Unavailable)
+    {
+        ShowOutcome::Metadata(show) | ShowOutcome::UnconfirmedMetadata(show) => Ok(Some(catalog_model(
+            state,
+            entry,
+            name,
+            show.as_ref(),
+            &resident,
+        ))),
+        ShowOutcome::Changed => Err(ApiError::new(
+            StatusCode::CONFLICT,
+            format!(
+                "installed model {name} changed while its metadata was read; refusing to attach old metadata to a new revision"
+            ),
+        )
+        .with_code("model_identity_changed")),
+        ShowOutcome::Unavailable => Err(ApiError::upstream(format!(
+            "metadata unavailable for installed model {name}"
+        ))),
+    }
+}
+
+fn endpoint_name<'a>(
+    names: &[&'a str],
+    requested: &str,
+    family_fallback: bool,
+) -> Result<Option<&'a str>, ApiError> {
+    if family_fallback {
+        crate::ollama_http::resolve_listed(names, requested).map_err(|family| {
+            ApiError::bad_request(format!(
+                "model name is ambiguous: {requested} (installed: {})",
+                family.join(", ")
+            ))
+        })
+    } else {
+        Ok(crate::ollama_http::resolve_as_ollama(names, requested))
+    }
+}
+
+/// Text context belongs to the declared architecture, not an auxiliary vision encoder.
+/// Metadata without an architecture is usable only when there is one unambiguous context field.
 fn advertised_context_from_show(show: &Value) -> Option<u64> {
     let info = show.get("model_info")?.as_object()?;
     let value = if let Some(architecture) = info.get("general.architecture") {
@@ -291,33 +464,122 @@ fn estimate_kv_cache_bytes_per_token_f16(show: &Value) -> Option<u64> {
         .checked_mul(2)
 }
 
-/// Concurrent `/api/show` lookups for a whole catalog, so a cold catalog does not cost one serial
-/// round trip per installed model; a small bound keeps a large library from flooding Ollama. Results keep the order of `names`.
+/// Each catalog endpoint fill spawns at most four workers; the shared metadata cache also limits
+/// active `/show` requests to four across endpoints and independent pinned discovery calls.
 const SHOW_CONCURRENCY: usize = 4;
+const MAX_SHOW_BODY_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Clone)]
+struct ShowLookup {
+    show: Arc<Value>,
+    fetched: bool,
+}
+
+/// What one tag's `/api/show` pass established about the revision `/api/tags` listed.
+enum ShowOutcome {
+    /// Metadata for the listed revision, or a tag that did not advertise an artifact digest.
+    Metadata(Arc<Value>),
+    /// The listed digest could not be re-checked. Serve once, never cache in either layer.
+    UnconfirmedMetadata(Arc<Value>),
+    /// The tag now names a different revision (or vanished): the fetched metadata describes
+    /// neither the listed digest nor a known one, so it is discarded.
+    Changed,
+    /// No usable metadata (request failed, malformed or oversized body).
+    Unavailable,
+}
 
 async fn show_models(
     state: &PlatformState,
     upstream: &str,
-    names: &[&str],
-) -> Result<Vec<Option<Value>>, ApiError> {
-    let permits = Arc::new(tokio::sync::Semaphore::new(SHOW_CONCURRENCY));
-    let mut lookups = tokio::task::JoinSet::new();
-    for (index, name) in names.iter().enumerate() {
-        let (state, upstream, name) = (state.clone(), upstream.to_owned(), (*name).to_owned());
-        let permits = Arc::clone(&permits);
-        lookups.spawn(async move {
-            let _permit = permits.acquire_owned().await;
-            (index, show_model(&state, &upstream, &name).await)
-        });
+    entries: &[(&Value, &str)],
+) -> Vec<ShowOutcome> {
+    let mut shows = vec![None; entries.len()];
+    for (chunk_index, chunk) in entries.chunks(SHOW_CONCURRENCY).enumerate() {
+        let mut lookups = tokio::task::JoinSet::new();
+        for (offset, (entry, name)) in chunk.iter().enumerate() {
+            let (state, upstream, name) = (state.clone(), upstream.to_owned(), (*name).to_owned());
+            let digest = entry
+                .get("digest")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            lookups.spawn(async move {
+                (
+                    offset,
+                    show_model(&state, &upstream, &name, digest.as_deref()).await,
+                )
+            });
+        }
+        while let Some(joined) = lookups.join_next().await {
+            match joined {
+                Ok((offset, show)) => shows[chunk_index * SHOW_CONCURRENCY + offset] = show,
+                Err(error) => eprintln!("skipping model metadata lookup: {error}"),
+            }
+        }
     }
-    let mut shows = vec![None; names.len()];
-    while let Some(joined) = lookups.join_next().await {
-        let (index, show) = joined
-            .context("model metadata lookup panicked")
-            .map_err(ApiError::upstream)?;
-        shows[index] = show?;
-    }
-    Ok(shows)
+    confirm_show_identities(state, upstream, entries, shows).await
+}
+
+/// `/show` is addressed by mutable tag, not by digest. Confirm identities once after a miss batch
+/// before caching metadata under the earlier `/tags` digest. Otherwise a concurrent tag update
+/// could attribute a new revision's capabilities to old weights. Cache hits need no extra trip.
+/// If the confirmation read fails, the fetched metadata serves this request but is not cached; a
+/// changed revision is reported as [`ShowOutcome::Changed`], never paired with the old show.
+async fn confirm_show_identities(
+    state: &PlatformState,
+    upstream: &str,
+    entries: &[(&Value, &str)],
+    shows: Vec<Option<ShowLookup>>,
+) -> Vec<ShowOutcome> {
+    let listed_digest = |entry: &Value| {
+        entry
+            .get("digest")
+            .and_then(Value::as_str)
+            .filter(|digest| !digest.trim().is_empty())
+            .map(str::to_owned)
+    };
+    let needs_confirmation = entries.iter().zip(&shows).any(|((entry, _), lookup)| {
+        lookup.as_ref().is_some_and(|lookup| lookup.fetched) && listed_digest(entry).is_some()
+    });
+    let current = if needs_confirmation {
+        get_json(&state.client, upstream, "/api/tags").await.ok()
+    } else {
+        None
+    };
+    let current = current
+        .as_ref()
+        .and_then(|tags| tags.get("models"))
+        .and_then(Value::as_array);
+    entries
+        .iter()
+        .zip(shows)
+        .map(|((entry, name), lookup)| {
+            let Some(found) = lookup else {
+                return ShowOutcome::Unavailable;
+            };
+            let Some(digest) = listed_digest(entry).filter(|_| found.fetched) else {
+                return ShowOutcome::Metadata(found.show);
+            };
+            let Some(models) = current else {
+                eprintln!("model {name}: revision not confirmed after /api/show; not caching");
+                return ShowOutcome::UnconfirmedMetadata(found.show);
+            };
+            let same_revision = models
+                .iter()
+                .find(|model| crate::ollama_http::ps_entry_name(model) == Some(*name))
+                .and_then(|model| model.get("digest"))
+                .and_then(Value::as_str)
+                == Some(digest.as_str());
+            if same_revision {
+                state
+                    .catalog_metadata
+                    .insert(upstream, Some(&digest), Arc::clone(&found.show));
+                ShowOutcome::Metadata(found.show)
+            } else {
+                eprintln!("model {name}: revision changed after /api/show");
+                ShowOutcome::Changed
+            }
+        })
+        .collect()
 }
 
 /// `None` means skip this tag — a single corrupt `/api/show` must not 502 the whole catalog.
@@ -325,84 +587,156 @@ async fn show_model(
     state: &PlatformState,
     upstream: &str,
     name: &str,
-) -> Result<Option<Value>, ApiError> {
-    match state
-        .client
-        .post(crate::ollama_http::url(upstream, "/api/show"))
-        .timeout(platform_control_timeout())
-        .json(&json!({"model": name}))
-        .send()
-        .await
-    {
-        Ok(response) if response.status().is_success() => Ok(Some(
-            response.json::<Value>().await.map_err(ApiError::upstream)?,
-        )),
-        Ok(response) => {
-            eprintln!(
-                "skipping model {name}: /api/show returned {}",
-                response.status()
-            );
-            Ok(None)
-        }
+    digest: Option<&str>,
+) -> Option<ShowLookup> {
+    if let Some(show) = state.catalog_metadata.get(upstream, digest) {
+        return Some(ShowLookup {
+            show,
+            fetched: false,
+        });
+    }
+    let _fetch = state.catalog_metadata.fetch_slot().await?;
+    if let Some(show) = state.catalog_metadata.get(upstream, digest) {
+        return Some(ShowLookup {
+            show,
+            fetched: false,
+        });
+    }
+    let fetched = async {
+        let response = state
+            .client
+            .post(crate::ollama_http::url(upstream, "/api/show"))
+            .timeout(platform_control_timeout())
+            .json(&json!({"model": name, "verbose": false}))
+            .send()
+            .await?
+            .error_for_status()?;
+        let value = bounded_show_json(response).await?;
+        metadata::compact_show(value).context("malformed /api/show metadata")
+    }
+    .await;
+    match fetched {
+        Ok(show) => Some(ShowLookup {
+            show: Arc::new(show),
+            fetched: true,
+        }),
         Err(error) => {
             eprintln!("skipping model {name}: {error:#}");
-            Ok(None)
+            None
         }
     }
 }
 
+async fn bounded_show_json(mut response: reqwest::Response) -> Result<Value> {
+    anyhow::ensure!(
+        response
+            .content_length()
+            .is_none_or(|length| length <= MAX_SHOW_BODY_BYTES as u64),
+        "/api/show body exceeds metadata limit"
+    );
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        anyhow::ensure!(
+            chunk.len() <= MAX_SHOW_BODY_BYTES.saturating_sub(body.len()),
+            "/api/show body exceeds metadata limit"
+        );
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).context("invalid /api/show JSON")
+}
+
 async fn refresh_residency(
     state: &PlatformState,
-    models: &mut [CatalogModel],
+    models: &mut Vec<CatalogModel>,
 ) -> Result<(), ApiError> {
     let (gpu, cpu) = backend_residency(state).await;
-    let gpu = gpu?;
-    let gpu_running = gpu
-        .get("models")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let cpu_running = if let Some(cpu) = cpu {
-        cpu?.get("models")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default()
-    } else {
-        Vec::new()
+    let cpu = cpu.map(|result| result.and_then(running_models));
+    let gpu = match gpu.and_then(running_models) {
+        Err(error) if !matches!(cpu, Some(Ok(_))) => return Err(error),
+        other => other,
     };
-    for model in models {
+    // Drop only the failed endpoint's candidates. A cached positive residency observation must
+    // not survive a failed live observation, and an unknown observation is not `resident=false`.
+    models.retain_mut(|model| {
         let running = if state.cpu_models.contains(&model.name) {
-            &cpu_running
+            cpu.as_ref().and_then(|result| result.as_ref().ok())
         } else {
-            &gpu_running
+            gpu.as_ref().ok()
         };
-        let resident = running
-            .iter()
-            .find(|entry| crate::ollama_http::ps_entry_name(entry) == Some(model.name.as_str()));
-        model.resident = resident.is_some();
-        model.resident_size = resident
-            .and_then(|value| value.get("size"))
-            .and_then(Value::as_u64);
-        model.resident_vram = resident
-            .and_then(|value| value.get("size_vram"))
-            .and_then(Value::as_u64);
-        model.resident_context = resident
-            .and_then(|value| value.get("context_length"))
-            .and_then(Value::as_u64);
-        // Live like residency: cached static metadata must not hide a loop seen since.
-        model.observed_loops = state
-            .model_facts
-            .loops_for(&model.name, model.digest.as_deref());
-        model.learned_output_tokens = state
-            .model_facts
-            .output_need(&model.name, model.digest.as_deref());
-        let ratio = state
-            .model_facts
-            .bytes_per_token(&model.name, model.digest.as_deref());
-        model.bytes_per_token_milli = ratio.map(|(milli, _)| milli);
-        model.bytes_per_token_samples = ratio.map_or(0, |(_, samples)| samples);
-    }
+        let Some(running) = running else { return false };
+        update_residency(state, model, running);
+        true
+    });
     Ok(())
+}
+
+fn running_models(ps: Value) -> Result<Vec<Value>, ApiError> {
+    let models = match ps {
+        Value::Object(mut object) => object.remove("models"),
+        _ => None,
+    };
+    let Some(Value::Array(models)) = models else {
+        return Err(ApiError::upstream(
+            "Ollama /api/ps response has no models array; residency is unknown",
+        ));
+    };
+    if models
+        .iter()
+        .any(|entry| crate::ollama_http::ps_entry_name(entry).is_none_or(str::is_empty))
+    {
+        return Err(ApiError::upstream(
+            "Ollama /api/ps contains an unnamed model; residency is unknown",
+        ));
+    }
+    Ok(models)
+}
+
+fn matching_resident<'a>(
+    resident: &'a [Value],
+    name: &str,
+    digest: Option<&str>,
+) -> Option<&'a Value> {
+    resident.iter().find(|running| {
+        crate::ollama_http::ps_entry_name(running) == Some(name)
+            && match (digest, running.get("digest").and_then(Value::as_str)) {
+                (Some(expected), Some(actual)) => expected == actual,
+                _ => true,
+            }
+    })
+}
+
+fn update_residency(state: &PlatformState, model: &mut CatalogModel, running: &[Value]) {
+    let resident = matching_resident(running, &model.name, model.digest.as_deref());
+    model.resident = resident.is_some();
+    model.resident_size = resident
+        .and_then(|value| value.get("size"))
+        .and_then(Value::as_u64);
+    model.resident_vram = resident
+        .and_then(|value| value.get("size_vram"))
+        .and_then(Value::as_u64);
+    model.resident_context = resident
+        .and_then(|value| value.get("context_length"))
+        .and_then(Value::as_u64);
+    // Live like residency: static metadata must not hide observations learned since its fill.
+    model.observed_loops = state
+        .model_facts
+        .loops_for(&model.name, model.digest.as_deref());
+    model.learned_output_tokens = state
+        .model_facts
+        .output_need(&model.name, model.digest.as_deref());
+    let ratio = state
+        .model_facts
+        .bytes_per_token(&model.name, model.digest.as_deref());
+    model.bytes_per_token_milli = ratio.map(|(milli, _)| milli);
+    model.bytes_per_token_samples = ratio.map_or(0, |(_, samples)| samples);
+}
+
+fn endpoint_error(upstream: &str, error: &ApiError) -> ApiError {
+    ApiError::upstream(format!(
+        "model catalog unavailable at {upstream}: {}",
+        error.body.error
+    ))
+    .with_code("catalog_endpoint_unavailable")
 }
 
 /// Independent runner observations share a deadline window rather than adding backend delays.
@@ -495,6 +829,10 @@ fn rounded_percent(vram: u64, size: u64) -> u64 {
         .find(|candidate| float(*candidate).total_cmp(&target).is_eq())
         .unwrap_or(exact)
 }
+
+#[cfg(test)]
+#[path = "catalog_tests.rs"]
+mod cache_tests;
 
 #[cfg(test)]
 mod resident_view_tests {
@@ -720,6 +1058,7 @@ mod kv_estimate_tests {
             kv_cache_bytes_per_token_f16: Some(10),
             modelfile_num_ctx: None,
             architecture: None,
+            thinking: None,
             resident: false,
             resident_size: None,
             resident_vram: None,
@@ -729,6 +1068,7 @@ mod kv_estimate_tests {
             learned_output_tokens: None,
             bytes_per_token_milli: None,
             bytes_per_token_samples: 0,
+            vision_tokens: None,
             policy_rank: BTreeMap::new(),
             policy_options: BTreeMap::new(),
         };

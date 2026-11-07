@@ -13,9 +13,12 @@ mod admission_fairness_contract;
 mod cli_contract;
 mod context_flow_contract;
 mod control_timing_contract;
+mod decision_task_contract;
 mod doctor_contract;
 mod edge_cases;
+mod lease_split_contract;
 mod model_bench_contract;
+mod model_identity_contract;
 mod model_lifecycle_contract;
 mod monitoring_contract;
 mod platform_contract;
@@ -32,6 +35,7 @@ mod session_kill_contract;
 mod smart_placement_contract;
 mod structured_errors_contract;
 mod task_jobs_contract;
+mod timing_contract;
 mod warming_receipt_contract;
 
 /// A `tests/*.rs` file missing from the list above would silently never run.

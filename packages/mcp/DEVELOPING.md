@@ -68,7 +68,7 @@ the publish verifier; an installation made with `--omit=optional` cannot load th
 requires Node >= 20.
 
 Machine discovery distinguishes total host memory (`memory_bytes`) from known unified memory
-(`unified_memory_bytes`). Library-tag `fitsInMemory` is a conservative host-memory preflight and
+(`memory_kind: "unified"`). Library-tag `fitsInMemory` is a conservative host-memory preflight and
 includes `fitScope: "host_memory_budget_only"`; inspect `/api/ps` for actual accelerator placement.
 
 Start the serve-backed tools' dependency from the repository root:

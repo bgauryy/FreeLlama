@@ -10,6 +10,7 @@ function rustEnumMembers(file: string, name: string): string[] {
   if (!body) throw new Error(`could not find Rust enum ${name} in ${file}`);
   return body
     .replace(/#\[[^\]]+\]/g, "")
+    .replace(/\/\/[^\n]*/g, "")
     .split(",")
     .map((entry) => entry.trim().match(/^([A-Z][A-Za-z0-9]*)/)?.[1])
     .filter((entry): entry is string => Boolean(entry))

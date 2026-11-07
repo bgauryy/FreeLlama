@@ -121,10 +121,34 @@ pub(crate) fn listed_names(listing: &Value) -> Vec<&str> {
 /// The `/api/ps` entry whose [`ps_entry_name`] is exactly `model`. The single matcher for every
 /// residency lookup, so the benchmark and platform agree on what "loaded" means.
 pub(crate) fn find_ps_entry<'a>(ps: &'a Value, model: &str) -> Option<&'a Value> {
-    ps.get("models")?
-        .as_array()?
-        .iter()
-        .find(|entry| ps_entry_name(entry) == Some(model))
+    ps_entries(ps, model).next()
+}
+
+/// Every `/api/ps` entry named `model`. Ollama can hold one name at several contexts or digests,
+/// so an identity decision must look at all of them, not the first.
+pub(crate) fn ps_entries<'a, 'm>(
+    ps: &'a Value,
+    model: &'m str,
+) -> impl Iterator<Item = &'a Value> + use<'a, 'm> {
+    ps.get("models")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(move |entry| ps_entry_name(entry) == Some(model))
+}
+
+/// The entry for `model` carrying `digest` when one does; otherwise the first same-name entry.
+/// With several same-name runners, a digest the caller knows decides which one it means.
+pub(crate) fn find_ps_entry_by_digest<'a>(
+    ps: &'a Value,
+    model: &str,
+    digest: Option<&str>,
+) -> Option<&'a Value> {
+    digest
+        .and_then(|digest| {
+            ps_entries(ps, model).find(|entry| entry["digest"].as_str() == Some(digest))
+        })
+        .or_else(|| find_ps_entry(ps, model))
 }
 
 pub(crate) async fn server_version(client: &Client, endpoint: &str) -> Result<String> {
@@ -160,6 +184,22 @@ mod tests {
         assert!(find_ps_entry(&ps, "other:latest").is_none());
         assert_eq!(find_ps_entry(&ps, "bare:latest").unwrap()["size"], 2);
         assert!(find_ps_entry(&json!({}), "bare:latest").is_none());
+    }
+
+    #[test]
+    fn several_same_name_runners_resolve_by_digest_not_by_position() {
+        let ps = json!({"models": [
+            {"name": "m:latest", "digest": "old", "context_length": 2048},
+            {"name": "m:latest", "digest": "new", "context_length": 8192},
+        ]});
+        assert_eq!(ps_entries(&ps, "m:latest").count(), 2);
+        let pick =
+            |digest| find_ps_entry_by_digest(&ps, "m:latest", digest).unwrap()["digest"].clone();
+        assert_eq!(pick(Some("new")), "new");
+        assert_eq!(pick(Some("old")), "old");
+        // An unknown or absent digest cannot choose; the caller's identity check then decides.
+        assert_eq!(pick(Some("other")), "old");
+        assert_eq!(pick(None), "old");
     }
 
     #[test]

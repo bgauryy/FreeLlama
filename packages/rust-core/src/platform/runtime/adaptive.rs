@@ -243,11 +243,6 @@ impl AdaptiveLimiter {
             "profile_windows": state.baseline_tps.iter()
                 .map(|(task, baseline)| (*task, json!({"metric_kind":baseline.profile.metric_kind,"rate":baseline.rate,"samples":baseline.samples,"profile":baseline.profile})))
                 .collect::<BTreeMap<_, _>>(),
-            "baseline_output_tokens_per_second_scope": "legacy_model_summary",
-            "baseline_output_tokens_per_second": state.baseline_tps.values()
-                .filter(|baseline| baseline.profile.metric_kind == ThroughputMetricKind::OutputTokensPerSecond)
-                .map(|baseline| (baseline.profile.model.clone(), json!({"tps": baseline.rate, "samples": baseline.samples, "profile": baseline.profile})))
-                .collect::<serde_json::Map<_, _>>(),
         })
     }
 }

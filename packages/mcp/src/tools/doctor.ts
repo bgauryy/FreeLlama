@@ -88,9 +88,6 @@ export function registerDoctorTool(server: McpServer): void {
             `freellama serve unreachable: ${error instanceof Error ? error.message : String(error)}`;
         }
         const full = { ...report.structuredContent };
-        // `ollama_config.categories` is the canonical categorized form (configuration and scheduler
-        // settings included); the flat `ollama_env_config` duplicated it, so it is not sent.
-        delete full.ollama_env_config;
         if ((view ?? "summary") === "full") return structuredResult(full);
         const running = (full.running as { models?: unknown[] } | undefined)?.models ?? [];
         const { status: overall, problems } = doctorStatus(full);

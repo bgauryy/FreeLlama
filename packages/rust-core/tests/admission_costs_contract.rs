@@ -205,8 +205,12 @@ async fn partial_cost_overrides_agree_in_preview_execution_and_config() {
     assert_eq!(config["settings"]["task_costs"]["value"]["completion"], 2);
     assert_eq!(config["settings"]["task_costs"]["source"], "file");
     let (_, health) = request(&fixture, "GET", "health", Value::Null).await;
-    assert_eq!(health["admission"]["costs"]["vision"], 2);
-    assert_eq!(health["admission"]["costs"]["chat"], 2);
+    assert_eq!(health["admission"]["costs"]["base_by_task"]["vision"], 2);
+    assert_eq!(
+        health["admission"]["costs"]["base_by_task"]["completion"],
+        2
+    );
+    assert!(health["admission"]["costs"].get("chat").is_none());
     assert_eq!(health["admission"]["costs"]["base_by_task"]["coding"], 7);
     assert_eq!(config["settings"]["task_costs"]["value"]["coding"], 7);
 }

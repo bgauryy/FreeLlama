@@ -33,7 +33,9 @@ fn candidate(name: &str, size: u64, capabilities: &[Capability], resident: bool)
         size,
         capabilities: capabilities.iter().copied().collect(),
         other_capabilities: Vec::new(),
+        thinking: None,
         advertised_context: Some(32_768),
+        vision_tokens: None,
         kv_cache_bytes_per_token_f16: None,
         modelfile_num_ctx: None,
         architecture: None,
@@ -241,7 +243,10 @@ async fn embedding_task_forwards_route_options_and_returns_prompt_free_metrics()
         response["route"]["context_window_fit"],
         "fits_advertised_window"
     );
-    assert_eq!(response["route"]["hardware_fit"], "context_window_only");
+    assert_eq!(
+        response["route"]["context_window_fit"],
+        "fits_advertised_window"
+    );
     assert!(response["metrics"]["prompt_tokens_per_second"].is_null());
     assert!(response["metrics"]["cached_prompt_tokens"].is_null());
     assert_eq!(response["metrics"]["load_duration_ns"], 500_000_000_u64);
@@ -354,7 +359,7 @@ async fn chat_task_preserves_typed_history_and_advanced_ollama_controls() {
             "/api/show",
             post(|| async {
                 Json(json!({
-                    "capabilities": ["completion", "tools", "vision", "future-capability"],
+                    "capabilities": ["completion", "tools", "vision", "thinking", "future-capability"],
                     "model_info": {"test.context_length": 32768}
                 }))
             }),
@@ -786,7 +791,7 @@ async fn assigned_cpu_model_uses_the_cpu_ollama_backend() {
     assert_eq!(response.status(), StatusCode::OK);
     let response: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
-    assert_eq!(response["execution"]["placement"], "cpu");
+    assert_eq!(response["execution"]["requested_processor"], "cpu");
     assert_eq!(response["execution"]["upstream"], cpu_upstream);
     assert_eq!(cpu_calls.load(Ordering::SeqCst), 1);
     assert_eq!(gpu_calls.load(Ordering::SeqCst), 0);
@@ -865,7 +870,7 @@ async fn preview_honors_cpu_preference_and_exposes_the_execution_receipt() {
     let body: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(body["selected_model"], "cpu-model");
-    assert_eq!(body["execution"]["placement"], "cpu");
+    assert_eq!(body["execution"]["requested_processor"], "cpu");
     assert_eq!(body["execution"]["upstream"], cpu_upstream);
     assert_eq!(body["execution"]["preference"], "prefer_cpu");
     assert_eq!(body["execution"]["preference_satisfied"], true);
@@ -957,7 +962,7 @@ async fn preview_honors_cpu_preference_and_exposes_the_execution_receipt() {
     let pinned: Value =
         serde_json::from_slice(&to_bytes(pinned.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(pinned["selected_model"], "gpu-model");
-    assert_eq!(pinned["execution"]["placement"], "gpu");
+    assert_eq!(pinned["execution"]["requested_processor"], "gpu");
     assert_eq!(pinned["execution"]["preference_satisfied"], false);
     assert_eq!(pinned["execution"]["reason"], "explicit_model");
 
@@ -1321,22 +1326,29 @@ async fn raw_passthrough_stays_byte_exact_on_the_primary_backend_with_cpu_config
     let cpu_calls = Arc::new(AtomicUsize::new(0));
     let captured = Arc::new(Mutex::new(None));
 
-    let gpu_app = Router::new().route(
-        "/api/chat",
-        post({
-            let gpu_calls = Arc::clone(&gpu_calls);
-            let captured = Arc::clone(&captured);
-            move |body: Bytes| {
+    let gpu_app = Router::new()
+        .route(
+            "/api/tags",
+            get(|| async {
+                Json(json!({"models": [{"name": "cpu-model", "digest": "d", "size": 1_000_000}]}))
+            }),
+        )
+        .route(
+            "/api/chat",
+            post({
                 let gpu_calls = Arc::clone(&gpu_calls);
                 let captured = Arc::clone(&captured);
-                async move {
-                    gpu_calls.fetch_add(1, Ordering::SeqCst);
-                    *captured.lock().await = Some(body.clone());
-                    (StatusCode::OK, body)
+                move |body: Bytes| {
+                    let gpu_calls = Arc::clone(&gpu_calls);
+                    let captured = Arc::clone(&captured);
+                    async move {
+                        gpu_calls.fetch_add(1, Ordering::SeqCst);
+                        *captured.lock().await = Some(body.clone());
+                        (StatusCode::OK, body)
+                    }
                 }
-            }
-        }),
-    );
+            }),
+        );
     let gpu_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let gpu_upstream = format!("http://{}", gpu_listener.local_addr().unwrap());
     let gpu_task = tokio::spawn(async move { axum::serve(gpu_listener, gpu_app).await.unwrap() });
@@ -1582,14 +1594,14 @@ async fn resident_managed_tasks_keep_same_model_concurrency() {
         .route(
             "/api/tags",
             get(|| async {
-                Json(json!({"models": [{"name": "embed-model", "size": 274_000_000}]}))
+                Json(json!({"models": [{"name": "embed-model", "digest": "embed-digest", "size": 274_000_000}]}))
             }),
         )
         .route(
             "/api/ps",
             get(|| async {
                 Json(json!({
-                    "models": [{"name": "embed-model", "size_vram": 274_000_000}]
+                    "models": [{"name": "embed-model", "digest": "embed-digest", "context_length": 2048, "size": 274_000_000, "size_vram": 274_000_000}]
                 }))
             }),
         )
@@ -1658,7 +1670,7 @@ async fn stale_residency_is_rechecked_before_using_the_shared_transition_lock() 
         .route(
             "/api/tags",
             get(|| async {
-                Json(json!({"models": [{"name": "embed-model", "size": 274_000_000}]}))
+                Json(json!({"models": [{"name": "embed-model", "digest": "embed-digest", "size": 274_000_000}]}))
             }),
         )
         .route(
@@ -1672,6 +1684,8 @@ async fn stale_residency_is_rechecked_before_using_the_shared_transition_lock() 
                         Json(json!({
                             "models": [{
                                 "name": "embed-model",
+                                "digest": "embed-digest",
+                                "context_length": 2048,
                                 "size": 274_000_000,
                                 "size_vram": 274_000_000
                             }]
@@ -1719,11 +1733,21 @@ async fn stale_residency_is_rechecked_before_using_the_shared_transition_lock() 
         response["admission"]["mode"],
         "nonresident_transition_exclusive"
     );
+    // Every `/api/ps` read of one cold embedding task, in order. Each costs a round trip on every
+    // cold request, so a new read needs a reason of its own. Exactly six:
+    //  1. discovery: which models are installed and resident (`discover_for_route`);
+    //  2. the receipt's capacity preview: the memory forecast at routing time (`readiness::assess`);
+    //  3. `make_room`: one listing for the dispatch-time forecast and the model-memory budget check;
+    //  4. the pre-lock observation: is a compatible runner resident, so no load lock is needed?
+    //     Discovery's sample is stale here (the mock reports the runner gone), so it is not trusted;
+    //  5. the observation after winning the backend load lock: a same-model load that finished
+    //     meanwhile is shared instead of loaded again;
+    //  6. the placement observation after the run (`observe_physical_placement`).
+    // The reservation revalidation under the lock forecasts from read 5 and reads nothing itself.
     assert_eq!(
         ps_calls.load(Ordering::SeqCst),
-        4,
-        "expected discovery, the memory-budget check, the under-lock residency recheck, and \
-         post-run observation"
+        6,
+        "discovery, receipt preview, make_room, pre-lock, under-lock and post-run observations"
     );
     mock_task.abort();
 }
@@ -1971,7 +1995,7 @@ fn context_window_fit_grades_the_window_that_will_be_sent() {
     .unwrap();
     assert_eq!(decision.options["num_ctx"], 2_048);
     assert_eq!(decision.context_window_fit, "fits_advertised_window");
-    assert_eq!(decision.hardware_fit, "context_window_only");
+    assert_eq!(decision.context_window_fit, "fits_advertised_window");
     assert!(
         !decision
             .reasons
@@ -1998,7 +2022,7 @@ fn a_smaller_advertised_window_clamps_and_still_fits() {
     .unwrap();
     assert_eq!(decision.options["num_ctx"], 4_096);
     assert_eq!(decision.context_window_fit, "fits_advertised_window");
-    assert_eq!(decision.hardware_fit, "context_window_only");
+    assert_eq!(decision.context_window_fit, "fits_advertised_window");
     assert!(
         decision
             .reasons
@@ -2399,6 +2423,7 @@ fn route_eligibility_covers_every_relevant_capability_permutation() {
         TaskKind::Vision,
         TaskKind::Embedding,
         TaskKind::LongContext,
+        TaskKind::Decision,
     ];
     let capabilities = [
         Capability::Completion,
@@ -2406,6 +2431,7 @@ fn route_eligibility_covers_every_relevant_capability_permutation() {
         Capability::Vision,
         Capability::Embedding,
         Capability::Thinking,
+        Capability::Decision,
     ];
     let mut checked = 0;
 
@@ -2435,8 +2461,10 @@ fn route_eligibility_covers_every_relevant_capability_permutation() {
                 TaskKind::CodeRepair | TaskKind::Tools | TaskKind::Browser => {
                     has(Capability::Completion) && has(Capability::Tools)
                 }
-                TaskKind::Vision => has(Capability::Vision),
+                // Managed vision executes /api/chat, which requires completion plus visual input.
+                TaskKind::Vision => has(Capability::Completion) && has(Capability::Vision),
                 TaskKind::Embedding => has(Capability::Embedding),
+                TaskKind::Decision => has(Capability::Decision),
             };
             assert_eq!(
                 succeeds, expected,
@@ -2446,7 +2474,7 @@ fn route_eligibility_covers_every_relevant_capability_permutation() {
         }
     }
 
-    assert_eq!(checked, 8 * 32);
+    assert_eq!(checked, 9 * 64);
 }
 
 /// Discovery routes every managed task needs before it can pick a model. Shared by the
@@ -2688,13 +2716,13 @@ fn concurrency_probe() -> (Router<InFlight>, InFlight) {
         .route(
             "/api/tags",
             get(|| async {
-                Json(json!({"models": [{"name": "embed-model", "size": 274_000_000}]}))
+                Json(json!({"models": [{"name": "embed-model", "digest": "embed-digest", "size": 274_000_000}]}))
             }),
         )
         .route(
             "/api/ps",
             get(|| async {
-                Json(json!({"models": [{"name": "embed-model", "size_vram": 274_000_000}]}))
+                Json(json!({"models": [{"name": "embed-model", "digest": "embed-digest", "context_length": 2048, "size": 274_000_000, "size_vram": 274_000_000}]}))
             }),
         )
         .route(
@@ -3433,7 +3461,7 @@ fn routing_reports_its_evidence_dimensions_separately() {
     for (name, value) in [
         ("quality_evidence", &decision.quality_evidence),
         ("task_evidence", &decision.task_evidence),
-        ("hardware_fit", &decision.hardware_fit),
+        ("context_window_fit", &decision.context_window_fit),
     ] {
         assert!(!value.is_empty(), "{name} must be reported, got empty");
     }
@@ -3529,7 +3557,7 @@ async fn health_reports_admission_capacity() {
             .as_u64()
             .is_some()
     );
-    assert_eq!(body["admission"]["costs"]["vision"], 4);
+    assert_eq!(body["admission"]["costs"]["base_by_task"]["vision"], 4);
     assert_eq!(body["admission"]["raw_proxy_max_concurrent_requests"], 1);
     assert_eq!(
         body["contracts"]["raw_passthrough_admission"],
@@ -3748,7 +3776,7 @@ async fn verified_feedback_survives_a_platform_restart() {
     assert_eq!(health["feedback"]["persistence"]["enabled"], true);
     assert_eq!(
         health["contracts"]["placement_feedback_persistence"],
-        "shared_database_snapshot_v1"
+        "shared_database_snapshot_v2"
     );
     mock_task.abort();
 }
@@ -4026,12 +4054,12 @@ async fn image_tasks_need_an_explicit_or_policy_qualified_vision_model() {
             "/api/tags",
             get(|| async {
                 Json(json!({"models": [
-                    {"name": "glm-ocr:latest", "size": 2_000_000_000},
+                    {"name": "glm-ocr:latest", "digest":"sha256:vision-qualified", "size": 2_000_000_000},
                     {"name": "text:latest", "size": 1_000_000_000}
                 ]}))
             }),
         )
-        .route("/api/ps", get(|| async { Json(json!({"models": []})) }))
+        .route("/api/ps", get(|| async { Json(json!({"models": [{"name":"glm-ocr:latest","digest":"sha256:vision-qualified","size":2_000_000_000_u64,"size_vram":2_000_000_000_u64,"context_length":8192}]})) }))
         .route(
             "/api/show",
             post(|Json(body): Json<Value>| async move {
@@ -4090,7 +4118,7 @@ async fn image_tasks_need_an_explicit_or_policy_qualified_vision_model() {
     let mut policy = tempfile::NamedTempFile::new().unwrap();
     std::io::Write::write_all(
         &mut policy,
-        b"schema_version = 1\n[policies.vision]\nqualified_models = [\"glm-ocr:latest\"]\n",
+        b"schema_version = 1\n[policies.vision]\nqualified_models = [\"glm-ocr:latest\"]\nmodel_digests = { \"glm-ocr:latest\" = \"sha256:vision-qualified\" }\n",
     )
     .unwrap();
     let qualified = app(&crate::support::platform_config(

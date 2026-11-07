@@ -50,6 +50,16 @@ token and keeps it only for the browser tab.
   deadlines, states, and waiting reasons. States cover discovery, admission, resources, runner
   transitions, loading, execution, and completion. Metadata excludes the original payload.
 
+A task receipt explains its own wait. `admission.mode` is `resident_shared` (the runner was
+reused without the backend load lock) or `nonresident_transition_exclusive` (this task loaded the
+runner under it). `admission.reason` says why a present runner could not be shared when its identity
+was not established, for example `resident_identity_unobserved` when `/api/ps` reports no digest;
+it is `null` for a plain match. `queue_wait_ms`, `transition_wait_ms` (waiting for the load lock) and
+`resource_wait_ms` add up to `total_wait_ms`. Waiting for the lock is bounded by the task's queue
+deadline; a raw load that waits too long gets 503 `proxy busy`, and a raw generation whose
+allocation cannot be forecast gets 503 `model_forecast_unavailable`. See
+[Load lock and use lease](CPU_GPU_ROUTING.md#load-lock-and-use-lease).
+
 Use `run_task {defer:true}` in MCP or `task --defer` in the CLI to get a job handle. A list or
 status request omits results; fetching one ID returns its retained result or structured failure.
 Terminal states are `completed`, `failed`, `cancelled`, and `expired`. Cancellation is per task,
@@ -172,8 +182,8 @@ A task captures its cost when execution starts. Reload affects tasks that start 
 already queued or active tasks keep their captured cost. `config` reports effective values and
 the runtime-file source; invalid keys, zero,
 or overflow reject the reload and retain the last good configuration. Preview advice, health
-costs, and execution receipts use the resolved policy. Health retains its summary aliases and
-exposes the complete task-kind map under `admission.costs.base_by_task`. Task kinds remain
+costs, and execution receipts use the resolved policy. Health exposes the complete task-kind map
+under `admission.costs.base_by_task` and the embedding batch formula. Task kinds remain
 caller-declared; these weights are cooperative scheduling policy, not workload classification.
 See the
 [runtime example](https://github.com/bgauryy/FreeLlama/blob/main/freellama.runtime.example.toml) for the table syntax.
@@ -203,10 +213,8 @@ report verified placement and `feedback.accepted:true` while
 `execution.throughput_learning.eligible:false`; it contributes no comparable speed sample.
 
 Each backend retains at most one adaptive profile window per task kind. Status exposes
-`adaptive.profile_windows` keyed by task; `baseline_output_tokens_per_second` is a compatibility
-output-only summary by model and can omit additional task windows for the same model. Embedding
-windows report their explicit input-rate kind separately. Use the task windows for learning
-evidence. See [automatic feedback](CPU_GPU_ROUTING.md#understand-automatic-feedback) for
+`adaptive.profile_windows` keyed by task. Embedding windows report their explicit input-rate kind
+separately. Use the task windows for learning evidence. See [automatic feedback](CPU_GPU_ROUTING.md#understand-automatic-feedback) for
 persisted routing windows.
 
 The CPU backend is adaptive by default because oversubscribing it shows up as a throughput collapse

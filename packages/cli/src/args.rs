@@ -37,7 +37,7 @@ pub(crate) struct AdmissionArgs {
     pub(crate) resource_resume_available_percent: Option<u32>,
     /// Primary/GPU admission budget in weighted units — embedding 1, chat 2, vision 4 (default 2
     /// per Ollama parallel slot, or the runtime file). This is not a literal task count.
-    #[arg(long, alias = "gpu-admission-slots")]
+    #[arg(long)]
     pub(crate) max_concurrent_tasks: Option<usize>,
     /// CPU-backend admission budget in weighted units (default 1, or the
     /// runtime file).
@@ -392,11 +392,11 @@ pub(crate) enum Command {
         #[command(flatten)]
         backends: BackendArgs,
         /// Optional machine-local benchmark report used for evidence-backed ranking. Defaults to
-        /// `benchmark-report.json` in the working directory, then the user config directory.
+        /// `benchmark-report.json` in the working directory, then the `FreeLlama` home.
         #[arg(long, env = "FREELLAMA_BENCHMARK_REPORT")]
         benchmark_report: Option<PathBuf>,
         /// Strict task policy containing evaluated candidate order. Defaults to `platform.toml` in
-        /// the working directory, then the user config directory (`~/.config/freellama/`).
+        /// the working directory, then the `FreeLlama` home (`~/.octocode/freellama/`).
         #[arg(long, env = "FREELLAMA_POLICY_FILE")]
         policy_file: Option<PathBuf>,
         #[command(flatten)]
@@ -412,6 +412,18 @@ pub(crate) enum Command {
             default_value = freellama::DEFAULT_SERVE_ENDPOINT
         )]
         endpoint: String,
+    },
+    /// Tested model picks for each job, with evidence, what is installed, and what fits now.
+    Catalog {
+        #[arg(
+            long,
+            env = "FREELLAMA_SERVE_ENDPOINT",
+            default_value = freellama::DEFAULT_SERVE_ENDPOINT
+        )]
+        endpoint: String,
+        /// Show one job, such as `classify`, `ocr` or `speech-to-text`.
+        #[arg(long)]
+        job: Option<String>,
     },
     /// Print the machine execution profile (CPU, memory, GPU, backends) visible to the platform.
     Machine {
@@ -711,9 +723,23 @@ pub(crate) struct TaskArgs {
     #[arg(long = "image")]
     pub(crate) images: Vec<PathBuf>,
     /// Read the input from a file instead of the positional prompt: one item per line for
-    /// `--task embedding` (batched in one request), otherwise the whole file is the prompt.
+    /// `--task embedding` (batched in one request), the state for `--task decision` (parsed as
+    /// JSON when it is JSON), otherwise the whole file is the prompt.
     #[arg(long)]
     pub(crate) input_file: Option<PathBuf>,
+    /// `--task decision` only: the named questions as a JSON object, or `@path` to a JSON file,
+    /// e.g. `{"kind":{"type":"choice","instructions":"Which kind?","criteria":{"bug":"Broken","feature":"New"}}}`.
+    /// The prompt (or --input-file) is the state the questions are about.
+    #[arg(long)]
+    pub(crate) questions: Option<String>,
+    /// `--task embedding` only: rank the input items against this query and print the `--top`
+    /// closest (line number, score, text) instead of vectors. Use the model's own prefixes,
+    /// e.g. `search_query: ...` for nomic.
+    #[arg(long, requires = "input_file")]
+    pub(crate) nearest: Option<String>,
+    /// How many `--nearest` matches to print.
+    #[arg(long, default_value_t = 5, requires = "nearest")]
+    pub(crate) top: usize,
     /// Refuse rather than run a route graded below this ("low" or "medium").
     #[arg(long, value_parser = ["low", "medium"])]
     pub(crate) min_confidence: Option<String>,

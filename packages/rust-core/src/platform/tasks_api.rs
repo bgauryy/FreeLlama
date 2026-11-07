@@ -34,6 +34,10 @@ pub(crate) struct TaskInput {
     pub(crate) route_fields: BTreeSet<String>,
     #[serde(skip)]
     pub(crate) operation: ManagedOperation,
+    /// Internal speculative load: skip instead of queueing or evicting any runner.
+    /// Callers cannot opt into this execution mode through the wire contract.
+    #[serde(skip)]
+    pub(crate) opportunistic_warm: bool,
     #[serde(default)]
     pub(crate) messages: Vec<Value>,
     pub(crate) prompt: Option<String>,
@@ -43,6 +47,15 @@ pub(crate) struct TaskInput {
     /// path.
     pub(crate) images: Option<Vec<String>>,
     pub(crate) input: Option<Value>,
+    /// Strict artifact/backend contract for continued work such as sliced embeddings.
+    /// These fields reject a changed selection; they never authorize moving an operator's model.
+    pub(crate) expected_model_digest: Option<String>,
+    pub(crate) expected_execution_backend: Option<String>,
+    pub(crate) expected_upstream: Option<String>,
+    /// Decision tasks: the text or JSON the questions are about (`/v1/systemone` `state`).
+    pub(crate) state: Option<Value>,
+    /// Decision tasks: named `noul`, `choice` or `score` questions, answered in this order.
+    pub(crate) questions: Option<Value>,
     /// Service class affects admission only; it never changes model selection or bypasses a
     /// backend's weighted capacity.
     #[serde(default)]
@@ -60,6 +73,8 @@ pub(crate) struct TaskInput {
     pub(crate) max_wait_seconds: Option<u64>,
     #[serde(default)]
     pub(crate) defer: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) idempotency_key: Option<String>,
     /// Total time including discovery, queueing, loading and generation; capped by the server.
     pub(crate) timeout_seconds: Option<u64>,
     /// Stream a chat from Ollama and stop as soon as the output repeats itself, instead of
@@ -111,8 +126,6 @@ pub(crate) struct BatchTaskInput {
 pub(crate) struct TaskBatchInput {
     pub(crate) tasks: Vec<BatchTaskInput>,
     max_parallelism: Option<usize>,
-    /// Caller-chosen id under which `GET /task-batches/{id}` reports progress while this call runs.
-    progress_id: Option<String>,
 }
 
 const MAX_BATCH_TASKS: usize = 64;
@@ -146,8 +159,8 @@ fn next_batch_task(
     pending.remove(0)
 }
 
-/// Reject a batch that is empty, too large, has duplicate or empty ids, defers, declares a
-/// dependency, or names an unusable progress id.
+/// Reject a batch that is empty, too large, has duplicate or empty ids, defers, or declares a
+/// dependency.
 fn validate_batch(input: &TaskBatchInput) -> Result<(), ApiError> {
     if input.tasks.is_empty() || input.tasks.len() > MAX_BATCH_TASKS {
         return Err(ApiError::bad_request(format!(
@@ -173,13 +186,6 @@ fn validate_batch(input: &TaskBatchInput) -> Result<(), ApiError> {
             )));
         }
     }
-    if let Some(id) = &input.progress_id
-        && !super::batch_progress::valid_id(id)
-    {
-        return Err(ApiError::bad_request(
-            "progress_id must be 1 to 64 letters, digits, '-' or '_'",
-        ));
-    }
     Ok(())
 }
 
@@ -195,11 +201,6 @@ pub(crate) async fn run_task_batch(
         }
     }
     validate_batch(&input)?;
-    // Progress is a view: a batch that cannot be tracked still runs.
-    let progress_id = input
-        .progress_id
-        .clone()
-        .filter(|id| state.batch_progress.begin(id, input.tasks.len()));
     let max_parallelism = input
         .max_parallelism
         .unwrap_or(DEFAULT_BATCH_PARALLELISM)
@@ -218,11 +219,6 @@ pub(crate) async fn run_task_batch(
         while running.len() < max_parallelism && !pending.is_empty() {
             let index = next_batch_task(&mut pending, &input.tasks, &mut credits);
             let task = input.tasks[index].task.clone();
-            if let Some(progress) = &progress_id {
-                state
-                    .batch_progress
-                    .started(progress, &input.tasks[index].id);
-            }
             let task_state = state.clone();
             let handle = running.spawn(Box::pin(execution::execute_task(
                 State(task_state),
@@ -239,10 +235,6 @@ pub(crate) async fn run_task_batch(
                 continue;
             };
             let id = input.tasks[index].id.clone();
-            if let Some(progress) = &progress_id {
-                let ok = matches!(outcome, Ok(Ok(_)));
-                state.batch_progress.finished(progress, &id, ok);
-            }
             results[index] = Some(match outcome {
                 Ok(Ok(Json(response))) => json!({ "id": id, "ok": true, "response": response }),
                 Ok(Err(error)) => error.into_batch_result(id),
@@ -253,9 +245,6 @@ pub(crate) async fn run_task_batch(
                 .into_batch_result(id),
             });
         }
-    }
-    if let Some(progress) = &progress_id {
-        state.batch_progress.end(progress);
     }
     Ok(Json(json!({
         "independent_only": true,

@@ -1,7 +1,6 @@
 //! Bounded empirical runner footprints. No extrapolation across model revisions or contexts.
 use super::CatalogModel;
 use crate::store::{FootprintRow, Store};
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, VecDeque};
 
@@ -103,17 +102,13 @@ const HISTORY_LIMIT: usize = 64;
 
 /// One measurement. The Ollama settings it was taken under are part of its identity: a size
 /// measured with one parallel slot or an F16 cache says nothing safe about four slots or `q8_0`,
-/// and samples outlive the process that measured them. A sample without these fields
-/// deserializes them as 0, which matches no live setting, so it is ignored.
-#[derive(Serialize, Deserialize)]
+/// and samples outlive the process that measured them.
 struct Sample {
     backend: String,
     digest: String,
     context: u64,
     bytes: u64,
-    #[serde(default)]
     num_parallel: u64,
-    #[serde(default)]
     kv_cache_percent: u64,
 }
 
@@ -280,11 +275,10 @@ impl FootprintHistory {
         let warm = current.is_some_and(|entry| {
             entry["context_length"]
                 .as_u64()
-                .is_some_and(|loaded| loaded >= context)
-                && model
-                    .digest
-                    .as_ref()
-                    .is_some_and(|digest| entry["digest"].as_str() == Some(digest.as_str()))
+                .is_some_and(|loaded| context > 0 && loaded == context)
+                && model.digest.as_ref().is_some_and(|digest| {
+                    !digest.is_empty() && entry["digest"].as_str() == Some(digest.as_str())
+                })
         });
         if warm {
             return json!({"required_available_bytes":0,"source":"matching_resident_context","exact":false,
@@ -361,6 +355,32 @@ mod tests {
     fn model() -> CatalogModel {
         serde_json::from_value(json!({"name":"m","digest":"a","size":1000,"capabilities":[],"advertised_context":32768,"resident":false,"benchmark":{},"policy_rank":{}})).unwrap()
     }
+
+    #[test]
+    fn zero_forecast_requires_exact_nonzero_context_and_known_matching_digest() {
+        let history = FootprintHistory::default();
+        let loaded = json!({"digest":"a","context_length":8192});
+        let matching = history.requirement("cpu", &model(), 8192, Some(&loaded), true);
+        assert_eq!(matching["required_available_bytes"], 0);
+        assert_eq!(matching["source"], "matching_resident_context");
+        for context in [0, 4096, 16384] {
+            assert!(history.requirement("cpu", &model(), context, Some(&loaded), true)
+                ["required_available_bytes"].as_u64().unwrap() > 0);
+        }
+        for digest in [None, Some(String::new()), Some("changed".into())] {
+            let mut requested = model();
+            requested.digest = digest;
+            assert!(history.requirement("cpu", &requested, 8192, Some(&loaded), true)
+                ["required_available_bytes"].as_u64().unwrap() > 0);
+        }
+        // Omitting the live entry is the conservative path for explicit unreported load controls.
+        assert!(
+            history.requirement("cpu", &model(), 8192, None, true)["required_available_bytes"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+    }
     #[test]
     fn observed_footprints_never_cross_revisions_or_extrapolate_upward() {
         let mut history = FootprintHistory::default();
@@ -394,7 +414,7 @@ mod tests {
         let history = FootprintHistory::default();
         let current = json!({"digest":"a","size":2000,"context_length":8192});
         assert_eq!(
-            history.requirement("cpu", &model(), 4096, Some(&current), true)["required_available_bytes"],
+            history.requirement("cpu", &model(), 8192, Some(&current), true)["required_available_bytes"],
             0
         );
         assert_eq!(

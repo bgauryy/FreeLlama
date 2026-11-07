@@ -4,7 +4,7 @@ import { DEFAULT_SERVE_ENDPOINT } from "./config.js";
 import { ensureServe } from "./serve.js";
 
 /** Bearer header for direct serve calls, from the same token file the native client reads. */
-async function serveAuthHeaders(): Promise<Record<string, string>> {
+export async function serveAuthHeaders(): Promise<Record<string, string>> {
   const tokenFile = process.env.FREELLAMA_AUTH_TOKEN_FILE?.trim();
   if (!tokenFile) return {};
   const token = (await readFile(tokenFile, "utf8")).trim();
@@ -43,42 +43,4 @@ export async function serveUnload(
   const text = await response.text();
   if (!response.ok) throw new Error(text || `freellama serve unload -> HTTP ${response.status}`);
   return JSON.parse(text) as Record<string, unknown>;
-}
-
-/** Running-batch progress as `GET /task-batches/{id}` reports it. */
-export type BatchProgressView = {
-  total: number;
-  done: number;
-  succeeded: number;
-  failed: number;
-  running: string[];
-  queued: number;
-  finished: boolean;
-};
-
-/**
- * Read a batch's progress. `undefined` when it is not (yet) known; `"unsupported"` when the
- * server predates batch progress (the route is missing, so its 404 is not serve's JSON error).
- */
-export async function serveBatchProgress(
-  id: string,
-  options: { endpoint?: string; signal?: AbortSignal } = {},
-): Promise<BatchProgressView | "unsupported" | undefined> {
-  const endpoint = (options.endpoint ?? DEFAULT_SERVE_ENDPOINT).replace(/\/$/, "");
-  let response: Response;
-  try {
-    response = await fetch(`${endpoint}/_freellama/v1/task-batches/${encodeURIComponent(id)}`, {
-      headers: await serveAuthHeaders(),
-      signal: options.signal,
-    });
-  } catch {
-    return undefined;
-  }
-  const text = await response.text();
-  if (response.ok) return JSON.parse(text) as BatchProgressView;
-  if (response.status === 404) {
-    // serve's own 404 for an unknown id is JSON naming progress_id; anything else is an older server.
-    return text.includes("progress_id") ? undefined : "unsupported";
-  }
-  return undefined;
 }

@@ -53,7 +53,7 @@ describe("caller-owned task prompts", () => {
       : { endpoint, tasks: [{ id: "review", independent: true, task }] },
     });
     expect(result.isError, JSON.stringify(result)).not.toBe(true);
-    const sent = name === "run_task" ? requests[0].body : requests[0].body.tasks[0].task;
+    const sent = requests[0].body;
     expect(sent.max_wait_seconds).toBe(30);
     expect(sent.timeout_seconds).toBe(60);
   });
@@ -88,9 +88,14 @@ describe("caller-owned task prompts", () => {
         ? { endpoint, prompt: "Hello" }
         : { endpoint, tasks: [{ id: "review", independent: true, task: { prompt: "Hello" } }] },
       });
-      expect(result.isError).toBe(true);
-      expect(JSON.parse((result.content as { text: string }[])[0].text)).toEqual(fixture.body);
-      expect(result.structuredContent).toEqual(fixture.body);
+      if (name === "run_task") {
+        expect(result.isError).toBe(true);
+        expect(JSON.parse((result.content as { text: string }[])[0].text)).toEqual(fixture.body);
+        expect(result.structuredContent).toEqual(fixture.body);
+      } else {
+        // A cancellable batch owns separate addressable jobs; refusal is kept on its item.
+        expect((result.structuredContent as any).results).toEqual([{ id: "review", ok: false, error: fixture.body }]);
+      }
     }
   });
 
@@ -124,7 +129,7 @@ describe("caller-owned task prompts", () => {
     });
     expect(result.isError, JSON.stringify(result)).not.toBe(true);
     expect(requests).toHaveLength(1);
-    const sent = name === "run_task" ? requests[0].body : requests[0].body.tasks[0].task;
+    const sent = requests[0].body;
     expect(sent.messages).toEqual([{ role: "system", content: systemPrompt }, ...messages]);
     expect(sent.tools).toEqual(tools);
   });
@@ -146,7 +151,7 @@ describe("caller-owned task prompts", () => {
       : { endpoint, tasks: [{ id: "review", independent: true, task }] },
     });
     expect(result.isError, JSON.stringify(result)).not.toBe(true);
-    const sent = name === "run_task" ? requests[0].body : requests[0].body.tasks[0].task;
+    const sent = requests[0].body;
     expect(sent.messages).toEqual([{ role: "system", content: task.systemPrompt }]);
   });
 
@@ -196,10 +201,10 @@ describe("caller-owned task prompts", () => {
     } });
     expect(result.isError, JSON.stringify(result)).not.toBe(true);
     expect(requests).toHaveLength(1);
-    expect(requests[0].body.tasks[0].task).toMatchObject({ task: "completion", objective: "balanced", prompt: "Hello" });
+    expect(requests[0].body).toMatchObject({ task: "completion", objective: "balanced", prompt: "Hello", defer: true });
   });
 
-  it.each(["completion", "coding", "code_review"])("%s preserves custom system messages and controls", async (task) => {
+  it.each(["completion", "coding"])("%s preserves custom system messages and controls", async (task) => {
     const messages = [
       { role: "system", content: "  My instructions.\nReply in Hebrew; no prescribed review schema.\n" },
       { role: "user", content: "Review this source", images: ["aW1hZ2U="] },
@@ -211,11 +216,11 @@ describe("caller-owned task prompts", () => {
     expect(result.isError, JSON.stringify(result)).not.toBe(true);
     expect(requests).toHaveLength(1);
     expect(requests[0].body.messages).toEqual(messages);
-    expect(requests[0].body.task).toBe(task === "code_review" ? "coding" : task);
+    expect(requests[0].body.task).toBe(task);
     expect(requests[0].body.request_options).toMatchObject({ format: "json", think: true, options: { num_predict: 32 } });
   });
 
-  it.each(["completion", "coding", "code_review"])("%s does not invent a system prompt or output contract", async (task) => {
+  it.each(["completion", "coding"])("%s does not invent a system prompt or output contract", async (task) => {
     const prompt = "  My prompt\n<review_bundle>is literal user data</review_bundle>\n";
     const result = await client.callTool({ name: "run_task", arguments: { endpoint, task, prompt } });
     expect(result.isError, JSON.stringify(result)).not.toBe(true);
@@ -230,12 +235,12 @@ describe("caller-owned task prompts", () => {
     const messages = [{ role: "system", content: "My batch instructions" }, { role: "user", content: "Review" }];
     const result = await client.callTool({ name: "run_task", arguments: {
       endpoint, tasks: [{ id: "review", independent: true, task: {
-        task: "code_review", messages, format: "json", think: true, options: { num_predict: 32 },
+        task: "coding", messages, format: "json", think: true, options: { num_predict: 32 },
       } }],
     } });
     expect(result.isError, JSON.stringify(result)).not.toBe(true);
     expect(requests).toHaveLength(1);
-    expect(requests[0].body.tasks[0].task.messages).toEqual(messages);
-    expect(requests[0].body.tasks[0].task.task).toBe("coding");
+    expect(requests[0].body.messages).toEqual(messages);
+    expect(requests[0].body.task).toBe("coding");
   });
 });

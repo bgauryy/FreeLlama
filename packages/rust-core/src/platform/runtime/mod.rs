@@ -172,8 +172,6 @@ impl Tunables {
             } else {
                 format!("{embedding} * ceil(input_items/4)")
             },
-            "chat": self.task_cost(super::TaskKind::Completion),
-            "vision": self.task_cost(super::TaskKind::Vision),
         })
     }
 
@@ -211,7 +209,8 @@ impl Tunables {
 
 fn default_task_cost(task: super::TaskKind) -> NonZeroU32 {
     let cost = match task {
-        super::TaskKind::Embedding => 1,
+        // One forward pass each: a decision scores a few answer tokens and generates nothing.
+        super::TaskKind::Embedding | super::TaskKind::Decision => 1,
         super::TaskKind::Vision => 4,
         _ => 2,
     };

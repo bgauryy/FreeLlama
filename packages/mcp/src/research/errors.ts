@@ -15,11 +15,25 @@ export class ToolTimeoutError extends Error {
   override name = "ToolTimeoutError";
 }
 
+/** A completed subprocess without usable evidence; an empty search is distinct from a failure. */
+export class ToolExitError extends Error {
+  override name = "ToolExitError";
+
+  constructor(
+    readonly exitCode: number,
+    readonly output: string,
+    readonly status: "empty" | "error" = "error",
+  ) {
+    super(`${status === "empty" ? "nothing found" : "command failed"} (exit code ${exitCode})` +
+      (output ? `\n${output}` : ""));
+  }
+}
+
 /**
  * Whether a tool runner failure becomes a `tool error: ...` observation for the model instead of
- * ending the run: refusals, system errors, timeouts, and malformed tool output.
+ * ending the run: refusals, non-successful exits, system errors, timeouts, and malformed output.
  */
 export function isToolError(error: unknown): error is Error {
-  return error instanceof ValidationError || error instanceof ToolTimeoutError || error instanceof SyntaxError
+  return error instanceof ValidationError || error instanceof ToolTimeoutError || error instanceof ToolExitError || error instanceof SyntaxError
     || isSystemError(error);
 }

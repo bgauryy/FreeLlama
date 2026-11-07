@@ -40,6 +40,8 @@ pub(super) fn profile(input: &RouteInput, model: &CatalogModel) -> TaskProfile {
         ),
         TaskKind::Vision => ("vision", 512, Value::Bool(false), false),
         TaskKind::Embedding => ("embedding", 0, Value::Null, false),
+        // One forward pass; the answer is a few tokens of scores, never generated text.
+        TaskKind::Decision => ("decision", 0, Value::Null, false),
         TaskKind::Completion => ("completion", 512, Value::Bool(false), false),
     };
     let output_reserve = if starting_estimate == 0 {
@@ -70,6 +72,9 @@ pub(super) fn profile(input: &RouteInput, model: &CatalogModel) -> TaskProfile {
         Some(false) => Value::Bool(false),
         None => think,
     };
+    // A generic task preference must not invent a level or disable an always-thinking model.
+    // Use the model's own declared default whenever that preference is unavailable.
+    let think = supported_default(model, think);
     let mut options = json!({"num_ctx": num_ctx});
     if let Some(cap) = policy_cap {
         options["num_predict"] = json!(cap);
@@ -87,7 +92,9 @@ pub(super) fn profile(input: &RouteInput, model: &CatalogModel) -> TaskProfile {
 
 pub(super) fn requested_context(input: &RouteInput) -> u64 {
     input.context_tokens.unwrap_or(match input.task {
-        TaskKind::Browser | TaskKind::Tools | TaskKind::CodeRepair => 8_192,
+        // Decision: Ollama sizes the runner itself (`/v1/systemone` takes no options); this only
+        // feeds the memory estimate, so it matches a typical state rather than the model's window.
+        TaskKind::Browser | TaskKind::Tools | TaskKind::CodeRepair | TaskKind::Decision => 8_192,
         TaskKind::LongContext => 32_768,
         // Embeddings are not chat: embedding models commonly advertise 2048, so the chat default
         // would make every embed look like a context miss.
@@ -101,5 +108,22 @@ pub(super) fn thinking_or_off(model: &CatalogModel, effort: impl Into<Value>) ->
         effort.into()
     } else {
         Value::Bool(false)
+    }
+}
+
+fn supported_default(model: &CatalogModel, preferred: Value) -> Value {
+    if preferred.is_null() {
+        return preferred;
+    }
+    let Some(thinking) = &model.thinking else {
+        return preferred;
+    };
+    let Some(values) = thinking["values"].as_array() else {
+        return preferred;
+    };
+    if values.contains(&preferred) {
+        preferred
+    } else {
+        thinking["default"].clone()
     }
 }

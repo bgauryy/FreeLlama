@@ -37,15 +37,34 @@ const FIELDS: &[(&[u8], Field)] = &[
 
 /// Bytes kept from the end of one chunk so a field split across chunks is still found.
 const CARRY: usize = 64;
+const MAX_COMPLETION_RECORD: usize = 64 * 1024;
 
 #[derive(Debug, Default)]
 pub struct UsageScanner {
     carry: Vec<u8>,
     usage: RawUsage,
+    record: Vec<u8>,
+    record_overflow: bool,
+    terminal: bool,
+    upstream_error: bool,
 }
 
 impl UsageScanner {
     pub fn feed(&mut self, chunk: &[u8]) {
+        // Keep only one bounded record; parse structural fields, never generated string text.
+        for part in chunk.split_inclusive(|byte| *byte == b'\n') {
+            if !self.record_overflow {
+                if self.record.len().saturating_add(part.len()) <= MAX_COMPLETION_RECORD {
+                    self.record.extend_from_slice(part);
+                } else {
+                    self.record.clear();
+                    self.record_overflow = true;
+                }
+            }
+            if part.last() == Some(&b'\n') {
+                self.complete_record();
+            }
+        }
         let mut window = std::mem::take(&mut self.carry);
         window.extend_from_slice(chunk);
         for (name, field) in FIELDS {
@@ -88,6 +107,43 @@ impl UsageScanner {
     pub fn usage(&self) -> RawUsage {
         self.usage
     }
+
+    pub(crate) fn end_stream(&mut self) {
+        self.complete_record();
+    }
+
+    pub(crate) fn terminal(&self) -> bool {
+        self.terminal
+    }
+
+    pub(crate) fn upstream_error(&self) -> bool {
+        self.upstream_error
+    }
+
+    fn complete_record(&mut self) {
+        if !self.record_overflow {
+            let record = std::mem::take(&mut self.record);
+            let line = record
+                .strip_prefix(b"data: ")
+                .or_else(|| record.strip_prefix(b"data:"))
+                .unwrap_or(&record);
+            if line.trim_ascii() == b"[DONE]" {
+                self.terminal = true;
+            } else if let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) {
+                self.upstream_error |= value.get("error").is_some_and(|error| !error.is_null());
+                self.terminal |= value["done"] == true
+                    || value["choices"].as_array().is_some_and(|choices| {
+                        choices.iter().any(|choice| {
+                            choice
+                                .get("finish_reason")
+                                .is_some_and(|reason| !reason.is_null())
+                        })
+                    });
+            }
+        }
+        self.record.clear();
+        self.record_overflow = false;
+    }
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -99,6 +155,27 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_detection_is_structural_split_safe_and_bounded() {
+        let mut scanner = UsageScanner::default();
+        scanner
+            .feed(br#"{"message":{"content":"fake \"done\":true and \"error\":1"},"done":false}"#);
+        scanner.feed(b"\n");
+        assert!(!scanner.terminal());
+        assert!(!scanner.upstream_error());
+        scanner.feed(b"{\"done\":tr");
+        scanner.feed(b"ue}\n");
+        assert!(scanner.terminal());
+        let mut scanner = UsageScanner::default();
+        scanner.feed(&vec![b'x'; MAX_COMPLETION_RECORD + 1]);
+        assert!(scanner.record.len() <= MAX_COMPLETION_RECORD);
+        scanner.feed(b"\ndata: [DONE]\n");
+        assert!(scanner.terminal());
+        scanner.feed(b"{\"error\":\"oom\"}");
+        scanner.end_stream();
+        assert!(scanner.upstream_error());
+    }
 
     #[test]
     fn native_streams_report_their_final_counts() {

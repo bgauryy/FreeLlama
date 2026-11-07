@@ -120,6 +120,20 @@ pub(super) fn preload_task(
     .into_task()
 }
 
+/// A predicted load may use only capacity that is immediately available. Startup and explicit
+/// warms keep ordinary managed admission; only this private constructor enables speculation.
+pub(super) fn predicted_task(model: String) -> Result<TaskInput, ApiError> {
+    let mut input = preload_task(
+        model,
+        None,
+        None,
+        Vec::new(),
+        super::TaskPriority::Background,
+    )?;
+    input.opportunistic_warm = true;
+    Ok(input)
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct UnloadInput {
@@ -246,6 +260,37 @@ pub(super) fn completion_receipt(execution: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn predictive_admission_is_internal_and_does_not_change_explicit_warms() {
+        let prediction = predicted_task("model:exact".into()).unwrap();
+        assert!(prediction.opportunistic_warm);
+        assert!(matches!(
+            prediction.operation,
+            super::super::ManagedOperation::Warm
+        ));
+        assert_eq!(prediction.route.model.as_deref(), Some("model:exact"));
+        let wire = serde_json::to_value(&prediction).unwrap();
+        assert!(wire.get("opportunistic_warm").is_none());
+        let ordinary: TaskInput = serde_json::from_value(wire).unwrap();
+        assert!(!ordinary.opportunistic_warm);
+        assert!(
+            serde_json::from_value::<TaskInput>(json!({
+                "model": "model:exact", "opportunistic_warm": true
+            }))
+            .is_err()
+        );
+        let explicit = preload_task(
+            "model:exact".into(),
+            None,
+            None,
+            Vec::new(),
+            super::super::TaskPriority::Background,
+        )
+        .unwrap();
+        assert!(!explicit.opportunistic_warm);
+    }
+
     #[test]
     fn reuse_load_and_pressure_are_bounded_and_operator_tunable() {
         let policy = WarmingPolicy::default();

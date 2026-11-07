@@ -1,3 +1,4 @@
+import { fileURLToPath } from "node:url";
 import { defineConfig } from "vitest/config";
 
 // Unit tier: pure functions imported straight from src/*.ts (vitest transpiles TS with esbuild,
@@ -6,6 +7,7 @@ import { defineConfig } from "vitest/config";
 export default defineConfig({
   test: {
     name: "mcp",
+    globalSetup: [fileURLToPath(new URL("../../vitest.tmp.global.ts", import.meta.url))],
     environment: "node",
     include: ["test/unit/**/*.test.ts"],
   },

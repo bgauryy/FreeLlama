@@ -1,5 +1,4 @@
-// delegate_research with and without a client progressToken: the adapter is asked for progress only
-// when the client can receive it, and its progress lines become notifications/progress.
+// Lifecycle tracking is independent of progressToken; only human-facing notifications depend on it.
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { PROGRESS_ENV, PROGRESS_PREFIX } from "../../src/research/progress-events.js";
@@ -8,7 +7,9 @@ const fixture = vi.hoisted(() => ({
   handlers: new Map<string, (...args: any[]) => Promise<any>>(),
   exec: vi.fn(),
   cancelTaskJob: vi.fn(async (_endpoint: string, _id: string) => "{}"),
+  result: {} as Record<string, unknown>,
 }));
+const DEFAULT_RESULT = { final_answer: "foo is in src/a.ts", tool_calls: [], usage: {} };
 
 vi.mock("../../src/serve-client.js", () => ({ route: vi.fn(), cancelTaskJob: fixture.cancelTaskJob }));
 vi.mock("node:fs", async (importOriginal) => {
@@ -19,7 +20,7 @@ vi.mock("node:fs/promises", async (importOriginal) => ({
   ...await importOriginal<typeof import("node:fs/promises")>(),
   mkdtemp: vi.fn(async () => "/mock-delegate"),
   writeFile: vi.fn(async () => undefined),
-  readFile: vi.fn(async () => JSON.stringify({ final_answer: "foo is in src/a.ts", tool_calls: [], usage: {} })),
+  readFile: vi.fn(async () => JSON.stringify(fixture.result)),
   rm: vi.fn(async () => undefined),
 }));
 vi.mock("../../src/lifecycle.js", () => ({
@@ -46,6 +47,7 @@ describe("delegate_research progress", () => {
   beforeEach(() => {
     fixture.exec.mockReset();
     fixture.cancelTaskJob.mockClear();
+    fixture.result = DEFAULT_RESULT;
     vi.unstubAllEnvs();
   });
 
@@ -95,17 +97,44 @@ describe("delegate_research progress", () => {
     expect(sent).toContain("turn 2/8: loading m (~8.7 s)");
   });
 
-  it("without a progressToken spawns exactly as before, even if the server env names the variable", async () => {
+  it("tracks and cleans up jobs without a progressToken while keeping notifications quiet", async () => {
     vi.stubEnv(PROGRESS_ENV, "stderr");
     fixture.exec.mockImplementation(async (_file: string, _argv: string[], options: Options) => {
-      expect(options.env[PROGRESS_ENV]).toBeUndefined();
-      expect(options).not.toHaveProperty("stderrFilter");
+      expect(options.env[PROGRESS_ENV]).toBe("stderr");
+      const kept = options.stderrFilter!.push(Buffer.from(
+        `${PROGRESS_PREFIX}{"event":"job_open","id":"quiet-job"}\n` +
+        `${PROGRESS_PREFIX}{"event":"model","turn":1,"maxTurns":8}\ndiagnostic\n`,
+      ));
+      expect(kept.toString()).toBe("diagnostic\n");
       return { stdout: "", stderr: "" };
     });
     const sendNotification = vi.fn(async () => undefined);
     const result = await fixture.handlers.get("delegate_research")!(args, { signal: new AbortController().signal, sendNotification });
     expect(result.isError).toBeFalsy();
     expect(fixture.exec).toHaveBeenCalledTimes(1);
+    expect(fixture.cancelTaskJob).toHaveBeenCalledWith(expect.any(String), "quiet-job");
     expect(sendNotification).not.toHaveBeenCalled();
+  });
+
+  it("cites only steps that read something; failed and empty steps stay in the trail with their status", async () => {
+    fixture.result = {
+      ...DEFAULT_RESULT,
+      tool_calls: [
+        { raw_name: "shell", arguments: { command: "cat package.json" }, status: "ok", result: "{}" },
+        { raw_name: "shell", arguments: { command: "cat missing.txt" }, status: "error", exit_code: 1, result: "No such file" },
+        { raw_name: "shell", arguments: { command: "rg absent package.json" }, status: "empty", exit_code: 1, result: "nothing found" },
+        { raw_name: "shell", arguments: { command: "cat package.json" }, status: "ok", result: "{}" },
+      ],
+    };
+    fixture.exec.mockResolvedValue({ stdout: "", stderr: "" });
+    const result = await fixture.handlers.get("delegate_research")!(args, { signal: new AbortController().signal });
+    expect(result.isError).toBeFalsy();
+    const content = result.structuredContent;
+    expect(content.citations.map((citation: { step: number }) => citation.step)).toEqual([1, 4]);
+    expect(content.toolCallCount).toBe(4);
+    expect(content.successfulToolCallCount).toBe(2);
+    expect(content.evidence.map((step: { status: string }) => step.status)).toEqual(["ok", "error", "empty", "ok"]);
+    expect(content.evidence[1]).toMatchObject({ exit_code: 1 });
+    expect(content.summary).toContain("2 of which did not succeed");
   });
 });

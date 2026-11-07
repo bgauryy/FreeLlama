@@ -28,6 +28,10 @@ pub(super) struct ErrorBody {
     /// Seconds a caller should wait before retrying; also sent as the `Retry-After` header.
     #[serde(skip_serializing_if = "Option::is_none")]
     retry_after_seconds: Option<u64>,
+    /// When a load waited for memory: the processes holding the most of it, so the caller can
+    /// ask its user what to close.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    memory_holders: Option<Vec<resources::MemoryHolder>>,
 }
 
 /// A deadline can expire before footprint discovery establishes a byte requirement. Keep that
@@ -60,6 +64,7 @@ impl ApiError {
                 upstream_response: None,
                 lifecycle: None,
                 retry_after_seconds: None,
+                memory_holders: None,
             }),
         }
     }
@@ -67,6 +72,10 @@ impl ApiError {
     /// A host-memory admission wait that ran out of time (as opposed to a queue or input error).
     pub(super) fn is_resource_wait(&self) -> bool {
         self.body.code == Some("resource_admission_unavailable")
+    }
+
+    pub(super) fn is_opportunistic_warm_skip(&self) -> bool {
+        self.body.code == Some("opportunistic_warm_skipped")
     }
 
     /// Attach a machine-readable code.
@@ -149,6 +158,17 @@ impl ApiError {
                     .collect::<Vec<_>>()
                     .join(", ");
                 self.body.error = format!("{}: host held by {names}", self.body.error);
+                if reasons.iter().any(|reason| reason.is_memory()) {
+                    let holders = resources::memory_holders();
+                    if !holders.is_empty() {
+                        self.body.error = format!(
+                            "{}; largest memory users: {}",
+                            self.body.error,
+                            resources::describe_holders(&holders)
+                        );
+                        self.body.memory_holders = Some(holders);
+                    }
+                }
             }
             *held_by = reasons;
         }
@@ -180,8 +200,22 @@ impl IntoResponse for ApiError {
 }
 
 pub(super) fn resource_error(error: resources::ResourceWaitError) -> ApiError {
-    let message = error.to_string();
+    let mut message = error.to_string();
     let receipt = *error.receipt;
+    let memory_short = receipt.assessment.as_ref().is_some_and(|assessment| {
+        assessment.denial_reason == Some(resources::CapacityDenialReason::InsufficientCapacity)
+            || assessment.held_by.iter().any(|reason| reason.is_memory())
+    });
+    let memory_holders = memory_short.then(resources::memory_holders);
+    if let Some(holders) = memory_holders
+        .as_ref()
+        .filter(|holders| !holders.is_empty())
+    {
+        message = format!(
+            "{message}; largest memory users: {}",
+            resources::describe_holders(holders)
+        );
+    }
     ApiError {
         status: StatusCode::SERVICE_UNAVAILABLE,
         body: Box::new(ErrorBody {
@@ -192,6 +226,7 @@ pub(super) fn resource_error(error: resources::ResourceWaitError) -> ApiError {
             lifecycle: None,
             // Host memory rarely recovers in under a few seconds.
             retry_after_seconds: Some(5),
+            memory_holders,
         }),
     }
 }

@@ -200,10 +200,9 @@ Everything the server learns lives in one `SQLite` database, `~/.octocode/freell
 ledger and the residency audit. It uses write-ahead logging, so several FreeLlama processes on one
 machine share it safely and learn from each other. The feedback snapshot is versioned and bounded by
 backend and task type; only physically verified warm samples are saved, and a corrupt or unsupported
-snapshot makes startup fail instead of silently discarding routing evidence. The first start imports
-the files earlier versions kept under `~/.local/share/freellama` once and copies `platform.toml`
-from `~/.config/freellama`, leaving the old files in place. Use `--ephemeral` only for disposable
-tests.
+snapshot makes startup fail instead of silently discarding routing evidence. A database file with
+another schema version is refused with its path; move or delete it to start a new one. Use
+`--ephemeral` only for disposable tests.
 
 ## Bound conversation history and residency
 
@@ -246,7 +245,7 @@ longer resident before returning. Inspect both `execution.observation` and
 
 Require these health contracts before admitting traffic:
 
-- `placement_feedback_persistence: shared_database_snapshot_v1`
+- `placement_feedback_persistence: shared_database_snapshot_v2`
 - `authentication: optional_bearer_all_routes`
 - `immediate_unload_observation: observe_then_unload`
 - `placement_observation: ollama_api_ps_after_execution`

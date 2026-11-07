@@ -17,9 +17,9 @@ The server uses the official [TypeScript SDK](https://github.com/modelcontextpro
 `doctor`, `models`, `run_task`, `task_jobs`, `scope`, and `session` call the Rust core through native NAPI bindings
 (`packages/rust-core/src/napi.rs`), with no CLI subprocess and no routing decisions in TypeScript; the
 TypeScript layer validates request shapes and derives presentation fields (see
-[what the MCP layer computes](#what-the-mcp-layer-computes)). `run_task` has four modes: one task,
-`tasks[]` (independent batch), `preview: true` (decision only, no inference), and `warm: true`
-(load an exact installed model, no generation). Preview and execution are separate calls: preview
+[what the MCP layer computes](#what-the-mcp-layer-computes)). `run_task` has three modes: one task,
+`tasks[]` (independent batch) and `preview: true` (decision only, no inference); `ollama_manage {action:"warm"}`
+loads an exact installed model without generating. Preview and execution are separate calls: preview
 accepts routing fields only and rejects task payloads or runtime controls instead of silently
 ignoring them. `ollama_manage` and `ollama_delete` call Ollama's HTTP API directly for lifecycle
 operations the routing layer does not perform.
@@ -275,13 +275,14 @@ catalog loading; a server without `/ready` counts as ready once it answers. See
 |---|---|---|
 | `doctor` | No (except `status`/`usage`) | Runtime/configuration diagnostic. Target another Ollama with `ollamaEndpoint` and serve with `serveEndpoint`. `summary` (default) returns `status` (`ok`, or `degraded` with `problems` when serve is unreachable or `/ready` reports what it waits for), endpoint, version, resident count, `platform_health` with readiness, host/profile signals, and next step; `full` adds all non-duplicated diagnostics, including admission and categorized Ollama settings; `status` returns serve's live view (per-backend queues, current and adaptive limits, circuit breakers, loaded models, host memory, Ollama's effective settings, today's usage); `usage` returns task and token totals per day and model (`days`, default 7). The report distinguishes an observed same-user macOS process from configuration hints and never claims remote process visibility. |
 | `models` | `installed` (default) and `resident` do; `detail`/`raw`/`library` don't | Views: `installed` (capabilities, use explanations, derived `model_type`, VRAM, context, policy_rank), `resident` (loaded now + managed GPU/CPU split), `detail` (one model, maximum context), paged `raw` (`GET /api/tags`), `library` (two-step public search: omit `model` to search ollama.com families and, for a `query`, Hugging Face GGUF repos (`source` limits it to one; `limit` applies per source); pass `model:"<family>"` or `model:"hf.co/<owner>/<repo>"` for every pullable tag with its size and `fitsInMemory`). `includeLibrary:true` enriches installed/detail views with sourced public guidance; `includeReadme:true` returns the README text in library step 2 or enriched detail. |
-| `run_task` | Yes | **Routes or executes** a chat/generate/embed call. `preview: true` accepts routing fields only and returns a decision without generation. Execution omits preview and supplies the payload. Embedding results withhold raw vectors inline by default; the response file keeps them (`read_response` section `embeddings`, or `returnEmbeddings: true`). With an MCP `progressToken`, a single execution runs as a job and reports its phases (queued, waiting for memory, loading, running) as `notifications/progress`, then returns the same result. `tasks: [{id, independent:true, task}]` (max 64, `maxParallelism` bounds fan-out) runs a batch whose nested `task` takes the same fields; it is not a dependency scheduler. `warm: true` warms an exact installed `model` through managed admission with residency/profile controls and optional `defer:true`. |
+| `run_task` | Yes | **Routes or executes** a chat/generate/embed call. `preview: true` accepts routing fields only and returns a decision without generation. Execution omits preview and supplies the payload. Embedding results withhold raw vectors inline by default; the response file keeps them (`read_response` section `embeddings`, or `returnEmbeddings: true`). A caller cancellation signal uses an addressable job even without progress notifications. An MCP `progressToken` additionally reports phases (queued, waiting for memory, loading, running) as `notifications/progress`; accepted jobs are never replayed when polling or result retrieval fails. A client cancellation retries the cancel request up to 3 times and returns `cancellation_state`: `acknowledged` (serve reports the job terminal), `requested`, or `unknown`; none confirms that Ollama stopped work. A typed refusal from serve (HTTP 429, 502 or 503 with a `code`) is returned whole and ran nothing; a submission that gets no answer from serve returns `execution_outcome:"unknown"` and `retry_safe:false`. `tasks: [{id, independent:true, task}]` (max 64, `maxParallelism` bounds fan-out) runs a batch whose nested `task` takes the same fields; it is not a dependency scheduler. Decision tasks take `state` + `questions` and answer one line per question; `files` names inputs by path or glob (the server reads them; roots: working directory, temp directory, `FREELLAMA_FILE_ROOTS`); with `tasks`, top-level `task`, `model`, `systemPrompt`, `questions`, `format`, `options` and routing fields are sent once as defaults for every item; `nearest` ranks embeddings against a `query`, or finds the most similar pairs, and returns labels with scores instead of vectors. |
 | `scope` | Yes | Creates, inspects, forks, or deletes process-local message history; history inclusion requires `includeMessages:true`. |
 | `session` | Yes | Creates, deletes, or kills model affinity without storing messages or KV; `kill` cancels the session's in-flight work. |
 | `task_jobs` | Yes | Inspects, cancels, or removes a deferred task or warming operation. |
-| `ollama_manage` | Pull: no. Stop: when available | `action: "pull"` downloads a model from Ollama directly (additive); `action: "stop"` unloads it through serve's `/unload`, which waits for that model's running tasks, and asks Ollama directly when serve is unreachable, older, or another `ollamaEndpoint` is named. Both are idempotent |
+| `ollama_manage` | Pull: no. Warm: yes. Unload: when available | `action: "pull"` downloads a model from Ollama directly (additive); `action: "warm"` loads an exact installed model through serve's managed admission (optional `systemPrompt`/`messages` cached as a prompt prefix, residency/profile controls, `defer:true`); `action: "unload"` unloads it through serve's `/unload`, which waits for that model's running tasks, and asks Ollama directly when serve is unreachable, older, or another `ollamaEndpoint` is named. Both are idempotent |
+| `audio` | Yes | `action: "transcribe"` or `"translate"` sends a WAV named by `file` (read by the server under the same roots as `run_task {files}`) to serve's `/v1/audio/transcriptions` or `/translations` passthrough and returns the text; `"speak"` sends `text` to `/v1/audio/speech` and writes the WAV to `outputFile` or the temp directory, returning its path and length. Admission and memory checks are serve's raw-generation ones. |
 | `ollama_delete` | No (direct to Ollama) | **Destructive**: permanently removes a model. Call only on an explicit human instruction naming the exact model |
-| `delegate_research` | Yes (and spawns the adapter) | Answers a grounded question from files under `workspacePath`; returns the answer, citations, and an independent verification verdict inline, with placement receipts, the evidence trail and every observation in the response file (`receipt:"full"` for all inline). With an MCP `progressToken`, each research step (model turn, tool call, page, finish) is reported as `notifications/progress`, for example `turn 2/8: grep 'foo' in src`; the result is unchanged. Each managed turn then runs as a deferred job, so waiting for admission or memory and loading the model are reported too (`turn 2/8: loading gpt-oss:20b (~8.7 s)`), with the synchronous call as fallback when the job path cannot carry the turn |
+| `delegate_research` | Yes (and spawns the adapter) | Answers a grounded question from files under `workspacePath` (`adapter: "bash"` by default, or `"octocode"` for the installed Octocode CLI's read-only local tools), or from GitHub with `adapter: "github"` (its read-only GitHub tools); the prompts are [docs/octocode](../../docs/octocode/LOCAL.md); returns the answer, citations, and an independent verification verdict inline, with placement receipts, the evidence trail and every observation in the response file (`receipt:"full"` for all inline). With an MCP `progressToken`, each research step (model turn, tool call, page, finish) is reported as `notifications/progress`, for example `turn 2/8: grep 'foo' in src`; the result is unchanged. Every managed research turn uses a deferred job, independently of progress subscriptions, so it remains addressable for cancellation. Progress also reports admission, memory and model loading (`turn 2/8: loading gpt-oss:20b (~8.7 s)`). A pre-execution job refusal returns a typed error; an accepted or uncertain job is never replayed synchronously |
 | `read_response` | No | Returns one section of a saved `response_file` (a `sections` name, a top-level field, or a JSON pointer), paged by `offset`/`limit`; omit `section` for an outline. Only files under the response directory are read |
 
 Every tool result is also saved whole to `~/.octocode/freellama/responses/<session>/<n>-<tool>.json`
@@ -383,14 +384,14 @@ You own the task instructions. Pass system prompts as `messages` entries with `r
 or use `systemPrompt` to prepend one caller-supplied system message. FreeLlama preserves existing
 messages and adds no task instructions of its own. A plain `prompt` becomes one user message,
 and a supplied `messages` array takes precedence over `prompt`. This also applies to
-`task:"code_review"` (an alias for `coding`) and `run_task {tasks}` batches: no review wrapper, mandatory
+`run_task {tasks}` batches: no review wrapper, mandatory
 JSON review format, or review-specific output-token minimum is added.
 
 The separate `delegate_research` adapter retains internal protocol prompts for its own bounded job. Those prompts are not injected into `run_task`
 conversations. Ollama can still apply the selected model's own template or Modelfile defaults.
 
 `model_type` is a display-oriented value derived from Ollama's additive capabilities:
-`generative`, `multimodal`, `embedding_only`, or `unknown`. Routing continues to use the original
+`generative`, `multimodal`, `embedding_only`, `decision` (answers `/v1/systemone` questions, never chats), `speech` (text to speech through `/v1/audio/speech`), or `unknown`. Routing continues to use the original
 capability set, not this summary label. Unknown future Ollama capabilities are omitted from the
 typed routing set instead of being treated as a known capability.
 
@@ -400,8 +401,7 @@ Scripts that bypass MCP post the same fields in snake_case to `POST /_freellama/
 `task`, `objective`, `model`, `session_id`, `required_capabilities`, `prompt` or `messages`,
 `images`, `priority`, `keep_alive`, `max_wait_seconds`, `timeout_seconds`, `stop_on_repetition`,
 and `request_options: {options, format, think, logprobs, top_logprobs}`. A batch is
-`POST /_freellama/v1/task-batches` with `{tasks: [{id, independent: true, task: {...}}], max_parallelism, progress_id?}`
-(`GET /_freellama/v1/task-batches/{progress_id}` reports done, failed, running and queued items while it runs); sessions are
+`POST /_freellama/v1/task-batches` with `{tasks: [{id, independent: true, task: {...}}], max_parallelism}`; sessions are
 `POST /_freellama/v1/sessions` with `{}`. `model` accepts a bare name (`name` resolves to
 `name:latest`, or the one installed tag of that family); an ambiguous or unknown name is refused
 with the installed candidates. See [Request shapes](https://github.com/bgauryy/FreeLlama/blob/main/docs/ARCHITECTURE.md#request-shapes)
@@ -414,7 +414,7 @@ revision as `scopeId` and `scopeRevision` with only the new input to `run_task`;
 returns the next scope revision. Fork a snapshot before parallel branches. `sessionId` continues to
 mean model affinity only.
 
-Use `run_task {warm:true,model,contextTokens,keepAlive?}` for a matching runner profile; add
+Use `ollama_manage {action:"warm",model,contextTokens,keepAlive?}` for a matching runner profile; add
 `task:"embedding"` for an embedding model. Add `systemPrompt` or `messages` to evaluate a long,
 stable prefix into the runner's prompt cache: later calls that start with it report
 `cached_prompt_tokens` and skip that work. It accepts no other task payload and does not pull a model. Add `defer:true` to inspect its progress through `task_jobs`.
@@ -435,7 +435,7 @@ reason without generating. Automatic feedback normalizes work by tokens and requ
 comparable warm serial samples on both backends with a 10% advantage. It matches model digest,
 explicit observed context, effective controls, endpoint-attributed process settings, and managed
 admission class. Unknown identity, parallel intervals, and decision-only payload-free previews
-use capacity and policy signals. Stored legacy totals do not qualify speed hints. Feedback does
+use capacity and policy signals. Aggregate duration totals do not qualify speed hints. Feedback does
 not steer the `quality` objective. See [automatic feedback](https://github.com/bgauryy/FreeLlama/blob/main/docs/CPU_GPU_ROUTING.md#understand-automatic-feedback).
 `minPlacementEvidence:"observed"` fails closed unless resident
 `/api/ps` evidence matches the configured processor; warm cold models once with `"configured"`.

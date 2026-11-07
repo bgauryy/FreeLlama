@@ -70,14 +70,14 @@ describe("scope and warming client contracts", () => {
     const task = { scopeId: id, scopeRevision: 3, prompt: "continue" };
     const result = await call("run_task", name === "run_task" ? task : { tasks: [{ id: "one", independent: true, task }] });
     expect(result.isError, JSON.stringify(result)).not.toBe(true);
-    const sent = name === "run_task" ? requests[0].body : requests[0].body.tasks[0].task;
+    const sent = requests[0].body;
     expect(sent).toMatchObject({ scope_id: id, scope_revision: 3, prompt: "continue" });
     for (const field of ["task", "objective", "model", "context_tokens", "required_capabilities", "execution_preference", "min_placement_evidence", "min_confidence"]) {
       expect(sent).not.toHaveProperty(field);
     }
-    await call("run_task", name === "run_task" ? { ...task, task: "code_review", objective: "fastest" }
-      : { tasks: [{ id: "one", independent: true, task: { ...task, task: "code_review", objective: "fastest" } }] });
-    const override = name === "run_task" ? requests[1].body : requests[1].body.tasks[0].task;
+    await call("run_task", name === "run_task" ? { ...task, task: "coding", objective: "fastest" }
+      : { tasks: [{ id: "one", independent: true, task: { ...task, task: "coding", objective: "fastest" } }] });
+    const override = requests[1].body;
     expect(override).toMatchObject({ task: "coding", objective: "fastest" });
   });
   it.each([
@@ -86,35 +86,53 @@ describe("scope and warming client contracts", () => {
     { name: "scope", args: { action: "delete", scopeId: id, includeMessages: false } },
     { name: "run_task", args: { scopeId: id, prompt: "missing revision" } },
     { name: "run_task", args: { preview: true, scopeId: id, scopeRevision: 0 } },
-    { name: "run_task", args: { warm: true, task: "completion" } },
-    { name: "run_task", args: { warm: true, model: "test:latest", prompt: "hidden generation" } },
+    { name: "run_task", args: { warm: true, model: "test:latest" } },
+    { name: "run_task", args: { task: "code_review", prompt: "aliases are gone" } },
+    { name: "ollama_manage", args: { action: "warm", model: "test:latest", ollamaEndpoint: "http://127.0.0.1:1" } },
+    { name: "ollama_manage", args: { action: "warm", model: "d:1", task: "decision" } },
+    { name: "run_task", args: { task: "decision", state: "s" } },
+    { name: "run_task", args: { task: "decision", state: "s", questions: { q: { type: "noul", instructions: "?" } }, prompt: "p" } },
+    { name: "run_task", args: { task: "completion", prompt: "p", questions: { q: { type: "noul", instructions: "?" } } } },
+    { name: "run_task", args: { task: "completion", prompt: "p", nearest: { top: 3 } } },
     { name: "run_task", args: { prompt: "solo", maxParallelism: 2 } },
-    { name: "run_task", args: { model: "test:latest", tasks: [{ id: "a", independent: true, task: { prompt: "x" } }] } },
+    { name: "run_task", args: { prompt: "shared prompt", tasks: [{ id: "a", independent: true, task: { prompt: "x" } }] } },
   ])("rejects action or preview misuse before contacting the server ($name)", async ({ name, args }) => {
     expect((await call(name, args)).isError).toBe(true);
     expect(requests).toHaveLength(0);
   });
   const batch = [{ id: "a", independent: true, task: { prompt: "x" } }];
   it.each([
-    { args: { model: "test:latest", tasks: batch }, message: "With `tasks`, put `model` inside each item's `task`." },
+    { args: { prompt: "p", tasks: batch }, message: "With `tasks`, put `prompt` inside each item's `task`; only `task`, `model`," },
     { args: { defer: true, tasks: batch }, message: "`defer` is not supported with `tasks`." },
-    { args: { returnEmbeddings: true, preview: true, warm: true, tasks: batch },
-      message: "`returnEmbeddings`, `preview`, `warm` are not supported with `tasks`." },
+    { args: { returnEmbeddings: true, preview: true, nearest: { top: 2 }, tasks: batch },
+      message: "`returnEmbeddings`, `nearest`, `preview` are not supported with `tasks`." },
   ])("names the right fix for a stray batch field ($message)", async ({ args, message }) => {
     const result = await call("run_task", args);
     expect(result.isError).toBe(true);
     expect(JSON.stringify(result.content)).toContain(JSON.stringify(message).slice(1, -1));
     expect(requests).toHaveLength(0);
   });
+  it("sends shared batch fields once as defaults that each item may override", async () => {
+    const questions = { kind: { type: "choice", instructions: "Which kind?", criteria: { bug: "Broken", feature: "New" } } };
+    const result = await call("run_task", { task: "decision", model: "d:1", questions, tasks: [
+      { id: "a", independent: true, task: { state: "Crash on save" } },
+      { id: "b", independent: true, task: { state: "Add dark mode", model: "d:2" } },
+    ] });
+    expect(result.isError, JSON.stringify(result)).not.toBe(true);
+    const a = requests.find((item) => item.body?.state === "Crash on save")!.body;
+    const b = requests.find((item) => item.body?.state === "Add dark mode")!.body;
+    expect(a).toMatchObject({ task: "decision", model: "d:1", questions, state: "Crash on save" });
+    expect(b).toMatchObject({ task: "decision", model: "d:2", questions, state: "Add dark mode" });
+  });
   it("forwards warming controls with no prompt/history and no invented TTL", async () => {
-    const result = await call("run_task", { warm: true, model: "test:latest", contextTokens: 4096, defer: true, priority: "background", timeoutSeconds: 10 });
+    const result = await call("ollama_manage", { action: "warm", model: "test:latest", contextTokens: 4096, defer: true, priority: "background", timeoutSeconds: 10 });
     expect(result.isError, JSON.stringify(result)).not.toBe(true);
     expect(requests[0]).toEqual({ method: "POST", path: "/_freellama/v1/warm", body: {
       model: "test:latest", context_tokens: 4096, defer: true, priority: "background", timeout_seconds: 10,
     } });
   });
   it("forwards an embedding warm to the server, which loads it with an empty embed request", async () => {
-    const result = await call("run_task", { warm: true, model: "test:latest", task: "embedding", keepAlive: "60s" });
+    const result = await call("ollama_manage", { action: "warm", model: "test:latest", task: "embedding", keepAlive: "60s" });
     expect(result.isError, JSON.stringify(result)).not.toBe(true);
     expect(requests[0]).toEqual({ method: "POST", path: "/_freellama/v1/warm", body: {
       model: "test:latest", task: "embedding", keep_alive: "60s",

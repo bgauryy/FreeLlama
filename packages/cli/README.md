@@ -35,7 +35,7 @@ npx @octocodeai/freellama serve --auth-token-file ~/.octocode/freellama/auth.tok
 `doctor` works without the control plane. It reports Ollama reachability, CLI/server version drift,
 portable host hardware and disk discovery, effective settings, a non-mutating
 `local_conservative_config_posture`, and source/permission-aware runtime signals. `memory_bytes`
-is total host RAM; `unified_memory_bytes` is present only when the memory is known to be shared with
+is total host RAM; `memory_kind` is `unified` only when the memory is known to be shared with
 the accelerator. In another terminal, inspect or execute:
 
 ```bash

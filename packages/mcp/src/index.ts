@@ -24,21 +24,37 @@ import { registerTaskJobsTool } from "./tools/task-jobs.js";
 import { registerOllamaLifecycleTools } from "./tools/ollama-lifecycle.js";
 import { registerDelegateResearchTool } from "./tools/delegate-research.js";
 import { registerReadResponseTool } from "./tools/read-response.js";
+import { registerAudioTool } from "./tools/audio.js";
 
 installProcessLifecycle();
 
-const INSTRUCTIONS = `models{view:"installed"}; models{view:"resident"}.
-run_task preview never executes; code_review aliases coding. requiredCapabilities:["tools"] previews a tool route; omit preview and supply the payload. Caller runs tool calls.
-quality objective needs a task policy or explicit model; medium confidence needs policy+benchmark; observed placement needs /api/ps proof.
-Scoped run_task needs scopeId+scopeRevision. defer:true: job.id→task_jobs.jobId unchanged. Restart loses scopes/sessions/jobs.
-Check isError first; prefer structuredContent, else content[].text. page.next_cursor→cursor unchanged.
-caller owns task decomposition/prompts/format/verification; findings are candidates, not accepted defects. operator owns endpoints, exact --cpu-model assignments/lifecycle. Ollama plus the OS/driver run physical CPU/GPU.
-ask approval for one exact tag and reported size before ollama_manage pull; search or recommendation is never download permission. Stop/delete need exact-tag approval.
-serve :11435; default-endpoint autostart optional. Docs: freellama://docs/index.`;
+const INSTRUCTIONS = `FreeLlama runs bounded work on local Ollama models so you spend fewer of your own tokens. Offload when what you send plus what you read back costs less than doing the work yourself, and the answer is cheap to check. Rule of thumb: offload 10 or more similar items, or an input over about 2,000 tokens that you would otherwise read whole; keep a single short item.
+
+Offload:
+- Label, triage, route or yes/no-check many items: run_task {task:"decision", state, questions}, or tasks:[...] for up to 64 items. One short line per answer.
+- Find the files or issues that relate to a text, or duplicates: run_task {task:"embedding", files or input, nearest:{query}} (omit query for duplicate pairs). Returns ranked labels, never vectors.
+- Read a screenshot, scan or diagram: run_task {task:"vision", files:[path], prompt}.
+- Rewrite, summarize or extract across many short texts: one run_task with tasks:[...].
+- Where is X / what calls Y in a repository: delegate_research, then verify its citations.
+- Turn a recording into text: audio {action:"transcribe", file}; you cannot hear audio yourself.
+Do it yourself: judgment you must stand behind (security review, design, merge decisions), edits across files, a task shorter than its instructions, or one item you already understand.
+
+Spend fewer tokens:
+- Name inputs with files (paths or globs such as src/**/*.rs, under the server's working directory or the temp directory); pasted text and base64 images are your own output tokens.
+- One call with tasks:[...] instead of many calls, with what the items share (task, model, systemPrompt, questions) set once at the top level; each item carries only its own prompt, state or files.
+- ollama_manage {action:"warm", model, systemPrompt} before a burst loads the model and evaluates the shared prompt once, so later calls start faster; it saves local time, not your tokens.
+- Answers come back compact; large receipts stay in response_file, so read_response only the section you need.
+- A multi-turn local chat: scope keeps the history server-side, so each turn sends only the new message.
+- You own the prompts, output format and verification: local answers are candidates, so check a few (3 to 5, more where a mistake costs more) before you rely on the rest. Decision answers carry probabilities: treat low ones as unknown.
+
+Not sure which model? models{view:"catalog"} gives tested picks per job, what is installed and fits now, and a cookbook for each at freellama://docs/cookbooks/<job>. Otherwise start with models{view:"installed"} (what can run, by capability: decision, embedding, vision, completion, tools) and doctor{view:"status"} (free memory, queues). Choose by capability, not by name. With tools, the local model returns tool_calls and you run them.
+Memory: a refusal names the programs holding memory; tell the user and never stop their processes, then retry once they free memory, or use a smaller installed model with the same capability. When a burst ends, ollama_manage unload the models you warmed.
+Approval: before ollama_manage pull, ask the user for one exact tag and its reported size; search results are not permission. Unload only a model you warmed or one the user named; delete only a tag the user names.
+Results: check isError first; prefer structuredContent. Pass page.next_cursor back unchanged. defer:true returns job.id for task_jobs. A server restart loses scopes, sessions and jobs. CPU/GPU placement is operator-configured; executionPreference only chooses among eligible backends. Docs: freellama://docs/index.`;
 
 const server = withToolResults(new McpServer(
   { name: "freellama", version: SERVER_VERSION },
-  { instructions: INSTRUCTIONS },
+  { instructions: INSTRUCTIONS, capabilities: { logging: {} } },
 ));
 
 registerDocsResources(server);
@@ -51,6 +67,7 @@ registerRunTaskTool(server);
 registerTaskJobsTool(server);
 registerOllamaLifecycleTools(server);
 registerDelegateResearchTool(server);
+registerAudioTool(server);
 registerReadResponseTool(server);
 
 const transport = withNormalizedToolSchemas(new StdioServerTransport());

@@ -8,7 +8,6 @@ export const killSession = withServe(native.killSession);
 export const listModels = withServe(native.listModels);
 export const route = withServe(native.route);
 export const runTaskRequest = withServe(native.runTaskRequest);
-export const runTaskBatchRequest = withServe(native.runTaskBatchRequest);
 export const warmModelRequest = withServe(native.warmModelRequest);
 export const listTaskJobs = withServe(native.listTaskJobs);
 export const getTaskJob = withServe(native.getTaskJob);

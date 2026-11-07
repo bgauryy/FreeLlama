@@ -80,6 +80,14 @@ cargo clippy --all-targets -- -D warnings
 
 Routing regressions run in the default Rust suite; none are hidden behind `#[ignore]`. Add a
 focused contract test for each repaired behavior and keep it enabled in ordinary release checks.
+Completion-planning regressions cover payload fit before ranking, global quality gates across
+backends, exact-profile history retention, idempotent snapshot merges, unknown phase
+costs, prefill/decode tradeoffs and cached-token normalization. Runner tests reject mismatched
+digests/contexts and distinguish reported setup duration from an observed load transition.
+Resource tests require released forecasts to invalidate both cached and already-returned host
+snapshots. Predictive warm fixtures use a mock Ollama to assert no queuing or eviction under
+contention; they require permission to bind a loopback listener. MCP tests require accepted jobs
+to retain their identity and fail without re-execution if result retention fails.
 Resource contracts cover conservative full host-memory reservations when discrete-GPU telemetry is
 missing, and immediate-unload cleanup after a failed inference response body. The latter also checks
 that uncertain inference is never replayed and ordinary keep-alive requests retain their runner.

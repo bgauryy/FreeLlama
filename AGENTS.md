@@ -24,7 +24,8 @@ prompts, task dependencies, judgment, and verification. Ollama and the host exec
   prompts, messages, embedding input, tools, images, and runtime controls. Review the decision,
   then submit a separate execution call; preview does not reserve capacity.
 - Model search and recommendation do not authorize a pull. Require explicit approval for one
-  exact tag and its reported size. Stop or delete only an explicitly approved exact installed tag.
+  exact tag and its reported size. Unload only a model the agent warmed or one the user named;
+  delete only an exact installed tag the user names.
 - CPU eligibility is operator-owned. Preferences cannot move arbitrary models to another backend.
   Configured assignment is intent; require returned observed evidence when placement matters.
 - `delegate_research` is bounded read-only lookup. The caller retains decomposition, judgment,

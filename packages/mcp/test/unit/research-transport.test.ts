@@ -10,6 +10,7 @@ import { BASH_ADAPTER } from "../../src/research/bash-agent.js";
 import { ObservationStore } from "../../src/research/observations.js";
 import { OCTOCODE_ADAPTER } from "../../src/research/octocode-agent.js";
 import { cpLength } from "../../src/research/text.js";
+import { verifiedResearchDigest } from "../../src/delegate.js";
 import {
   HTTPError, PromptCacheUsage, RequestTimeoutError, URLError, chatErrorDetails, chatRequest, requestHeaders,
   retryableChatError, unwrapChatResponse,
@@ -125,7 +126,7 @@ describe("transport", () => {
     const payload = "FIRST\n" + "🦙\\\"\r\n".repeat(20_000) + "LAST";
     const cases: Array<[AdapterSpec, Record<string, unknown>]> = [
       [BASH_ADAPTER, { action: "shell", command: "read src/router.py" }],
-      [OCTOCODE_ADAPTER, { action: "octocode", tool: "localGetFileContent", queries: { path: "src/router.py" } }],
+      [OCTOCODE_ADAPTER, { action: "octocode", tool: "localFetch", queries: [{ path: "src/router.py" }] }],
     ];
     for (const [adapter, action] of cases) {
       const { root, prompt, result } = workspace("Find the router.");
@@ -203,12 +204,56 @@ describe("transport", () => {
   });
 
   it("retries only when inference was refused", () => {
-    expect(retryableChatError(new HTTPError(503, "busy"))).toBe(true);
+    const refusal = (body: unknown) => new HTTPError(503, "busy", Buffer.from(JSON.stringify(body)));
+    expect(retryableChatError(refusal({ code: "admission_timeout" }))).toBe(true);
+    expect(retryableChatError(refusal({ retry_safe: true, execution_outcome: "not_started" }))).toBe(true);
+    expect(retryableChatError(new HTTPError(503, "busy"))).toBe(false);
+    for (const body of [
+      { code: "admission_timeout", retry_safe: false },
+      { code: "admission_timeout", execution_outcome: "unknown" },
+      { retry_safe: true, execution_outcome: "unknown" },
+      { code: "upstream_error" },
+    ]) expect(retryableChatError(refusal(body))).toBe(false);
     expect(retryableChatError(new URLError(socketError("ECONNREFUSED")))).toBe(true);
     for (const error of [new RequestTimeoutError(), new URLError(new RequestTimeoutError()),
       new HTTPError(504, "timeout"), new HTTPError(400, "invalid"), new URLError(socketError("ECONNRESET"))]) {
       expect(retryableChatError(error)).toBe(false);
     }
+  });
+
+  it("does not retry an uncertain 503 in the research loop", async () => {
+    const { root, prompt, result } = workspace("Find a fact.");
+    const failure = new HTTPError(503, "unknown", Buffer.from(JSON.stringify({
+      error: "execution outcome unknown", code: "admission_timeout", retry_safe: false, execution_outcome: "unknown",
+    })));
+    const request = scripted(failure, { message: { content: '{"action":"finish","answer":"must not replay"}' } });
+    const code = await runAdapter(OCTOCODE_ADAPTER, { env: {
+      FREELLAMA_TARGET_MODEL: "fixture:latest", FREELLAMA_BENCH_WORKSPACE: root,
+      FREELLAMA_BENCH_PROMPT: prompt, FREELLAMA_AGENT_RESULT: result, FREELLAMA_AGENT_RETRY_BACKOFF_SECONDS: "0",
+    }, requestJson: request, print: quiet });
+    expect(code).toBe(1);
+    expect(request.calls).toBe(1);
+    expect(JSON.parse(readFileSync(result, "utf8")).model_metadata.transport_error.receipt)
+      .toMatchObject({ retry_safe: false, execution_outcome: "unknown" });
+  });
+
+  it("records missing managed execution receipts instead of qualifying only the identified turns", async () => {
+    const { root, prompt, result } = workspace("Find a fact.");
+    const model = "fixture:latest";
+    const digest = "a".repeat(64);
+    const request = scripted(
+      { message: { content: '{"action":"page","step":999,"page":1}' } },
+      { route: { selected_model: model }, execution: { model_digest: digest, observation: { resident: true, digest } },
+        response: { message: { content: '{"action":"finish","answer":"done"}' } } },
+    );
+    expect(await runAdapter(OCTOCODE_ADAPTER, { env: {
+      FREELLAMA_TARGET_MODEL: model, FREELLAMA_BENCH_WORKSPACE: root, FREELLAMA_BENCH_PROMPT: prompt,
+      FREELLAMA_AGENT_RESULT: result, FREELLAMA_AGENT_MANAGED_ENDPOINT: "http://managed.invalid",
+    }, requestJson: request, resolvePlatformTokenRatio: async () => null, print: quiet })).toBe(0);
+    const receipts = JSON.parse(readFileSync(result, "utf8")).model_metadata.execution_receipts;
+    expect(receipts).toHaveLength(2);
+    expect(receipts[0]).toMatchObject({ reason: "managed_execution_receipt_missing" });
+    expect(verifiedResearchDigest(receipts, model)).toBeUndefined();
   });
 
   it("cache usage distinguishes missing, zero and partial reporting", () => {

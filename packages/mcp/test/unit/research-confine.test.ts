@@ -201,7 +201,7 @@ describe("read-only shell", () => {
       await withShell(async (shell) => {
         // `env` is not an allowed tool, and printf cannot expand variables past validation.
         await asyncValueError(() => shell.run("env", 10));
-        expect(await shell.run("grep -r s3cret . ; echo done", 10)).not.toContain("s3cret");
+        await expect(shell.run("grep -r s3cret .", 10)).rejects.toMatchObject({ status: "empty", output: "" });
         expect(shell.env).not.toHaveProperty("FREELLAMA_TEST_SECRET");
       });
     } finally {

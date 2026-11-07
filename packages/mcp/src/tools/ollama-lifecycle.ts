@@ -1,11 +1,15 @@
-// Ollama lifecycle: pull and delete talk to Ollama directly; stop goes through serve when it can
-// (it waits for running tasks), else Ollama. `models` covers list/ps/show.
-// `ollama_delete` stays its own tool so pull/stop are not marked destructive.
+// Model lifecycle: pull and delete talk to Ollama directly; warm goes through serve's managed
+// admission; unload goes through serve when it can (it waits for running tasks), else Ollama.
+// `models` covers list/ps/show. `ollama_delete` stays its own tool so the others are not marked
+// destructive.
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as z from "zod";
 import { DEFAULT_PULL_TIMEOUT_SECONDS } from "../config.js";
-import { errorResult, ollamaEndpointParam, ollamaFetch, structuredResult } from "../helpers.js";
-import type { ToolExtra } from "../progress.js";
+import {
+  endpointParam, errorResult, executionPreferenceParam, messagesParam, minPlacementEvidenceParam, ollamaEndpointParam,
+  ollamaFetch, parsedResult, structuredResult, systemPromptParam, taskMessages, taskParam,
+} from "../helpers.js";
+import { progressSink, type ToolExtra } from "../progress.js";
 import { serveUnload } from "../serve-http.js";
 
 const manageResultSchema = z.object({
@@ -97,28 +101,21 @@ async function ollamaPull(
 
 
 
-/** MCP progress for a pull: clients that sent a progressToken see bytes instead of a silent wait. */
-function pullProgressReporter(extra: ToolExtra): ((event: Record<string, unknown>) => void) | undefined {
-  const token = extra._meta?.progressToken;
-  if (token === undefined) return undefined;
-  let lastSent = 0;
-  let step = 0;
+/** A monotonic notification counter; layer byte totals describe the message, not overall progress. */
+export function pullProgressReporter(extra: ToolExtra): ((event: Record<string, unknown>) => void) | undefined {
+  const report = progressSink(extra);
+  if (!report) return undefined;
+  let lastSent = -Infinity;
   return (event) => {
     const now = Date.now();
     if (now - lastSent < 500 && event.status !== "success") return;
     lastSent = now;
-    step += 1;
-    const completed = typeof event.completed === "number" ? event.completed : undefined;
-    const total = typeof event.total === "number" ? event.total : undefined;
-    void extra.sendNotification({
-      method: "notifications/progress",
-      params: {
-        progressToken: token,
-        progress: completed ?? step,
-        ...(completed !== undefined && total !== undefined ? { total } : {}),
-        message: String(event.status ?? "pulling"),
-      },
-    }).catch(() => undefined);
+    const completed = typeof event.completed === "number" && Number.isFinite(event.completed) && event.completed >= 0 ? event.completed : undefined;
+    const total = typeof event.total === "number" && Number.isFinite(event.total) && event.total > 0 ? event.total : undefined;
+    const percent = completed !== undefined && total !== undefined && completed <= total
+      ? ` (${Math.round(completed / total * 1000) / 10}%)` : "";
+    const bytes = completed !== undefined ? `: ${completed}${total === undefined ? "" : `/${total}`} bytes${percent}` : "";
+    report(`${String(event.status ?? "pulling")}${bytes}`);
   };
 }
 
@@ -127,14 +124,15 @@ function pullProgressReporter(extra: ToolExtra): ((event: Record<string, unknown
  * running tasks and records the unload. Ollama is asked directly when a caller names another
  * Ollama endpoint, or serve is unreachable or too old to have `/unload`.
  */
-export async function stopModel(
+export async function unloadModel(
   model: string,
   ollamaEndpoint: string | undefined,
   signal?: AbortSignal,
   unloadThroughServe: typeof serveUnload = serveUnload,
+  endpoint?: string,
 ): Promise<Record<string, unknown>> {
   if (ollamaEndpoint === undefined) {
-    const served = await unloadThroughServe(model, { signal });
+    const served = await unloadThroughServe(model, { endpoint, signal });
     if (served) return { ...served, via: "freellama_serve" };
   }
   const payload = await ollamaFetch(ollamaEndpoint, "/api/generate", {
@@ -152,25 +150,56 @@ export function registerOllamaLifecycleTools(server: McpServer): void {
     "ollama_manage",
     {
       description:
-        "Use when: a human approved pulling one exact tag (action:pull) or unloading a loaded model (action:stop). " +
-        "Do not use when: deleting (ollama_delete), searching (models), or preloading (run_task {warm:true}). Returns: receipt (stop: unloaded, status; waits for the model's running tasks); timeoutSeconds is pull-only.",
+        "Use when: loading or freeing a model. pull = download one exact tag a human approved with its size; " +
+        "warm = load an installed model before a burst of run_task calls; an optional systemPrompt/messages is evaluated into the runner's prompt cache, so later calls that send the same prefix skip that work (they still send it; put it once at the batch top level); " +
+        "unload = free a model's memory once its work is done (a model you warmed, or one the user named; waits for its running tasks). " +
+        "Do not use when: deleting (ollama_delete) or searching (models). Returns: a receipt with status.",
       inputSchema: z.object({
-        action: z.enum(["pull", "stop"]),
-        model: z.string().min(1),
+        action: z.enum(["pull", "warm", "unload"]),
+        model: z.string().min(1).describe("exact tag"),
         ollamaEndpoint: ollamaEndpointParam,
-        timeoutSeconds: z
-          .number()
-          .int()
-          .positive()
-          .optional(),
+        endpoint: endpointParam.describe("serve endpoint (warm, unload)"),
+        timeoutSeconds: z.number().int().positive().optional().describe("pull and warm"),
+        task: taskParam.removeDefault().optional().describe("warm: the task the model will serve; embedding and decision models load as what they are"),
+        contextTokens: z.number().int().positive().optional().describe("warm: num_ctx later calls will use, so they reuse this runner"),
+        systemPrompt: systemPromptParam,
+        messages: messagesParam,
+        keepAlive: z.string().min(1).optional().describe('warm: "-1" pins; omitted = adaptive finite TTL'),
+        executionPreference: executionPreferenceParam,
+        minPlacementEvidence: minPlacementEvidenceParam,
+        priority: z.enum(["interactive", "normal", "background"]).optional(),
+        maxWaitSeconds: z.number().int().positive().optional(),
+        defer: z.boolean().optional(),
       }).strict(),
       outputSchema: manageResultSchema,
       annotations: { destructiveHint: false },
     },
-    async ({ action, model, ollamaEndpoint, timeoutSeconds }, extra) => {
+    async ({ action, model, ollamaEndpoint, endpoint, timeoutSeconds, task, contextTokens, systemPrompt, messages,
+      keepAlive, executionPreference, minPlacementEvidence, priority, maxWaitSeconds, defer }, extra) => {
       try {
-        if (action === "stop" && timeoutSeconds !== undefined) {
-          return errorResult(new Error('`timeoutSeconds` is valid only for action "pull".'));
+        const warmFields = { task, contextTokens, systemPrompt, messages, keepAlive, executionPreference,
+          minPlacementEvidence, priority, maxWaitSeconds, defer };
+        if (action === "pull" && endpoint !== undefined) {
+          return errorResult(new Error('pull talks to Ollama; pass `ollamaEndpoint`, not `endpoint`.'));
+        }
+        const stray = Object.entries(warmFields).filter(([, value]) => value !== undefined).map(([name]) => `\`${name}\``);
+        if (action !== "warm" && stray.length > 0) {
+          return errorResult(new Error(`${stray.join(", ")} ${stray.length === 1 ? "applies" : "apply"} to action "warm" only.`));
+        }
+        if (action === "warm") {
+          if (ollamaEndpoint !== undefined) return errorResult(new Error('warm runs through serve; pass `endpoint`, not `ollamaEndpoint`.'));
+          if (task === "decision") return errorResult(new Error("decision models load on their first question; run the decision task instead of warming."));
+          const prefix = taskMessages({ systemPrompt, messages });
+          // Loaded on use: the serve client needs the native addon, which pull and unload do not.
+          const { warmModelRequest } = await import("../serve-client.js");
+          return parsedResult(await warmModelRequest(endpoint, {
+            model, task, context_tokens: contextTokens, messages: prefix.length === 0 ? undefined : prefix,
+            execution_preference: executionPreference, min_placement_evidence: minPlacementEvidence,
+            priority, keep_alive: keepAlive, max_wait_seconds: maxWaitSeconds, timeout_seconds: timeoutSeconds, defer,
+          }));
+        }
+        if (action === "unload" && timeoutSeconds !== undefined) {
+          return errorResult(new Error('`timeoutSeconds` is valid only for actions "pull" and "warm".'));
         }
         const data =
           action === "pull"
@@ -178,7 +207,7 @@ export function registerOllamaLifecycleTools(server: McpServer): void {
                 signal: extra.signal,
                 onProgress: pullProgressReporter(extra),
               })
-            : await stopModel(model, ollamaEndpoint, extra.signal);
+            : await unloadModel(model, ollamaEndpoint, extra.signal, serveUnload, endpoint);
         const payload = data as Record<string, unknown>;
         // Pull failures arrive as an {"error": ...} event on an HTTP 200 stream, so the fetch
         // above succeeds; report them as errors or a caller gating on isError believes the model
@@ -197,7 +226,7 @@ export function registerOllamaLifecycleTools(server: McpServer): void {
     "ollama_delete",
     {
       description:
-        "DESTRUCTIVE AND IRREVERSIBLE. Use when: a human explicitly names the exact installed tag to delete. Do not use when: you inferred the cleanup yourself, or only want to unload (ollama_manage stop). Returns: the deleted tag.",
+        "DESTRUCTIVE AND IRREVERSIBLE. Use when: a human explicitly names the exact installed tag to delete. Do not use when: you inferred the cleanup yourself, or only want to free memory (ollama_manage unload). Returns: the deleted tag.",
       inputSchema: z.object({
         model: z.string().min(1),
         ollamaEndpoint: ollamaEndpointParam,

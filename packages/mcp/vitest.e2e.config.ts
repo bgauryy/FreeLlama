@@ -1,3 +1,4 @@
+import { fileURLToPath } from "node:url";
 import { defineConfig } from "vitest/config";
 
 // E2E tier: the whole system live — release binary (`cargo build --release`), installed models,
@@ -9,7 +10,7 @@ export default defineConfig({
     name: "mcp-e2e",
     environment: "node",
     include: ["test/e2e/**/*.test.ts"],
-    globalSetup: ["test/setup/global.ts"],
+    globalSetup: ["test/setup/global.ts", fileURLToPath(new URL("../../vitest.tmp.global.ts", import.meta.url))],
     fileParallelism: false,
     testTimeout: 600_000,
     hookTimeout: 120_000,

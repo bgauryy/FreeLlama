@@ -434,26 +434,6 @@ pub async fn warm_model_request(endpoint: Option<String>, request: Value) -> Res
     )
 }
 
-/// Executes caller-declared independent managed tasks with bounded, priority-fair dispatch.
-///
-/// # Errors
-///
-/// Returns an error if `freellama serve` is unreachable or rejects the batch envelope. Individual
-/// task failures remain explicit entries in the successful batch response so sibling work is not
-/// discarded.
-#[napi(ts_args_type = "endpoint: string | undefined | null, request: unknown")]
-pub async fn run_task_batch_request(endpoint: Option<String>, request: Value) -> Result<String> {
-    let endpoint = endpoint_or_default(endpoint);
-    let value = post_json(
-        &endpoint,
-        "/_freellama/v1/task-batches",
-        &request,
-        crate::serve_client::task_timeout(),
-    )
-    .await?;
-    pretty(&value)
-}
-
 /// Lists bounded process-local deferred task receipts, without prompts or retained results.
 ///
 /// # Errors

@@ -167,7 +167,15 @@ async fn serve(fake: FakeOllama) -> (String, tokio::task::JoinHandle<()>) {
                         )
                         .await;
                     }
-                    "/api/ps" => respond_json(&mut stream, &json!({"models": []})).await,
+                    "/api/ps" => {
+                        let chats = fake.chats.lock().await;
+                        let models = chats.last().map(|body| json!({
+                            "name":"loop:latest", "digest":"d-loop", "size":1000,
+                            "size_vram":1000, "context_length":body["options"]["num_ctx"].as_u64().unwrap_or(8192),
+                        })).into_iter().collect::<Vec<_>>();
+                        drop(chats);
+                        respond_json(&mut stream, &json!({"models":models})).await;
+                    }
                     "/api/chat" => {
                         fake.chats.lock().await.push(body.clone());
                         if body["stream"] == true {
