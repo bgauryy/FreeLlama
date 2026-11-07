@@ -19,7 +19,7 @@ fn retryable_managed_status(status: StatusCode) -> bool {
 /// Send `body` to `url`, retrying transient failures on the passthrough proxy's backoff
 /// schedule (`proxy::retry_delay`), and return the first response that is final.
 ///
-/// The caller holds the `managed_execution` admission permit across this call: an Ollama 500 —
+/// The caller holds its admission slot across this call: an Ollama 500 —
 /// which it returns under load-model contention, the exact condition managed routing creates —
 /// must not fail the task and throw away a slot it already queued for.
 async fn send_with_retries(
@@ -43,9 +43,9 @@ async fn send_with_retries(
             Ok(response) => return Ok(response),
             // A timeout is NOT a transient hiccup here. This client's per-attempt budget is
             // `platform_task_timeout()` (900s by default), and the caller holds both an admission
-            // slot and — on the non-resident path — the exclusive `managed_execution` write lock
-            // across every attempt. Retrying a timeout would therefore hold the whole managed
-            // plane for up to 3 x 900s, which is exactly the "one hung request deadlocks every
+            // slot and — on the non-resident path — the backend load lock
+            // across every attempt. Retrying a timeout would therefore hold every other load for
+            // up to 3 x 900s, which is exactly the "one hung request deadlocks every
             // subsequent managed task" failure the client timeout was added to prevent. Connection
             // errors are still retried: those fail fast and cost nothing to re-pay.
             Err(error) if more_attempts && error.is_connect() && !error.is_timeout() => {

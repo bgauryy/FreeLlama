@@ -382,9 +382,9 @@ where
 
 /// Build the version-labelled, categorized Ollama configuration diagnostic.
 ///
-/// `ollama_env_advisories` intentionally remains the backwards-compatible flat view of the eleven
-/// memory controls. This report adds the other production-relevant variables advertised by the
-/// detected Ollama 0.33 generation, grouped by operational purpose. The detected server version is
+/// `categories.memory_scheduler` is `ollama_env_advisories`, the eleven memory controls. This
+/// report adds the other production-relevant variables advertised by the detected Ollama 0.33
+/// generation, grouped by operational purpose. The detected server version is
 /// included because Ollama's environment surface changes over time; this is a known-setting audit,
 /// not a claim that every listed variable exists in every past or future release.
 ///
@@ -762,11 +762,12 @@ pub async fn doctor(endpoint: &str) -> Result<Value> {
     };
     let local_conservative_posture =
         local_conservative_config_posture(&categorized_config, &observed_process_environment);
-    let env_config = categorized_config["categories"]["memory_scheduler"].clone();
     // Read the value back out of the table rather than probing the selected environment source a
     // second time, so the advisory and reported value cannot disagree.
-    let ollama_env_config_warning =
-        max_loaded_models_advisory(env_config["OLLAMA_MAX_LOADED_MODELS"]["value"].as_str());
+    let ollama_env_config_warning = max_loaded_models_advisory(
+        categorized_config["categories"]["memory_scheduler"]["OLLAMA_MAX_LOADED_MODELS"]["value"]
+            .as_str(),
+    );
     // Each reported setting carries its effective default, because a missing best-effort value
     // can mean "Ollama picks" or that a separately launched service has an environment this
     // process cannot see. Either interpretation differs from "off".
@@ -775,9 +776,8 @@ pub async fn doctor(endpoint: &str) -> Result<Value> {
         "version": {"version": server_version},
         "ollama_cli": cli,
         "running": running,
-        "ollama_env_config": env_config,
-        // Categorized superset of `ollama_env_config`. Keep the flat field above for clients that
-        // already consume it, and use this field for production/security audits.
+        // Categorized settings, memory and scheduler controls included, for production and
+        // security audits.
         "ollama_config": categorized_config,
         // Unlike `ollama_config`, this is not inherited from FreeLlama or launchd. On supported
         // local hosts it is a deliberately allow-listed snapshot of one same-user `ollama serve`

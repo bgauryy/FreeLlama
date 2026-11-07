@@ -95,13 +95,20 @@ async fn refuse_mode_holds_a_load_that_does_not_fit_and_still_admits_resident_ru
         .await
         .expect("resident request admitted under a low-memory hold");
     assert_eq!(permit.receipt.status, "admitted");
-    let cold = low
+    // Low available memory is judged per load: a small load that leaves its own reserve (1 GiB
+    // load + 1 GiB reserve in 3 GiB) runs; a larger one that does not is held.
+    let small = low
         .wait_for_capacity("http://localhost:11434", GIB, Duration::ZERO)
         .await
-        .expect_err("refuse mode holds a new load under a low-memory hold");
+        .expect("a small load that fits its own reserve runs under low memory");
+    drop(small);
+    let cold = low
+        .wait_for_capacity("http://localhost:11434", 5 * GIB / 2, Duration::ZERO)
+        .await
+        .expect_err("refuse mode holds a new load that does not leave its reserve");
     assert_eq!(
         cold.receipt.assessment.unwrap().denial_reason,
-        Some(CapacityDenialReason::HostPressure)
+        Some(CapacityDenialReason::InsufficientCapacity)
     );
 }
 
@@ -308,6 +315,109 @@ async fn released_permit_returns_capacity_before_drop() {
     permit.release();
     assert_eq!(governor.reservations.load(Ordering::Acquire), 0);
     drop(permit);
+    assert_eq!(governor.reservations.load(Ordering::Acquire), 0);
+}
+
+#[tokio::test]
+async fn releasing_a_forecast_invalidates_cached_and_already_returned_observations() {
+    let available = Arc::new(AtomicU64::new(16 * GIB));
+    let sampled = available.clone();
+    let governor = ResourceGovernor::with_sampler(
+        ResourcePolicy {
+            sample_interval: Duration::from_secs(60),
+            ..refusing_policy()
+        },
+        move || HostResources {
+            available_memory_bytes: Some(sampled.load(Ordering::Acquire)),
+            ..healthy()
+        },
+    )
+    .unwrap();
+    let mut permit = governor
+        .wait_for_capacity("http://localhost:11434", 4 * GIB, Duration::ZERO)
+        .await
+        .unwrap();
+    let before_load = governor.snapshot().await;
+    // Ollama has allocated the runner, but the governor still holds its pre-load sample.
+    available.store(6 * GIB, Ordering::Release);
+    permit.release();
+    assert_eq!(
+        governor.reserve_snapshot(&before_load, ResourceDemand::load(8 * GIB), GIB, false),
+        Reservation::StaleObservation,
+    );
+    assert_eq!(governor.reservations.load(Ordering::Acquire), 0);
+    let after_load = governor.snapshot().await;
+    assert_eq!(after_load.observation.available_memory_bytes, Some(6 * GIB));
+    assert!(after_load.sample_generation > before_load.sample_generation);
+    assert!(after_load.sample_count > before_load.sample_count);
+    assert!(
+        governor
+            .wait_for_capacity("http://localhost:11434", 8 * GIB, Duration::ZERO,)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn speculative_capacity_is_strict_even_when_normal_admission_is_advisory() {
+    let governor = ResourceGovernor::with_sampler(quick_policy(), healthy).unwrap();
+    assert!(
+        governor
+            .try_reserve_idle("http://localhost:11434", ResourceDemand::load(16 * GIB),)
+            .await
+            .is_err()
+    );
+    assert_eq!(governor.reservations.load(Ordering::Acquire), 0);
+    let permit = governor
+        .try_reserve_idle("http://localhost:11434", ResourceDemand::load(8 * GIB))
+        .await
+        .unwrap();
+    assert_eq!(permit.receipt.status, "admitted_idle_capacity");
+    assert!(
+        governor
+            .try_reserve_idle("http://localhost:11434", ResourceDemand::load(8 * GIB),)
+            .await
+            .is_err()
+    );
+    assert_eq!(governor.reservations.load(Ordering::Acquire), 8 * GIB);
+}
+
+#[tokio::test]
+async fn speculative_capacity_rejects_unknown_memory_and_remote_backends() {
+    let governor = ResourceGovernor::with_sampler(
+        ResourcePolicy {
+            telemetry_policy: TelemetryPolicy::BestEffort,
+            ..quick_policy()
+        },
+        HostResources::default,
+    )
+    .unwrap();
+    for upstream in ["http://localhost:11434", "https://example.com"] {
+        assert!(
+            governor
+                .try_reserve_idle(upstream, ResourceDemand::load(GIB))
+                .await
+                .is_err()
+        );
+    }
+    assert_eq!(governor.reservations.load(Ordering::Acquire), 0);
+}
+
+#[tokio::test]
+async fn speculative_capacity_never_uses_resident_pressure_exemptions() {
+    let governor = ResourceGovernor::with_sampler(quick_policy(), || HostResources {
+        memory_pressure: Some(MemoryPressure::Warning),
+        ..healthy()
+    })
+    .unwrap();
+    let refused = governor
+        .try_reserve_idle("http://localhost:11434", ResourceDemand::resident())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        refused.receipt.assessment.unwrap().denial_reason,
+        Some(CapacityDenialReason::HostPressure)
+    );
     assert_eq!(governor.reservations.load(Ordering::Acquire), 0);
 }
 
@@ -1081,5 +1191,27 @@ fn macos_thermal_pressure_fills_the_thermal_signal() {
     assert_eq!(
         (unknown.thermal_pressure, unknown.thermal_throttled),
         (None, None)
+    );
+}
+
+#[tokio::test]
+async fn swapping_holds_large_and_unknown_loads_but_not_a_small_one_that_fits() {
+    let mut snapshot = ResourceGovernor::with_sampler(refusing_policy(), healthy)
+        .unwrap()
+        .snapshot()
+        .await;
+    snapshot.holding = true;
+    snapshot.reasons = vec![PressureReason::ActiveSwapping];
+    let small = snapshot.assess_demand(ResourceDemand::load(300 * 1024 * 1024), false);
+    assert!(small.admissible, "{small:?}");
+    let large = snapshot.assess_demand(ResourceDemand::load(4 * GIB), false);
+    assert_eq!(
+        large.denial_reason,
+        Some(CapacityDenialReason::HostPressure)
+    );
+    let unknown = snapshot.assess_demand(ResourceDemand::load(0), false);
+    assert_eq!(
+        unknown.denial_reason,
+        Some(CapacityDenialReason::HostPressure)
     );
 }

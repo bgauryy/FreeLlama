@@ -141,17 +141,6 @@ export declare function removeTaskJob(endpoint: string | undefined | null, jobId
 export declare function route(endpoint: string | undefined | null, task: string, objective?: string | undefined | null, model?: string | undefined | null, sessionId?: string | undefined | null, contextTokens?: number | undefined | null, requiredCapabilities?: Array<string> | undefined | null, minConfidence?: string | undefined | null, executionPreference?: string | undefined | null, minPlacementEvidence?: string | undefined | null): Promise<string>
 
 /**
- * Executes caller-declared independent managed tasks with bounded, priority-fair dispatch.
- *
- * # Errors
- *
- * Returns an error if `freellama serve` is unreachable or rejects the batch envelope. Individual
- * task failures remain explicit entries in the successful batch response so sibling work is not
- * discarded.
- */
-export declare function runTaskBatchRequest(endpoint: string | undefined | null, request: unknown): Promise<string>
-
-/**
  * Object-based managed task API for callers that need the complete task contract without a long,
  * ABI-fragile positional argument list. The request is forwarded to `/_freellama/v1/tasks`, where
  * the typed Rust server validates routing fields, message history, and advanced Ollama controls.

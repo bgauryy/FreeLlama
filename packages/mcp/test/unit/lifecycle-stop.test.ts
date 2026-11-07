@@ -1,6 +1,6 @@
 import { createServer, type Server } from "node:http";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { stopModel } from "../../src/tools/ollama-lifecycle.js";
+import { unloadModel } from "../../src/tools/ollama-lifecycle.js";
 
 const servers: Server[] = [];
 afterEach(async () => {
@@ -29,17 +29,19 @@ async function ollama(): Promise<{ endpoint: string; bodies: unknown[] }> {
 describe("ollama_manage stop", () => {
   it("unloads through serve when it answers, without asking Ollama", async () => {
     const served = vi.fn(async () => ({ model: "m", backend: "gpu", unloaded: true, status: "unloaded", unload_ms: 120 }));
-    expect(await stopModel("m", undefined, undefined, served)).toEqual({
+    expect(await unloadModel("m", undefined, undefined, served)).toEqual({
       model: "m", backend: "gpu", unloaded: true, status: "unloaded", unload_ms: 120, via: "freellama_serve",
     });
-    expect(served).toHaveBeenCalledWith("m", { signal: undefined });
+    expect(served).toHaveBeenCalledWith("m", { endpoint: undefined, signal: undefined });
+    await unloadModel("m", undefined, undefined, served, "http://127.0.0.1:11455");
+    expect(served).toHaveBeenLastCalledWith("m", { endpoint: "http://127.0.0.1:11455", signal: undefined });
   });
 
   it("asks Ollama directly when serve is unreachable or too old", async () => {
     const { endpoint, bodies } = await ollama();
     vi.stubEnv("FREELLAMA_OLLAMA_ENDPOINT", endpoint);
     vi.resetModules();
-    const { stopModel: stop } = await import("../../src/tools/ollama-lifecycle.js");
+    const { unloadModel: stop } = await import("../../src/tools/ollama-lifecycle.js");
     const result = await stop("m", undefined, undefined, async () => undefined);
     expect(result).toMatchObject({ model: "m", unloaded: true, status: "unload_requested", via: "ollama" });
     expect(bodies).toEqual([{ model: "m", keep_alive: 0 }]);
@@ -49,11 +51,11 @@ describe("ollama_manage stop", () => {
   it("goes straight to a caller-named Ollama endpoint, and passes serve refusals through", async () => {
     const { endpoint, bodies } = await ollama();
     const served = vi.fn(async () => ({ unloaded: true }));
-    expect(await stopModel("m", endpoint, undefined, served)).toMatchObject({ via: "ollama" });
+    expect(await unloadModel("m", endpoint, undefined, served)).toMatchObject({ via: "ollama" });
     expect(served).not.toHaveBeenCalled();
     expect(bodies).toHaveLength(1);
     const refusal = JSON.stringify({ error: "tasks still running", code: "unload_wait_exceeded" });
-    await expect(stopModel("m", undefined, undefined, async () => { throw new Error(refusal); })).rejects.toThrow(refusal);
+    await expect(unloadModel("m", undefined, undefined, async () => { throw new Error(refusal); })).rejects.toThrow(refusal);
     expect(bodies).toHaveLength(1);
   });
 });

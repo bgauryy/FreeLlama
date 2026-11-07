@@ -1,4 +1,4 @@
-// scope: server-side message history (create/get/fork/delete); residency is `run_task {warm:true}`.
+// scope: server-side message history (create/get/fork/delete); residency is `ollama_manage {action:"warm"}`.
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as z from "zod";
 import { createScope, deleteScope, forkScope, getScope } from "../serve-client.js";
@@ -8,7 +8,7 @@ import { endpointParam, errorResult, messageParam, objectResultSchema, parsedRes
 // exposes neither `route_defaults` nor `limits`.
 export function registerScopeTool(server: McpServer): void {
   server.registerTool("scope", {
-    description: "Use when: a multi-turn local conversation should keep its message history server-side (create/get/fork/delete), then continue with run_task {scopeId, scopeRevision}. Do not use when: you want model affinity (session) or runner KV control. Returns: process-local scope metadata; message history only with includeMessages:true.",
+    description: "Use when: a multi-turn local chat should keep its history on the server: create, then run_task {scopeId, scopeRevision} (always together) with the last result's revision; fork (needs `revision`) branches. Do not use when: you only want one model kept warm (session) or a one-shot task. Returns: scope id and revision; history only with includeMessages:true.",
     inputSchema: z.object({
       action: z.enum(["create", "get", "fork", "delete"]), endpoint: endpointParam,
       scopeId: z.string().uuid().optional(), revision: z.number().int().nonnegative().optional(),

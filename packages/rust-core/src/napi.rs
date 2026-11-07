@@ -124,6 +124,10 @@ pub fn version() -> String {
 #[used]
 static EMBEDDED_VERSION: &str = concat!("freellama-version:", env!("CARGO_PKG_VERSION"));
 
+/// Keeps the source marker in the compiled addon for `scripts/verify-release-packages.mjs`.
+#[used]
+static EMBEDDED_SOURCE: &str = crate::SOURCE_MARKER;
+
 /// Runs `freellama doctor` against Ollama directly — no running `freellama serve` required.
 /// Cross-checks the Ollama CLI and server versions and confirms the endpoint is reachable.
 ///
@@ -432,26 +436,6 @@ pub async fn warm_model_request(endpoint: Option<String>, request: Value) -> Res
         )
         .await?,
     )
-}
-
-/// Executes caller-declared independent managed tasks with bounded, priority-fair dispatch.
-///
-/// # Errors
-///
-/// Returns an error if `freellama serve` is unreachable or rejects the batch envelope. Individual
-/// task failures remain explicit entries in the successful batch response so sibling work is not
-/// discarded.
-#[napi(ts_args_type = "endpoint: string | undefined | null, request: unknown")]
-pub async fn run_task_batch_request(endpoint: Option<String>, request: Value) -> Result<String> {
-    let endpoint = endpoint_or_default(endpoint);
-    let value = post_json(
-        &endpoint,
-        "/_freellama/v1/task-batches",
-        &request,
-        crate::serve_client::task_timeout(),
-    )
-    .await?;
-    pretty(&value)
 }
 
 /// Lists bounded process-local deferred task receipts, without prompts or retained results.

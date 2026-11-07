@@ -1,8 +1,8 @@
 //! Which resident model to unload when a load needs room.
 //!
-//! Ollama's own eviction is least-recently-used and only knows about requests already inside it.
-//! `FreeLlama` knows more: which models have tasks queued or running, how often each one is used,
-//! and how long each took to load last time. The planner uses that to pick the cheapest set of
+//! Ollama manages its own runner expiry and eviction using engine state. `FreeLlama` additionally
+//! knows which models have tasks queued or running, how often each one is used, and observed
+//! request-to-runner-ready costs. The planner uses that to pick the cheapest set of
 //! runners to unload, in the spirit of llama-swap's `evict_costs` and `LocalAI`'s busy-aware LRU,
 //! and unloads them before Ollama has to choose on its own.
 use serde_json::{Value, json};
@@ -15,27 +15,24 @@ use std::{
 /// Recent use decays with this half-life, so a model used heavily an hour ago counts less than
 /// one used a few times in the last minutes.
 const USE_HALF_LIFE: Duration = Duration::from_secs(30 * 60);
-/// A load shorter than this was a warm runner, not a load worth learning from.
-const MIN_LEARNED_LOAD_MS: u64 = 200;
-
-/// Whether Ollama's reported `load_duration` means the request loaded its runner.
-pub(super) const fn was_a_load(load_ms: u64) -> bool {
-    load_ms >= MIN_LEARNED_LOAD_MS
-}
 /// Assumed read throughput when a model has never been loaded here (bytes per second).
 const ASSUMED_LOAD_BYTES_PER_SECOND: f64 = 1.5e9;
 /// Exhaustive search over candidate sets stays cheap up to this many runners.
 const MAX_EXACT_CANDIDATES: usize = 14;
+/// Idle history is bounded; live leases are never discarded to satisfy the history limit.
+const MAX_IDLE_HISTORY: usize = 1024;
 
 #[derive(Debug, Default)]
 struct Activity {
     /// Tasks routed to this model and not yet finished, queued ones included.
     active: usize,
+    /// An unload owns the lifecycle until its request/confirmation finishes or is cancelled.
+    evicting: bool,
     last_used: Option<Instant>,
     /// Exponentially decayed use count (half-life `USE_HALF_LIFE`) as of `decayed_at`.
     uses: f64,
     decayed_at: Option<Instant>,
-    /// Average cold-load time reported by Ollama (`load_duration`).
+    /// Runner-ready duration for observed transitions, including upstream scheduling/setup.
     load_ms: Option<f64>,
 }
 
@@ -50,8 +47,14 @@ impl Activity {
 }
 
 /// Per-model demand and load history, keyed by backend and model name.
+#[derive(Default)]
+struct ActivityState {
+    entries: Mutex<HashMap<(String, String), Activity>>,
+    changed: tokio::sync::Notify,
+}
+
 #[derive(Clone, Default)]
-pub(crate) struct ModelActivity(Arc<Mutex<HashMap<(String, String), Activity>>>);
+pub(crate) struct ModelActivity(Arc<ActivityState>);
 
 /// Held while a task is routed to a model; dropping it marks the model idle again.
 pub(super) struct ActiveModel {
@@ -61,9 +64,56 @@ pub(super) struct ActiveModel {
 
 impl Drop for ActiveModel {
     fn drop(&mut self) {
-        if let Some(entry) = self.activity.lock().get_mut(&self.key) {
+        let mut inner = self.activity.lock();
+        if let Some(entry) = inner.get_mut(&self.key) {
             entry.active = entry.active.saturating_sub(1);
         }
+        trim_idle_history(&mut inner);
+        drop(inner);
+        self.activity.0.changed.notify_waiters();
+    }
+}
+
+impl ActiveModel {
+    /// Register demand before waiting, then wait outside all locks for an already-claimed
+    /// unload. Call this before acquiring any backend transition guard. Dropping this future
+    /// and its owner only releases sidecar demand; it does not prove upstream work stopped.
+    pub(super) async fn ready(&self) {
+        self.activity.ready_key(&self.key).await;
+    }
+}
+
+/// Exclusive per-model lifecycle ownership. No mutex is held during network work.
+pub(super) struct ModelEviction {
+    activity: ModelActivity,
+    key: (String, String),
+}
+
+impl Drop for ModelEviction {
+    fn drop(&mut self) {
+        let mut inner = self.activity.lock();
+        if let Some(entry) = inner.get_mut(&self.key) {
+            entry.evicting = false;
+        }
+        trim_idle_history(&mut inner);
+        drop(inner);
+        self.activity.0.changed.notify_waiters();
+    }
+}
+
+fn trim_idle_history(entries: &mut HashMap<(String, String), Activity>) {
+    if entries.len() <= MAX_IDLE_HISTORY {
+        return;
+    }
+    let mut idle: Vec<_> = entries
+        .iter()
+        .filter(|(_, entry)| entry.active == 0 && !entry.evicting)
+        .map(|(key, entry)| (key.clone(), entry.last_used))
+        .collect();
+    idle.sort_unstable_by_key(|(_, used)| *used);
+    let remove = idle.len().saturating_sub(MAX_IDLE_HISTORY);
+    for (key, _) in idle.into_iter().take(remove) {
+        entries.remove(&key);
     }
 }
 
@@ -71,26 +121,57 @@ impl Drop for ActiveModel {
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(super) struct Usage {
     pub(super) active: usize,
+    pub(super) evicting: bool,
     pub(super) idle_seconds: Option<f64>,
     pub(super) recent_uses: f64,
     pub(super) load_ms: Option<f64>,
 }
 
 impl ModelActivity {
-    /// Start from the load times this machine measured before, so the first eviction plan after a
-    /// restart already knows what reloading each model costs.
+    /// The caller must retain its registered `ActiveModel` while waiting, and already own a
+    /// bounded admission slot. This method never registers an additional queue or demand.
+    pub(super) async fn ready(&self, backend: &str, model: &str) {
+        self.ready_key(&(backend.to_owned(), model.to_owned()))
+            .await;
+    }
+
+    async fn ready_key(&self, key: &(String, String)) {
+        loop {
+            let changed = self.0.changed.notified();
+            if !self.lock().get(key).is_some_and(|entry| entry.evicting) {
+                return;
+            }
+            changed.await;
+        }
+    }
+    /// A future that completes when a runner becomes ready or a model's use/unload claim ends. Create it
+    /// before the state it will be compared against is read, so a change in between is not lost.
+    pub(super) fn changed(&self) -> tokio::sync::futures::Notified<'_> {
+        self.0.changed.notified()
+    }
+
+    /// A load became a reusable runner while its task is still decoding. Capacity waiters must
+    /// re-measure their demand: a same-model follower now needs no second model allocation.
+    pub(super) fn runner_ready(&self) {
+        self.0.changed.notify_waiters();
+    }
+
+    /// Restore only events whose callers observed a transition. Other audit rows, such as a slow
+    /// response timer, are not physical-load evidence and are not restored.
     pub(super) fn seeded(store: Option<&crate::store::Store>) -> Self {
         let activity = Self::default();
-        for backend in [super::Backend::Gpu, super::Backend::Cpu] {
-            let measured = store
-                .and_then(|store| store.load_times(backend.as_str()).ok())
-                .unwrap_or_default();
-            let mut inner = activity.lock();
-            for (model, load_ms) in measured {
-                inner
-                    .entry((backend.as_str().to_owned(), model))
-                    .or_default()
-                    .load_ms = Some(load_ms);
+        let events = store
+            .and_then(|store| store.events_since(0, 1000).ok())
+            .unwrap_or_default();
+        for event in events.into_iter().rev() {
+            if event.event == "load"
+                && matches!(
+                    event.trigger.as_str(),
+                    "managed_transition_observed" | "warm_transition_observed"
+                )
+                && let Some(load_ms) = event.duration_ms
+            {
+                activity.learn_load(&event.backend, &event.model, load_ms);
             }
         }
         activity
@@ -98,27 +179,70 @@ impl ModelActivity {
 
     fn lock(&self) -> MutexGuard<'_, HashMap<(String, String), Activity>> {
         self.0
+            .entries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Mark a task as routed to `model` on `backend` until the returned guard drops.
+    /// Register demand until the guard drops. Call `ready()` before backend locking/dispatch:
+    /// registration protects queued tasks but does not overtake an already-owned unload.
     pub(super) fn begin(&self, backend: &str, model: &str) -> ActiveModel {
+        self.register(backend, model, false)
+            .expect("ordinary demand always registers")
+    }
+
+    /// Speculation must not wait behind an unload or existing demand for this model.
+    pub(super) fn try_begin_idle(&self, backend: &str, model: &str) -> Option<ActiveModel> {
+        self.register(backend, model, true)
+    }
+
+    fn register(&self, backend: &str, model: &str, idle_only: bool) -> Option<ActiveModel> {
         let key = (backend.to_owned(), model.to_owned());
         let now = Instant::now();
         let mut inner = self.lock();
         let entry = inner.entry(key.clone()).or_default();
+        if idle_only && (entry.evicting || entry.active > 0) {
+            return None;
+        }
         entry.decay(now);
         entry.active += 1;
         entry.last_used = Some(now);
+        trim_idle_history(&mut inner);
         drop(inner);
-        ActiveModel {
+        Some(ActiveModel {
             activity: self.clone(),
             key,
+        })
+    }
+
+    /// Test idle and claim its lifecycle in the same critical section as demand registration.
+    pub(super) fn try_evict(&self, backend: &str, model: &str) -> Option<ModelEviction> {
+        let key = (backend.to_owned(), model.to_owned());
+        let mut inner = self.lock();
+        let entry = inner.entry(key.clone()).or_default();
+        if entry.active > 0 || entry.evicting {
+            return None;
+        }
+        entry.evicting = true;
+        trim_idle_history(&mut inner);
+        Some(ModelEviction {
+            activity: self.clone(),
+            key,
+        })
+    }
+
+    /// Explicit unload waits for existing demand without occupying the backend writer.
+    pub(super) async fn evict_when_idle(&self, backend: &str, model: &str) -> ModelEviction {
+        loop {
+            let changed = self.0.changed.notified();
+            if let Some(claim) = self.try_evict(backend, model) {
+                return claim;
+            }
+            changed.await;
         }
     }
 
-    /// Record a served task: one more recent use, when it ran, and how long a cold load took.
+    /// Record a served task and an optional qualified runner-ready duration (zero means none).
     /// Only served work counts as demand; a task refused at admission never used the model.
     pub(super) fn completed(&self, backend: &str, model: &str, load_ms: u64) {
         let now = Instant::now();
@@ -129,7 +253,7 @@ impl ModelActivity {
         entry.decay(now);
         entry.uses += 1.0;
         entry.last_used = Some(now);
-        if was_a_load(load_ms) {
+        if load_ms > 0 {
             let sample = super::float(load_ms);
             entry.load_ms = Some(
                 entry
@@ -137,11 +261,13 @@ impl ModelActivity {
                     .map_or(sample, |previous| previous * 0.7 + sample * 0.3),
             );
         }
+        trim_idle_history(&mut inner);
     }
 
-    /// Learn a cold-load time observed outside a managed task, without counting a use.
+    /// Learn an independently observed transition duration, without counting a use.
+    /// Callers must qualify the transition; a nonzero timer alone is insufficient.
     pub(super) fn learn_load(&self, backend: &str, model: &str, load_ms: u64) {
-        if !was_a_load(load_ms) {
+        if load_ms == 0 {
             return;
         }
         let sample = super::float(load_ms);
@@ -154,6 +280,7 @@ impl ModelActivity {
                 .load_ms
                 .map_or(sample, |previous| previous * 0.7 + sample * 0.3),
         );
+        trim_idle_history(&mut inner);
     }
 
     pub(super) fn usage(&self, backend: &str, model: &str) -> Usage {
@@ -165,6 +292,7 @@ impl ModelActivity {
         entry.decay(now);
         Usage {
             active: entry.active,
+            evicting: entry.evicting,
             idle_seconds: entry
                 .last_used
                 .map(|then| now.saturating_duration_since(then).as_secs_f64()),
@@ -180,6 +308,8 @@ pub(super) enum Freed {
     /// The whole runner (CPU backend or unified memory).
     Total,
     /// Discrete-GPU memory (`size_vram`).
+    /// Pure planner coverage only until backend/device eligibility is established.
+    #[cfg(test)]
     Vram,
     /// The part of a runner held in host RAM on a discrete-GPU machine (`size - size_vram`).
     HostSpill,
@@ -197,7 +327,7 @@ pub(super) struct Candidate {
     pub(super) idle_seconds: Option<f64>,
     /// Operator multiplier from `eviction_costs` (default 1).
     pub(super) weight: f64,
-    /// Ollama's own expiry, the tiebreak Ollama itself would use.
+    /// Observed Ollama expiry, used as a local tiebreak.
     expires_at: String,
 }
 
@@ -251,6 +381,9 @@ pub(super) struct PlanInputs<'a> {
     pub(super) weights: &'a std::collections::BTreeMap<String, f64>,
     pub(super) freed: Freed,
     pub(super) shortfall: u64,
+    /// Spare runners used within this many seconds: they are in use, only between requests, and
+    /// unloading them would reload them on the next request. `None` spares none for recency.
+    pub(super) min_idle_seconds: Option<f64>,
 }
 
 /// Choose the cheapest set of idle runners whose unloading frees at least `shortfall` bytes.
@@ -283,8 +416,14 @@ pub(super) fn plan(ps: &Value, activity: &ModelActivity, inputs: &PlanInputs<'_>
         } else if expires_at.starts_with("0001-") {
             // Ollama reports the zero time while a runner is still loading for someone.
             Some("loading")
-        } else if usage.active > 0 {
+        } else if usage.active > 0 || usage.evicting {
             Some("busy")
+        } else if inputs
+            .min_idle_seconds
+            .zip(usage.idle_seconds)
+            .is_some_and(|(minimum, idle)| idle < minimum)
+        {
+            Some("recently_used")
         } else {
             None
         };
@@ -298,6 +437,7 @@ pub(super) fn plan(ps: &Value, activity: &ModelActivity, inputs: &PlanInputs<'_>
         let vram = entry.get("size_vram").and_then(Value::as_u64).unwrap_or(0);
         let bytes = match inputs.freed {
             Freed::Total => size,
+            #[cfg(test)]
             Freed::Vram => vram,
             Freed::HostSpill => size.saturating_sub(vram),
         };
@@ -312,7 +452,7 @@ pub(super) fn plan(ps: &Value, activity: &ModelActivity, inputs: &PlanInputs<'_>
                     "size_estimate",
                 )
             },
-            |ms| (ms / 1000.0, "measured_load_duration"),
+            |ms| (ms / 1000.0, "observed_runner_ready_duration"),
         );
         candidates.push(Candidate {
             name: name.to_owned(),
@@ -423,6 +563,81 @@ fn pinned_expiry(expires_at: &str) -> bool {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    use std::{
+        future::Future as _,
+        task::{Context, Waker},
+    };
+
+    #[tokio::test]
+    async fn eviction_claim_and_arrival_are_atomic_in_both_orders() {
+        let activity = ModelActivity::default();
+        let running = activity.begin("gpu", "a");
+        running.ready().await;
+        assert!(activity.try_evict("gpu", "a").is_none());
+        drop(running);
+
+        let eviction = activity.try_evict("gpu", "a").unwrap();
+        assert!(activity.try_evict("gpu", "a").is_none());
+        assert!(activity.try_begin_idle("gpu", "a").is_none());
+        let arriving = activity.begin("gpu", "a");
+        {
+            let mut ready = std::pin::pin!(arriving.ready());
+            assert!(
+                ready
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+            // Another model and another backend remain independent.
+            activity.begin("gpu", "b").ready().await;
+            activity.begin("cpu", "a").ready().await;
+            drop(eviction);
+            ready.await;
+        }
+        assert!(activity.try_evict("gpu", "a").is_none());
+        drop(arriving);
+        assert!(activity.try_evict("gpu", "a").is_some());
+    }
+
+    #[tokio::test]
+    async fn cancelled_arrival_releases_demand_and_cancelled_eviction_wakes_arrivals() {
+        let activity = ModelActivity::default();
+        let eviction = activity.try_evict("gpu", "a").unwrap();
+        let waiting = activity.begin("gpu", "a");
+        let mut pending = Box::pin(async move {
+            waiting.ready().await;
+            waiting
+        });
+        assert!(
+            pending
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        assert_eq!(activity.usage("gpu", "a").active, 1);
+        drop(pending);
+        assert_eq!(activity.usage("gpu", "a").active, 0);
+        assert!(activity.usage("gpu", "a").evicting);
+        let next = activity.begin("gpu", "a");
+        drop(eviction); // Includes cancellation of an in-flight unload; no stop claim is made.
+        next.ready().await;
+        assert!(!activity.usage("gpu", "a").evicting);
+    }
+
+    #[test]
+    fn idle_history_is_bounded_without_discarding_live_lifecycle_owners() {
+        let activity = ModelActivity::default();
+        let running = activity.begin("gpu", "running");
+        let eviction = activity.try_evict("gpu", "evicting").unwrap();
+        for index in 0..MAX_IDLE_HISTORY + 100 {
+            activity.completed("gpu", &format!("idle-{index}"), 0);
+        }
+        assert_eq!(activity.lock().len(), MAX_IDLE_HISTORY + 2);
+        assert_eq!(activity.usage("gpu", "running").active, 1);
+        assert!(activity.usage("gpu", "evicting").evicting);
+        drop((running, eviction));
+        assert_eq!(activity.lock().len(), MAX_IDLE_HISTORY);
+    }
 
     const GIB: u64 = 1024 * 1024 * 1024;
 
@@ -445,6 +660,7 @@ mod tests {
             weights,
             freed,
             shortfall,
+            min_idle_seconds: None,
         }
     }
 
@@ -453,6 +669,36 @@ mod tests {
             .iter()
             .map(|victim| victim.name.as_str())
             .collect()
+    }
+
+    #[test]
+    fn restart_restores_only_observed_transitions_as_load_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open(&directory.path().join("events.db")).unwrap();
+        for (model, trigger, duration_ms) in [
+            ("slow_timer", "managed_task", 30_000),
+            ("observed", "managed_transition_observed", 50),
+            ("raw_observed", "raw_transition_observed", 30_000),
+            ("unverified_raw", "raw_transition_unverified", 30_000),
+        ] {
+            store
+                .record_event(&crate::store::ResidencyEvent {
+                    at_ms: 1,
+                    backend: "gpu".into(),
+                    model: model.into(),
+                    event: "load".into(),
+                    trigger: trigger.into(),
+                    duration_ms: Some(duration_ms),
+                    bytes: None,
+                })
+                .unwrap();
+        }
+        let activity = ModelActivity::seeded(Some(&store));
+        assert_eq!(activity.usage("gpu", "slow_timer").load_ms, None);
+        assert_eq!(activity.usage("gpu", "raw_observed").load_ms, None);
+        assert_eq!(activity.usage("gpu", "unverified_raw").load_ms, None);
+        assert_eq!(activity.usage("gpu", "observed").load_ms, Some(50.0));
+        assert_eq!(activity.usage("gpu", "observed").recent_uses, 0.0);
     }
 
     #[test]
@@ -478,6 +724,40 @@ mod tests {
         // Two small runners (4 GiB) are not enough; big-cold alone costs less than small-a +
         // small-b + anything, and far less than the hot model.
         assert_eq!(names(&plan), ["big-cold"]);
+    }
+
+    #[test]
+    fn a_runner_in_use_between_requests_is_spared_when_recency_counts() {
+        let activity = ModelActivity::default();
+        // "ocr" just answered a request; "old" was never used through FreeLlama.
+        activity.completed("gpu", "ocr", 0);
+        let loaded = ps(&[
+            ("ocr", 2 * GIB, 2 * GIB, "2026-09-29T12:05:00Z"),
+            ("old", GIB, GIB, "2026-09-29T12:01:00Z"),
+        ]);
+        let (pinned, weights) = (BTreeSet::new(), BTreeMap::new());
+        let spared = plan(
+            &loaded,
+            &activity,
+            &PlanInputs {
+                min_idle_seconds: Some(60.0),
+                ..inputs(&pinned, &weights, Freed::Total, 3 * GIB)
+            },
+        );
+        assert_eq!(names(&spared), ["old"]);
+        assert!(
+            spared
+                .skipped
+                .iter()
+                .any(|(name, reason)| name == "ocr" && *reason == "recently_used")
+        );
+        // Without recency (swapping or OS pressure), the in-use runner is a candidate too.
+        let any_idle = plan(
+            &loaded,
+            &activity,
+            &inputs(&pinned, &weights, Freed::Total, 3 * GIB),
+        );
+        assert!(names(&any_idle).contains(&"ocr"));
     }
 
     #[test]
@@ -532,7 +812,10 @@ mod tests {
             &inputs(&pinned, &weights, Freed::Vram, 3 * GIB),
         );
         assert_eq!(names(&chosen), ["quick"]);
-        assert_eq!(chosen.victims[0].reload_source, "measured_load_duration");
+        assert_eq!(
+            chosen.victims[0].reload_source,
+            "observed_runner_ready_duration"
+        );
         weights.insert("quick".to_owned(), 100.0);
         let weighted = plan(
             &loaded,

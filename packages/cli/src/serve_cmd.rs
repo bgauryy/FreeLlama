@@ -42,16 +42,48 @@ fn resolve_operator_files(
     (policy_file, benchmark_report)
 }
 
+/// Refuse an unusable listen/auth/upstream combination before anything is printed or opened:
+/// a refused start must not create the SQLite store or announce files it will never use.
+fn validate_listener(
+    listen: &str,
+    upstream: &str,
+    auth_token: Option<&str>,
+    allow_remote: bool,
+) -> Result<()> {
+    let mut probe =
+        PlatformConfig::new(listen, upstream, None, None).with_remote_access(allow_remote);
+    if let Some(token) = auth_token {
+        probe = probe.with_auth_token(token.to_owned());
+    }
+    probe.validate()
+}
+
+/// The bearer token file and its token, with the listener validated against them first.
+fn authenticated_listener(args: &PlatformStartArgs) -> Result<Option<(PathBuf, String)>> {
+    let token_file = args
+        .production
+        .auth_token_file
+        .clone()
+        .or_else(|| std::env::var_os("FREELLAMA_AUTH_TOKEN_FILE").map(PathBuf::from));
+    let credentials = token_file
+        .map(|path| freellama::auth::read_token_file(&path).map(|token| (path, token)))
+        .transpose()?;
+    validate_listener(
+        &args.listen,
+        &args.backends.upstream,
+        credentials.as_ref().map(|(_, token)| token.as_str()),
+        args.production.allow_remote,
+    )?;
+    Ok(credentials)
+}
+
 pub(crate) async fn start_platform(args: PlatformStartArgs) -> Result<()> {
+    let credentials = authenticated_listener(&args)?;
     let home = args
         .production
         .home
         .clone()
         .or_else(freellama::store::default_home);
-    // An ephemeral server writes nothing, not even the one-time copy of older operator files.
-    if let Some(home) = home.as_deref().filter(|_| !args.production.ephemeral) {
-        adopt_legacy_config(home);
-    }
     let (policy_file, benchmark_report) =
         resolve_operator_files(args.policy_file, args.benchmark_report, home.as_deref());
     let mut config = PlatformConfig::new(
@@ -118,12 +150,7 @@ pub(crate) async fn start_platform(args: PlatformStartArgs) -> Result<()> {
     if let Some(seconds) = args.admission.session_ttl_seconds {
         config = config.with_session_ttl(Duration::from_secs(seconds));
     }
-    let token_file = args
-        .production
-        .auth_token_file
-        .or_else(|| std::env::var_os("FREELLAMA_AUTH_TOKEN_FILE").map(PathBuf::from));
-    if let Some(path) = token_file {
-        let token = freellama::auth::read_token_file(&path)?;
+    if let Some((path, token)) = credentials {
         eprintln!(
             "freellama: bearer authentication enabled from {}",
             path.display()
@@ -191,22 +218,6 @@ fn with_runtime_and_store(
     let home = home.context("cannot determine the FreeLlama home; pass --home or --ephemeral")?;
     let path = home.join(freellama::store::DATABASE_FILE);
     let store = freellama::store::Store::open(&path)?;
-    if let Some(legacy) = legacy_data_dir()
-        && let Some(imported) = store.import_legacy(&legacy)?
-        && (imported.feedback || imported.footprints > 0 || imported.usage > 0)
-    {
-        eprintln!(
-            "freellama: imported {} usage records, {} footprints{} from {}",
-            imported.usage,
-            imported.footprints,
-            if imported.feedback {
-                " and placement feedback"
-            } else {
-                ""
-            },
-            legacy.display()
-        );
-    }
     eprintln!(
         "freellama: keeping footprints, feedback, usage and the residency audit in {}",
         path.display()
@@ -272,50 +283,6 @@ fn report_admission_config() {
     );
 }
 
-/// Where versions before the shared database kept their data files.
-fn legacy_data_dir() -> Option<PathBuf> {
-    if cfg!(target_os = "windows") {
-        return std::env::var_os("LOCALAPPDATA").map(|path| PathBuf::from(path).join("FreeLlama"));
-    }
-    std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
-        .map(|path| path.join("freellama"))
-}
-
-/// Where versions before the home directory kept their operator files.
-fn legacy_config_dir() -> Option<PathBuf> {
-    if cfg!(target_os = "windows") {
-        return std::env::var_os("APPDATA").map(|path| PathBuf::from(path).join("FreeLlama"));
-    }
-    std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-        .map(|path| path.join("freellama"))
-}
-
-/// Copy operator files from the old per-user config directory into the home once, so an upgrade
-/// keeps its policy. The old files stay where they were.
-fn adopt_legacy_config(home: &Path) {
-    let Some(legacy) = legacy_config_dir() else {
-        return;
-    };
-    for name in ["platform.toml", "benchmark-report.json", "runtime.toml"] {
-        let (from, to) = (legacy.join(name), home.join(name));
-        if from.is_file() && !to.exists() {
-            let copied = std::fs::create_dir_all(home).and_then(|()| std::fs::copy(&from, &to));
-            match copied {
-                Ok(_) => eprintln!(
-                    "freellama: copied {} into {}",
-                    from.display(),
-                    home.display()
-                ),
-                Err(error) => eprintln!("freellama: could not copy {}: {error}", from.display()),
-            }
-        }
-    }
-}
-
 /// Look for a conventional config file in the working directory (a project-local policy), then
 /// in the `FreeLlama` home, which is what an MCP-autostarted `serve`, launched from whatever
 /// directory the client chose, can rely on. Only used when the corresponding flag is absent.
@@ -326,4 +293,22 @@ fn discover_config(name: &str, home: Option<&Path>) -> Option<PathBuf> {
     }
     home.map(|home| home.join(name))
         .filter(|path| path.is_file())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_listener;
+
+    const UPSTREAM: &str = "http://127.0.0.1:11434";
+
+    #[test]
+    fn a_remote_listener_without_authentication_is_refused_up_front() {
+        let error = validate_listener("0.0.0.0:11499", UPSTREAM, None, false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("non-loopback"), "{error}");
+        assert!(validate_listener("127.0.0.1:11499", UPSTREAM, None, false).is_ok());
+        assert!(validate_listener("not-an-address", UPSTREAM, None, false).is_err());
+        assert!(validate_listener("127.0.0.1:11499", UPSTREAM, None, true).is_err());
+    }
 }

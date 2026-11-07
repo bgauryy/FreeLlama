@@ -147,6 +147,8 @@ const supportedUses: Record<string, { use: string; reason: string }> = {
   thinking: { use: "thinking", reason: "Ollama advertises a thinking mode; it does not establish reasoning accuracy." },
   insert: { use: "fill_in_middle", reason: "Ollama advertises suffix-based insertion support." },
   image: { use: "image_generation", reason: "Ollama advertises image-generation support." },
+  decision: { use: "typed_decisions", reason: "Ollama advertises decision support: typed questions through run_task {task:\"decision\"}; accuracy still needs labeled examples." },
+  speech: { use: "text_to_speech", reason: "Ollama advertises speech output, through the audio tool; quality is not established." },
 };
 
 const advertisedUses = [

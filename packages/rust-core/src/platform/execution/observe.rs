@@ -20,45 +20,6 @@ pub(crate) async fn request_unload(
     post_json_with_retries(state, upstream, "/api/generate", &body).await
 }
 
-pub(crate) async fn unload_after_observation(
-    state: &PlatformState,
-    execution: &ExecutionTarget,
-    model: &str,
-) -> Value {
-    match request_unload(state, &execution.upstream, model).await {
-        Ok((status, _)) if status.is_success() => {
-            let observation = observe_physical_placement(state, execution, model).await;
-            let unloaded = observation["status"] == "not_resident";
-            if unloaded {
-                state.audit.record(&super::super::audit::Entry {
-                    backend: execution.placement.as_str(),
-                    model,
-                    event: "unload",
-                    trigger: "caller_unload",
-                    duration_ms: None,
-                    bytes: None,
-                });
-            }
-            json!({
-                "requested": "immediate_unload",
-                "status": if unloaded { "verified" } else { "failed" },
-                "post_unload_observation": observation,
-            })
-        }
-        Ok((status, body)) => json!({
-            "requested": "immediate_unload",
-            "status": "failed",
-            "upstream_status": status.as_u16(),
-            "error": body,
-        }),
-        Err(error) => json!({
-            "requested": "immediate_unload",
-            "status": "failed",
-            "error": error.body.error,
-        }),
-    }
-}
-
 /// Observe the processor that Ollama actually loaded after a managed request. An assignment to
 /// the CPU daemon plus `num_gpu:0` is a request, not proof: Metal/MLX builds may still put every
 /// byte in VRAM. Unknown/mixed/mismatched observations are returned to the caller and excluded
@@ -109,14 +70,16 @@ pub(crate) async fn observe_physical_placement(
     observation
 }
 
-/// The `/api/ps` entry for `model` on `upstream`, if it is loaded.
-pub(crate) async fn resident_entry(client: &Client, upstream: &str, model: &str) -> Option<Value> {
+/// The `/api/ps` entry for `model` on `upstream`, if it is loaded. With several same-name
+/// runners, the one carrying `digest` (the catalog identity the caller expects) is preferred.
+pub(crate) async fn resident_entry(
+    client: &Client,
+    upstream: &str,
+    model: &str,
+    digest: Option<&str>,
+) -> Option<Value> {
     let ps = get_json(client, upstream, "/api/ps").await.ok()?;
-    crate::ollama_http::find_ps_entry(&ps, model).cloned()
-}
-
-pub(crate) async fn model_is_resident(client: &Client, upstream: &str, model: &str) -> bool {
-    resident_entry(client, upstream, model).await.is_some()
+    crate::ollama_http::find_ps_entry_by_digest(&ps, model, digest).cloned()
 }
 
 pub(crate) fn physical_placement_observation(

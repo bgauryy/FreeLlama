@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use clap::{Args, Subcommand};
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -38,9 +38,10 @@ pub enum ScopeAction {
 }
 
 fn object_input(input: Option<String>) -> Result<Value> {
-    let value = input
-        .map_or(Ok(json!({})), |input| serde_json::from_str(&input))
-        .context("--json must be a JSON object")?;
+    let value = input.map_or(Ok(json!({})), |input| {
+        serde_json::from_str(&input)
+            .map_err(|error| anyhow::anyhow!("--json is not valid JSON: {error}"))
+    })?;
     ensure!(value.is_object(), "--json must be a JSON object");
     Ok(value)
 }
@@ -126,4 +127,21 @@ pub async fn run_warm(args: WarmArgs) -> Result<()> {
         body["task"] = json!(task);
     }
     super::print_post(&args.endpoint, "/_freellama/v1/warm", &body).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::object_input;
+
+    #[test]
+    fn json_flag_errors_name_the_flag_and_carry_the_parser_message() {
+        let message = object_input(Some("{nope".into())).unwrap_err().to_string();
+        assert!(
+            message.starts_with("--json is not valid JSON: key must be a string"),
+            "{message}"
+        );
+        let message = object_input(Some("[1]".into())).unwrap_err().to_string();
+        assert_eq!(message, "--json must be a JSON object");
+        assert_eq!(object_input(None).unwrap(), serde_json::json!({}));
+    }
 }

@@ -38,7 +38,16 @@ The repository has no CI or release workflows; they were removed (see git histor
 clean checkout: `yarn release:version <version>`, `yarn release:build` (builds each target's
 executable and addon into `release-artifacts/<target>/`), `node scripts/assemble-release.mjs
 release-artifacts release`, then `yarn release:verify:publish`. The publish verifier checks that
-`FREELLAMA_RELEASE_TAG`, when set, matches the workspace version.
+`FREELLAMA_RELEASE_TAG`, when set, matches the workspace version. It also requires every addon and
+executable to embed `freellama-source-commit=<sha>` (written by `packages/rust-core/build.rs`; also
+shown by `freellama --version`) equal to `git rev-parse HEAD`, and a clean tracked tree; a stale or
+`-dirty` artifact fails naming the file and the commit it was built from. CI checkouts without git
+set `FREELLAMA_RELEASE_COMMIT` to the 40-character release SHA. Then run `yarn release:smoke`: it packs
+`packages/cli`, `packages/mcp` and this host's `packages/native/<id>`, installs them into a fresh
+project and checks `freellama --version`, that `freellama --help` lists every subcommand of
+`target/release/freellama`, that the installed addon exports exactly the functions in
+`packages/mcp/native/index.d.ts`, and that the installed MCP server answers `tools/list` (needs the
+registry for the MCP dependencies). `yarn verify:production` runs both.
 Live E2E and hardware qualification remain separate operator checks; verify those receipts before tagging.
 
 Attach `release/SHA256SUMS` and binaries to the release. Publish the eight `@octocodeai/freellama-native-*` packages
@@ -199,11 +208,12 @@ Everything the server learns lives in one `SQLite` database, `~/.octocode/freell
 (`--home` or `FREELLAMA_HOME` moves the home): measured runner sizes, placement feedback, the usage
 ledger and the residency audit. It uses write-ahead logging, so several FreeLlama processes on one
 machine share it safely and learn from each other. The feedback snapshot is versioned and bounded by
-backend and task type; only physically verified warm samples are saved, and a corrupt or unsupported
-snapshot makes startup fail instead of silently discarding routing evidence. The first start imports
-the files earlier versions kept under `~/.local/share/freellama` once and copies `platform.toml`
-from `~/.config/freellama`, leaving the old files in place. Use `--ephemeral` only for disposable
-tests.
+backend and task type; only physically verified warm samples are saved, and a schema-1 snapshot (0.7.x)
+is migrated on load (aggregates kept as diagnostics, original kept as `placement_feedback_v1_backup`);
+a corrupt or unknown-version snapshot starts empty with a stderr warning and `/health`
+`feedback.persistence.last_error`, and is never overwritten. A database file with
+another schema version is refused with its path; move or delete it to start a new one. Use
+`--ephemeral` only for disposable tests.
 
 ## Bound conversation history and residency
 
@@ -246,7 +256,7 @@ longer resident before returning. Inspect both `execution.observation` and
 
 Require these health contracts before admitting traffic:
 
-- `placement_feedback_persistence: shared_database_snapshot_v1`
+- `placement_feedback_persistence: shared_database_snapshot_v2`
 - `authentication: optional_bearer_all_routes`
 - `immediate_unload_observation: observe_then_unload`
 - `placement_observation: ollama_api_ps_after_execution`

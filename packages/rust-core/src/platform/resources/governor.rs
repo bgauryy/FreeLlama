@@ -2,7 +2,7 @@
 
 use std::{
     sync::{
-        Arc, OnceLock,
+        Arc, Mutex as StdMutex, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -28,6 +28,8 @@ pub struct ResourcePermit {
     pub receipt: ResourceReceipt,
     reservations: Arc<AtomicU64>,
     changed: Arc<Notify>,
+    accounting: Arc<StdMutex<()>>,
+    sample_generation: Arc<AtomicU64>,
     bytes: u64,
 }
 
@@ -38,7 +40,16 @@ impl ResourcePermit {
     pub fn release(&mut self) {
         let bytes = std::mem::take(&mut self.bytes);
         if bytes > 0 {
+            let accounting = self
+                .accounting
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Residency is not a fresh OS sample. Invalidate observations before returning the
+            // forecast, and serialize this with reservation checks so an already-returned stale
+            // snapshot cannot spend the pre-load headroom after the forecast disappears.
+            self.sample_generation.fetch_add(1, Ordering::AcqRel);
             self.reservations.fetch_sub(bytes, Ordering::AcqRel);
+            drop(accounting);
             // Wake capacity waiters now instead of at their next sampling tick.
             self.changed.notify_waiters();
         }
@@ -60,9 +71,10 @@ impl Drop for ResourcePermit {
 struct SampleState {
     saved: Option<(Instant, HostResources)>,
     pending: Option<JoinHandle<HostResources>>,
+    pending_generation: u64,
+    generation: u64,
     sample_count: u64,
     holds: Vec<PressureHold>,
-    stale: bool,
 }
 
 struct PressureHold {
@@ -82,6 +94,8 @@ pub struct ResourceGovernor {
     state: Arc<Mutex<SampleState>>,
     pub(super) reservations: Arc<AtomicU64>,
     changed: Arc<Notify>,
+    accounting: Arc<StdMutex<()>>,
+    sample_generation: Arc<AtomicU64>,
 }
 
 /// Outcome of an atomic reservation attempt.
@@ -97,6 +111,8 @@ pub(super) enum Reservation {
     TelemetryUnavailable,
     /// Nothing reserved: the accounting would overflow.
     Overflow,
+    /// The forecast accounting changed after this host observation began.
+    StaleObservation,
 }
 
 impl std::fmt::Debug for ResourceGovernor {
@@ -142,6 +158,8 @@ impl ResourceGovernor {
             state: Arc::default(),
             reservations: Arc::new(AtomicU64::new(0)),
             changed: Arc::new(Notify::new()),
+            accounting: Arc::default(),
+            sample_generation: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -153,8 +171,17 @@ impl ResourceGovernor {
         &self.policy
     }
 
+    #[expect(
+        clippy::unused_async,
+        reason = "preserve the public async API while invalidation becomes synchronous"
+    )]
     pub async fn invalidate(&self) {
-        self.state.lock().await.stale = true;
+        let accounting = self
+            .accounting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.sample_generation.fetch_add(1, Ordering::AcqRel);
+        drop(accounting);
     }
 
     /// Read the latest cached observation, sampling once when stale.
@@ -162,15 +189,15 @@ impl ResourceGovernor {
     /// Panics only if the private sampler state violates its initialized-handle/cache invariant.
     pub async fn snapshot(&self) -> ResourceSnapshot {
         let mut state = self.state.lock().await;
-        let needs_sample = state.stale
+        let needs_sample = state.generation != self.sample_generation.load(Ordering::Acquire)
             || state
                 .saved
                 .as_ref()
                 .is_none_or(|(at, _)| at.elapsed() >= self.policy.sample_interval);
-        state.stale = false;
         if needs_sample {
             if state.pending.is_none() {
                 let sampler = self.sampler.clone();
+                state.pending_generation = self.sample_generation.load(Ordering::Acquire);
                 state.pending = Some(tokio::task::spawn_blocking(move || sampler()));
             }
             // Keep the JoinHandle in shared state while awaiting: cancellation drops only the
@@ -186,6 +213,7 @@ impl ResourceGovernor {
                     ..HostResources::default()
                 });
             state.pending = None;
+            state.generation = state.pending_generation;
             let previous = state.saved.as_ref().map(|(_, sample)| sample);
             let triggered = pressure_reasons(&observed, previous, &self.policy);
             // Recover each signal independently. Low RAM must not preserve an obsolete CPU
@@ -246,6 +274,7 @@ impl ResourceGovernor {
                 .min()
                 .unwrap_or(0),
             sample_count: state.sample_count,
+            sample_generation: state.generation,
             sample_age_ms: saved_at.elapsed().as_millis(),
             reserved_bytes,
             effective_available_bytes: observation
@@ -284,6 +313,8 @@ impl ResourceGovernor {
             receipt,
             reservations: self.reservations.clone(),
             changed: self.changed.clone(),
+            accounting: self.accounting.clone(),
+            sample_generation: self.sample_generation.clone(),
         }
     }
 
@@ -330,17 +361,9 @@ impl ResourceGovernor {
             };
             let mut assessment = snapshot.assess_demand(demand, recovering_capacity);
             let available = snapshot.observation.available_memory_bytes;
-            let reserved = if !assessment.admissible {
-                None
-            } else if demand.resident && demand.bytes == 0 {
-                Some(Reservation::Fits)
-            } else {
-                Some(self.try_reserve(
-                    required_available_bytes,
-                    available,
-                    assessment.reserve_bytes,
-                ))
-            };
+            let reserved = assessment
+                .admissible
+                .then(|| self.reserve_snapshot(&snapshot, demand, assessment.reserve_bytes, false));
             match reserved {
                 Some(outcome @ (Reservation::Fits | Reservation::BelowReserve)) => {
                     // Another admission may consume the headroom between the snapshot and
@@ -365,6 +388,17 @@ impl ResourceGovernor {
                         assessment: Some(assessment),
                     };
                     return Ok(self.permit(receipt));
+                }
+                Some(Reservation::StaleObservation) => {
+                    deny_reservation(&mut assessment, Reservation::StaleObservation);
+                    last = Some(snapshot);
+                    last_assessment = Some(assessment);
+                    if tokio::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    // A release invalidated the sample after it was returned. Re-sample now;
+                    // waiting for the ordinary sampling tick would needlessly idle capacity.
+                    continue;
                 }
                 Some(refused) => deny_reservation(&mut assessment, refused),
                 None => {}
@@ -399,16 +433,129 @@ impl ResourceGovernor {
         })
     }
 
-    /// Atomically reserve `bytes` against `available` minus `reserve`. Under
-    /// [`LowMemoryMode::Advisory`] a shortfall still reserves and reports
-    /// [`Reservation::BelowReserve`]; under [`LowMemoryMode::Refuse`] it reserves nothing.
+    /// A speculative load may use idle headroom but cannot opt into advisory overcommit or wait
+    /// for pressure recovery. Remote capacity is unknown to this host and is refused here.
+    /// # Errors
+    /// Returns the observation and refusal reason when capacity is unknown, busy, stale, or too low.
+    pub async fn try_reserve_idle(
+        &self,
+        upstream: &str,
+        demand: ResourceDemand,
+    ) -> Result<ResourcePermit, ResourceWaitError> {
+        let started = Instant::now();
+        let mut receipt = ResourceReceipt {
+            status: "speculative_capacity_unavailable",
+            waited_ms: 0,
+            required_available_bytes: demand.bytes,
+            reserved_bytes: 0,
+            snapshot: None,
+            assessment: None,
+        };
+        if !crate::net::is_loopback_url(upstream) {
+            return Err(ResourceWaitError {
+                receipt: Box::new(receipt),
+            });
+        }
+        let Ok(mut snapshot) =
+            tokio::time::timeout(self.policy.first_sample_grace, self.snapshot()).await
+        else {
+            receipt.waited_ms = started.elapsed().as_millis();
+            return Err(ResourceWaitError {
+                receipt: Box::new(receipt),
+            });
+        };
+        let configured_low_memory = snapshot.policy.low_memory;
+        snapshot.policy.low_memory = LowMemoryMode::Refuse;
+        let mut assessment = snapshot.assess_demand(demand, false);
+        snapshot.policy.low_memory = configured_low_memory;
+        let outcome = if snapshot.observation.available_memory_bytes.is_none() {
+            Some(Reservation::TelemetryUnavailable)
+        } else if snapshot.holding {
+            assessment.admissible = false;
+            assessment.status = "held_host_pressure";
+            assessment.denial_reason = Some(CapacityDenialReason::HostPressure);
+            assessment.held_by.clone_from(&snapshot.reasons);
+            None
+        } else if assessment.admissible {
+            Some(self.reserve_snapshot(&snapshot, demand, assessment.reserve_bytes, true))
+        } else {
+            None
+        };
+        if let Some(outcome) = outcome {
+            if outcome == Reservation::Fits {
+                receipt.status = "admitted_idle_capacity";
+                receipt.reserved_bytes = demand.bytes;
+            } else {
+                deny_reservation(&mut assessment, outcome);
+            }
+        }
+        receipt.waited_ms = started.elapsed().as_millis();
+        let admitted = receipt.status == "admitted_idle_capacity";
+        receipt.snapshot = Some(snapshot);
+        receipt.assessment = Some(assessment);
+        if admitted {
+            Ok(self.permit(receipt))
+        } else {
+            Err(ResourceWaitError {
+                receipt: Box::new(receipt),
+            })
+        }
+    }
+
+    /// Serialize the observation epoch check with forecast releases. A snapshot returned before
+    /// a release can no longer admit against memory that may already contain the loaded runner.
+    pub(super) fn reserve_snapshot(
+        &self,
+        snapshot: &ResourceSnapshot,
+        demand: ResourceDemand,
+        reserve: u64,
+        strict: bool,
+    ) -> Reservation {
+        let _accounting = self
+            .accounting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if snapshot.sample_generation != self.sample_generation.load(Ordering::Acquire) {
+            return Reservation::StaleObservation;
+        }
+        if demand.resident_only() {
+            return Reservation::Fits;
+        }
+        self.reserve(
+            demand.bytes,
+            snapshot.observation.available_memory_bytes,
+            reserve,
+            strict,
+        )
+    }
+
+    #[cfg(test)]
     pub(super) fn try_reserve(
         &self,
         bytes: u64,
         available: Option<u64>,
         reserve: u64,
     ) -> Reservation {
-        if available.is_none() && self.policy.telemetry_policy != TelemetryPolicy::BestEffort {
+        let _accounting = self
+            .accounting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.reserve(bytes, available, reserve, false)
+    }
+
+    /// Atomically reserve `bytes` against `available` minus `reserve`. Under
+    /// [`LowMemoryMode::Advisory`] a shortfall still reserves and reports
+    /// [`Reservation::BelowReserve`]; under [`LowMemoryMode::Refuse`] it reserves nothing.
+    fn reserve(
+        &self,
+        bytes: u64,
+        available: Option<u64>,
+        reserve: u64,
+        strict: bool,
+    ) -> Reservation {
+        if available.is_none()
+            && (strict || self.policy.telemetry_policy != TelemetryPolicy::BestEffort)
+        {
             return Reservation::TelemetryUnavailable;
         }
         let mut occupied = self.reservations.load(Ordering::Acquire);
@@ -420,7 +567,7 @@ impl ResourceGovernor {
                 return Reservation::Overflow;
             };
             let fits = available.is_none_or(|available| available >= required);
-            if !fits && self.policy.low_memory == LowMemoryMode::Refuse {
+            if !fits && (strict || self.policy.low_memory == LowMemoryMode::Refuse) {
                 return Reservation::Insufficient;
             }
             match self.reservations.compare_exchange_weak(
@@ -453,6 +600,10 @@ fn deny_reservation(assessment: &mut ResourceCapacityAssessment, outcome: Reserv
         Reservation::Overflow => (
             "held_arithmetic_overflow",
             CapacityDenialReason::ArithmeticOverflow,
+        ),
+        Reservation::StaleObservation => (
+            "held_stale_observation",
+            CapacityDenialReason::StaleObservation,
         ),
     };
     assessment.admissible = false;

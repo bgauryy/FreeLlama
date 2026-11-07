@@ -38,19 +38,22 @@ describe("research progress messages", () => {
   });
 
   it("describes octocode calls with workspace-relative paths", () => {
-    expect(describeOctocodeCall("localGetFileContent", { path: `${WS}/src/a.ts`, startLine: 1, endLine: 120 }, WS))
+    expect(describeOctocodeCall("localFetch", [{ path: `${WS}/src/a.ts`, ranges: [{ startLine: 1, endLine: 120 }] }], WS))
       .toBe("read src/a.ts (lines 1-120)");
-    expect(describeOctocodeCall("localGetFileContent", { path: `${WS}/src/a.ts`, matchString: "export" }, WS))
+    expect(describeOctocodeCall("localFetch", [{ path: `${WS}/src/a.ts`, matchString: ["export"] }], WS))
       .toBe("read src/a.ts (around 'export')");
-    expect(describeOctocodeCall("localGetFileContent", { path: "src/a.ts", minify: "symbols" }, WS)).toBe("read src/a.ts (outline)");
-    expect(describeOctocodeCall("localSearchCode", { path: `${WS}/src`, keywords: "foo" }, WS)).toBe("grep 'foo' in src");
-    expect(describeOctocodeCall("localViewStructure", { path: WS, maxDepth: 2 }, WS)).toBe("list . (depth 2)");
-    expect(describeOctocodeCall("localFindFiles", { path: WS, names: ["*.ts", "*.md"] }, WS)).toBe("find *.ts, *.md in .");
-    expect(describeOctocodeCall("lspGetSemantics", { uri: `${WS}/src/a.ts`, type: "references", symbolName: "run" }, WS))
+    expect(describeOctocodeCall("localFetch", [{ path: "src/a.ts", view: "symbols" }], WS)).toBe("read src/a.ts (outline)");
+    expect(describeOctocodeCall("localSearch", [{ path: `${WS}/src`, matchString: ["foo"] }], WS)).toBe("grep 'foo' in src");
+    expect(describeOctocodeCall("localSearch", [{ path: "src", matchString: ["a", "b"] }, { path: "lib", matchString: ["c"] }], WS)).toBe("grep 'a, b' in src (+1 more)");
+    expect(describeOctocodeCall("structureSearch", [{ operation: "tree", path: WS, maxDepth: 2 }], WS)).toBe("list . (depth 2)");
+    expect(describeOctocodeCall("structureSearch", [{ operation: "files", path: WS, include: ["*.ts", "*.md"] }], WS)).toBe("find *.ts, *.md in .");
+    expect(describeOctocodeCall("lspSearch", [{ path: `${WS}/src/a.ts`, operation: "references", symbolName: "run" }], WS))
       .toBe("lsp references 'run' in src/a.ts");
+    expect(describeOctocodeCall("ghSearchCode", [{ owner: "o", repo: "r", keywords: ["x"] }], WS)).toBe("search o/r for 'x'");
+    expect(describeOctocodeCall("ghGetHistoryItem", [{ owner: "o", repo: "r", operation: "pullRequest", number: 7 }], WS)).toBe("read o/r pullRequest 7");
     // A path outside the workspace is shown as given, not as a ../ walk.
-    expect(describeOctocodeCall("localSearchCode", { path: "/elsewhere", keywords: "x" }, WS)).toBe("grep 'x' in /elsewhere");
-    expect(describeOctocodeCall("otherTool", { a: 1 }, WS)).toBe('otherTool {"a":1}');
+    expect(describeOctocodeCall("localSearch", [{ path: "/elsewhere", matchString: ["x"] }], WS)).toBe("grep 'x' in /elsewhere");
+    expect(describeOctocodeCall("otherTool", [{ a: 1 }], WS)).toBe('otherTool {"a":1}');
   });
 
   it("describes simple shell reads and searches, and shows anything else whole", () => {

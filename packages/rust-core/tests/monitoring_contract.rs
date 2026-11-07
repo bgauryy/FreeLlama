@@ -382,9 +382,11 @@ async fn residency_upstream(residency: Arc<Residency>) -> String {
                 let state = Arc::clone(&ps_state);
                 async move {
                     let loaded = state.loaded.lock().await.clone();
+                    // 2048 is the context a short prompt is sized to; the runner Ollama reports
+                    // after the load must carry it for the load time to count as observed.
                     Json(json!({"models": loaded.iter().map(|(name, size)| json!({
                         "name": name, "model": name, "size": size, "size_vram": 0,
-                        "digest": format!("digest-{name}"), "context_length": 4096,
+                        "digest": format!("digest-{name}"), "context_length": 2048,
                         "expires_at": "2026-09-29T12:00:00Z",
                     })).collect::<Vec<_>>()}))
                 }

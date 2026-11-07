@@ -72,58 +72,17 @@ fn usage_and_events_read_back_by_time() {
 }
 
 #[test]
-fn legacy_files_are_imported_once_and_left_in_place() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("feedback.json"),
-        "{\"schema_version\":1,\"feedback\":{\"gpu\":{},\"cpu\":{}}}\n",
-    )
-    .unwrap();
-    std::fs::write(
-        dir.path().join("footprints.json"),
-        r#"[{"backend":"gpu","digest":"d","context":4096,"bytes":7,"num_parallel":1,"kv_cache_percent":100}]"#,
-    )
-    .unwrap();
-    std::fs::write(
-        dir.path().join("usage.jsonl"),
-        "{\"ts\":5,\"model\":\"m\"}\nnot json\n",
-    )
-    .unwrap();
-    std::fs::write(
-        dir.path().join("usage.jsonl.1"),
-        "{\"ts\":1,\"model\":\"old\"}\n",
-    )
-    .unwrap();
-    let database = dir.path().join(DATABASE_FILE);
-    let store = Store::open(&database).unwrap();
-    let other = Store::open(&database).unwrap();
-    assert_eq!(
-        store.import_legacy(dir.path()).unwrap(),
-        Some(LegacyImport {
-            footprints: 1,
-            usage: 2,
-            feedback: true
-        })
-    );
-    // A second process sharing the file finds the import done.
-    assert_eq!(other.import_legacy(dir.path()).unwrap(), None);
-    assert_eq!(store.usage_since(0).unwrap().len(), 2);
-    assert_eq!(store.footprints(64).unwrap()[0].bytes, 7);
-    assert!(dir.path().join("usage.jsonl").exists());
-}
-
-#[test]
-fn a_database_from_a_newer_build_is_refused() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join(DATABASE_FILE);
-    Connection::open(&path)
-        .unwrap()
-        .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
-        .unwrap();
-    assert!(
-        Store::open(&path)
-            .unwrap_err()
-            .to_string()
-            .contains("newer")
-    );
+fn a_database_of_another_schema_version_is_refused_with_its_path() {
+    for version in [1, 2, SCHEMA_VERSION + 1] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(DATABASE_FILE);
+        Connection::open(&path)
+            .unwrap()
+            .pragma_update(None, "user_version", version)
+            .unwrap();
+        let message = Store::open(&path).unwrap_err().to_string();
+        assert!(message.contains(&format!("schema {version}")), "{message}");
+        assert!(message.contains(&path.display().to_string()), "{message}");
+        assert!(message.contains("move or delete"), "{message}");
+    }
 }

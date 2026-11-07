@@ -32,6 +32,9 @@ const RED_PIXEL_PNG: &[u8] = &[
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelMetadata {
     pub name: String,
+    /// Artifact identity recorded at discovery; a report without it cannot qualify routing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
     pub size: u64,
     pub format: String,
     pub family: String,
@@ -376,6 +379,11 @@ async fn discover_models(client: &Client, endpoint: &str) -> Result<Vec<ModelMet
         let model_type = ModelType::from_capabilities(capabilities.iter().copied());
         models.push(ModelMetadata {
             name: name.to_owned(),
+            digest: entry
+                .get("digest")
+                .and_then(Value::as_str)
+                .filter(|digest| !digest.is_empty())
+                .map(str::to_owned),
             size,
             format: string_field(&details, "format"),
             family: string_field(&details, "family"),
@@ -403,6 +411,9 @@ async fn run_case(
     model: &ModelMetadata,
     case: &BenchCase,
 ) -> ModelCaseResult {
+    if let Err(error) = verify_benchmark_identity(client, endpoint, model, "/api/tags").await {
+        return failed(case, 0, error);
+    }
     let started = Instant::now();
     let response = match case.kind {
         CaseKind::Embedding => client.post(crate::ollama_http::url(endpoint, "/api/embed"))
@@ -421,25 +432,96 @@ async fn run_case(
         },
         Err(error) => return failed(case, client_ms, format!("request: {error}")),
     };
+    if let Err(error) = verify_benchmark_identity(client, endpoint, model, "/api/ps").await {
+        return failed(case, client_ms, error);
+    }
+    grade_completed_case(case, client_ms, &value)
+}
+
+/// Grade only a completed operation. Correct-looking partial output or an upstream error must
+/// never qualify an artifact; embeddings intentionally do not use the chat completion envelope.
+fn grade_completed_case(case: &BenchCase, client_ms: u64, value: &Value) -> ModelCaseResult {
+    if value.get("error").is_some_and(|error| !error.is_null()) {
+        return failed(
+            case,
+            client_ms,
+            "benchmark response contains an upstream error".to_owned(),
+        );
+    }
+    if !matches!(case.kind, CaseKind::Embedding) {
+        if value["done"] != true {
+            return failed(
+                case,
+                client_ms,
+                "chat benchmark response did not complete with done:true".to_owned(),
+            );
+        }
+        let message = &value["message"];
+        let payload_present = match case.kind {
+            CaseKind::Tool | CaseKind::ToolRecovery => message["tool_calls"].is_array(),
+            _ => message["content"].is_string(),
+        };
+        if message["role"] != "assistant" || !payload_present {
+            return failed(
+                case,
+                client_ms,
+                "chat benchmark response lacks the required assistant message shape".to_owned(),
+            );
+        }
+    }
     let output = value
         .pointer("/message/content")
         .and_then(Value::as_str)
         .unwrap_or("");
-    let passed = grade(case.kind, &value, output);
+    let passed = grade(case.kind, value, output);
     ModelCaseResult {
         id: case.id.to_owned(),
         capability: case.capability,
         passed,
         client_ms,
         load_ms: ns_ms(value.get("load_duration").and_then(Value::as_u64)),
-        prompt_tokens_per_second: rate(&value, "prompt_eval_count", "prompt_eval_duration"),
-        decode_tokens_per_second: rate(&value, "eval_count", "eval_duration"),
+        prompt_tokens_per_second: rate(value, "prompt_eval_count", "prompt_eval_duration"),
+        decode_tokens_per_second: rate(value, "eval_count", "eval_duration"),
         prompt_tokens: value.get("prompt_eval_count").and_then(Value::as_u64),
         output_tokens: value.get("eval_count").and_then(Value::as_u64),
         num_ctx: case.num_ctx,
         output_excerpt: (!output.is_empty()).then(|| output.chars().take(160).collect()),
         error: (!passed).then(|| "response did not satisfy the deterministic grader".to_owned()),
     }
+}
+
+/// Discovery establishes the expected artifact; every trial must still name that artifact
+/// immediately before dispatch and observe it after completion. A mutable tag alone is not
+/// sufficient evidence for a digest-bound benchmark score.
+async fn verify_benchmark_identity(
+    client: &Client,
+    endpoint: &str,
+    model: &ModelMetadata,
+    path: &str,
+) -> Result<(), String> {
+    let expected = model
+        .digest
+        .as_deref()
+        .filter(|digest| !digest.is_empty())
+        .ok_or_else(|| {
+            "benchmark model digest unavailable; cannot qualify measured evidence".to_owned()
+        })?;
+    let observed = get_json(client, &crate::ollama_http::url(endpoint, path))
+        .await
+        .map_err(|error| format!("benchmark identity unavailable: {error}"))?;
+    let digest = observed["models"]
+        .as_array()
+        .and_then(|models| {
+            models.iter().find(|entry| {
+                entry["name"].as_str().or_else(|| entry["model"].as_str())
+                    == Some(model.name.as_str())
+            })
+        })
+        .and_then(|entry| entry["digest"].as_str());
+    if digest != Some(expected) {
+        return Err("benchmark model digest changed or cannot be observed; re-run against a stable artifact".to_owned());
+    }
+    Ok(())
 }
 
 fn chat_request(model: &ModelMetadata, case: &BenchCase) -> Value {
@@ -650,6 +732,56 @@ fn f64_count(value: usize) -> f64 {
 #[cfg(test)]
 mod cache_metric_tests {
     use super::*;
+
+    #[test]
+    fn correct_text_cannot_pass_without_a_complete_error_free_assistant_message() {
+        let case = BenchCase {
+            id: "exact",
+            capability: Capability::Completion,
+            num_ctx: 2048,
+            kind: CaseKind::Exact,
+        };
+        let complete = json!({"done":true,"message":{"role":"assistant","content":"FREELLAMA_OK"}});
+        assert!(grade_completed_case(&case, 100, &complete).passed);
+        for completion in [json!(false), Value::Null, json!("true")] {
+            let mut incomplete = complete.clone();
+            incomplete["done"] = completion;
+            let result = grade_completed_case(&case, 100, &incomplete);
+            assert!(!result.passed, "{incomplete}");
+            assert!(result.error.unwrap().contains("done:true"));
+        }
+        for error in [
+            json!("generation failed"),
+            json!({"message":"generation failed"}),
+        ] {
+            let mut failed = complete.clone();
+            failed["error"] = error;
+            assert!(!grade_completed_case(&case, 100, &failed).passed);
+        }
+        for message in [
+            json!({"role":"user","content":"FREELLAMA_OK"}),
+            json!({"content":"FREELLAMA_OK"}),
+            json!({"role":"assistant","content":42}),
+        ] {
+            let mut invalid = complete.clone();
+            invalid["message"] = message;
+            assert!(!grade_completed_case(&case, 100, &invalid).passed);
+        }
+    }
+
+    #[test]
+    fn embedding_benchmark_keeps_its_non_chat_completion_contract() {
+        let case = BenchCase {
+            id: "embedding",
+            capability: Capability::Embedding,
+            num_ctx: 2048,
+            kind: CaseKind::Embedding,
+        };
+        let mut response = json!({"embeddings":[[0.1,0.2],[0.2,0.3]]});
+        assert!(grade_completed_case(&case, 100, &response).passed);
+        response["error"] = json!("embedding failed");
+        assert!(!grade_completed_case(&case, 100, &response).passed);
+    }
 
     #[test]
     fn benchmark_prefill_rate_uses_uncached_tokens() {

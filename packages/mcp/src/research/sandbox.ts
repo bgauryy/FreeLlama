@@ -24,7 +24,9 @@ import { accessSync, constants as fsConstants, mkdirSync, mkdtempSync, realpathS
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { probe, runProcess } from "./proc.js";
-import { READ_ONLY_TOOLS, validateCommand } from "./sandbox-validate.js";
+import { ToolExitError, ValidationError } from "./errors.js";
+import { READ_ONLY_TOOLS, segments, validateCommand } from "./sandbox-validate.js";
+import { shlexTokens } from "./shlex.js";
 import { trimSpace } from "./text.js";
 import { isDir, resolvePath } from "./workspace-path.js";
 
@@ -152,11 +154,32 @@ export class ReadOnlyShell {
 
   async run(commandText: string, timeoutSeconds: number): Promise<string> {
     const command = validateCommand(this.workspace, commandText);
+    const tokens = shlexTokens(command, { posix: true, punctuationChars: ";&|()<>", whitespaceSplit: true, commenters: "" });
+    // One pipeline per observation, as the adapter contract requires. Lists can hide a failed
+    // read behind a later successful command, including failures exempt from bash's errexit.
+    if (tokens.some((token) => token === ";" || token === "&&" || token === "||")) {
+      throw new ValidationError("command blocked: send one pipeline per turn so each execution outcome can be recorded");
+    }
     const result = await runProcess(
-      [...this.prefix, this.bash, "--restricted", "--noprofile", "--norc", "-c", command],
+      [...this.prefix, this.bash, "--restricted", "--noprofile", "--norc", "-o", "pipefail", "-c", command],
       { cwd: this.workspace, env: this.env, timeoutSeconds },
     );
     let output = result.stdout + result.stderr;
+    if (result.returncode !== 0) {
+      const parts = segments(command);
+      const words = parts.length === 1 ? parts[0]! : [];
+      const isSearch = ["rg", "grep", "egrep", "fgrep"].includes(words[0] ?? "")
+        || (words[0] === "git" && words[1] === "grep");
+      // A plain search's exit 1 means no matches. Never infer that from a mixed pipeline's last
+      // command: an earlier read may have failed. diff's exit 1 is a successful comparison.
+      const isDiff = words[0] === "diff" || (words[0] === "git" && words[1] === "diff");
+      if (result.returncode === 1 && isSearch && !trimSpace(result.stderr)) {
+        throw new ToolExitError(result.returncode, output, "empty");
+      }
+      if (!(result.returncode === 1 && isDiff && !trimSpace(result.stderr))) {
+        throw new ToolExitError(result.returncode, output);
+      }
+    }
     if (!trimSpace(output)) output = `(no output, exit code ${result.returncode})`;
     return output;
   }

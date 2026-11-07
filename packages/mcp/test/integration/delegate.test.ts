@@ -3,6 +3,7 @@
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { connectClient, REPO_ROOT } from "../setup/client.js";
+import { MODEL_EVIDENCE, qualifiedModelGrade } from "../../src/delegate.js";
 
 type ToolResult = { isError?: boolean; content: { text: string }[]; structuredContent?: any };
 
@@ -26,7 +27,11 @@ describe("delegate_research guardrails", () => {
     expect(escaped.content[0].text).toMatch(/outside the allowed|no research roots/i);
   });
 
-  it("refuses an unusable model before spawning anything, as a verdict not an error", async () => {
+  it("refuses a measured unusable artifact before spawning anything, as a verdict not an error", async ({ skip }) => {
+    if (MODEL_EVIDENCE["qwen2.5:0.5b"]?.grade !== "unusable") skip("No artifact-bound unusable measurement; name-only history cannot authorize this test.");
+    const installed = await client.callTool({ name: "models", arguments: { view: "installed" } }) as ToolResult;
+    const current = installed.structuredContent?.models?.find((entry: { name?: string }) => entry.name === "qwen2.5:0.5b");
+    if (!qualifiedModelGrade("qwen2.5:0.5b", current?.digest)) skip("Installed artifact does not match the unusable measurement; do not start inference.");
     const started = Date.now();
     const weak = (await client.callTool({
       name: "delegate_research",

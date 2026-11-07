@@ -2,6 +2,7 @@
 import * as z from "zod";
 import { DEFAULT_OLLAMA_ENDPOINT, DEFAULT_OLLAMA_FETCH_TIMEOUT_SECONDS, DEFAULT_SERVE_ENDPOINT } from "./config.js";
 import { modelNames, seconds } from "./job-progress.js";
+import { nearestText, type NearestResult } from "./nearest.js";
 
 export async function ollamaFetch(
   endpoint: string | undefined,
@@ -84,35 +85,25 @@ export const TASK_KINDS = [
   "vision",
   "embedding",
   "long_context",
+  "decision",
 ] as const;
-const MCP_TASK_KINDS = [...TASK_KINDS, "code_review"] as const;
-type McpTaskKind = (typeof MCP_TASK_KINDS)[number];
-export const taskParam = z
-  .enum(MCP_TASK_KINDS)
-  .default("completion")
-  .describe("caller owns prompts and output format.");
-
-/**
- * MCP accepts the name humans and agents naturally use for a review, while the Rust routing
- * contract deliberately keeps one coding profile. Normalize at the boundary so every downstream
- * policy, receipt, and benchmark continues to use the canonical task kind.
- */
-export function canonicalTaskKind(task: McpTaskKind): (typeof TASK_KINDS)[number] {
-  return task === "code_review" ? "coding" : task;
-}
+export const taskParam = z.enum(TASK_KINDS).default("completion");
 export const objectiveParam = z
   .enum(["fastest", "balanced", "quality"])
-  .optional();
+  .optional()
+  .describe("quality needs a task policy or an explicit model");
 export const executionPreferenceParam = z
   .enum(["auto", "prefer_cpu", "prefer_gpu"])
   .optional();
 export const minPlacementEvidenceParam = z
   .enum(["configured", "observed"])
+  .describe("observed: refuse unless /api/ps proves where the model runs")
   .optional();
 // Router grades only "low" | "medium"; the Rust core enforces the floor (`enforce_min_confidence`).
 export const minConfidenceParam = z
   .enum(["low", "medium"])
-  .optional();
+  .optional()
+  .describe("refuse a route graded lower; medium needs a task policy plus a benchmark");
 
 export const REQUIRED_CAPABILITIES = [
   "completion",
@@ -121,6 +112,8 @@ export const REQUIRED_CAPABILITIES = [
   "audio",
   "thinking",
   "embedding",
+  "decision",
+  "speech",
 ] as const;
 export const requiredCapabilitiesParam = z
   .array(z.enum(REQUIRED_CAPABILITIES))
@@ -128,7 +121,7 @@ export const requiredCapabilitiesParam = z
   .optional();
 
 export const systemPromptParam = z.string().optional()
-  .describe("Local model instructions; verbatim.");
+  .describe("Local model instructions, sent verbatim.");
 // One chat message; each array sets its own length bound (zod 4 accumulates `.min` checks).
 export const messageParam = z.object({
   role: z.enum(["system", "user", "assistant", "tool"]),
@@ -144,6 +137,28 @@ export const localToolsParam = z.array(z.object({
   }).loose(),
 }).loose()).min(1).optional();
 
+/** Decision state: the text or JSON the questions are about. */
+export const stateParam = z.union([z.string().min(1), z.record(z.string(), z.unknown()), z.array(z.unknown()).min(1)]).optional();
+/** Decision questions, answered in order: noul = probability of true, choice = one option, score = a 0-based level. */
+export const questionsParam = z.record(
+  z.string().min(1).max(100),
+  z.object({
+    type: z.enum(["noul", "choice", "score"]),
+    instructions: z.union([z.string().min(1), z.record(z.string(), z.unknown()), z.array(z.unknown())]),
+    criteria: z.union([z.record(z.string(), z.string().nullable()), z.array(z.string()).min(2).max(10)]).optional(),
+  }).strict(),
+).optional();
+/** Paths the server reads into the task, so the caller does not paste file content. */
+export const filesParam = z.array(z.string().min(1)).min(1).max(2_000).optional();
+
+const embeddingItemParam = z.union([
+  z.string().min(1),
+  z.object({ text: z.string().optional(), image: z.string().min(1).optional(), audio: z.string().min(1).optional() })
+    .strict().refine((value) => value.text !== undefined || value.image !== undefined || value.audio !== undefined, "embedding input needs text, image or audio"),
+]);
+/** Ollama embedding inputs can be text or explicit modality objects, singly or mixed. */
+export const embeddingInputParam = z.union([embeddingItemParam, z.array(embeddingItemParam).min(1)]).optional();
+
 /** Only explicitly supplied instructions become a system message; existing messages stay intact. */
 export function taskMessages({ systemPrompt, messages, prompt, images }: {
   systemPrompt?: string;
@@ -158,10 +173,9 @@ export function taskMessages({ systemPrompt, messages, prompt, images }: {
   return [{ role: "system", content: systemPrompt }, ...conversation];
 }
 
-// The stable parts are typed so an MCP client can construct a batch without guessing. The
-// forwarded Ollama controls remain deliberately open because Ollama evolves them independently.
+// Full per-item shape, checked in run_task by `parseBatchTask` (strict: a misspelled or mistyped
+// field fails the call). It is never sent to the model; `batchItemParam` below is.
 const batchTaskParam = z.object({
-  // Nested `task` shares the top-level description; repeating it re-sends the text every request.
   task: taskParam.removeDefault().optional(),
   objective: objectiveParam,
   model: z.string().min(1).optional(),
@@ -175,16 +189,19 @@ const batchTaskParam = z.object({
   priority: z.enum(["interactive", "normal", "background"]).optional(),
   maxWaitSeconds: z.number().int().positive().optional(),
   timeoutSeconds: z.number().int().positive().optional(),
-  stopOnRepetition: z.boolean().optional().describe("Stop a repeating loop, keeping its text; default on without num_predict"),
+  stopOnRepetition: z.boolean().optional(),
   prompt: z.string().min(1).optional(),
   systemPrompt: systemPromptParam,
   messages: messagesParam,
   images: z.array(z.string().min(1)).min(1).optional(),
-  input: z.union([z.string().min(1), z.array(z.string().min(1)).min(1)]).optional(),
+  input: embeddingInputParam,
+  state: stateParam,
+  questions: z.record(z.string(), z.record(z.string(), z.unknown())).optional(),
+  files: filesParam,
   tools: localToolsParam,
   keepAlive: z.string().min(1).optional(),
   format: z.union([z.literal("json"), z.record(z.string(), z.unknown())]).optional(),
-  think: z.union([z.boolean(), z.enum(["low", "medium", "high"])]).optional(),
+  think: z.union([z.boolean(), z.string().min(1)]).optional(),
   options: z.record(z.string(), z.unknown()).optional(),
   logprobs: z.boolean().optional(),
   topLogprobs: z.number().int().nonnegative().optional(),
@@ -194,11 +211,40 @@ const batchTaskParam = z.object({
 /** Field names a `tasks[].task` item accepts; derived from the schema so hints cannot drift. */
 export const BATCH_TASK_FIELDS: ReadonlySet<string> = new Set(Object.keys(batchTaskParam.shape));
 
+export type BatchTask = z.infer<typeof batchTaskParam>;
+export type BatchItem = { id: string; independent: true; task: BatchTask };
+
+// What the model sees: only the fields that usually differ between items, loosely typed. Every
+// other batch field is still accepted (`catchall`) and `parseBatchTask` validates the whole item.
 export const batchItemParam = z.object({
   id: z.string().min(1),
   independent: z.literal(true),
-  task: batchTaskParam,
+  task: z.object({
+    prompt: z.string().optional(),
+    systemPrompt: systemPromptParam,
+    messages: z.array(z.unknown()).optional(),
+    state: z.unknown().optional(),
+    input: z.unknown().optional(),
+    files: z.array(z.string()).optional(),
+    images: z.array(z.string()).optional(),
+    model: z.string().optional(),
+    task: taskParam.removeDefault().optional(),
+    questions: z.record(z.string(), z.unknown()).optional(),
+    options: z.record(z.string(), z.unknown()).optional(),
+    keepAlive: z.string().optional(),
+    format: z.unknown().optional(),
+    think: z.unknown().optional(),
+    tools: localToolsParam,
+  }).catchall(z.unknown()),
 }).strict();
+
+/** Check one batch item's `task` against the full strict shape; the error names the item. */
+export function parseBatchTask(item: { id: string; task: Record<string, unknown> }): BatchItem["task"] {
+  const parsed = batchTaskParam.safeParse(item.task);
+  if (!parsed.success) throw new Error(`batch item ${item.id}: ${parsed.error.issues.map((issue) =>
+    `${issue.path.length ? `${issue.path.join(".")}: ` : ""}${issue.message}`).join("; ")}`);
+  return parsed.data;
+}
 
 // Output schemas describe FreeLlama-owned decision envelopes while leaving Ollama-owned payloads
 // open. This gives a client useful validation without making a newly-added upstream response field
@@ -273,12 +319,24 @@ export function withRequiredCapability<T extends string>(
   return [...new Set([...(required ?? []), capability])];
 }
 
-/** A short human/backward-client cue; canonical result data stays in structuredContent. */
+/** Largest JSON text fallback; beyond it the text points at structuredContent. */
+export const RESULT_TEXT_LIMIT = 4_000;
+
+/**
+ * The text of a result with no explicit `summary`. MCP says a tool returning structuredContent
+ * SHOULD also return its serialized JSON as text, and text-only clients otherwise see no data.
+ * The JSON is compact and capped; an oversized one is cut with a note that the whole object is in
+ * structuredContent. Views that are routinely large render their own text (result-text.ts).
+ */
 function resultSummary(value: Record<string, unknown>): string {
   const explicit = value.summary;
   if (typeof explicit === "string" && explicit.trim()) return explicit.trim();
-  const keys = Object.keys(value);
-  return `Structured result available (${keys.join(", ") || "empty object"}).`;
+  const json = JSON.stringify(value);
+  if (json.length <= RESULT_TEXT_LIMIT) return json;
+  return (
+    `${json.slice(0, RESULT_TEXT_LIMIT)}\n[freellama: JSON truncated at ${RESULT_TEXT_LIMIT} of ${json.length} characters; ` +
+    "the complete object is in structuredContent]"
+  );
 }
 
 function record(value: unknown): Record<string, unknown> | undefined {
@@ -306,6 +364,8 @@ export function taskAnswerText(payload: Record<string, unknown>): string | undef
     return header + parts.join("\n");
   }
   if (typeof response.response === "string") return header + response.response.trim();
+  const answers = record(response.answers);
+  if (answers) return header + decisionAnswerText(answers);
   const omitted = record(response.embeddings_omitted);
   if (Array.isArray(response.embeddings) || omitted) {
     const count = Array.isArray(response.embeddings) ? response.embeddings.length : omitted?.count;
@@ -313,6 +373,32 @@ export function taskAnswerText(payload: Record<string, unknown>): string | undef
     return `${header}embedding complete (${String(count ?? "?")} vectors); ${where}.`;
   }
   return undefined;
+}
+
+/** One line per decision answer: `kind: bug (p 0.97, confidence 0.94)`, `refund: true (p 0.99)`, `urgency: 1.20 of 0-2, likeliest "Soon" (confidence 0.40)`. */
+export function decisionAnswerText(answers: Record<string, unknown>): string {
+  const fixed = (value: unknown) => (typeof value === "number" ? value.toFixed(2) : "?");
+  return Object.entries(answers).map(([name, raw]) => {
+    const answer = record(raw) ?? {};
+    const confidence = typeof answer.confidence === "number" ? `, confidence ${fixed(answer.confidence)}` : "";
+    if (answer.type === "choice") {
+      const choice = String(answer.choice ?? "?");
+      return `${name}: ${choice} (p ${fixed(record(answer.probabilities)?.[choice])}${confidence})`;
+    }
+    if (answer.type === "noul" && typeof answer.noul === "number") {
+      return `${name}: ${answer.noul >= 0.5 ? "true" : "false"} (p(true) ${fixed(answer.noul)})`;
+    }
+    if (answer.type === "score") {
+      const legend = record(answer.legend) ?? {};
+      const probabilities = Object.entries(record(answer.probabilities) ?? {})
+        .filter((entry): entry is [string, number] => typeof entry[1] === "number");
+      const likeliest = probabilities.sort((left, right) => right[1] - left[1])[0]?.[0];
+      const top = Math.max(0, Object.keys(legend).length - 1);
+      const label = likeliest === undefined ? "" : `, likeliest ${JSON.stringify(legend[likeliest] ?? likeliest)}`;
+      return `${name}: ${fixed(answer.score)} of 0-${top}${label} (${confidence.slice(2) || "no confidence"})`;
+    }
+    return `${name}: ${JSON.stringify(raw)}`;
+  }).join("\n");
 }
 
 /** A cold load costs at least this much before the answer line mentions it. */
@@ -342,6 +428,89 @@ function answerContent(content: string, payload: Record<string, unknown>): strin
   return `${trimmed}\n[freellama: ${characters.length - keep} repeated characters omitted here (full text in structuredContent); the model looped until its output limit — treat as low confidence]`;
 }
 
+const oneLine = (value: unknown, limit = 300) => {
+  const text = typeof value === "string" ? value : JSON.stringify(value);
+  return text.length > limit ? `${text.slice(0, limit)}…` : text;
+};
+
+/** `closest of 3 items to the query:` plus its ranked lines, from the core's `nearest` ranking. */
+function rankingText(ranked: Record<string, unknown>): string | undefined {
+  if (ranked.mode === "query" && Array.isArray(ranked.matches)) {
+    return `closest to the query:\n${nearestText(ranked as unknown as NearestResult)}`;
+  }
+  if (ranked.mode === "pairs" && Array.isArray(ranked.pairs)) {
+    return `most similar pairs:\n${nearestText(ranked as unknown as NearestResult)}`;
+  }
+  return undefined;
+}
+
+/**
+ * A job in one line: id, status, task, model, and why it is not finished yet. `task_jobs`
+ * list prints one per job.
+ */
+export function jobLine(job: Record<string, unknown>): string {
+  const model = job.selected_model ?? job.requested_model;
+  const status = String(job.status ?? "?");
+  const waiting = ["completed", "failed", "cancelled", "expired"].includes(status) || !job.reason ? "" : ` (${String(job.reason)})`;
+  return [`${String(job.id ?? "?")}`, String(job.task ?? "?"), typeof model === "string" && model ? model : "-", `${status}${waiting}`].join("  ");
+}
+
+/**
+ * The text of a `task_jobs` result: the job's status first, then what the agent acts on: the
+ * answer, the decision answers, the nearest ranking, or the error. The whole receipt, with its
+ * execution diagnostics, stays in structuredContent.
+ */
+export function jobsText(payload: Record<string, unknown>): string | undefined {
+  if (Array.isArray(payload.jobs)) {
+    return payload.jobs.length === 0 ? "no jobs" : payload.jobs.map((job) => jobLine(record(job) ?? {})).join("\n");
+  }
+  const job = record(payload.job);
+  if (!job) return undefined;
+  const lines = [jobLine(job)];
+  if (typeof job.detail === "string" && job.detail) lines.push(job.detail);
+  const result = record(job.result);
+  const error = record(job.error);
+  if (result) {
+    const ranked = record(result.nearest);
+    const ranking = ranked ? rankingText(ranked) : undefined;
+    const answer = taskAnswerText(result);
+    if (ranking) lines.push(ranking);
+    else if (answer) lines.push(answer);
+    else lines.push(oneLine(result.response ?? result, 1_500));
+  } else if (error) {
+    lines.push(`error: ${oneLine(error.error ?? error, 600)}${typeof error.code === "string" ? ` [${error.code}]` : ""}`);
+  }
+  return lines.join("\n");
+}
+
+/**
+ * One line for a finished `ollama_manage` warm or unload: which model, whether it is resident,
+ * its keep-alive, the load time and what it waited for. A deferred warm names its job instead.
+ */
+export function lifecycleText(action: string, model: string, payload: Record<string, unknown>): string | undefined {
+  const job = record(payload.job);
+  if (payload.deferred === true && job) return `${action} ${model} deferred: ${jobLine(job)}`;
+  if (action === "unload") {
+    const state = payload.unloaded === true ? "unloaded" : String(payload.status ?? "unload requested");
+    return [`${String(payload.model ?? model)}: ${state}`, typeof payload.via === "string" ? `via ${payload.via}` : "",
+      typeof payload.unload_ms === "number" ? `${payload.unload_ms} ms` : ""].filter(Boolean).join(", ");
+  }
+  if (action !== "warm") return undefined;
+  const execution = record(payload.execution);
+  const resident = record(payload.warm)?.loaded;
+  const loadNs = record(payload.metrics)?.load_duration_ns;
+  const waited = record(payload.admission)?.total_wait_ms;
+  // The core reports its adaptive choice as an object; `value` is the TTL it sent to Ollama.
+  const policy = record(execution?.keep_alive);
+  const keepAlive = policy ? (policy.value !== undefined ? `${String(policy.value)}${typeof policy.mode === "string" ? ` (${policy.mode})` : ""}` : undefined) : execution?.keep_alive;
+  return [
+    `${String(record(payload.route)?.selected_model ?? model)}: ${resident === true ? "resident" : resident === false ? "not resident" : "warm requested"}`,
+    keepAlive !== undefined && keepAlive !== null ? `keep_alive ${oneLine(keepAlive, 40)}` : "",
+    typeof loadNs === "number" ? `load ${seconds(loadNs / 1e6)}` : "",
+    typeof waited === "number" ? `waited ${waited} ms` : "",
+  ].filter(Boolean).join(", ");
+}
+
 /** Batch counterpart of taskAnswerText: one labelled answer per item, in request order. */
 export function batchAnswerText(payload: Record<string, unknown>): string | undefined {
   if (!Array.isArray(payload.results)) return undefined;
@@ -355,10 +524,9 @@ export function batchAnswerText(payload: Record<string, unknown>): string | unde
   return lines.join("\n\n");
 }
 
-// MCP clients that understand structuredContent receive the canonical object. Repeating a large
-// JSON serialization in TextContent wastes agent context (especially doctor and raw model views),
-// so the text block is a compact compatibility cue rather than a second transport encoding.
-// Task results are the exception: their text is the model's answer, since that is the payload.
+// MCP clients that understand structuredContent receive the canonical object. The text block is
+// the explicit `summary` when there is one, else the compact JSON capped at RESULT_TEXT_LIMIT so
+// text-only clients still see the data. Task results pass their own text: the model's answer.
 export function structuredResult(
   value: Record<string, unknown>,
   options: { text?: string } = {},
@@ -417,6 +585,30 @@ const SERVE_ADDRESS_PATTERN = (() => {
   return new RegExp(`(?:_freellama|${addresses.join("|")})`, "i");
 })();
 
+/**
+ * One line from a FreeLlama refusal body: the receipt behind a memory refusal is several KB, and
+ * says no more to an agent than why it waited and what would let it run. The full receipt stays
+ * in `structuredContent`.
+ */
+export function refusalLine(body: string, status?: number): string {
+  let parsed: { error?: unknown; code?: unknown; resource_admission?: { assessment?: Record<string, unknown> } };
+  try {
+    parsed = JSON.parse(body) as typeof parsed;
+  } catch {
+    return body.trim().slice(0, 400) || `HTTP ${status ?? "error"}`;
+  }
+  const error = typeof parsed.error === "string" ? parsed.error : `HTTP ${status ?? "error"}`;
+  const code = typeof parsed.code === "string" ? ` [${parsed.code}]` : "";
+  const assessment = parsed.resource_admission?.assessment;
+  // The core's managed-task refusals already state "needs X GB incl. Y GB reserve, Z GB free"
+  // (or "free memory unknown"); add figures only to refusals that lack them (raw audio routes).
+  if (!assessment || /\bneeds [\d.]+ GB incl\./.test(error)) return `${error}${code}`;
+  const gb = (value: unknown) => (typeof value === "number" ? `${(value / 1e9).toFixed(1)} GB` : "?");
+  const held = Array.isArray(assessment.held_by) && assessment.held_by.length > 0 ? ` (held by ${assessment.held_by.join(", ")})` : "";
+  return `${error}${code}${held}: ${gb(assessment.effective_available_bytes)} available, ${gb(assessment.required_with_reserve_bytes)} needed with reserve; ` +
+    "retry once the host frees memory (doctor{view:\"status\"} shows what holds it)";
+}
+
 export function errorResult(error: unknown) {
   const message = error instanceof Error ? error.message : String(error);
   let receipt: Record<string, unknown> | undefined;
@@ -445,7 +637,7 @@ export function errorResult(error: unknown) {
     ? `${message}\n\nFreeLlama managed serve is unreachable. Start it with \`freellama serve\`, or set \`FREELLAMA_SERVE_ENDPOINT\` to a running managed endpoint; then retry. Run \`doctor\` to inspect the configured endpoint.`
     : ollamaUnavailable
       ? `${message}\n\nOllama is not running at that address. Ask the user to start Ollama (the app, or \`ollama serve\`); retrying before that cannot succeed.`
-      : message;
+      : receipt && message.length > 600 ? refusalLine(message) : message;
   return { content: [{ type: "text" as const, text: actionableMessage }], isError: true,
     ...(receipt ? { structuredContent: receipt } : {}) };
 }

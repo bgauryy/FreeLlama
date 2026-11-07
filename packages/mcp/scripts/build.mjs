@@ -1,4 +1,4 @@
-// MCP artifacts: dist/index.js (the server) and dist/research/{bash,octocode}-agent.js (the
+// MCP artifacts: dist/index.js (the server) and dist/research/{bash,octocode,github}-agent.js (the
 // research adapters it spawns). Native .node stays next door (cannot go in a JS bundle).
 import { build } from "esbuild";
 import { chmodSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -34,6 +34,7 @@ await build({
   entryPoints: {
     "bash-agent": path.join(pkg, "src", "research", "bash-agent.ts"),
     "octocode-agent": path.join(pkg, "src", "research", "octocode-agent.ts"),
+    "github-agent": path.join(pkg, "src", "research", "github-agent.ts"),
   },
   outdir: path.join(distDir, "research"),
   bundle: true,

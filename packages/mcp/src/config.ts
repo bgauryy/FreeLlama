@@ -41,12 +41,12 @@ function adapterPath(file: string): string {
   return path.join(PACKAGE_ROOT, "dist", "research", file);
 }
 
-// Two interchangeable research adapters. Same env contract and result shape. In-repo
-// measurements: bash tied or beat octocode on every model, and was faster — hence the default.
-// `octocode` remains for structured search when asked.
+// Interchangeable research adapters with one env contract and result shape: `bash` (the default),
+// `octocode` (the installed CLI's local tools) and `github` (its GitHub tools).
 export const RESEARCH_ADAPTERS = {
   bash: adapterPath("bash-agent.js"),
   octocode: adapterPath("octocode-agent.js"),
+  github: adapterPath("github-agent.js"),
 } as const;
 export type ResearchAdapter = keyof typeof RESEARCH_ADAPTERS;
 

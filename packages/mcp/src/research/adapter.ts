@@ -41,7 +41,7 @@ export interface AdapterSession {
 export interface AdapterHooks {
   env?: Env;
   requestJson?: (url: string, payload: unknown, timeoutSeconds: number) => unknown | Promise<unknown>;
-  /** The HTTP client of managed job turns (progress on, no `requestJson`). */
+  /** The HTTP client of managed job turns (no `requestJson`). */
   httpRequest?: typeof httpRequest;
   resolveModelIdentity?: typeof resolveModelIdentity;
   /** Reads serve's learned token ratio for the model (managed runs only). */

@@ -336,6 +336,25 @@ impl AdmissionPool {
             .free()
     }
 
+    /// Speculative work may claim an idle backend, but must never join or bypass its queue.
+    pub(super) fn try_acquire_idle(&self, cost: usize) -> Option<AdmissionPermit> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.in_flight != 0 || state.queue_depth() != 0 || state.granted.is_some() {
+            return None;
+        }
+        let cost = state.charge(cost);
+        state.active += cost;
+        state.in_flight += 1;
+        state.admitted = state.admitted.saturating_add(1);
+        Some(AdmissionPermit {
+            pool: self.clone(),
+            cost,
+        })
+    }
+
     pub(super) fn receipt(&self) -> Value {
         let state = self
             .state

@@ -4,6 +4,7 @@ use freellama::model_bench::{BenchmarkConfiguration, ModelMetadata, benchmark_pl
 fn model(capabilities: &[Capability], size: u64) -> ModelMetadata {
     ModelMetadata {
         name: "fixture:latest".to_owned(),
+        digest: None,
         size,
         format: "gguf".to_owned(),
         family: "fixture".to_owned(),

@@ -10,7 +10,7 @@ use axum::response::IntoResponse;
 use axum::routing::any;
 use freellama::proxy::{app, proxy_target};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::RwLock;
+use tokio::sync::Mutex;
 use tower::ServiceExt;
 
 struct IncompleteRequestBody;
@@ -30,11 +30,11 @@ impl http_body::Body for IncompleteRequestBody {
 #[tokio::test]
 async fn incomplete_upload_times_out_and_releases_execution_before_any_upstream_request() {
     let (upstream, calls) = spawn_flaky_upstream(0).await;
-    let execution = Arc::new(RwLock::new(()));
+    let execution = Arc::new(Mutex::new(()));
     let proxy = app(crate::support::proxy_config("127.0.0.1:0", upstream, false)
         .with_request_timeout(std::time::Duration::from_millis(40))
         .with_max_concurrent_requests(1)
-        .with_execution_lock(execution.clone()))
+        .with_load_lock(execution.clone()))
     .unwrap();
     let response = tokio::time::timeout(
         std::time::Duration::from_millis(500),
@@ -50,7 +50,7 @@ async fn incomplete_upload_times_out_and_releases_execution_before_any_upstream_
     assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     assert!(
-        execution.try_write().is_ok(),
+        execution.try_lock().is_ok(),
         "timeout releases the backend lock before its error body is consumed"
     );
     let healthy = proxy
@@ -102,9 +102,14 @@ fn proxy_rejects_a_recursive_upstream() {
 async fn spawn_flaky_upstream(fail_count: usize) -> (String, Arc<AtomicUsize>) {
     let calls = Arc::new(AtomicUsize::new(0));
     let counter = calls.clone();
-    let router = Router::new().fallback(any(move |State(()): State<()>| {
+    // Counts what reaches Ollama on the client's behalf. `/api/tags` is the proxy's own read of
+    // the installed models (the load forecast), not a forwarded request.
+    let router = Router::new().fallback(any(move |uri: axum::http::Uri| {
         let counter = counter.clone();
         async move {
+            if uri.path() == "/api/tags" {
+                return (StatusCode::OK, "{\"models\":[]}").into_response();
+            }
             let seen = counter.fetch_add(1, Ordering::SeqCst) + 1;
             if seen <= fail_count {
                 (
@@ -304,10 +309,10 @@ async fn spawn_hanging_upstream(hang_for: std::time::Duration) -> (String, Arc<A
 #[tokio::test]
 async fn proxy_times_out_a_hung_upstream_instead_of_blocking_forever() {
     let (upstream, calls) = spawn_hanging_upstream(std::time::Duration::from_secs(30)).await;
-    let execution = Arc::new(RwLock::new(()));
+    let execution = Arc::new(Mutex::new(()));
     let config = crate::support::proxy_config("127.0.0.1:0", upstream, false)
         .with_request_timeout(std::time::Duration::from_millis(200))
-        .with_execution_lock(execution.clone());
+        .with_load_lock(execution.clone());
     let router = app(config).unwrap();
 
     let request = Request::builder()
@@ -318,7 +323,7 @@ async fn proxy_times_out_a_hung_upstream_instead_of_blocking_forever() {
     let started = std::time::Instant::now();
     let response = router.oneshot(request).await.unwrap();
     assert!(
-        execution.try_write().is_ok(),
+        execution.try_lock().is_ok(),
         "upstream errors must release shared execution before returning"
     );
     let elapsed = started.elapsed();
@@ -368,11 +373,11 @@ async fn raw_proxy_cap_is_held_for_the_stream_lifetime() {
             });
         }
     });
-    let execution = Arc::new(RwLock::new(()));
+    let execution = Arc::new(Mutex::new(()));
     let proxy = app(
         crate::support::proxy_config("127.0.0.1:0", format!("http://{addr}"), false)
             .with_max_concurrent_requests(1)
-            .with_execution_lock(execution.clone()),
+            .with_load_lock(execution.clone()),
     )
     .unwrap();
     let request = || Request::post("/api/chat").body(Body::from("{}")).unwrap();
@@ -380,8 +385,8 @@ async fn raw_proxy_cap_is_held_for_the_stream_lifetime() {
     let first = proxy.clone().oneshot(request()).await.unwrap();
     assert_eq!(first.status(), StatusCode::OK);
     assert!(
-        execution.try_read().is_err(),
-        "raw stream must exclude managed execution"
+        execution.try_lock().is_ok(),
+        "a raw body that names no model can load nothing, so it holds no backend lock"
     );
     let second = proxy.clone().oneshot(request()).await.unwrap();
     // The configured raw cap is FreeLlama's own limit: 429 with a Retry-After hint.
@@ -395,7 +400,7 @@ async fn raw_proxy_cap_is_held_for_the_stream_lifetime() {
 
     drop(first);
     assert!(
-        execution.try_write().is_ok(),
+        execution.try_lock().is_ok(),
         "dropping the stream releases execution"
     );
     let third = proxy.oneshot(request()).await.unwrap();
@@ -404,14 +409,14 @@ async fn raw_proxy_cap_is_held_for_the_stream_lifetime() {
 }
 
 #[tokio::test]
-async fn raw_mutations_share_managed_execution_but_metadata_remains_available() {
+async fn raw_loads_wait_for_the_backend_load_lock_but_metadata_remains_available() {
     let (upstream, calls) = spawn_flaky_upstream(0).await;
-    let execution = Arc::new(RwLock::new(()));
+    let execution = Arc::new(Mutex::new(()));
     let proxy = app(crate::support::proxy_config("127.0.0.1:0", upstream, false)
         .with_max_concurrent_requests(1)
-        .with_execution_lock(execution.clone()))
+        .with_load_lock(execution.clone()))
     .unwrap();
-    let managed = execution.read().await;
+    let managed = execution.lock().await;
     for method in ["POST", "PUT", "PATCH", "DELETE"] {
         let response = proxy
             .clone()
@@ -419,7 +424,7 @@ async fn raw_mutations_share_managed_execution_but_metadata_remains_available() 
                 Request::builder()
                     .method(method)
                     .uri("/api/chat")
-                    .body(Body::from("{}"))
+                    .body(Body::from(r#"{"model":"m"}"#))
                     .unwrap(),
             )
             .await
@@ -429,11 +434,18 @@ async fn raw_mutations_share_managed_execution_but_metadata_remains_available() 
             StatusCode::SERVICE_UNAVAILABLE,
             "{method}"
         );
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains("another model load is active"),
+            "{method} must be refused by the load lock, not by another check"
+        );
     }
     assert_eq!(
         calls.load(Ordering::SeqCst),
         0,
-        "refused mutations never reach Ollama"
+        "refused loads never reach Ollama"
     );
     for method in ["GET", "HEAD"] {
         let response = proxy
@@ -454,7 +466,11 @@ async fn raw_mutations_share_managed_execution_but_metadata_remains_available() 
     }
     drop(managed);
     let response = proxy
-        .oneshot(Request::post("/api/chat").body(Body::from("{}")).unwrap())
+        .oneshot(
+            Request::post("/api/chat")
+                .body(Body::from(r#"{"model":"m"}"#))
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
@@ -462,10 +478,47 @@ async fn raw_mutations_share_managed_execution_but_metadata_remains_available() 
         .await
         .unwrap();
     assert!(
-        execution.try_write().is_ok(),
+        execution.try_lock().is_ok(),
         "EOF releases shared execution guard"
     );
     assert_eq!(calls.load(Ordering::SeqCst), 3);
+}
+
+/// A generation whose model cannot be resolved may still make Ollama load something (a body
+/// this proxy cannot read but Ollama can). It must be refused with a typed forecast error, not
+/// admitted as a zero-byte load. A well-formed JSON body naming no model loads nothing and
+/// still reaches Ollama, which answers it.
+#[tokio::test]
+async fn an_unresolvable_generation_is_refused_with_a_typed_forecast_error() {
+    let (upstream, calls) = spawn_flaky_upstream(0).await;
+    let proxy = app(crate::support::proxy_config("127.0.0.1:0", upstream, false)).unwrap();
+    let refused = proxy
+        .clone()
+        .oneshot(
+            Request::post("/api/chat")
+                .body(Body::from("not json and not multipart"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(refused.headers().contains_key("retry-after"));
+    let body = axum::body::to_bytes(refused.into_body(), 4096)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["code"], "model_forecast_unavailable");
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "nothing reached Ollama");
+
+    let nameless = proxy
+        .oneshot(Request::post("/api/chat").body(Body::from("{}")).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(nameless.status(), StatusCode::OK);
+    axum::body::to_bytes(nameless.into_body(), 1024)
+        .await
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -580,15 +633,15 @@ async fn proxy_does_not_restart_ollama_for_an_ordinary_5xx_not_a_dead_process() 
 }
 
 #[tokio::test]
-async fn model_file_work_and_unloads_bypass_the_execution_lock() {
+async fn model_file_work_and_unloads_bypass_the_load_lock() {
     let (upstream, calls) = spawn_flaky_upstream(0).await;
-    let execution = Arc::new(RwLock::new(()));
+    let execution = Arc::new(Mutex::new(()));
     let proxy = app(crate::support::proxy_config("127.0.0.1:0", upstream, false)
         .with_max_concurrent_requests(1)
-        .with_execution_lock(execution.clone()))
+        .with_load_lock(execution.clone()))
     .unwrap();
     // A managed task is running; a pull must not be refused, nor hold the lock while it downloads.
-    let managed = execution.read().await;
+    let managed = execution.lock().await;
     for (path, body) in [
         ("/api/pull", r#"{"model":"llama3.2:1b"}"#),
         ("/api/delete", r#"{"model":"llama3.2:1b"}"#),
@@ -714,7 +767,7 @@ async fn a_swapping_hold_spares_raw_requests_for_a_resident_model() {
         .route(
             "/api/ps",
             any(|| async {
-                axum::Json(serde_json::json!({"models":[{"name":"warm:1b","context_length":4096}]}))
+                axum::Json(serde_json::json!({"models":[{"name":"warm:1b","context_length":4096,"digest":"recording-fixture-revision"}]}))
             }),
         )
         .route("/api/chat", any(|| async { "{}" }));
@@ -742,7 +795,8 @@ async fn a_swapping_hold_spares_raw_requests_for_a_resident_model() {
     assert!(governor.snapshot().await.holding, "fixture must hold");
     let proxy = app(
         crate::support::proxy_config("127.0.0.1:0", format!("http://{addr}"), false)
-            .with_resource_governor(governor),
+            .with_resource_governor(governor)
+            .with_hooks(Arc::new(RecordingHooks::default())),
     )
     .unwrap();
     let chat = |body: &'static str| {
@@ -780,6 +834,19 @@ struct RecordingHooks {
 }
 
 impl freellama::proxy::RawModelHooks for RecordingHooks {
+    fn forecast<'a>(
+        &'a self,
+        _: &'a str,
+        context: Option<u64>,
+    ) -> freellama::proxy::ForecastFuture<'a> {
+        Box::pin(async move {
+            Some(freellama::proxy::RawForecast {
+                required_host_bytes: 4 << 30,
+                context_tokens: context.or(Some(4096)),
+                digest: Some("recording-fixture-revision".into()),
+            })
+        })
+    }
     fn prepare<'a>(
         &'a self,
         model: &'a str,
@@ -797,11 +864,14 @@ impl freellama::proxy::RawModelHooks for RecordingHooks {
         Box::new(())
     }
 
-    fn served(&self, model: &str, loaded: bool) {
-        self.served.lock().unwrap().push((model.to_owned(), loaded));
+    fn served(&self, model: &str, reuse_unverified: bool) {
+        self.served
+            .lock()
+            .unwrap()
+            .push((model.to_owned(), reuse_unverified));
     }
 
-    fn unloaded(&self, model: &str) {
+    fn unload_accepted(&self, model: &str) {
         self.unloaded.lock().unwrap().push(model.to_owned());
     }
 }
@@ -813,13 +883,13 @@ async fn raw_generations_tell_the_platform_which_model_they_load_and_use() {
             "/api/ps",
             any(|| async {
                 axum::Json(serde_json::json!({"models":[
-                    {"name":"warm:1b","context_length":4096},
-                    {"name":"plain:latest","context_length":4096}
+                    {"name":"warm:1b","context_length":4096,"digest":"recording-fixture-revision"},
+                    {"name":"plain:latest","context_length":4096,"digest":"recording-fixture-revision"}
                 ]}))
             }),
         )
-        .route("/api/chat", any(|| async { "{}" }))
-        .route("/api/generate", any(|| async { "{}" }))
+        .route("/api/chat", any(|| async { "{\"done\":true}" }))
+        .route("/api/generate", any(|| async { "{\"done\":true}" }))
         .route("/api/tags", any(|| async { "{\"models\":[]}" }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -869,7 +939,7 @@ async fn raw_generations_tell_the_platform_which_model_they_load_and_use() {
         vec![
             ("cold:1b".to_owned(), Some(8192)),
             ("warm:1b".to_owned(), Some(8192)),
-            ("warm:latest".to_owned(), None)
+            ("warm:latest".to_owned(), Some(4096))
         ]
     );
     assert_eq!(hooks.begun.load(Ordering::SeqCst), 5);
@@ -883,4 +953,428 @@ async fn raw_generations_tell_the_platform_which_model_they_load_and_use() {
             ("warm:latest".to_owned(), true)
         ]
     );
+}
+
+#[tokio::test]
+async fn healthy_raw_cold_loads_reserve_forecasts_until_response_release() {
+    use freellama::platform::resources::{HostResources, ResourceGovernor, ResourcePolicy};
+    struct ForecastHooks;
+    impl freellama::proxy::RawModelHooks for ForecastHooks {
+        fn prepare<'a>(&'a self, _: &'a str, _: Option<u64>) -> freellama::proxy::HookFuture<'a> {
+            Box::pin(async {})
+        }
+        fn begin(&self, _: &str) -> Box<dyn Send> {
+            Box::new(())
+        }
+        fn served(&self, _: &str, _: bool) {}
+        fn unload_accepted(&self, _: &str) {}
+        fn forecast<'a>(
+            &'a self,
+            _: &'a str,
+            _: Option<u64>,
+        ) -> freellama::proxy::ForecastFuture<'a> {
+            Box::pin(async {
+                Some(freellama::proxy::RawForecast {
+                    required_host_bytes: 8 << 30,
+                    context_tokens: Some(4096),
+                    digest: Some("revision".into()),
+                })
+            })
+        }
+    }
+    let upstream = Router::new()
+        .route(
+            "/api/ps",
+            any(|| async { axum::Json(serde_json::json!({"models":[]})) }),
+        )
+        .route("/api/chat", any(|| async { "{\"done\":true}" }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+    let governor = ResourceGovernor::with_sampler(ResourcePolicy::default(), || HostResources {
+        source: "healthy_raw_forecast_fixture".into(),
+        total_memory_bytes: Some(32 << 30),
+        available_memory_bytes: Some(16 << 30),
+        ..HostResources::default()
+    })
+    .unwrap();
+    assert!(!governor.snapshot().await.holding);
+    let proxy = app(
+        crate::support::proxy_config("127.0.0.1:0", format!("http://{addr}"), false)
+            .with_hooks(Arc::new(ForecastHooks))
+            .with_resource_governor(governor.clone())
+            .with_max_concurrent_requests(2)
+            .with_raw_queue_wait(Duration::from_secs(5)),
+    )
+    .unwrap();
+    let request = || {
+        Request::post("/api/chat")
+            .body(Body::from(r#"{"model":"cold:1b"}"#))
+            .unwrap()
+    };
+    let first = proxy.clone().oneshot(request()).await.unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(governor.snapshot().await.reserved_bytes, 8 << 30);
+    let second = proxy.oneshot(request()).await.unwrap();
+    assert_eq!(
+        second.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the healthy sample cannot admit a second overlapping forecast"
+    );
+    drop(first);
+    assert_eq!(governor.snapshot().await.reserved_bytes, 0);
+    server.abort();
+}
+
+#[tokio::test]
+async fn unavailable_local_model_forecast_refuses_before_inference_but_missing_model_reaches_validation()
+ {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let requests = Arc::clone(&calls);
+    let upstream = Router::new()
+        .route(
+            "/api/ps",
+            any(|| async { axum::Json(serde_json::json!({"models":[]})) }),
+        )
+        .route(
+            "/api/tags",
+            any(|| async { StatusCode::SERVICE_UNAVAILABLE }),
+        )
+        .route(
+            "/api/chat",
+            any(move || {
+                let requests = Arc::clone(&requests);
+                async move {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    (StatusCode::BAD_REQUEST, "missing model")
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+    let proxy = app(crate::support::proxy_config(
+        "127.0.0.1:0",
+        format!("http://{addr}"),
+        false,
+    ))
+    .unwrap();
+    let response = proxy
+        .clone()
+        .oneshot(
+            Request::post("/api/chat")
+                .body(Body::from(r#"{"model":"cold:1b"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["code"], "model_forecast_unavailable");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let response = proxy
+        .oneshot(Request::post("/api/chat").body(Body::from("{}")).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn raw_lifecycle_waiters_use_the_existing_bounded_admission_queue() {
+    struct Lease(Arc<AtomicUsize>);
+    impl Drop for Lease {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    struct BlockedHooks {
+        active: Arc<AtomicUsize>,
+        waiting: Arc<AtomicUsize>,
+    }
+    impl freellama::proxy::RawModelHooks for BlockedHooks {
+        fn prepare<'a>(&'a self, _: &'a str, _: Option<u64>) -> freellama::proxy::HookFuture<'a> {
+            Box::pin(async {})
+        }
+        fn begin(&self, _: &str) -> Box<dyn Send> {
+            self.active.fetch_add(1, Ordering::SeqCst);
+            Box::new(Lease(Arc::clone(&self.active)))
+        }
+        fn ready<'a>(&'a self, _: &'a str) -> freellama::proxy::HookFuture<'a> {
+            self.waiting.fetch_add(1, Ordering::SeqCst);
+            Box::pin(std::future::pending())
+        }
+        fn served(&self, _: &str, _: bool) {}
+        fn unload_accepted(&self, _: &str) {}
+    }
+    let active = Arc::new(AtomicUsize::new(0));
+    let ready_calls = Arc::new(AtomicUsize::new(0));
+    let admission = freellama::proxy::RawAdmission::new(1, Duration::from_secs(30));
+    let proxy = app(
+        crate::support::proxy_config("127.0.0.1:0", "http://127.0.0.1:1", false)
+            .with_raw_admission(admission.clone())
+            .with_hooks(Arc::new(BlockedHooks {
+                active: Arc::clone(&active),
+                waiting: Arc::clone(&ready_calls),
+            })),
+    )
+    .unwrap();
+    let request = || {
+        Request::post("/api/chat")
+            .body(Body::from(r#"{"model":"waiting:1b"}"#))
+            .unwrap()
+    };
+    let mut pending = Vec::new();
+    for _ in 0..9 {
+        let proxy = proxy.clone();
+        pending.push(tokio::spawn(async move { proxy.oneshot(request()).await }));
+    }
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while admission.receipt()["waiting"] != 8 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let refused = proxy.oneshot(request()).await.unwrap();
+    assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(admission.receipt()["active"], 1);
+    assert_eq!(
+        ready_calls.load(Ordering::SeqCst),
+        1,
+        "only the slot owner waits on model lifecycle"
+    );
+    assert_eq!(
+        active.load(Ordering::SeqCst),
+        9,
+        "queued requests retain their registered demand"
+    );
+    for request in pending {
+        request.abort();
+        let _ = request.await;
+    }
+    assert_eq!(active.load(Ordering::SeqCst), 0);
+    assert_eq!(admission.receipt()["active"], 0);
+    assert_eq!(admission.receipt()["waiting"], 0);
+}
+
+#[tokio::test]
+async fn cancelled_raw_unload_keeps_ownership_until_bounded_cleanup_confirms_absence() {
+    struct Lease(Arc<AtomicUsize>);
+    impl Drop for Lease {
+        fn drop(&mut self) {
+            self.0.store(0, Ordering::SeqCst);
+        }
+    }
+    struct Hooks(Arc<AtomicUsize>);
+    impl freellama::proxy::RawModelHooks for Hooks {
+        fn prepare<'a>(&'a self, _: &'a str, _: Option<u64>) -> freellama::proxy::HookFuture<'a> {
+            Box::pin(async {})
+        }
+        fn begin(&self, _: &str) -> Box<dyn Send> {
+            Box::new(())
+        }
+        fn served(&self, _: &str, _: bool) {}
+        fn unload_accepted(&self, _: &str) {}
+        fn acquire_unload<'a>(&'a self, _: &'a str) -> freellama::proxy::LeaseFuture<'a> {
+            self.0.store(1, Ordering::SeqCst);
+            Box::pin(async move { Box::new(Lease(Arc::clone(&self.0))) as Box<dyn Send> })
+        }
+    }
+    let owned = Arc::new(AtomicUsize::new(0));
+    let (started, dispatched) = tokio::sync::oneshot::channel();
+    let started = Arc::new(std::sync::Mutex::new(Some(started)));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let finish = Arc::clone(&release);
+    let upstream = Router::new()
+        .route(
+            "/api/ps",
+            any(|| async { axum::Json(serde_json::json!({"models":[]})) }),
+        )
+        .route(
+            "/api/generate",
+            any(move || {
+                let started = Arc::clone(&started);
+                let finish = Arc::clone(&finish);
+                async move {
+                    if let Some(started) = started.lock().unwrap().take() {
+                        let _ = started.send(());
+                    }
+                    finish.notified().await;
+                    "{\"done\":true}"
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+    let proxy = app(
+        crate::support::proxy_config("127.0.0.1:0", format!("http://{addr}"), false)
+            .with_hooks(Arc::new(Hooks(Arc::clone(&owned)))),
+    )
+    .unwrap();
+    let caller = tokio::spawn(async move {
+        proxy
+            .oneshot(
+                Request::post("/api/generate")
+                    .body(Body::from(r#"{"model":"m:latest","keep_alive":0}"#))
+                    .unwrap(),
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(1), dispatched)
+        .await
+        .unwrap()
+        .unwrap();
+    caller.abort();
+    let _ = caller.await;
+    assert_eq!(
+        owned.load(Ordering::SeqCst),
+        1,
+        "caller cancellation cannot release an already-dispatched unload"
+    );
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while owned.load(Ordering::SeqCst) != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+async fn raw_unload_waiting_for_demand_does_not_occupy_the_generation_slot() {
+    struct Hooks {
+        unloading: Arc<AtomicUsize>,
+        running: Arc<AtomicUsize>,
+    }
+    impl freellama::proxy::RawModelHooks for Hooks {
+        fn prepare<'a>(&'a self, _: &'a str, _: Option<u64>) -> freellama::proxy::HookFuture<'a> {
+            Box::pin(async {})
+        }
+        fn begin(&self, _: &str) -> Box<dyn Send> {
+            Box::new(())
+        }
+        fn ready<'a>(&'a self, _: &'a str) -> freellama::proxy::HookFuture<'a> {
+            self.running.fetch_add(1, Ordering::SeqCst);
+            Box::pin(std::future::pending())
+        }
+        fn acquire_unload<'a>(&'a self, _: &'a str) -> freellama::proxy::LeaseFuture<'a> {
+            self.unloading.fetch_add(1, Ordering::SeqCst);
+            Box::pin(std::future::pending())
+        }
+        fn served(&self, _: &str, _: bool) {}
+        fn unload_accepted(&self, _: &str) {}
+    }
+    let unloading = Arc::new(AtomicUsize::new(0));
+    let running = Arc::new(AtomicUsize::new(0));
+    let admission = freellama::proxy::RawAdmission::new(1, Duration::from_secs(30));
+    let proxy = app(
+        crate::support::proxy_config("127.0.0.1:0", "http://127.0.0.1:1", false)
+            .with_raw_admission(admission.clone())
+            .with_hooks(Arc::new(Hooks {
+                unloading: Arc::clone(&unloading),
+                running: Arc::clone(&running),
+            })),
+    )
+    .unwrap();
+    let control = tokio::spawn({
+        let proxy = proxy.clone();
+        async move {
+            proxy
+                .oneshot(
+                    Request::post("/api/generate")
+                        .body(Body::from(r#"{"model":"m:latest","keep_alive":0}"#))
+                        .unwrap(),
+                )
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while unloading.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(admission.receipt()["active"], 0);
+    let generation = tokio::spawn(async move {
+        proxy
+            .oneshot(
+                Request::post("/api/chat")
+                    .body(Body::from(
+                        r#"{"model":"m:latest","messages":[{"role":"user","content":"hi"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while running.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(admission.receipt()["active"], 1);
+    control.abort();
+    generation.abort();
+    let _ = control.await;
+    let _ = generation.await;
+    assert_eq!(admission.receipt()["active"], 0);
+}
+
+/// A model Ollama does not list cannot load, so a raw request must reach Ollama and get its own
+/// "not found". A forecast refusal there says "retry", and a client would retry forever.
+#[tokio::test]
+async fn a_raw_request_for_a_model_that_is_not_installed_gets_ollamas_answer() {
+    let mock = axum::Router::new()
+        .route(
+            "/api/tags",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({"models": [{"name": "real:latest", "digest": "d", "size": 1_000}]}))
+            }),
+        )
+        .route("/api/ps", axum::routing::get(|| async { axum::Json(serde_json::json!({"models": []})) }))
+        .route(
+            "/api/chat",
+            axum::routing::post(|| async {
+                (axum::http::StatusCode::NOT_FOUND, axum::Json(serde_json::json!({"error": "model 'missing:1' not found"})))
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    let platform = freellama::platform::app(&crate::support::platform_config(
+        "127.0.0.1:11435",
+        upstream,
+        None,
+        None,
+    ))
+    .unwrap();
+    let response = tower::ServiceExt::oneshot(
+        platform,
+        axum::http::Request::post("/api/chat")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                r#"{"model":"missing:1","messages":[],"stream":false}"#,
+            ))
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&body).contains("not found"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    server.abort();
 }

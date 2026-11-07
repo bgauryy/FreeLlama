@@ -42,6 +42,8 @@ pub enum TaskKind {
     Vision,
     Embedding,
     LongContext,
+    /// Typed questions about a state, answered by a decision model through `/v1/systemone`.
+    Decision,
 }
 
 impl TaskKind {
@@ -57,6 +59,7 @@ impl TaskKind {
             Self::Vision => "vision",
             Self::Embedding => "embedding",
             Self::LongContext => "long_context",
+            Self::Decision => "decision",
         }
     }
 
@@ -181,6 +184,14 @@ impl Default for RouteInput {
     }
 }
 
+/// Image token cost bounds declared by a model's own `/api/show` vision metadata. A `None`
+/// bound is not declared and is never guessed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VisionTokenBounds {
+    pub min_per_image: Option<u64>,
+    pub max_per_image: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CatalogModel {
     pub name: String,
@@ -190,6 +201,9 @@ pub struct CatalogModel {
     /// Installed model file bytes reported by `/api/tags`, used for routing and forecasts.
     pub size: u64,
     pub capabilities: BTreeSet<Capability>,
+    /// Exact thinking controls and default advertised by Ollama's `/api/show`; absence is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<Value>,
     /// Capabilities Ollama reports that routing does not use (for example `decision`),
     /// kept verbatim so a capability added upstream is visible instead of silently dropped.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -208,6 +222,8 @@ pub struct CatalogModel {
     /// context and attention fields. Routing never ranks by it.
     #[serde(default)]
     pub architecture: Option<String>,
+    /// Per-image token bounds from the model's vision metadata; `None` keeps image cost unknown.
+    pub vision_tokens: Option<VisionTokenBounds>,
     pub resident: bool,
     /// Loaded runner bytes reported by `/api/ps`, distinct from the installed file size.
     #[serde(default)]
@@ -296,8 +312,6 @@ pub struct RouteDecision {
     /// Whether the sent context fits the model's advertised context window. This is not a RAM,
     /// KV-cache, or live runner-admission claim.
     pub context_window_fit: String,
-    /// Deprecated alias; retained for older callers.
-    pub hardware_fit: String,
     /// Every other eligible candidate and why it lost.
     pub rejected: Vec<Value>,
     pub reasons: Vec<String>,
@@ -343,14 +357,64 @@ pub fn installed_model<'a>(
     )
 }
 
-/// # Errors
-///
-/// Returns an error when no installed model satisfies the request contract.
-pub fn select_route(
+/// Which gate of [`eligible_models`] rejected `model`: the failed requirement, named, so a caller
+/// can fix the request or pick another model instead of guessing.
+fn ineligibility_reason(
     input: &RouteInput,
-    models: &[CatalogModel],
-    sessions: &SessionAffinity,
-) -> Result<RouteDecision> {
+    model: &CatalogModel,
+    required: &BTreeSet<Capability>,
+) -> String {
+    let missing: Vec<String> = required
+        .difference(&model.capabilities)
+        .map(|capability| format!("{capability:?}").to_lowercase())
+        .collect();
+    if !missing.is_empty() {
+        let task = serde_json::to_value(input.task)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .unwrap_or_default();
+        return format!(
+            "task {task} requires capability {} that the model lacks",
+            missing.join(", ")
+        );
+    }
+    if let Some(requested) = input.context_tokens {
+        match model.advertised_context {
+            Some(available) if requested > available => {
+                return format!(
+                    "requested context {requested} tokens exceeds the {available} the model advertises"
+                );
+            }
+            None => {
+                return format!(
+                    "requested context {requested} tokens cannot be checked: the model advertises no context window"
+                );
+            }
+            Some(_) => {}
+        }
+    }
+    "it failed the objective's quality gate for this task".to_owned()
+}
+
+/// Up to three eligible models to name as alternatives, or nothing when none qualifies.
+fn alternatives_hint(eligible: &[&CatalogModel]) -> String {
+    if eligible.is_empty() {
+        return "; no installed model is eligible".to_owned();
+    }
+    let names: Vec<&str> = eligible
+        .iter()
+        .take(3)
+        .map(|model| model.name.as_str())
+        .collect();
+    format!("; eligible alternatives: {}", names.join(", "))
+}
+
+/// Apply capability, context and objective gates once across the complete catalog before
+/// backend partitioning. A backend with no qualified model cannot relax a global quality gate.
+pub(crate) fn eligible_models<'a>(
+    input: &RouteInput,
+    models: &'a [CatalogModel],
+) -> Result<Vec<&'a CatalogModel>> {
     let required = requirements(input);
     let capability_eligible = models
         .iter()
@@ -364,7 +428,19 @@ pub fn select_route(
         })
         .collect::<Vec<_>>();
 
-    let eligible = eligible_for_objective(input, capability_eligible)?;
+    eligible_for_objective(input, capability_eligible)
+}
+
+/// # Errors
+///
+/// Returns an error when no installed model satisfies the request contract.
+pub fn select_route(
+    input: &RouteInput,
+    models: &[CatalogModel],
+    sessions: &SessionAffinity,
+) -> Result<RouteDecision> {
+    let required = requirements(input);
+    let eligible = eligible_models(input, models)?;
 
     let chosen = if let Some(requested) = input.model.as_deref() {
         let model = installed_model(models, requested)?;
@@ -372,8 +448,10 @@ pub fn select_route(
             eligible
                 .iter()
                 .any(|candidate| candidate.name == model.name),
-            "model is not eligible for the request: {}",
-            model.name
+            "model is not eligible for the request: {} ({}{})",
+            model.name,
+            ineligibility_reason(input, model, &required),
+            alternatives_hint(&eligible)
         );
         model
     } else if let Some(affine) = input
@@ -449,7 +527,6 @@ pub fn select_route(
         quality_evidence: graded.quality_evidence.to_owned(),
         task_evidence: graded.task_evidence.to_owned(),
         context_window_fit: graded.context_window_fit.to_owned(),
-        hardware_fit: graded.hardware_fit.to_owned(),
         rejected,
         reasons,
     })
@@ -604,11 +681,8 @@ struct RouteEvidence {
     /// Sent `num_ctx` vs the model's advertised window. This is intentionally not named
     /// hardware fit: it proves neither live RAM/KV headroom nor successful runner admission.
     pub context_window_fit: &'static str,
-    /// Deprecated compatibility alias for `context_window_fit`. Never interpret this as a live
-    /// hardware-memory result; use `memory_kv_preflight` and post-run observation instead.
-    pub hardware_fit: &'static str,
-    /// Legacy single-word summary, derived from the three above. Kept so existing callers and the
-    /// `min_confidence` gate keep working.
+    /// Single-word summary derived from `quality_evidence` and `task_evidence`; the
+    /// `min_confidence` gate reads it.
     pub confidence: &'static str,
     /// The strongest evidence class behind the pick, for one-line logging.
     pub evidence: &'static str,
@@ -630,11 +704,6 @@ fn route_evidence(
         task_evidence: if has_benchmark { "strong" } else { "none" },
         context_window_fit: match fits {
             Some(true) => "fits_advertised_window",
-            Some(false) => "insufficient_context",
-            None => "unknown",
-        },
-        hardware_fit: match fits {
-            Some(true) => "context_window_only",
             Some(false) => "insufficient_context",
             None => "unknown",
         },

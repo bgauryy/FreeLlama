@@ -1,0 +1,3 @@
+[mcp_servers.freellama-local]
+command = "node"
+args = ["/Users/bgaryy/code/FreeLlama/packages/mcp/dist/index.js"]

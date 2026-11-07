@@ -1,13 +1,14 @@
 // A managed research turn as a deferred job: the same POST /_freellama/v1/tasks with `defer:true`,
 // polled so the wait for admission, memory or a model load is reported while it happens. The
-// phases, fallbacks and polling are run_task's (src/job-progress.ts); this module only maps them
-// onto the adapter's HTTP client, so a turn returns the synchronous call's body and throws its
+// phases and polling are run_task's (src/job-progress.ts); this module maps them onto the
+// adapter's HTTP client, so a turn returns the synchronous call's body and throws its
 // `HTTPError`, `URLError` or `RequestTimeoutError`.
 import { STATUS_CODES } from "node:http";
 import { runWithJobProgress, type CallError, type JobOptions } from "../job-progress.js";
 import { isRecord } from "./canonical-json.js";
 import { HTTPError, RECEIPT_BODY_LIMIT, RequestTimeoutError, httpRequest, parseJsonBody, requestHeaders } from "./transport-http.js";
 import { decodeUtf8 } from "./text.js";
+import { retryableChatError } from "./transport.js";
 
 const TASKS_SUFFIX = "/_freellama/v1/tasks";
 
@@ -67,13 +68,26 @@ export async function requestJsonAsJob(
       submit: () => call("POST", url, { ...payload, defer: true }),
       get: (id) => call("GET", `${jobs}/${encodeURIComponent(id)}`, undefined, deadline.signal),
       cancel: (id) => call("POST", `${jobs}/${encodeURIComponent(id)}/cancel`, null),
-      sync,
+      sync: async () => {
+        // Reached only for a definitive refusal before execution. Research needs an addressable
+        // job for deadline and subprocess cleanup; a synchronous fallback would lose that handle.
+        throw syncError({
+          code: "cancellable_task_unavailable",
+          error: "Serve refused job submission before execution; cancellable research requires available job capacity and a supported request size.",
+          execution_outcome: "not_started", retry_safe: true,
+        }, 409);
+      },
     }, options.report, {
       signal: deadline.signal,
       wait: options.wait,
       describe: describeHttpError,
       failure: syncError,
       aborted: () => new RequestTimeoutError(),
+      // Keep transport types, but do not let an arbitrary 503 erase an uncertain submission.
+      unconfirmed: (error, body) => error instanceof HTTPError && !retryableChatError(error)
+        ? syncError({ ...body, error: typeof body?.error === "string" ? body.error : error.message,
+          execution_outcome: body?.execution_outcome ?? "unknown", retry_safe: false }, error.code)
+        : error as Error,
       onJob: options.onJob,
     });
     return parseJsonBody(Buffer.from(raw, "utf8"), "chat response");

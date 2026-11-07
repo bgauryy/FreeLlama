@@ -41,8 +41,10 @@ describe.skipIf(process.platform === "win32")("runDelegate", () => {
     await expect(run.done).rejects.toMatchObject({ name: "AbortError" });
   });
 
+  // Spawning `sh` under a loaded machine (a parallel build) can take seconds; the test timeout
+  // stays above the delegate's own 10 s so a slow start reports the overflow, not a vitest timeout.
   it("rejects with the maxBuffer RangeError when output overflows", async () => {
     const run = runDelegate("sh", ["-c", "head -c 4096 /dev/zero; sleep 30"], { ...base, maxBuffer: 1024 });
     await expect(run.done).rejects.toMatchObject({ code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" });
-  });
+  }, 20_000);
 });

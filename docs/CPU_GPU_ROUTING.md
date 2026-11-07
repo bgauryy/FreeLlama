@@ -27,8 +27,8 @@ machine-specific:
 | CPU-only | CPU | A second process can isolate helpers, but it does not create a second accelerator | Host RAM and measured overlap |
 
 `doctor` reports `machine.memory_bytes` on macOS, Linux, and Windows. It reports
-`machine.unified_memory_bytes` only when unified memory is known; that compatibility field is not a
-VRAM estimate on discrete-GPU hosts. `machine.gpu` names the accelerator when the OS reports it
+`machine.memory_kind` as `unified` only when host and accelerator share one memory pool; host RAM
+is not a VRAM estimate on discrete-GPU hosts. `machine.gpu` names the accelerator when the OS reports it
 (Apple model and core count, or NVIDIA name and memory on Linux), and `performance_cpus` /
 `efficiency_cpus` split hybrid CPUs on macOS. These are identity facts, not placement proof. Model-library fit is therefore a host-memory preflight, and
 actual accelerator placement must come from Ollama's resident-runner report.
@@ -216,7 +216,7 @@ curl --silent http://127.0.0.1:11435/_freellama/v1/tasks \
     }' | jq '{execution, admission, route}'
 ```
 
-The `execution` object separates the configured `backend`, requested compatibility `placement`, and
+The `execution` object separates the configured `backend`, the `requested_processor`, and
 post-run `observation`. The source is Ollama `/api/ps`; direct inspection remains useful:
 
 ```bash
@@ -232,9 +232,9 @@ samples are reported but excluded from adaptive feedback.
 
 ## Understand concurrency
 
-Each backend has its own weighted admission pool and its own resident/shared and
-transition/exclusive lock. CPU and GPU model transitions therefore do not block each other, and a
-GPU burst cannot spend the CPU helper's permit:
+Each backend has its own weighted admission pool and its own load lock (see
+[Load lock and use lease](#load-lock-and-use-lease)). CPU and GPU model loads therefore do not block
+each other, and a GPU burst cannot spend the CPU helper's permit:
 
 Both pools also share local host-pressure sampling and forecast-memory reservations. Independent
 queues do not imply independent RAM on a unified-memory machine. A request can wait for available
@@ -249,10 +249,10 @@ flowchart TD
     B -->|"CPU"| CA["CPU admission pool<br/>default 1 unit"]
     GA --> GL{"Resident?"}
     CA --> CL{"Resident?"}
-    GL -->|"Yes"| GR["GPU shared permit"]
-    GL -->|"No"| GX["GPU exclusive transition"]
-    CL -->|"Yes"| CR["CPU shared permit"]
-    CL -->|"No"| CX["CPU exclusive transition"]
+    GL -->|"Yes"| GR["Use lease only"]
+    GL -->|"No"| GX["GPU load lock until the runner is observed"]
+    CL -->|"Yes"| CR["Use lease only"]
+    CL -->|"No"| CX["CPU load lock until the runner is observed"]
     GR --> GO["Primary Ollama"]
     GX --> GO
     CR --> CO["Secondary Ollama"]
@@ -271,16 +271,92 @@ the entire pool's ceiling. Default vision weight four can serialize two vision r
 four-unit budget even when Ollama has two slots. A lower weight requires a qualified workload;
 it does not add engine slots or relax memory checks. See
 [monitoring controls](MONITORING.md#adaptive-concurrency).
-Raw generation requests also require exclusive access to the primary backend's managed transition
-lock and receive 503 if it stays busy past the raw queue wait. Metadata GET/HEAD, `/api/show`,
-model-store calls (pull, push, copy, delete), and empty `keep_alive:0` unloads remain available.
-This prevents raw inference from overlapping a managed generation on that backend.
+Raw generation requests follow the same rules on the primary backend. A raw request for a runner
+Ollama already holds at a matching digest and context takes no lock. A raw load takes the load lock
+and receives 503 (`proxy busy: another model load is active`) if it stays busy past the raw queue
+wait. Metadata GET/HEAD, `/api/show`, model-store calls (pull, push, copy, delete), and empty
+`keep_alive:0` unloads remain available. Raw and managed work share the lock, the use leases and the
+memory forecast, so a raw load and a managed load on one backend never overlap.
+
+### Load lock and use lease
+
+Two different things protect a model. Its use lease lasts through generation; the backend load
+lock ends as soon as a compatible runner is observed, including before a nonstream response returns
+its headers.
+
+| | Held by | Held for | Blocks |
+|---|---|---|---|
+| **Use lease** (per model, per backend) | every managed task and raw generation for that model | the whole request, until the response ends or the caller disconnects | eviction and unload of that model. Tasks arriving for a model being unloaded wait for the unload |
+| **Load lock** (per backend) | a request that loads or reloads a runner, and a managed explicit unload | only until `/api/ps` shows the runner (or the request ends or is cancelled); managed unloads retain it through bounded confirmation | other loads and managed explicit unloads on the same backend |
+
+The rules that follow:
+
+- A request whose runner is already resident at the expected digest and context (`resident_shared`)
+  takes no load lock. It waits for no other model's load, and its lease keeps its runner from being
+  evicted while it decodes.
+- A request for a model that is not resident (`nonresident_transition_exclusive`) takes the load
+  lock, reads `/api/ps` again, and shares the runner if a same-model load just finished. Otherwise
+  it holds the lock until the runner appears, then releases it and keeps decoding under its lease.
+  Same-model arrivals queue behind that load and then share the loaded runner instead of loading
+  it again. A cancelled loader releases the lock at once.
+- A load that needs memory held by a busy model waits. Eviction only ever takes models with no
+  lease, and each time any model's use ends the waiting load plans its eviction again, so it
+  proceeds as soon as that model is idle and never earlier.
+- Managed explicit unloads take the model's lease first and then the load lock. Raw explicit
+  unloads and automatic idle eviction use the per-model lifecycle claim without the backend load
+  lock, so they can free an idle runner while another model is preparing a load. They still wait
+  for that model's users and retain ownership through bounded unload observation.
+- Observing runner readiness wakes resource waiters to re-size their demand. A same-model follower
+  waiting for a cold-load forecast can then share the runner while its first request still decodes.
+
+A cold task reads `/api/ps` six times in all: discovery, the receipt's capacity preview, the
+dispatch-time forecast, the observation before the lock, the observation after winning it, and the
+placement observation after the run. A resident task skips the post-lock read.
+
+### Degraded runner identity
+
+Reusing a runner without the load lock requires an observed identity. `/api/ps` must report the
+runner's digest and it must equal the catalog digest. The reported `context_length` must equal the
+requested `num_ctx`; when `/api/ps` omits it, the runner is shared only if the request sends no
+`num_ctx` (Ollama's default applies, so nothing explicit can contradict it). A missing digest is never
+compatible: the runner could be any build of the tag, so the task takes the load lock instead.
+
+The reason is in the task receipt at `admission.reason` (copied from `execution.runner_reuse.reason`):
+`resident_identity_unobserved`, `resident_digest_changed`, `resident_context_mismatch`,
+`resident_context_unobserved`, `unverified_load_options`, `resident_placement_mismatch`,
+`resident_context_unobserved_default_context_assumed` (shared, with the context assumed), or `null`
+for a plain match or when no runner is resident. `execution.runner_reuse.status` is `compatible`, `incompatible_or_unverified`,
+`absent` or `unavailable`.
+
+### GPU placement rule
+
+One rule decides whether a resident runner satisfies a request's placement, for managed and raw work
+alike (`PlacementRule`). Placement is judged from the same `/api/ps` entry's `size_vram`:
+
+| Rule | When | A runner satisfies it when |
+|---|---|---|
+| `any` | no placement evidence required (the default, and all raw passthrough) | always |
+| `cpu_only` | the request sets `num_gpu:0` | `size_vram` is `0` |
+| `gpu_resident` | `minPlacementEvidence: "observed"` on a GPU-assigned task | `size_vram` is above `0` |
+
+`execution.runner_reuse.placement_rule` reports the rule applied. A runner that fails it is
+`resident_placement_mismatch` and the task takes the load lock and reloads.
+
+### Raw generation whose allocation cannot be forecast
+
+A raw generation is admitted only with a memory forecast. When the model's metadata cannot be read
+in time, or the request body names a model the proxy cannot resolve (a multipart body, say) and
+could still load one, nothing could size or serialize that load. It is refused with HTTP 503,
+`Retry-After: 1` and `code: "model_forecast_unavailable"` instead of being admitted with a zero-byte
+reservation. A well-formed JSON body that names no usable model, or a model that is not installed,
+reaches Ollama's own validation and gets its 4xx.
 
 ## Understand automatic feedback
 
 With `executionPreference: "auto"`, unpinned `fastest` and `balanced` work can select a backend from
-comparable observed warm task duration. Learned hints require two eligible backends, explicit
-context, and a known execution payload-control projection. A decision-only preview cannot supply
+comparable observed warm execution profiles. Learned hints require two eligible backends, a verified
+effective context and known execution controls. Automatic context preparation is shared with execution,
+including Ollama's known default where suitable. A decision-only preview cannot supply
 that payload projection and uses capacity and policy signals. The loop is bounded:
 
 ```mermaid
@@ -294,9 +370,16 @@ flowchart LR
     P --> R["Return reason + placement receipt"]
 ```
 
-Generation compares decode nanoseconds per output token; embeddings compare total nanoseconds per
-input token. Each task/backend has one current profile window, reset when identity changes.
-Identity includes installed/resident digest, rate metric kind, explicit observed context, effective controls,
+When both candidates have qualified phase history and idle compatible runners, routing compares
+estimated setup + prefill + decode time. It requires more than a 10% predicted advantage and takes
+no speculative prefix-cache credit. Cached-token counters are required to learn generation prefill
+rates; older Ollama responses without those counters retain the existing normalized-rate fallback.
+Busy queues and cold-load costs remain unknown rather than becoming zero.
+
+The fallback compares generation decode nanoseconds per output token or embedding nanoseconds per
+input token. Each task/backend retains up to 32 exact profiles with 32 observations each; switching
+models does not erase another model's history. Identity includes installed/resident digest, rate
+metric kind, observed effective context, effective controls,
 endpoint-attributed process settings, and serial admission class. Unknown or changed evidence,
 cold transitions, and overlapping managed work supply no speed sample. A difference
 of 10% or less is treated as noise. Feedback never overrides an explicit model, session affinity,
@@ -304,11 +387,14 @@ capability or policy guards, or the `quality` objective. A measured advantage al
 cold load: when the faster backend's model is not loaded but the other backend's eligible model is,
 the loaded one runs (`resident_backend_avoids_cold_load`); warm the faster model to switch. The CLI
 keeps the bounded, versioned, prompt-free snapshot in the shared database by default; `--ephemeral`
-opts into reset-on-restart behavior. Legacy aggregate fields survive loading but do not qualify learned hints. Health's
+opts into reset-on-restart behavior. Aggregate duration counters are diagnostic only and do not
+qualify learned hints; a snapshot of another schema version is refused. Health's
 `decision_ready` describes the stored profile window; the current request must independently
 match it before routing can use its speed. `GET /_freellama/v1/health` exposes profile identity,
-profile sample counts, persistence status, and per-backend admission capacity. Physically verified
-warm completions still contribute legacy duration diagnostics even when their interval cannot
+profile sample counts, persistence status, and per-backend admission capacity. Task receipts include
+`execution.completion_planning` with candidate estimates and fallback explanations. These are snapshots,
+not capacity reservations or measurements of saved time. Physically verified
+warm completions still contribute aggregate duration diagnostics even when their interval cannot
 qualify a speed-learning sample.
 
 Configured processor intent, verified placement, and speed-learning eligibility remain separate

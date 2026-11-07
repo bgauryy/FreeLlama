@@ -19,10 +19,12 @@ fn model(name: &str, size: u64, capabilities: &[Capability]) -> CatalogModel {
         size,
         capabilities: capabilities.iter().copied().collect(),
         other_capabilities: Vec::new(),
+        thinking: None,
         advertised_context: Some(32_768),
         kv_cache_bytes_per_token_f16: None,
         modelfile_num_ctx: None,
         architecture: None,
+        vision_tokens: None,
         resident: false,
         resident_size: None,
         resident_vram: None,
@@ -321,6 +323,7 @@ fn empty_cli_output_never_claims_a_version_match() {
 fn metadata(size: u64, advertised_context: Option<u64>) -> ModelMetadata {
     ModelMetadata {
         name: "fixture:latest".to_owned(),
+        digest: None,
         size,
         format: "gguf".to_owned(),
         family: "fixture".to_owned(),
@@ -480,7 +483,13 @@ fn runtime_metrics_reports_null_rates_for_zero_or_missing_durations() {
 fn model_names_resolve_to_installed_tags_like_ollama() {
     use freellama::platform::installed_model;
     let models = vec![
-        model("glm-ocr:latest", 2_900_000_000, &[Capability::Vision]),
+        // Ollama's chat handler requires Completion even for OCR. Vision alone also
+        // describes image embedding/decision models and does not imply generation.
+        model(
+            "glm-ocr:latest",
+            2_900_000_000,
+            &[Capability::Completion, Capability::Vision],
+        ),
         model("qwen3:8b", 5_000_000_000, &[Capability::Completion]),
         model("qwen3:1.7b", 1_400_000_000, &[Capability::Completion]),
     ];
@@ -527,4 +536,46 @@ fn model_names_resolve_to_installed_tags_like_ollama() {
     )
     .unwrap();
     assert_eq!(route.selected_model, "glm-ocr:latest");
+}
+
+/// A refusal must name the requirement that failed and offer eligible alternatives.
+#[test]
+fn an_ineligible_explicit_model_names_the_failed_requirement_and_alternatives() {
+    let text_only = model("text:7b", 7_000_000_000, &[Capability::Completion]);
+    let seer = model(
+        "seer:7b",
+        7_000_000_000,
+        &[Capability::Completion, Capability::Vision],
+    );
+    let error = select_route(
+        &RouteInput {
+            task: TaskKind::Vision,
+            model: Some("text:7b".to_owned()),
+            ..RouteInput::default()
+        },
+        &[text_only.clone(), seer],
+        &SessionAffinity::default(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("not eligible"), "{error}");
+    assert!(
+        error.contains("task vision requires capability vision"),
+        "{error}"
+    );
+    assert!(error.contains("eligible alternatives: seer:7b"), "{error}");
+
+    let error = select_route(
+        &RouteInput {
+            model: Some("text:7b".to_owned()),
+            context_tokens: Some(1_000_000),
+            ..RouteInput::default()
+        },
+        &[text_only],
+        &SessionAffinity::default(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("exceeds the 32768"), "{error}");
+    assert!(error.contains("no installed model is eligible"), "{error}");
 }

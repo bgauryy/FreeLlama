@@ -105,6 +105,9 @@ async fn run() -> Result<()> {
         Command::Models { endpoint } => {
             print_get(&endpoint, "/_freellama/v1/models").await?;
         }
+        Command::Catalog { endpoint, job } => {
+            requests::request_catalog(&endpoint, job.as_deref()).await?;
+        }
         Command::Machine { endpoint } => {
             print_get(&endpoint, "/_freellama/v1/machine").await?;
         }
@@ -225,6 +228,13 @@ mod tests {
             .context("print response")
             .unwrap_err();
         assert!(is_broken_pipe(&error));
+    }
+
+    #[test]
+    fn a_blocked_init_reaches_main_as_a_plain_failure() {
+        let error = crate::init::exit_for_status("blocked").unwrap_err();
+        assert!(error.is::<super::PlainError>());
+        assert!(error.to_string().contains("blocked"));
     }
 
     #[test]

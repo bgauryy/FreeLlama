@@ -513,7 +513,7 @@ async fn warm_forecast_is_rechecked_after_waiting_for_a_model_transition() {
             {"name":"blocker:latest","digest":"blocker-digest","size":0},
             {"name":"target:latest","digest":"target-digest","size":4000}]}))}))
         .route("/api/ps",get(move || {let warm=seen_warm.clone();let calls=seen_calls.clone(); async move {
-            let models=if warm.load(Ordering::SeqCst) {json!([{"name":"target:latest","digest":"target-digest","size":4000,"size_vram":0,"context_length":32768}])} else {json!([])};
+            let models=if warm.load(Ordering::SeqCst) {json!([{"name":"target:latest","digest":"target-digest","size":4000,"size_vram":0,"context_length":2048}])} else {json!([])};
             calls.fetch_add(1,Ordering::SeqCst);
             Json(json!({"models":models}))
         }}))

@@ -76,7 +76,7 @@ const SIZE_CHIP = /^(?:\d+x)?(?:e)?\d+(?:\.\d+)?[kmbt]$/i;
  * `/search.json`, and the registry `_catalog` endpoint all 404. So this parses the rendered page by
  * meaning rather than by CSS class: one <li> per model with a /library/<name> (or namespace) link,
  * the first paragraph as the description, short chip spans as capabilities or sizes, and the
- * download and tag counts by their text. Both the 2025 and the October 2026 card layouts parse;
+ * download and tag counts by their text. The October 2026 card layout parses;
  * a redesign that breaks them surfaces as "0 results" with the source URL, not an exception.
  */
 export function parseModelSearch(html: string) {
@@ -101,8 +101,6 @@ export function parseModelSearch(html: string) {
     // Family chips advertise features. A cloud chip does not prove the absence of local tags.
     const capabilities = [...new Set(words.filter((chip) => inGroup(chip.at)).map((chip) => chip.text))];
     const labels = [...new Set(words.filter((chip) => !inGroup(chip.at)).map((chip) => chip.text))];
-    const legacyStat = (label: string) =>
-      block.match(new RegExp(`<span >([\\d.,KMB]+)<\\/span>\\s*<span class="hidden sm:flex">&nbsp;${label}`))?.[1] ?? null;
     const downloads = block.match(/title="([\d,]+) downloads"/)?.[1];
     const pullsShort = block.match(/title="[\d,]+ downloads"[\s\S]*?<span\s*>([\d.,]+[KMB]?)<\/span>/)?.[1];
     const tagCount = block.match(/>\s*(\d+)\s+tags?\s*</)?.[1];
@@ -112,9 +110,9 @@ export function parseModelSearch(html: string) {
       capabilities,
       ...(labels.length ? { labels } : {}),
       ...(sizes.length ? { sizes } : {}),
-      pulls: pullsShort ?? legacyStat("Pulls"),
+      pulls: pullsShort ?? null,
       ...(downloads ? { downloads: Number(downloads.replace(/,/g, "")) } : {}),
-      tags: tagCount ?? legacyStat("Tag"),
+      tags: tagCount ?? null,
       cloudAvailable: capabilities.includes("cloud"),
     });
   }

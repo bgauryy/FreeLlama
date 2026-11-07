@@ -11,7 +11,10 @@ use tokio::sync::Mutex;
 use tower::ServiceExt;
 
 #[tokio::test]
-async fn raw_inference_cannot_overlap_managed_work_but_metadata_remains_available() {
+/// A load owns the backend load lock until its runner is observed. The mock never lists a runner,
+/// so the managed task's load holds the lock for its whole request: a raw load of the same model
+/// is refused, while metadata stays available.
+async fn a_raw_load_cannot_overlap_a_managed_load_but_metadata_remains_available() {
     let started = Arc::new(tokio::sync::Notify::new());
     let finish = Arc::new(tokio::sync::Notify::new());
     let (started_handler, finish_handler) = (Arc::clone(&started), Arc::clone(&finish));
@@ -54,7 +57,11 @@ async fn raw_inference_cannot_overlap_managed_work_but_metadata_remains_availabl
         .unwrap();
     let raw = platform
         .clone()
-        .oneshot(Request::post("/api/chat").body(Body::from("{}")).unwrap())
+        .oneshot(
+            Request::post("/api/chat")
+                .body(Body::from(r#"{"model":"test:latest"}"#))
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(raw.status(), StatusCode::SERVICE_UNAVAILABLE);

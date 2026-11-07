@@ -23,6 +23,26 @@ pub const MIN_TOKEN_BYTES: usize = 32;
 /// world-accessible (Unix), cannot be read, or does not hold exactly one whitespace-free token of
 /// at least [`MIN_TOKEN_BYTES`].
 pub fn read_secret_file(path: &Path) -> Result<String> {
+    /// Name the real reason an open failed: a missing file and a refused symlink look alike to a
+    /// reader who is only told "open failed".
+    fn open_failure(path: &Path, error: &std::io::Error) -> anyhow::Error {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return anyhow::anyhow!(
+                "authentication token file not found: {} (create one with `freellama auth-token --out {}`)",
+                path.display(),
+                path.display()
+            );
+        }
+        #[cfg(unix)]
+        if error.raw_os_error() == Some(libc::ELOOP) {
+            return anyhow::anyhow!(
+                "authentication token file {} is a symlink (symlinks are not accepted)",
+                path.display()
+            );
+        }
+        anyhow::anyhow!("open authentication token file {}: {error}", path.display())
+    }
+
     use std::io::Read;
 
     let mut options = std::fs::OpenOptions::new();
@@ -39,12 +59,9 @@ pub fn read_secret_file(path: &Path) -> Result<String> {
         // FILE_FLAG_OPEN_REPARSE_POINT: open a symlink itself so the handle check rejects it.
         options.custom_flags(0x0020_0000);
     }
-    let mut file = options.open(path).with_context(|| {
-        format!(
-            "open authentication token file {} (symlinks are not accepted)",
-            path.display()
-        )
-    })?;
+    let mut file = options
+        .open(path)
+        .map_err(|error| open_failure(path, &error))?;
     let metadata = file
         .metadata()
         .with_context(|| format!("inspect authentication token file {}", path.display()))?;
@@ -149,6 +166,19 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         let error = read_token_file(&path).unwrap_err().to_string();
         assert!(error.contains("chmod 600"), "{error}");
+    }
+
+    #[test]
+    fn missing_file_is_reported_as_missing_not_as_a_symlink() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("absent.token");
+        let error = read_token_file(&path).unwrap_err().to_string();
+        assert!(
+            error.contains("authentication token file not found"),
+            "{error}"
+        );
+        assert!(error.contains("auth-token --out"), "{error}");
+        assert!(!error.contains("symlink"), "{error}");
     }
 
     #[cfg(unix)]

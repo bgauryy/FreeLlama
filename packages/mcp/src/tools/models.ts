@@ -9,6 +9,10 @@ import {
   structuredResult,
 } from "../helpers.js";
 import { libraryTrialCandidate } from "../model-search.js";
+import { CATALOG_JOBS, catalogText, catalogView } from "../model-catalog.js";
+import { serveAuthHeaders } from "../serve-http.js";
+import { installedModelsText, modelDetailText, residentModelsText } from "../result-text.js";
+import { DEFAULT_SERVE_ENDPOINT } from "../config.js";
 import { HUB_EMBEDDING_TASKS, HuggingFaceClient, huggingFaceReference } from "../huggingface.js";
 import {
   enrichInstalledModels, isRemoteModel, libraryReference, modelKnowledge, OllamaLibraryClient, publicModelGuidance,
@@ -99,7 +103,7 @@ async function libraryLookup({
     }
     try {
       const profile = JSON.parse(await machine(endpoint));
-      memoryBytes = profile.memory_bytes ?? profile.unified_memory_bytes ?? null;
+      memoryBytes = profile.memory_bytes ?? null;
     } catch {
       // serve unreachable: recommendationUnavailable below explains the missing fit check.
     }
@@ -228,17 +232,34 @@ async function libraryLookup({
   }
 }
 
+/** What is installed and how much memory is available; unknown stays null rather than "no". */
+async function catalogLiveState(endpoint: string | undefined, ollamaEndpoint: string | undefined): Promise<[ReadonlySet<string> | null, number | null]> {
+  let installed: ReadonlySet<string> | null = null;
+  let available: number | null = null;
+  try {
+    const tags = (await ollamaFetch(ollamaEndpoint, "/api/tags")) as { models?: Array<{ name?: string }> };
+    installed = new Set((tags.models ?? []).map((m) => m.name ?? ""));
+  } catch { /* reported as null */ }
+  try {
+    const response = await fetch(`${(endpoint ?? DEFAULT_SERVE_ENDPOINT).replace(/\/$/, "")}/_freellama/v1/status`, { headers: await serveAuthHeaders(), signal: AbortSignal.timeout(3000) });
+    const status = await response.json() as { host?: { available_memory_bytes?: number } };
+    available = status.host?.available_memory_bytes ?? null;
+  } catch { /* reported as null */ }
+  return [installed, available];
+}
+
 export function registerModelsTool(server: McpServer): void {
   server.registerTool(
     "models",
     {
       description:
-        "Use when: listing installed or loaded models with capabilities, policy rank and memory fit, inspecting one model, or searching ollama.com and Hugging Face GGUF repos (view:library). " +
-        "Do not use when: running work (run_task) or pulling (ollama_manage). Returns: models; library lists families first, then one family's tags.",
+        "Use when: choosing a model (view:catalog: tested picks per job, what is installed and fits now), listing installed or loaded models, inspecting one, or searching ollama.com and Hugging Face GGUF repos (view:library). " +
+        "Do not use when: running work (run_task) or pulling (ollama_manage). Returns: models; library lists families, then one family's tags.",
       inputSchema: z.object({
         view: z
-          .enum(["installed", "resident", "detail", "raw", "library"])
+          .enum(["catalog", "installed", "resident", "detail", "raw", "library"])
           .optional(),
+        job: z.enum(CATALOG_JOBS as [string, ...string[]]).optional().describe("catalog: one job's measured picks that fit now"),
         model: z.string().min(1).optional(),
         includeVerbose: z
           .boolean()
@@ -247,7 +268,7 @@ export function registerModelsTool(server: McpServer): void {
         includeReadme: z.boolean().optional(),
         query: z.string().min(1).optional(),
         capabilities: z
-          .array(z.string().regex(/^[a-z][a-z-]*$/).describe("ollama.com capability word, e.g. vision, tools, thinking, embedding, audio, decision, cloud"))
+          .array(z.string().regex(/^[a-z][a-z-]*$/).describe("e.g. vision, tools, embedding, cloud"))
           .min(1)
           .max(8)
           .optional(),
@@ -263,9 +284,16 @@ export function registerModelsTool(server: McpServer): void {
       outputSchema: modelsResultSchema,
       annotations: { readOnlyHint: true },
     },
-    async ({ view, model, includeVerbose, includeLibrary, includeReadme, query, capabilities, order, source, limit, cursor, endpoint, ollamaEndpoint }) => {
+    async ({ view, job, model, includeVerbose, includeLibrary, includeReadme, query, capabilities, order, source, limit, cursor, endpoint, ollamaEndpoint }) => {
       try {
         const selectedView = view ?? "installed";
+        if (selectedView === "catalog") {
+          const stray = Object.entries({ model, includeVerbose, includeLibrary, includeReadme, query, capabilities, order, source, limit, cursor }).filter(([, value]) => value !== undefined).map(([name]) => `\`${name}\``);
+          if (stray.length > 0) return errorResult(new Error(`view "catalog" takes only \`job\`; remove ${stray.join(", ")}.`));
+          const shown = catalogView(job, ...await catalogLiveState(endpoint, ollamaEndpoint));
+          return structuredResult(shown, { text: catalogText(shown) });
+        }
+        if (job !== undefined) return errorResult(new Error('`job` is valid only for view "catalog".'));
         if (includeLibrary !== undefined && selectedView !== "installed" && selectedView !== "detail") {
           return errorResult(new Error('`includeLibrary` is valid only for views "installed" and "detail".'));
         }
@@ -276,7 +304,7 @@ export function registerModelsTool(server: McpServer): void {
           return errorResult(new Error(`view "${selectedView}" does not accept library search fields.`));
         }
         if (selectedView !== "library" && selectedView !== "raw" && [limit, cursor].some((value) => value !== undefined)) {
-          return errorResult(new Error(`view "${selectedView}" accepts neither pagination nor library search fields.`));
+          return errorResult(new Error(`\`limit\` and \`cursor\` apply only to views "library" and "raw", not "${selectedView}".`));
         }
         if (selectedView !== "detail" && includeVerbose !== undefined) {
           return errorResult(new Error('`includeVerbose` is valid only for view "detail".'));
@@ -325,7 +353,7 @@ export function registerModelsTool(server: McpServer): void {
                 },
               };
             });
-            return structuredResult({ ...data, models });
+            return structuredResult({ ...data, models }, { text: residentModelsText({ models }) });
           }
 
           case "detail": {
@@ -355,12 +383,13 @@ export function registerModelsTool(server: McpServer): void {
             const contextEntry = Object.entries(modelInfo).find(
               ([key, value]) => key.endsWith(".context_length") && typeof value === "number",
             );
-            return structuredResult({
+            const detail = {
               ...rest,
               max_context_length: (contextEntry?.[1] as number) ?? null,
               knowledge: modelKnowledge(model, local, library, includeReadme),
               ...(includeVerbose ? { license, modelfile } : {}),
-            });
+            };
+            return structuredResult(detail, { text: modelDetailText(model, detail) });
           }
 
           case "library":
@@ -370,8 +399,9 @@ export function registerModelsTool(server: McpServer): void {
             const result = parsedResult(await listModels(endpoint));
             if (!isStructuredSuccess(result)) return result;
             const data = result.structuredContent as { models?: Array<Record<string, unknown>> };
-            return structuredResult({ ...data, models: await enrichInstalledModels(data.models ?? [], ollamaLibrary, includeLibrary ?? false,
-              async (upstream) => (await ollamaFetch(upstream ?? ollamaEndpoint, "/api/tags") as { models?: Array<Record<string, unknown>> }).models ?? []) });
+            const installed = { ...data, models: await enrichInstalledModels(data.models ?? [], ollamaLibrary, includeLibrary ?? false,
+              async (upstream) => (await ollamaFetch(upstream ?? ollamaEndpoint, "/api/tags") as { models?: Array<Record<string, unknown>> }).models ?? []) };
+            return structuredResult(installed, { text: installedModelsText(installed) });
           }
         }
       } catch (error) {

@@ -47,7 +47,7 @@ for (const target of targets) {
       createRequire(import.meta.url)(path.join(out, addonName(target.id))).version(),
       execFileSync(path.join(out, executableName(target.id)), ["--version"], { encoding: "utf8" }).trim(),
     ];
-    if (reported[0] !== version || reported[1] !== `freellama ${version}`) {
+    if (reported[0] !== version || reported[1].split("\n")[0] !== `freellama ${version}`) {
       throw new Error(`${target.id}: host artifacts report ${reported.join(" / ")}, expected ${version}`);
     }
   }

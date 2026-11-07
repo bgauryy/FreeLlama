@@ -38,8 +38,15 @@ async fn controlled_platform(
         }
     };
     let upstream = Router::new()
-        .route("/api/tags", get(|| async {Json(json!({"models":[{"name":"test:latest","size":1}]}))}))
-        .route("/api/ps", get(|| async {Json(json!({"models":[{"name":"test:latest","size":1,"size_vram":1}]}))}))
+        // `test:latest` is resident at the 2048-token context these short prompts are sized to
+        // (a different `num_ctx` makes Ollama reload the runner); the other two are
+        // installed but cold, so a request for either one needs the backend load lock.
+        .route("/api/tags", get(|| async {Json(json!({"models":[
+            {"name":"test:latest","digest":"digest-test","size":1},
+            {"name":"cold:latest","digest":"digest-cold","size":1},
+            {"name":"other:latest","digest":"digest-other","size":1}
+        ]}))}))
+        .route("/api/ps", get(|| async {Json(json!({"models":[{"name":"test:latest","digest":"digest-test","context_length":2048,"size":1,"size_vram":1}]}))}))
         .route("/api/show", post(|| async {Json(json!({"capabilities":["completion","embedding"],"model_info":{"general.architecture":"llama","llama.context_length":32768}}))}))
         .route("/api/chat", post(handler.clone()))
         .route("/api/embed", post(handler));
@@ -187,15 +194,19 @@ async fn raw_execution_cannot_extend_managed_queue_deadlines() {
             .oneshot(
                 Request::post("/api/chat")
                     .header("content-type", "application/json")
-                    .body(Body::from("{}"))
+                    .body(Body::from(
+                        json!({"model":"cold:latest","messages":[{"role":"user","content":"raw"}]})
+                            .to_string(),
+                    ))
                     .unwrap(),
             )
             .await
             .unwrap()
     });
+    // The raw cold load owns the backend load lock until its runner is observed (never, here).
     let release_raw = started(&mut receive, "raw").await;
     let input =
-        json!({"task":"embedding","model":"test:latest","objective":"fastest","input":"blocked"});
+        json!({"task":"embedding","model":"other:latest","objective":"fastest","input":"blocked"});
     let response = tokio::time::timeout(
         Duration::from_secs(1),
         platform.clone().oneshot(

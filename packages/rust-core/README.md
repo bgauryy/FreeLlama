@@ -157,6 +157,6 @@ This writes `packages/mcp/native/freellama.<triple>.node`. The crate denies unsa
 `napi.rs`, where generated NAPI glue requires an explicit exception.
 
 Machine discovery is OS-specific behind one serialized contract: `memory_bytes` is total host RAM,
-while `unified_memory_bytes` is populated only on a known unified-memory host. Recommendations use
-the former as a conservative preflight. They never equate host RAM with discrete-GPU VRAM; Ollama's
+while `memory_kind` is `unified` only on a known unified-memory host. Recommendations use
+`memory_bytes` as a conservative preflight. They never equate host RAM with discrete-GPU VRAM; Ollama's
 resident-runner data remains the execution proof.

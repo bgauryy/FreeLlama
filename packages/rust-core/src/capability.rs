@@ -13,6 +13,10 @@ pub enum Capability {
     Audio,
     Thinking,
     Embedding,
+    /// Answers typed questions about a state in one forward pass (`/v1/systemone`).
+    Decision,
+    /// Turns text into speech (`/v1/audio/speech`).
+    Speech,
     Other,
 }
 
@@ -26,6 +30,8 @@ impl Capability {
             "audio" => Self::Audio,
             "thinking" => Self::Thinking,
             "embedding" => Self::Embedding,
+            "decision" => Self::Decision,
+            "speech" => Self::Speech,
             _ => Self::Other,
         }
     }
@@ -41,6 +47,10 @@ pub enum ModelType {
     Generative,
     Multimodal,
     EmbeddingOnly,
+    /// A decision model: answers typed questions through `/v1/systemone`, never chats.
+    Decision,
+    /// A speech model: turns text into audio through `/v1/audio/speech`, never chats.
+    Speech,
     #[default]
     Unknown,
 }
@@ -53,6 +63,14 @@ impl ModelType {
             && !capabilities.contains(&Capability::Completion)
         {
             Self::EmbeddingOnly
+        } else if capabilities.contains(&Capability::Decision)
+            && !capabilities.contains(&Capability::Completion)
+        {
+            Self::Decision
+        } else if capabilities.contains(&Capability::Speech)
+            && !capabilities.contains(&Capability::Completion)
+        {
+            Self::Speech
         } else if capabilities.contains(&Capability::Completion)
             && (capabilities.contains(&Capability::Vision)
                 || capabilities.contains(&Capability::Audio))

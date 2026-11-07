@@ -10,7 +10,7 @@ use std::{
 use anyhow::Result;
 use axum::body::{Body, Bytes};
 use http_body::{Body as HttpBody, Frame, SizeHint};
-use tokio::sync::{Notify, OwnedRwLockReadGuard, OwnedRwLockWriteGuard};
+use tokio::sync::{Notify, OwnedMutexGuard};
 
 use crate::platform::resources::ResourcePermit;
 
@@ -190,16 +190,11 @@ impl Drop for RawPermit {
     }
 }
 
-/// The backend execution lock a raw generation holds until its response ends: shared for a model
-/// already resident, exclusive for one it loads.
-#[expect(
-    dead_code,
-    reason = "each guard is held only for its Drop, which releases the lock when the response ends"
-)]
-pub(crate) enum ExecutionGuard {
-    Shared(OwnedRwLockReadGuard<()>),
-    Exclusive(OwnedRwLockWriteGuard<()>),
-}
+/// The backend load lock a raw generation holds while its model loads: until the runner is
+/// observed ready, or the response ends. A request on a compatible resident runner holds none.
+pub(crate) type LoadGuard = OwnedMutexGuard<()>;
+
+pub(crate) type TransitionWatch = Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
 
 /// Response body that owns the raw-admission permit for the complete upstream stream lifetime.
 /// Receiving headers is not completion for Ollama: generation usually continues while bytes are
@@ -207,32 +202,48 @@ pub(crate) enum ExecutionGuard {
 pub(crate) struct AdmittedBody {
     pub(crate) inner: Body,
     pub(crate) permit: Option<RawPermit>,
-    pub(crate) execution: Option<ExecutionGuard>,
+    pub(crate) load: Option<LoadGuard>,
     pub(crate) resource: Option<ResourcePermit>,
     /// The platform's in-use mark for the model the request names.
     pub(crate) in_use: Option<Box<dyn Send>>,
     /// Reads what the response reports using and hands it on once the stream ends or the
     /// client goes away.
     pub(crate) usage: Option<UsageTap>,
+    /// Polls alongside the response and releases the load lock once compatible residency is
+    /// observed; the model's use lease (`in_use`) then keeps the runner from being evicted.
+    pub(crate) transition_watch: Option<TransitionWatch>,
 }
 
 /// The scanner of one response and what to do with its counts.
 pub(crate) struct UsageTap {
     pub(crate) scanner: super::usage::UsageScanner,
-    pub(crate) finished: Option<Box<dyn FnOnce(super::usage::RawUsage) + Send>>,
+    pub(crate) requires_terminal: bool,
+    pub(crate) finished: Option<Box<dyn FnOnce(super::usage::RawUsage, super::RawOutcome) + Send>>,
 }
 
 impl UsageTap {
-    fn finish(&mut self) {
+    fn finish(&mut self, outcome: super::RawOutcome) {
         if let Some(finished) = self.finished.take() {
-            finished(self.scanner.usage());
+            finished(self.scanner.usage(), outcome);
         }
+    }
+
+    fn end_stream(&mut self) {
+        self.scanner.end_stream();
+        let outcome = if self.scanner.upstream_error() {
+            super::RawOutcome::UpstreamError
+        } else if self.requires_terminal && !self.scanner.terminal() {
+            super::RawOutcome::Incomplete
+        } else {
+            super::RawOutcome::Complete
+        };
+        self.finish(outcome);
     }
 }
 
 impl Drop for UsageTap {
     fn drop(&mut self) {
-        self.finish();
+        self.finish(super::RawOutcome::ClientDropped);
     }
 }
 
@@ -244,18 +255,35 @@ impl HttpBody for AdmittedBody {
         mut self: Pin<&mut Self>,
         context: &mut TaskContext<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        if let Some(watch) = self.transition_watch.as_mut()
+            && watch.as_mut().poll(context).is_ready()
+        {
+            self.transition_watch.take();
+            self.load.take();
+            // Host telemetry owns the allocation after compatible residency is observed.
+            if crate::platform::host_has_unified_memory()
+                && let Some(resource) = self.resource.as_mut()
+            {
+                resource.release();
+            }
+        }
         let result = Pin::new(&mut self.inner).poll_frame(context);
         if let (Poll::Ready(Some(Ok(frame))), Some(tap)) = (&result, self.usage.as_mut())
             && let Some(data) = frame.data_ref()
         {
             tap.scanner.feed(data);
         }
-        if matches!(&result, Poll::Ready(None)) {
+        if matches!(&result, Poll::Ready(None | Some(Err(_)))) {
             if let Some(mut tap) = self.usage.take() {
-                tap.finish();
+                if matches!(&result, Poll::Ready(Some(Err(_)))) {
+                    tap.finish(super::RawOutcome::UpstreamError);
+                } else {
+                    tap.end_stream();
+                }
             }
+            self.transition_watch.take();
             self.permit.take();
-            self.execution.take();
+            self.load.take();
             self.resource.take();
             self.in_use.take();
         }
@@ -274,6 +302,105 @@ impl HttpBody for AdmittedBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tap(
+        outcomes: &Arc<std::sync::Mutex<Vec<super::super::RawOutcome>>>,
+        requires_terminal: bool,
+    ) -> UsageTap {
+        let outcomes = Arc::clone(outcomes);
+        UsageTap {
+            scanner: super::super::usage::UsageScanner::default(),
+            requires_terminal,
+            finished: Some(Box::new(move |_, outcome| {
+                outcomes.lock().unwrap().push(outcome);
+            })),
+        }
+    }
+
+    #[test]
+    fn completion_error_incomplete_and_drop_have_distinct_outcomes() {
+        use super::super::RawOutcome;
+        let outcomes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        for (body, streaming, expected) in [
+            (b"{\"done\":true}\n".as_slice(), true, RawOutcome::Complete),
+            (
+                b"{\"done\":false}\n".as_slice(),
+                true,
+                RawOutcome::Incomplete,
+            ),
+            (
+                b"{\"error\":\"runner stopped\"}\n".as_slice(),
+                true,
+                RawOutcome::UpstreamError,
+            ),
+            (
+                b"{\"embeddings\":[]}".as_slice(),
+                false,
+                RawOutcome::Complete,
+            ),
+        ] {
+            let mut tap = tap(&outcomes, streaming);
+            tap.scanner.feed(body);
+            tap.end_stream();
+            drop(tap);
+            assert_eq!(outcomes.lock().unwrap().pop(), Some(expected));
+            assert!(outcomes.lock().unwrap().is_empty());
+        }
+        drop(tap(&outcomes, true));
+        assert_eq!(*outcomes.lock().unwrap(), [RawOutcome::ClientDropped]);
+    }
+
+    #[tokio::test]
+    async fn verified_transition_releases_the_load_lock_but_keeps_the_use_lease_until_body_drop() {
+        struct PendingBody;
+        impl HttpBody for PendingBody {
+            type Data = Bytes;
+            type Error = std::convert::Infallible;
+            fn poll_frame(
+                self: Pin<&mut Self>,
+                _: &mut TaskContext<'_>,
+            ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+                Poll::Pending
+            }
+        }
+        struct Lease(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Lease {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let loading = Arc::clone(&lock).lock_owned().await;
+        let outcomes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut body = AdmittedBody {
+            inner: Body::new(PendingBody),
+            permit: None,
+            load: Some(loading),
+            resource: None,
+            in_use: Some(Box::new(Lease(Arc::clone(&released)))),
+            usage: Some(tap(&outcomes, true)),
+            transition_watch: Some(Box::pin(async {})),
+        };
+        // The watch owns no lease itself. Dropping a response before consumption releases
+        // local ownership and reports disconnect, not completed upstream execution.
+        assert!(lock.try_lock().is_err());
+        assert!(!released.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            Pin::new(&mut body)
+                .poll_frame(&mut TaskContext::from_waker(std::task::Waker::noop()))
+                .is_pending()
+        );
+        // Readiness frees the next load immediately; the response still owns its use lease.
+        assert!(lock.try_lock().is_ok());
+        assert!(!released.load(std::sync::atomic::Ordering::SeqCst));
+        drop(body);
+        assert!(released.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            *outcomes.lock().unwrap(),
+            [super::super::RawOutcome::ClientDropped]
+        );
+    }
 
     #[tokio::test]
     async fn a_waiter_whose_client_disconnects_leaves_the_queue() {

@@ -1,39 +1,29 @@
 //! Building the Ollama request body for a managed task, and its admission cost.
 
+use crate::capability::Capability;
 use anyhow::{Context, Result};
+use base64::Engine as _;
 use serde_json::{Value, json};
 
 use super::super::error::ApiError;
-use super::super::{Backend, OllamaRequestOptions, RouteDecision, TaskInput, TaskKind};
+use super::super::{
+    Backend, CatalogModel, OllamaRequestOptions, RouteDecision, TaskInput, TaskKind,
+};
 use super::ExecutionTarget;
 
 pub(crate) fn requests_immediate_unload(value: Option<&str>) -> bool {
     matches!(value.map(str::trim), Some("0" | "0s" | "0m" | "0h"))
 }
 
-/// Thread count for CPU-placed runners, or `None` to let Ollama choose.
-///
-/// Ollama compares `num_thread` when deciding whether a loaded runner can serve a request, so a
-/// value that differs from what other clients send forces a reload. It is therefore set only on
-/// the dedicated CPU backend, where `FreeLlama` is the only client. The GPU backend is left alone:
-/// a forced value there makes every raw request without `num_thread` reload the runner managed
-/// traffic loaded, and on Apple Silicon (no SMT) `logical/2` halves CPU throughput.
+/// An explicit operator override for CPU-placed runners. Otherwise Ollama detects its own
+/// thread count. Guessing physical cores from half the logical CPUs is inaccurate on many
+/// topologies and creates avoidable runner-option mismatches with other clients. Explicit
+/// thread settings remain unverified by /api/ps and use conservative exclusive admission.
 fn cpu_num_thread() -> Option<u64> {
-    if let Some(value) = std::env::var("FREELLAMA_CPU_NUM_THREAD")
+    std::env::var("FREELLAMA_CPU_NUM_THREAD")
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|value| *value > 0)
-    {
-        return Some(value);
-    }
-    if cfg!(target_os = "macos") {
-        // Ollama already sizes to performance cores; efficiency cores slow llama.cpp's barriers.
-        return None;
-    }
-    // x86 SMT: half the logical CPUs approximates physical cores and leaves the siblings free.
-    std::thread::available_parallelism()
-        .ok()
-        .map(|cores| (cores.get() as u64 / 2).max(1))
 }
 
 pub(crate) fn apply_execution_options(body: &mut Value, target: &ExecutionTarget) {
@@ -79,16 +69,28 @@ pub(crate) fn apply_request_options(
         )));
     }
     if let Some(think) = &request.think
+        && !think.is_null()
         && !think.is_boolean()
-        && !matches!(think.as_str(), Some("low" | "medium" | "high"))
+        && think.as_str().is_none_or(|level| level.trim().is_empty())
     {
         return Err(ApiError::bad_request(anyhow::anyhow!(
-            "request_options.think must be a boolean or one of low, medium, high"
+            "request_options.think must be a boolean, null, or a non-empty model-defined thinking level"
         )));
     }
     if request.top_logprobs.is_some() && request.logprobs != Some(true) {
         return Err(ApiError::bad_request(anyhow::anyhow!(
             "request_options.top_logprobs requires logprobs=true"
+        )));
+    }
+    if matches!(task, TaskKind::Decision)
+        && (request.options.is_some()
+            || request.format.is_some()
+            || request.think.is_some()
+            || request.logprobs.is_some()
+            || request.top_logprobs.is_some())
+    {
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "decision tasks take state and questions only; /v1/systemone accepts no options, format, think, or logprobs"
         )));
     }
     if matches!(task, TaskKind::Embedding)
@@ -112,6 +114,150 @@ pub(crate) fn apply_request_options(
     Ok(())
 }
 
+/// Explicit controls must match known model metadata. Unknown metadata leaves Ollama as the
+/// authority; unlike a global enum, this admits future levels advertised by the selected model.
+pub(crate) fn validate_model_controls(
+    model: &CatalogModel,
+    request: &OllamaRequestOptions,
+) -> Result<(), ApiError> {
+    let Some(think) = request.think.as_ref().filter(|think| !think.is_null()) else {
+        return Ok(());
+    };
+    let Some(values) = model
+        .thinking
+        .as_ref()
+        .and_then(|thinking| thinking["values"].as_array())
+    else {
+        return Ok(());
+    };
+    let supported = match think {
+        Value::Bool(true) => values
+            .iter()
+            .any(|value| value == true || value.is_string()),
+        Value::Bool(false) => values.iter().any(|value| value == false),
+        Value::String(_) => values.contains(think),
+        _ => false,
+    };
+    if supported {
+        return Ok(());
+    }
+    Err(ApiError::bad_request(format!(
+        "model {} does not advertise think={think}; use one of its /api/show thinking.values: {}",
+        model.name,
+        Value::Array(values.clone())
+    ))
+    .with_code("unsupported_thinking_control"))
+}
+
+/// Derive requirements from the actual payload before routing. Ollama's legacy `images` field
+/// also carries WAV audio; its name alone is not evidence that the input requires vision.
+pub(crate) fn derive_input_capabilities(input: &mut TaskInput) -> Result<(), ApiError> {
+    if input.tools.is_some() {
+        input.route.required_capabilities.insert(Capability::Tools);
+    }
+    if input
+        .request_options
+        .think
+        .as_ref()
+        .is_some_and(|think| think == true || think.is_string())
+    {
+        input
+            .route
+            .required_capabilities
+            .insert(Capability::Thinking);
+    }
+    let mut media = Vec::new();
+    if let Some(images) = &input.images {
+        media.extend(
+            images
+                .iter()
+                .map(|data| media_capability(data, Capability::Vision)),
+        );
+    }
+    for message in &input.messages {
+        if let Some(images) = message["images"].as_array() {
+            media.extend(
+                images
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(|data| media_capability(data, Capability::Vision)),
+            );
+        }
+    }
+    if matches!(input.route.task, TaskKind::Embedding)
+        && let Some(value) = &input.input
+    {
+        let items = value
+            .as_array()
+            .map_or_else(|| vec![value], |items| items.iter().collect());
+        for item in items {
+            match item {
+                Value::String(_) => {}
+                Value::Object(fields) => {
+                    if fields.is_empty() || fields.values().all(|value| value.as_str() == Some(""))
+                    {
+                        return Err(ApiError::bad_request(
+                            "embedding input item has no text, image, or audio",
+                        ));
+                    }
+                    for (key, value) in fields {
+                        let Some(text) = value.as_str() else {
+                            return Err(ApiError::bad_request(format!(
+                                "embedding input.{key} must be a string"
+                            )));
+                        };
+                        match key.as_str() {
+                            "text" => {}
+                            "image" | "audio" if !text.is_empty() => media.push(media_capability(
+                                text,
+                                if key == "audio" {
+                                    Capability::Audio
+                                } else {
+                                    Capability::Vision
+                                },
+                            )),
+                            "image" | "audio" => {
+                                return Err(ApiError::bad_request(format!(
+                                    "embedding input.{key} must not be empty"
+                                )));
+                            }
+                            _ => {
+                                return Err(ApiError::bad_request(format!(
+                                    "unsupported embedding input field {key}; use text, image, or audio"
+                                )));
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    return Err(ApiError::bad_request(
+                        "embedding input must be text, a text/image/audio object, or an array of those items",
+                    ));
+                }
+            }
+        }
+    }
+    input.route.required_capabilities.extend(media);
+    Ok(())
+}
+
+fn media_capability(data: &str, declared: Capability) -> Capability {
+    // Decode only the RIFF/WAVE header; payload validation and decoding belong to Ollama.
+    let mut header = [0u8; 12];
+    let prefix = data.get(..16).unwrap_or(data);
+    if base64::engine::general_purpose::STANDARD
+        .decode_slice(prefix, &mut header)
+        .ok()
+        == Some(12)
+        && &header[..4] == b"RIFF"
+        && &header[8..12] == b"WAVE"
+    {
+        Capability::Audio
+    } else {
+        declared
+    }
+}
+
 /// A generation needs something to work on: an embedding needs `input`; a chat needs messages,
 /// or a prompt with text or images. Checked before routing, so an empty request never costs a
 /// model load.
@@ -119,7 +265,21 @@ pub(crate) fn require_payload(input: &TaskInput) -> Result<(), ApiError> {
     if matches!(input.operation, super::super::ManagedOperation::Warm) {
         return Ok(());
     }
+    if matches!(input.route.task, TaskKind::Decision) {
+        return require_decision_payload(input);
+    }
     if matches!(input.route.task, TaskKind::Embedding) {
+        if input.prompt.is_some()
+            || !input.messages.is_empty()
+            || input.images.is_some()
+            || input.tools.is_some()
+            || input.state.is_some()
+            || input.questions.is_some()
+        {
+            return Err(ApiError::bad_request(
+                "embedding tasks take input; chat and decision payload fields are not accepted",
+            ));
+        }
         let empty = match &input.input {
             None | Some(Value::Null) => true,
             Some(Value::String(text)) => text.is_empty(),
@@ -145,6 +305,46 @@ pub(crate) fn require_payload(input: &TaskInput) -> Result<(), ApiError> {
     if input.messages.is_empty() && !has_text && !has_images {
         return Err(ApiError::bad_request(anyhow::anyhow!(
             "task requires messages, or a prompt with text or images; use warm to load a model without generating"
+        )));
+    }
+    if matches!(input.route.task, TaskKind::Vision) && !task_has_images(input) {
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "vision task requires an image (CLI: --image <file>; request: `images`); use a completion task for text only"
+        )));
+    }
+    Ok(())
+}
+
+/// A decision needs a state and at least one named question; chat fields have no meaning there,
+/// so sending them is refused rather than silently dropped.
+fn require_decision_payload(input: &TaskInput) -> Result<(), ApiError> {
+    let state_present = match &input.state {
+        None | Some(Value::Null) => false,
+        Some(Value::String(text)) => !text.trim().is_empty(),
+        Some(_) => true,
+    };
+    if !state_present {
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "decision task requires a non-empty state: the text or JSON the questions are about"
+        )));
+    }
+    if input
+        .questions
+        .as_ref()
+        .and_then(Value::as_object)
+        .is_none_or(serde_json::Map::is_empty)
+    {
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "decision task requires questions: an object of named questions, each {{\"type\":\"noul\"|\"choice\"|\"score\",\"instructions\":...,\"criteria\":...}}"
+        )));
+    }
+    if !input.messages.is_empty()
+        || input.prompt.is_some()
+        || input.input.is_some()
+        || input.tools.is_some()
+    {
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "decision tasks take state and questions; prompt, messages, input, and tools belong to other tasks"
         )));
     }
     Ok(())
@@ -191,6 +391,9 @@ pub(crate) fn build_managed_request(
     decision: &RouteDecision,
     keep_alive: &Value,
 ) -> Result<(&'static str, Value), ApiError> {
+    if matches!(input.route.task, TaskKind::Decision) {
+        return build_decision_request(input, decision, keep_alive);
+    }
     if matches!(input.operation, super::super::ManagedOperation::Warm) {
         // Ollama loads a model on an empty request: no messages for chat, no input for embed.
         if matches!(input.route.task, TaskKind::Embedding) {
@@ -277,35 +480,77 @@ pub(crate) fn build_managed_request(
         "keep_alive": keep_alive,
         "options": decision.options,
     });
+    body.as_object_mut()
+        .expect("request body is an object")
+        .extend(
+            profile_controls(input, decision)
+                .as_object()
+                .expect("controls are an object")
+                .clone(),
+        );
+    Ok(("/api/chat", body))
+}
+
+/// The exact controls shared by request forwarding and profile prediction. Keeping payloads
+/// out of this projection avoids cloning large prompts, histories or images for each candidate.
+pub(super) fn profile_controls(input: &TaskInput, decision: &RouteDecision) -> Value {
+    let mut controls = json!({"options":decision.options});
+    if matches!(input.route.task, TaskKind::Embedding) {
+        return controls;
+    }
     if !decision.think.is_null() {
-        body["think"] = decision.think.clone();
+        controls["think"] = decision.think.clone();
     }
-    if let Some(tools) = input.tools.take() {
-        body["tools"] = tools;
+    if let Some(tools) = &input.tools {
+        controls["tools"] = tools.clone();
     }
-    if let Some(format) = input.request_options.format.take() {
-        body["format"] = format;
+    if let Some(format) = &input.request_options.format {
+        controls["format"] = format.clone();
     }
     if let Some(logprobs) = input.request_options.logprobs {
-        body["logprobs"] = json!(logprobs);
+        controls["logprobs"] = json!(logprobs);
     }
     if let Some(top_logprobs) = input.request_options.top_logprobs {
-        body["top_logprobs"] = json!(top_logprobs);
+        controls["top_logprobs"] = json!(top_logprobs);
     }
-    Ok(("/api/chat", body))
+    controls
+}
+
+/// `/v1/systemone` takes no options: Ollama sizes the runner, so only what it reads is sent.
+fn build_decision_request(
+    input: &mut TaskInput,
+    decision: &RouteDecision,
+    keep_alive: &Value,
+) -> Result<(&'static str, Value), ApiError> {
+    if matches!(input.operation, super::super::ManagedOperation::Warm) {
+        return Err(ApiError::bad_request(
+            "decision models load on their first question; /v1/systemone has no empty request to warm with",
+        ));
+    }
+    let mut body = json!({
+        "model": decision.selected_model,
+        "state": input.state.take(),
+        "questions": input.questions.take(),
+        "keep_alive": keep_alive,
+    });
+    if let Some(images) = input.images.take().filter(|images| !images.is_empty()) {
+        body["images"] = json!(images);
+    }
+    Ok(("/v1/systemone", body))
 }
 
 pub(crate) fn task_has_images(input: &TaskInput) -> bool {
     input
         .images
-        .as_ref()
-        .is_some_and(|images| !images.is_empty())
-        || input.messages.iter().any(|message| {
-            message
-                .get("images")
-                .and_then(Value::as_array)
-                .is_some_and(|images| !images.is_empty())
-        })
+        .iter()
+        .flatten()
+        .any(|data| media_capability(data, Capability::Vision) == Capability::Vision)
+        || input
+            .messages
+            .iter()
+            .flat_map(|message| message["images"].as_array().into_iter().flatten())
+            .filter_map(Value::as_str)
+            .any(|data| media_capability(data, Capability::Vision) == Capability::Vision)
 }
 
 /// Charge an embedding batch for its actual cardinality. Ollama executes a batched `/api/embed`
@@ -335,3 +580,7 @@ pub(crate) fn input_batch_items(input: &TaskInput) -> usize {
         .map_or(1, Vec::len)
         .max(1)
 }
+
+#[cfg(test)]
+#[path = "request_contract_tests.rs"]
+mod contract_tests;

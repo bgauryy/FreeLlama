@@ -188,9 +188,9 @@ A batch nests whole task bodies:
 
 The machine profile is host-derived rather than model-name-derived. It reports total physical
 memory on macOS (`sysctl`), Linux (`/proc`), and Windows (CIM through PowerShell), along with CPU, OS,
-architecture, and disk. `memory_bytes` is portable host RAM. `unified_memory_bytes` is populated
-only when host and accelerator memory are known to share a pool; it must not be treated as discrete
-GPU VRAM. Ollama's `/api/ps` remains the placement authority.
+architecture, and disk. `memory_bytes` is portable host RAM. `memory_kind` is `unified` only
+when host and accelerator memory are known to share a pool; host RAM must not be treated as
+discrete GPU VRAM. Ollama's `/api/ps` remains the placement authority.
 
 All other paths use the compatibility proxy. It buffers request bodies up to 64 MB so a retry can
 resend identical bytes, then streams the upstream response. It removes hop-by-hop headers, adds
@@ -323,13 +323,13 @@ flowchart TD
     K --> A{"Acquire selected backend's<br/>3:2:1 fair weighted budget"}
     A -->|"No"| E503["429 queue full or<br/>503 wait timeout"]
     A -->|"Yes"| B{"Execution backend"}
-    B -->|"Primary"| GL{"GPU model resident<br/>under transition lock?"}
+    B -->|"Primary"| GL{"GPU runner resident<br/>at expected identity?"}
     B -->|"CPU assignment"| CO["Add num_gpu: 0"]
-    CO --> CL{"CPU model resident<br/>under transition lock?"}
+    CO --> CL{"CPU runner resident<br/>at expected identity?"}
     GL -->|"Yes"| GR["GPU shared lock"]
-    GL -->|"No"| GX["GPU exclusive transition lock"]
+    GL -->|"No"| GX["GPU load lock until runner observed"]
     CL -->|"Yes"| CR["CPU shared lock"]
-    CL -->|"No"| CX["CPU exclusive transition lock"]
+    CL -->|"No"| CX["CPU load lock until runner observed"]
     GR --> OQ["Send to selected Ollama queue"]
     GX --> OQ
     CR --> OQ
@@ -374,9 +374,11 @@ new arrivals and a smaller reloaded queue limit cannot displace accepted work. E
 prevent admission even when an execution slot is free. Cancellation removes either waiter, and releasing a memory reservation wakes resource
 waiters immediately; host telemetry still obeys the sampling and recovery policy below.
 
-FreeLlama acquires the admission slot before a transition lock to avoid deadlock. A model marked
-resident during discovery is checked again while the shared transition lock is held; stale or
-unavailable residency falls back to the exclusive transition path. Session affinity is bound only
+FreeLlama acquires the admission slot before the backend load lock to avoid deadlock. A model marked
+resident during discovery is observed again before dispatch; a stale or unavailable listing means a
+load, which takes the load lock and observes once more after winning it (a same-model load that
+finished meanwhile is then shared).
+See [Load lock and use lease](CPU_GPU_ROUTING.md#load-lock-and-use-lease). Session affinity is bound only
 after successful upstream execution, so refused and failed tasks cannot change later routing.
 An explicit `done:false` chat response or a reported upstream error is a failure, even with HTTP 200.
 It cannot train runtime feedback or bind affinity. Completed failed exchanges retain the raw response
@@ -411,7 +413,10 @@ all work on a host whose sampler sees no accelerator; the
 thermal hold applies to CPU-assigned work and to cold loads (a new heat source) but not to a bounded
 request on a runner already resident on the GPU (`ResourceDemand::is_held_by`; the assessment's
 `held_by` lists the holds that applied). Low available RAM (below the larger of 15% or 1 GiB, clearing after two
-healthy samples above the larger of 20% or 2 GiB) follows `ResourcePolicy::low_memory`.
+healthy samples above the larger of 20% or 2 GiB) holds nothing host-wide: each load is judged by the capacity
+check below, which follows `ResourcePolicy::low_memory`. Active swapping holds new loads of 1 GiB or more, or of
+unknown size; a smaller load of known size still has to fit its reserve. A held or refused load names the largest
+memory users (`resources::memory_holders`, one memory-sorted `ps` sample cached for 10 s).
 A new load must leave that reserve free, but never more than its own size above the 1 GiB floor.
 By default (`refuse`, every platform) a new load that does not fit first unloads idle runners and then waits
 with `held_insufficient_capacity` until a permit release or a fresh sample frees capacity, or refuses
@@ -441,8 +446,9 @@ resource readiness. Insufficient model headroom reports `held_insufficient_capac
 Managed CPU/unified-memory tasks reserve estimated additional model-file and known F16 KV bytes
 across both backends. Verified runner footprints replace that estimate only for the same backend,
 immutable model digest, and equal-or-larger observed context. Exact resident digest/context matches
-avoid double-counting existing allocations. The reservation is rechecked after transition locking
-without waiting while holding the backend lock; an increased requirement that no longer fits the
+avoid double-counting existing allocations. The reservation is rechecked after winning the load lock
+(forecast from the residency listing that decided the transition) without waiting while holding
+that lock; an increased requirement that no longer fits the
 estimate dispatches with a `memory_advisory`, and a pressure hold refuses with 503. Permits release on completion or cancellation. On discrete-GPU hosts, observed free
 VRAM discounts the estimated host-memory requirement by the bytes the GPU can hold. Missing VRAM
 telemetry reserves the full estimated footprint in host RAM. The governor cannot constrain external
@@ -455,19 +461,27 @@ Multimodal and embedding requests retain their profiles. The execution receipt e
 `context_sizing`; previews contain routing fields only and therefore retain task defaults.
 Managed chat sends `truncate:false` and `shift:false` so supporting Ollama backends refuse overflow
 instead of silently losing earlier instructions. Managed embeddings send `truncate:false` too.
-Only the dedicated CPU backend supplies a thread default: half the logical CPU count on other
-platforms, while macOS leaves Ollama to select its performance cores. `FREELLAMA_CPU_NUM_THREAD`
-overrides that default; explicit request options take precedence. The primary backend leaves thread
-selection to Ollama to avoid changing the options of a shared runner. `runtime_options` reports
-forwarded values; runner support is not assumed.
+Thread selection defaults to Ollama on every platform. `FREELLAMA_CPU_NUM_THREAD` explicitly
+overrides the dedicated CPU backend; explicit request options take precedence. FreeLlama does not
+guess physical cores from half the logical CPU count. `runtime_options` reports forwarded values;
+runner support is not assumed. Overrides of load controls absent from `/api/ps` take the conservative
+transition path rather than claiming verified runner compatibility.
 
-Resident tasks share a backend lock. Nonresident tasks take that backend's exclusive lock so a cold
-load cannot race another managed task on the same server. CPU and GPU backends have separate locks
-and admission pools, so they can progress independently.
+A compatible resident runner needs no backend lock: nonempty model digest and effective context must
+match the observed runner (a request that sends no `num_ctx` also accepts a runner whose context
+`/api/ps` omits). Name-only residency is insufficient, and `admission.reason` names the degraded
+identity. Every task holds a per-model use lease for its whole request, which keeps its runner from
+being evicted or unloaded. Forecast release invalidates the
+host sample generation so an older available-memory observation cannot spend released capacity.
+A task that must load or reload a runner takes that backend's load lock until the runner is
+observed in `/api/ps`, so loads and unloads on one server are serialized and same-model arrivals
+share the loaded runner; decoding on another model does not wait for it. CPU and GPU backends have
+separate locks and admission pools, so they can progress independently.
 
-In `serve`, raw generation requests also take the primary backend's exclusive transition lock,
-returning 503 when it stays busy past the raw queue wait. The response body holds this guard through
-EOF or disconnect. Metadata GET/HEAD, `/api/show`, model-store calls (pull, push, copy, delete, and
+In `serve`, raw generation requests follow the same rules on the primary backend: a resident match
+takes no lock, and a load takes the load lock and returns 503 when it stays busy past the raw queue
+wait. The response body holds the model's use lease through EOF or disconnect. A generation whose
+allocation cannot be forecast is refused with 503 `model_forecast_unavailable`. Metadata GET/HEAD, `/api/show`, model-store calls (pull, push, copy, delete, and
 blob uploads), and empty `keep_alive:0` unload requests take no lock and bypass pressure. Raw
 inference waits at most two seconds for host pressure to clear, then returns 503 with `Retry-After`. Raw request-body collection has the configured request deadline too; an incomplete upload
 returns HTTP 408 and releases its guards without contacting Ollama. Admission receipts report
@@ -514,7 +528,17 @@ cold-load cost do not poison the comparison. It requires more than a 10% advanta
 break a tie before the sample threshold. Quality routing, explicit model selection, and session
 affinity do not follow the latency loop.
 
-The same selection function supplies preview receipts and managed task execution. This keeps advertised placement and actual request routing aligned.
+Payload context fit is checked before automatic model ranking. Objective/quality gates apply to the
+complete eligible catalog before it is split by backend. Qualified idle resident candidates can use
+setup + prefill + decode estimates instead of a decode-rate-only comparison; cold and busy candidates
+retain the conservative fallback. Exact-profile history is bounded to 32 profiles × 32 observations
+per task/backend, with idempotent process snapshot merging.
+
+The same selection function supplies preview receipts and managed task execution. Preview cannot
+estimate an execution payload it does not accept; its placement is a non-reserving snapshot.
+Execution receipts expose `completion_planning`, including estimated costs and whether the comparison
+influenced selection. Ollama's cached-token counts inform prefill-rate learning; FreeLlama does not
+export or manage KV tensors. See [implementation scope](OLLAMA_IMPLEMENTATION_PLAN.md).
 
 Raw proxy traffic always uses the primary upstream. For setup and runtime verification, see
 [Run models on CPU and GPU](CPU_GPU_ROUTING.md).
@@ -611,7 +635,7 @@ FreeLlama keeps these values in memory:
 - Independent GPU and CPU priority-fair weighted admission pools
 - Per-task normalized warm latency and queue feedback for each backend, restored from an optional
   versioned atomic snapshot
-- Separate CPU and GPU transition locks
+- Per-model use leases and separate CPU and GPU backend load locks
 
 Sessions are bounded (default 1024) and expire after idle time (default one hour); they store only
 model affinity, never prompts or Ollama KV. Restarting `freellama serve` clears sessions and the catalog cache. Persisted placement feedback is
@@ -622,7 +646,7 @@ expected revision. Warming uses ordinary admission and fit checks; omitted resid
 a finite measured policy. See [Scope history and model warming](SCOPES_AND_WARMING.md) for the
 public contract and configured limits.
 
-In `serve`, raw generation traffic shares the primary transition lock and receives
+In `serve`, raw generation traffic shares the primary load lock and use leases and receives
 host-pressure gating, while managed tasks also reserve forecast memory. Direct Ollama callers bypass
 these controls. FreeLlama cannot preempt inference or constrain other processes. A configured but
 unreachable CPU backend makes managed catalog discovery fail closed; raw primary passthrough remains

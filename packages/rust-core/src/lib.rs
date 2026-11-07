@@ -1,5 +1,20 @@
 //! Local Ollama gateway, evidence-aware router, benchmark harness, and server library.
 
+/// The shipped model catalog: tested picks per job with their evidence. MCP bundles the same file.
+pub const MODEL_CATALOG: &str = include_str!("model_catalog.json");
+
+/// Greppable source marker: `freellama-source-commit=<sha>[-dirty]`, or `unknown` without git.
+pub const SOURCE_MARKER: &str =
+    concat!("freellama-source-commit=", env!("FREELLAMA_SOURCE_COMMIT"));
+
+/// Text of `freellama --version`: the crate version, then the source marker.
+pub const LONG_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "\n",
+    "freellama-source-commit=",
+    env!("FREELLAMA_SOURCE_COMMIT")
+);
+
 pub mod auth;
 pub mod capability;
 mod doctor;

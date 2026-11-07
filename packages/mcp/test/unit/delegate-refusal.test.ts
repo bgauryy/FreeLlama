@@ -1,5 +1,6 @@
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { MODEL_EVIDENCE } from "../../src/delegate.js";
 
 const fixture = vi.hoisted(() => ({
   handlers: new Map<string, (...args: any[]) => Promise<any>>(),
@@ -8,13 +9,14 @@ const fixture = vi.hoisted(() => ({
   exec: vi.fn(),
   removed: vi.fn(),
   route: vi.fn(),
+  catalog: vi.fn(),
   write: vi.fn(),
   adapterExists: true,
 }));
 
 // Only the delegate tool's own dependencies are replaced: the managed route call and the
 // subprocess/filesystem surface. The tool registers on a minimal recording server.
-vi.mock("../../src/serve-client.js", () => ({ route: fixture.route }));
+vi.mock("../../src/serve-client.js", () => ({ route: fixture.route, listModels: fixture.catalog }));
 vi.mock("node:fs", async (importOriginal) => {
   const original = await importOriginal<typeof import("node:fs")>();
   return { ...original, existsSync: (file: string) => /(?:bash|octocode)-agent\.js$/.test(file) ? fixture.adapterExists : original.existsSync(file) };
@@ -50,6 +52,8 @@ describe("delegate_research refusal forwarding", () => {
     fixture.adapterExists = true;
     fixture.result = {};
     fixture.route.mockReset();
+    fixture.catalog.mockReset();
+    delete MODEL_EVIDENCE["research-fixture:latest"];
     fixture.exec.mockReset();
     fixture.write.mockReset();
     fixture.removed.mockReset();
@@ -123,5 +127,63 @@ describe("delegate_research refusal forwarding", () => {
     expect(result.content[0].text).not.toContain("Command failed");
     expect(fixture.exec).toHaveBeenCalledTimes(1);
     expect(fixture.removed).toHaveBeenCalledWith("/mock-delegate", { recursive: true, force: true });
+  });
+
+  it("never cites failed, empty or unreported execution outcomes as grounded evidence", async () => {
+    fixture.result = {
+      final_answer: "A plausible but unsupported claim",
+      tool_calls: [
+        { raw_name: "shell", status: "error", exit_code: 2, result: "file not found" },
+        { raw_name: "shell", status: "empty", exit_code: 1, result: "nothing found" },
+        { raw_name: "custom", result: "outcome not reported" },
+      ],
+    };
+    fixture.exec.mockImplementation(() => Object.assign(Promise.resolve({ stdout: "", stderr: "" }), {
+      child: { kill: vi.fn() },
+    }));
+    const result = await fixture.handlers.get("delegate_research")!({
+      question: "Where is this declared?", workspacePath: process.cwd(), model: "unmeasured-fixture:latest",
+    }, { signal: new AbortController().signal });
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      citations: [], successfulToolCallCount: 0,
+      verification: { grounded: false },
+      evidence: [{ status: "error", exit_code: 2 }, { status: "empty", exit_code: 1 }, { status: "unknown" }],
+      observations: [{ result: "file not found" }, { result: "nothing found" }, { result: "outcome not reported" }],
+    });
+  });
+
+  it.each(["diagnostic", "source", "changed-artifact"])("qualifies only source evidence on the measured artifact: %s", async (mode) => {
+    const digest = "a".repeat(64);
+    const model = "research-fixture:latest";
+    MODEL_EVIDENCE[model] = { grade: "strong", note: "fixture measurement", model_digest: digest };
+    const observed = mode === "changed-artifact" ? "b".repeat(64) : digest;
+    fixture.result = {
+      final_answer: "A source claim",
+      tool_calls: [{ raw_name: "shell", status: "ok", arguments: { command: mode === "diagnostic" ? "echo invented" : "cat AGENTS.md" }, result: "# Agents" }],
+      model_metadata: { execution_receipts: [{ model, execution: { model_digest: observed, observation: { resident: true, digest: observed } } }] },
+    };
+    fixture.exec.mockImplementation(() => Object.assign(Promise.resolve({ stdout: "", stderr: "" }), { child: { kill: vi.fn() } }));
+    const result = await fixture.handlers.get("delegate_research")!({ question: "Where is this declared?", workspacePath: process.cwd(), model },
+      { signal: new AbortController().signal });
+    expect(result.structuredContent.verification).toMatchObject({
+      grounded: mode !== "diagnostic", recommendation: mode === "source" ? "accept" : mode === "diagnostic" ? "escalate" : "verify",
+    });
+    expect(result.structuredContent.successfulToolCallCount).toBe(1);
+    expect(result.structuredContent.sourceLookupCount).toBe(mode === "diagnostic" ? 0 : 1);
+    expect(result.structuredContent.citations).toHaveLength(mode === "diagnostic" ? 0 : 1);
+    expect(result.structuredContent.observations[0].result).toBe("# Agents");
+  });
+
+  it("refuses an unusable artifact before spawning only when current catalog identity matches", async () => {
+    const model = "research-fixture:latest";
+    const digest = "a".repeat(64);
+    MODEL_EVIDENCE[model] = { grade: "unusable", note: "fixture measurement", model_digest: digest };
+    fixture.catalog.mockResolvedValue(JSON.stringify({ models: [{ name: model, digest }] }));
+    const result = await fixture.handlers.get("delegate_research")!({ question: "Find a fact", workspacePath: process.cwd(), model },
+      { signal: new AbortController().signal });
+    expect(result.structuredContent.verification.recommendation).toBe("escalate");
+    expect(result.structuredContent.toolCallCount).toBe(0);
+    expect(fixture.exec).not.toHaveBeenCalled();
   });
 });

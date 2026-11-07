@@ -26,7 +26,8 @@ flowchart TD
 | `serve` | Run the control plane and Ollama-compatible proxy | Starts it |
 | `auth-token` | Create a new mode-0600 bearer-token file without printing the secret | No |
 | `models` | List installed models, capabilities, residency, and evidence | Yes |
-| `machine` | Print portable host RAM, CPU, OS, architecture, disk, and the local Ollama endpoint | Yes |
+| `catalog` | Tested model picks per job, with evidence, what is installed, and what fits now (`--job`); without `serve`, `installed` and `fits_now` stay null | No |
+| `machine` | Print the machine execution profile (CPU, memory, GPU, backends) visible to the platform | Yes |
 | `status` | Live queues (also as a page at `http://127.0.0.1:11435/_freellama/ui`), current and adaptive limits, circuit breakers, loaded models, host memory, Ollama's effective settings, today's usage | Yes |
 | `usage` | Task and token totals per day and per model (`--days`, default 7) | Yes |
 | `config` | Effective runtime settings and the source of each; `--reload` re-reads the runtime file | Yes |
@@ -34,14 +35,14 @@ flowchart TD
 | `scope` | Create, inspect, fork, or delete bounded message history | Yes |
 | `ready` | Exit 0 once `serve` can run managed work (Ollama answers and its catalog reads); otherwise print what it waits for and exit non-zero | Yes |
 | `warm` | Load an installed model (chat or embedding) through managed admission | Yes |
-| `unload` | Unload a resident model once its running tasks finish; a model that is not loaded is reported, never loaded first | Yes |
+| `unload` | Unload a resident model once its running tasks finish; a model that is not loaded is reported (`status: not_resident`), never loaded first, and still exits 0 (idempotent, like `rm -f`) | Yes |
 | `route` | Choose a model and request profile without executing it | Yes |
 | `task` | Route and execute one nonstreaming task | Yes |
 | `jobs` | List, inspect, cancel, or remove deferred tasks and warming operations | Yes |
 | `proxy` | Run only the Ollama-compatible retry and telemetry sidecar | No |
 | `bench-all` | Measure installed models by capability group | No |
 | `policy from-eval` | Write a task policy (`platform.toml`) from a quality-evaluation aggregate and the installed tags | No |
-| `doctor` | Inspect Ollama, hardware, versions, and effective settings | No |
+| `doctor` | Verify that an Ollama server exposes the required diagnostic APIs and report the hardware, versions, and settings it found | No |
 
 Run `npx @octocodeai/freellama <command> --help` for every accepted flag and enum value. The executable's help
 is authoritative; this page explains how the commands fit together.
@@ -148,7 +149,7 @@ over the cap waits up to `--raw-queue-wait-seconds` (default 10) and is then ref
 All of these, plus pinned models, idle eviction, adaptive concurrency, the circuit breaker, and
 context sizing, can also live in a runtime file (`--runtime-config`) that `serve` re-reads when it
 changes. See [Monitoring and live tuning](MONITORING.md). The standalone
-`proxy` command keeps its cap opt-in for compatibility.
+`proxy` command leaves its cap off unless set.
 
 The local host-pressure gate reports low available RAM below 15% and clears it above 20% after two
 healthy samples; minimum reserves are 1 GiB and 2 GiB, respectively. Tune the percentages with
@@ -211,7 +212,8 @@ Start with the read-only guided receipt, then inspect available models. `init` n
 it stops at exact-tag approval and prints the next prerequisite, serve, managed-task, and MCP steps.
 Its `status` is `blocked` when Ollama is unavailable, `setup_required` when the managed service or
 installed models are missing, and `ready` when all three are present. Separate `readiness` flags
-identify the missing part. Readiness does not qualify a model for a particular task; use a route
+identify the missing part. `init` prints the receipt in every case but exits non-zero only when the
+status is `blocked`; `setup_required` and `ready` exit 0. Readiness does not qualify a model for a particular task; use a route
 preview to inspect eligibility and rejection reasons.
 
 ```bash
@@ -221,7 +223,7 @@ npx @octocodeai/freellama models
 npx @octocodeai/freellama machine
 ```
 
-`serve` answers `/health` as soon as it listens. Wait on `ready` instead before sending work from a
+`serve` answers `GET /_freellama/v1/health` as soon as it listens (there is no bare `/health` route). Wait on `ready` instead before sending work from a
 script; it returns 503 with `waiting_for: "ollama" | "cpu_backend" | "catalog"` until it can serve:
 
 ```bash
@@ -239,12 +241,23 @@ npx @octocodeai/freellama route \
   --required-capability vision
 ```
 
-Task kinds are `completion`, `coding`, `code-repair`, `tools`, `browser`, `vision`, `embedding`, and
-`long-context`. Objectives are `fastest`, `balanced`, and `quality`. `fastest` can use capability
+Task kinds are `completion`, `coding`, `code-repair`, `tools`, `browser`, `vision`, `embedding`,
+`long-context`, and `decision` (hyphens and underscores are interchangeable). Objectives are `fastest`, `balanced`, and `quality`. `fastest` can use capability
 and local benchmark evidence alone. Default `balanced` prefers eligible task-policy candidates;
 without them it falls back to capability/context-compatible models and reports low confidence
 and missing quality evidence. `quality` requires a policy unless you supply an explicit model.
 An explicit minimum-confidence gate still refuses insufficient evidence in every objective.
+
+`route` ranks by task eligibility and quality evidence, not by free memory, so under memory pressure
+it can pick a large model whose receipt says `dispatch_readiness: held_host_pressure`. That is
+deliberate: the route is a deterministic preview from the catalog, and host memory is checked later
+at admission. When admission refuses for memory, the error states `needs X GB incl. Y GB reserve,
+Z GB free`, names the largest memory users, and lists installed models of the same task capability
+that fit the free memory (or says none does). Pin one with `--model`.
+
+Failures exit non-zero (1 for runtime errors, 2 for usage errors): `init` when `blocked`, and every
+command that cannot reach `serve` or is refused by it. A malformed JSON flag names itself, for
+example `--questions is not valid JSON: <parser error>`.
 
 ## Execute tasks
 
@@ -255,6 +268,10 @@ npx @octocodeai/freellama task --task completion --objective fastest "Reply with
 npx @octocodeai/freellama task --task coding --min-confidence medium "Explain this patch."
 ```
 
+`freellama catalog [--job JOB]` prints the shipped model picks for each job, with their evidence, what
+is installed and what fits now. Without a running `serve`, `installed` and `fits_now` stay null. Recipes
+are in the [cookbooks](cookbooks/README.md).
+
 Useful task options include:
 
 - `--model` for an exact installed model.
@@ -264,7 +281,9 @@ Useful task options include:
 - `--context-tokens` for the complete input and output context window (`num_ctx`).
 - repeatable `--required-capability` constraints.
 - repeatable `--image` paths for vision tasks.
-- `--input-file` reads the input from a file: one item per line for `--task embedding` (batched in one request), otherwise the whole file is the prompt.
+- `--input-file` reads the input from a file: one item per line for `--task embedding` (batched in one request), the state for `--task decision` (JSON stays JSON), otherwise the whole file is the prompt.
+- `--nearest QUERY [--top N]` for `--task embedding --input-file FILE`: ranks the file's lines against the query and prints the closest (line number, score, text) instead of vectors; use the model's own prefixes, such as `search_query: ` for nomic.
+- `--questions JSON|@FILE` for `--task decision`: named `noul`, `choice` or `score` questions answered by a decision model through `/v1/systemone`, for example `freellama task --task decision --questions '{"kind":{"type":"choice","instructions":"Which kind?","criteria":{"bug":"Broken","feature":"New"}}}' "Checkout returns 500 since 9am."`.
 - `--min-confidence low|medium` to refuse insufficiently evidenced routes before generation.
 - `--priority interactive|normal|background` for fair admission scheduling.
 - `--max-wait-seconds` for a shorter admission/resource wait budget.
@@ -281,8 +300,8 @@ through MCP `task_jobs`.
 Cancellation and removal wait for local execution permits to be released; they do not unload a shared model
 or confirm that the physical runner has stopped.
 
-Jobs stay in server memory: at most 64 receipts, 1 MiB per input, and 2 MiB per retained result or
-error. Finished receipts expire after 10 minutes and can be evicted earlier to make room for new
+Jobs stay in server memory: at most 64 receipts, 16 MiB per input (64 MiB across queued and running
+jobs), and 2 MiB per retained result or error. Finished receipts expire after 10 minutes and can be evicted earlier to make room for new
 work. A restart discards all jobs. Admission queue limits still apply, and deferred work can fail
 after acceptance. See [monitoring](MONITORING.md) for states and waiting reasons.
 

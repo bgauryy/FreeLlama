@@ -45,16 +45,30 @@ function pick(source: Fields | undefined, keys: string[]): Fields | undefined {
   return Object.keys(kept).length > 0 ? kept : undefined;
 }
 
+/** Keep the core's routing explanation and candidate totals; detailed phase estimates stay saved. */
+function compactCompletionPlanning(value: unknown): Fields | undefined {
+  const planning = object(value);
+  if (!planning) return undefined;
+  const compact = pick(planning, ["mode", "applied", "snapshot_only", "payload_fit_rejections"]) ?? {};
+  if (Array.isArray(planning.candidates)) {
+    compact.candidates = planning.candidates.map((candidate) =>
+      pick(object(candidate), ["model", "backend", "status", "estimated_completion_ns"]) ?? {});
+  }
+  return compact;
+}
+
 /**
  * The part of one managed receipt an agent acts on: the answer whole, which model gave it, how it
- * ended, what it cost, where it ran and what it unloaded. Routing alternatives, admission and
+ * ended, what it cost, why and where it ran, and what it unloaded. Detailed routing phases,
  * host-telemetry snapshots and feedback internals stay in the response file.
  */
 function compactReceipt(receipt: Fields): Fields {
   const execution = object(receipt.execution);
   const reservation = pick(object(execution?.memory_reservation), ["evicted_idle_models", "eviction", "required_available_bytes", "source"]);
+  const completionPlanning = compactCompletionPlanning(execution?.completion_planning);
   const compact: Fields = {};
-  for (const key of ["selected_model", "response", "output_check", "metrics", "telemetry", "scope", "warm", "job", "deferred"]) {
+  for (const key of ["selected_model", "response", "output_check", "metrics", "telemetry", "scope", "warm", "job", "deferred",
+    "nearest", "files_read", "embedding_requests", "embedding_identity", "accepted_job_ids"]) {
     if (receipt[key] !== undefined) compact[key] = receipt[key];
   }
   const response = withoutThinking(object(receipt.response));
@@ -65,7 +79,8 @@ function compactReceipt(receipt: Fields): Fields {
   if (admission) compact.admission = admission;
   if (execution) {
     compact.execution = {
-      ...pick(execution, ["placement", "backend", "observation", "lifecycle", "context_sizing", "keep_alive", "preference_satisfied"]),
+      ...pick(execution, ["placement", "backend", "reason", "observation", "lifecycle", "context_sizing", "keep_alive", "preference_satisfied"]),
+      ...(completionPlanning ? { completion_planning: completionPlanning } : {}),
       ...(reservation ? { memory_reservation: reservation } : {}),
     };
   }
@@ -125,7 +140,8 @@ function shapeResult(tool: string, args: Fields | undefined, content: Fields, is
   // nothing may move out of the view: there would be nowhere left to read it.
   const full = args?.receipt === "full" || args?.preview === true || !saved;
   if (tool === "delegate_research") return full ? { shaped: content, sections: [] } : compactResearchResult(content);
-  if (tool !== "run_task" || isError) return { shaped: content, sections: [] };
+  // A deferred acknowledgement carries only the job; its result arrives through task_jobs.
+  if (tool !== "run_task" || isError || content.deferred === true) return { shaped: content, sections: [] };
   let shaped = full ? content : compactTaskResult(content);
   const sections = full ? [] : ["receipt"];
   if (!full && !Array.isArray(content.results) && withoutThinking(object(content.response))) sections.push("thinking");

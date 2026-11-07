@@ -22,8 +22,8 @@ pub struct PlatformConfig {
     pub benchmark_report: Option<PathBuf>,
     pub policy_file: Option<PathBuf>,
     /// Concurrent managed tasks allowed against Ollama, in cost units. `None` falls back to
-    /// the runtime file, then to two units per Ollama parallel slot. This is the primary/GPU backend's weighted
-    /// admission budget; the legacy field name is retained for compatibility.
+    /// the runtime file, then to two units per Ollama parallel slot. This is the primary/GPU
+    /// backend's weighted admission budget (the `--max-concurrent-tasks` flag and runtime-file key).
     pub max_concurrent_tasks: Option<usize>,
     /// Weighted admission budget for the optional CPU backend. `None` falls back to
     /// the runtime file, then to 1.
@@ -42,7 +42,7 @@ pub struct PlatformConfig {
     /// Idle lifetime for affinity handles. Successful route/task use refreshes the TTL.
     pub session_ttl: Option<Duration>,
     /// Generic cap for byte-preserving raw proxy traffic. `None` resolves to one streaming request
-    /// in `serve`; the standalone `proxy` command remains opt-in for compatibility.
+    /// in `serve`; the standalone `proxy` command leaves the cap off unless set.
     pub raw_proxy_max_concurrent_requests: Option<usize>,
     /// How long a raw generation may wait for a slot or for managed execution before 429/503.
     /// `None` falls back to the runtime file, then 10s.
@@ -61,6 +61,9 @@ pub struct PlatformConfig {
     /// The shared database for measured footprints, placement feedback, usage and the residency
     /// audit. `None` keeps them in memory for this process only.
     pub store: Option<crate::store::Store>,
+    /// Opt-in durable deferred-job receipts/results. No prompts are persisted or replayed.
+    /// `None` reads `FREELLAMA_DURABLE_JOBS` (disabled by default).
+    pub durable_jobs: Option<bool>,
 }
 
 /// Manual so the bearer token never reaches logs: a set token prints as `"<redacted>"`.
@@ -90,6 +93,7 @@ impl std::fmt::Debug for PlatformConfig {
             allow_remote,
             runtime_config,
             store,
+            durable_jobs,
         } = self;
         formatter
             .debug_struct("PlatformConfig")
@@ -118,6 +122,7 @@ impl std::fmt::Debug for PlatformConfig {
             .field("allow_remote", allow_remote)
             .field("runtime_config", runtime_config)
             .field("store", store)
+            .field("durable_jobs", durable_jobs)
             .finish()
     }
 }
@@ -153,6 +158,7 @@ impl PlatformConfig {
             allow_remote: false,
             runtime_config: None,
             store: None,
+            durable_jobs: None,
         }
     }
 
@@ -169,6 +175,24 @@ impl PlatformConfig {
     pub fn with_store(mut self, store: crate::store::Store) -> Self {
         self.store = Some(store);
         self
+    }
+
+    /// Persist bounded deferred-job receipts and results without replaying uncertain work.
+    #[must_use]
+    pub fn with_durable_jobs(mut self, enabled: bool) -> Self {
+        self.durable_jobs = Some(enabled);
+        self
+    }
+
+    pub(super) fn durable_jobs_enabled(&self) -> Result<bool> {
+        if let Some(enabled) = self.durable_jobs {
+            return Ok(enabled);
+        }
+        match std::env::var("FREELLAMA_DURABLE_JOBS").as_deref() {
+            Ok("1" | "true") => Ok(true),
+            Ok("0" | "false" | "") | Err(std::env::VarError::NotPresent) => Ok(false),
+            _ => anyhow::bail!("FREELLAMA_DURABLE_JOBS must be true, false, 1 or 0"),
+        }
     }
 
     /// Cap how long a task may queue for admission before being refused.

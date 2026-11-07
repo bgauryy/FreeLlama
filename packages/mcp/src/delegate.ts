@@ -37,7 +37,21 @@ export function researchErrorResult(error: unknown, diagnostic?: string) {
  * Empty by default. A model with no entry is treated as unmeasured, which yields a `verify`
  * verdict — the correct answer when nothing is known, and a safer default than assuming strength.
  */
-type ModelGrade = { grade: "strong" | "weak" | "unusable"; note: string };
+const digestSchema = z.string().regex(/^(?:sha256:)?[a-fA-F0-9]{64}$/)
+  .transform((value) => value.replace(/^sha256:/, "").toLowerCase());
+const modelGradeSchema = z.object({
+  grade: z.enum(["strong", "weak", "unusable"]), note: z.string().min(1), model_digest: digestSchema,
+});
+type ModelGrade = z.infer<typeof modelGradeSchema>;
+
+/** Old name-only measurements and malformed grades are unqualified, never silently strong. */
+export function parseModelEvidence(value: unknown): Record<string, ModelGrade> {
+  const { models } = z.object({ models: z.record(z.string(), z.unknown()) }).parse(value);
+  return Object.fromEntries(Object.entries(models).flatMap(([model, evidence]) => {
+    const parsed = modelGradeSchema.safeParse(evidence);
+    return parsed.success ? [[model, parsed.data]] : [];
+  }));
+}
 
 export const MODEL_EVIDENCE: Record<string, ModelGrade> = (() => {
   const configured = process.env.FREELLAMA_MCP_MODEL_EVIDENCE;
@@ -48,8 +62,7 @@ export const MODEL_EVIDENCE: Record<string, ModelGrade> = (() => {
   for (const file of candidates) {
     try {
       if (!existsSync(file)) continue;
-      const parsed = JSON.parse(readFileSync(file, "utf8")) as { models?: Record<string, ModelGrade> };
-      return parsed.models ?? {};
+      return parseModelEvidence(JSON.parse(readFileSync(file, "utf8")));
     } catch (error) {
       // A malformed evidence file must not stop the server: an empty table degrades every verdict
       // to `verify`, which is conservative rather than wrong. Say so, or the operator never learns
@@ -62,6 +75,28 @@ export const MODEL_EVIDENCE: Record<string, ModelGrade> = (() => {
   }
   return {};
 })();
+
+export function qualifiedModelGrade(model: string, digest: unknown): ModelGrade | undefined {
+  const observed = digestSchema.safeParse(digest);
+  const evidence = MODEL_EVIDENCE[model];
+  return observed.success && evidence?.model_digest === observed.data ? evidence : undefined;
+}
+
+/** All managed turns must identify the same executed artifact, not just the requested tag. */
+export function verifiedResearchDigest(receipts: unknown, model: string): string | undefined {
+  if (!Array.isArray(receipts) || receipts.length === 0) return undefined;
+  let digest: string | undefined;
+  for (const receipt of receipts) {
+    const parsed = z.object({ model: z.literal(model), execution: z.object({
+      model_digest: digestSchema, observation: z.object({ resident: z.literal(true), digest: digestSchema }),
+    }) }).safeParse(receipt);
+    if (!parsed.success || parsed.data.execution.model_digest !== parsed.data.execution.observation.digest) return undefined;
+    const actual = parsed.data.execution.model_digest;
+    if (digest !== undefined && actual !== digest) return undefined;
+    digest = actual;
+  }
+  return digest;
+}
 
 /** Recovery hint for weak/unusable models; the evidence file, not this code, names which are strong. */
 export const STRONG_MODEL_HINT =
@@ -92,6 +127,7 @@ export function assessDelegatedAnswer(
    */
   evidenceCount: number,
   model: string,
+  verifiedDigest?: string,
 ): {
   recommendation: "accept" | "verify" | "escalate";
   grounded: boolean;
@@ -99,7 +135,7 @@ export function assessDelegatedAnswer(
   measuredBaseRate: string;
 } {
   const grounded = evidenceCount > 0;
-  const evidence = MODEL_EVIDENCE[model];
+  const evidence = qualifiedModelGrade(model, verifiedDigest);
 
   // The model gates everything else. No amount of grounding rescues a model measured at 0-38%,
   // and an unmeasured model has no base rate to quote in the first place.
@@ -119,10 +155,9 @@ export function assessDelegatedAnswer(
       recommendation: "verify",
       grounded,
       why:
-        `${model} has no measured accuracy in this repo's benchmarks, so no base rate applies to ` +
-        "this answer. Treat it as unverified until it has been evaluated — accuracy fell off a " +
-        "cliff below ~12B in the models that were measured.",
-      measuredBaseRate: "no measured base rate for this model",
+        `${model} has no research grade matching verified execution identity. Treat this answer as ` +
+        "unverified; name-only, missing, or mismatched artifact evidence cannot qualify it.",
+      measuredBaseRate: "no measured base rate for the verified model artifact",
     };
   }
   if (evidence.grade === "weak" && grounded) {
@@ -224,12 +259,16 @@ export function extractExistingWorkspacePath(command: string, workspace: string)
 const adapterCallSchema = z
   .object({
     raw_name: z.string().optional(),
-    status: z.string().optional(),
+    // Older/custom adapters may omit this. Missing execution evidence is not a successful read.
+    status: z.string().default("unknown"),
     arguments: z
       .object({
         tool: z.string().optional(),
         command: z.string().optional(),
-        queries: z.object({ path: z.string().optional() }).loose().optional(),
+        queries: z.union([
+          z.object({ path: z.string().optional() }).loose(),
+          z.array(z.object({ path: z.string().optional() }).loose()),
+        ]).optional(),
       })
       .loose()
       .optional(),

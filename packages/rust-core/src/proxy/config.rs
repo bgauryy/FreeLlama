@@ -4,7 +4,7 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, ensure};
 use reqwest::Url;
-use tokio::sync::RwLock;
+use tokio::sync::Mutex;
 
 use super::retry::default_restart_ollama;
 use super::{RawAdmission, RestartAction};
@@ -36,7 +36,7 @@ pub struct ProxyConfig {
     /// How long a raw generation may wait for a free slot and for managed execution to finish
     /// before being refused. Zero (the standalone default) refuses immediately.
     pub raw_queue_wait: Duration,
-    pub(crate) execution_lock: Option<Arc<RwLock<()>>>,
+    pub(crate) load_lock: Option<Arc<Mutex<()>>>,
     pub(crate) restart_action: RestartAction,
     pub(crate) raw_admission: Option<RawAdmission>,
     pub(crate) telemetry: Option<Telemetry>,
@@ -56,7 +56,7 @@ impl ProxyConfig {
             auto_restart_ollama: false,
             max_concurrent_requests: None,
             raw_queue_wait: Duration::ZERO,
-            execution_lock: None,
+            load_lock: None,
             restart_action: Arc::new(default_restart_ollama),
             raw_admission: None,
             telemetry: None,
@@ -132,12 +132,14 @@ impl ProxyConfig {
         self
     }
 
-    /// Share a backend's managed execution boundary. Raw mutations may load or unload any model,
-    /// so they require exclusive access until their response stream ends. Metadata GET/HEAD
-    /// requests remain available while managed execution is active.
+    /// Share a backend's load lock with managed execution. A raw generation that must load its
+    /// model owns the lock until that runner is observed ready (or the response ends), so loads
+    /// queue behind each other; a raw generation on a compatible resident runner takes no lock
+    /// and is protected from eviction by its model use lease. Metadata GET/HEAD requests and
+    /// model-store work never take the lock.
     #[must_use]
-    pub fn with_execution_lock(mut self, execution_lock: Arc<RwLock<()>>) -> Self {
-        self.execution_lock = Some(execution_lock);
+    pub fn with_load_lock(mut self, load_lock: Arc<Mutex<()>>) -> Self {
+        self.load_lock = Some(load_lock);
         self
     }
 

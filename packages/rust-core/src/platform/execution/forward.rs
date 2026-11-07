@@ -12,7 +12,7 @@ use super::super::{
 use super::ExecutionTarget;
 use super::feedback::{adaptive_throughput_metric, observe_completion};
 use super::feedback::{feedback_work_unit_ns, runtime_metrics};
-use super::observe::{observe_physical_placement, unload_after_observation};
+use super::observe::observe_physical_placement;
 use super::select::{
     ProfileEvidence, comparable_backend_settings, profile_from_observations,
     unchanged_admission_interval,
@@ -44,27 +44,18 @@ fn record_upstream_outcome(
     }
 }
 
-async fn validate_upstream_completion(
-    state: &PlatformState,
-    execution: &ExecutionTarget,
-    model: &str,
+fn validate_upstream_completion(
     path: &str,
     status: StatusCode,
     value: Value,
-    immediate_unload: bool,
 ) -> Result<Value, ApiError> {
     let reported_error = value.get("error").is_some_and(|error| !error.is_null());
     let incomplete =
         status.is_success() && !reported_error && path == "/api/chat" && value["done"] != true;
     if !status.is_success() || incomplete || reported_error {
         // A completed HTTP exchange can still contain an incomplete generation or an error.
-        // Do not train feedback or bind affinity. Honor this request's immediate-unload contract,
-        // but never replay the uncertain generation to manufacture a completed response.
-        let lifecycle = if immediate_unload {
-            Some(unload_after_observation(state, execution, model).await)
-        } else {
-            None
-        };
+        // Do not train feedback or bind affinity. The pipeline owns any requested unload after
+        // execution leases drop; never replay uncertain generation to manufacture completion.
         let code = if incomplete {
             "upstream_incomplete_response"
         } else {
@@ -85,7 +76,7 @@ async fn validate_upstream_completion(
             },
             message,
         )
-        .with_upstream_response(code, value, lifecycle));
+        .with_upstream_response(code, value, None));
     }
     Ok(value)
 }
@@ -107,9 +98,8 @@ pub(crate) struct ForwardRequest<'a> {
     pub(crate) path: &'a str,
     pub(crate) body: Value,
     pub(crate) admission: AdmissionTimings<'a>,
-    /// Remains owned until completion, including validation and requested unload.
+    /// Remains owned until completion and validation. The pipeline owns any later unload.
     pub(crate) slot: AdmissionPermit,
-    pub(crate) immediate_unload: bool,
     pub(crate) breaker_probe: Option<super::super::runtime::BreakerProbe>,
 }
 
@@ -122,7 +112,7 @@ pub(crate) async fn forward_managed_task(
     request: ForwardRequest<'_>,
 ) -> Result<Json<Value>, ApiError> {
     let ForwardRequest {
-        decision,
+        mut decision,
         execution,
         mut execution_receipt,
         path,
@@ -136,9 +126,15 @@ pub(crate) async fn forward_managed_task(
                 cost,
             },
         slot,
-        immediate_unload,
         breaker_probe,
     } = request;
+    super::identity::verify_before_forward(
+        state,
+        execution,
+        &execution_receipt,
+        &decision.selected_model,
+    )
+    .await?;
     let mut completion_guard = super::super::monitor::adaptive_applies(state, execution.placement)
         .then(|| state.adaptive_for(execution.placement).completion_guard());
     let initial_admission = execution.admission.receipt();
@@ -166,34 +162,32 @@ pub(crate) async fn forward_managed_task(
     if upstream_failed {
         observe_completion(state, execution, true, None, None).await;
     }
-    let (status, value) = match posted {
-        Ok(response) => response,
-        Err(error) => {
-            // The runner may have loaded before the response or its body failed. We replaced
-            // the caller's zero TTL with 30s to observe placement, so finish the owned cleanup
-            // even when no response can be decoded. Never replay uncertain inference.
-            return Err(if immediate_unload {
-                error.with_lifecycle(
-                    unload_after_observation(state, execution, &decision.selected_model).await,
-                )
-            } else {
-                error
-            });
-        }
-    };
-    let value = validate_upstream_completion(
-        state,
-        execution,
-        &decision.selected_model,
-        path,
-        status,
-        value,
-        immediate_unload,
-    )
-    .await?;
+    let (status, value) = posted?;
+    let value = validate_upstream_completion(path, status, value)?;
     let metrics = runtime_metrics(&value);
     let placement = observe_physical_placement(state, execution, &decision.selected_model).await;
+    super::identity::verify_completed(&execution_receipt, &placement)?;
+    super::identity::finalize_route_evidence(&mut decision, &mut execution_receipt, &placement);
     let feedback_accepted = placement["status"] == "verified";
+    execution_receipt["runner_ready"] = super::runner::completion_receipt(
+        &execution_receipt["runner_reuse"],
+        &placement,
+        value["load_duration"].as_u64(),
+    );
+    // Hash the effective default only when the completed runner proves that exact context.
+    // The original request and runtime_options retain Ollama's automatic-mode omission.
+    let mut profile_body = body.clone();
+    if body["options"].get("num_ctx").is_none()
+        && let Some(tokens) =
+            execution_receipt["context_sizing"]["ollama_default_context"]["tokens"].as_u64()
+        && tokens > 0
+        && placement["context_length"].as_u64() == Some(tokens)
+    {
+        if !profile_body["options"].is_object() {
+            profile_body["options"] = json!({});
+        }
+        profile_body["options"]["num_ctx"] = json!(tokens);
+    }
     let observed_admission = execution.admission.receipt();
     let completion_settings = if dispatch_settings.is_some()
         && unchanged_admission_interval(&dispatch_admission, &observed_admission)
@@ -208,7 +202,7 @@ pub(crate) async fn forward_managed_task(
         model: &decision.selected_model,
         catalog_digest: execution_receipt["model_digest"].as_str(),
         upstream: &execution.upstream,
-        body: &body,
+        body: &profile_body,
         placement: &placement,
         dispatch_admission: &dispatch_admission,
         completion_admission: &completion_admission,
@@ -272,7 +266,11 @@ pub(crate) async fn forward_managed_task(
                 queue_wait_ms,
             );
             if let (Ok(profile), Some(duration)) = (&learning_profile, work_score) {
-                observation.record_profile(profile, duration);
+                observation.record_profile_with_phases(
+                    profile,
+                    duration,
+                    super::completion::phase_sample(decision.task, &value, queue_wait_ms),
+                );
             }
         }
         let mut receipt = observation.receipt();
@@ -314,13 +312,20 @@ pub(crate) async fn forward_managed_task(
         receipt["persistence"] = persistence;
         receipt
     };
-    if immediate_unload {
-        execution_receipt["lifecycle"] =
-            unload_after_observation(state, execution, &decision.selected_model).await;
-    }
     drop(slot);
     let output_check = super::super::repetition::output_check(&value);
-    if path == "/api/chat" {
+    let artifact_verified = execution_receipt["observation"]["resident"] == true
+        && execution_receipt["model_digest"]
+            .as_str()
+            .is_some_and(|digest| {
+                !digest.is_empty()
+                    && execution_receipt["observation"]["digest"].as_str() == Some(digest)
+            });
+    execution_receipt["model_facts_learning"] = json!({
+        "accepted": path == "/api/chat" && artifact_verified,
+        "reason": if path != "/api/chat" {"not_chat"} else if artifact_verified {"observed_artifact_verified"} else {"observed_artifact_unknown_or_changed"},
+    });
+    if path == "/api/chat" && artifact_verified {
         // Routing learns from what a model does, not its name: count the run and any loop, and
         // how much room its answer needed.
         let digest = execution_receipt["model_digest"].as_str();
@@ -355,11 +360,16 @@ pub(crate) async fn forward_managed_task(
             );
         }
     }
+    let embedding_identity = (path == "/api/embed")
+        .then(|| super::identity::embedding_identity(&body, &value, &execution_receipt));
     let mut receipt = json!({
         "route": decision,
         "execution": execution_receipt,
         "admission": {
             "mode": admission_mode,
+            // Why the runner was not shared when its identity could not be established,
+            // e.g. `resident_identity_unobserved`; null for a plain match or a cold load.
+            "reason": execution_receipt["runner_reuse"]["reason"].clone(),
             "queue_wait_ms": queue_wait_ms,
             "transition_wait_ms": transition_wait_ms,
             "resource_wait_ms": resource_wait_ms,
@@ -374,6 +384,9 @@ pub(crate) async fn forward_managed_task(
     });
     if let Some(check) = output_check {
         receipt["output_check"] = check;
+    }
+    if let Some(identity) = embedding_identity {
+        receipt["embedding_identity"] = identity;
     }
     Ok(Json(receipt))
 }
