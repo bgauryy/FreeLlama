@@ -67,3 +67,22 @@ describe("library tag size", () => {
     await expect(libraryTagSize("offlinefamily:1b")).rejects.toThrow(/ENOTFOUND/);
   });
 });
+
+describe("library fit with the memory free now", () => {
+  const tags = [
+    { tag: "q:27b", sizeBytes: 18e9, cloud: false },
+    { tag: "q:9b", sizeBytes: 6.6e9, cloud: false },
+    { tag: "q:4b", sizeBytes: 3.3e9, cloud: false },
+  ];
+  it("recommends the largest tag that loads now, and marks the others", () => {
+    const { annotated, best, memoryNote } = annotateTags(tags, null, 34e9, false, 11e9);
+    expect(best?.tag).toBe("q:9b");
+    expect(memoryNote).toBeUndefined();
+    expect(annotated.find((tag) => tag.tag === "q:27b")).toMatchObject({ fitsInMemory: true, fitsNow: false, estimatedNeedBytes: 23.6e9 });
+  });
+  it("says how much to free when nothing loads now", () => {
+    const { best, memoryNote } = annotateTags(tags, null, 34e9, false, 2e9);
+    expect(best?.tag).toBe("q:27b");
+    expect(memoryNote).toMatch(/Needs about 23\.6 GB free; 2\.0 GB is free now/);
+  });
+});

@@ -107,6 +107,9 @@ const MESSAGE_CHANGES: Array<[RegExp, string]> = [
   // pathlib's RuntimeError text and OSError `[Errno N] strerror: 'path'` became Node's forms.
   [/^Symlink loop from '(.*)'$/, 'symlink loop at "$1"'],
   [/^\[Errno N\] File name too long: '(.*)'$/, "ENAMETOOLONG: name too long, stat '$1'"],
+  // The xargs refusal now names the search that works instead (a model otherwise retries xargs).
+  [/^command blocked: xargs filesystem arguments cannot be confined$/,
+    "command blocked: xargs can only feed echo/printf here (its file arguments cannot be confined). Search file contents directly instead: grep -rln --include='*.ts' \"PATTERN\" .  or  rg -l \"PATTERN\""],
 ];
 const changedMessage = (result: Outcome): Outcome => {
   if (!result.error) return result;

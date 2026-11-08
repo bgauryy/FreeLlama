@@ -51,8 +51,36 @@ FreeLlama never changes Ollama's settings. These matter most, per Ollama's docs 
 | Setting | What it does | Suggested start |
 |---|---|---|
 | `OLLAMA_NUM_PARALLEL` | Decoding slots per model, each with its own prompt cache; RAM grows with slots times context ([Ollama FAQ](https://github.com/ollama/ollama/blob/main/docs/faq.mdx)). Small gain on Apple silicon; some engines run one request at a time ([MLX engine](https://github.com/ollama/ollama/issues/17280)) | `1`, raised only after measuring. FreeLlama's budget follows it |
-| `OLLAMA_FLASH_ATTENTION` + `OLLAMA_KV_CACHE_TYPE=q8_0` | A quantized KV cache roughly halves its memory and needs flash attention ([Ollama FAQ](https://github.com/ollama/ollama/blob/main/docs/faq.mdx)); with `OLLAMA_FLASH_ATTENTION` unset, llama.cpp enables it automatically | On, when the model's quality holds |
+| `OLLAMA_FLASH_ATTENTION` + `OLLAMA_KV_CACHE_TYPE=q8_0` | A quantized KV cache roughly halves its memory and needs flash attention ([Ollama FAQ](https://github.com/ollama/ollama/blob/main/docs/faq.mdx)); with `OLLAMA_FLASH_ATTENTION` unset, Ollama enables it automatically on supported backends. See [KV cache and flash attention](#kv-cache-and-flash-attention) | On, when the model's quality holds |
 | Context length | Ollama defaults to 4k below 24 GiB of VRAM and recommends at least 64k for agent and coding work ([context length](https://github.com/ollama/ollama/blob/main/docs/context-length.mdx)) | Size per task. FreeLlama keeps Ollama's default when it covers the prompt, otherwise sizes text tasks to the prompt; `contextTokens` overrides |
 | `OLLAMA_MAX_LOADED_MODELS` | How many runners stay resident. Unset and `0` mean 3 per GPU, then Ollama unloads by count | More than the model memory budget can hold, so the budget decides by size and reload cost. `1` reloads on every switch |
 | `keep_alive` | How long a runner stays loaded after use | Leave it out. FreeLlama picks a finite time from measured reuse |
 | `LLAMA_ARG_CACHE_RAM` | Host RAM llama-server may use for displaced prompt caches (`--cache-ram`); default 8192 MiB per runner ([llama.cpp server](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md)), counted by no footprint estimate. Set it on the Ollama server, which passes its environment to llama-server; `doctor` checks it | `2048` on 32 GB or less; `0` disables it at the cost of re-evaluating prefixes |
+
+#### KV cache and flash attention
+
+FreeLlama sizes each backend's KV cache from that Ollama process's settings. A model whose metadata
+does not describe its cache (hybrid, recurrent or sliding-window layers) is assumed to need a quarter
+of its file size per 16K tokens of context, for each parallel slot, until its first load is
+measured (`source: model_file_plus_assumed_kv_plus_graph` in the receipt):
+
+| `OLLAMA_FLASH_ATTENTION` | State | KV share of f16 with `q8_0` / `q4_0` |
+|---|---|---|
+| unset | `auto`: Ollama enables flash attention where the backend supports it (Metal, CUDA) | 50% / 25% |
+| `1`, `true` | `on` | 50% / 25% |
+| `0`, `false` | `off`: Ollama ignores `OLLAMA_KV_CACHE_TYPE` | 100% |
+
+`auto` is sized like `on`. A model or backend without flash attention falls back to an f16 cache, so
+its first load can be larger than the estimate; the measured footprint, keyed by
+`OLLAMA_NUM_PARALLEL` and the KV cache share, then sizes later loads. `status` reports the result
+under `ollama.config.effective` (`cpu_config` for a CPU backend) and `config` under
+`ollama.effective`: `flash_attention`, `kv_cache_type` and `kv_cache_percent_of_f16`.
+
+Ollama's own fit check still predicts an f16 cache, and its scheduler evicts other runners or
+offloads layers when that prediction passes 80% of free memory. FreeLlama reserves the quantized
+estimate (or a measurement) and keeps Ollama's f16 figure beside it as
+`memory_reservation.ollama_f16_preflight_bytes`. When the quantized estimate fits within 80% of the
+available memory FreeLlama admitted against but the f16 figure does not, the receipt adds
+`ollama_may_evict_or_offload: true` and `ollama_preflight_reason`. This applies to CPU and
+unified-memory backends; on a discrete GPU Ollama compares against VRAM, which FreeLlama does not
+attribute to a backend.

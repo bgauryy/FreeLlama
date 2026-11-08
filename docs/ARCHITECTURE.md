@@ -405,7 +405,10 @@ The K/V preflight derives single-sequence F16 K+V bytes-per-token for any archit
 metadata declares the block count and head counts. Explicit key/value dimensions take precedence
 over embedding length divided by heads; sliding-window, shared-KV, recurrent, cross-attention, and
 unknown layouts report unknown. F16 is advisory because quantized KV can
-use less memory. The coarse model-file budget refuses files over 80% of local CPU/unified RAM only
+use less memory: reservations scale it by each backend's `OLLAMA_KV_CACHE_TYPE` unless
+`OLLAMA_FLASH_ATTENTION` forces flash attention off (unset is Ollama's `auto`), and keep Ollama's
+F16 fit-check figure beside the quantized one to flag a load Ollama may evict or offload for
+([KV cache and flash attention](TUNING.md#kv-cache-and-flash-attention)). The coarse model-file budget refuses files over 80% of local CPU/unified RAM only
 for loopback backends. Forecasts use each backend's independently attributed parallelism and KV
 cache settings where process inspection is available, with explicit fallback sources otherwise.
 Process observations refresh on requests after five seconds; measurements made under different
@@ -452,7 +455,7 @@ Previews use the same footprint lookup, subtract existing reservations, and expo
 resource readiness. Insufficient model headroom reports `held_insufficient_capacity`, or
 `runnable_low_memory_estimate` under `--low-memory advisory`. Preview capacity is advisory and conservative, never a reservation.
 
-Managed CPU/unified-memory tasks reserve estimated additional model-file and known F16 KV bytes
+Managed CPU/unified-memory tasks reserve estimated additional model-file and known KV bytes
 across both backends. Verified runner footprints replace that estimate only for the same backend,
 immutable model digest, and equal-or-larger observed context. Exact resident digest/context matches
 avoid double-counting existing allocations. The reservation is rechecked after winning the load lock

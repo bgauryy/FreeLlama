@@ -15,6 +15,7 @@ import { runProcess } from "./proc.js";
 import { githubSystemPrompt, octocodeSystemPrompt } from "./prompts.js";
 import { trimSpace } from "./text.js";
 import { escapesRoot, joinPath, resolvePath } from "./workspace-path.js";
+import { workspaceOverview } from "./workspace-overview.js";
 
 export const OCTOCODE_TOOLS: ReadonlySet<string> = new Set([
   "structureSearch", "localSearch", "localFetch", "astSearch", "lspSearch",
@@ -121,10 +122,12 @@ function adapterFor(options: {
   prompt: (workspace: string) => string;
   run: typeof runOctocode;
   metadata: string;
+  briefing?: (workspace: string) => string;
 }): AdapterSpec {
   return {
     defaultToolTimeoutSeconds: 45,
     systemPrompt: options.prompt,
+    ...(options.briefing ? { briefing: options.briefing } : {}),
     parseAction: actionParser(options.tools),
     open: () => ({
       toolCall: (action, workspace, runtime) => {
@@ -148,7 +151,7 @@ function adapterFor(options: {
   };
 }
 
-export const OCTOCODE_ADAPTER = adapterFor({ tools: OCTOCODE_TOOLS, prompt: octocodeSystemPrompt, run: runOctocode, metadata: "octocode_cli_agent_v2" });
+export const OCTOCODE_ADAPTER = adapterFor({ tools: OCTOCODE_TOOLS, prompt: octocodeSystemPrompt, run: runOctocode, metadata: "octocode_cli_agent_v2", briefing: workspaceOverview });
 export const GITHUB_ADAPTER = adapterFor({ tools: GITHUB_TOOLS, prompt: githubSystemPrompt, run: runGithub, metadata: "octocode_github_agent_v1" });
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

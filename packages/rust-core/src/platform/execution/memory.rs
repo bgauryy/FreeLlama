@@ -620,6 +620,20 @@ where
     confirmation
 }
 
+/// Add Ollama's F16 fit-check advisory to a load's memory receipt (see
+/// [`super::super::footprint::annotate_ollama_preflight`]). `available` is the effective available
+/// memory the admission assessment used for this load. A discrete GPU is left alone: Ollama judges
+/// it against VRAM, which `FreeLlama` does not attribute to a backend.
+pub(crate) fn annotate_ollama_preflight(
+    footprint: &mut Value,
+    execution: &ExecutionTarget,
+    available: Option<u64>,
+) {
+    if host_memory_relevant(&execution.upstream, execution.placement) {
+        super::super::footprint::annotate_ollama_preflight(footprint, available);
+    }
+}
+
 /// Host RAM is charged for a loopback backend that runs on the CPU or shares unified memory.
 pub(crate) fn host_memory_relevant(upstream: &str, placement: Backend) -> bool {
     crate::net::is_loopback_url(upstream)

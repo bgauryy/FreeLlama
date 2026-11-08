@@ -44,6 +44,8 @@ pub struct ProxyConfig {
     pub(crate) upstreams: Vec<super::OpenAiUpstream>,
     /// Buffered-body budget; `None` uses the process-wide one.
     pub(crate) body_budget: Option<super::BodyBudget>,
+    /// Request body limit; `None` reads `FREELLAMA_MAX_REQUEST_BYTES`.
+    pub(crate) max_request_bytes: Option<usize>,
 }
 
 impl ProxyConfig {
@@ -65,7 +67,16 @@ impl ProxyConfig {
             hooks: None,
             upstreams: Vec::new(),
             body_budget: None,
+            max_request_bytes: None,
         }
+    }
+
+    /// Override the request body limit without touching the process environment.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_max_request_bytes(mut self, bytes: usize) -> Self {
+        self.max_request_bytes = Some(bytes);
+        self
     }
 
     /// Share this buffered-body budget, as `serve` does between its control API and the proxy.

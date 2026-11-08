@@ -76,7 +76,10 @@ cancellation closes the upstream request; physical computation may continue on a
 `ollama.config` describes the primary process; `ollama.cpu_config` describes the CPU process when
 configured. Process attribution matches `OLLAMA_HOST` to the selected endpoint, so separate
 parallelism and KV cache settings size each backend independently. Fallback sources remain visible
-when process settings cannot be observed.
+when process settings cannot be observed. Each config's `effective` block reports the resolved
+`num_parallel`, `context_length`, `flash_attention` (`on`, `off`, or `auto` when unset) and the KV
+cache it sizes for (`kv_cache_type`, `kv_cache_percent_of_f16`); see
+[KV cache and flash attention](TUNING.md#kv-cache-and-flash-attention).
 
 Process settings are cached for five seconds and refreshed on discovery or monitoring requests,
 including after an Ollama restart. Each config receipt includes `observed_at` and
@@ -278,6 +281,16 @@ why, the `trigger` (`gpu_memory`, `model_memory_budget` or `host_memory`) and `u
 and the page show the latest one that unloaded something. Eviction runs once per task, after
 admission and before the memory wait, and is never cancelled halfway by a deadline. Set
 `evict_idle_models = false` to leave residency entirely to Ollama.
+
+`memory_reservation` names the `kv_cache_type` and `flash_attention` state it sized for. With a
+quantized cache it also carries `ollama_f16_preflight_bytes`, the f16-cache size Ollama's own fit
+check predicts. On a CPU or
+unified-memory backend, `ollama_preflight_threshold_bytes` is 80% of the available memory the load
+was admitted against; when the reserved estimate fits under it and the f16 figure does not, the
+receipt adds `ollama_may_evict_or_offload: true` and a one-line `ollama_preflight_reason`: Ollama may
+unload other runners or offload layers even though FreeLlama found room. Run previews carry the
+same fields. The reservation itself is unchanged: measurements still take precedence over the
+estimate.
 
 ### The residency audit
 

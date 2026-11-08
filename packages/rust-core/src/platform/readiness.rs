@@ -1,7 +1,7 @@
 //! Read-only, model-aware execution previews. No permits or model loads occur here.
 use super::{
     Backend, PlatformState, TaskKind,
-    execution::{ManagedDecision, model_memory_requirement},
+    execution::{ManagedDecision, annotate_ollama_preflight, model_memory_requirement},
     resources::{ResourceCapacityAssessment, ResourceDemand, ResourceSnapshot},
 };
 use serde::Serialize;
@@ -54,6 +54,14 @@ pub(super) async fn assess(
     .on_cpu(decision.execution.placement == Backend::Cpu);
     let assessment = crate::net::is_loopback_url(&decision.execution.upstream)
         .then(|| resources.assess_demand(demand, false));
+    let mut footprint = footprint;
+    annotate_ollama_preflight(
+        &mut footprint,
+        &decision.execution,
+        assessment
+            .as_ref()
+            .and_then(|assessment| assessment.effective_available_bytes),
+    );
     let task_cost = task_cost
         .min(u32::try_from(decision.execution.admission.total()).unwrap_or(u32::MAX))
         .max(1);

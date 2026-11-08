@@ -20,6 +20,7 @@ import {
 } from "./transport.js";
 import { requestJsonAsJob } from "./transport-jobs.js";
 import { resolvePath } from "./workspace-path.js";
+import { evidencePaths, groundingNote, groundingRepairNotice, missingPaths, toolErrorHint } from "./grounding.js";
 
 export type { Action, AdapterHooks, AdapterSession, AdapterSpec, ToolCall } from "./adapter.js";
 
@@ -107,7 +108,7 @@ async function runLoop(spec: AdapterSpec, hooks: AdapterHooks, env: Env, inputs:
   }
   let messages: Message[] = [
     { role: "system", content: spec.systemPrompt(workspace) },
-    { role: "user", content: prompt },
+    { role: "user", content: withBriefing(prompt, spec, workspace) },
   ];
   const calls: Record<string, unknown>[] = [];
   const usage: Record<string, unknown> = { input_tokens: 0, output_tokens: 0, cache_read_tokens: null, cache_write_tokens: null };
@@ -214,6 +215,10 @@ async function runLoop(spec: AdapterSpec, hooks: AdapterHooks, env: Env, inputs:
     session = spec.open ? await spec.open(workspace) : undefined;
     let parseFailures = 0;
     let exhausted = true;
+    // Repeats answered from earlier steps; a second one means the model is circling, so finalize.
+    let repeats = 0;
+    let groundingRepaired = false;
+    const seenOutputs: string[] = [];
     for (let turn = 0; turn < runtime.max_turns; turn += 1) {
       const at = { turn: turn + 1, maxTurns: runtime.max_turns };
       phaseAt = at;
@@ -267,8 +272,23 @@ async function runLoop(spec: AdapterSpec, hooks: AdapterHooks, env: Env, inputs:
         continue;
       }
       if (action.action === "finish") {
+        const proposed = trimSpace(String(action.answer ?? ""));
+        const missing = missingPaths(proposed, workspace);
+        // One repair turn when the answer cites a file that is not there; it costs no tool call.
+        if (missing.length > 0 && !groundingRepaired) {
+          groundingRepaired = true;
+          progress?.({ event: "repair", ...at });
+          messages.push({ role: "assistant", content: echo(action) });
+          messages.push({ role: "user", content: groundingRepairNotice(missing, evidencePaths(seenOutputs, workspace)) });
+          if (!refit()) {
+            answer = proposed + groundingNote(missing);
+            exhausted = false;
+            break;
+          }
+          continue;
+        }
         progress?.({ event: "finish", ...at });
-        answer = trimSpace(String(action.answer ?? ""));
+        answer = missing.length > 0 ? proposed + groundingNote(missing) : proposed;
         exhausted = false;
         break;
       }
@@ -284,6 +304,7 @@ async function runLoop(spec: AdapterSpec, hooks: AdapterHooks, env: Env, inputs:
         progress?.({ event: "action", ...at, action, repeat: true });
         observation = REPEAT_NOTICE;
         status = "repeat";
+        repeats += 1;
       } else {
         progress?.({ event: "action", ...at, action });
         try {
@@ -293,7 +314,7 @@ async function runLoop(spec: AdapterSpec, hooks: AdapterHooks, env: Env, inputs:
           if (!isToolError(error)) throw error;
           status = error instanceof ToolExitError ? error.status : "error";
           exitCode = error instanceof ToolExitError ? error.exitCode : undefined;
-          observation = `${status === "empty" ? "tool search" : "tool error"}: ${error.message}`;
+          observation = `${status === "empty" ? "tool search" : "tool error"}: ${error.message}${toolErrorHint(error.message)}`;
         }
         seenCalls.set(signature, calls.length + 1);
       }
@@ -307,11 +328,13 @@ async function runLoop(spec: AdapterSpec, hooks: AdapterHooks, env: Env, inputs:
       const remaining = runtime.max_turns - calls.length;
       const step = calls.length;
       observations.put(step, observation, call.ledger(status));
+      seenOutputs.push(observation);
       messages.push({ role: "user", content: observations.message(step) + spec.remaining(remaining) });
       if (!refit()) {
         exhausted = false;
         break;
       }
+      if (repeats >= 2) break;
     }
     if (exhausted) {
       progress?.({ event: "finalize", maxTurns: runtime.max_turns });
@@ -323,6 +346,8 @@ async function runLoop(spec: AdapterSpec, hooks: AdapterHooks, env: Env, inputs:
           const finalAction = spec.parseAction(content(response));
           if (finalAction.action !== "finish") throw new ValidationError("forced final response was not finish");
           answer = trimSpace(String(finalAction.answer ?? ""));
+          const missing = missingPaths(answer, workspace);
+          if (missing.length > 0) answer += groundingNote(missing);
         } catch (error) {
           if (!isTransportError(error) && !isValidationError(error)) throw error;
           let diagnostic: string;
@@ -367,5 +392,15 @@ async function runLoop(spec: AdapterSpec, hooks: AdapterHooks, env: Env, inputs:
   } finally {
     session?.close?.();
     observations.close();
+  }
+}
+
+/** The question plus the adapter's workspace facts; a failed briefing never fails the run. */
+function withBriefing(prompt: string, spec: AdapterSpec, workspace: string): string {
+  try {
+    const briefing = spec.briefing?.(workspace);
+    return briefing ? `${prompt}\n\n${briefing}` : prompt;
+  } catch {
+    return prompt;
   }
 }

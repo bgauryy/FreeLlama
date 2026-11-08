@@ -90,3 +90,22 @@ describe("workspacePath resolution", () => {
     );
   });
 });
+
+describe("research raw chat context shift", async () => {
+  const { chatRequest, contextShift } = await import("../../src/research/transport.js");
+  const { mkdtempSync, writeFileSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const path = (await import("node:path")).default;
+
+  it("sends shift:false by default and omits it when the operator chose ollama_default", () => {
+    const home = mkdtempSync(path.join(tmpdir(), "freellama-shift-"));
+    expect(contextShift({ FREELLAMA_HOME: home }, true)).toBe("off");
+    expect(chatRequest("http://127.0.0.1:11434", "m", [], {}, false, "5m")[1]).toMatchObject({ shift: false, truncate: false });
+    writeFileSync(path.join(home, "runtime.toml"), 'context_shift = "ollama_default"\n[admission]\nx = 1\n');
+    expect(contextShift({ FREELLAMA_HOME: home }, true)).toBe("ollama_default");
+    const payload = chatRequest("http://127.0.0.1:11434", "m", [], {}, false, "5m")[1];
+    expect(payload).not.toHaveProperty("shift");
+    expect(payload).toMatchObject({ truncate: false });
+    expect(contextShift({ FREELLAMA_HOME: home, FREELLAMA_CONTEXT_SHIFT: "off" }, true)).toBe("off");
+  });
+});

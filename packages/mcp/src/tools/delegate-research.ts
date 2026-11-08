@@ -16,6 +16,7 @@ import { progressSink } from "../progress.js";
 import { cancelOpenJobs, researchProgressFilter } from "../research-progress.js";
 import { PROGRESS_ENV } from "../research/progress-events.js";
 import { sourceBearingLookup } from "../research/source-evidence.js";
+import { searchHitCitations } from "../research/grounding.js";
 import { EXTERNAL_COST } from "../telemetry.js";
 import {
   costTelemetry, endpointParam,
@@ -263,6 +264,12 @@ export function registerDelegateResearchTool(server: McpServer): void {
           arguments: call.arguments ?? null,
           result: typeof call.result === "string" ? call.result : (call.result ?? null),
         }));
+        // A grep hit on the file the answer names is a line the caller can open; add it when no
+        // read of that file is cited already.
+        const readPaths = new Set(citations.map((citation) => citation.path).filter(Boolean));
+        for (const hit of searchHitCitations(observations, result.final_answer, workspace)) {
+          if (!readPaths.has(hit.path)) citations.push(hit as unknown as (typeof citations)[number]);
+        }
         if (adapterError) {
           const diagnostic = `research adapter failed: ${result.final_answer}` +
             (evidenceText ? `\nEvidence collected before the failure:\n${evidenceText}` : "");

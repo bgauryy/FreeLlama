@@ -120,11 +120,53 @@ export function assertCommandConfined(root: string, commandText: string): void {
 const OPERATOR_CHARS = new Set(";&|()<>");
 const SEPARATORS = new Set(["|", "||", "&&", ";"]);
 
+/** Stand-ins for a parenthesis the shell reads as a literal character, restored after splitting. */
+const LITERAL_OPEN = "\uE000";
+const LITERAL_CLOSE = "\uE001";
+
+/**
+ * An escaped (`\(`) or quoted (`'('`, `"("`) parenthesis is an argument, such as `find`'s
+ * grouping, not a subshell. The splitter cannot tell them apart from operators once it has removed
+ * the quotes, so mark them first.
+ */
+export function protectLiteralParens(commandText: string): string {
+  let out = "";
+  let quote: "'" | "\"" | undefined;
+  for (let index = 0; index < commandText.length; index++) {
+    const char = commandText[index]!;
+    if (quote === undefined && char === "\\" && (commandText[index + 1] === "(" || commandText[index + 1] === ")")) {
+      out += commandText[index + 1] === "(" ? LITERAL_OPEN : LITERAL_CLOSE;
+      index += 1;
+      continue;
+    }
+    if (quote === undefined && char === "\\") {
+      out += char + (commandText[index + 1] ?? "");
+      index += 1;
+      continue;
+    }
+    if (quote === undefined && (char === "'" || char === "\"")) quote = char;
+    else if (quote === char) quote = undefined;
+    else if (quote !== undefined && (char === "(" || char === ")")) {
+      out += char === "(" ? LITERAL_OPEN : LITERAL_CLOSE;
+      continue;
+    }
+    out += char;
+  }
+  return out;
+}
+
+const restoreParens = (token: string) => token.replaceAll(LITERAL_OPEN, "(").replaceAll(LITERAL_CLOSE, ")");
+
 /** The pipeline segments of a command; an input redirect `<` stays in its segment as a word. */
 export function segments(commandText: string): string[][] {
-  const tokens = shlexIter(commandText, { posix: true, punctuationChars: ";&|()<>", whitespaceSplit: true, commenters: "" });
+  const tokens = [...shlexIter(protectLiteralParens(commandText), { posix: true, punctuationChars: ";&|()<>", whitespaceSplit: true, commenters: "" })];
   const result: string[][] = [[]];
-  for (const token of tokens) {
+  for (const raw of tokens) {
+    if (raw.includes(LITERAL_OPEN) || raw.includes(LITERAL_CLOSE)) {
+      result[result.length - 1]!.push(restoreParens(raw));
+      continue;
+    }
+    const token = raw;
     if (SEPARATORS.has(token)) {
       result.push([]);
     } else if (token && [...token].every((char) => OPERATOR_CHARS.has(char))) {
@@ -185,7 +227,8 @@ function checkTool(words: string[]): void {
     }
     const target = xargsCommand(args);
     if (!["echo", "printf", "true", "false"].includes(target[0]!)) {
-      throw new ValidationError("command blocked: xargs filesystem arguments cannot be confined");
+      throw new ValidationError("command blocked: xargs can only feed echo/printf here (its file arguments cannot be confined). "
+        + "Search file contents directly instead: grep -rln --include='*.ts' \"PATTERN\" .  or  rg -l \"PATTERN\"");
     }
     checkTool(target);
   }

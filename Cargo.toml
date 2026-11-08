@@ -34,6 +34,8 @@ axum = "0.8.9"
 base64 = "0.23"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 http-body = "1.1"
+# Names the error behind axum's body length limit; the version axum already locks, so nothing new is fetched.
+http-body-util = "0.1.5"
 napi = { version = "3.16", default-features = false, features = ["napi4", "async", "tokio_rt", "serde-json"] }
 napi-derive = { version = "3.7" }
 rusqlite = { version = "0.41.1", features = ["bundled"] }

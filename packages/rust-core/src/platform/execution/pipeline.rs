@@ -622,6 +622,15 @@ async fn run_admitted_task(
         }
     };
     resource_wait_ms = resource_wait_ms.saturating_add(recheck_started.elapsed().as_millis());
+    // The recheck's available figure already subtracts this task's first reservation.
+    let admitted_available = resource_recheck
+        .receipt
+        .assessment
+        .as_ref()
+        .and_then(|assessment| assessment.effective_available_bytes)
+        .map(|bytes| bytes.saturating_add(resource_permit.receipt.reserved_bytes));
+    let mut footprint = footprint;
+    super::memory::annotate_ollama_preflight(&mut footprint, &execution, admitted_available);
     execution_receipt["resource_revalidation"] = json!(resource_recheck.receipt);
     let previous = execution_receipt["memory_reservation"].clone();
     execution_receipt["memory_reservation"] = footprint;

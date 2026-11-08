@@ -13,6 +13,7 @@ import { ValidationError } from "./errors.js";
 import { BASH_SYSTEM_PROMPT } from "./prompts.js";
 import { ReadOnlyShell, assertCommandConfined } from "./sandbox.js";
 import { trimSpace } from "./text.js";
+import { workspaceOverview } from "./workspace-overview.js";
 
 export { assertCommandConfined };
 
@@ -49,6 +50,7 @@ export async function runShell(root: string, commandText: string, timeoutSeconds
 export const BASH_ADAPTER: AdapterSpec = {
   defaultToolTimeoutSeconds: 30,
   systemPrompt: () => BASH_SYSTEM_PROMPT,
+  briefing: workspaceOverview,
   parseAction,
   open: (workspace) => {
     const shell = new ReadOnlyShell(workspace).enter();

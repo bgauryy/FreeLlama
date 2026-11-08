@@ -24,6 +24,8 @@ export interface AdapterSpec {
   defaultToolTimeoutSeconds: number;
   systemPrompt: (workspace: string) => string;
   parseAction: (content: string) => Action;
+  /** Facts about the workspace appended to the question, such as its file types. */
+  briefing?: (workspace: string) => string;
   /** Enter adapter resources (e.g. the read-only shell) after the context is fitted. */
   open?: (workspace: string) => Promise<AdapterSession> | AdapterSession;
   /** Per-turn reminder appended to an observation, given the remaining call budget. */
