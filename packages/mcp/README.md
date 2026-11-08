@@ -7,7 +7,9 @@ Agents offload bounded tasks to local Ollama models; FreeLlama handles model sel
 admission, memory checks, and routing to configured CPU/GPU backends. Results include execution
 evidence for the calling agent to inspect.
 
-The agent owns prompts, task dependencies, and answer verification. The operator configures
+The agent owns prompts, task dependencies, and answer verification; with `run_task {job}` it opts into
+FreeLlama's model pick and prompt for that job instead ([jobs](https://github.com/bgauryy/FreeLlama/blob/main/docs/cookbooks/jobs.md)),
+and any field it passes still wins. The operator configures
 Ollama and model lifecycle permissions; Ollama performs inference. See
 [architecture](https://github.com/bgauryy/FreeLlama/blob/main/docs/ARCHITECTURE.md) for the full ownership boundary.
 The server uses the official [TypeScript SDK](https://github.com/modelcontextprotocol/typescript-sdk).
@@ -171,7 +173,9 @@ the serve policy file; without either the core refuses rather than trusting a `v
 tag. Inspect the execution receipt for admission and observed placement.
 
 Use the prompt the model documents; dedicated OCR models expect their own task prompts.
-FreeLlama adds no stop sequence or other option because of which model was chosen.
+FreeLlama adds no stop sequence or other option because of which model was chosen, except in job
+mode: `job` applies the values the model's card documents (`src/local-prompts.ts`, with sources) and
+lists them in `job_profile.applied`.
 
 Some models repeat their answer until their output limit. The repetition stop streams the task and
 stops once the output repeats itself; everything generated is kept, and the result carries
@@ -215,7 +219,7 @@ flowchart TD
 subprocess. Direct lifecycle and no-serve model views use Ollama HTTP. `delegate_research` starts a
 bounded adapter against an allowlisted workspace; each adapter model turn re-enters managed
 `run_task` as `coding`, so it shares routing, admission, and placement evidence. The adapters are
-TypeScript in `src/research/`, compiled to `dist/research/{bash-agent,octocode-agent}.js`, and run as
+TypeScript in `src/research/`, compiled to `dist/research/{bash,octocode,github,coder}-agent.js`, and run as
 `node <file>` in their own process group with the server's Node.js; no Python is required.
 
 ### What the MCP layer computes
@@ -240,6 +244,15 @@ MCP clients can list resources and read `freellama://docs/index` (the repository
 then fetch exactly one relevant guide such as `freellama://docs/PRODUCTION` or
 `freellama://docs/CLI`. Resources are deliberately lazy: do not load every guide into an agent
 context. The server fails on startup if the index is absent.
+
+## Use the built-in prompts
+
+The server also lists MCP prompts, which clients usually show as slash commands: one per job
+(`ocr`, `image`, `classify`, `find-code`, `duplicates`, `coding`, `summarize`, `research`,
+`github-research`, `sweep`), each returning a short message with the exact call to make, and
+`freellama`, a guide to when to offload, how to verify results, the approval rules and how to apply
+the coding job's SEARCH/REPLACE edits. Their texts, and every instruction FreeLlama sends a local
+model, are in `src/local-prompts.ts`.
 
 
 ## Run
@@ -284,15 +297,16 @@ catalog loading; a server without `/ready` counts as ready once it answers. See
 |---|---|---|
 | `doctor` | No (except `status`/`usage`) | Runtime/configuration diagnostic. Target another Ollama with `ollamaEndpoint` and serve with `endpoint` (`serveEndpoint` is an alias). `summary` (default) returns `status` (`ok`, or `degraded` with `problems` when serve is unreachable or `/ready` reports what it waits for), endpoint, version, resident count, `platform_health` with readiness, host/profile signals, and next step; `full` adds all non-duplicated diagnostics, including admission and categorized Ollama settings; `status` returns serve's live view (per-backend queues, current and adaptive limits, circuit breakers, loaded models, host memory, Ollama's effective settings, today's usage); `usage` returns task and token totals per day and model (`days`, default 7). The report distinguishes an observed same-user macOS process from configuration hints and never claims remote process visibility. |
 | `models` | `installed` (default) and `resident` do; `detail`/`raw`/`library` don't | Views: `catalog` (tested picks per job; `installed` matches by tag, or by digest when a pick names one, with `installed_as` for weights under another tag), `installed` (capabilities, use explanations, derived `model_type`, VRAM, context, policy_rank), `resident` (loaded now + managed GPU/CPU split), `detail` (one model, maximum context), paged `raw` (`GET /api/tags`), `library` (two-step public search: omit `model` to search ollama.com families and, for a `query`, Hugging Face GGUF repos (`source` limits it to one; `limit` applies per source); pass `model:"<family>"` or `model:"hf.co/<owner>/<repo>"` for every pullable tag with its size, `fitsInMemory`, and `installed` (by tag, or by the digest ollama.com lists, with `installed_as` naming the local tag)). `includeLibrary:true` enriches installed/detail views with sourced public guidance; `includeReadme:true` returns the README text in library step 2 or enriched detail. |
-| `run_task` | Yes | **Routes or executes** a chat/generate/embed call. `preview: true` accepts routing fields only and returns a decision without generation. Execution omits preview and supplies the payload. Embedding results withhold raw vectors inline by default; the response file keeps them (`read_response` section `embeddings`, or `returnEmbeddings: true`). A caller cancellation signal uses an addressable job even without progress notifications. An MCP `progressToken` additionally reports phases (queued, waiting for memory, loading, running) as `notifications/progress`, repeats a phase with its elapsed time every 10 s so clients that reset their timeout on progress keep the call alive, and reports `k/N items done` for batches; accepted jobs are never replayed when polling or result retrieval fails. A client cancellation retries the cancel request up to 3 times and returns `cancellation_state`: `acknowledged` (serve reports the job terminal), `requested`, or `unknown`; none confirms that Ollama stopped work. A typed refusal from serve (HTTP 429, 502 or 503 with a `code`) is returned whole and ran nothing; a submission that gets no answer from serve returns `execution_outcome:"unknown"` and `retry_safe:false`. `tasks: [{id, independent:true, task}]` (max 64, `maxParallelism` bounds fan-out) runs a batch whose nested `task` takes the same fields (the tool schema lists only those that usually differ per item: `prompt`, `systemPrompt`, `messages`, `state`, `input`, `files`, `images`, `model`, `task`, `questions`, `options`, `keepAlive`, `format`, `think`, `tools`; every other `run_task` field is still accepted, and a misspelled or mistyped one fails the call naming the item); it is not a dependency scheduler. Decision tasks take `state` + `questions` and answer one line per question; `files` names inputs by path or glob (the server reads them; roots: working directory, temp directory, `FREELLAMA_FILE_ROOTS`); with `tasks`, top-level `task`, `model`, `systemPrompt`, `questions`, `tools`, `format`, `options` and routing fields (including `minConfidence`, `requiredCapabilities`, `minPlacementEvidence`) are sent once as defaults for every item (an item's own value, `tools` included, replaces the default); `nearest` ranks embeddings in the core against a `query`, or finds the most similar pairs, and returns labels with scores instead of vectors (also with `defer`). `defer` with `tasks` submits one job per item. |
+| `run_task` | Yes | **Routes or executes** a chat/generate/embed call. `preview: true` accepts routing fields only and returns a decision without generation. Execution omits preview and supplies the payload. Embedding results withhold raw vectors inline by default; the response file keeps them (`read_response` section `embeddings`, or `returnEmbeddings: true`). A caller cancellation signal uses an addressable job even without progress notifications. An MCP `progressToken` additionally reports phases (queued, waiting for memory, loading, running) as `notifications/progress`, repeats a phase with its elapsed time every 10 s so clients that reset their timeout on progress keep the call alive, and reports `k/N items done` for batches; accepted jobs are never replayed when polling or result retrieval fails. A client cancellation retries the cancel request up to 3 times and returns `cancellation_state`: `acknowledged` (serve reports the job terminal), `requested`, or `unknown`; none confirms that Ollama stopped work. A typed refusal from serve (HTTP 429, 502 or 503 with a `code`) is returned whole and ran nothing; a submission that gets no answer from serve returns `execution_outcome:"unknown"` and `retry_safe:false`. `tasks: [{id, independent:true, task}]` (max 64, `maxParallelism` bounds fan-out) runs a batch whose nested `task` takes the same fields (the tool schema lists only those that usually differ per item: `prompt`, `systemPrompt`, `messages`, `state`, `input`, `files`, `images`, `model`, `task`, `questions`, `options`, `keepAlive`, `format`, `think`, `tools`; every other `run_task` field is still accepted, and a misspelled or mistyped one fails the call naming the item); it is not a dependency scheduler. Decision tasks take `state` + `questions` and answer one line per question; `files` names inputs by path or glob (the server reads them; roots: working directory, temp directory, `FREELLAMA_FILE_ROOTS`); with `tasks`, top-level `task`, `model`, `systemPrompt`, `questions`, `tools`, `format`, `options` and routing fields (including `minConfidence`, `requiredCapabilities`, `minPlacementEvidence`) are sent once as defaults for every item (an item's own value, `tools` included, replaces the default); `nearest` ranks embeddings in the core against a `query`, or finds the most similar pairs, and returns labels with scores instead of vectors (also with `defer`). `defer` with `tasks` submits one job per item. `job` (`classify`, `find-code`, `duplicates`, `ocr`, `image-recognition`, `image-search`, `coding`, `summarize`; with `tasks` too, except the embedding jobs, which rank in one call) runs the job's first catalog pick that is installed and fits now (a refusal lists each pick's memory need and what is free) and fills `task`, `prompt`, `systemPrompt`, `options`, `think` and embedding prefixes from `src/local-prompts.ts`; fields you pass win, and `job_profile.applied` lists what was filled. `saveAs:"<name>"` (single call) writes the answer to `handoffs/<name>.md` in the FreeLlama home, with `## Summary` and `## Result`, and returns `handoff_file`, which a later task reads with `files`. |
 | `scope` | Yes | Creates, inspects, forks, or deletes process-local message history; history inclusion requires `includeMessages:true`. |
 | `session` | Yes | Creates, deletes, or kills model affinity without storing messages or KV; `kill` cancels the session's in-flight work. |
 | `task_jobs` | Yes | Inspects, cancels, or removes a deferred task or warming operation. |
 | `ollama_pull` | No (direct to Ollama) | Downloads one exact tag (additive, idempotent) after the user approved it at its reported size: `approvedSizeBytes` is required and the pull is refused when the tag is not listed by ollama.com or Hugging Face or its current size differs by more than 5%. When the size lookup fails (offline), an installed tag is reported `already_installed` and anything else is refused. Reports byte progress as `notifications/progress`. |
 | `ollama_manage` | Warm: yes. Unload: when available | `action: "pull"` is a deprecated alias that downloads nothing and returns an error pointing to `ollama_pull`; `action: "warm"` loads an exact installed model through serve's managed admission (optional `systemPrompt`/`messages` cached as a prompt prefix, residency/profile controls, `defer:true`); `action: "unload"` unloads it through serve's `/unload`, which waits for that model's running tasks, and asks Ollama directly when serve is unreachable, older, or another `ollamaEndpoint` is named. Both are idempotent |
 | `audio` | Yes | `action: "transcribe"` or `"translate"` sends a WAV named by `file` (read by the server under the same roots as `run_task {files}`) to serve's `/v1/audio/transcriptions` or `/translations` passthrough and returns the text; `"speak"` sends `text` to `/v1/audio/speech` and writes the WAV to `outputFile` or the temp directory, returning its path and length. Admission and memory checks are serve's raw-generation ones. |
+| `sweep` | Yes | Judges a large divisible source (`files`, or a polite crawl of public `urls`) chunk by chunk on a decision model in the background, saving each result before the next; `wait` follows it, `results` pages flagged, unsure, failed or changed chunks, `baseline` reuses an earlier sweep for unchanged chunks, and `saveAs` on `results` writes every chunk of the filter to a handoff file. See the [sweep cookbook](https://github.com/bgauryy/FreeLlama/blob/main/docs/cookbooks/sweep.md). |
 | `ollama_delete` | No (direct to Ollama) | **Destructive**: permanently removes a model. Call only on an explicit human instruction naming the exact model |
-| `delegate_research` | Yes (and spawns the adapter) | Answers a grounded question from files under `workspacePath` (`adapter: "bash"` by default, or `"octocode"` for the installed Octocode CLI's read-only local tools), or from GitHub with `adapter: "github"` (its read-only GitHub tools; `workspacePath` optional). `workspacePath` is absolute, or relative to the server's working directory when that is not `/` or the home directory, and must be under `FREELLAMA_MCP_ALLOWED_ROOTS` (required in a published install); the prompts are [docs/octocode](../../docs/octocode/LOCAL.md); returns the answer, citations, and an independent verification verdict inline, with placement receipts, the evidence trail and every observation in the response file (`receipt:"full"` for all inline). With an MCP `progressToken`, each research step (model turn, tool call, page, finish) is reported as `notifications/progress`, for example `turn 2/8: grep 'foo' in src`; the result is unchanged. Every managed research turn uses a deferred job, independently of progress subscriptions, so it remains addressable for cancellation. Progress also reports admission, memory and model loading (`turn 2/8: loading gpt-oss:20b (~8.7 s)`). A pre-execution job refusal returns a typed error; an accepted or uncertain job is never replayed synchronously |
+| `delegate_research` | Yes (and spawns the adapter) | Answers a grounded question from files under `workspacePath` (`adapter: "bash"` by default, or `"octocode"` for the installed Octocode CLI's read-only local tools), or from GitHub with `adapter: "github"` (its read-only GitHub tools; `workspacePath` optional). With `adapter: "coder"` (operator opt-in) it edits an isolated copy, runs only `agent.commands`, and returns a diff to review and apply ([the coder adapter](#the-coder-adapter)). `workspacePath` is absolute, or relative to the server's working directory when that is not `/` or the home directory, and must be under `FREELLAMA_MCP_ALLOWED_ROOTS` (required in a published install); the prompts are [docs/octocode](../../docs/octocode/LOCAL.md); returns the answer, citations, and an independent verification verdict inline, with placement receipts, the evidence trail and every observation in the response file (`receipt:"full"` for all inline). With an MCP `progressToken`, each research step (model turn, tool call, page, finish) is reported as `notifications/progress`, for example `turn 2/8: grep 'foo' in src`; the result is unchanged. Every managed research turn uses a deferred job, independently of progress subscriptions, so it remains addressable for cancellation. Progress also reports admission, memory and model loading (`turn 2/8: loading gpt-oss:20b (~8.7 s)`). A pre-execution job refusal returns a typed error; an accepted or uncertain job is never replayed synchronously |
 | `read_response` | No | Returns one section of a saved `response_file` (a `sections` name, a top-level field, or a JSON pointer), paged by `offset`/`limit`; omit `section` for an outline. Only files under the response directory are read |
 
 Every tool result is also saved whole to `~/.octocode/freellama/responses/<session>/<n>-<tool>.json`
@@ -315,6 +329,35 @@ them. A result without structured content (most errors) carries it in `_meta["fr
 Arguments the input schema refuses never reach the tool, so they have no timing. `doctor
 {view:"status"}` shows the residency audit: switch time per model, unloads by cause, and models
 being swapped back and forth.
+
+### The coder adapter
+
+`delegate_research {adapter:"coder", agent:{commands:[...]}}` lets a local model edit files and run
+tests without touching the user's working tree. The operator enables it with
+`FREELLAMA_MCP_ALLOW_CODER=1`; `workspacePath` must be under `FREELLAMA_MCP_ALLOWED_ROOTS`.
+
+- **Isolated copy.** A git workspace becomes `git worktree add --detach <tmp>/freellama-coder-*/freellama-coder HEAD`
+  (hooks off) with the caller's uncommitted changes to tracked files (`git diff HEAD`) applied.
+  Untracked files and submodule changes are not copied. Any other directory is copied without
+  `node_modules`, `target`, `dist` and `.git`, up to 200 MB. The workspace's `node_modules` are linked into
+  the copy entry by entry so JavaScript commands can run. The copy and its worktree entry are removed
+  when the call ends, also after a timeout or kill.
+- **Actions.** `search`, `read`, `list`, read-only `shell` (the bash adapter's validator), `edit`
+  (`{path, search, replace}`: `search` must occur exactly once, else the error names the match
+  count), `write` (`{path, content}`, at most 256 KB), `run` (`{command}`: exactly one of
+  `agent.commands`, at most 10, run with `/bin/sh -c` in the copy; output keeps its first and last
+  lines around a `… N lines omitted …` marker), `page` and `finish`. Writes are confined to the copy
+  (no `..`, symlink escape or `.git`).
+- **Run sandbox.** `sandbox-exec` (macOS) or `bwrap` (Linux) lets an allowed command write only the
+  copy and its scratch directory, plus `FREELLAMA_CODER_WRITABLE`, and reach no network. Without
+  either, `run` is refused unless `FREELLAMA_CODER_UNSANDBOXED_RUN=1`. Toolchain caches outside the
+  copy are read-only, so `cargo test` needs `FREELLAMA_CODER_WRITABLE=~/.cargo` and a populated
+  registry; a `rustc-wrapper` such as sccache needs its cache and server, so allow a command like
+  `RUSTC_WRAPPER= cargo test -p x`.
+- **Result.** The answer, `diff` (the agent's changes only, relative to `workspacePath`),
+  `changedFiles`, `runs` (exit codes, last outputs), `patchFile` and `applyCommand`
+  (`git -C <workspacePath> apply <patchFile>`). Review the diff and rerun the tests before applying.
+  Defaults: 16 turns and at least 600 s.
 
 ### Inspect capabilities and intended uses
 

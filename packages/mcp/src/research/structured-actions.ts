@@ -146,6 +146,11 @@ export function workspaceIndex(workspace: string): { files: string[]; dirs: stri
   return index;
 }
 
+/** Drop the cached index of `workspace` after its files changed (the coder's writes). */
+export function forgetWorkspaceIndex(workspace: string): void {
+  indexes.delete(workspace);
+}
+
 /**
  * Where a path the model named probably is: entries whose path ends with it (`routing/profile.rs`
  * for `packages/rust-core/src/platform/routing/profile.rs`), shortest first. Models write paths

@@ -529,9 +529,9 @@ describe("tool contract", () => {
     expect(Date.now() - started).toBeLessThan(5000);
   });
 
-  it("delegate_research offers exactly its three adapters", () => {
+  it("delegate_research offers exactly its four adapters", () => {
     const adapterTool = byName.get("delegate_research")!;
-    expect([...adapterTool.inputSchema.properties.adapter.enum].sort()).toEqual(["bash", "github", "octocode"]);
+    expect([...adapterTool.inputSchema.properties.adapter.enum].sort()).toEqual(["bash", "coder", "github", "octocode"]);
   });
 
   it("delegate_research exposes typed budgets and keeps deployment tuning out of requests", () => {
@@ -545,7 +545,8 @@ describe("tool contract", () => {
     expect(properties.contextTokens.type).toBe("integer");
     expect(properties.maxTurns.exclusiveMinimum).toBe(0);
     expect(properties.outputTokens.exclusiveMinimum).toBe(0);
-    expect(Object.keys(properties).sort()).toEqual(["contextTokens", "maxTurns", "outputTokens", "timeoutSeconds"]);
+    expect(Object.keys(properties).sort()).toEqual(["commands", "contextTokens", "maxTurns", "outputTokens", "timeoutSeconds"]);
+    expect(properties.commands.maxItems).toBe(10);
     // Bigger models need longer runs; the caller may extend up to 30 minutes.
     expect(properties.timeoutSeconds.maximum).toBe(1800);
     expect(properties.retryAttempts).toBeUndefined();
@@ -575,16 +576,37 @@ describe("tool contract", () => {
     // 2026-11-07 usage rules (catalog pick, one model per batch, shared tools, tool_calls and OCR notes),
     // 6,752 on 2026-11-08 with two tools that replace agent work worth far more: sweep (674: chunked
     // background checks the agent would otherwise read whole) and ollama_pull (242: size-checked pull
-    // approval), plus the glob, defer and sweep rules in the instructions.
+    // approval), plus the glob, defer and sweep rules in the instructions; 6,800 before and 6,956 after
+    // the 2026-11-08 job mode: run_task `job` (62) and `saveAs` (32), sweep `saveAs` (30) and one
+    // instruction sentence (32), which replace the prompt, options and prefixes an agent would write;
+    // +60 for delegate_research adapter "coder" and agent.commands (edits an isolated copy, returns a diff).
     const modelFacing = tools.map(({ name, description, inputSchema }) => ({ name, description, inputSchema }));
     const surfaceTokens = Math.round(
       (JSON.stringify(modelFacing).length + (client.getInstructions() ?? "").length) / 4,
     );
-    expect(surfaceTokens, `model-facing surface grew to ~${surfaceTokens} tokens`).toBeLessThan(6850);
+    expect(surfaceTokens, `model-facing surface grew to ~${surfaceTokens} tokens`).toBeLessThan(7050);
     // The whole tools/list payload, output schemas included (7,522 tokens on 2026-11-01, 6,412 on 2026-11-07,
-    // 7,846 on 2026-11-08 with sweep and ollama_pull).
+    // 7,846 on 2026-11-08 with sweep and ollama_pull, 7,890 before and 8,055 after job mode).
     const wireTokens = Math.round((JSON.stringify(tools).length + (client.getInstructions() ?? "").length) / 4);
-    expect(wireTokens, `tools/list grew to ~${wireTokens} tokens`).toBeLessThan(7950);
+    expect(wireTokens, `tools/list grew to ~${wireTokens} tokens`).toBeLessThan(8150);
+  });
+
+  it("offers one prompt per job, each returning the exact call, and the freellama guide", async () => {
+    const { prompts } = await client.listPrompts();
+    expect(prompts.map((prompt) => prompt.name).sort()).toEqual([
+      "classify", "coding", "duplicates", "find-code", "freellama", "github-research", "image", "ocr", "research", "summarize", "sweep",
+    ]);
+    const ocr = await client.getPrompt({ name: "ocr", arguments: { file: "shots/error.png", kind: "table" } });
+    expect((ocr.messages[0]!.content as { text: string }).text)
+      .toContain('run_task {"job":"ocr","prompt":"Table Recognition:","files":["shots/error.png"]}');
+    const coding = await client.getPrompt({ name: "coding", arguments: { file: "src/a.ts", change: "rename x" } });
+    expect((coding.messages[0]!.content as { text: string }).text).toMatch(/SEARCH text occurs exactly once/);
+    const guide = await client.getPrompt({ name: "freellama" });
+    expect((guide.messages[0]!.content as { text: string }).text).toMatch(/approves one exact tag and its size/);
+    expect(client.getInstructions()).toMatch(/run_task\{job\}: FreeLlama picks the model and its prompt for the job \(your fields win\); MCP prompts/);
+    expect(byName.get("run_task")!.inputSchema.properties.job.enum).toEqual([
+      "classify", "find-code", "duplicates", "ocr", "image-recognition", "image-search", "coding", "summarize",
+    ]);
   });
 
   it("lists self-contained schemas with no $ref and no $schema dialect key", () => {

@@ -3,6 +3,7 @@
 // Every result is saved before the next chunk starts, so the work survives restarts; unchanged
 // chunks reuse a baseline sweep's results, which is how a re-run reports only what happened since.
 import { randomUUID } from "node:crypto";
+import { TOOL_JOBS } from "../local-prompts.js";
 import { collectFiles, crawl, type CollectedChunk } from "./sources.js";
 import {
   hashText, SweepStore, type Change, type Chunk, type ChunkResult, type FlagRule, type Manifest, type SweepConfig, type Verdict,
@@ -328,7 +329,7 @@ export class SweepRunner {
     };
     const decide = async (model: string) => {
       const receipt = await attempt(() => this.execute({
-        task: "decision", objective: "balanced", model, state: `Source: ${chunk.label}\n\n${text}`, questions: config.questions,
+        task: "decision", objective: "balanced", model, state: TOOL_JOBS.sweep.state(chunk.label, text), questions: config.questions,
         priority: config.priority, keep_alive: "5m",
       }, signal));
       const answers = object(object(receipt.response)?.answers);
@@ -348,9 +349,10 @@ export class SweepRunner {
           task: "completion", objective: "balanced", model: config.explain!.model, priority: config.priority, keep_alive: "5m",
           messages: [
             ...(config.systemPrompt ? [{ role: "system", content: config.systemPrompt }] : []),
-            { role: "user", content: `${config.explain!.prompt}\n\nSource: ${chunk.label}\n\n${text}` },
+            { role: "user", content: TOOL_JOBS.sweep.explain(config.explain!.prompt, chunk.label, text) },
           ],
-          request_options: { think: false, options: { temperature: 0, num_predict: config.explain!.maxTokens } },
+          request_options: { think: TOOL_JOBS.sweep.explainControls.think,
+            options: { temperature: TOOL_JOBS.sweep.explainControls.temperature, num_predict: config.explain!.maxTokens } },
         }, signal));
         const content = object(object(receipt.response)?.message)?.content;
         if (typeof content === "string") result.note = content.trim();

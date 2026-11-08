@@ -31,6 +31,11 @@ server-launch config (for example `.mcp.json`'s `env` block) or the launching sh
 | `FREELLAMA_SERVE_BINARY` | checkout `target/release`/`debug`, then the platform package | Binary used for serve autostart |
 | `FREELLAMA_AGENT_OS_SANDBOX` | `auto` | Bash adapter OS confinement: `bwrap` on Linux, `sandbox-exec` on macOS, when present. `off` keeps only the restricted shell |
 | `FREELLAMA_AGENT_OCTOCODE_PACKAGE` | `octocode@19.1.0` | Pinned npm spec the Octocode adapter runs through `npx` |
+| `FREELLAMA_MCP_ALLOW_CODER` | unset (off) | `1` enables `delegate_research` `adapter:"coder"`, which edits files and runs the caller's `agent.commands` in an isolated copy of the workspace (see [the coder adapter](README.md#the-coder-adapter)) |
+| `FREELLAMA_CODER_RUN_TIMEOUT_SECONDS` | `300` (at most `1800`) | Timeout of one coder `run`; the whole call is still bounded by `agent.timeoutSeconds` (coder default at least 600 s) |
+| `FREELLAMA_CODER_MAX_COPY_BYTES` | `209715200` (200 MB) | Size cap of a coder copy of a workspace that is not a git repository (`node_modules`, `target`, `dist` and `.git` excluded) |
+| `FREELLAMA_CODER_WRITABLE` | unset | Platform-separated extra directories the coder's allowed commands may write, such as `~/.cargo` for `cargo test`; an entry that holds or lies inside the workspace is refused |
+| `FREELLAMA_CODER_UNSANDBOXED_RUN` | unset | `1` lets the coder `run` without an OS sandbox (`sandbox-exec` or `bwrap`); without one, `run` is refused |
 
 Serve-side placement settings (read by `freellama serve`, not the MCP process):
 

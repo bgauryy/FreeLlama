@@ -20,6 +20,9 @@ allow = [
     "MIT-0",
     "Unicode-3.0",
     "Unlicense",
+    # foldhash (via rusqlite -> hashlink -> hashbrown) is Zlib only; Zlib is permissive and
+    # compatible with Apache-2.0 OR MIT.
+    "Zlib",
 ]
 confidence-threshold = 0.9
 

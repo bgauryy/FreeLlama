@@ -8,6 +8,7 @@ import { runWithJobProgress } from "../job-progress.js";
 import { progressSink, type ToolExtra } from "../progress.js";
 import { defaultFlags, SweepRunner, type Executor, type SweepView } from "../sweep/runner.js";
 import { SweepStore, type ChunkResult, type SweepConfig } from "../sweep/store.js";
+import { HANDOFF_NAME, writeHandoff } from "../handoffs.js";
 
 type Fields = Record<string, unknown>;
 
@@ -113,6 +114,7 @@ export function registerSweepTool(server: McpServer): void {
         baseline: z.string().length(36).optional().describe("an earlier sweepId"),
         filter: z.enum(["flagged", "unsure", "failed", "changed", "all"]).optional(),
         cursor: z.string().min(1).optional(),
+        saveAs: z.string().regex(HANDOFF_NAME).optional().describe("results: all of filter to handoffs/<name>.md"),
         endpoint: endpointParam,
       }).strict(),
       outputSchema: objectResultSchema,
@@ -127,8 +129,8 @@ export function registerSweepTool(server: McpServer): void {
           const stray = startOnly.filter((name) => args[name] !== undefined);
           if (stray.length > 0) return errorResult(new Error(`${stray.map((name) => `\`${name}\``).join(", ")} apply to action "start" only.`));
         }
-        if (action !== "results" && (args.filter !== undefined || args.cursor !== undefined)) {
-          return errorResult(new Error("`filter` and `cursor` apply to action \"results\" only."));
+        if (action !== "results" && (args.filter !== undefined || args.cursor !== undefined || args.saveAs !== undefined)) {
+          return errorResult(new Error("`filter`, `cursor` and `saveAs` apply to action \"results\" only."));
         }
         if (action === "list") {
           const sweeps = store.list().map((id) => runnerOf(id).view(id))
@@ -158,7 +160,7 @@ export function registerSweepTool(server: McpServer): void {
             unsubscribe();
           }
         }
-        if (action === "results") return results(sweepId, args.filter ?? "flagged", 50, args.cursor);
+        if (action === "results") return results(sweepId, args.filter ?? "flagged", 50, args.cursor, args.saveAs ? { name: args.saveAs, view: runner.view(sweepId) } : undefined);
         const view = runner.view(sweepId);
         return structuredResult(view as unknown as Fields, { text: viewText(view) });
       } catch (error) {
@@ -211,7 +213,14 @@ async function start(args: StartArgs) {
   return structuredResult(view as unknown as Fields, { text: viewText(view) });
 }
 
-function results(id: string, filter: Filter, limit: number, cursor: string | undefined) {
+/** One chunk's result line, as `results` lists it and a handoff saves it. */
+function rowLine(row: { label: string; change?: string; status: string; error?: string; triage?: string; answers?: Fields; verified?: ChunkResult["verified"]; note?: string }): string {
+  const verified = row.verified ? ` → ${row.verified.model}: ${row.verified.verdict} (${answerLine(row.verified.answers)})` : "";
+  const change = row.change ? ` [${row.change}]` : "";
+  return `- ${row.label}${change}: ${row.status === "failed" ? `failed: ${(row.error ?? "").slice(0, 200)}` : `${row.triage} (${answerLine(row.answers)})${verified}`}${row.note ? `\n  note: ${row.note.replace(/\s+/g, " ").slice(0, 400)}` : ""}`;
+}
+
+function results(id: string, filter: Filter, limit: number, cursor: string | undefined, handoff?: { name: string; view: SweepView }) {
   const manifest = store.manifest(id);
   const latest = store.results(id);
   const offset = cursor ? Number.parseInt(cursor, 10) : 0;
@@ -234,13 +243,16 @@ function results(id: string, filter: Filter, limit: number, cursor: string | und
   });
   const page = rows.slice(offset, offset + limit);
   const next = offset + limit < rows.length ? String(offset + limit) : undefined;
-  const text = page.length === 0
+  let text = page.length === 0
     ? `no ${filter} chunks in sweep ${id}`
-    : page.map((row) => {
-      const verified = row.verified ? ` → ${row.verified.model}: ${row.verified.verdict} (${answerLine(row.verified.answers)})` : "";
-      const change = row.change ? ` [${row.change}]` : "";
-      return `- ${row.label}${change}: ${row.status === "failed" ? `failed: ${(row.error ?? "").slice(0, 200)}` : `${row.triage} (${answerLine(row.answers)})${verified}`}${row.note ? `\n  note: ${row.note.replace(/\s+/g, " ").slice(0, 400)}` : ""}`;
-    }).join("\n") + (next ? `\n(${rows.length - offset - page.length} more: cursor "${next}")` : "") +
+    : page.map(rowLine).join("\n") + (next ? `\n(${rows.length - offset - page.length} more: cursor "${next}")` : "") +
       "\nThese are a small model's candidates: read 3 to 5 of the cited ranges yourself before relying on the rest.";
-  return structuredResult({ sweep_id: id, filter, total: rows.length, chunks: page, page: { next_cursor: next } }, { text });
+  // A handoff holds every chunk of the filter, not one page: the next agent reads it whole.
+  const file = handoff ? writeHandoff(handoff.name, {
+    source: `From sweep ${id}${manifest.config.name ? ` (${manifest.config.name})` : ""}, filter ${filter}`,
+    summary: viewText(handoff.view),
+    result: rows.length === 0 ? `no ${filter} chunks` : rows.map(rowLine).join("\n"),
+  }) : undefined;
+  if (file) text += `\nhandoff_file: ${file}`;
+  return structuredResult({ sweep_id: id, filter, total: rows.length, chunks: page, page: { next_cursor: next }, ...(file ? { handoff_file: file } : {}) }, { text });
 }

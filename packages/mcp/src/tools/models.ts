@@ -10,14 +10,12 @@ import {
 } from "../helpers.js";
 import { libraryTrialCandidate } from "../model-search.js";
 import { CATALOG_JOBS, catalogText, catalogView, installedMatch, type InstalledModel } from "../model-catalog.js";
-import { serveAuthHeaders } from "../serve-http.js";
 import { installedModelsText, modelDetailText, residentModelsText } from "../result-text.js";
-import { DEFAULT_SERVE_ENDPOINT } from "../config.js";
 import { HUB_EMBEDDING_TASKS, huggingFaceReference } from "../huggingface.js";
 import {
   enrichInstalledModels, isRemoteModel, libraryReference, modelKnowledge, publicModelGuidance,
 } from "../model-knowledge.js";
-import { huggingFace, installedInventory, ollamaLibrary } from "../model-library.js";
+import { catalogLiveState, huggingFace, installedInventory, liveAvailableBytes, ollamaLibrary } from "../model-library.js";
 
 export { installedInventory, libraryTagSize, type TagSizeLookup } from "../model-library.js";
 
@@ -247,25 +245,6 @@ async function libraryLookup({
 }
 
 /** What is installed and how much memory is available; unknown stays null rather than "no". */
-/** Memory free now, as serve's host sampler sees it (reclaimable included); null when serve is down. */
-async function liveAvailableBytes(endpoint: string | undefined): Promise<number | null> {
-  try {
-    const response = await fetch(`${(endpoint ?? DEFAULT_SERVE_ENDPOINT).replace(/\/$/, "")}/_freellama/v1/status`, { headers: await serveAuthHeaders(), signal: AbortSignal.timeout(3000) });
-    const status = await response.json() as { host?: { available_memory_bytes?: number; effective_available_bytes?: number } };
-    return status.host?.effective_available_bytes ?? status.host?.available_memory_bytes ?? null;
-  } catch {
-    return null;
-  }
-}
-
-async function catalogLiveState(endpoint: string | undefined, ollamaEndpoint: string | undefined): Promise<[InstalledModel[] | null, number | null]> {
-  let installed: InstalledModel[] | null = null;
-  try {
-    installed = await installedInventory(ollamaEndpoint);
-  } catch { /* reported as null */ }
-  return [installed, await liveAvailableBytes(endpoint)];
-}
-
 export function registerModelsTool(server: McpServer): void {
   server.registerTool(
     "models",

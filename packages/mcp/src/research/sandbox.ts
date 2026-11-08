@@ -34,15 +34,16 @@ export {
   READ_ONLY_GIT, READ_ONLY_TOOLS, SAFE_BUILTINS, assertCommandConfined, segments, validateCommand,
 } from "./sandbox-validate.js";
 
-function macosProfile(workspace: string, scratch: string): string {
+function macosProfile(workspace: string, scratch: string, readPaths: string[] = []): string {
   const quote = (value: string) => `"${value.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`;
+  const extra = readPaths.map((dir) => ` (subpath ${quote(dir)})`).join("");
   return `(version 1)
 (allow default)
 (deny network*)
 (deny file-write*)
 (allow file-write* (literal "/dev/null") (literal "/dev/tty") (literal "/dev/dtracehelper") (subpath ${quote(scratch)}))
 (deny file-read-data (subpath "/Users") (subpath "/Volumes") (subpath "/private/var/root"))
-(allow file-read-data (subpath ${quote(workspace)}) (subpath ${quote(scratch)}))
+(allow file-read-data (subpath ${quote(workspace)}) (subpath ${quote(scratch)})${extra})
 `;
 }
 
@@ -75,9 +76,12 @@ export class ReadOnlyShell {
   env: Record<string, string> = {};
   bash = "/bin/bash";
   private scratch: string | null = null;
+  /** Directories outside the workspace the shell may also read, such as a worktree's git directory. */
+  private readonly readPaths: string[];
 
-  constructor(workspace: string) {
+  constructor(workspace: string, options: { readPaths?: string[] } = {}) {
     this.workspace = workspace;
+    this.readPaths = options.readPaths ?? [];
   }
 
   enter(): this {
@@ -125,7 +129,7 @@ export class ReadOnlyShell {
     const sandboxExec = which("sandbox-exec");
     if (sandboxExec) {
       const profile = path.join(scratch, "profile.sb");
-      writeFileSync(profile, macosProfile(this.workspace, scratch), "utf8");
+      writeFileSync(profile, macosProfile(this.workspace, scratch, this.readPaths), "utf8");
       const prefix = [sandboxExec, "-f", profile];
       if (probe([...prefix, this.bash, "-c", "true"], this.env)) {
         this.kind = "sandbox-exec+restricted-bash";
@@ -140,6 +144,7 @@ export class ReadOnlyShell {
       }
       prefix.push(
         "--ro-bind", this.workspace, this.workspace,
+        ...this.readPaths.flatMap((dir) => ["--ro-bind", dir, dir]),
         "--ro-bind", binDir, binDir,
         "--bind", scratch, scratch,
         "--chdir", this.workspace, "--",

@@ -34,6 +34,12 @@ Read the flagged chunks, then open the cited ranges yourself:
 {"tool": "sweep", "arguments": {"action": "results", "sweepId": "00000000-0000-4000-8000-000000000000", "filter": "flagged"}}
 ```
 
+Hand every flagged chunk to another task: `saveAs` writes them, under a summary of the counts, to `handoffs/<name>.md` and returns `handoff_file`, which a later `run_task` reads with `files`:
+
+```json
+{"tool": "sweep", "arguments": {"action": "results", "sweepId": "00000000-0000-4000-8000-000000000000", "filter": "flagged", "saveAs": "swallowed-errors"}}
+```
+
 Check a docs site for outdated install steps, two link hops deep:
 
 ```json

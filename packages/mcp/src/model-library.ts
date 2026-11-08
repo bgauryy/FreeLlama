@@ -1,9 +1,11 @@
 // Public model sources shared by `models{view:"library"}` and `ollama_pull`: one cached client per
 // source, and the local inventory with digests. No native addon, so lifecycle tools load it freely.
+import { DEFAULT_SERVE_ENDPOINT } from "./config.js";
 import { ollamaFetch } from "./helpers.js";
 import { HuggingFaceClient, huggingFaceReference } from "./huggingface.js";
 import type { InstalledModel } from "./model-catalog.js";
 import { libraryReference, OllamaLibraryClient } from "./model-knowledge.js";
+import { serveAuthHeaders } from "./serve-http.js";
 
 export const ollamaLibrary = new OllamaLibraryClient();
 export const huggingFace = new HuggingFaceClient();
@@ -47,3 +49,23 @@ export async function installedInventory(ollamaEndpoint: string | undefined): Pr
   return (tags.models ?? []).map((m) => ({ name: m.name ?? m.model ?? "", digest: m.digest ?? null })).filter((m) => m.name);
 }
 
+
+/** Memory free now, as serve's host sampler sees it (reclaimable included); null when serve is down. */
+export async function liveAvailableBytes(endpoint: string | undefined): Promise<number | null> {
+  try {
+    const response = await fetch(`${(endpoint ?? DEFAULT_SERVE_ENDPOINT).replace(/\/$/, "")}/_freellama/v1/status`, { headers: await serveAuthHeaders(), signal: AbortSignal.timeout(3000) });
+    const status = await response.json() as { host?: { available_memory_bytes?: number; effective_available_bytes?: number } };
+    return status.host?.effective_available_bytes ?? status.host?.available_memory_bytes ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** What models{view:"catalog"} and run_task {job} judge picks by: the inventory (null when unreadable) and free memory. */
+export async function catalogLiveState(endpoint: string | undefined, ollamaEndpoint: string | undefined): Promise<[InstalledModel[] | null, number | null]> {
+  let installed: InstalledModel[] | null = null;
+  try {
+    installed = await installedInventory(ollamaEndpoint);
+  } catch { /* reported as null */ }
+  return [installed, await liveAvailableBytes(endpoint)];
+}

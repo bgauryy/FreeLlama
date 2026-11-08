@@ -5,7 +5,6 @@
 //
 // Run as `node octocode-agent.js` with FREELLAMA_TARGET_MODEL (or FREELLAMA_BENCH_MODEL),
 // FREELLAMA_BENCH_WORKSPACE, FREELLAMA_BENCH_PROMPT and FREELLAMA_AGENT_RESULT set.
-import { pathToFileURL } from "node:url";
 import { type Action, type AdapterSpec, isPositiveInt } from "./adapter.js";
 import { runAdapter } from "./agent-loop.js";
 import { parseJsonAction } from "./actions.js";
@@ -17,6 +16,7 @@ import { trimSpace } from "./text.js";
 import { escapesRoot, joinPath, resolvePath } from "./workspace-path.js";
 import { workspaceOverview } from "./workspace-overview.js";
 import { runGh, validateGhArgs } from "./gh-action.js";
+import { isEntry } from "./entry.js";
 
 export const OCTOCODE_TOOLS: ReadonlySet<string> = new Set([
   "structureSearch", "localSearch", "localFetch", "astSearch", "lspSearch",
@@ -170,6 +170,6 @@ function adapterFor(options: {
 export const OCTOCODE_ADAPTER = adapterFor({ tools: OCTOCODE_TOOLS, prompt: octocodeSystemPrompt, run: runOctocode, metadata: "octocode_cli_agent_v2", briefing: workspaceOverview });
 export const GITHUB_ADAPTER = adapterFor({ tools: GITHUB_TOOLS, prompt: githubSystemPrompt, run: runGithub, metadata: "octocode_github_agent_v2", gh: true });
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isEntry(import.meta.url, "octocode-agent")) {
   process.exitCode = await runAdapter(OCTOCODE_ADAPTER);
 }

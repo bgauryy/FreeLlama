@@ -12,6 +12,8 @@
 
 Up to 64 items per call. Top-level `task`, `model`, `systemPrompt`, `questions`, `format` and `options` apply to every item; `prompt`, `state`, `input`, `files` and `images` stay per item.
 
+`job:"summarize"` in place of `model` and `systemPrompt` lets FreeLlama pick the model and its summary prompt ([jobs](jobs.md)). On a single call, `saveAs` writes the answer to a handoff file a later task reads with `files`.
+
 **Read the result:** one `## <id>` section per item, in order.
 
 **Check it:** read 3 to 5, more where a mistake costs more.

@@ -87,8 +87,9 @@ export function chunkLines(text: string, limit = EMBEDDING_CHUNK_BYTES): Array<{
 /**
  * Directories `files` may read under: the server's working directory (the agent's project when a
  * client starts the server there), the OS temp directory (where screenshots and tool output land),
- * and `FREELLAMA_FILE_ROOTS` (path-delimited). Reading stays inside what the agent could already
- * reach in its project, so a file the host would not show the agent is not read here either.
+ * `FREELLAMA_FILE_ROOTS` (path-delimited), and the handoffs a task wrote with `saveAs`
+ * (`${FREELLAMA_HOME}/handoffs`). Reading stays inside what the agent could already reach in its
+ * project, so a file the host would not show the agent is not read here either.
  */
 export function fileRoots(env: NodeJS.ProcessEnv = process.env, cwd = process.cwd(), home = homedir()): string[] {
   const configured = (env.FREELLAMA_FILE_ROOTS ?? "").split(path.delimiter).filter(Boolean);
@@ -96,15 +97,22 @@ export function fileRoots(env: NodeJS.ProcessEnv = process.env, cwd = process.cw
   // file there; such a working directory is not a project, so only configured roots apply.
   const broad = new Set([path.parse(path.resolve(cwd)).root, resolvedRoot(home)]);
   const project = broad.has(resolvedRoot(cwd)) ? [] : [cwd];
-  return [...project, tmpdir(), ...configured].map(resolvedRoot);
+  // The same directory as handoffs.ts HANDOFF_DIR, derived from `env` so callers can pass their own.
+  const handoffs = path.join(env.FREELLAMA_HOME || path.join(home, ".octocode", "freellama"), "handoffs");
+  return [...project, tmpdir(), ...configured, handoffs].map(resolvedRoot);
 }
 
-/** A root as files resolve: through symlinks (macOS `/var` is `/private/var`). */
+/**
+ * A root as files resolve: through symlinks (macOS `/var` is `/private/var`). A root that does not
+ * exist yet (the handoffs directory before the first saveAs) resolves through its nearest parent.
+ */
 function resolvedRoot(root: string): string {
   try {
     return realpathSync(root);
   } catch {
-    return path.resolve(root);
+    const absolute = path.resolve(root);
+    const parent = path.dirname(absolute);
+    return parent === absolute ? absolute : path.join(resolvedRoot(parent), path.basename(absolute));
   }
 }
 

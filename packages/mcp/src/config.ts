@@ -42,11 +42,13 @@ function adapterPath(file: string): string {
 }
 
 // Interchangeable research adapters with one env contract and result shape: `bash` (the default),
-// `octocode` (the installed CLI's local tools) and `github` (its GitHub tools).
+// `octocode` (the installed CLI's local tools), `github` (its GitHub tools) and `coder` (edits and
+// runs allowed commands in an isolated copy; operator opt-in with FREELLAMA_MCP_ALLOW_CODER=1).
 export const RESEARCH_ADAPTERS = {
   bash: adapterPath("bash-agent.js"),
   octocode: adapterPath("octocode-agent.js"),
   github: adapterPath("github-agent.js"),
+  coder: adapterPath("coder-agent.js"),
 } as const;
 export type ResearchAdapter = keyof typeof RESEARCH_ADAPTERS;
 
@@ -209,6 +211,8 @@ const DELEGATE_ENV_ALLOWLIST = new Set([
   "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy",
   "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE",
   "XDG_CACHE_HOME", "XDG_DATA_HOME", "npm_config_cache",
+  // Toolchain homes the coder adapter's allowed commands (cargo, corepack) resolve from.
+  "CARGO_HOME", "RUSTUP_HOME", "COREPACK_HOME",
 ]);
 
 export function delegateEnvironment(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {

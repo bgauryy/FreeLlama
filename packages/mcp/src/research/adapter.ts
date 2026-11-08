@@ -32,9 +32,15 @@ export interface AdapterSpec {
   remaining: (count: number) => string;
   exhausted: string;
   adapterMetadata: (session: AdapterSession | undefined) => Record<string, unknown>;
+  /** Whether a finish that names no file gets one repair turn asking for a source (default true). */
+  requireSource?: boolean;
+  /** Adapter fields added to result.json (the coder's diff), computed before the session closes. */
+  report?: (session: AdapterSession | undefined) => Record<string, unknown> | Promise<Record<string, unknown>>;
 }
 
 export interface AdapterSession {
+  /** The directory tools run in and answers are checked against, when not the workspace itself. */
+  workspace?: string;
   toolCall: (action: Action, workspace: string, runtime: AgentRuntimeConfig) => ToolCall;
   close?: () => void;
 }

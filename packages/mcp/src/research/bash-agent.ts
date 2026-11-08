@@ -5,7 +5,6 @@
 //
 // Run as `node bash-agent.js` with FREELLAMA_TARGET_MODEL (or FREELLAMA_BENCH_MODEL),
 // FREELLAMA_BENCH_WORKSPACE, FREELLAMA_BENCH_PROMPT and FREELLAMA_AGENT_RESULT set.
-import { pathToFileURL } from "node:url";
 import { type Action, type AdapterSpec, isPositiveInt } from "./adapter.js";
 import { runAdapter } from "./agent-loop.js";
 import { parseJsonAction } from "./actions.js";
@@ -14,7 +13,9 @@ import { BASH_SYSTEM_PROMPT } from "./prompts.js";
 import { ReadOnlyShell, assertCommandConfined } from "./sandbox.js";
 import { trimSpace } from "./text.js";
 import { workspaceOverview } from "./workspace-overview.js";
-import { listEntries, looksLikeRegex, readLines, resolveNamedPath, searchArgv, validateRead, validateSearch, type ReadAction, type SearchAction } from "./structured-actions.js";
+import { validateRead, validateSearch } from "./structured-actions.js";
+import { structuredCall } from "./structured-call.js";
+import { isEntry } from "./entry.js";
 
 export { assertCommandConfined };
 
@@ -51,55 +52,6 @@ export async function runShell(root: string, commandText: string, timeoutSeconds
   }
 }
 
-/**
- * A search that corrects the two mistakes models make most: a path written relative to a package
- * or taken from the question (resolved by suffix, else the whole workspace is searched), and a
- * regex such as `a|b` sent as a literal (retried as a regex when the literal finds nothing).
- */
-async function structuredSearch(shell: ReadOnlyShell, action: SearchAction, timeoutSeconds: number): Promise<string> {
-  const notes: string[] = [];
-  const resolved = resolveNamedPath(shell.workspace, action.path, "any");
-  let target = resolved.path;
-  if (target === undefined) {
-    notes.push(`(${resolved.note}; searched the whole workspace)`);
-    target = ".";
-  } else if (resolved.note) {
-    notes.push(resolved.note);
-  }
-  const ripgrep = shell.hasTool("rg");
-  const run = (regex: boolean | undefined) => shell.runTool(searchArgv(shell.workspace, { ...action, path: target, regex }, ripgrep), timeoutSeconds);
-  let output = await run(action.regex);
-  if (output === "(no matches)" && action.regex === undefined && looksLikeRegex(action.pattern)) {
-    try {
-      const asRegex = await run(true);
-      if (asRegex !== "(no matches)") {
-        notes.push("(no literal match; searched as a regular expression)");
-        output = asRegex;
-      }
-    } catch {
-      // Not a valid regex either: the literal result stands.
-    }
-  }
-  return notes.length > 0 ? `${notes.join("\n")}\n${output}` : output;
-}
-
-/** A search, read or list: the harness builds the confined command; the model only names it. */
-function structuredCall(shell: ReadOnlyShell, action: Action, timeoutSeconds: number) {
-  const name = String(action.action);
-  const args: Record<string, unknown> = Object.fromEntries(Object.entries(action).filter(([key]) => key !== "action"));
-  const run = async (): Promise<string> => {
-    if (name === "read") return readLines(shell.workspace, args as ReadAction);
-    if (name === "list") return listEntries(shell.workspace, args.path as string | undefined);
-    return structuredSearch(shell, args as SearchAction, timeoutSeconds);
-  };
-  return {
-    signature: { [name]: args },
-    run,
-    record: { name, raw_name: name, arguments: args },
-    ledger: (status: string) => ({ action: name, status, source: JSON.stringify(args) }),
-  };
-}
-
 export const BASH_ADAPTER: AdapterSpec = {
   defaultToolTimeoutSeconds: 30,
   systemPrompt: () => BASH_SYSTEM_PROMPT,
@@ -132,6 +84,6 @@ export const BASH_ADAPTER: AdapterSpec = {
   }),
 };
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isEntry(import.meta.url, "bash-agent")) {
   process.exitCode = await runAdapter(BASH_ADAPTER);
 }

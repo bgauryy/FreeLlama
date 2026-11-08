@@ -70,7 +70,7 @@ function compactReceipt(receipt: Fields): Fields {
   const completionPlanning = compactCompletionPlanning(execution?.completion_planning);
   const compact: Fields = {};
   for (const key of ["selected_model", "response", "output_check", "metrics", "telemetry", "scope", "warm", "job", "deferred",
-    "nearest", "files_read", "embedding_requests", "embedding_identity", "accepted_job_ids"]) {
+    "nearest", "files_read", "embedding_requests", "embedding_identity", "accepted_job_ids", "job_profile", "handoff_file"]) {
     if (receipt[key] !== undefined) compact[key] = receipt[key];
   }
   const response = withoutThinking(object(receipt.response));

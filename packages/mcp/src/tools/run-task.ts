@@ -16,6 +16,9 @@ import {
 } from "../helpers.js";
 import { applyTaskFiles, inputLabels, type FileReceipt } from "../task-files.js";
 import { nearestText, validateEmbeddingVectors, type NearestRequest } from "../nearest.js";
+import { applyJob, mergeProfiles, pickLiveJobModel, type JobProfile } from "../job-mode.js";
+import { LOCAL_JOBS, RUN_TASK_JOBS, type JobName } from "../local-prompts.js";
+import { HANDOFF_NAME, summaryOf, writeHandoff } from "../handoffs.js";
 
 // Typed where the agent acts on a field; Ollama-owned payloads (`response`) stay open.
 const taskResultSchema = z.object({
@@ -34,6 +37,7 @@ const taskResultSchema = z.object({
   response_file: z.string().optional(),
   sections: z.array(z.string()).optional(),
   telemetry: z.unknown().optional(),
+  handoff_file: z.string().optional(),
 }).loose();
 const batchResultSchema = z.object({
   results: z.array(z.object({
@@ -513,6 +517,7 @@ export function registerRunTaskTool(server: McpServer): void {
       inputSchema: z.object({
         endpoint: endpointParam,
         task: taskParam.removeDefault().optional(),
+        job: z.enum(RUN_TASK_JOBS).optional().describe("picks a model that fits now and fills prompt, systemPrompt, options, think, prefixes; your fields win"),
         objective: objectiveParam,
         model: z.string().min(1).optional().describe(
           "exact tag; omitted: routing picks by capability only and may choose one that does not fit now, so name the catalog's pick for the job",
@@ -571,6 +576,7 @@ export function registerRunTaskTool(server: McpServer): void {
           .optional()
           .describe("compact (default): full receipt at response_file; full: inline"),
         defer: z.boolean().optional(),
+        saveAs: z.string().regex(HANDOFF_NAME).optional().describe("answer to handoffs/<name>.md, returned as handoff_file"),
         returnEmbeddings: z.boolean().optional(),
         nearest: z
           .object({
@@ -603,6 +609,8 @@ export function registerRunTaskTool(server: McpServer): void {
     async ({
       endpoint,
       task,
+      job,
+      saveAs,
       objective,
       model,
       sessionId,
@@ -647,6 +655,7 @@ export function registerRunTaskTool(server: McpServer): void {
           timeoutSeconds, stopOnRepetition, defer, returnEmbeddings, nearest: nearestRequest, preview,
         };
         if (tasks !== undefined) {
+          if (saveAs !== undefined) return errorResult(new Error("`saveAs` saves one answer; it is not valid with `tasks`."));
           // `defer` is the one single-call field a batch accepts: it submits every item as its own job.
           const stray = Object.entries(singleFields).filter(([name, value]) => value !== undefined && name !== "defer").map(([name]) => name);
           const unsupported = stray.filter((name) => !BATCH_TASK_FIELDS.has(name)).map((name) => `\`${name}\``);
@@ -661,10 +670,24 @@ export function registerRunTaskTool(server: McpServer): void {
           }
           // Shared fields are sent once and apply to every item that does not set its own.
           const shared = Object.fromEntries(stray.map((name) => [name, singleFields[name as keyof typeof singleFields]]));
-          const items: BatchItem[] = tasks.map((item) => ({ ...item, task: { ...shared, ...withoutUndefined(parseBatchTask(item)) } as BatchItem["task"] }));
-          return await runBatch(items, maxParallelism, endpoint, extra, defer === true);
+          let items: BatchItem[] = tasks.map((item) => ({ ...item, task: { ...shared, ...withoutUndefined(parseBatchTask(item)) } as BatchItem["task"] }));
+          let profile: JobProfile | undefined;
+          if (job !== undefined) ({ items, profile } = await withBatchJob(job, items, endpoint));
+          return withJob(await runBatch(items, maxParallelism, endpoint, extra, defer === true), profile);
         }
         if (maxParallelism !== undefined) return errorResult(new Error("`maxParallelism` is valid only with `tasks`."));
+        if (saveAs !== undefined && (preview || defer)) return errorResult(new Error("`saveAs` saves a finished answer; it is not valid with `preview` or `defer`."));
+        let profile: JobProfile | undefined;
+        if (job !== undefined) {
+          if (scopeId !== undefined) return errorResult(new Error("`job` picks the model and prompt, and a scope has its own: remove `job` or `scopeId`."));
+          const picked = model === undefined ? await pickLiveJobModel(job, endpoint) : undefined;
+          const applied = applyJob(job, { task, model, prompt, systemPrompt, messages, options, think, input, nearest: nearestRequest }, picked, preview === true);
+          ({ prompt, systemPrompt, options, think, input, model } = applied.fields);
+          task = applied.fields.task as typeof task;
+          nearestRequest = applied.fields.nearest as typeof nearestRequest;
+          profile = applied.profile;
+        }
+        const finish = <R,>(result: R): R => withJob(result, profile, saveAs);
         const canonicalTask = task ?? "completion";
         if (preview) {
           const executionOnlyFields = ([
@@ -715,9 +738,9 @@ export function registerRunTaskTool(server: McpServer): void {
         // The core enforces minConfidence inside route(), so preview and synchronous execution
         // refuse there, with the core's actionable message, before any generation.
         if (preview) {
-          return withText(parsedResult(
+          return finish(withText(parsedResult(
             await route(endpoint, canonicalTask, objective, model, sessionId, contextTokens, effectiveRequiredCapabilities, minConfidence, executionPreference, minPlacementEvidence),
-          ), routeText);
+          ), routeText));
         }
         const filled = withFiles({ task, files, prompt, images, input, state, documentPrefix: nearestRequest?.documentPrefix });
         ({ prompt, images, input, state } = filled.task);
@@ -787,7 +810,7 @@ export function registerRunTaskTool(server: McpServer): void {
         const result = parsedResult(slicedEmbedding
           ? await embedInSlices(target, request, input as unknown[], report, extra.signal)
           : await runManagedTask(target, request, report, extra.signal));
-        if (isStructuredSuccess(result) && result.structuredContent.deferred === true) return withText(result, deferText);
+        if (isStructuredSuccess(result) && result.structuredContent.deferred === true) return finish(withText(result, deferText));
         if (request.task === "embedding" && nearestRequest === undefined && isStructuredSuccess(result)) {
           validateEmbeddingVectors(object(result.structuredContent.response)?.embeddings, Array.isArray(input) ? input.length : 1);
         }
@@ -804,19 +827,62 @@ export function registerRunTaskTool(server: McpServer): void {
           finished.structuredContent.files_read = filled.files;
         }
         if (nearestRequest !== undefined && isStructuredSuccess(finished)) {
-          return rankedResult(finished, nearestRequest.query !== undefined, items.length);
+          return finish(rankedResult(finished, nearestRequest.query !== undefined, items.length));
         }
         // The vectors stay in the saved response; the inline result and its text omit them.
         if (!returnEmbeddings && isStructuredSuccess(finished)) {
           const trimmed = summarizeEmbeddings(finished.structuredContent);
-          if (trimmed) return { ...finished, content: [{ type: "text" as const, text: taskAnswerText(trimmed) ?? "" }] };
+          if (trimmed) return finish({ ...finished, content: [{ type: "text" as const, text: taskAnswerText(trimmed) ?? "" }] });
         }
-        return finished;
+        return finish(finished);
       } catch (error) {
         return errorResult(error);
       }
     },
   );
+}
+
+/** Job mode over a batch: one model pick for the items that name none, then each item's defaults. */
+async function withBatchJob(job: JobName, items: BatchItem[], endpoint: string | undefined): Promise<{ items: BatchItem[]; profile: JobProfile }> {
+  // Ranking (`nearest`) belongs to one call over all the items, which a batch item cannot carry.
+  if (LOCAL_JOBS[job].task === "embedding") throw new Error(`job "${job}" ranks every item in one call with \`nearest\`; send it without \`tasks\`, naming the inputs in \`files\`.`);
+  const picked = items.some((item) => item.task.model === undefined) ? await pickLiveJobModel(job, endpoint) : undefined;
+  const profiles: JobProfile[] = [];
+  const filled = items.map((item) => {
+    try {
+      const { fields, profile } = applyJob(job, item.task, picked);
+      profiles.push(profile);
+      return { ...item, task: fields as BatchItem["task"] };
+    } catch (error) {
+      throw new Error(`batch item ${item.id}: ${(error as Error).message}`);
+    }
+  });
+  return { items: filled, profile: mergeProfiles(job, profiles) };
+}
+
+type Shown = { content?: Array<{ type: string; text?: string }>; structuredContent?: Fields; isError?: boolean };
+
+/**
+ * A finished result with `job_profile` (what job mode filled in) and, for `saveAs`, the answer text
+ * written as a handoff whose path is `handoff_file`. Errors pass through: there is nothing to hand on.
+ */
+export function withJob<R>(result: R, profile: JobProfile | undefined, saveAs?: string, dir?: string): R {
+  const shown = result as Shown;
+  if (shown.isError || !shown.structuredContent || (profile === undefined && saveAs === undefined)) return result;
+  const structuredContent: Fields = { ...shown.structuredContent, ...(profile ? { job_profile: profile } : {}) };
+  let content = shown.content;
+  if (saveAs !== undefined) {
+    // The answer as the agent reads it, without its `[model · lifecycle]` label.
+    const answer = (content ?? []).map((part) => part.text ?? "").join("\n").replace(/^\[[^\]\n]*\] /, "");
+    const model = profile?.model ?? object(structuredContent.route)?.selected_model ?? structuredContent.selected_model;
+    const file = writeHandoff(saveAs, {
+      source: `From run_task${profile ? ` job ${profile.job}` : ""}${typeof model === "string" ? `, model ${model}` : ""}`,
+      summary: summaryOf(answer), result: answer,
+    }, dir);
+    structuredContent.handoff_file = file;
+    content = (content ?? []).map((part, index) => (index === 0 && part.type === "text" ? { ...part, text: `${part.text ?? ""}\nhandoff_file: ${file}` } : part));
+  }
+  return { ...result, structuredContent, content } as R;
 }
 
 /** An embedding result the core ranked by `nearest`: labelled matches inline, vectors only on request. */
