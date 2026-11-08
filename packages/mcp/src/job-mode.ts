@@ -25,11 +25,6 @@ export type JobFields = {
 
 const lower = (tag: string) => tag.toLowerCase();
 
-/**
- * The job's model for this machine now: the first catalog pick that is installed and not known to
- * be short of memory (unknown free memory is not "no room"). A pick installed under another tag
- * runs under that tag. Throws a JSON refusal naming each pick's need and what is free.
- */
 /** Catalog roles from most to least capable: a `capable` workflow tries them in this order. */
 const CAPABLE_ORDER = ["stronger", "alternative", "default", "small"];
 
@@ -41,6 +36,12 @@ export function neededCapabilities(fields: { tools?: unknown[]; think?: unknown 
   ];
 }
 
+/**
+ * The job's model for this machine now: the first catalog pick that is installed and not known to
+ * be short of memory (unknown free memory is not "no room"), and that Ollama does not report
+ * without a capability in `needs`; `capable` takes the strongest such pick. A pick installed under
+ * another tag runs under that tag. Throws a JSON refusal naming each pick's need and what is free.
+ */
 export function pickJobModel(
   job: JobName, installed: readonly InstalledModel[] | null, availableBytes: number | null, prefer: "default" | "capable" = "default", needs: readonly string[] = [],
 ): string {

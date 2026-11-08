@@ -4,7 +4,7 @@
 // a time and records the answer, the tool trail and whether it narrowed before reading.
 // Usage: node scripts/local-test/octocode-agent.mjs <model> [serve] [local|github|all] [adapter-for-local]
 import { spawn } from "node:child_process";
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import path from "node:path";
 
 const MODEL = process.argv[2];
@@ -54,7 +54,8 @@ const rpc = (method, params) => new Promise((resolve) => { const key = ++id; pen
 await rpc("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "octocode-agent-check", version: "1" } });
 mcp.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
 
-const reportPath = process.env.FREELLAMA_AGENT_REPORT ?? path.join(ROOT, "LOCAL_OCTOCODE.md");
+const reportPath = process.env.FREELLAMA_AGENT_REPORT ?? path.join(ROOT, ".octocode", "local-test", "LOCAL_OCTOCODE.md");
+mkdirSync(path.dirname(reportPath), { recursive: true });
 const lines = existsSync(reportPath) ? [readFileSync(reportPath, "utf8").trimEnd(), ""] : ["# LOCAL_OCTOCODE: can a local model use Octocode from the concise instructions?", "",
   "Instructions: docs/octocode/LOCAL.md and docs/octocode/GITHUB.md. Each question ran through delegate_research with the local model as the agent. One run per question on one machine, not a benchmark.", ""];
 const out = (text = "") => { lines.push(text); console.error(text); };

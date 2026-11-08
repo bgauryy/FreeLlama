@@ -27,8 +27,6 @@
     "native/index.d.ts",
     "native/package.json",
     "docs",
-    "!docs/OLLAMA_*.md",
-    "!docs/IMPROVEMENT_BACKLOG_*.md",
     "README.md",
     "CONFIGURATION.md",
     "DEVELOPING.md",

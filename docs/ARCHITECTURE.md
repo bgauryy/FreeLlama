@@ -559,7 +559,7 @@ The same selection function supplies preview receipts and managed task execution
 estimate an execution payload it does not accept; its placement is a non-reserving snapshot.
 Execution receipts expose `completion_planning`, including estimated costs and whether the comparison
 influenced selection. Ollama's cached-token counts inform prefill-rate learning; FreeLlama does not
-export or manage KV tensors. See [implementation scope](OLLAMA_IMPLEMENTATION_PLAN.md).
+export or manage KV tensors.
 
 Raw proxy traffic always uses the primary upstream. For setup and runtime verification, see
 [Run models on CPU and GPU](CPU_GPU_ROUTING.md).

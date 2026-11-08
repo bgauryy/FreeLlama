@@ -7,7 +7,7 @@ or `freellama catalog`; for the exact calls, see the [cookbooks](cookbooks/READM
 
 **Snapshot:** 2026-11-01. Apple M2 Pro, 32 GB unified memory, Ollama 0.40.13, FreeLlama 0.8.0. Other
 work was running throughout, leaving about 4–14 GB available. Each model answered the same questions
-in three rounds, one model at a time ([LOCAL_RIVALS.md](../LOCAL_RIVALS.md)). "Best" means best among
+in three rounds, one model at a time (`scripts/local-test/rivals.mjs`). "Best" means best among
 the models tried here, on small question sets, drawn images and generated speech; a difference of one
 or two questions is noise.
 
@@ -175,12 +175,9 @@ least one tool call.
 
 ## Detailed results
 
-- `LOCAL_TEST.md`: 100 graded questions by group.
-- `LOCAL_LIFECYCLE.md`: load, unload, CPU and GPU, queues, caching.
-- `LOCAL_ASSIST.md`: issue to code, duplicates, triage, OCR on a real repository.
-- `LOCAL_OFFLOAD.md`: decisions, ranking and OCR through MCP.
-- `LOCAL_MEDIA.md`: speech round trip, image search, code search comparison.
-- `LOCAL_OCTOCODE.md`: local models using Octocode.
+Rerun the harnesses in `scripts/local-test/` for current numbers (see
+[Testing](TESTING.md#run-live-model-harnesses)); each writes its report to the git-ignored
+`.octocode/local-test/`.
 
 ## Sources
 

@@ -38,8 +38,7 @@ the ratings as a first screen for these exact tags, not a benchmark.
 ### What they did for a coding agent
 
 Measured 2026-10-31 on the same M2 Pro (Ollama 0.40.13, FreeLlama 0.8.0) while builds and editors
-kept it swapping; full tables in [LOCAL_TEST.md](../LOCAL_TEST.md), [LOCAL_ASSIST.md](../LOCAL_ASSIST.md)
-and [LOCAL_LIFECYCLE.md](../LOCAL_LIFECYCLE.md).
+kept it swapping; rerun the [live model harnesses](TESTING.md#run-live-model-harnesses) for current tables.
 
 | Agent chore | Model | Result | Cost |
 |---|---|---|---|

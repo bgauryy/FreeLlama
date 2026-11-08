@@ -206,6 +206,19 @@ placement, shared-memory contention, or OCR quality.
 The historical CPU/GPU observations above predate the corrected paired-run acceptance gate.
 They remain records of those runs and do not qualify a release.
 
+## Run live model harnesses
+
+These scripts measure installed models through a running `serve`. They are not part of any test
+tier, and each writes a dated report to the git-ignored `.octocode/local-test/`.
+
+| Script | Measures |
+|---|---|
+| `scripts/local-test/rivals.mjs` | The graded questions in `cases.mjs` on rival models per job, three rounds, resumable |
+| `scripts/local-test/lifecycle.mjs` | Cold and warm calls, keep-alive, unload, switching, queue priorities, prompt caching, CPU vs GPU |
+| `scripts/local-test/assist.mjs` | Issue to code, duplicates, triage and OCR on a real repository |
+| `scripts/local-test/media.mjs` | Speech round trip, multimodal image search, embedding comparison through MCP |
+| `scripts/local-test/octocode-agent.mjs` | A local model driving Octocode through `delegate_research` |
+
 ## Verify release packages
 
 ```bash

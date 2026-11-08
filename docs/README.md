@@ -31,17 +31,6 @@ Start with the [repository README](https://github.com/bgauryy/FreeLlama/blob/mai
 | Run development and release checks | [Testing](TESTING.md), [release packages](TESTING.md#verify-release-packages) |
 | Embed the routing core | [Rust core](https://github.com/bgauryy/FreeLlama/blob/main/packages/rust-core/README.md) |
 | Use the read-only status page | `/_freellama/ui` on a running `serve` (see [Monitoring](MONITORING.md)) |
-
-## Evidence and design
-
-| Goal | Source |
-|---|---|
-| Understand Ollama and competitor findings | [Resource audit](OLLAMA_RESOURCE_AUDIT_2026-11-01.md) |
-| Review the completion-planning implementation | [Implementation plan](OLLAMA_IMPLEMENTATION_PLAN.md) |
-| Compare before/after ratings, Ollama competitors and model coverage | [Follow-up evaluation](OLLAMA_BEFORE_AFTER_COMPETITORS_2026-11-01.md) |
-| Review the subsequent correctness, memory and caching fixes | [Ollama coordination hardening](OLLAMA_HARDENING_2026-11-01.md) |
-| Check the latest repeat audit, repairs and current ratings | [Implementation recheck](OLLAMA_RECHECK_2026-11-01.md) |
-| Prioritize the 50 proposed improvements against current code | [Validated improvement backlog](IMPROVEMENT_BACKLOG_VALIDATED_2026-11-01.md) |
 | Configure durable receipts, idempotency and bounded job retention | [Deferred jobs and recovery](DEFERRED_JOBS.md) |
 
 Historical measurements describe one model, machine, and workload. Inspect current state and

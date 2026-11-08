@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Head-to-head: the same questions on rival models for each job, three rounds, one model at a time.
 // A model runs when FreeLlama would admit it (a route preview loads nothing); smaller groups go first,
-// larger ones wait for room. Progress is saved, so a rerun resumes. Writes LOCAL_RIVALS.md.
+// larger ones wait for room. Progress is saved, so a rerun resumes. Writes .octocode/local-test/LOCAL_RIVALS.md (git-ignored).
 // Usage: node scripts/local-test/rivals.mjs [serve]
 import { execFileSync, spawn } from "node:child_process";
 import { existsSync, globSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
@@ -13,7 +13,8 @@ const SERVE = (process.argv[2] ?? "http://127.0.0.1:11455").replace(/\/$/, "");
 const API = `${SERVE}/_freellama/v1`;
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../..");
 const STORE = path.join(ROOT, ".octocode/tmp/rivals.json");
-const REPORT = path.join(ROOT, "LOCAL_RIVALS.md");
+const REPORT = path.join(ROOT, ".octocode", "local-test", "LOCAL_RIVALS.md");
+mkdirSync(path.dirname(REPORT), { recursive: true });
 const WORK = path.join(tmpdir(), "freellama-rivals");
 const ROUNDS = 3;
 const NEMOTRON = "hf.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-4GB:Q4_K_M";
