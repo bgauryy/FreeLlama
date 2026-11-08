@@ -18,6 +18,7 @@ server-launch config (for example `.mcp.json`'s `env` block) or the launching sh
 | `FREELLAMA_MCP_PULL_TIMEOUT_SECONDS` | `1200` | Default `ollama_manage` `"pull"` timeout |
 | `FREELLAMA_MCP_FETCH_TIMEOUT_SECONDS` | `30` | Timeout for other direct Ollama HTTP calls |
 | `FREELLAMA_MCP_ALLOWED_ROOTS` | checkout: this repository; published: must be set | Platform-separated allowlist of directories `delegate_research` may read (`:` on macOS/Linux, `;` on Windows) |
+| `FREELLAMA_FILE_ROOTS` | unset | Platform-separated extra directories `run_task` and `audio` may read `files` from and `audio` may write `outputFile` to, besides the temp directory and the server's working directory (the working directory is skipped when it is `/` or the home directory) |
 | `FREELLAMA_MCP_MODEL_EVIDENCE` | checkout: `packages/mcp/evidence/model-evidence.json`; published: unset | Path to per-model research grades (see "Runtime evidence") |
 | `FREELLAMA_EXTERNAL_COST_MODEL` | unset | External-model label in estimated avoided-cost telemetry; set all three cost variables or none |
 | `FREELLAMA_EXTERNAL_COST_INPUT_USD_PER_M` | unset | External input USD per million tokens |

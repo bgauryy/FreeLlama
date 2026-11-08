@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 // The compiled addon is not loadable under vitest; these helpers do not use it.
 vi.mock("../../src/native.js", () => ({}));
-import { doctorStatus, serveReadiness } from "../../src/tools/doctor.js";
+import { doctorStatus, ollamaProblems, serveReadiness } from "../../src/tools/doctor.js";
 
 const servers: Server[] = [];
 afterEach(async () => {
@@ -42,5 +42,14 @@ describe("doctor status", () => {
     expect(await serveReadiness(await serve(404, ""))).toMatchObject({ supported: false });
     expect(await serveReadiness(await serve(401, "{}"))).toEqual({ http_status: 401 });
     expect(await serveReadiness("http://127.0.0.1:9")).toHaveProperty("unreachable");
+  });
+});
+
+describe("doctor status problems", () => {
+  it("names each backend whose Ollama residency query failed", () => {
+    expect(ollamaProblems({ loaded_models: [{ backend: "gpu", error: "error sending request for url (http://127.0.0.1:11434/api/ps)" }] }))
+      .toEqual([expect.stringMatching(/^Ollama unreachable on backend gpu .*ask the user to start Ollama$/)]);
+    expect(ollamaProblems({ loaded_models: [{ backend: "gpu", models: [] }] })).toEqual([]);
+    expect(ollamaProblems({})).toEqual([]);
   });
 });

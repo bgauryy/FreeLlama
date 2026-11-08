@@ -40,8 +40,10 @@ fn ollama_endpoint_or_default(endpoint: Option<String>) -> String {
         .unwrap_or_else(|| DEFAULT_OLLAMA_ENDPOINT.to_owned())
 }
 
+/// The whole cause chain (`{:#}` on anyhow): the outer context alone ("connect to Ollama") hid
+/// the endpoint and the cause the MCP layer reads to say that Ollama is down.
 fn to_napi_err(error: impl std::fmt::Display) -> Error {
-    Error::from_reason(error.to_string())
+    Error::from_reason(format!("{error:#}"))
 }
 
 /// [`crate::serve_client::authenticate`], with the error named for the JavaScript caller.

@@ -111,6 +111,13 @@ describe("files on run_task", () => {
     expect(roots).toContain(realpathSync(root));
     expect(roots.length).toBe(4);
   });
+
+  it("does not treat a working directory of / or the home directory as a project root", () => {
+    const home = mkdtempSync(path.join(tmpdir(), "freellama-home-"));
+    expect(fileRoots({}, "/", home)).not.toContain("/");
+    expect(fileRoots({}, home, home)).not.toContain(realpathSync(home));
+    expect(fileRoots({}, root, home)).toContain(realpathSync(root));
+  });
 });
 
 describe("nearest text", () => {

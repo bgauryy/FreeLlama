@@ -9,6 +9,7 @@ import {
   endpointParam, errorResult, executionPreferenceParam, messagesParam, minPlacementEvidenceParam, ollamaEndpointParam,
   isStructuredSuccess, lifecycleText, ollamaFetch, parsedResult, structuredResult, systemPromptParam, taskMessages, taskParam,
 } from "../helpers.js";
+import { runWithJobProgress } from "../job-progress.js";
 import { progressSink, type ToolExtra } from "../progress.js";
 import { serveUnload } from "../serve-http.js";
 
@@ -172,7 +173,8 @@ export function registerOllamaLifecycleTools(server: McpServer): void {
         defer: z.boolean().optional(),
       }).strict(),
       outputSchema: manageResultSchema,
-      annotations: { destructiveHint: false },
+      // pull downloads from the internet; unload ends another client's warm runner.
+      annotations: { destructiveHint: false, openWorldHint: true },
     },
     async ({ action, model, ollamaEndpoint, endpoint, timeoutSeconds, task, contextTokens, systemPrompt, messages,
       keepAlive, executionPreference, minPlacementEvidence, priority, maxWaitSeconds, defer }, extra) => {
@@ -190,16 +192,31 @@ export function registerOllamaLifecycleTools(server: McpServer): void {
           if (ollamaEndpoint !== undefined) return errorResult(new Error('warm runs through serve; pass `endpoint`, not `ollamaEndpoint`.'));
           const prefix = taskMessages({ systemPrompt, messages });
           // Loaded on use: the serve client needs the native addon, which pull and unload do not.
-          const { warmModelRequest } = await import("../serve-client.js");
-          const warmed = parsedResult(await warmModelRequest(endpoint, {
+          const { warmModelRequest, getTaskJob, cancelTaskJob } = await import("../serve-client.js");
+          const request = {
             model, task, context_tokens: contextTokens, messages: prefix.length === 0 ? undefined : prefix,
             execution_preference: executionPreference, min_placement_evidence: minPlacementEvidence,
             priority, keep_alive: keepAlive, max_wait_seconds: maxWaitSeconds, timeout_seconds: timeoutSeconds, defer,
-          }));
+          };
+          // A cold load can outlast the client's request timeout. Run it as a job so each phase
+          // (queued, waiting for memory, loading) is reported and a client cancel stops it.
+          const warmed = parsedResult(defer === true
+            ? await warmModelRequest(endpoint, request)
+            : await runWithJobProgress({
+              submit: () => warmModelRequest(endpoint, { ...request, defer: true }),
+              get: (id) => getTaskJob(endpoint, id),
+              cancel: (id) => cancelTaskJob(endpoint, id),
+              // Reached only when serve refused the job before running it (registry full).
+              sync: () => warmModelRequest(endpoint, request),
+            }, progressSink(extra) ?? (() => undefined), { signal: extra.signal }));
           // One line for the model; the receipt with its execution diagnostics stays structured.
           return isStructuredSuccess(warmed)
             ? structuredResult(warmed.structuredContent, { text: lifecycleText("warm", model, warmed.structuredContent) })
             : warmed;
+        }
+        // A bare family name resolves to `:latest`, whose size the user never saw.
+        if (action === "pull" && !/:[^/:]+$/.test(model)) {
+          return errorResult(new Error(`pull needs an exact tag such as ${model}:<tag>; list tags and sizes with models{view:"library", model:"${model}"} and ask the user to approve one.`));
         }
         if (action === "unload" && timeoutSeconds !== undefined) {
           return errorResult(new Error('`timeoutSeconds` is valid only for actions "pull" and "warm".'));

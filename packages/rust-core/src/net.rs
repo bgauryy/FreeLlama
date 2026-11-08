@@ -207,3 +207,29 @@ mod tls_root_tests {
         super::build_http_client(|builder| builder).expect("client builds");
     }
 }
+
+/// Resolves when the process is asked to stop: Ctrl-C, or SIGTERM on Unix (what supervisors and
+/// the MCP server send to an autostarted `serve`). Graceful shutdown waits on this so the usage
+/// ledger flushes and owned child processes are stopped instead of orphaned.
+pub async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = terminate.recv() => {}
+                }
+                return;
+            }
+            Err(error) => {
+                eprintln!("freellama: SIGTERM handler unavailable ({error}); Ctrl-C only");
+            }
+        }
+    }
+    if let Err(error) = tokio::signal::ctrl_c().await {
+        eprintln!("freellama: Ctrl-C handler unavailable ({error})");
+        std::future::pending::<()>().await;
+    }
+}

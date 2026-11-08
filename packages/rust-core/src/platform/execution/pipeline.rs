@@ -166,7 +166,9 @@ async fn run_admitted_task(
     let requested_cost = task_cost_for(input.route.task, batch_items, &state.tunables());
     let models =
         super::super::catalog::discover_for_route(&state, input.route.model.as_deref()).await?;
-    let sessions = state.sessions.read().await;
+    // Snapshot the small affinity map: holding the read guard across routing's Ollama calls
+    // queued every session write behind one `/api/ps`, and routing takes `feedback` next.
+    let sessions = state.sessions.read().await.clone();
     let mut managed = select_managed_route(
         &state,
         &input.route,
@@ -176,7 +178,6 @@ async fn run_admitted_task(
         Some(&input),
     )
     .await?;
-    drop(sessions);
     // A `vision` capability tag is metadata, not evidence the build reads images (MLX conversions
     // have shipped without the vision head). Automatic image routing therefore needs an operator
     // policy naming the model for `vision`; otherwise the caller names a model it has trialled.

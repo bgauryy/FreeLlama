@@ -495,9 +495,7 @@ pub async fn serve(config: PlatformConfig) -> Result<()> {
         config.listen
     );
     axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
+        .with_graceful_shutdown(crate::net::shutdown_signal())
         .await
         .context("serve platform")?;
     if !state.telemetry.flush_ledger(Duration::from_secs(2)).await {
@@ -576,13 +574,16 @@ async fn ready(State(state): State<PlatformState>) -> axum::response::Response {
 /// tool so the surface does not grow.
 async fn health(State(state): State<PlatformState>) -> Json<Value> {
     let resource_snapshot = state.resources.snapshot().await;
-    let feedback = state.feedback.read().await;
-    let persistence_error = state.feedback_persistence_error.read().await.clone();
+    // Lock order: `sessions` is never taken while `feedback` is held. Routing reads `feedback`
+    // under a `sessions` snapshot, and tokio's fair RwLock would let a queued feedback writer
+    // close the cycle.
     let active_sessions = {
         let mut sessions = state.sessions.write().await;
         sessions.prune_expired(state.session_ttl);
         sessions.len()
     };
+    let feedback = state.feedback.read().await;
+    let persistence_error = state.feedback_persistence_error.read().await.clone();
     let gpu_admission = state.gpu_admission.receipt();
     let cpu_admission = state.cpu_admission.receipt();
     let feedback_for = |placement: Backend| {
@@ -730,11 +731,11 @@ async fn route(
 ) -> Result<Json<Value>, ApiError> {
     require_active_session(&state, input.session_id.as_deref()).await?;
     let models = catalog::discover_for_route(&state, input.model.as_deref()).await?;
-    let sessions = state.sessions.read().await;
+    // Snapshot the small affinity map so no lock is held across routing's Ollama calls.
+    let sessions = state.sessions.read().await.clone();
     let requested_cost = state.tunables().task_cost(input.task);
     let managed =
         select_managed_route(&state, &input, &models, &sessions, requested_cost, None).await?;
-    drop(sessions);
     let mut value = serde_json::to_value(&managed.route).expect("RouteDecision serializes");
     value["execution"] = managed.execution_receipt(requested_cost, &state).await;
     Ok(Json(value))

@@ -50,13 +50,13 @@ sha2.workspace = true
 hmac.workspace = true
 tokio.workspace = true
 toml.workspace = true
-tempfile.workspace = true
 uuid.workspace = true
 
 [build-dependencies]
 napi-build = { workspace = true, optional = true }
 
 [dev-dependencies]
+tempfile.workspace = true
 tower = { version = "0.5.3", features = ["util"] }
 
 [lints]

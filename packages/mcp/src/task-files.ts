@@ -1,7 +1,7 @@
 // `files` on run_task: the server reads the paths an agent names, so the agent does not re-emit a
 // log, a screenshot or a source file as its own output tokens. Each task gives files one role.
 import { globSync, realpathSync, statSync, readFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 
 /** Largest file read as text; larger inputs are the caller's to cut where meaning allows. */
@@ -90,9 +90,13 @@ export function chunkLines(text: string, limit = EMBEDDING_CHUNK_BYTES): Array<{
  * and `FREELLAMA_FILE_ROOTS` (path-delimited). Reading stays inside what the agent could already
  * reach in its project, so a file the host would not show the agent is not read here either.
  */
-export function fileRoots(env: NodeJS.ProcessEnv = process.env, cwd = process.cwd()): string[] {
+export function fileRoots(env: NodeJS.ProcessEnv = process.env, cwd = process.cwd(), home = homedir()): string[] {
   const configured = (env.FREELLAMA_FILE_ROOTS ?? "").split(path.delimiter).filter(Boolean);
-  return [cwd, tmpdir(), ...configured].map(resolvedRoot);
+  // A host that starts the server from `/` or the home directory would otherwise expose every
+  // file there; such a working directory is not a project, so only configured roots apply.
+  const broad = new Set([path.parse(path.resolve(cwd)).root, resolvedRoot(home)]);
+  const project = broad.has(resolvedRoot(cwd)) ? [] : [cwd];
+  return [...project, tmpdir(), ...configured].map(resolvedRoot);
 }
 
 /** A root as files resolve: through symlinks (macOS `/var` is `/private/var`). */
@@ -104,7 +108,7 @@ function resolvedRoot(root: string): string {
   }
 }
 
-function within(file: string, root: string): boolean {
+export function within(file: string, root: string): boolean {
   const relative = path.relative(root, file);
   return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
 }

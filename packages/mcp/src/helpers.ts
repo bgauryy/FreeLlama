@@ -517,7 +517,14 @@ export function batchAnswerText(payload: Record<string, unknown>): string | unde
   const lines = payload.results.map((row) => {
     const item = record(row) ?? {};
     const id = String(item.id ?? "?");
-    if (item.ok !== true) return `## ${id} (failed)\n${JSON.stringify(item.error ?? item)}`;
+    // One line per failure; the full error stays in structuredContent and the response file.
+    if (item.ok !== true) {
+      const error = record(item.error);
+      const line = typeof error?.error === "string"
+        ? refusalLine(JSON.stringify(error))
+        : oneLine(JSON.stringify(item.error ?? item), 400);
+      return `## ${id} (failed)\n${line}`;
+    }
     const answer = taskAnswerText(record(item.response) ?? {}) ?? "(no answer)";
     return `## ${id}\n${answer}`;
   });
@@ -632,7 +639,7 @@ export function errorResult(error: unknown) {
   const ollamaUnavailable =
     !managedServeUnavailable &&
     /(?:connection refused|connect error|failed to connect|error sending request)/i.test(message) &&
-    /\/api\/(?:tags|ps|chat|generate|embed|show)/.test(message);
+    /\/api\/(?:tags|ps|chat|generate|embed|show|version)/.test(message);
   const actionableMessage = managedServeUnavailable
     ? `${message}\n\nFreeLlama managed serve is unreachable. Start it with \`freellama serve\`, or set \`FREELLAMA_SERVE_ENDPOINT\` to a running managed endpoint; then retry. Run \`doctor\` to inspect the configured endpoint.`
     : ollamaUnavailable

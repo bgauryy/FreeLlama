@@ -31,6 +31,7 @@ export function statusText(status: Fields): string {
       `memory pressure ${String(host.memory_pressure ?? "?")}, load ${String(host.load_average_one_minute ?? "?")}` +
       (reasons.length > 0 ? `; reasons: ${reasons.join(", ")}` : "") + ".",
   );
+  for (const problem of list(status.problems)) lines.push(`problem: ${String(problem)}`);
   for (const [name, backend] of Object.entries(obj(status.backends) ?? {})) {
     const admission = obj(obj(backend)?.admission);
     if (!admission) continue;
@@ -40,7 +41,14 @@ export function statusText(status: Fields): string {
         (num(admission.resource_waiters) ? `, ${String(admission.resource_waiters)} waiting for memory` : "") + ".",
     );
   }
-  const loaded = list(status.loaded_models).map((m) => str(obj(m)?.name ?? obj(m)?.model) ?? String(m));
+  // Rows are models, or per-backend groups ({backend, models}); a failed backend ({backend, error})
+  // is already a `problem:` line.
+  const loaded = list(status.loaded_models).flatMap((m) => {
+    const row = obj(m);
+    if (row && typeof row.error === "string") return [];
+    if (row && Array.isArray(row.models)) return row.models.map((model) => str(obj(model)?.name ?? obj(model)?.model) ?? String(model));
+    return [str(row?.name ?? row?.model) ?? String(m)];
+  });
   lines.push(`loaded models: ${loaded.length === 0 ? "none" : capped(loaded)}.`);
   const jobs = list(obj(status.task_jobs)?.jobs);
   lines.push(`task jobs: ${jobs.length}.`);

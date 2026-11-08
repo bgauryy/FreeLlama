@@ -122,6 +122,7 @@ function withFiles<T extends TaskPayload & { files?: string[] }>(task: T, label?
 export const BATCH_SHARED_FIELDS: ReadonlySet<string> = new Set([
   "task", "model", "objective", "sessionId", "contextTokens", "executionPreference", "systemPrompt", "questions",
   "format", "think", "options", "keepAlive", "priority", "timeoutSeconds", "maxWaitSeconds", "stopOnRepetition", "tools",
+  "minConfidence", "requiredCapabilities", "minPlacementEvidence",
 ]);
 
 function withoutUndefined<T extends object>(value: T): Partial<T> {
@@ -348,6 +349,11 @@ async function runCancellableBatch(
     }
     return pending.shift()!;
   };
+  let settled = 0;
+  const settle = (id: string, ok: boolean) => {
+    settled += 1;
+    report?.(`${settled}/${tasks.length} items done (${id} ${ok ? "ok" : "failed"})`);
+  };
   await Promise.all(Array.from({ length: parallelism }, async () => {
     while (pending.length > 0) {
       const index = next();
@@ -364,11 +370,13 @@ async function runCancellableBatch(
         if (item.task.task === "embedding") validateEmbeddingVectors(object(response.response)?.embeddings,
           Array.isArray(item.task.input) ? item.task.input.length : 1);
         results[index] = { id: item.id, ok: true, response, ...(jobIds.length ? { accepted_job_ids: jobIds } : {}) };
+        settle(item.id, true);
       } catch (error) {
         let body: Fields | undefined;
         try { body = object(JSON.parse(error instanceof Error ? error.message : String(error))); } catch { /* retain plain transport failures */ }
         results[index] = { id: item.id, ok: false, error: body ?? { error: error instanceof Error ? error.message : String(error) },
           ...(jobIds.length ? { accepted_job_ids: jobIds } : {}) };
+        settle(item.id, false);
       }
     }
   }));
@@ -530,7 +538,7 @@ export function registerRunTaskTool(server: McpServer): void {
         topLogprobs: z.number().int().nonnegative().optional(),
         minConfidence: minConfidenceParam,
         priority: z.enum(["interactive", "normal", "background"]).optional(),
-        maxWaitSeconds: z.number().int().positive().optional().describe("capped by the operator's max_queue_wait_seconds (default 120); a lowered waits show as wait_limit"),
+        maxWaitSeconds: z.number().int().positive().optional().describe("capped by the operator's max_queue_wait_seconds (default 120); lowered waits show as wait_limit"),
         timeoutSeconds: z.number().int().positive().optional(),
         stopOnRepetition: z
           .boolean()

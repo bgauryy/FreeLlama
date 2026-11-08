@@ -44,6 +44,17 @@ export function doctorStatus(report: Fields): { status: "ok" | "degraded"; probl
   return { status: problems.length > 0 ? "degraded" : "ok", problems };
 }
 
+/** "Ollama unreachable on backend gpu (…)" for each backend whose residency query failed. */
+export function ollamaProblems(status: Fields): string[] {
+  const loaded = Array.isArray(status.loaded_models) ? status.loaded_models : [];
+  return loaded.flatMap((entry) => {
+    const row = entry as Fields;
+    return typeof row?.error === "string"
+      ? [`Ollama unreachable on backend ${String(row.backend ?? "?")} (${row.error}); ask the user to start Ollama`]
+      : [];
+  });
+}
+
 export function registerDoctorTool(server: McpServer): void {
   server.registerTool(
     "doctor",
@@ -62,7 +73,19 @@ export function registerDoctorTool(server: McpServer): void {
       try {
         if (days !== undefined && view !== "usage") return errorResult(new Error("days is only valid with view: usage."));
         // Live views come from serve alone; they do not need the Ollama half of the diagnostic.
-        if (view === "status") return withText(parsedResult(await status(serveEndpoint)), statusText);
+        if (view === "status") {
+          const live = parsedResult(await status(serveEndpoint));
+          // serve's own `status` is its liveness; a backend whose /api/ps failed means Ollama is
+          // down, which is what decides whether a task can run.
+          if (isStructuredSuccess(live)) {
+            const problems = ollamaProblems(live.structuredContent);
+            if (problems.length > 0) {
+              live.structuredContent.status = "degraded";
+              live.structuredContent.problems = problems;
+            }
+          }
+          return withText(live, statusText);
+        }
         if (view === "usage") return withText(parsedResult(await usage(serveEndpoint, days)), usageText);
         const report = parsedResult(await doctor(ollamaEndpoint));
         if (!isStructuredSuccess(report)) return report;

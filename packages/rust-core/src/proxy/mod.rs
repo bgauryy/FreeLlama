@@ -163,7 +163,7 @@ pub fn app(config: ProxyConfig) -> Result<Router> {
 }
 
 async fn shutdown() {
-    let _ = tokio::signal::ctrl_c().await;
+    crate::net::shutdown_signal().await;
 }
 
 /// How a raw request is admitted. Only generations take the execution lock and memory checks.
