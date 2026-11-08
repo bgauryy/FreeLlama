@@ -29,7 +29,13 @@ prompts, task dependencies, judgment, and verification. Ollama and the host exec
 - CPU eligibility is operator-owned. Preferences cannot move arbitrary models to another backend.
   Configured assignment is intent; require returned observed evidence when placement matters.
 - `delegate_research` is bounded read-only lookup. The caller retains decomposition, judgment,
-  mutation authority, and final verification. Discard an `escalate` result.
+  mutation authority, and final verification. Discard an `escalate` result. The one writing
+  adapter, `coder`, is operator opt-in (`FREELLAMA_MCP_ALLOW_CODER=1`): it edits and runs only
+  allowlisted commands in an isolated worktree copy and returns a patch; the caller reviews and
+  applies it. It never writes the caller's tree.
+- `run_task {job}` is an explicit opt-in to FreeLlama's model pick and local prompts
+  (`packages/mcp/src/local-prompts.ts`, the single owner of local-model instructions); any field
+  the caller sends wins. Act on a result's `check:` lines before relying on it.
 - An empty LSP result is ambiguous. Retry or search instead; a cold zero does not prove a language
   is unsupported. Structural code search requires `pattern` or `rule`, not `keywords` alone.
 - Research adapter implementations live only in `packages/mcp/src/research/`. Preserve full audit

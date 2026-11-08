@@ -3,7 +3,7 @@
 import path from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as z from "zod";
-import { AGENT_CHECKS, AGENT_GUIDE, APPLY_EDITS, OCR_PROMPTS, TOOL_JOBS } from "./local-prompts.js";
+import { AGENT_CHECKS, AGENT_GUIDE, APPLY_EDITS, TOOL_JOBS, WORKFLOWS, type WorkflowName } from "./local-prompts.js";
 import { expandFileEntries } from "./task-files.js";
 
 type Args = Record<string, unknown>;
@@ -44,22 +44,6 @@ const otherPicks = (job: string) => `If that model is not installed or does not 
 
 /** Every prompt: name, description, arguments and the message it returns. */
 export const BUILTIN_PROMPTS = {
-  ocr: {
-    description: "Read the text in images with the local OCR job",
-    argsSchema: { file: filesArg, kind: z.enum(["text", "table", "formula"]).optional().describe("default text") },
-    build: ({ file, kind }: { file: string; kind?: "text" | "table" | "formula" }) => {
-      const { args, note } = perFile(file, { job: "ocr" }, kind && kind !== "text" ? { prompt: OCR_PROMPTS[kind] } : {});
-      return message("Read the text in these images on a local OCR model. Call:", call("run_task", args), note, AGENT_CHECKS.ocr);
-    },
-  },
-  image: {
-    description: "Ask a question about images with the local image-recognition job",
-    argsSchema: { file: filesArg, question: z.string().describe("what to find out, e.g. which bar is tallest") },
-    build: ({ file, question }: { file: string; question: string }) => {
-      const { args, note } = perFile(file, { job: "image-recognition" }, { prompt: question });
-      return message("Ask a local vision model about these images. Call:", call("run_task", args), note, AGENT_CHECKS.image);
-    },
-  },
   classify: {
     description: "Label or yes/no-check each file with the local decision job",
     argsSchema: { files: filesArg, question: z.string(), labels: z.string().optional().describe("comma-separated; omit for yes/no") },
@@ -69,7 +53,7 @@ export const BUILTIN_PROMPTS = {
         ? { label: { type: "choice", instructions: question, criteria: { ...Object.fromEntries(options.map((option) => [option, option])), ...(options.includes("other") ? {} : { other: "None of these fits" }) } } }
         : { answer: { type: "noul", instructions: question } };
       const { args, note } = perFile(files, { job: "classify", questions });
-      return message("Classify each file on a local decision model. Call:", call("run_task", args), note, AGENT_CHECKS.classify);
+      return message("Classify each file on a local decision model. Call:", call("run_task", args), note, RESULT_LINE);
     },
   },
   "find-code": {
@@ -77,27 +61,14 @@ export const BUILTIN_PROMPTS = {
     argsSchema: { question: z.string().describe("the issue, or what the code does"), files: filesArg },
     build: ({ question, files }: { question: string; files: string }) => message(
       "Rank the code against the question on a local embedding model. Call:",
-      call("run_task", { job: "find-code", files: list(files), nearest: { query: question, top: 5 } }), AGENT_CHECKS["find-code"]),
+      call("run_task", { job: "find-code", files: list(files), nearest: { query: question, top: 5 } }), RESULT_LINE),
   },
   duplicates: {
     description: "Find likely duplicate texts with a local embedding model",
     argsSchema: { files: filesArg },
     build: ({ files }: { files: string }) => message(
       "Find the most similar pairs on a local embedding model. Call:",
-      call("run_task", { job: "duplicates", files: list(files), nearest: { top: 10 } }), AGENT_CHECKS.duplicates),
-  },
-  coding: {
-    description: "Have a local model draft one small change as SEARCH/REPLACE edits",
-    argsSchema: { file: filesArg, change: z.string().describe("the change to make") },
-    build: ({ file, change }: { file: string; change: string }) => message(
-      "Draft the change on a local coding model. Call:", call("run_task", { job: "coding", files: list(file), prompt: change }), APPLY_EDITS),
-  },
-  summarize: {
-    description: "Summarize files with a local model",
-    argsSchema: { files: filesArg, question: z.string().optional().describe("what the summary must answer") },
-    build: ({ files, question }: { files: string; question?: string }) => message(
-      "Summarize on a local model. Call:", call("run_task", { job: "summarize", files: list(files), ...(question ? { prompt: question } : {}) }),
-      "Add saveAs:\"<name>\" to hand the summary to a later task as a file.", AGENT_CHECKS.summarize),
+      call("run_task", { job: "duplicates", files: list(files), nearest: { top: 10 } }), RESULT_LINE),
   },
   research: {
     description: "Ask a local research agent a question about a code tree",
@@ -126,7 +97,29 @@ export const BUILTIN_PROMPTS = {
   },
 } as const;
 
+/** What every run_task prompt ends with: the result says what to check. */
+const RESULT_LINE = "The result ends with check: lines worked out from it; act on them first.";
+
+/**
+ * One prompt per workflow, built from local-prompts.ts: the call that runs it on a local model.
+ * Per-file workflows (reading images, reviewing files) run one task per file.
+ */
+export function workflowPrompt(name: WorkflowName, files: string, request?: string) {
+  const flow = WORKFLOWS[name];
+  const perFileJobs = new Set(["ocr", "image-recognition"]);
+  const item = request ? { prompt: request } : {};
+  const { args, note } = perFileJobs.has(flow.job) ? perFile(files, { workflow: name }, item) : { args: { workflow: name, files: list(files), ...item }, note: undefined };
+  return message(`${flow.title} on a local model. Call:`, call("run_task", args), note,
+    flow.job === "coding" && name !== "review-code" && name !== "explain-code" ? APPLY_EDITS : undefined, RESULT_LINE);
+}
+
 export function registerBuiltinPrompts(server: McpServer): void {
+  for (const [name, flow] of Object.entries(WORKFLOWS) as Array<[WorkflowName, (typeof WORKFLOWS)[WorkflowName]]>) {
+    server.registerPrompt(name, {
+      description: `${flow.title} (${flow.input})`,
+      argsSchema: { files: filesArg, request: z.string().optional().describe("the question, change, symptom or field names") },
+    }, ((args: { files: string; request?: string }) => workflowPrompt(name, args.files, args.request)) as never);
+  }
   for (const [name, prompt] of Object.entries(BUILTIN_PROMPTS)) {
     server.registerPrompt(name, { description: prompt.description, argsSchema: prompt.argsSchema },
       ((args: never) => prompt.build(args)) as never);

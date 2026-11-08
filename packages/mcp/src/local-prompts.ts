@@ -18,7 +18,8 @@ export type Prefixes = { query?: string; document?: string };
 /** The jobs `run_task {job}` runs. */
 export const RUN_TASK_JOBS = ["classify", "find-code", "duplicates", "ocr", "image-recognition", "image-search", "coding", "summarize"] as const;
 export type JobName = (typeof RUN_TASK_JOBS)[number];
-export type PromptInput = { question?: string; kind?: string; model?: string };
+/** What a job's default prompt may depend on: the model that will run it. */
+export type PromptInput = { model?: string };
 
 export type LocalJob = {
   job: JobName;
@@ -84,42 +85,191 @@ export const EMBEDDING_PREFIXES = {
 const GEMMA = EMBEDDING_PREFIXES.embeddinggemma;
 const NOMIC = EMBEDDING_PREFIXES["nomic-embed-text"];
 
-/** The prompts both OCR picks were trained on. MiniCPM-OCR adds "Seal Recognition:" and "Chart to Table:". */
+/**
+ * The prompts both OCR picks were trained on. MiniCPM-OCR also documents "Seal Recognition:" and
+ * "Chart to Table:" and answers tables in HTML; GLM-OCR also documents "Figure Recognition:".
+ */
 export const OCR_PROMPTS = { text: "Text Recognition:", table: "Table Recognition:", formula: "Formula Recognition:" } as const;
-export type OcrKind = keyof typeof OCR_PROMPTS;
 /** Families trained on OCR_PROMPTS. Any other vision model reads a plain instruction instead. */
 const OCR_TRAINED = ["minicpm-ocr", "glm-ocr"];
-/** The same requests, worded for a general vision model that was not trained on the prefixes. */
-const OCR_PLAIN: Record<OcrKind, string> = {
+/** The read-text and read-table requests, worded for a general vision model not trained on the prefixes. */
+const OCR_PLAIN = {
   text: "Transcribe all text in the image exactly, line by line. Output only the text.",
   table: "Transcribe the table in the image as a Markdown table. Output only the table.",
-  formula: "Transcribe the formula in the image as LaTeX. Output only the LaTeX.",
 };
-const ocrPrompt = (kind: string | undefined, model: string | undefined): string => {
-  const wanted = (kind && kind in OCR_PROMPTS ? kind : "text") as OcrKind;
+const ocrPrompt = (kind: keyof typeof OCR_PLAIN, model: string | undefined): string => {
   const name = (model ?? "").toLowerCase().replace(/^(?:hf\.co|huggingface\.co)\/[^/]+\//, "");
-  return model === undefined || OCR_TRAINED.some((family) => name.startsWith(family)) ? OCR_PROMPTS[wanted] : OCR_PLAIN[wanted];
+  return model === undefined || OCR_TRAINED.some((family) => name.startsWith(family)) ? OCR_PROMPTS[kind] : OCR_PLAIN[kind];
 };
 
-const CODING_SYSTEM = `You make small code changes. Reply with the edits only; explain nothing unless the task asks.
-Change an existing file with one or more blocks in exactly this form:
-path/to/file.ts
+// ---- Workflows: what a local model is told to do, step by step, for one kind of task. ----
+// run_task {workflow} sends one as the system prompt (the caller's request is the user message);
+// run_task {job} without a workflow sends the model's documented system prompt, else the job's
+// own (applyJob in job-mode.ts). Short on purpose: these models are 2-30B.
+
+/** How a coding workflow returns a change. */
+const EDIT_FORMAT = `Return each change to an existing file as the file's path (copied from its "--- file:" line), then:
 <<<<<<< SEARCH
 exact current lines (5 to 30, unique in the file, indentation exact)
 =======
 replacement lines
 >>>>>>> REPLACE
-Copy SEARCH lines character for character from the file shown; never shorten them. Prefer several small blocks to one large one.
-For a new file, or one under 30 lines, write its path on one line, then the whole file in one fenced code block.
-If the file was not shown, you cannot copy its lines: return the new or changed code in one fenced block and say which file and function it belongs in.
-If the task asks a question rather than a change, answer it in a few lines.`;
+Copy SEARCH lines character for character; prefer several small blocks to one large one. For a new file, or one under 30 lines, give its path on one line and the whole file in one fenced block. If the file was not shown, give the code in one fenced block and say which file and function it belongs in.`;
 
-const SUMMARIZE_SYSTEM = `Summarize the text you are given as short bullet points.
-Keep the facts the task asks for. Quote numbers, names, versions and paths exactly.
-If the text does not say something the task asks, write "not stated"; never guess.
-No introduction and no closing remarks.`;
+export type Workflow = {
+  /** The job whose model picks run it. */
+  job: JobName;
+  /** One line for the calling agent. */
+  title: string;
+  /** What the caller sends: the request goes in `prompt`, inputs in `files`. */
+  input: string;
+  /** The local model's instructions; for OCR-trained models the trained prefix is sent instead. */
+  system?: string;
+  /** The user message when the caller's prompt is the input to it (OCR prefixes, field lists). */
+  prompt?: (request: string | undefined, model: string | undefined) => string;
+  /** Ollama `format` (structured output). */
+  format?: "json";
+  /** `capable`: run on the strongest catalog pick that fits now, for work a 2B model does badly. */
+  prefer?: "capable";
+  /** Thinking for this kind of task; false for bounded output, where reasoning only adds time and can leak into the answer. */
+  think?: boolean;
+};
 
-const IMAGE_SYSTEM = 'Answer the question about the image from what it shows. Be brief: the value, the label, or one or two sentences. If the image does not show it, say "not visible".';
+/**
+ * Every text workflow starts here: small models invent tool calls when they see file paths. Job
+ * mode drops this line when the caller sends `tools`.
+ */
+export const NO_TOOLS = "You have no tools and cannot open files: everything you need is in this message. Answer in plain text.";
+
+export const WORKFLOWS = {
+  "read-text": {
+    job: "ocr", title: "Read all text in an image, exactly", input: "files: the images",
+    prompt: (_request, model) => ocrPrompt("text", model),
+  },
+  "read-table": {
+    job: "ocr", title: "Read a table in an image as Markdown", input: "files: the images",
+    prompt: (_request, model) => ocrPrompt("table", model),
+  },
+  "read-fields": {
+    job: "ocr", title: "Pull named fields from a receipt, invoice or form image as JSON", input: "files: the images; prompt: the field names",
+    prompt: (request) => `Extract these fields from the image: ${request ?? "all labelled fields"}. Format the output as a JSON object with these keys, values exactly as printed; use "###" for a field the image does not show.`,
+  },
+  "answer-image": {
+    job: "image-recognition", title: "Answer a question about an image", input: "files: the images; prompt: the question",
+    system: `Answer the question about the image.
+1. Find the part of the image the question is about.
+2. Read any text there exactly as printed.
+3. Answer with just the value or label, or one or two sentences.
+If the image does not show it, answer "not visible". Never guess at what is cut off.`,
+  },
+  "describe-screen": {
+    job: "image-recognition", title: "Describe a screenshot for a developer: text, errors, state", input: "files: the screenshot; prompt: what to look for (optional)",
+    system: `You describe a software screenshot for a developer, in short bullets, in this order:
+- the app or page shown;
+- headings and main text, quoted exactly;
+- any error, warning or empty state, quoted exactly;
+- the state of the controls that matter (selected, disabled, filled in);
+- anything that looks broken or misaligned.
+Describe only what is visible.`,
+  },
+  "change-code": {
+    job: "coding", title: "Make one small code change", input: "files: the file to change; prompt: the change",
+    system: `${NO_TOOLS}
+You make one small code change.
+1. Find where the change belongs in the code shown.
+2. Follow the file's existing names, style and error handling.
+3. Change as few lines as the task needs; touch nothing else.
+${EDIT_FORMAT}
+Explain nothing unless asked. If the task is a question, answer it in a few lines.`,
+  },
+  "fix-bug": {
+    prefer: "capable",
+    job: "coding", title: "Fix a bug with the smallest change", input: "files: the suspect code; prompt: the error message or symptom",
+    system: `${NO_TOOLS}
+You fix one bug with the smallest change.
+1. Read the error or symptom, then the code shown.
+2. Name the cause in one sentence, quoting the line that causes it.
+3. Change only what the fix needs.
+Answer with the cause line, then the edits.
+${EDIT_FORMAT}
+If the code shown cannot cause the symptom, say so and name the file or function to look at instead.`,
+  },
+  implement: {
+    prefer: "capable",
+    job: "coding", title: "Add a small feature to existing code", input: "files: the code; prompt: the feature",
+    system: `${NO_TOOLS}
+You add one small feature to the code shown.
+1. Find the function or place it belongs; reuse helpers the file already has.
+2. Follow the file's names, style and error handling.
+3. Handle the empty and error cases the feature can meet.
+${EDIT_FORMAT}
+End with one line: what to test.`,
+  },
+  "write-tests": {
+    prefer: "capable",
+    job: "coding", title: "Write unit tests for the code shown", input: "files: the code (and an existing test, for style); prompt: what to cover (optional)",
+    system: `${NO_TOOLS}
+You write unit tests for the code shown; you never change that code.
+1. List the behaviours: the normal case, edge cases (empty, zero, missing, boundary) and one failure case.
+2. Use the test framework and import style the project already uses; copy them from the files shown.
+3. Write one small test per behaviour, named after it, with literal expected values.
+Answer with the test file's path on one line, then the whole file in one fenced block.`,
+  },
+  "review-code": {
+    prefer: "capable",
+    job: "coding", title: "Find real defects in code (not style)", input: "files: the code; prompt: what to focus on (optional)",
+    system: `${NO_TOOLS}
+You review the code shown for real defects only: wrong logic, unhandled errors, off-by-one, null or undefined access, leaks, injection, races. Ignore style and naming.
+For each defect write one line: path:line - the problem - the fix.
+Report at most 5, the surest first. If you find none, answer "no defects found". Never invent a line you did not see.`,
+  },
+  "explain-code": {
+    job: "coding", title: "Explain code to someone about to change it", input: "files: the code; prompt: what to explain (optional)",
+    system: `${NO_TOOLS}
+Explain the code shown to a developer who is about to change it, in at most 6 bullets:
+what it does (one sentence); its inputs and outputs; side effects (files, network, shared state); what calls it, if visible; the one thing most likely to break when it changes.
+Name functions and variables exactly.`,
+  },
+  "summarize-log": {
+    think: false,
+    prefer: "capable",
+    job: "summarize", title: "Summarize a log: errors grouped, counted, first failure", input: "files: the log; prompt: what you are investigating (optional)",
+    system: `${NO_TOOLS}
+You read a log for a developer. Report:
+1. Errors and warnings, grouped by message, each with its count and first and last timestamp.
+2. The first error in time order, quoted exactly.
+3. The likely cause, only if the log shows it.
+Quote messages exactly, skip routine lines, at most 10 bullets.`,
+  },
+  "summarize-text": {
+    think: false,
+    job: "summarize", title: "Summarize text for someone who will act on it", input: "files: the text; prompt: what you need from it (optional)",
+    system: `${NO_TOOLS}
+Summarize the text for someone who will act on it, in short bullets: the decisions, the numbers, the deadlines and the open questions, plus whatever the request asks for.
+Quote numbers, names, versions and paths exactly. Write "not stated" when the text does not say; never guess. No introduction or closing.`,
+  },
+  "summarize-diff": {
+    think: false,
+    prefer: "capable",
+    job: "summarize", title: "Summarize a diff for a reviewer: changes and risks", input: "files: the diff or patch",
+    system: `${NO_TOOLS}
+You summarize a code diff for a reviewer, in at most 8 bullets:
+one line per file on what changed; any change in behaviour; risks such as a removed check, a changed default, a new dependency or a missing test.
+Name files, functions and settings exactly.`,
+  },
+  "extract-json": {
+    think: false,
+    job: "summarize", title: "Extract named fields from text into JSON", input: "files: the text; prompt: the field names (or a JSON schema)",
+    system: `${NO_TOOLS}
+Extract the fields the request names from the text into one JSON object.
+Use the values exactly as written in the text; use null for a field the text does not give; never invent a value.
+Output only the JSON object.`,
+    format: "json",
+  },
+} satisfies Record<string, Workflow>;
+
+export type WorkflowName = keyof typeof WORKFLOWS;
+export const WORKFLOW_NAMES = Object.keys(WORKFLOWS) as WorkflowName[];
 
 /** bonsai-2:9b with thinking off and the card's non-thinking preset: for short bounded jobs. */
 const BONSAI_9B: ModelProfile = {
@@ -133,7 +283,7 @@ const BONSAI_9B: ModelProfile = {
 const qwenNonThinking = (sources: string[]): ModelProfile => ({
   think: false,
   options: { temperature: 0.7, top_p: 0.8, top_k: 20, min_p: 0, presence_penalty: 1.5, repeat_penalty: 1 },
-  notes: "Thinks by default; with think:true use the thinking preset (temperature 1.0, top_p 0.95, top_k 20) and a large output budget. Raise presence_penalty (up to 2) if it repeats.",
+  notes: "Thinks by default; with think:true use the card's thinking preset (temperature 1.0, top_p 0.95, top_k 20; Qwen3.8 presence_penalty 0, Qwen3.5 1.5, or 0 with temperature 0.6 for precise coding) and a large output budget (Qwen3.5 32,768 tokens). Raise presence_penalty (up to 2) if it repeats.",
   sources,
 });
 
@@ -146,13 +296,17 @@ const CHAT_MODELS: Record<string, ModelProfile> = {
   },
   "nvidia-nemotron-3.5-bolt": {
     options: { temperature: 1, top_p: 0.95 },
-    notes: "Reasons by default; a tight num_predict cuts the reasoning mid-sentence.",
+    // `ollama show` of the hf.co Q4_K_M tag, 2026-11-08: no thinking capability, and the template
+    // defaults enable_thinking to false.
+    notes: "The card says it reasons by default, but its GGUF template turns thinking off and Ollama reports no thinking capability, so it answers directly; think:true is refused.",
     sources: SOURCES.nemotronBolt,
   },
   "bonsai-2": BONSAI_9B,
+  // The card documents the same instruct (non-thinking) preset as the 9B; Ollama lists think
+  // values false, low, medium and xhigh for this tag.
   "bonsai-2:27b": {
-    options: { temperature: 1, top_p: 0.95, top_k: 20, min_p: 0.05, presence_penalty: 0, repeat_penalty: 1 },
-    notes: "The card's thinking preset; it documents no switch to turn thinking off.",
+    ...BONSAI_9B,
+    notes: "With think:true (or low, medium, xhigh) use the card's thinking preset (temperature 1.0, top_p 0.95, top_k 20, min_p 0.05, presence_penalty 0) and allow about 16,384 output tokens.",
     sources: SOURCES.bonsai27b,
   },
   "qwen3.8": qwenNonThinking(SOURCES.qwen38),
@@ -166,7 +320,7 @@ export const LOCAL_JOBS: Record<JobName, LocalJob> = {
   classify: {
     job: "classify", task: "decision", catalogJob: "classify", defaultPicks: picksOf("classify"),
     models: {
-      "strands-decider": { notes: "State and questions together must fit 4,096 tokens; weak on long, multi-step documents.", sources: SOURCES.strandsDecider },
+      "strands-decider": { notes: "State and questions together must fit 4,096 tokens; weak on long, multi-step documents. Its README: answers at confidence 0.9 or more are right about 95% of the time; confirm the rest.", sources: SOURCES.strandsDecider },
       "nimble-v3": { notes: "Documents num_ctx 32768 (routing sizes it here); CC BY-NC 4.0, noncommercial.", sources: SOURCES.nimble },
     },
     notes: "A decision model reads state and questions, no prompt. Ask short questions about the state, one concern each, and give a choice question an explicit fallback option such as other.",
@@ -194,10 +348,19 @@ export const LOCAL_JOBS: Record<JobName, LocalJob> = {
   },
   ocr: {
     job: "ocr", task: "vision", catalogJob: "ocr", defaultPicks: picksOf("ocr"),
-    prompt: ({ kind, model }) => ocrPrompt(kind, model),
+    prompt: ({ model }) => ocrPrompt("text", model),
+    // Both publishers' Ollama Modelfiles set temperature 0; the hf.co MiniCPM tag ships no parameters.
     models: {
-      "minicpm-ocr": { notes: "Chinese and English; no sampling settings documented.", sources: SOURCES.miniCpmOcr },
-      "glm-ocr": { notes: "Also documents Figure Recognition:; no sampling settings documented.", sources: SOURCES.glmOcr },
+      "minicpm-ocr": {
+        options: { temperature: 0 },
+        notes: "Chinese and English; tables come back as HTML. Its Modelfile sets num_ctx 8192.",
+        sources: [...SOURCES.miniCpmOcr, "https://raw.githubusercontent.com/OpenBMB/MiniCPM-OCR/main/docs/ollama_deploy.md"],
+      },
+      "glm-ocr": {
+        options: { temperature: 0 },
+        notes: "Also documents Figure Recognition:.",
+        sources: [...SOURCES.glmOcr, "https://github.com/zai-org/GLM-OCR/blob/main/examples/ollama-deploy/README.md"],
+      },
     },
     notes: "The OCR picks were trained on Text Recognition:, Table Recognition: and Formula Recognition:; a general vision model gets the same request in plain words. Crop to the text first.",
     sources: [...SOURCES.miniCpmOcr, ...SOURCES.glmOcr, cookbook("ocr")],
@@ -205,17 +368,17 @@ export const LOCAL_JOBS: Record<JobName, LocalJob> = {
   "image-recognition": {
     job: "image-recognition", task: "vision", catalogJob: "image-recognition", defaultPicks: picksOf("image-recognition"),
     needs: "prompt: your question about the image",
-    systemPrompt: IMAGE_SYSTEM,
+    systemPrompt: WORKFLOWS["answer-image"].system,
     models: {
       "lfm3-vl": {
         options: { temperature: 0.1, top_p: 1, top_k: 50, min_p: 0, repeat_penalty: 1.1 },
-        notes: "Thinks before it answers, with no documented switch; images go in at native resolution, so a large one costs many tokens.",
+        notes: "Thinks before it answers by default (Ollama lists think values true and false; off is unmeasured here); images go in at native resolution, so a large one costs many tokens.",
         sources: SOURCES.lfm3Vl,
       },
       "lfm3-omni": {
         systemPrompt: "Answer questions about the provided image. Base every answer only on what can be seen.",
         options: { temperature: 0 },
-        notes: "Non-reasoning: never send think:true. Up to 2,048 tokens per image.",
+        notes: "Non-reasoning: never send think:true. Up to 2,048 tokens per image. The card gives 32K context; the Ollama tag advertises 128K.",
         sources: SOURCES.lfm3Omni,
       },
       "bonsai-2": BONSAI_9B,
@@ -235,15 +398,15 @@ export const LOCAL_JOBS: Record<JobName, LocalJob> = {
   coding: {
     job: "coding", task: "coding", catalogJob: "coding", defaultPicks: picksOf("coding"),
     needs: "prompt: the change to make",
-    systemPrompt: CODING_SYSTEM,
+    systemPrompt: WORKFLOWS["change-code"].system,
     models: CHAT_MODELS,
     notes: "The answer is SEARCH/REPLACE blocks: apply one only where its SEARCH text matches exactly once, then run the tests.",
     sources: [...CHAT_SOURCES, cookbook("coding")],
   },
   summarize: {
     job: "summarize", task: "completion", catalogJob: "coding", defaultPicks: picksOf("coding"),
-    prompt: ({ question }) => question ?? "Summarize the text below.",
-    systemPrompt: SUMMARIZE_SYSTEM,
+    prompt: () => "Summarize the text below.",
+    systemPrompt: WORKFLOWS["summarize-text"].system,
     models: CHAT_MODELS,
     notes: "The coding picks: the same chat models apply (docs/cookbooks/batch-text.md). Check every number and name you reuse.",
     sources: [...CHAT_SOURCES, cookbook("batch-text")],
@@ -341,17 +504,10 @@ export function githubSystemPrompt(): string {
 
 // ---- What the calling agent reads: the MCP prompts (builtin-prompts.ts builds their calls). ----
 
-/**
- * What the agent checks. run_task results carry their own `check:` lines, computed from the result
- * (result-checks.ts): uncertain answers, close or weak matches, facts missing from the source,
- * edits that do not match the file, an empty or looping read. Research and sweep say it here.
- */
-export const RESULT_CHECKS = "The result ends with check: lines worked out from it; act on them first.";
+/** Research and sweep results are read by the agent; run_task results carry their own check: lines. */
 export const AGENT_CHECKS: Record<string, string> = {
-  ocr: RESULT_CHECKS, image: RESULT_CHECKS, classify: RESULT_CHECKS, "find-code": RESULT_CHECKS,
-  duplicates: RESULT_CHECKS, summarize: RESULT_CHECKS,
   research: "Discard verification.recommendation \"escalate\"; otherwise open the cited path:line.",
-  sweep: "Read the unsure chunks first, then 3 flagged and 2 clear ones, before trusting the rest.",
+  sweep: "Read the unsure chunks first, then a few flagged and clear ones.",
 };
 
 /** Applying the coding job's SEARCH/REPLACE answer. */
@@ -362,7 +518,7 @@ export const AGENT_GUIDE = `Use FreeLlama to run bounded work on local models an
 
 Offload when the answer is cheap to check and the work is 10 or more similar items, or an input over about 2,000 tokens you would otherwise read whole. Do it yourself: judgment you must stand behind, edits across files, one short item.
 
-Pick a job and pass it to run_task: classify (labels, yes/no), find-code (which file), duplicates, ocr (text in an image), image-recognition (what an image shows), image-search, coding (one small change), summarize. FreeLlama runs the first catalog model that is installed and fits now, with its prompt for that job; any field you pass wins, and job_profile.applied says what it filled in. Name inputs with files; for one answer per file send tasks:[{id, independent:true, task:{files:[path]}}] with job at the top level. For a whole code tree, log or site use sweep; for a question about a repository, delegate_research.
+Name a workflow and run_task does the rest: it picks the first catalog model for the job that is installed and fits now and gives it step-by-step instructions for the task. Workflows: read-text, read-table, read-fields (images); answer-image, describe-screen; change-code, fix-bug, implement, write-tests, review-code, explain-code; summarize-log, summarize-text, summarize-diff, extract-json. For labels, code search and duplicates use job classify, find-code or duplicates. Any field you pass wins; job_profile says what was filled in. Name inputs with files; for one answer per file send tasks:[{id, independent:true, task:{files:[path]}}] with job at the top level. For a whole code tree, log or site use sweep; for a question about a repository, delegate_research.
 
 Verify: local answers are candidates. Each run_task result ends with check: lines worked out from it (uncertain answers, close matches, facts not in the source, edits that do not match the file); act on those first, and discard a research result whose verification.recommendation is "escalate".
 

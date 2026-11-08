@@ -11,7 +11,8 @@ export const MODEL_CATALOG = catalogData as { snapshot: string; measured_on: str
 export const CATALOG_JOBS = MODEL_CATALOG.jobs.map((job) => job.job);
 
 /** One `/api/tags` entry: Ollama reports each installed tag with its manifest digest. */
-export type InstalledModel = { name: string; digest?: string | null };
+/** `capabilities`: what Ollama's /api/tags reports for the tag (tools, thinking, vision, ...), when it does. */
+export type InstalledModel = { name: string; digest?: string | null; capabilities?: string[] };
 
 /** `glm-ocr`, `library/glm-ocr:latest` and `GLM-OCR:latest` name one tag. */
 function canonicalTag(name: string): string {

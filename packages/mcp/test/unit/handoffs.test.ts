@@ -1,3 +1,4 @@
+import { WORKFLOW_NAMES } from "../../src/local-prompts.js";
 // saveAs handoffs: the file format, the readable root that lets a later task read one, and sweep
 // results saved whole. MCP prompts: each returns the exact call. No serve or Ollama.
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -22,7 +23,7 @@ import { withJob } from "../../src/tools/run-task.js";
 import { registerSweepTool } from "../../src/tools/sweep.js";
 import { defaultFlags, SweepRunner, type Executor } from "../../src/sweep/runner.js";
 import { SweepStore, SWEEP_ROOT } from "../../src/sweep/store.js";
-import { BUILTIN_PROMPTS, perFile, registerBuiltinPrompts } from "../../src/builtin-prompts.js";
+import { BUILTIN_PROMPTS, perFile, registerBuiltinPrompts, workflowPrompt } from "../../src/builtin-prompts.js";
 
 describe("handoff files", () => {
   it("writes a summary and the whole result, and refuses a name that is not a short slug", () => {
@@ -83,10 +84,10 @@ describe("handoff files", () => {
 describe("MCP prompts", () => {
   const text = (result: { messages: Array<{ content: { text: string } }> }) => result.messages[0]!.content.text;
 
-  it("registers one prompt per job and the freellama guide", () => {
+  it("registers one prompt per workflow, the non-prompt tools and the freellama guide", () => {
     const names: string[] = [];
     registerBuiltinPrompts({ registerPrompt: (name: string) => names.push(name) } as unknown as McpServer);
-    expect(names).toEqual(["ocr", "image", "classify", "find-code", "duplicates", "coding", "summarize", "research", "github-research", "sweep", "freellama"]);
+    expect(names).toEqual([...WORKFLOW_NAMES, "classify", "find-code", "duplicates", "research", "github-research", "sweep", "freellama"]);
   });
 
   it("returns the exact call, one task per file when several files match", () => {
@@ -98,13 +99,14 @@ describe("MCP prompts", () => {
       { id: path.join(root, "a.md"), independent: true, task: { files: [path.join(root, "a.md")] } },
       { id: path.join(root, "b.md"), independent: true, task: { files: [path.join(root, "b.md")] } },
     ] });
-    expect(text(BUILTIN_PROMPTS.ocr.build({ file: "shots/x.png", kind: "formula" })))
-      .toContain('run_task {"job":"ocr","prompt":"Formula Recognition:","files":["shots/x.png"]}');
+    expect(text(workflowPrompt("read-table", "shots/x.png"))).toContain('run_task {"workflow":"read-table","files":["shots/x.png"]}');
+    expect(text(workflowPrompt("summarize-log", "logs/app.log", "why did checkout fail"))).toContain('run_task {"workflow":"summarize-log","files":["logs/app.log"],"prompt":"why did checkout fail"}');
     expect(text(BUILTIN_PROMPTS.classify.build({ files: "issue.md", question: "What kind of issue is this?", labels: "bug, feature" })))
       .toContain('"criteria":{"bug":"bug","feature":"feature","other":"None of these fits"}');
     expect(text(BUILTIN_PROMPTS["find-code"].build({ question: "where are ports parsed", files: "src/**/*.ts" })))
       .toContain('run_task {"job":"find-code","files":["src/**/*.ts"],"nearest":{"query":"where are ports parsed","top":5}}');
-    expect(text(BUILTIN_PROMPTS.coding.build({ file: "src/a.ts", change: "rename x" }))).toMatch(/SEARCH text occurs exactly once.*run the tests/s);
+    expect(text(workflowPrompt("fix-bug", "src/a.ts", "TypeError: x is undefined"))).toMatch(/run_task \{"workflow":"fix-bug".*SEARCH text occurs exactly once.*check: lines/s);
+    expect(text(workflowPrompt("review-code", "src/a.ts"))).not.toMatch(/SEARCH text occurs/);
     expect(text(BUILTIN_PROMPTS["github-research"].build({ question: "Where is X?", repo: "ollama/ollama" })))
       .toContain('delegate_research {"question":"In ollama/ollama: Where is X?","adapter":"github","model":"bonsai-2:9b"}');
     expect(text(BUILTIN_PROMPTS.sweep.build({ files: "src/**/*.ts", question: "Does this code swallow an error?" })))

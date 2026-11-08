@@ -1,3 +1,4 @@
+import { WORKFLOW_NAMES } from "../../src/local-prompts.js";
 // Protocol-completeness checks: every tool must advertise machine-readable behaviour hints, and
 // every non-error result must actually carry structured content. These are the parts a client
 // reads to decide whether to prompt a human and how to parse a result — prose in a description
@@ -576,7 +577,9 @@ describe("tool contract", () => {
     // 2026-11-07 usage rules (catalog pick, one model per batch, shared tools, tool_calls and OCR notes),
     // 6,752 on 2026-11-08 with two tools that replace agent work worth far more: sweep (674: chunked
     // background checks the agent would otherwise read whole) and ollama_pull (242: size-checked pull
-    // approval), plus the glob, defer and sweep rules in the instructions; 6,800 before and 6,956 after
+    // approval), plus the glob, defer and sweep rules in the instructions; 7,157 with run_task workflow
+    // (step-by-step local-model instructions per task, which replace per-task prompting by the agent);
+    // 6,800 before and 6,956 after
     // the 2026-11-08 job mode: run_task `job` (62) and `saveAs` (32), sweep `saveAs` (30) and one
     // instruction sentence (32), which replace the prompt, options and prefixes an agent would write;
     // +60 for delegate_research adapter "coder" and agent.commands (edits an isolated copy, returns a diff).
@@ -584,26 +587,27 @@ describe("tool contract", () => {
     const surfaceTokens = Math.round(
       (JSON.stringify(modelFacing).length + (client.getInstructions() ?? "").length) / 4,
     );
-    expect(surfaceTokens, `model-facing surface grew to ~${surfaceTokens} tokens`).toBeLessThan(7050);
+    expect(surfaceTokens, `model-facing surface grew to ~${surfaceTokens} tokens`).toBeLessThan(7250);
     // The whole tools/list payload, output schemas included (7,522 tokens on 2026-11-01, 6,412 on 2026-11-07,
     // 7,846 on 2026-11-08 with sweep and ollama_pull, 7,890 before and 8,055 after job mode).
     const wireTokens = Math.round((JSON.stringify(tools).length + (client.getInstructions() ?? "").length) / 4);
-    expect(wireTokens, `tools/list grew to ~${wireTokens} tokens`).toBeLessThan(8150);
+    expect(wireTokens, `tools/list grew to ~${wireTokens} tokens`).toBeLessThan(8350);
   });
 
   it("offers one prompt per job, each returning the exact call, and the freellama guide", async () => {
     const { prompts } = await client.listPrompts();
+    // One prompt per workflow (from local-prompts.ts), plus the tools that take no instructions.
     expect(prompts.map((prompt) => prompt.name).sort()).toEqual([
-      "classify", "coding", "duplicates", "find-code", "freellama", "github-research", "image", "ocr", "research", "summarize", "sweep",
-    ]);
-    const ocr = await client.getPrompt({ name: "ocr", arguments: { file: "shots/error.png", kind: "table" } });
-    expect((ocr.messages[0]!.content as { text: string }).text)
-      .toContain('run_task {"job":"ocr","prompt":"Table Recognition:","files":["shots/error.png"]}');
-    const coding = await client.getPrompt({ name: "coding", arguments: { file: "src/a.ts", change: "rename x" } });
-    expect((coding.messages[0]!.content as { text: string }).text).toMatch(/SEARCH text occurs exactly once/);
+      ...WORKFLOW_NAMES, "classify", "duplicates", "find-code", "freellama", "github-research", "research", "sweep",
+    ].sort());
+    const table = await client.getPrompt({ name: "read-table", arguments: { files: "shots/error.png" } });
+    expect((table.messages[0]!.content as { text: string }).text).toContain('run_task {"workflow":"read-table","files":["shots/error.png"]}');
+    const fix = await client.getPrompt({ name: "fix-bug", arguments: { files: "src/a.ts", request: "TypeError: x is undefined" } });
+    expect((fix.messages[0]!.content as { text: string }).text).toMatch(/"workflow":"fix-bug".*SEARCH text occurs exactly once/s);
     const guide = await client.getPrompt({ name: "freellama" });
     expect((guide.messages[0]!.content as { text: string }).text).toMatch(/approves one exact tag and its size/);
-    expect(client.getInstructions()).toMatch(/run_task\{job\}: FreeLlama picks the model and its prompt for the job \(your fields win\); MCP prompts/);
+    expect(client.getInstructions()).toMatch(/run_task\{workflow\} \(fix-bug, write-tests.*\) or run_task\{job\}: FreeLlama picks the model and gives it step-by-step instructions/);
+    expect(byName.get("run_task")!.inputSchema.properties.workflow.enum).toEqual(WORKFLOW_NAMES);
     expect(byName.get("run_task")!.inputSchema.properties.job.enum).toEqual([
       "classify", "find-code", "duplicates", "ocr", "image-recognition", "image-search", "coding", "summarize",
     ]);

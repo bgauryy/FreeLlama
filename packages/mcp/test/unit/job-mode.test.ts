@@ -17,7 +17,7 @@ vi.mock("../../src/model-library.js", () => ({ catalogLiveState: (...args: any[]
 
 import { applyJob, pickJobModel, familyMatch } from "../../src/job-mode.js";
 import { MODEL_CATALOG } from "../../src/model-catalog.js";
-import { LOCAL_JOBS, OCR_PROMPTS, RUN_TASK_JOBS } from "../../src/local-prompts.js";
+import { LOCAL_JOBS, OCR_PROMPTS, RUN_TASK_JOBS, WORKFLOWS } from "../../src/local-prompts.js";
 import { registerRunTaskTool } from "../../src/tools/run-task.js";
 
 const installed = (...names: string[]) => names.map((name) => ({ name }));
@@ -39,11 +39,33 @@ describe("local-prompts job table", () => {
     }
   });
 
-  it("asks the coding model for exact SEARCH/REPLACE blocks", () => {
-    const system = LOCAL_JOBS.coding.systemPrompt!;
-    expect(system).toContain("<<<<<<< SEARCH\nexact current lines (5 to 30, unique in the file, indentation exact)\n=======\nreplacement lines\n>>>>>>> REPLACE");
-    expect(system).toMatch(/whole file/);
-    expect(LOCAL_JOBS.summarize.systemPrompt).toMatch(/"not stated"; never guess/);
+  it("gives every editing workflow the edit format, and only those", () => {
+    for (const name of ["change-code", "fix-bug", "implement"] as const) expect(WORKFLOWS[name].system, name).toMatch(/<<<<<<< SEARCH[\s\S]*>>>>>>> REPLACE/);
+    for (const name of ["review-code", "explain-code", "write-tests", "summarize-log"] as const) expect(WORKFLOWS[name].system, name).not.toMatch(/<<<<<<< SEARCH/);
+    expect(LOCAL_JOBS.coding.systemPrompt).toBe(WORKFLOWS["change-code"].system);
+    expect(LOCAL_JOBS.summarize.systemPrompt).toBe(WORKFLOWS["summarize-text"].system);
+  });
+
+  it("runs a workflow: its instructions win over a model's style prompt, and its output format applies", () => {
+    const screen = applyJob("image-recognition", { prompt: "is there an error?" }, "lfm3-omni:2b-q4_K_M", false, "describe-screen");
+    expect(screen.fields.systemPrompt).toBe(WORKFLOWS["describe-screen"].system);
+    expect(screen.profile).toMatchObject({ job: "image-recognition", workflow: "describe-screen" });
+    const fields = applyJob("summarize", { prompt: "vendor, total" }, "lfm3:1.7b-q4_K_M", false, "extract-json");
+    expect(fields.fields).toMatchObject({ format: "json", systemPrompt: WORKFLOWS["extract-json"].system });
+    // A JSON schema request becomes the structured-output format and stays in the prompt.
+    const schema = { type: "object", properties: { vendor: { type: "string" }, total: { type: "number" } }, required: ["vendor"] };
+    const typed = applyJob("summarize", { prompt: JSON.stringify(schema) }, "lfm3:1.7b-q4_K_M", false, "extract-json");
+    expect(typed.fields).toMatchObject({ format: schema, prompt: JSON.stringify(schema) });
+    expect(applyJob("summarize", { prompt: "{not json" }, "lfm3:1.7b-q4_K_M", false, "extract-json").fields.format).toBe("json");
+    expect(applyJob("ocr", { prompt: "vendor, total" }, "glm-ocr:latest", false, "read-fields").fields.prompt).toMatch(/^Extract these fields from the image: vendor, total\./);
+    expect(applyJob("summarize", {}, "lfm3:1.7b-q4_K_M", false, "summarize-log").fields.prompt).toBe("Apply your instructions to the input below.");
+    expect(() => applyJob("coding", {}, "lfm3:1.7b-q4_K_M", false, "summarize-log")).toThrow(/runs job "summarize"/);
+    // A text workflow says it has no tools, unless the caller sends some.
+    expect(fields.fields.systemPrompt).toMatch(/^You have no tools/);
+    const tools = [{ type: "function", function: { name: "lookup", parameters: { type: "object", properties: {} } } }];
+    const withTools = applyJob("summarize", { prompt: "vendor", tools }, "lfm3:1.7b-q4_K_M", false, "extract-json");
+    expect(withTools.fields.systemPrompt).toBe(WORKFLOWS["extract-json"].system.split("\n").slice(1).join("\n"));
+    expect(applyJob("coding", { prompt: "x", tools }, "lfm3:1.7b-q4_K_M").fields.systemPrompt).not.toMatch(/no tools/);
   });
 });
 
@@ -57,6 +79,21 @@ describe("job model pick", () => {
     expect(pickJobModel("classify", installed("strands-decider:2b-nvfp4"), null)).toBe("strands-decider:2b-nvfp4");
     // summarize runs the coding picks.
     expect(pickJobModel("summarize", installed("bonsai-2:9b"), 12 * GB)).toBe("bonsai-2:9b");
+  });
+
+  it("skips a pick whose Ollama capabilities lack the tools or thinking a request needs", () => {
+    const inventory = [
+      { name: "lfm3:1.7b-q4_K_M", capabilities: ["completion"] },
+      { name: "bonsai-2:9b", capabilities: ["completion", "tools", "thinking"] },
+    ];
+    expect(pickJobModel("coding", inventory, 64 * GB)).toBe("lfm3:1.7b-q4_K_M");
+    expect(pickJobModel("coding", inventory, 64 * GB, "default", ["tools"])).toBe("bonsai-2:9b");
+    // Unknown capabilities are not "no".
+    expect(pickJobModel("coding", installed("lfm3:1.7b-q4_K_M"), 64 * GB, "default", ["tools"])).toBe("lfm3:1.7b-q4_K_M");
+    let refusal: any;
+    try { pickJobModel("coding", inventory.slice(0, 1), 64 * GB, "default", ["tools"]); } catch (error) { refusal = JSON.parse((error as Error).message); }
+    expect(refusal.error).toMatch(/no catalog pick with tools support is installed.*lfm3:1\.7b-q4_K_M \(needs [\d.]+ GB, installed, no tools support\)/);
+    expect(refusal.picks.find((pick: any) => pick.tag === "lfm3:1.7b-q4_K_M").lacks).toEqual(["tools"]);
   });
 
   it("refuses with each pick's memory need and what is free, or when the inventory is unreadable", () => {
@@ -76,7 +113,10 @@ describe("job defaults", () => {
   it("fills the OCR prompt, and the caller's prompt wins", () => {
     const filled = applyJob("ocr", {}, "glm-ocr:latest");
     expect(filled.fields).toMatchObject({ task: "vision", model: "glm-ocr:latest", prompt: "Text Recognition:" });
-    expect(filled.profile).toEqual({ job: "ocr", model: "glm-ocr:latest", applied: ["task", "model", "prompt"] });
+    // Both OCR publishers' Modelfiles set temperature 0.
+    expect(filled.fields.options).toEqual({ temperature: 0 });
+    expect(filled.profile).toEqual({ job: "ocr", model: "glm-ocr:latest", applied: ["task", "model", "prompt", "options"] });
+    expect(applyJob("ocr", {}, "hf.co/openbmb/MiniCPM-OCR-1.0-gguf:Q4_K_M", false, "read-table").fields).toMatchObject({ prompt: "Table Recognition:", options: { temperature: 0 } });
     expect(applyJob("ocr", { prompt: OCR_PROMPTS.table }, "glm-ocr:latest").fields.prompt).toBe("Table Recognition:");
   });
 
@@ -205,7 +245,8 @@ describe("family profiles and model-aware prompts", () => {
     const coding = LOCAL_JOBS.coding.models;
     expect(familyMatch(coding, "lfm3:latest")).toBe(familyMatch(coding, "lfm3:1.7b-q4_K_M"));
     expect(familyMatch(coding, "LFM3:1.7B")).toBeDefined();
-    expect(familyMatch(coding, "bonsai-2:27b-q8_0")?.options?.temperature).toBe(1);
+    expect(familyMatch(coding, "bonsai-2:27b-q8_0")).toMatchObject({ think: false, options: { temperature: 0.7, top_p: 0.8, presence_penalty: 1.5 } });
+    expect(familyMatch(coding, "bonsai-2:27b-q8_0")?.sources[0]).toMatch(/Ternary-Bonsai-2-27B/);
     expect(familyMatch(coding, "bonsai-2:9b-q4_K_M")?.think).toBe(false);
     expect(familyMatch(coding, "qwen3.8:27b")?.think).toBe(false);
     expect(familyMatch(coding, "hf.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-4GB:Q8_0")).toBeDefined();
@@ -217,9 +258,9 @@ describe("family profiles and model-aware prompts", () => {
   it("asks OCR-trained models with their trained prefix and other vision models in plain words", () => {
     const prompt = LOCAL_JOBS.ocr.prompt!;
     expect(prompt({ model: "hf.co/openbmb/MiniCPM-OCR-1.0-gguf:Q8_0" })).toBe("Text Recognition:");
-    expect(prompt({ model: "glm-ocr:latest", kind: "table" })).toBe("Table Recognition:");
+    expect(WORKFLOWS["read-table"].prompt(undefined, "glm-ocr:latest")).toBe("Table Recognition:");
     expect(prompt({ model: "qwen3.8:27b" })).toMatch(/^Transcribe all text in the image exactly/);
-    expect(prompt({ model: "lfm3-vl:2b", kind: "formula" })).toMatch(/LaTeX/);
+    expect(WORKFLOWS["read-table"].prompt(undefined, "lfm3-vl:2b")).toMatch(/Markdown table/);
   });
 });
 

@@ -16,8 +16,8 @@ import {
 } from "../helpers.js";
 import { applyTaskFiles, inputLabels, type FileReceipt } from "../task-files.js";
 import { nearestText, validateEmbeddingVectors, type NearestRequest } from "../nearest.js";
-import { applyJob, mergeProfiles, pickLiveJobModel, type JobProfile } from "../job-mode.js";
-import { LOCAL_JOBS, RUN_TASK_JOBS, type JobName } from "../local-prompts.js";
+import { applyJob, mergeProfiles, neededCapabilities, pickLiveJobModel, type JobProfile } from "../job-mode.js";
+import { LOCAL_JOBS, RUN_TASK_JOBS, WORKFLOW_NAMES, WORKFLOWS, type JobName, type WorkflowName } from "../local-prompts.js";
 import { HANDOFF_NAME, summaryOf, writeHandoff } from "../handoffs.js";
 import { resultChecks, withChecks } from "../result-checks.js";
 
@@ -519,6 +519,7 @@ export function registerRunTaskTool(server: McpServer): void {
         endpoint: endpointParam,
         task: taskParam.removeDefault().optional(),
         job: z.enum(RUN_TASK_JOBS).optional().describe("picks a model that fits now and fills prompt, systemPrompt, options, think, prefixes; your fields win"),
+        workflow: z.enum(WORKFLOW_NAMES as [WorkflowName, ...WorkflowName[]]).optional().describe("step-by-step instructions for the local model (fix-bug, write-tests, review-code, summarize-log, extract-json, read-fields...); implies its job"),
         objective: objectiveParam,
         model: z.string().min(1).optional().describe(
           "exact tag; omitted: routing picks by capability only and may choose one that does not fit now, so name the catalog's pick for the job",
@@ -611,6 +612,7 @@ export function registerRunTaskTool(server: McpServer): void {
       endpoint,
       task,
       job,
+      workflow,
       saveAs,
       objective,
       model,
@@ -649,6 +651,12 @@ export function registerRunTaskTool(server: McpServer): void {
       maxParallelism,
     }, extra: ToolExtra) => {
       try {
+        // A workflow names its job; a different explicit job is a contradiction.
+        if (workflow !== undefined) {
+          const flowJob = WORKFLOWS[workflow].job;
+          if (job !== undefined && job !== flowJob) return errorResult(new Error(`workflow "${workflow}" runs job "${flowJob}"; remove \`job\`.`));
+          job = flowJob;
+        }
         const singleFields = {
           task, objective, model, sessionId, scopeId, scopeRevision, contextTokens, executionPreference,
           minPlacementEvidence, requiredCapabilities, prompt, systemPrompt, images, messages, input, files, state, questions,
@@ -673,7 +681,7 @@ export function registerRunTaskTool(server: McpServer): void {
           const shared = Object.fromEntries(stray.map((name) => [name, singleFields[name as keyof typeof singleFields]]));
           let items: BatchItem[] = tasks.map((item) => ({ ...item, task: { ...shared, ...withoutUndefined(parseBatchTask(item)) } as BatchItem["task"] }));
           let profile: JobProfile | undefined;
-          if (job !== undefined) ({ items, profile } = await withBatchJob(job, items, endpoint));
+          if (job !== undefined) ({ items, profile } = await withBatchJob(job, items, endpoint, workflow));
           return withJob(withBatchChecks(await runBatch(items, maxParallelism, endpoint, extra, defer === true), job, items), profile);
         }
         if (maxParallelism !== undefined) return errorResult(new Error("`maxParallelism` is valid only with `tasks`."));
@@ -681,16 +689,18 @@ export function registerRunTaskTool(server: McpServer): void {
         let profile: JobProfile | undefined;
         if (job !== undefined) {
           if (scopeId !== undefined) return errorResult(new Error("`job` picks the model and prompt, and a scope has its own: remove `job` or `scopeId`."));
-          const picked = model === undefined ? await pickLiveJobModel(job, endpoint) : undefined;
-          const applied = applyJob(job, { task, model, prompt, systemPrompt, messages, options, think, input, nearest: nearestRequest }, picked, preview === true);
+          const prefer = workflow !== undefined ? (WORKFLOWS[workflow] as { prefer?: "capable" }).prefer : undefined;
+          const picked = model === undefined ? await pickLiveJobModel(job, endpoint, prefer, neededCapabilities({ tools, think })) : undefined;
+          const applied = applyJob(job, { task, model, prompt, systemPrompt, messages, options, think, input, format, tools, nearest: nearestRequest }, picked, preview === true, workflow);
           ({ prompt, systemPrompt, options, think, input, model } = applied.fields);
+          format = applied.fields.format as typeof format;
           task = applied.fields.task as typeof task;
           nearestRequest = applied.fields.nearest as typeof nearestRequest;
           profile = applied.profile;
         }
         // Checks read the result itself (uncertain answers, close matches, unsupported facts, edits
         // that do not match the file) and are saved with a handoff too.
-        const finish = <R,>(result: R): R => withJob(withChecks(result, job, task ?? "completion"), profile, saveAs);
+        const finish = <R,>(result: R): R => withJob(withChecks(result, job, task ?? "completion", tools), profile, saveAs);
         const canonicalTask = task ?? "completion";
         if (preview) {
           const executionOnlyFields = ([
@@ -846,14 +856,18 @@ export function registerRunTaskTool(server: McpServer): void {
 }
 
 /** Job mode over a batch: one model pick for the items that name none, then each item's defaults. */
-async function withBatchJob(job: JobName, items: BatchItem[], endpoint: string | undefined): Promise<{ items: BatchItem[]; profile: JobProfile }> {
+async function withBatchJob(job: JobName, items: BatchItem[], endpoint: string | undefined, workflow?: WorkflowName): Promise<{ items: BatchItem[]; profile: JobProfile }> {
   // Ranking (`nearest`) belongs to one call over all the items, which a batch item cannot carry.
   if (LOCAL_JOBS[job].task === "embedding") throw new Error(`job "${job}" ranks every item in one call with \`nearest\`; send it without \`tasks\`, naming the inputs in \`files\`.`);
-  const picked = items.some((item) => item.task.model === undefined) ? await pickLiveJobModel(job, endpoint) : undefined;
+  const prefer = workflow !== undefined ? (WORKFLOWS[workflow] as { prefer?: "capable" }).prefer : undefined;
+  // One pick serves every item that names no model, so it must cover what any of them needs.
+  const needs = [...new Set(items.filter((item) => item.task.model === undefined)
+    .flatMap((item) => neededCapabilities(item.task as { tools?: unknown[]; think?: unknown })))];
+  const picked = items.some((item) => item.task.model === undefined) ? await pickLiveJobModel(job, endpoint, prefer, needs) : undefined;
   const profiles: JobProfile[] = [];
   const filled = items.map((item) => {
     try {
-      const { fields, profile } = applyJob(job, item.task, picked);
+      const { fields, profile } = applyJob(job, item.task, picked, false, workflow);
       profiles.push(profile);
       return { ...item, task: fields as BatchItem["task"] };
     } catch (error) {
@@ -910,6 +924,7 @@ function withBatchChecks<R>(result: R, job: string | undefined, items: BatchItem
   const rows = Array.isArray(shown.structuredContent?.results) ? shown.structuredContent.results as unknown[] : [];
   if (shown.isError || rows.length === 0) return result;
   const taskOf = new Map(items.map((item) => [item.id, String(item.task.task ?? "completion")]));
+  const toolsOf = new Map(items.map((item) => [item.id, item.task.tools as unknown[] | undefined]));
   const flagged: string[] = [];
   const checks: Record<string, string[]> = {};
   for (const raw of rows) {
@@ -917,8 +932,8 @@ function withBatchChecks<R>(result: R, job: string | undefined, items: BatchItem
     if (!row || row.ok !== true) continue;
     const id = String(row.id);
     const receipt = object(row.response) ?? {};
-    const lines = resultChecks({ job, task: taskOf.get(id), answer: taskAnswerText(receipt) ?? "", structured: receipt });
-    if (lines.length === 0 || /^every answer is outside|^every number and quoted name|^all \d+ SEARCH/.test(lines[0]!)) continue;
+    const lines = resultChecks({ job, task: taskOf.get(id), answer: taskAnswerText(receipt) ?? "", structured: receipt, tools: toolsOf.get(id) });
+    if (lines.length === 0 || /^every answer is outside|^every number and quoted name|^all \d+ SEARCH|^\d+ tool call\(s\) match/.test(lines[0]!)) continue;
     checks[id] = lines;
     flagged.push(`${id}: ${lines.join("; ")}`);
   }

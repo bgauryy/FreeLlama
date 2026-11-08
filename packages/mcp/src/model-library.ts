@@ -45,8 +45,11 @@ export async function libraryTagSize(model: string): Promise<TagSizeLookup> {
 
 /** Installed tags with their digests, read from Ollama's /api/tags. */
 export async function installedInventory(ollamaEndpoint: string | undefined): Promise<InstalledModel[]> {
-  const tags = (await ollamaFetch(ollamaEndpoint, "/api/tags")) as { models?: Array<{ name?: string; model?: string; digest?: string }> };
-  return (tags.models ?? []).map((m) => ({ name: m.name ?? m.model ?? "", digest: m.digest ?? null })).filter((m) => m.name);
+  const tags = (await ollamaFetch(ollamaEndpoint, "/api/tags")) as { models?: Array<{ name?: string; model?: string; digest?: string; capabilities?: unknown }> };
+  return (tags.models ?? []).map((m) => ({
+    name: m.name ?? m.model ?? "", digest: m.digest ?? null,
+    ...(Array.isArray(m.capabilities) ? { capabilities: m.capabilities.map(String) } : {}),
+  })).filter((m) => m.name);
 }
 
 
