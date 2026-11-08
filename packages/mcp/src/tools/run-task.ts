@@ -19,6 +19,7 @@ import { nearestText, validateEmbeddingVectors, type NearestRequest } from "../n
 import { applyJob, mergeProfiles, pickLiveJobModel, type JobProfile } from "../job-mode.js";
 import { LOCAL_JOBS, RUN_TASK_JOBS, type JobName } from "../local-prompts.js";
 import { HANDOFF_NAME, summaryOf, writeHandoff } from "../handoffs.js";
+import { resultChecks, withChecks } from "../result-checks.js";
 
 // Typed where the agent acts on a field; Ollama-owned payloads (`response`) stay open.
 const taskResultSchema = z.object({
@@ -673,7 +674,7 @@ export function registerRunTaskTool(server: McpServer): void {
           let items: BatchItem[] = tasks.map((item) => ({ ...item, task: { ...shared, ...withoutUndefined(parseBatchTask(item)) } as BatchItem["task"] }));
           let profile: JobProfile | undefined;
           if (job !== undefined) ({ items, profile } = await withBatchJob(job, items, endpoint));
-          return withJob(await runBatch(items, maxParallelism, endpoint, extra, defer === true), profile);
+          return withJob(withBatchChecks(await runBatch(items, maxParallelism, endpoint, extra, defer === true), job, items), profile);
         }
         if (maxParallelism !== undefined) return errorResult(new Error("`maxParallelism` is valid only with `tasks`."));
         if (saveAs !== undefined && (preview || defer)) return errorResult(new Error("`saveAs` saves a finished answer; it is not valid with `preview` or `defer`."));
@@ -687,7 +688,9 @@ export function registerRunTaskTool(server: McpServer): void {
           nearestRequest = applied.fields.nearest as typeof nearestRequest;
           profile = applied.profile;
         }
-        const finish = <R,>(result: R): R => withJob(result, profile, saveAs);
+        // Checks read the result itself (uncertain answers, close matches, unsupported facts, edits
+        // that do not match the file) and are saved with a handoff too.
+        const finish = <R,>(result: R): R => withJob(withChecks(result, job, task ?? "completion"), profile, saveAs);
         const canonicalTask = task ?? "completion";
         if (preview) {
           const executionOnlyFields = ([
@@ -895,4 +898,33 @@ function rankedResult(
   if (!ranked) return errorResult(new Error("serve returned no nearest ranking for the embedding task"));
   const header = withQuery ? `closest of ${itemCount} items to the query:` : `most similar pairs among ${itemCount} items:`;
   return { ...finished, content: [{ type: "text" as const, text: `${header}\n${nearestText(ranked)}` }] };
+}
+
+
+/**
+ * Per-item checks for a batch: each item's result is read the way a single call's is, and only
+ * items with something specific to check are listed, so 50 confident answers stay one line.
+ */
+function withBatchChecks<R>(result: R, job: string | undefined, items: BatchItem[]): R {
+  const shown = result as { content?: Array<{ type: string; text?: string }>; structuredContent?: Fields; isError?: boolean };
+  const rows = Array.isArray(shown.structuredContent?.results) ? shown.structuredContent.results as unknown[] : [];
+  if (shown.isError || rows.length === 0) return result;
+  const taskOf = new Map(items.map((item) => [item.id, String(item.task.task ?? "completion")]));
+  const flagged: string[] = [];
+  const checks: Record<string, string[]> = {};
+  for (const raw of rows) {
+    const row = object(raw);
+    if (!row || row.ok !== true) continue;
+    const id = String(row.id);
+    const receipt = object(row.response) ?? {};
+    const lines = resultChecks({ job, task: taskOf.get(id), answer: taskAnswerText(receipt) ?? "", structured: receipt });
+    if (lines.length === 0 || /^every answer is outside|^every number and quoted name|^all \d+ SEARCH/.test(lines[0]!)) continue;
+    checks[id] = lines;
+    flagged.push(`${id}: ${lines.join("; ")}`);
+  }
+  if (flagged.length === 0) return result;
+  const content = (shown.content ?? []).map((part, index) => (index === 0 && part.type === "text"
+    ? { ...part, text: `${part.text ?? ""}\n\ncheck these items first:\n${flagged.slice(0, 20).map((line) => `- ${line}`).join("\n")}${flagged.length > 20 ? `\n- … ${flagged.length - 20} more in structuredContent.checks` : ""}` }
+    : part));
+  return { ...result, structuredContent: { ...shown.structuredContent, checks }, content } as R;
 }

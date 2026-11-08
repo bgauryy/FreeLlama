@@ -15,7 +15,7 @@ const fixture = vi.hoisted(() => {
 vi.mock("../../src/serve-client.js", () => ({ runTaskRequest: (...args: any[]) => fixture.run(...args), getTaskJob: vi.fn(), cancelTaskJob: vi.fn(), route: vi.fn() }));
 vi.mock("../../src/model-library.js", () => ({ catalogLiveState: (...args: any[]) => fixture.live(...args) }));
 
-import { applyJob, pickJobModel } from "../../src/job-mode.js";
+import { applyJob, pickJobModel, familyMatch } from "../../src/job-mode.js";
 import { MODEL_CATALOG } from "../../src/model-catalog.js";
 import { LOCAL_JOBS, OCR_PROMPTS, RUN_TASK_JOBS } from "../../src/local-prompts.js";
 import { registerRunTaskTool } from "../../src/tools/run-task.js";
@@ -24,12 +24,13 @@ const installed = (...names: string[]) => names.map((name) => ({ name }));
 const GB = 1e9;
 
 describe("local-prompts job table", () => {
-  it("draws every job's picks from the catalog, in catalog order, and profiles only those picks", () => {
+  it("draws every job's picks from the catalog, in catalog order, and profiles every pick by family", () => {
     for (const job of RUN_TASK_JOBS) {
       const spec = LOCAL_JOBS[job];
       const catalogJob = MODEL_CATALOG.jobs.find((entry) => entry.job === spec.catalogJob)!;
       expect(spec.defaultPicks, job).toEqual(catalogJob.picks.map((pick) => pick.tag));
-      for (const tag of Object.keys(spec.models ?? {})) expect(spec.defaultPicks, `${job}: ${tag}`).toContain(tag);
+      // Profiles are by family: every catalog pick resolves to one, and other installed tags of a family do too.
+      if (spec.models) for (const tag of spec.defaultPicks) expect(familyMatch(spec.models, tag), `${job}: ${tag}`).toBeDefined();
       expect(spec.sources.length, job).toBeGreaterThan(0);
       for (const profile of Object.values(spec.models ?? {})) {
         expect(profile.sources.every((source) => source.startsWith("https://")), job).toBe(true);
@@ -198,3 +199,27 @@ describe("run_task with job", () => {
     expect((await call({ saveAs: "x", tasks: [{ id: "a", independent: true, task: { prompt: "x" } }] })).content[0].text).toMatch(/not valid with `tasks`/);
   });
 });
+
+describe("family profiles and model-aware prompts", () => {
+  it("covers other tags, sizes and quantizations of a family, preferring the longest key", () => {
+    const coding = LOCAL_JOBS.coding.models;
+    expect(familyMatch(coding, "lfm3:latest")).toBe(familyMatch(coding, "lfm3:1.7b-q4_K_M"));
+    expect(familyMatch(coding, "LFM3:1.7B")).toBeDefined();
+    expect(familyMatch(coding, "bonsai-2:27b-q8_0")?.options?.temperature).toBe(1);
+    expect(familyMatch(coding, "bonsai-2:9b-q4_K_M")?.think).toBe(false);
+    expect(familyMatch(coding, "qwen3.8:27b")?.think).toBe(false);
+    expect(familyMatch(coding, "hf.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-4GB:Q8_0")).toBeDefined();
+    expect(familyMatch(coding, "lfm3-vl:2b")).toBeDefined();
+    expect(familyMatch(LOCAL_JOBS["image-recognition"].models, "lfm3-vl:2b")).toBe(LOCAL_JOBS["image-recognition"].models!["lfm3-vl"]);
+    expect(familyMatch(coding, "llama3:8b")).toBeUndefined();
+  });
+
+  it("asks OCR-trained models with their trained prefix and other vision models in plain words", () => {
+    const prompt = LOCAL_JOBS.ocr.prompt!;
+    expect(prompt({ model: "hf.co/openbmb/MiniCPM-OCR-1.0-gguf:Q8_0" })).toBe("Text Recognition:");
+    expect(prompt({ model: "glm-ocr:latest", kind: "table" })).toBe("Table Recognition:");
+    expect(prompt({ model: "qwen3.8:27b" })).toMatch(/^Transcribe all text in the image exactly/);
+    expect(prompt({ model: "lfm3-vl:2b", kind: "formula" })).toMatch(/LaTeX/);
+  });
+});
+

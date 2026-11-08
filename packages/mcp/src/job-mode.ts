@@ -56,19 +56,37 @@ export async function pickLiveJobModel(job: JobName, endpoint: string | undefine
 }
 
 function familyPrefixes(spec: LocalJob, model: string | undefined): Prefixes | undefined {
-  if (!spec.prefixes || model === undefined) return undefined;
-  const name = lower(model).replace(/^(?:registry\.ollama\.ai\/)?library\//, "");
-  return Object.entries(spec.prefixes).find(([family]) => name.startsWith(family))?.[1];
+  return familyMatch(spec.prefixes, model);
 }
 
 /** Any prefix a family documents: text that already starts with one is not prefixed again. */
 const KNOWN_PREFIXES = Object.values(EMBEDDING_PREFIXES).flatMap((family) => Object.values(family) as string[]);
 const prefixed = (text: string) => KNOWN_PREFIXES.some((prefix) => text.startsWith(prefix));
 
+/** `hf.co/openbmb/MiniCPM-OCR-1.0-gguf:Q4_K_M` -> `minicpm-ocr-1.0-gguf:q4_k_m`: the name a family key matches. */
+export function modelName(model: string): string {
+  return lower(model).replace(/^(?:hf\.co|huggingface\.co)\/[^/]+\//, "").replace(/^registry\.ollama\.ai\/library\//, "");
+}
+
+/**
+ * The profile for `model`: the longest key that is its name or a prefix ending at a name boundary
+ * (`:` or `-`), so `lfm3` covers lfm3:1.7b and lfm3:latest, `bonsai-2:27b` wins over `bonsai-2`
+ * for bonsai-2:27b-q4, and any quantization of a family gets that family's documented values.
+ */
+export function familyMatch<V>(table: Record<string, V> | undefined, model: string | undefined): V | undefined {
+  if (!table || model === undefined) return undefined;
+  const name = modelName(model);
+  let best: [string, V] | undefined;
+  for (const [key, value] of Object.entries(table)) {
+    const wanted = modelName(key);
+    const fits = name === wanted || (name.startsWith(wanted) && /[:-]/.test(name[wanted.length] ?? "")) || (wanted.endsWith(":") && name.startsWith(wanted));
+    if (fits && (!best || wanted.length > best[0].length)) best = [wanted, value];
+  }
+  return best?.[1];
+}
+
 function modelProfile(spec: LocalJob, model: string | undefined): ModelProfile | undefined {
-  if (!spec.models || model === undefined) return undefined;
-  const wanted = lower(model);
-  return Object.entries(spec.models).find(([tag]) => lower(tag) === wanted)?.[1];
+  return familyMatch(spec.models, model);
 }
 
 /**
@@ -120,7 +138,7 @@ export function applyJob<T extends JobFields>(job: JobName, fields: T, model: st
   if (next.messages === undefined) {
     if (next.prompt === undefined) {
       if (!spec.prompt) throw new Error(`job "${job}" needs ${spec.needs ?? "`prompt`"}.`);
-      next.prompt = spec.prompt({});
+      next.prompt = spec.prompt({ model: next.model });
       applied.push("prompt");
     }
     const systemPrompt = own?.systemPrompt ?? spec.systemPrompt;

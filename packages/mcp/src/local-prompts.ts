@@ -18,7 +18,7 @@ export type Prefixes = { query?: string; document?: string };
 /** The jobs `run_task {job}` runs. */
 export const RUN_TASK_JOBS = ["classify", "find-code", "duplicates", "ocr", "image-recognition", "image-search", "coding", "summarize"] as const;
 export type JobName = (typeof RUN_TASK_JOBS)[number];
-export type PromptInput = { question?: string; kind?: string };
+export type PromptInput = { question?: string; kind?: string; model?: string };
 
 export type LocalJob = {
   job: JobName;
@@ -35,17 +35,20 @@ export type LocalJob = {
   think?: boolean;
   /** Embedding jobs, by model family (the start of the tag). */
   prefixes?: Record<string, Prefixes>;
-  /** Documented per-model values, by catalog tag. */
+  /**
+   * Documented per-model values, by model family: a key covers every tag of that family (any size
+   * suffix or quantization after `:` or `-`); the longest matching key wins, so `bonsai-2:27b`
+   * overrides `bonsai-2`. `hf.co/<owner>/` and case are ignored.
+   */
   models?: Record<string, ModelProfile>;
   notes: string;
   sources: string[];
 };
 
 const catalog = catalogData as { jobs: Array<{ job: string; picks: Array<{ tag: string }> }> };
+/** A catalog job's picks; a job the catalog lacks has none, and job mode refuses it when called. */
 function picksOf(job: string): string[] {
-  const found = catalog.jobs.find((entry) => entry.job === job);
-  if (!found) throw new Error(`model_catalog.json has no job ${job}`);
-  return found.picks.map((pick) => pick.tag);
+  return catalog.jobs.find((entry) => entry.job === job)?.picks.map((pick) => pick.tag) ?? [];
 }
 
 const cookbook = (name: string) => `docs/cookbooks/${name}.md`;
@@ -64,6 +67,8 @@ const SOURCES = {
   lfm3: ["https://huggingface.co/LiquidAI/LFM3-1.7B", "https://ollama.com/library/lfm3"],
   nemotronBolt: ["https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-4GB"],
   lfm3Audio: ["https://huggingface.co/LiquidAI/LFM3-Audio-2B", "https://ollama.com/library/lfm3-audio"],
+  qwen38: ["https://huggingface.co/Qwen/Qwen3.8-27B", "https://ollama.com/library/qwen3.8"],
+  qwen35: ["https://huggingface.co/Qwen/Qwen3.5-4B", "https://ollama.com/library/qwen3.5"],
   phonon: ["https://ollama.com/library/phonon:en"],
 };
 
@@ -79,9 +84,22 @@ export const EMBEDDING_PREFIXES = {
 const GEMMA = EMBEDDING_PREFIXES.embeddinggemma;
 const NOMIC = EMBEDDING_PREFIXES["nomic-embed-text"];
 
-/** The prompts both OCR picks document. MiniCPM-OCR adds "Seal Recognition:" and "Chart to Table:". */
+/** The prompts both OCR picks were trained on. MiniCPM-OCR adds "Seal Recognition:" and "Chart to Table:". */
 export const OCR_PROMPTS = { text: "Text Recognition:", table: "Table Recognition:", formula: "Formula Recognition:" } as const;
 export type OcrKind = keyof typeof OCR_PROMPTS;
+/** Families trained on OCR_PROMPTS. Any other vision model reads a plain instruction instead. */
+const OCR_TRAINED = ["minicpm-ocr", "glm-ocr"];
+/** The same requests, worded for a general vision model that was not trained on the prefixes. */
+const OCR_PLAIN: Record<OcrKind, string> = {
+  text: "Transcribe all text in the image exactly, line by line. Output only the text.",
+  table: "Transcribe the table in the image as a Markdown table. Output only the table.",
+  formula: "Transcribe the formula in the image as LaTeX. Output only the LaTeX.",
+};
+const ocrPrompt = (kind: string | undefined, model: string | undefined): string => {
+  const wanted = (kind && kind in OCR_PROMPTS ? kind : "text") as OcrKind;
+  const name = (model ?? "").toLowerCase().replace(/^(?:hf\.co|huggingface\.co)\/[^/]+\//, "");
+  return model === undefined || OCR_TRAINED.some((family) => name.startsWith(family)) ? OCR_PROMPTS[wanted] : OCR_PLAIN[wanted];
+};
 
 const CODING_SYSTEM = `You make small code changes. Reply with the edits only; explain nothing unless the task asks.
 Change an existing file with one or more blocks in exactly this form:
@@ -93,6 +111,7 @@ replacement lines
 >>>>>>> REPLACE
 Copy SEARCH lines character for character from the file shown; never shorten them. Prefer several small blocks to one large one.
 For a new file, or one under 30 lines, write its path on one line, then the whole file in one fenced code block.
+If the file was not shown, you cannot copy its lines: return the new or changed code in one fenced block and say which file and function it belongs in.
 If the task asks a question rather than a change, answer it in a few lines.`;
 
 const SUMMARIZE_SYSTEM = `Summarize the text you are given as short bullet points.
@@ -110,35 +129,45 @@ const BONSAI_9B: ModelProfile = {
   sources: SOURCES.bonsai9b,
 };
 
-/** The chat models of the coding picks, as their cards document them. */
+/** Qwen3.8 / Qwen3.5 with thinking off and their cards' non-thinking preset: for short bounded jobs. */
+const qwenNonThinking = (sources: string[]): ModelProfile => ({
+  think: false,
+  options: { temperature: 0.7, top_p: 0.8, top_k: 20, min_p: 0, presence_penalty: 1.5, repeat_penalty: 1 },
+  notes: "Thinks by default; with think:true use the thinking preset (temperature 1.0, top_p 0.95, top_k 20) and a large output budget. Raise presence_penalty (up to 2) if it repeats.",
+  sources,
+});
+
+/** The chat models of the coding picks, and other families installed for chat, as their cards document them. */
 const CHAT_MODELS: Record<string, ModelProfile> = {
-  "lfm3:1.7b-q4_K_M": {
+  lfm3: {
     options: { temperature: 0.1, top_k: 50, repeat_penalty: 1.1 },
     notes: "Thinks by default; its card calls thinking off inconsistent, so it stays on. Not for agentic coding or multi-step reasoning.",
     sources: SOURCES.lfm3,
   },
-  "hf.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-4GB:Q4_K_M": {
+  "nvidia-nemotron-3.5-bolt": {
     options: { temperature: 1, top_p: 0.95 },
     notes: "Reasons by default; a tight num_predict cuts the reasoning mid-sentence.",
     sources: SOURCES.nemotronBolt,
   },
-  "bonsai-2:9b": BONSAI_9B,
+  "bonsai-2": BONSAI_9B,
   "bonsai-2:27b": {
     options: { temperature: 1, top_p: 0.95, top_k: 20, min_p: 0.05, presence_penalty: 0, repeat_penalty: 1 },
     notes: "The card's thinking preset; it documents no switch to turn thinking off.",
     sources: SOURCES.bonsai27b,
   },
+  "qwen3.8": qwenNonThinking(SOURCES.qwen38),
+  "qwen3.5": qwenNonThinking(SOURCES.qwen35),
 };
 
-const CHAT_SOURCES = [...SOURCES.lfm3, ...SOURCES.nemotronBolt, ...SOURCES.bonsai9b, ...SOURCES.bonsai27b];
+const CHAT_SOURCES = [...SOURCES.lfm3, ...SOURCES.nemotronBolt, ...SOURCES.bonsai9b, ...SOURCES.bonsai27b, ...SOURCES.qwen38, ...SOURCES.qwen35];
 
 /** Per job: what job mode sends a local model when the caller leaves it out. */
 export const LOCAL_JOBS: Record<JobName, LocalJob> = {
   classify: {
     job: "classify", task: "decision", catalogJob: "classify", defaultPicks: picksOf("classify"),
     models: {
-      "strands-decider:2b-nvfp4": { notes: "State and questions together must fit 4,096 tokens; weak on long, multi-step documents.", sources: SOURCES.strandsDecider },
-      "nimble-v3:9b-q4_K_M": { notes: "Documents num_ctx 32768 (routing sizes it here); CC BY-NC 4.0, noncommercial.", sources: SOURCES.nimble },
+      "strands-decider": { notes: "State and questions together must fit 4,096 tokens; weak on long, multi-step documents.", sources: SOURCES.strandsDecider },
+      "nimble-v3": { notes: "Documents num_ctx 32768 (routing sizes it here); CC BY-NC 4.0, noncommercial.", sources: SOURCES.nimble },
     },
     notes: "A decision model reads state and questions, no prompt. Ask short questions about the state, one concern each, and give a choice question an explicit fallback option such as other.",
     sources: [...SOURCES.strandsDecider, ...SOURCES.nimble, cookbook("classify")],
@@ -165,12 +194,12 @@ export const LOCAL_JOBS: Record<JobName, LocalJob> = {
   },
   ocr: {
     job: "ocr", task: "vision", catalogJob: "ocr", defaultPicks: picksOf("ocr"),
-    prompt: ({ kind }) => OCR_PROMPTS[kind as OcrKind] ?? OCR_PROMPTS.text,
+    prompt: ({ kind, model }) => ocrPrompt(kind, model),
     models: {
-      "hf.co/openbmb/MiniCPM-OCR-1.0-gguf:Q4_K_M": { notes: "Chinese and English; no sampling settings documented.", sources: SOURCES.miniCpmOcr },
-      "glm-ocr:latest": { notes: "Also documents Figure Recognition:; no sampling settings documented.", sources: SOURCES.glmOcr },
+      "minicpm-ocr": { notes: "Chinese and English; no sampling settings documented.", sources: SOURCES.miniCpmOcr },
+      "glm-ocr": { notes: "Also documents Figure Recognition:; no sampling settings documented.", sources: SOURCES.glmOcr },
     },
-    notes: "Both picks document Text Recognition:, Table Recognition: and Formula Recognition:. Crop to the text first.",
+    notes: "The OCR picks were trained on Text Recognition:, Table Recognition: and Formula Recognition:; a general vision model gets the same request in plain words. Crop to the text first.",
     sources: [...SOURCES.miniCpmOcr, ...SOURCES.glmOcr, cookbook("ocr")],
   },
   "image-recognition": {
@@ -178,18 +207,20 @@ export const LOCAL_JOBS: Record<JobName, LocalJob> = {
     needs: "prompt: your question about the image",
     systemPrompt: IMAGE_SYSTEM,
     models: {
-      "lfm3-vl:2b-q4_K_M": {
+      "lfm3-vl": {
         options: { temperature: 0.1, top_p: 1, top_k: 50, min_p: 0, repeat_penalty: 1.1 },
         notes: "Thinks before it answers, with no documented switch; images go in at native resolution, so a large one costs many tokens.",
         sources: SOURCES.lfm3Vl,
       },
-      "lfm3-omni:2b-q4_K_M": {
+      "lfm3-omni": {
         systemPrompt: "Answer questions about the provided image. Base every answer only on what can be seen.",
         options: { temperature: 0 },
         notes: "Non-reasoning: never send think:true. Up to 2,048 tokens per image.",
         sources: SOURCES.lfm3Omni,
       },
-      "bonsai-2:9b": BONSAI_9B,
+      "bonsai-2": BONSAI_9B,
+      "qwen3.8": qwenNonThinking(SOURCES.qwen38),
+      "qwen3.5": qwenNonThinking(SOURCES.qwen35),
     },
     notes: "Ask a specific question, not \"describe this\". Tested on drawn images only.",
     sources: [...SOURCES.lfm3Vl, ...SOURCES.lfm3Omni, ...SOURCES.bonsai9b, cookbook("image-recognition")],
@@ -310,16 +341,17 @@ export function githubSystemPrompt(): string {
 
 // ---- What the calling agent reads: the MCP prompts (builtin-prompts.ts builds their calls). ----
 
-/** How to check each job's result, one line each. */
+/**
+ * What the agent checks. run_task results carry their own `check:` lines, computed from the result
+ * (result-checks.ts): uncertain answers, close or weak matches, facts missing from the source,
+ * edits that do not match the file, an empty or looping read. Research and sweep say it here.
+ */
+export const RESULT_CHECKS = "The result ends with check: lines worked out from it; act on them first.";
 export const AGENT_CHECKS: Record<string, string> = {
-  ocr: "Check every number and name you will use against the image; garbled text means crop to the text and retry.",
-  image: "Verify anything you act on; tested on drawn images only.",
-  classify: "Spot-check 3 to 5 answers and treat a low probability as unknown.",
-  "find-code": "Read the top ranges before relying on them; on a miss, widen top or rephrase.",
-  duplicates: "A high score is a candidate: read both texts before closing anything.",
-  summarize: "Check each number and name you reuse against the source.",
-  research: "Discard verification.recommendation \"escalate\"; otherwise verify the cited lines.",
-  sweep: "Read 3 to 5 flagged chunks and 2 clear ones before trusting the rest.",
+  ocr: RESULT_CHECKS, image: RESULT_CHECKS, classify: RESULT_CHECKS, "find-code": RESULT_CHECKS,
+  duplicates: RESULT_CHECKS, summarize: RESULT_CHECKS,
+  research: "Discard verification.recommendation \"escalate\"; otherwise open the cited path:line.",
+  sweep: "Read the unsure chunks first, then 3 flagged and 2 clear ones, before trusting the rest.",
 };
 
 /** Applying the coding job's SEARCH/REPLACE answer. */
@@ -332,7 +364,7 @@ Offload when the answer is cheap to check and the work is 10 or more similar ite
 
 Pick a job and pass it to run_task: classify (labels, yes/no), find-code (which file), duplicates, ocr (text in an image), image-recognition (what an image shows), image-search, coding (one small change), summarize. FreeLlama runs the first catalog model that is installed and fits now, with its prompt for that job; any field you pass wins, and job_profile.applied says what it filled in. Name inputs with files; for one answer per file send tasks:[{id, independent:true, task:{files:[path]}}] with job at the top level. For a whole code tree, log or site use sweep; for a question about a repository, delegate_research.
 
-Verify: local answers are candidates. Check 3 to 5 (more where a mistake costs more) before relying on the rest; treat low decision probabilities as unknown; discard a research result whose verification.recommendation is "escalate".
+Verify: local answers are candidates. Each run_task result ends with check: lines worked out from it (uncertain answers, close matches, facts not in the source, edits that do not match the file); act on those first, and discard a research result whose verification.recommendation is "escalate".
 
 Coding: the answer is SEARCH/REPLACE blocks. ${APPLY_EDITS}
 

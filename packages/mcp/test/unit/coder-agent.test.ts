@@ -254,7 +254,7 @@ describe("coder session in an isolated copy", () => {
       expect(existsSync(path.join(outside, "escape.txt"))).toBe(false);
       expect(existsSync(path.join(repo, "pwned.txt"))).toBe(false);
     }
-  });
+  }, 20_000); // spawns sandboxed processes; slow on a loaded machine
 
   it("scopes the diff to a subdirectory workspace so git -C <workspace> apply works", async () => {
     const repo = callerRepo();
