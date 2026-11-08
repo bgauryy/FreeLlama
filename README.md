@@ -36,8 +36,10 @@ Claude Desktop, Cursor and other hosts:
 At launch the server starts its own FreeLlama service on `127.0.0.1:11435` if none is running, so
 the CLI is optional. It does not install or start Ollama.
 
-Optional: `FREELLAMA_MCP_ALLOWED_ROOTS` lists the directories `delegate_research` may read
-(`:`-separated on macOS and Linux, `;` on Windows); unset, only that tool refuses paths. Add it with
+Required for `delegate_research` in a published install: `FREELLAMA_MCP_ALLOWED_ROOTS` lists the
+directories that tool may read (`:`-separated on macOS and Linux, `;` on Windows). Unset, every local
+`delegate_research` call is refused (its `adapter:"github"` runs without a workspace); the other tools
+do not need it, and `run_task` `files` uses `FREELLAMA_FILE_ROOTS` instead. Add it with
 `claude mcp add freellama -e FREELLAMA_MCP_ALLOWED_ROOTS=/absolute/path/to/your-project -- npx -y @octocodeai/freellama-mcp-server`
 or an `"env": { ... }` entry in JSON. All settings: [MCP configuration](packages/mcp/CONFIGURATION.md).
 

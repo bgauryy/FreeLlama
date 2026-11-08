@@ -1,6 +1,6 @@
 // Environment-derived configuration and the `delegate_research` workspace boundary.
 // Every default is overridable via an env var so no deployment needs a recompile.
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { realpath } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -114,29 +114,65 @@ function allowedResearchRoots(): Promise<string[]> {
   return resolvedRootsPromise;
 }
 
-export async function assertAllowedWorkspace(workspacePath: string): Promise<string> {
+/** The real path of `dir`, or its lexical form when it cannot be resolved. */
+function realDirectory(dir: string): string {
+  try {
+    return realpathSync(dir);
+  } catch {
+    return path.resolve(dir);
+  }
+}
+
+/**
+ * Make `workspacePath` absolute. A relative path resolves against the server's working directory,
+ * by the rule `files` uses (task-files.ts `fileRoots`): only when that directory is a project, not
+ * `/` or the home directory a host may start the server from.
+ */
+export function resolveWorkspacePath(workspacePath: string, cwd = process.cwd(), home = homedir()): string {
+  if (path.isAbsolute(workspacePath)) return workspacePath;
+  const working = realDirectory(cwd);
+  if (working === realDirectory(path.parse(path.resolve(cwd)).root) || working === realDirectory(home)) {
+    throw new Error(
+      `workspacePath "${workspacePath}" is relative, and the server's working directory (${cwd}) is ` +
+        "the filesystem root or the home directory, so it names no project. Pass an absolute path to the directory to research.",
+    );
+  }
+  return path.resolve(cwd, workspacePath);
+}
+
+/** The refusal for an install with no research roots: what to set, with an example. */
+export function missingResearchRootsMessage(workspacePath: string): string {
+  const example = path.delimiter === ";" ? "C:\\code\\project;D:\\work" : "/Users/me/code/project:/Users/me/work";
+  return (
+    `workspacePath "${workspacePath}" is rejected: delegate_research has no allowed research roots. ` +
+    "A published install requires FREELLAMA_MCP_ALLOWED_ROOTS in the MCP server's environment (the `env` of its client config), " +
+    `a list of absolute directories separated by "${path.delimiter}", for example FREELLAMA_MCP_ALLOWED_ROOTS="${example}". ` +
+    "Ask the user which directories it may read, then restart the server. run_task `files` uses FREELLAMA_FILE_ROOTS instead; " +
+    "a FreeLlama checkout defaults to its repo root."
+  );
+}
+
+export async function assertAllowedWorkspace(
+  workspacePath: string,
+  options: { roots?: string[]; cwd?: string; home?: string } = {},
+): Promise<string> {
   // `realpath`, not just `path.resolve`: resolve() is pure string arithmetic, so a symlink placed
   // inside an allowed root and pointing at $HOME (or /) passes a prefix check while actually
   // handing the local model everything on the other side of the link. The roots go through
   // realpath too, or the comparison would fail legitimately on macOS, where paths like /tmp are
   // themselves symlinks.
+  const absolute = resolveWorkspacePath(workspacePath, options.cwd, options.home);
   let resolved: string;
   try {
-    resolved = await realpath(path.resolve(workspacePath));
+    resolved = await realpath(absolute);
   } catch {
     throw new Error(
-      `workspacePath "${workspacePath}" does not exist or is not readable. It must be an ` +
-        "absolute path to a directory that exists on this machine.",
+      `workspacePath "${workspacePath}"${absolute === workspacePath ? "" : ` (resolved to ${absolute})`} does not exist or is not readable. ` +
+        "It must be a directory that exists on this machine.",
     );
   }
-  const roots = await allowedResearchRoots();
-  if (roots.length === 0) {
-    throw new Error(
-      `workspacePath "${workspacePath}" is rejected because no research roots are configured. ` +
-        "Set FREELLAMA_MCP_ALLOWED_ROOTS (a platform-separated list of absolute paths) to the directories " +
-        "`delegate_research` may read. In a FreeLlama checkout this defaults to the repo root.",
-    );
-  }
+  const roots = options.roots ? options.roots.map(realDirectory) : await allowedResearchRoots();
+  if (roots.length === 0) throw new Error(missingResearchRootsMessage(workspacePath));
   const allowed = roots.some(
     (root) => resolved === root || resolved.startsWith(`${root}${path.sep}`),
   );

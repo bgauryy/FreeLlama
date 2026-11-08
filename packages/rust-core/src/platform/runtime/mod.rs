@@ -53,6 +53,22 @@ pub enum ContextMode {
     OllamaDefault,
 }
 
+/// Whether managed chat sends Ollama's `shift` field. Ollama reloads a runner whose launch-time
+/// context-shift setting differs from a request's, and its default is on for most models, so a
+/// client that omits `shift` and one that sends `shift: false` reload each other's runner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextShift {
+    /// Send `shift: false`: a generation that reaches the context limit stops instead of
+    /// discarding its earliest tokens. Runners loaded by raw clients reload for managed chat.
+    #[default]
+    Off,
+    /// Omit `shift`, so Ollama's default for the model applies and managed and raw chat share a
+    /// runner. A long generation may then drop its earliest tokens; `truncate: false` still
+    /// refuses a prompt that does not fit.
+    OllamaDefault,
+}
+
 /// The runtime config file. Every field is optional; unknown fields are rejected so a typo is an
 /// error at reload instead of a silently ignored setting.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
@@ -77,6 +93,8 @@ pub struct RuntimeFile {
     /// Admission units per task; embeddings charge this base for each four-input group.
     pub task_costs: Option<BTreeMap<super::TaskKind, NonZeroU32>>,
     pub context_mode: Option<ContextMode>,
+    /// `off` (default) sends `shift: false` on managed chat; `ollama_default` omits it.
+    pub context_shift: Option<ContextShift>,
     pub ollama_default_context: Option<u64>,
     pub auto_context_max: Option<u64>,
     pub usage_queue_capacity: Option<std::num::NonZeroUsize>,
@@ -138,6 +156,7 @@ pub struct Tunables {
     pub adaptive_concurrency: AdaptiveMode,
     pub task_costs: BTreeMap<super::TaskKind, NonZeroU32>,
     pub context_mode: ContextMode,
+    pub context_shift: ContextShift,
     pub ollama_default_context: Option<u64>,
     pub auto_context_max: u64,
     /// Fixed at startup; changing it during reload is rejected.

@@ -26,6 +26,7 @@ import { registerOllamaLifecycleTools } from "./tools/ollama-lifecycle.js";
 import { registerDelegateResearchTool } from "./tools/delegate-research.js";
 import { registerReadResponseTool } from "./tools/read-response.js";
 import { registerAudioTool } from "./tools/audio.js";
+import { registerSweepTool } from "./tools/sweep.js";
 
 installProcessLifecycle();
 
@@ -33,11 +34,11 @@ const INSTRUCTIONS = `FreeLlama runs bounded work on local Ollama models so you 
 
 Start with models{view:"catalog", job} (tested picks per job, whether each is installed and fits now; cookbooks at freellama://docs/cookbooks/<job>), and pass that pick as model: routing without model picks by capability only and may choose one that does not fit now. Call doctor{view:"status"} when a call fails or before a large batch. Choose by capability, not by name. Keep one model per batch when you can; each extra model is a load and may evict another.
 
-Name inputs with files (paths or globs under the server's working directory, the temp directory or FREELLAMA_FILE_ROOTS); pasted text and base64 images are your own output tokens. One task reads all its files together, so a glob gives one answer; for one answer per file send tasks:[{id, independent:true, task:{files:[path]}}] (up to 64), with what the items share (task, model, systemPrompt, questions, tools, format, options) once at the top level. Hosts cut calls near 60 s: for a cold load, a long input or a large batch pass defer:true and poll task_jobs{action:"get", jobId}. Warming a model saves local time, not your tokens.
+Name inputs with files (paths or globs under the server's working directory, the temp directory or FREELLAMA_FILE_ROOTS); pasted text and base64 images are your own output tokens. One task reads all its files together, so a glob gives one answer; for one answer per file send tasks:[{id, independent:true, task:{files:[path]}}] (up to 64), with what the items share (task, model, systemPrompt, questions, tools, format, options) once at the top level. For a large divisible check (code tree, logs, docs site) use sweep: it judges small chunks in the background, saves each result and reports only flagged or changed chunks. Hosts cut calls near 60 s: for a cold load, a long input or a large batch pass defer:true and poll task_jobs{action:"get", jobId}. Warming a model saves local time, not your tokens.
 
 You own prompts, output format and verification: local answers are candidates, so check 3 to 5 (more where a mistake costs more) before relying on the rest, and treat low decision probabilities as unknown.
 Memory: a refusal names the programs holding memory; tell the user and never stop their processes, then retry once they free memory, or use a smaller installed model with the same capability.
-Approval: before ollama_manage pull, ask the user for one exact tag (name:tag) and its reported size; search results are not permission. Unload only a model you warmed (when its burst ends) or one the user named; delete only a tag the user names.
+Approval: before ollama_pull, ask the user for one exact tag (name:tag) and its reported size, and pass that size as approvedSizeBytes; search results are not permission. Unload only a model you warmed (when its burst ends) or one the user named; delete only a tag the user names.
 Results: check isError first, then read the text; open structuredContent or read_response{file:response_file, section} only for a receipt field your next step needs. Pass page.next_cursor (models) and next_offset (read_response) back unchanged. A server restart loses scopes, sessions and jobs. CPU/GPU placement is operator-configured; executionPreference only chooses among eligible backends. Docs: freellama://docs/index.`;
 
 const server = withToolResults(new McpServer(
@@ -65,6 +66,7 @@ registerTaskJobsTool(server);
 registerOllamaLifecycleTools(server);
 registerDelegateResearchTool(server);
 registerAudioTool(server);
+registerSweepTool(server);
 registerReadResponseTool(server);
 
 const transport = withNormalizedToolSchemas(new StdioServerTransport());

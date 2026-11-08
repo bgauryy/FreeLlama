@@ -134,6 +134,20 @@ impl Store {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// Block every reader and writer until `release` fires, as a slow disk would. Returns once
+    /// the connection is held.
+    #[cfg(test)]
+    pub(crate) fn stall_until(&self, release: std::sync::mpsc::Receiver<()>) {
+        let store = self.clone();
+        let (held, is_held) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _connection = store.lock();
+            let _ = held.send(());
+            let _ = release.recv();
+        });
+        let _ = is_held.recv();
+    }
+
     /// The JSON body stored under `name`, if any.
     /// # Errors
     /// Returns an error when the database cannot be read.

@@ -85,8 +85,8 @@ pub use routing::{
     PlacementEvidence, RouteDecision, RouteInput, SessionAffinity, TaskKind, TaskPriority,
     installed_model, select_route,
 };
-pub(crate) use runtime::ContextMode;
 pub use runtime::RuntimeFile;
+pub(crate) use runtime::{ContextMode, ContextShift};
 pub(crate) use scopes::ScopePolicy;
 pub(crate) use telemetry::Telemetry;
 pub(crate) use warming::WarmingPolicy;
@@ -166,6 +166,9 @@ struct PlatformState {
     ollama_refresh: Arc<Mutex<Instant>>,
     raw_admission: proxy::RawAdmission,
     jobs: Arc<std::sync::Mutex<jobs::JobRegistry>>,
+    /// Bytes of buffered request bodies, shared with the raw proxy fallback.
+    body_budget: proxy::BodyBudget,
+    max_request_bytes: usize,
 }
 
 impl PlatformState {
@@ -358,6 +361,8 @@ fn build(config: &PlatformConfig) -> Result<(Router, PlatformState)> {
         jobs: Arc::new(std::sync::Mutex::new(jobs::JobRegistry::configured(
             config,
         )?)),
+        body_budget: proxy::BodyBudget::shared(),
+        max_request_bytes: crate::net::max_request_bytes(),
     };
     let fallback_config = ProxyConfig::new(&config.listen, &config.upstream, config.allow_remote)
         .with_raw_admission(raw_admission)
@@ -365,7 +370,8 @@ fn build(config: &PlatformConfig) -> Result<(Router, PlatformState)> {
         .with_load_lock(Arc::clone(&state.load_lock))
         .with_resource_governor(state.resources.clone())
         .with_hooks(Arc::new(raw_models::RawModels(state.clone())))
-        .with_upstreams(config.upstreams.clone());
+        .with_upstreams(config.upstreams.clone())
+        .with_body_budget(state.body_budget.clone());
     let platform = Router::new()
         .route(&format!("{API_ROOT}/health"), get(health))
         .route(&format!("{API_ROOT}/ready"), get(ready))
@@ -413,7 +419,11 @@ fn build(config: &PlatformConfig) -> Result<(Router, PlatformState)> {
         )
         // Images travel base64 inside task JSON; axum's own 2 MB default refused a screenshot.
         .layer(axum::extract::DefaultBodyLimit::max(
-            crate::net::max_request_bytes(),
+            state.max_request_bytes,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            reserve_request_body,
         ))
         .with_state(state.clone());
     let fallback = proxy::app(fallback_config)?;
@@ -572,6 +582,44 @@ async fn ready(State(state): State<PlatformState>) -> axum::response::Response {
 /// nature, advisory by design — but 0 here means "expect to queue", which is exactly the decision
 /// input a caller needs. Standard readiness-endpoint practice, kept on `/health` rather than a new
 /// tool so the surface does not grow.
+/// Reserve a control-API request's body in the shared buffered-body budget for as long as its
+/// handler runs (the parsed task keeps the payload in memory until it finishes). A body over the
+/// request limit is not reserved: its extractor refuses it with 413 without reading it.
+async fn reserve_request_body(
+    State(state): State<PlatformState>,
+    request: axum::extract::Request,
+    next: middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    use http_body::Body as _;
+    let hint = request.body().size_hint();
+    let oversized =
+        usize::try_from(hint.lower()).map_or(true, |bytes| bytes > state.max_request_bytes);
+    let expected = if oversized {
+        0
+    } else {
+        proxy::expected_body_bytes(&hint, state.max_request_bytes)
+    };
+    match state
+        .body_budget
+        .reserve(expected, state.tunables().max_queue_wait())
+        .await
+    {
+        Ok(reservation) => {
+            let response = next.run(request).await;
+            drop(reservation);
+            response
+        }
+        Err(exhausted) => ApiError::new(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            exhausted.to_string(),
+        )
+        .with_code("request_body_budget_exhausted")
+        .with_retry_after(1)
+        .into_response(),
+    }
+}
+
 async fn health(State(state): State<PlatformState>) -> Json<Value> {
     let resource_snapshot = state.resources.snapshot().await;
     // Lock order: `sessions` is never taken while `feedback` is held. Routing reads `feedback`
@@ -642,8 +690,9 @@ async fn health(State(state): State<PlatformState>) -> Json<Value> {
             "max_queue_wait_seconds": state.tunables().max_queue_wait().as_secs(),
             "raw_proxy_max_concurrent_requests": state.tunables().raw_max_concurrent_requests,
             "raw_proxy": state.raw_admission.receipt(),
+            "request_body_budget": state.body_budget.receipt(),
             "costs": state.tunables().admission_costs(),
-            "priority_fairness": {"policy": "weighted_fair_round_robin", "weights": {"interactive": 3, "normal": 2, "background": 1}, "starvation_prevention": "oldest_capacity_reservation", "max_capacity_bypasses": MAX_CAPACITY_BYPASSES},
+            "priority_fairness": {"policy": "weighted_fair_round_robin", "weights": {"interactive": 3, "normal": 2, "background": 1}, "starvation_prevention": "oldest_capacity_reservation", "max_capacity_bypasses": MAX_CAPACITY_BYPASSES, "model_affinity": {"scope": "within_priority_class", "max_skips": admission::MAX_AFFINITY_SKIPS, "max_wait_ms": u64::try_from(admission::MAX_AFFINITY_WAIT.as_millis()).unwrap_or(u64::MAX)}},
             "queue_deadline_scope": "admission_resources_and_transition",
             "resources": resource_snapshot,
         },

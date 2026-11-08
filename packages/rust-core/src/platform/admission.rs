@@ -1,9 +1,10 @@
-//! Weighted admission, bounded backfill, and cancellation-safe permit accounting.
+//! Weighted admission, bounded backfill, model affinity, and cancellation-safe permit accounting.
 use super::TaskPriority;
 use serde_json::{Value, json};
 use std::{
+    collections::HashMap,
     sync::{Arc, Mutex as StdMutex},
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tokio::sync::Notify;
 
@@ -34,6 +35,11 @@ struct AdmissionState {
     /// prevents a thundering herd from letting a later task steal a higher-priority grant.
     granted: Option<u64>,
     in_flight: usize,
+    /// Admitted tasks per model, so a waiter for a model already running here can be preferred.
+    /// Entries leave when their last permit is released, so the map holds at most `in_flight`.
+    running_models: HashMap<Arc<str>, usize>,
+    /// The model of the most recently admitted task: likely still resident after it finished.
+    recent_model: Option<Arc<str>>,
     admitted: u64,
     released: u64,
     policy_epoch: u64,
@@ -41,6 +47,8 @@ struct AdmissionState {
     queue_timeouts: u64,
     queue_cancellations: u64,
     transition_timeouts: u64,
+    /// Grants given to a younger same-class waiter because its model was running or most recent.
+    affinity_promotions: u64,
 }
 
 impl AdmissionState {
@@ -57,6 +65,32 @@ impl AdmissionState {
     fn charge(&self, cost: usize) -> usize {
         cost.min(self.limit).max(1)
     }
+
+    /// Whether this waiter's model is running on this backend or was admitted last, so serving
+    /// it now is unlikely to make Ollama load or swap a runner. Admission never asks Ollama.
+    fn has_affinity(&self, waiter: &AdmissionWaiter) -> bool {
+        waiter.model.as_deref().is_some_and(|model| {
+            self.running_models.contains_key(model) || self.recent_model.as_deref() == Some(model)
+        })
+    }
+
+    fn record_admitted_model(&mut self, model: Option<&Arc<str>>) {
+        if let Some(model) = model {
+            *self.running_models.entry(Arc::clone(model)).or_default() += 1;
+            self.recent_model = Some(Arc::clone(model));
+        }
+    }
+
+    fn release_model(&mut self, model: Option<&Arc<str>>) {
+        if let Some(model) = model
+            && let Some(count) = self.running_models.get_mut(model)
+        {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.running_models.remove(model);
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -64,8 +98,38 @@ struct AdmissionWaiter {
     ticket: u64,
     cost: usize,
     priority: TaskPriority,
+    /// The selected model, used only to prefer work that reuses a running model.
+    model: Option<Arc<str>>,
     enqueued_at: Instant,
     bypasses: u8,
+    /// Times a younger same-class waiter was granted first for model affinity.
+    affinity_skips: u8,
+}
+
+impl AdmissionWaiter {
+    fn new(
+        ticket: u64,
+        cost: usize,
+        priority: TaskPriority,
+        model: Option<&str>,
+        enqueued_at: Instant,
+    ) -> Self {
+        Self {
+            ticket,
+            cost,
+            priority,
+            model: model.map(Arc::from),
+            enqueued_at,
+            bypasses: 0,
+            affinity_skips: 0,
+        }
+    }
+
+    /// Past its affinity allowance this waiter is served in FIFO order again.
+    fn affinity_aged(&self, now: Instant) -> bool {
+        self.affinity_skips >= MAX_AFFINITY_SKIPS
+            || now.saturating_duration_since(self.enqueued_at) >= MAX_AFFINITY_WAIT
+    }
 }
 
 /// Held admission charge. Releasing is synchronous and wakes every waiter so the next weighted
@@ -73,6 +137,7 @@ struct AdmissionWaiter {
 pub(super) struct AdmissionPermit {
     pool: AdmissionPool,
     cost: usize,
+    model: Option<Arc<str>>,
 }
 
 impl AdmissionPermit {
@@ -91,6 +156,7 @@ impl Drop for AdmissionPermit {
         state.active = state.active.saturating_sub(self.cost);
         state.in_flight = state.in_flight.saturating_sub(1);
         state.released = state.released.saturating_add(1);
+        state.release_model(self.model.as_ref());
         drop(state);
         self.pool.changed.notify_waiters();
     }
@@ -118,6 +184,7 @@ impl ResourceWaitGuard {
         self,
         cost: usize,
         priority: TaskPriority,
+        model: Option<&str>,
         deadline: tokio::time::Instant,
     ) -> Result<(AdmissionPermit, u128), AdmissionFailure> {
         let pool = self.pool.clone();
@@ -130,13 +197,13 @@ impl ResourceWaitGuard {
             state
                 .resource_waiting
                 .retain(|(ticket, _)| *ticket != self.ticket);
-            state.waiting.push(AdmissionWaiter {
-                ticket: self.ticket,
+            state.waiting.push(AdmissionWaiter::new(
+                self.ticket,
                 cost,
                 priority,
-                enqueued_at: queued,
-                bypasses: 0,
-            });
+                model,
+                queued,
+            ));
         }
         let registration = AdmissionWaitGuard {
             pool: pool.clone(),
@@ -199,6 +266,11 @@ pub(super) const PRIORITY_WEIGHTS: [u8; 3] = [3, 2, 1];
 /// Allow one complete priority round of useful smaller work before reserving released capacity.
 /// A stream of one-unit requests must not permanently prevent a two-unit request from fitting.
 pub(super) const MAX_CAPACITY_BYPASSES: u8 = 6;
+/// Within the class the round robin chose, a waiter whose model is running or was admitted last
+/// may go ahead of older waiters for other models. Each older waiter can be passed over this many
+/// times, and for at most `MAX_AFFINITY_WAIT`, before the class is served in FIFO order again.
+pub(super) const MAX_AFFINITY_SKIPS: u8 = 4;
+pub(super) const MAX_AFFINITY_WAIT: Duration = Duration::from_secs(2);
 
 pub(super) const fn priority_index(priority: TaskPriority) -> usize {
     match priority {
@@ -317,6 +389,8 @@ impl AdmissionPool {
                 credits: PRIORITY_WEIGHTS,
                 granted: None,
                 in_flight: 0,
+                running_models: HashMap::new(),
+                recent_model: None,
                 admitted: 0,
                 released: 0,
                 policy_epoch: 0,
@@ -324,6 +398,7 @@ impl AdmissionPool {
                 queue_timeouts: 0,
                 queue_cancellations: 0,
                 transition_timeouts: 0,
+                affinity_promotions: 0,
             })),
             changed: Arc::new(Notify::new()),
         }
@@ -337,7 +412,11 @@ impl AdmissionPool {
     }
 
     /// Speculative work may claim an idle backend, but must never join or bypass its queue.
-    pub(super) fn try_acquire_idle(&self, cost: usize) -> Option<AdmissionPermit> {
+    pub(super) fn try_acquire_idle(
+        &self,
+        cost: usize,
+        model: Option<&str>,
+    ) -> Option<AdmissionPermit> {
         let mut state = self
             .state
             .lock()
@@ -346,12 +425,15 @@ impl AdmissionPool {
             return None;
         }
         let cost = state.charge(cost);
+        let model = model.map(Arc::<str>::from);
         state.active += cost;
         state.in_flight += 1;
         state.admitted = state.admitted.saturating_add(1);
+        state.record_admitted_model(model.as_ref());
         Some(AdmissionPermit {
             pool: self.clone(),
             cost,
+            model,
         })
     }
 
@@ -385,6 +467,9 @@ impl AdmissionPool {
             "max_capacity_bypasses": MAX_CAPACITY_BYPASSES,
             "capacity_reservation_active": state.waiting.iter()
                 .any(|waiter| waiter.bypasses >= MAX_CAPACITY_BYPASSES),
+            "affinity_promotions": state.affinity_promotions,
+            "affinity_max_skips": MAX_AFFINITY_SKIPS,
+            "affinity_max_wait_ms": u64::try_from(MAX_AFFINITY_WAIT.as_millis()).unwrap_or(u64::MAX),
         })
     }
 
@@ -392,7 +477,8 @@ impl AdmissionPool {
     /// After six admissions pass a non-fitting request, reserve all newly released capacity for
     /// the oldest such request. Cancellation removes the reservation with its waiter. This
     /// intentionally lets a slot idle briefly so expensive jobs can eventually start.
-    fn selected_waiter(state: &mut AdmissionState) -> Option<usize> {
+    /// Within the chosen class, `class_choice` applies bounded model affinity.
+    fn selected_waiter(state: &mut AdmissionState, now: Instant) -> Option<usize> {
         if let Some(index) = state
             .waiting
             .iter()
@@ -411,10 +497,7 @@ impl AdmissionPool {
                 if state.credits[class] == 0 {
                     continue;
                 }
-                if let Some((index, _)) = state.waiting.iter().enumerate().find(|(_, waiter)| {
-                    priority_index(waiter.priority) == class
-                        && state.charge(waiter.cost) <= state.free()
-                }) {
+                if let Some(index) = Self::class_choice(state, class, now) {
                     state.credits[class] -= 1;
                     Self::record_capacity_bypasses(state);
                     return Some(index);
@@ -425,6 +508,43 @@ impl AdmissionPool {
             }
         }
         None
+    }
+
+    /// The oldest fitting waiter of `class`, unless a younger fitting one has model affinity and
+    /// no older fitting waiter has aged out of affinity skipping. Passed-over waiters count a skip.
+    fn class_choice(state: &mut AdmissionState, class: usize, now: Instant) -> Option<usize> {
+        let fits = |state: &AdmissionState, waiter: &AdmissionWaiter| {
+            priority_index(waiter.priority) == class && state.charge(waiter.cost) <= state.free()
+        };
+        let head = state
+            .waiting
+            .iter()
+            .position(|waiter| fits(state, waiter))?;
+        let mut promoted = None;
+        for (index, waiter) in state.waiting.iter().enumerate().skip(head) {
+            if !fits(state, waiter) {
+                continue;
+            }
+            if state.has_affinity(waiter) {
+                promoted = Some(index);
+                break;
+            }
+            if waiter.affinity_aged(now) {
+                break;
+            }
+        }
+        let Some(promoted) = promoted.filter(|&index| index != head) else {
+            return Some(head);
+        };
+        let passed_over: Vec<usize> = (head..promoted)
+            .filter(|&index| fits(state, &state.waiting[index]))
+            .collect();
+        for index in passed_over {
+            let waiter = &mut state.waiting[index];
+            waiter.affinity_skips = waiter.affinity_skips.saturating_add(1);
+        }
+        state.affinity_promotions = state.affinity_promotions.saturating_add(1);
+        Some(promoted)
     }
 
     fn record_capacity_bypasses(state: &mut AdmissionState) {
@@ -441,6 +561,7 @@ impl AdmissionPool {
         &self,
         cost: usize,
         priority: TaskPriority,
+        model: Option<&str>,
         deadline: tokio::time::Instant,
     ) -> Result<(AdmissionPermit, u128), AdmissionFailure> {
         let queued = Instant::now();
@@ -459,13 +580,9 @@ impl AdmissionPool {
             }
             let ticket = state.next_ticket;
             state.next_ticket = state.next_ticket.wrapping_add(1);
-            state.waiting.push(AdmissionWaiter {
-                ticket,
-                cost,
-                priority,
-                enqueued_at: queued,
-                bypasses: 0,
-            });
+            state
+                .waiting
+                .push(AdmissionWaiter::new(ticket, cost, priority, model, queued));
             ticket
         };
         let registration = AdmissionWaitGuard {
@@ -489,7 +606,7 @@ impl AdmissionPool {
             let changed = self.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            let (acquired, selected, units) = {
+            let (acquired, selected, units, model) = {
                 let mut state = self
                     .state
                     .lock()
@@ -501,7 +618,7 @@ impl AdmissionPool {
                 }
                 let mut selected = false;
                 if state.granted.is_none()
-                    && let Some(index) = Self::selected_waiter(&mut state)
+                    && let Some(index) = Self::selected_waiter(&mut state, Instant::now())
                 {
                     state.granted = Some(state.waiting[index].ticket);
                     selected = true;
@@ -526,10 +643,11 @@ impl AdmissionPool {
                     state.active = state.active.saturating_add(units);
                     state.in_flight = state.in_flight.saturating_add(1);
                     state.admitted = state.admitted.saturating_add(1);
+                    state.record_admitted_model(waiter.model.as_ref());
                     state.granted = None;
-                    (true, selected, units)
+                    (true, selected, units, waiter.model)
                 } else {
-                    (false, selected, 0)
+                    (false, selected, 0, None)
                 }
             };
             if acquired {
@@ -538,6 +656,7 @@ impl AdmissionPool {
                     AdmissionPermit {
                         pool: self.clone(),
                         cost: units,
+                        model,
                     },
                     queued.elapsed().as_millis(),
                 ));
@@ -602,16 +721,16 @@ mod tests {
         let pool = AdmissionPool::new(4, 4);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         let (holder, _) = pool
-            .acquire(4, TaskPriority::Normal, deadline)
+            .acquire(4, TaskPriority::Normal, None, deadline)
             .await
             .unwrap_or_else(|_| panic!("holder"));
-        let mut chosen = Box::pin(pool.acquire(1, TaskPriority::Interactive, deadline));
+        let mut chosen = Box::pin(pool.acquire(1, TaskPriority::Interactive, None, deadline));
         assert!(
             std::future::poll_fn(|cx| Poll::Ready(chosen.as_mut().poll(cx)))
                 .await
                 .is_pending()
         );
-        let mut following = Box::pin(pool.acquire(1, TaskPriority::Normal, deadline));
+        let mut following = Box::pin(pool.acquire(1, TaskPriority::Normal, None, deadline));
         let notification_count = Arc::new(WakeCount::default());
         let waker = Waker::from(Arc::clone(&notification_count));
         let mut context = Context::from_waker(&waker);
@@ -641,14 +760,14 @@ mod tests {
         let pool = AdmissionPool::new(4, 4);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         let (anchor, _) = pool
-            .acquire(1, TaskPriority::Normal, deadline)
+            .acquire(1, TaskPriority::Normal, None, deadline)
             .await
             .unwrap_or_else(|_| panic!("anchor"));
         let (released, _) = pool
-            .acquire(1, TaskPriority::Normal, deadline)
+            .acquire(1, TaskPriority::Normal, None, deadline)
             .await
             .unwrap_or_else(|_| panic!("released holder"));
-        let mut chosen = Box::pin(pool.acquire(3, TaskPriority::Interactive, deadline));
+        let mut chosen = Box::pin(pool.acquire(3, TaskPriority::Interactive, None, deadline));
         assert!(
             std::future::poll_fn(|cx| Poll::Ready(chosen.as_mut().poll(cx)))
                 .await
@@ -656,7 +775,7 @@ mod tests {
         );
 
         drop(released);
-        let mut following = Box::pin(pool.acquire(1, TaskPriority::Normal, deadline));
+        let mut following = Box::pin(pool.acquire(1, TaskPriority::Normal, None, deadline));
         assert!(
             std::future::poll_fn(|cx| Poll::Ready(following.as_mut().poll(cx)))
                 .await
@@ -703,13 +822,13 @@ mod tests {
         let pool = AdmissionPool::new(1, 1);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         let (holder, _) = pool
-            .acquire(1, TaskPriority::Normal, deadline)
+            .acquire(1, TaskPriority::Normal, None, deadline)
             .await
             .unwrap_or_else(|_| panic!("holder"));
         let resource = pool
             .register_resource_waiter()
             .unwrap_or_else(|_| panic!("resource waiter"));
-        let pending = tokio::spawn(resource.acquire(1, TaskPriority::Normal, deadline));
+        let pending = tokio::spawn(resource.acquire(1, TaskPriority::Normal, None, deadline));
         tokio::time::timeout(Duration::from_secs(1), async {
             while pool.receipt()["slot_waiters"] != 1 {
                 tokio::task::yield_now().await;
@@ -734,6 +853,7 @@ mod tests {
             .acquire(
                 1,
                 TaskPriority::Normal,
+                None,
                 tokio::time::Instant::now() - Duration::from_secs(1),
             )
             .await;
@@ -748,7 +868,7 @@ mod tests {
         let pool = AdmissionPool::new(1, 2);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         let (holder, _) = pool
-            .acquire(1, TaskPriority::Normal, deadline)
+            .acquire(1, TaskPriority::Normal, None, deadline)
             .await
             .unwrap_or_else(|_| panic!("holder"));
         let resource = pool
@@ -756,7 +876,9 @@ mod tests {
             .unwrap_or_else(|_| panic!("resource waiter"));
         let other = pool.clone();
         let queued =
-            tokio::spawn(async move { other.acquire(1, TaskPriority::Normal, deadline).await });
+            tokio::spawn(
+                async move { other.acquire(1, TaskPriority::Normal, None, deadline).await },
+            );
         tokio::time::timeout(Duration::from_secs(1), async {
             while pool.queue_depth() != 2 {
                 tokio::task::yield_now().await;
@@ -765,7 +887,7 @@ mod tests {
         .await
         .unwrap();
         pool.set_max_waiters(1);
-        let mut returning = tokio::spawn(resource.acquire(1, TaskPriority::Normal, deadline));
+        let mut returning = tokio::spawn(resource.acquire(1, TaskPriority::Normal, None, deadline));
         assert!(
             tokio::time::timeout(Duration::from_millis(20), &mut returning)
                 .await
@@ -787,5 +909,218 @@ mod tests {
         drop(second);
         assert_eq!(pool.queue_depth(), 0);
         assert_eq!(pool.receipt()["in_flight"], 0);
+    }
+
+    fn queue(pool: &AdmissionPool, waiters: &[(TaskPriority, Option<&str>, Duration)]) {
+        let now = Instant::now();
+        let mut state = pool.state.lock().unwrap();
+        for (priority, model, age) in waiters {
+            let ticket = state.next_ticket;
+            state.next_ticket += 1;
+            state.waiting.push(AdmissionWaiter::new(
+                ticket,
+                1,
+                *priority,
+                *model,
+                now.checked_sub(*age).unwrap_or(now),
+            ));
+        }
+    }
+
+    /// Select as a woken waiter would, then remove the chosen one as its claim does.
+    fn admit_next(pool: &AdmissionPool) -> Option<String> {
+        let mut state = pool.state.lock().unwrap();
+        let index = AdmissionPool::selected_waiter(&mut state, Instant::now())?;
+        let waiter = state.waiting.remove(index);
+        waiter.model.map(|model| model.to_string())
+    }
+
+    fn run_model(pool: &AdmissionPool, model: &str) -> AdmissionPermit {
+        pool.try_acquire_idle(1, Some(model))
+            .unwrap_or_else(|| panic!("idle pool admits {model}"))
+    }
+
+    #[test]
+    fn a_waiter_for_the_running_model_goes_ahead_of_an_older_waiter_for_another_model() {
+        let pool = AdmissionPool::new(4, 8);
+        let _running = run_model(&pool, "hot");
+        queue(
+            &pool,
+            &[
+                (TaskPriority::Normal, Some("cold"), Duration::ZERO),
+                (TaskPriority::Normal, Some("hot"), Duration::ZERO),
+            ],
+        );
+        assert_eq!(admit_next(&pool).as_deref(), Some("hot"));
+        assert_eq!(pool.receipt()["affinity_promotions"], 1);
+        assert_eq!(pool.state.lock().unwrap().waiting[0].affinity_skips, 1);
+        assert_eq!(admit_next(&pool).as_deref(), Some("cold"));
+        assert_eq!(
+            pool.receipt()["affinity_promotions"],
+            1,
+            "FIFO head is no promotion"
+        );
+    }
+
+    #[test]
+    fn affinity_skips_are_bounded_and_then_the_class_is_fifo_again() {
+        let pool = AdmissionPool::new(4, 8);
+        let _running = run_model(&pool, "hot");
+        queue(
+            &pool,
+            &[(TaskPriority::Normal, Some("cold"), Duration::ZERO)],
+        );
+        for _ in 0..MAX_AFFINITY_SKIPS {
+            queue(
+                &pool,
+                &[(TaskPriority::Normal, Some("hot"), Duration::ZERO)],
+            );
+            assert_eq!(admit_next(&pool).as_deref(), Some("hot"));
+        }
+        queue(
+            &pool,
+            &[(TaskPriority::Normal, Some("hot"), Duration::ZERO)],
+        );
+        assert_eq!(
+            admit_next(&pool).as_deref(),
+            Some("cold"),
+            "a waiter skipped {MAX_AFFINITY_SKIPS} times is served in arrival order"
+        );
+        assert_eq!(
+            pool.receipt()["affinity_promotions"],
+            u64::from(MAX_AFFINITY_SKIPS)
+        );
+    }
+
+    #[test]
+    fn a_waiter_older_than_the_affinity_wait_is_served_in_arrival_order() {
+        let pool = AdmissionPool::new(4, 8);
+        let _running = run_model(&pool, "hot");
+        queue(
+            &pool,
+            &[
+                (TaskPriority::Normal, Some("fresh"), Duration::ZERO),
+                (
+                    TaskPriority::Normal,
+                    Some("old"),
+                    MAX_AFFINITY_WAIT + Duration::from_millis(1),
+                ),
+                (TaskPriority::Normal, Some("hot"), Duration::ZERO),
+            ],
+        );
+        // The aged waiter blocks promotion past it, so the class falls back to its head.
+        assert_eq!(admit_next(&pool).as_deref(), Some("fresh"));
+        assert_eq!(admit_next(&pool).as_deref(), Some("old"));
+        assert_eq!(admit_next(&pool).as_deref(), Some("hot"));
+        assert_eq!(pool.receipt()["affinity_promotions"], 0);
+    }
+
+    #[test]
+    fn affinity_only_reorders_within_the_class_the_round_robin_chose() {
+        let pool = AdmissionPool::new(4, 8);
+        let _running = run_model(&pool, "hot");
+        queue(
+            &pool,
+            &[
+                (TaskPriority::Interactive, Some("cold"), Duration::ZERO),
+                (TaskPriority::Normal, Some("hot"), Duration::ZERO),
+                (TaskPriority::Background, Some("hot"), Duration::ZERO),
+                (TaskPriority::Interactive, None, Duration::ZERO),
+            ],
+        );
+        assert_eq!(admit_next(&pool).as_deref(), Some("cold"));
+        assert_eq!(
+            admit_next(&pool),
+            None,
+            "an unnamed interactive waiter is next"
+        );
+        assert_eq!(
+            pool.state.lock().unwrap().waiting.len(),
+            2,
+            "both interactive waiters went before normal and background work"
+        );
+        assert_eq!(pool.receipt()["affinity_promotions"], 0);
+    }
+
+    #[test]
+    fn the_last_admitted_model_keeps_affinity_after_its_task_finishes_and_releases_its_entry() {
+        let pool = AdmissionPool::new(4, 8);
+        drop(run_model(&pool, "recent"));
+        assert!(pool.state.lock().unwrap().running_models.is_empty());
+        queue(
+            &pool,
+            &[
+                (TaskPriority::Normal, Some("other"), Duration::ZERO),
+                (TaskPriority::Normal, Some("recent"), Duration::ZERO),
+            ],
+        );
+        assert_eq!(admit_next(&pool).as_deref(), Some("recent"));
+    }
+
+    #[test]
+    fn a_waiter_that_does_not_fit_is_never_promoted_over_one_that_does() {
+        let pool = AdmissionPool::new(2, 8);
+        let _running = run_model(&pool, "hot");
+        {
+            let now = Instant::now();
+            let mut state = pool.state.lock().unwrap();
+            state.waiting.push(AdmissionWaiter::new(
+                10,
+                1,
+                TaskPriority::Normal,
+                Some("cold"),
+                now,
+            ));
+            state.waiting.push(AdmissionWaiter::new(
+                11,
+                2,
+                TaskPriority::Normal,
+                Some("hot"),
+                now,
+            ));
+        }
+        assert_eq!(admit_next(&pool).as_deref(), Some("cold"));
+        assert_eq!(pool.receipt()["affinity_promotions"], 0);
+    }
+
+    #[tokio::test]
+    async fn released_capacity_goes_to_the_model_just_used_before_an_older_other_model() {
+        let pool = AdmissionPool::new(1, 8);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let (holder, _) = pool
+            .acquire(1, TaskPriority::Normal, Some("warm"), deadline)
+            .await
+            .unwrap_or_else(|_| panic!("holder"));
+        let mut cold = Box::pin(pool.acquire(1, TaskPriority::Normal, Some("cold"), deadline));
+        let mut warm = Box::pin(pool.acquire(1, TaskPriority::Normal, Some("warm"), deadline));
+        for waiter in [&mut cold, &mut warm] {
+            assert!(
+                std::future::poll_fn(|cx| Poll::Ready(waiter.as_mut().poll(cx)))
+                    .await
+                    .is_pending()
+            );
+        }
+        drop(holder);
+        let (warm_permit, _) = tokio::time::timeout(Duration::from_secs(1), &mut warm)
+            .await
+            .unwrap()
+            .unwrap_or_else(|_| panic!("warm waiter"));
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(cold.as_mut().poll(cx)))
+                .await
+                .is_pending(),
+            "the older cold-model waiter is still queued"
+        );
+        assert_eq!(pool.receipt()["affinity_promotions"], 1);
+        drop(warm_permit);
+        let (cold_permit, _) = tokio::time::timeout(Duration::from_secs(1), cold)
+            .await
+            .unwrap()
+            .unwrap_or_else(|_| panic!("cold waiter is served once capacity frees again"));
+        drop(cold_permit);
+        let receipt = pool.receipt();
+        assert_eq!(receipt["admitted"], receipt["released"]);
+        assert_eq!(receipt["queue_depth"], 0);
+        assert!(pool.state.lock().unwrap().running_models.is_empty());
     }
 }

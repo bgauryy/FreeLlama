@@ -360,7 +360,15 @@ export function taskAnswerText(payload: Record<string, unknown>): string | undef
     if (Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
       parts.push(`tool_calls: ${JSON.stringify(message.tool_calls)}`);
     }
-    if (parts.length === 0) parts.push("(empty response)");
+    if (parts.length === 0) {
+      // A thinking model can spend the whole output budget before answering; say so, or the agent
+      // reads an empty answer as the model having nothing to say.
+      const thought = typeof message.thinking === "string" && message.thinking.trim().length > 0;
+      const budget = record(record(payload.request_options)?.options)?.num_predict ?? record(response)?.eval_count;
+      parts.push(thought
+        ? `(empty answer: the model spent its output${typeof budget === "number" ? ` (${budget} tokens)` : ""} thinking; pass think:false or raise options.num_predict)`
+        : "(empty response)");
+    }
     return header + parts.join("\n");
   }
   if (typeof response.response === "string") return header + response.response.trim();

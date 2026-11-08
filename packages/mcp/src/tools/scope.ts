@@ -14,7 +14,9 @@ export function registerScopeTool(server: McpServer): void {
       scopeId: z.string().uuid().optional(), revision: z.number().int().nonnegative().optional(),
       messages: z.array(messageParam).optional(), includeMessages: z.boolean().optional(),
     }).strict(),
-    outputSchema: objectResultSchema, annotations: { destructiveHint: true },
+    // delete forgets only a scope this client created (its id), as session kill and task_jobs
+    // remove act only on the caller's own work, so none of them is marked destructive.
+    outputSchema: objectResultSchema, annotations: { destructiveHint: false },
   }, async ({ action, endpoint, scopeId, revision, messages, includeMessages }) => {
     try {
       if ((action === "create") !== (scopeId === undefined)) throw new Error("scopeId is required for get/fork/delete, forbidden for create.");

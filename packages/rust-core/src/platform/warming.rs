@@ -21,11 +21,13 @@ pub struct WarmingPolicy {
     pub pressure_factor: f64,
 }
 impl Default for WarmingPolicy {
+    /// `base_seconds` matches Ollama's own five-minute default `keep_alive`, so a model
+    /// `FreeLlama` loads is not released sooner than one a raw client loads.
     fn default() -> Self {
         Self {
             min_seconds: 15,
             max_seconds: 900,
-            base_seconds: 60,
+            base_seconds: 300,
             reuse_gain_seconds: 30,
             load_multiplier: 2.0,
             pressure_factor: 0.25,
@@ -294,13 +296,23 @@ mod tests {
     #[test]
     fn reuse_load_and_pressure_are_bounded_and_operator_tunable() {
         let policy = WarmingPolicy::default();
+        assert!(
+            policy.validate().is_ok(),
+            "defaults keep min <= base <= max"
+        );
+        assert_eq!(
+            policy.duration(super::super::residency::Usage::default(), false),
+            300,
+            "an unused model keeps Ollama's own five-minute default"
+        );
         let usage = super::super::residency::Usage {
             recent_uses: 4.0,
             load_ms: Some(2000.0),
             ..Default::default()
         };
-        assert_eq!(policy.duration(usage, false), 184);
-        assert_eq!(policy.duration(usage, true), 46);
+        // (300 + 4 * 30 + 2 s * 2.0) = 424, and a quarter of it under host pressure.
+        assert_eq!(policy.duration(usage, false), 424);
+        assert_eq!(policy.duration(usage, true), 106);
         assert_eq!(
             policy.duration(
                 super::super::residency::Usage {

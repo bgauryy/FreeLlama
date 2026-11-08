@@ -37,7 +37,7 @@ Prefer the MCP server when the host has it; the same operations run from a shell
 | `doctor` (its `platform_health.readiness`) | `ready` (exit 0 only when serve can run work) |
 | `read_response{file,section?,offset?,limit?}` | read the `response_file` JSON directly |
 | `session{action:"create"}`, `scope{...}` | `session`, `scope create`, `scope get`, `scope fork`, `scope delete` |
-| `models{view:"library"}`, `models{view:"detail"}`, `ollama_manage{action:"pull"}`, `ollama_delete`, `delegate_research` | MCP only |
+| `models{view:"library"}`, `models{view:"detail"}`, `ollama_pull{model,approvedSizeBytes}`, `ollama_delete`, `delegate_research`, `sweep{...}` | MCP only |
 
 ## Know who owns execution
 
@@ -100,6 +100,17 @@ runner. Explicit `keepAlive` wins over finite adaptive retention. Limits and API
 Ask for missing workload/modality, quality, latency, context, privacy, download, disk, and memory constraints. Diagnose the host and prefer qualified installed models. Search `models{view:"library",query}` (ollama.com families plus Hugging Face GGUF repos; `capabilities` such as `embedding`, `audio` or `decision` filter), then inspect pullable tags and `fitsInMemory` with `models{view:"library",model:"FAMILY"}` or `model:"hf.co/<owner>/<repo>"` (each quant is a tag like `hf.co/<owner>/<repo>:Q4_K_M`); with `serve` down, do not guess a tag. The `detail` view inspects an installed model. Present at most two evidence-backed candidates. Ask approval for one exact tag and size before `ollama_manage{action:"pull"}`; discovery never grants installation permission.
 
 `fastest` without evidence is only a capability filter and can pick a tiny model for code repair. For quality-sensitive work preview with `minConfidence:"medium"`; it needs both a task policy from correctness evaluations (`freellama policy from-eval`) and a local `bench-all` report. Never manufacture a policy from throughput. See [Model selection](https://github.com/bgauryy/FreeLlama/blob/main/docs/MODEL_SELECTION.md).
+
+### G — sweep a large job in small chunks
+
+Use `sweep` when a check over a code tree, a log or a docs site splits into independent chunks. You choose the questions and verify the result; the local model does the reading.
+
+1. `sweep{action:"start", files|urls, model:<classify pick>, questions}`; add `verifyModel` for a stronger second look at flagged or unsure chunks.
+2. `sweep{action:"wait", sweepId}` until it completes (each call is up to 50 s). Do other work meanwhile.
+3. `sweep{action:"results", sweepId}` lists the flagged chunks with their `path:Lstart-Lend` or `url#n`. Read 3 to 5 of them yourself before relying on the rest.
+4. Later, start again with `baseline:<sweepId>`: unchanged chunks reuse the saved results, and `filter:"changed"` shows what happened since.
+
+Recipe: `freellama://docs/cookbooks/sweep`.
 
 ### F — diagnose a failure
 

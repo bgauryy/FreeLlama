@@ -184,8 +184,9 @@ describe("scope and warming client contracts", () => {
   it("forwards an embedding warm to the server, which loads it with an empty embed request", async () => {
     const result = await call("ollama_manage", { action: "warm", model: "test:latest", task: "embedding", keepAlive: "60s" });
     expect(result.isError, JSON.stringify(result)).not.toBe(true);
+    // Warm runs as a cancellable job so a cold load reports progress; serve gets defer:true.
     expect(requests[0]).toEqual({ method: "POST", path: "/_freellama/v1/warm", body: {
-      model: "test:latest", task: "embedding", keep_alive: "60s",
+      model: "test:latest", task: "embedding", keep_alive: "60s", defer: true,
     } });
   });
   it.runIf(releaseServeAvailable)("CLI omitted controls preserve saved routing defaults", async () => {

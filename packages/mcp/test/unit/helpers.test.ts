@@ -355,6 +355,12 @@ describe("task answer text", () => {
     expect(text).toContain("returnEmbeddings:true");
   });
 
+  it("says when a thinking model spent its whole output budget before answering", () => {
+    const text = taskAnswerText({ response: { message: { content: "", thinking: "Let me think..." }, eval_count: 200 } });
+    expect(text).toMatch(/empty answer: the model spent its output \(200 tokens\) thinking; pass think:false or raise options.num_predict/);
+    expect(taskAnswerText({ response: { message: { content: "" } } })).toBe("(empty response)");
+  });
+
   it("labels each batch item, including failures", () => {
     const text = batchAnswerText({
       results: [

@@ -385,6 +385,27 @@ async function runCancellableBatch(
       note: "each accepted job remains cancellable; priority is enforced by core admission" }, results });
 }
 
+/**
+ * One context window per model in a batch. Ollama reloads a runner whose num_ctx differs, so items
+ * of one model sized apart (one item's explicit contextTokens, its siblings sized by the core from
+ * their own prompts) reload it mid-batch. The core owns prompt-based sizing (it needs the model's
+ * learned token ratio and window), so this only spreads what the caller chose: when any item of an
+ * explicitly named model sets contextTokens, every item of that model gets the largest value.
+ * Scoped items keep their own, since their history is sized against it. A batch where no item of a
+ * model sets contextTokens is left to the core, as a single call is.
+ */
+export function shareBatchContext<T extends { task: Pick<BatchItem["task"], "model" | "contextTokens" | "scopeId"> }>(tasks: T[]): T[] {
+  const widest = new Map<string, number>();
+  for (const { task } of tasks) {
+    if (task.model === undefined || task.scopeId !== undefined || task.contextTokens === undefined) continue;
+    widest.set(task.model, Math.max(widest.get(task.model) ?? 0, task.contextTokens));
+  }
+  return tasks.map((item) => {
+    const shared = item.task.model === undefined || item.task.scopeId !== undefined ? undefined : widest.get(item.task.model);
+    return shared === undefined || item.task.contextTokens === shared ? item : { ...item, task: { ...item.task, contextTokens: shared } };
+  });
+}
+
 async function runBatch(
   tasks: BatchItem[],
   maxParallelism: number | undefined,
@@ -399,6 +420,7 @@ async function runBatch(
     const problem = validateTaskPayload(item.task, `batch item ${item.id}`);
     if (problem) return errorResult(new Error(problem));
   }
+  tasks = shareBatchContext(tasks);
   const payload = {
     tasks: tasks.map(({ id, independent, task }) => ({
       id,

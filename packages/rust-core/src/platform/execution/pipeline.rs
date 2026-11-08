@@ -272,7 +272,12 @@ async fn run_admitted_task(
     if immediate_unload {
         execution_receipt["keep_alive"] = json!({"mode":"explicit","value":0,"reason":"caller_immediate_unload_with_placement_observation","finite":true});
     }
-    let (path, mut body) = build_managed_request(&mut input, &decision, &keep_alive)?;
+    let (path, mut body) = build_managed_request(
+        &mut input,
+        &decision,
+        &keep_alive,
+        state.tunables().context_shift,
+    )?;
     // `/v1/systemone` reads no options, so CPU placement there rests on the backend process.
     if path != "/v1/systemone" {
         apply_execution_options(&mut body, &execution);
@@ -300,7 +305,7 @@ async fn run_admitted_task(
     let (mut slot, mut cost, mut queue_wait_ms) = if opportunistic {
         let permit = execution
             .admission
-            .try_acquire_idle(requested_cost as usize)
+            .try_acquire_idle(requested_cost as usize, Some(&decision.selected_model))
             .ok_or_else(|| opportunistic_skip("backend has active or queued work"))?;
         let cost = u32::try_from(permit.units()).unwrap_or(u32::MAX);
         (permit, cost, 0)
@@ -310,6 +315,7 @@ async fn run_admitted_task(
             &execution,
             requested_cost,
             input.priority,
+            &decision.selected_model,
             queue_deadline,
             None,
         )
@@ -478,6 +484,7 @@ async fn run_admitted_task(
                     &execution,
                     requested_cost,
                     input.priority,
+                    &decision.selected_model,
                     queue_deadline,
                     Some(resource_waiter),
                 )

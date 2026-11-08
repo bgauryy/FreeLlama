@@ -35,7 +35,8 @@ describe("session kill protocol", () => {
   it("advertises kill and forwards the exact session to the native control plane", async () => {
     const tool = (await client.listTools()).tools.find((tool) => tool.name === "session")!;
     expect((tool.inputSchema.properties!.action as any).enum).toContain("kill");
-    expect(tool.annotations?.destructiveHint).toBe(true);
+    // kill acts only on the caller's own session, so the tool is not marked destructive.
+    expect(tool.annotations?.destructiveHint).toBe(false);
     const result = await client.callTool({ name: "session", arguments: { endpoint, action: "kill", sessionId: id } });
     expect(result.isError, JSON.stringify(result)).not.toBe(true);
     expect(result.structuredContent).toEqual({ session_id: id, killed: true, cancellation: "requested", runner_stop_confirmed: false, model_unloaded: false });

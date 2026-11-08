@@ -64,8 +64,14 @@ pub(super) fn start(state: &PlatformState) {
                             PressureReason::ActiveSwapping | PressureReason::OsMemoryPressure
                         )
                     });
-                    let min_idle_seconds =
-                        (!distress).then(|| super::float(state.tunables().warming.base_seconds));
+                    // The longest an unused runner would be kept under a memory hold
+                    // (`base_seconds × pressure_factor`, 75 s by default), not the unpressured
+                    // base: that matches Ollama's five-minute default, and a runner idle that
+                    // long would expire on its own before this sweep released it.
+                    let min_idle_seconds = (!distress).then(|| {
+                        let warming = &state.tunables().warming;
+                        super::float(warming.base_seconds) * warming.pressure_factor
+                    });
                     let receipt = execution::evict_idle_models(
                         &state,
                         &execution,

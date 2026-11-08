@@ -42,6 +42,8 @@ pub struct ProxyConfig {
     pub(crate) telemetry: Option<Telemetry>,
     pub(crate) hooks: Option<Arc<dyn super::RawModelHooks>>,
     pub(crate) upstreams: Vec<super::OpenAiUpstream>,
+    /// Buffered-body budget; `None` uses the process-wide one.
+    pub(crate) body_budget: Option<super::BodyBudget>,
 }
 
 impl ProxyConfig {
@@ -62,7 +64,15 @@ impl ProxyConfig {
             telemetry: None,
             hooks: None,
             upstreams: Vec::new(),
+            body_budget: None,
         }
+    }
+
+    /// Share this buffered-body budget, as `serve` does between its control API and the proxy.
+    #[must_use]
+    pub(crate) fn with_body_budget(mut self, budget: super::BodyBudget) -> Self {
+        self.body_budget = Some(budget);
+        self
     }
 
     /// Route OpenAI-compatible requests for models these engines serve to them.

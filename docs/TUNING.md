@@ -10,10 +10,12 @@ running out of memory. Best payoff first:
 
 1. **Avoid reloads.** Ollama reuses a loaded runner only when `num_ctx`, `num_batch`, `num_gpu`,
    `num_thread`, `use_mmap` and the context-shift setting match ([scheduler](https://github.com/ollama/ollama/blob/main/server/sched.go)).
-   Managed chat sends `shift:false` with `truncate:false` so an overflow is refused instead of
-   silently dropping context; raw clients that keep Ollama's default shift therefore reload a
-   runner FreeLlama loaded, and the reverse. Give raw and managed traffic separate models or
-   backends when both are busy.
+   Managed chat sends `truncate:false`, and by default `shift:false`, so an overflow is refused
+   instead of silently dropping context; raw clients that keep Ollama's default shift therefore
+   reload a runner FreeLlama loaded, and the reverse. Set `context_shift = "ollama_default"` in the
+   runtime file to omit `shift` so both share one runner (`truncate:false` is still sent; a long
+   generation may then drop its earliest tokens), or give raw and managed traffic separate models
+   or backends when both are busy. `freellama config` shows the active value and its source.
    FreeLlama sizes `num_ctx` in fixed buckets (2k–32k), reuses a loaded runner's larger context, and
    leaves thread selection to Ollama unless the operator or caller explicitly overrides it. Keep one model's callers on one
    `contextTokens`, warm at that context, and compare `models`' `context_default` and

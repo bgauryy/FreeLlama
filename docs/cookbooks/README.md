@@ -15,6 +15,7 @@ Short recipes for one job each: when to use it, which model, the exact call, and
 | Small coding tasks | [coding](coding.md) |
 | Research a repository | [research-agent](research-agent.md) |
 | Rewrite or summarize many texts | [batch-text](batch-text.md) |
+| Check a code tree, log or site in small saved chunks | [sweep](sweep.md) |
 | Memory, context and caching | [memory-and-caching](memory-and-caching.md) |
 
 Every call here is checked against the tool schemas by a test. Measured results come from one machine: an Apple M2 Pro with 32 GB. Measure on yours before you rely on them.

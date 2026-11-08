@@ -20,7 +20,10 @@ export function registerTaskJobsTool(server: McpServer): void {
         returnEmbeddings: z.boolean().optional(),
       }).strict(),
       outputSchema: objectResultSchema,
-      annotations: { destructiveHint: true },
+      // One tool for reads and changes, so not read-only (the spec default, not restated). Not destructive either: cancel and remove
+      // act only on a job this client submitted (its id), never on other clients' work or on data
+      // outside FreeLlama, and a job's input can be submitted again.
+      annotations: { destructiveHint: false },
     },
     async ({ endpoint, action, jobId, returnEmbeddings }) => {
       try {

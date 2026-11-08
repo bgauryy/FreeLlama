@@ -50,12 +50,14 @@ export function registerDelegateResearchTool(server: McpServer): void {
     {
       description:
         "Use when: a read-only question about files under workspacePath (where is X, what calls Y) would take several searches; it needs a local model that calls tools well: tools metadata does not prove it, so take the catalog's research-agent pick. " +
-        "Do not use when: editing, facts outside the workspace (GitHub excepted: adapter:\"github\", which still needs a `workspacePath`), final judgment, or a question one search answers; run_task embedding with `nearest` finds files faster. " +
+        "Do not use when: editing, facts outside the workspace (GitHub excepted: adapter:\"github\", which needs no `workspacePath`), final judgment, or a question one search answers; run_task embedding with `nearest` finds files faster. " +
         "Up to 8 turns, killed after 180 s by default; no defer (a host that cuts calls near 60 s may drop it). " +
         "Returns: citations/answer; discard verification.recommendation=escalate, otherwise verify citations.",
       inputSchema: z.object({
         question: z.string().min(1),
-        workspacePath: z.string().min(1),
+        workspacePath: z.string().min(1).optional().describe(
+          "directory to research, under FREELLAMA_MCP_ALLOWED_ROOTS; absolute, or relative to the server's working directory. Required except for adapter github",
+        ),
         adapter: z.enum(["bash", "octocode", "github"]).optional().describe("bash (default) or octocode search workspacePath; github searches GitHub"),
         model: z.string().min(1).optional(),
         endpoint: endpointParam,
@@ -73,15 +75,22 @@ export function registerDelegateResearchTool(server: McpServer): void {
           .describe("compact (default): trail at response_file; full: inline"),
       }).strict(),
       outputSchema: researchResultSchema,
+      // Read-only lookup; adapter "github" searches GitHub over the internet, so the tool is
+      // open-world, which is the spec default for openWorldHint and is not restated.
       annotations: { destructiveHint: false },
     },
     // `receipt` only shapes the inline view (tool-results.ts); the tool always returns everything.
     async ({ question, workspacePath, adapter, model, endpoint, agent }, extra) => {
       const chosenAdapter: ResearchAdapter = adapter ?? DEFAULT_RESEARCH_ADAPTER;
-      let resolvedWorkspace: string;
+      // The GitHub adapter reads nothing local: the workspace is only its tools' working
+      // directory, so without one it runs in the private temp directory made below.
+      let resolvedWorkspace: string | undefined;
       let chosenModel: string;
       try {
-        resolvedWorkspace = await assertAllowedWorkspace(workspacePath);
+        if (workspacePath === undefined && chosenAdapter !== "github") {
+          throw new Error(`workspacePath is required for adapter "${chosenAdapter}": the absolute directory to research (or one relative to the server's working directory). Only adapter "github" runs without one.`);
+        }
+        resolvedWorkspace = workspacePath === undefined ? undefined : await assertAllowedWorkspace(workspacePath);
         chosenModel = model ?? DEFAULT_DELEGATE_MODEL ?? await routedResearchModel(endpoint);
       } catch (error) {
         return researchErrorResult(error);
@@ -113,6 +122,7 @@ export function registerDelegateResearchTool(server: McpServer): void {
       const dir = await mkdtemp(path.join(tmpdir(), "freellama-delegate-"));
       const promptFile = path.join(dir, "prompt.md");
       const resultFile = path.join(dir, "result.json");
+      const workspace = resolvedWorkspace ?? dir;
       try {
         await writeFile(promptFile, `${question}\n`, "utf8");
         const adapter = RESEARCH_ADAPTERS[chosenAdapter];
@@ -133,7 +143,7 @@ export function registerDelegateResearchTool(server: McpServer): void {
           FREELLAMA_TARGET_MODEL: chosenModel,
           FREELLAMA_AGENT_MANAGED_ENDPOINT: endpoint ?? DEFAULT_SERVE_ENDPOINT,
           FREELLAMA_AGENT_TOKEN_CALIBRATION_DIR: DEFAULT_TOKEN_CALIBRATION_DIR,
-          FREELLAMA_BENCH_WORKSPACE: resolvedWorkspace,
+          FREELLAMA_BENCH_WORKSPACE: workspace,
           FREELLAMA_BENCH_PROMPT: promptFile,
           FREELLAMA_AGENT_RESULT: resultFile,
           FREELLAMA_AGENT_MAX_TURNS: String(agent?.maxTurns ?? DEFAULT_DELEGATE_MAX_TURNS),
@@ -148,7 +158,7 @@ export function registerDelegateResearchTool(server: McpServer): void {
         const running = runDelegate(process.execPath, [adapter], {
           signal: extra.signal,
           env: environment,
-          stderrFilter: researchProgressFilter(report ?? (() => undefined), resolvedWorkspace, openJobs),
+          stderrFilter: researchProgressFilter(report ?? (() => undefined), workspace, openJobs),
           timeoutMs: DEFAULT_DELEGATE_TIMEOUT_SECONDS * 1000,
           // The answer is read from `resultFile`, never from stdout — but execFile's usual 1 MB
           // maxBuffer still applies to the agent's own progress logging, and overflowing it kills
@@ -216,12 +226,12 @@ export function registerDelegateResearchTool(server: McpServer): void {
             // lets a reader tell a run that read three files from one that failed three commands —
             // indistinguishable in the trail before, and graded identically.
             status: call.status,
-            source_lookup: sourceBearingLookup(call, resolvedWorkspace),
+            source_lookup: sourceBearingLookup(call, workspace),
             ...(typeof call.exit_code === "number" ? { exit_code: call.exit_code } : {}),
             path: target
-              ? path.relative(resolvedWorkspace, path.resolve(resolvedWorkspace, target))
+              ? path.relative(workspace, path.resolve(workspace, target))
               : detail
-                ? extractExistingWorkspacePath(detail, resolvedWorkspace)
+                ? extractExistingWorkspacePath(detail, workspace)
                 : null,
             detail,
           };

@@ -69,3 +69,24 @@ describe("delegateEnvironment", () => {
     expect(env).toEqual({ PATH: "/usr/bin", FREELLAMA_AGENT_NUM_CTX: "8192" });
   });
 });
+
+describe("workspacePath resolution", () => {
+  it("resolves a relative path against a project working directory", async () => {
+    const { resolveWorkspacePath } = await import("../../src/config.js");
+    expect(resolveWorkspacePath("packages", REPO_ROOT, "/nonexistent-home")).toBe(path.join(REPO_ROOT, "packages"));
+    expect(resolveWorkspacePath(REPO_ROOT, "/", "/nonexistent-home")).toBe(REPO_ROOT);
+    await expect(assertAllowedWorkspace("packages", { cwd: REPO_ROOT })).resolves.toBeTruthy();
+  });
+
+  it("requires an absolute path when the server runs from / or the home directory", async () => {
+    const { resolveWorkspacePath } = await import("../../src/config.js");
+    expect(() => resolveWorkspacePath(".", "/", "/nonexistent-home")).toThrow(/relative.*filesystem root or the home directory.*absolute path/);
+    expect(() => resolveWorkspacePath("src", REPO_ROOT, REPO_ROOT)).toThrow(/absolute path/);
+  });
+
+  it("names the variable, an example and FREELLAMA_FILE_ROOTS when no research roots are configured", async () => {
+    await expect(assertAllowedWorkspace(REPO_ROOT, { roots: [] })).rejects.toThrow(
+      new RegExp(`requires FREELLAMA_MCP_ALLOWED_ROOTS.*FREELLAMA_MCP_ALLOWED_ROOTS=".+${path.delimiter === ";" ? ";" : ":"}.+".*FREELLAMA_FILE_ROOTS`),
+    );
+  });
+});

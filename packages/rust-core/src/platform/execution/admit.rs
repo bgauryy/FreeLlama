@@ -9,12 +9,15 @@ use super::ExecutionTarget;
 
 /// Wait for an admission slot sized to the task, or refuse.
 ///
+/// `model` is the selected model: within a priority class, admission prefers work for a model
+/// already running on this backend, within a bounded number of skips.
 /// Returns the held permit, the cost charged, and how long the caller queued.
 pub(crate) async fn admit(
     state: &PlatformState,
     execution: &ExecutionTarget,
     requested_cost: u32,
     priority: TaskPriority,
+    model: &str,
     deadline: tokio::time::Instant,
     resource_waiter: Option<ResourceWaitGuard>,
 ) -> Result<(AdmissionPermit, u32, u128), ApiError> {
@@ -22,14 +25,13 @@ pub(crate) async fn admit(
         .unwrap_or(u32::MAX)
         .max(1);
     let cost = requested_cost.min(budget).max(1);
+    let units = requested_cost.max(1) as usize;
     let acquired = if let Some(waiter) = resource_waiter {
-        waiter
-            .acquire(requested_cost.max(1) as usize, priority, deadline)
-            .await
+        waiter.acquire(units, priority, Some(model), deadline).await
     } else {
         execution
             .admission
-            .acquire(requested_cost.max(1) as usize, priority, deadline)
+            .acquire(units, priority, Some(model), deadline)
             .await
     };
     match acquired {

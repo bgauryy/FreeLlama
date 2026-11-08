@@ -229,6 +229,7 @@ pub(super) async fn status(State(state): State<PlatformState>) -> Json<Value> {
             "cpu_config": cpu_settings,
             "default_context": default_context.map(|(tokens, source)| json!({"tokens": tokens, "source": source})),
             "context_mode": tunables.context_mode,
+            "context_shift": tunables.context_shift,
         },
         "scheduling": {
             "last_eviction": state
@@ -264,12 +265,15 @@ pub(super) async fn usage(
     caller: Option<axum::Extension<crate::proxy::Caller>>,
     Query(query): Query<UsageQuery>,
 ) -> Json<Value> {
-    let mut view = state.telemetry.usage(
-        query
-            .days
-            .unwrap_or(7)
-            .clamp(1, super::telemetry::REPORT_WINDOW_DAYS),
-    );
+    let mut view = state
+        .telemetry
+        .usage_report(
+            query
+                .days
+                .unwrap_or(7)
+                .clamp(1, super::telemetry::REPORT_WINDOW_DAYS),
+        )
+        .await;
     if !state.clients.is_empty() {
         let today = state.telemetry.clients_today();
         let caller = caller.map(|axum::Extension(caller)| caller.0);
@@ -412,6 +416,13 @@ pub(super) async fn metrics(State(state): State<PlatformState>) -> Response {
         "freellama_queue_timeouts_total",
         "Tasks refused after waiting out the queue deadline.",
         "queue_timeouts",
+        true,
+    );
+    per_backend(
+        &mut gauges,
+        "freellama_admission_affinity_promotions_total",
+        "Grants given ahead of older same-priority work because the model was already in use.",
+        "affinity_promotions",
         true,
     );
 

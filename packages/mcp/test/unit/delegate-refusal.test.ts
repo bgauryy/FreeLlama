@@ -95,6 +95,21 @@ describe("delegate_research refusal forwarding", () => {
     },
   );
 
+  it("runs the github adapter without a workspacePath, in its private temp directory", async () => {
+    fixture.result = { final_answer: "defined in server/routes.go", tool_calls: [] };
+    fixture.exec.mockImplementation(() => Object.assign(Promise.resolve(), { child: { kill: vi.fn() } }));
+    const handler = fixture.handlers.get("delegate_research")!;
+    const result = await handler({ question: "Where is X defined in ollama/ollama?", adapter: "github", model: "unmeasured-fixture:latest" },
+      { signal: new AbortController().signal });
+    expect(result.isError).toBeFalsy();
+    expect(fixture.exec.mock.calls[0]![2].env.FREELLAMA_BENCH_WORKSPACE).toBe("/mock-delegate");
+    const local = await handler({ question: "Where is X?", adapter: "bash", model: "unmeasured-fixture:latest" },
+      { signal: new AbortController().signal });
+    expect(local.isError).toBe(true);
+    expect(local.content[0].text).toMatch(/workspacePath is required for adapter "bash"/);
+    expect(fixture.exec).toHaveBeenCalledTimes(1);
+  });
+
   it("forwards the managed receipt as an MCP error and still removes temporary files", async () => {
     const receipt = {
       error: "physical placement is not verified: configured=gpu, observed=unknown",

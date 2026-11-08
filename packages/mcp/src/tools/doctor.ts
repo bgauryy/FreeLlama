@@ -62,15 +62,21 @@ export function registerDoctorTool(server: McpServer): void {
       description: "Use when: checking Ollama/FreeLlama health, live queues and limits (view:status) or token usage (view:usage). Do not use when: choosing a model (models). Returns: a short summary; a view gives detail.",
       inputSchema: z.object({
         ollamaEndpoint: ollamaEndpointParam,
-        serveEndpoint: endpointParam,
+        endpoint: endpointParam,
+        // The older name; `endpoint` matches every other tool. Both name the serve endpoint.
+        serveEndpoint: endpointParam.describe("alias of endpoint"),
         view: z.enum(["summary", "full", "status", "usage"]).optional(),
         days: z.number().int().min(1).max(366).optional(),
       }).strict(),
       outputSchema: doctorResultSchema,
       annotations: { readOnlyHint: true },
     },
-    async ({ ollamaEndpoint, serveEndpoint, view, days }) => {
+    async ({ ollamaEndpoint, endpoint, serveEndpoint: serveAlias, view, days }) => {
       try {
+        if (endpoint !== undefined && serveAlias !== undefined && endpoint !== serveAlias) {
+          return errorResult(new Error("`endpoint` and `serveEndpoint` name the same serve endpoint; pass one."));
+        }
+        const serveEndpoint = endpoint ?? serveAlias;
         if (days !== undefined && view !== "usage") return errorResult(new Error("days is only valid with view: usage."));
         // Live views come from serve alone; they do not need the Ollama half of the diagnostic.
         if (view === "status") {

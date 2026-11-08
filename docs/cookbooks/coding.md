@@ -14,4 +14,4 @@ Pass the code by path:
 
 CLI: `freellama task --task coding --model lfm3:1.7b-q4_K_M --input-file prompt.txt`
 
-**Check it:** run the code. Set `num_predict` high enough for a thinking model's reasoning, which counts as output.
+**Check it:** run the code. Set `num_predict` high enough for a thinking model's reasoning, which counts as output, or pass `think:false` for a short answer: an answer that comes back empty says which.

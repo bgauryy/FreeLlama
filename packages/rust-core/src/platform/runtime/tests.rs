@@ -366,8 +366,8 @@ fn incomplete_or_cancelled_completions_reset_the_recovery_streak() {
 fn profile_windows_are_bounded_by_task_kinds_and_fully_visible() {
     let pool = AdmissionPool::new(8, 4);
     let limiter = AdaptiveLimiter::default();
-    let tasks = <super::super::TaskKind as clap::ValueEnum>::value_variants();
-    for task in tasks {
+    let tasks = super::super::TaskKind::ALL;
+    for task in &tasks {
         for revision in 0..20 {
             let mut profile = test_profile(&format!("{task:?}-{revision}"));
             profile.task = *task;
@@ -400,4 +400,30 @@ fn retry_after_scales_with_queue_and_is_bounded() {
     assert_eq!(retry_after_seconds(9, 2, Some(4_000)), 20);
     assert_eq!(retry_after_seconds(10_000, 1, Some(60_000)), 120);
     assert_eq!(retry_after_seconds(0, 4, None), 2);
+}
+
+#[test]
+fn context_shift_defaults_off_and_reloads_from_the_runtime_file() {
+    let defaults = resolve(
+        &PinnedTunables::default(),
+        &RuntimeFile::default(),
+        1,
+        &|_| None,
+    );
+    assert_eq!(defaults.context_shift, ContextShift::Off);
+    assert_eq!(defaults.sources["context_shift"], "default");
+    assert_eq!(defaults.receipt()["context_shift"]["value"], "off");
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("runtime.toml");
+    std::fs::write(&path, "context_shift = \"off\"\n").unwrap();
+    let settings = RuntimeSettings::new(PinnedTunables::default(), Some(path.clone()), 1).unwrap();
+    assert_eq!(settings.get().context_shift, ContextShift::Off);
+    std::fs::write(&path, "context_shift = \"ollama_default\"\n").unwrap();
+    assert!(settings.reload(true).unwrap().is_some());
+    assert_eq!(settings.get().context_shift, ContextShift::OllamaDefault);
+    assert_eq!(settings.get().sources["context_shift"], "file");
+    std::fs::write(&path, "context_shift = \"on\"\n").unwrap();
+    assert!(settings.reload(true).is_err(), "an unknown mode is refused");
+    assert_eq!(settings.get().context_shift, ContextShift::OllamaDefault);
 }
