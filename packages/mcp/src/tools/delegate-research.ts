@@ -6,7 +6,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
-  DEFAULT_DELEGATE_MAX_TURNS, DEFAULT_DELEGATE_MODEL, DEFAULT_DELEGATE_TIMEOUT_SECONDS, DEFAULT_RESEARCH_ADAPTER,
+  DEFAULT_DELEGATE_MAX_TURNS, DEFAULT_DELEGATE_MODEL, DEFAULT_RESEARCH_ADAPTER, MAX_DELEGATE_TIMEOUT_SECONDS, researchTimeoutSeconds,
   DEFAULT_SERVE_ENDPOINT, DEFAULT_TOKEN_CALIBRATION_DIR, RESEARCH_ADAPTERS, type ResearchAdapter, assertAllowedWorkspace,
   delegateEnvironment,
 } from "../config.js";
@@ -52,7 +52,7 @@ export function registerDelegateResearchTool(server: McpServer): void {
       description:
         "Use when: a read-only question about files under workspacePath (where is X, what calls Y) would take several searches; it needs a local model that calls tools well: tools metadata does not prove it, so take the catalog's research-agent pick. " +
         "Do not use when: editing, facts outside the workspace (GitHub excepted: adapter:\"github\", which needs no `workspacePath`), final judgment, or a question one search answers; run_task embedding with `nearest` finds files faster. " +
-        "Up to 8 turns, killed after 180 s by default; no defer (a host that cuts calls near 60 s may drop it). " +
+        "Up to 8 turns, killed after 180 s by default (longer for bigger models, or agent.timeoutSeconds); no defer (a host that cuts calls near 60 s may drop it). " +
         "Returns: citations/answer; discard verification.recommendation=escalate, otherwise verify citations.",
       inputSchema: z.object({
         question: z.string().min(1),
@@ -67,6 +67,8 @@ export function registerDelegateResearchTool(server: McpServer): void {
             maxTurns: z.number().int().positive().optional(),
             contextTokens: z.number().int().positive().optional(),
             outputTokens: z.number().int().positive().optional(),
+            timeoutSeconds: z.number().int().positive().max(MAX_DELEGATE_TIMEOUT_SECONDS).optional()
+              .describe("default scales with the model's size"),
           })
           .strict()
           .optional(),
@@ -135,6 +137,15 @@ export function registerDelegateResearchTool(server: McpServer): void {
             ),
           );
         }
+        // A bigger model decodes slower; its run gets more time before it is killed.
+        let sizeBytes: number | undefined;
+        if (agent?.timeoutSeconds === undefined) {
+          try {
+            const catalog = JSON.parse(await listModels(endpoint)) as { models?: { name?: string; size?: number }[] };
+            sizeBytes = catalog.models?.find((entry) => entry.name === chosenModel)?.size;
+          } catch { /* Unknown size: the default applies. */ }
+        }
+        const timeoutSeconds = researchTimeoutSeconds(sizeBytes, agent?.timeoutSeconds);
         // The adapter always reports lifecycle events for cleanup. A client progressToken only
         // controls whether the filter also forwards human-facing notifications.
         const report = progressSink(extra);
@@ -160,7 +171,7 @@ export function registerDelegateResearchTool(server: McpServer): void {
           signal: extra.signal,
           env: environment,
           stderrFilter: researchProgressFilter(report ?? (() => undefined), workspace, openJobs),
-          timeoutMs: DEFAULT_DELEGATE_TIMEOUT_SECONDS * 1000,
+          timeoutMs: timeoutSeconds * 1000,
           // The answer is read from `resultFile`, never from stdout — but execFile's usual 1 MB
           // maxBuffer still applies to the agent's own progress logging, and overflowing it kills
           // the subprocess and surfaces as a research failure with no explanation. Give the logs
@@ -202,7 +213,7 @@ export function registerDelegateResearchTool(server: McpServer): void {
             adapterError ??
               new Error(
                 "research adapter exited without writing a readable result file — it was killed " +
-                  `before it could report. Check that the model is loadable and that ${DEFAULT_DELEGATE_TIMEOUT_SECONDS}s ` +
+                  `before it could report. Check that the model is loadable and that ${timeoutSeconds}s ` +
                   "is enough for this question.",
               ),
           );
@@ -217,8 +228,14 @@ export function registerDelegateResearchTool(server: McpServer): void {
         // whichever adapter ran.
         const evidence = result.tool_calls.map((call, index) => {
           const queries = call.arguments?.queries;
-          const target = Array.isArray(queries) ? queries[0]?.path : queries?.path;
-          const rawDetail = call.arguments?.command ?? null;
+          const target = Array.isArray(queries) ? queries[0]?.path
+            : queries?.path ?? (call.raw_name === "read" || call.raw_name === "list" ? call.arguments?.path : undefined);
+          const targetPath = typeof target === "string" ? target : undefined;
+          // Structured actions carry their fields instead of a command line.
+          const structured = call.raw_name === "search" || call.raw_name === "read" || call.raw_name === "list";
+          const command = call.arguments?.command;
+          const rawDetail = typeof command === "string" ? command
+            : structured ? `${call.raw_name} ${JSON.stringify(call.arguments ?? {})}` : null;
           const detail = rawDetail ?? null;
           return {
             step: index + 1,
@@ -229,8 +246,8 @@ export function registerDelegateResearchTool(server: McpServer): void {
             status: call.status,
             source_lookup: sourceBearingLookup(call, workspace),
             ...(typeof call.exit_code === "number" ? { exit_code: call.exit_code } : {}),
-            path: target
-              ? path.relative(workspace, path.resolve(workspace, target))
+            path: targetPath
+              ? path.relative(workspace, path.resolve(workspace, targetPath))
               : detail
                 ? extractExistingWorkspacePath(detail, workspace)
                 : null,

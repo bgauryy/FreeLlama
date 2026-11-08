@@ -70,6 +70,16 @@ describe("research loop grounding and repeats", async () => {
     expect(result.final_answer).toMatch(/not found in the workspace: sweep\/tools\/a\.ts; treat this answer as unverified/);
   });
 
+  it("asks once for the source when an answer names no file but the results did", async () => {
+    const { result, sent } = await run([
+      { action: "shell", command: "grep -rn robots ." },
+      { action: "finish", answer: "The parser." },
+      { action: "finish", answer: "The parser. Source: sweep/sources.ts:95" },
+    ]);
+    expect(sent.some((message) => /names no source file.*sweep\/sources\.ts/s.test(message))).toBe(true);
+    expect(result.final_answer).toBe("The parser. Source: sweep/sources.ts:95");
+  });
+
   it("stops running tools after the second repeated command and asks for the answer", async () => {
     const shell = { action: "shell", command: "grep -rn robots ." };
     const { result, sent } = await run([shell, shell, shell, { action: "finish", answer: "sweep/sources.ts" }, shell, shell]);
@@ -92,5 +102,17 @@ describe("search-hit citations", async () => {
       { step: 2, tool: "shell", path: "sweep/sources.ts", line: 95, kind: "search_hit" },
     ]);
     expect(searchHitCitations(steps, "no path here", root)).toEqual([]);
+  });
+});
+
+describe("research time budget", async () => {
+  const { researchTimeoutSeconds } = await import("../../src/config.js");
+  it("gives bigger models more time, caps it, and lets the caller choose", () => {
+    expect(researchTimeoutSeconds(3.2e9, undefined)).toBe(180);
+    expect(researchTimeoutSeconds(18.2e9, undefined)).toBe(464);
+    expect(researchTimeoutSeconds(80e9, undefined)).toBe(1200);
+    expect(researchTimeoutSeconds(undefined, undefined)).toBe(180);
+    expect(researchTimeoutSeconds(3.2e9, 600)).toBe(600);
+    expect(researchTimeoutSeconds(3.2e9, 5000)).toBe(1800);
   });
 });

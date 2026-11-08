@@ -7,6 +7,8 @@ import path from "node:path";
 const SKIP = new Set(["node_modules", "target", ".git", "dist", "build", ".venv", "venv", "vendor", "__pycache__", ".octocode", "site-packages", "coverage"]);
 const MAX_ENTRIES = 20_000;
 const MAX_DEPTH = 8;
+/** Directory names that usually hold a package's source; named in the overview with file counts. */
+const SOURCE_DIRS = new Set(["src", "lib", "app", "source", "pkg", "cmd", "internal", "crates"]);
 
 export function workspaceOverview(root: string): string {
   let top: Dirent[];
@@ -16,9 +18,10 @@ export function workspaceOverview(root: string): string {
     return "";
   }
   const extensions = new Map<string, number>();
+  const sourceRoots = new Map<string, number>();
   let files = 0;
   let seen = 0;
-  const walk = (dir: string, depth: number) => {
+  const walk = (dir: string, depth: number, sourceRoot?: string) => {
     if (depth > MAX_DEPTH || seen > MAX_ENTRIES) return;
     let entries: Dirent[];
     try {
@@ -29,11 +32,14 @@ export function workspaceOverview(root: string): string {
     for (const entry of entries) {
       if (++seen > MAX_ENTRIES) return;
       if (entry.isDirectory()) {
-        if (!SKIP.has(entry.name) && !entry.name.startsWith(".")) walk(path.join(dir, entry.name), depth + 1);
+        if (SKIP.has(entry.name) || entry.name.startsWith(".")) continue;
+        const child = path.join(dir, entry.name);
+        walk(child, depth + 1, sourceRoot ?? (SOURCE_DIRS.has(entry.name) ? path.relative(root, child) : undefined));
       } else if (entry.isFile()) {
         files += 1;
         const extension = path.extname(entry.name).toLowerCase() || "(none)";
         extensions.set(extension, (extensions.get(extension) ?? 0) + 1);
+        if (sourceRoot) sourceRoots.set(sourceRoot, (sourceRoots.get(sourceRoot) ?? 0) + 1);
       }
     }
   };
@@ -45,7 +51,10 @@ export function workspaceOverview(root: string): string {
     .map((entry) => (entry.isDirectory() ? `${entry.name}/` : entry.name));
   const types = [...extensions.entries()].sort((left, right) => right[1] - left[1]).slice(0, 8)
     .map(([extension, count]) => `${extension} ${count}`);
+  const sources = [...sourceRoots.entries()].sort((left, right) => right[1] - left[1]).slice(0, 8)
+    .map(([dir, count]) => `${dir}/ (${count})`);
   return `Workspace overview (generated, not a search result): top level: ${listing.join(", ") || "(empty)"}${top.length > 25 ? ", …" : ""}. `
     + `${files}${seen > MAX_ENTRIES ? "+" : ""} files; most common types: ${types.join(", ") || "none"}. `
-    + "Search the types that exist here; start with a content search such as grep -rn \"KEYWORD\" . or rg -n \"KEYWORD\".";
+    + (sources.length > 0 ? `Source folders: ${sources.join(", ")}. Paths are relative to the workspace root. ` : "")
+    + "Search the file types that exist here, and search contents before concluding something is absent.";
 }

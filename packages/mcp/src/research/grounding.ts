@@ -70,3 +70,8 @@ export function searchHitCitations(
   }
   return [...cited.values()];
 }
+
+/** The repair for an answer that cites no file although the run's own results named some. */
+export function sourceRepairNotice(evidence: string[]): string {
+  return `Your answer names no source file. Keep the answer and end it with "Source: path:line" copied from your results, for example one of: ${evidence.slice(0, 6).join(", ")}.`;
+}

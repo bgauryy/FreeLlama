@@ -230,6 +230,12 @@ function describeAction(action: Fields, workspace: string): string {
       return describeShellCommand(String(action.command ?? ""));
     case "octocode":
       return describeOctocodeCall(String(action.tool ?? "?"), object(action.queries) ?? {}, workspace);
+    case "search":
+      return `search '${String(action.pattern ?? "")}'${action.glob ? ` in ${String(action.glob)}` : ""}${action.path ? ` under ${String(action.path)}` : ""}`;
+    case "read":
+      return `read ${String(action.path ?? "?")}${action.start ? `:${String(action.start)}${action.end ? `-${String(action.end)}` : ""}` : ""}`;
+    case "list":
+      return `list ${String(action.path ?? ".")}`;
     case "page":
       return `page ${String(action.page)} of step ${String(action.step)}`;
     default:

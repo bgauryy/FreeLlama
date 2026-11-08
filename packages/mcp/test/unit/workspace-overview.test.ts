@@ -16,7 +16,7 @@ describe("research workspace overview", () => {
     expect(overview).toContain("top level: src/, README.md");
     expect(overview).toMatch(/4 files; most common types: \.ts 3, \.md 1/);
     expect(overview).not.toContain(".js");
-    expect(overview).toMatch(/grep -rn/);
+    expect(overview).toMatch(/search contents before concluding something is absent/);
   });
 
   it("is empty for a missing workspace", () => {

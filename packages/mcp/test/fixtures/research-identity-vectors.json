@@ -14,7 +14,7 @@
       },
       "url": "http://127.0.0.1:11434/api/tags",
       "result": {
-        "identity": "a19d3c4597325334e6445f50944253dd5d3e9ed8ee6e97e5cb29a26f6236c82f",
+        "identity": "c59497675427be45bf27ddfac2e37aede64ee6b01379d9384b289f4d6913b992",
         "verified": true,
         "scope": "manifest_digest_and_system_prompt",
         "digest": "abcdef0000000000000000000000000000000000000000000000000000000000"

@@ -545,7 +545,9 @@ describe("tool contract", () => {
     expect(properties.contextTokens.type).toBe("integer");
     expect(properties.maxTurns.exclusiveMinimum).toBe(0);
     expect(properties.outputTokens.exclusiveMinimum).toBe(0);
-    expect(Object.keys(properties).sort()).toEqual(["contextTokens", "maxTurns", "outputTokens"]);
+    expect(Object.keys(properties).sort()).toEqual(["contextTokens", "maxTurns", "outputTokens", "timeoutSeconds"]);
+    // Bigger models need longer runs; the caller may extend up to 30 minutes.
+    expect(properties.timeoutSeconds.maximum).toBe(1800);
     expect(properties.retryAttempts).toBeUndefined();
     expect(properties.context).toBeUndefined();
     expect((agent.anyOf?.[0] ?? agent).additionalProperties).toBe(false);

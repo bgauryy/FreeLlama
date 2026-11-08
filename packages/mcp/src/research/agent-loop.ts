@@ -20,7 +20,7 @@ import {
 } from "./transport.js";
 import { requestJsonAsJob } from "./transport-jobs.js";
 import { resolvePath } from "./workspace-path.js";
-import { evidencePaths, groundingNote, groundingRepairNotice, missingPaths, toolErrorHint } from "./grounding.js";
+import { evidencePaths, groundingNote, groundingRepairNotice, missingPaths, pathsIn, sourceRepairNotice, toolErrorHint } from "./grounding.js";
 
 export type { Action, AdapterHooks, AdapterSession, AdapterSpec, ToolCall } from "./adapter.js";
 
@@ -218,6 +218,7 @@ async function runLoop(spec: AdapterSpec, hooks: AdapterHooks, env: Env, inputs:
     // Repeats answered from earlier steps; a second one means the model is circling, so finalize.
     let repeats = 0;
     let groundingRepaired = false;
+    let sourceRepaired = false;
     const seenOutputs: string[] = [];
     for (let turn = 0; turn < runtime.max_turns; turn += 1) {
       const at = { turn: turn + 1, maxTurns: runtime.max_turns };
@@ -282,6 +283,22 @@ async function runLoop(spec: AdapterSpec, hooks: AdapterHooks, env: Env, inputs:
           messages.push({ role: "user", content: groundingRepairNotice(missing, evidencePaths(seenOutputs, workspace)) });
           if (!refit()) {
             answer = proposed + groundingNote(missing);
+            exhausted = false;
+            break;
+          }
+          continue;
+        }
+        // An answer must say where it comes from: one repair turn when it names no file although
+        // the run's own results named some (a "no, not found" answer has no such results).
+        const evidence = missing.length === 0 && !sourceRepaired && pathsIn(proposed).length === 0
+          ? evidencePaths(seenOutputs, workspace) : [];
+        if (evidence.length > 0) {
+          sourceRepaired = true;
+          progress?.({ event: "repair", ...at });
+          messages.push({ role: "assistant", content: echo(action) });
+          messages.push({ role: "user", content: sourceRepairNotice(evidence) });
+          if (!refit()) {
+            answer = proposed;
             exhausted = false;
             break;
           }

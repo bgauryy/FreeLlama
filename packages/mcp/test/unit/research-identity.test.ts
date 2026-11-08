@@ -77,7 +77,8 @@ describe("frozen identity vectors", () => {
   it("system prompts hash to the reference digests", async () => {
     const { createHash } = await import("node:crypto");
     const sha = (text: string) => createHash("sha256").update(text, "utf8").digest("hex");
-    expect(sha(BASH_SYSTEM_PROMPT)).toBe("871743fbd51b1958c6ce7a5650b03c97d3639133ec3a07020e090303e77642a8");
+    // 2026-11-08: rewritten for small models (structured actions first, rg/grep shell, answer + Source contract); older research grades no longer apply.
+    expect(sha(BASH_SYSTEM_PROMPT)).toBe("031e6561563022cefc1af59c97c9d2e6189b319e51f392a45e9d21512e11e82b");
     expect(sha(octocodeSystemPrompt("/w"))).toBe("4568dbb071c8196dcb8f638c0999144613b52dda9f94ecb14b710507b9895bd2");
   });
 });

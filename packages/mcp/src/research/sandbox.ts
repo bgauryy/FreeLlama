@@ -20,7 +20,7 @@
 //
 // Layer 1 lives in sandbox-validate.ts; the differential corpus in
 // test/fixtures/shell-sandbox-corpus.json pins every verdict.
-import { accessSync, constants as fsConstants, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { accessSync, constants as fsConstants, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { probe, runProcess } from "./proc.js";
@@ -150,6 +150,28 @@ export class ReadOnlyShell {
       }
     }
     return [];
+  }
+
+  /**
+   * Run one read-only tool with an argument vector, no shell: the structured `search` action uses
+   * it so a pattern such as `${x}` or `(` is data, never shell syntax. Same OS sandbox, PATH and
+   * scrubbed environment as `run`; exit 1 of a search means no matches.
+   */
+  /** Whether `tool` was found on the caller's PATH when the shell was entered. */
+  hasTool(tool: string): boolean {
+    return this.scratch !== null && existsSync(path.join(this.scratch, "bin", tool));
+  }
+
+  async runTool(argv: string[], timeoutSeconds: number): Promise<string> {
+    const [tool, ...args] = argv;
+    if (!tool || !(READ_ONLY_TOOLS as readonly string[]).includes(tool) || this.scratch === null) {
+      throw new ValidationError(`tool ${tool ?? "(none)"} is not available to structured actions`);
+    }
+    const result = await runProcess([...this.prefix, path.join(this.scratch, "bin", tool), ...args],
+      { cwd: this.workspace, env: this.env, timeoutSeconds });
+    if (result.returncode === 1 && !trimSpace(result.stderr)) return "(no matches)";
+    if (result.returncode !== 0) throw new ToolExitError(result.returncode, result.stdout + result.stderr);
+    return trimSpace(result.stdout) ? result.stdout : "(no matches)";
   }
 
   async run(commandText: string, timeoutSeconds: number): Promise<string> {

@@ -73,6 +73,20 @@ export const DEFAULT_SERVE_ENDPOINT = process.env.FREELLAMA_SERVE_ENDPOINT ?? "h
 export const DEFAULT_DELEGATE_MODEL: string | undefined = process.env.FREELLAMA_MCP_DEFAULT_MODEL?.trim() || undefined;
 export const DEFAULT_DELEGATE_MAX_TURNS = envInt("FREELLAMA_MCP_MAX_TURNS", 8);
 export const DEFAULT_DELEGATE_TIMEOUT_SECONDS = envInt("FREELLAMA_MCP_DELEGATE_TIMEOUT_SECONDS", 180);
+
+/** The longest research run a caller may ask for. */
+export const MAX_DELEGATE_TIMEOUT_SECONDS = 1_800;
+
+/**
+ * How long a research run may take: the configured default for a model up to 4 GB, plus 20 s per
+ * further GB (a 27B model decodes several times slower than a 3B), at most 20 minutes; an explicit
+ * `agent.timeoutSeconds` wins.
+ */
+export function researchTimeoutSeconds(sizeBytes: number | undefined, requested: number | undefined): number {
+  if (requested !== undefined) return Math.min(requested, MAX_DELEGATE_TIMEOUT_SECONDS);
+  const extraGb = sizeBytes ? Math.max(0, sizeBytes / 1e9 - 4) : 0;
+  return Math.min(Math.round(DEFAULT_DELEGATE_TIMEOUT_SECONDS + extraGb * 20), 1_200);
+}
 export const DEFAULT_PULL_TIMEOUT_SECONDS = envInt("FREELLAMA_MCP_PULL_TIMEOUT_SECONDS", 1200);
 export const DEFAULT_OLLAMA_FETCH_TIMEOUT_SECONDS = envInt("FREELLAMA_MCP_FETCH_TIMEOUT_SECONDS", 30);
 // The FreeLlama home, shared with `serve` (packages/rust-core/src/store.rs `default_home`).
