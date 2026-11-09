@@ -1,6 +1,11 @@
+import { fileURLToPath } from "node:url";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { MODEL_EVIDENCE } from "../../src/delegate.js";
+
+// The repository root holds AGENTS.md; the run's cwd differs between `yarn test` at the root and
+// in packages/mcp, so source citations resolve against this fixed workspace.
+const REPO_ROOT = fileURLToPath(new URL("../../../..", import.meta.url));
 
 const fixture = vi.hoisted(() => ({
   handlers: new Map<string, (...args: any[]) => Promise<any>>(),
@@ -179,7 +184,7 @@ describe("delegate_research refusal forwarding", () => {
       model_metadata: { execution_receipts: [{ model, execution: { model_digest: observed, observation: { resident: true, digest: observed } } }] },
     };
     fixture.exec.mockImplementation(() => Object.assign(Promise.resolve({ stdout: "", stderr: "" }), { child: { kill: vi.fn() } }));
-    const result = await fixture.handlers.get("delegate_research")!({ question: "Where is this declared?", workspacePath: process.cwd(), model },
+    const result = await fixture.handlers.get("delegate_research")!({ question: "Where is this declared?", workspacePath: REPO_ROOT, model },
       { signal: new AbortController().signal });
     expect(result.structuredContent.verification).toMatchObject({
       grounded: mode !== "diagnostic", recommendation: mode === "source" ? "accept" : mode === "diagnostic" ? "escalate" : "verify",
