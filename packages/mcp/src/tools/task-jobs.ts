@@ -1,6 +1,7 @@
 // task_jobs: follow work submitted with run_task {defer:true}.
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as z from "zod";
+import { outputInput } from "../tool-results.js";
 import { cancelTaskJob, getTaskJob, listTaskJobs, removeTaskJob } from "../serve-client.js";
 import {
   endpointParam, errorResult, isStructuredSuccess, jobsText, objectResultSchema, parsedResult, structuredResult, summarizeEmbeddings,
@@ -18,6 +19,7 @@ export function registerTaskJobsTool(server: McpServer): void {
         action: z.enum(["list", "get", "cancel", "remove"]),
         jobId: z.string().uuid().optional(),
         returnEmbeddings: z.boolean().optional(),
+        output: outputInput.output.describe("get only; as run_task"),
       }).strict(),
       outputSchema: objectResultSchema,
       // One tool for reads and changes, so not read-only (the spec default, not restated). Not destructive either: cancel and remove
@@ -25,13 +27,13 @@ export function registerTaskJobsTool(server: McpServer): void {
       // outside FreeLlama, and a job's input can be submitted again.
       annotations: { destructiveHint: false },
     },
-    async ({ endpoint, action, jobId, returnEmbeddings }) => {
+    async ({ endpoint, action, jobId, returnEmbeddings, output }) => {
       try {
         if (action === "list" ? jobId !== undefined : jobId === undefined) {
           return errorResult(new Error("Use jobId only with get/cancel/remove; all require a jobId."));
         }
-        if (returnEmbeddings !== undefined && action !== "get") {
-          return errorResult(new Error("returnEmbeddings is valid only with get."));
+        if ((returnEmbeddings !== undefined || output !== undefined) && action !== "get") {
+          return errorResult(new Error("returnEmbeddings and output are valid only with get."));
         }
         const result = parsedResult(action === "list"
           ? await listTaskJobs(endpoint)

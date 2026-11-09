@@ -22,6 +22,8 @@ const fixture = vi.hoisted(() => ({
 // Only the delegate tool's own dependencies are replaced: the managed route call and the
 // subprocess/filesystem surface. The tool registers on a minimal recording server.
 vi.mock("../../src/serve-client.js", () => ({ route: fixture.route, listModels: fixture.catalog }));
+// No installed inventory: the catalog research pick cannot qualify, so the default model comes from routing.
+vi.mock("../../src/model-library.js", () => ({ catalogLiveState: async () => [null, null] }));
 vi.mock("node:fs", async (importOriginal) => {
   const original = await importOriginal<typeof import("node:fs")>();
   return { ...original, existsSync: (file: string) => /(?:bash|octocode)-agent\.js$/.test(file) ? fixture.adapterExists : original.existsSync(file) };

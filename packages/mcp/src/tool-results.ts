@@ -1,6 +1,8 @@
+import * as z from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { summarizeEmbeddings } from "./helpers.js";
 import { responseStore, type ResponseStore } from "./response-store.js";
+import { summaryOf, writeDefaultOutput, writeOutputFile } from "./handoffs.js";
 
 type ToolResult = { structuredContent?: unknown; isError?: boolean; _meta?: Record<string, unknown> };
 type Fields = Record<string, unknown>;
@@ -69,19 +71,22 @@ function compactReceipt(receipt: Fields): Fields {
     "ollama_may_evict_or_offload", "ollama_preflight_reason", "ollama_f16_preflight_bytes"]);
   const completionPlanning = compactCompletionPlanning(execution?.completion_planning);
   const compact: Fields = {};
-  for (const key of ["selected_model", "response", "output_check", "metrics", "telemetry", "scope", "warm", "job", "deferred",
+  for (const key of ["selected_model", "response", "output_check", "scope", "warm", "job", "deferred",
     "nearest", "files_read", "embedding_requests", "embedding_identity", "accepted_job_ids", "job_profile", "handoff_file"]) {
     if (receipt[key] !== undefined) compact[key] = receipt[key];
   }
   const response = withoutThinking(object(receipt.response));
   if (response) compact.response = response;
+  // Host telemetry snapshots stay in the file; metrics keep their scalar counts and durations.
+  const metrics = object(receipt.metrics);
+  if (metrics) compact.metrics = Object.fromEntries(Object.entries(metrics).filter(([, value]) => value === null || typeof value !== "object"));
   const route = pick(object(receipt.route), ["selected_model", "task", "confidence", "reasons", "output_reserve_tokens"]);
   if (route) compact.route = route;
   const admission = pick(object(receipt.admission), ["mode", "queue_wait_ms", "transition_wait_ms", "resource_wait_ms", "total_wait_ms"]);
   if (admission) compact.admission = admission;
   if (execution) {
     compact.execution = {
-      ...pick(execution, ["placement", "backend", "reason", "observation", "lifecycle", "context_sizing", "keep_alive", "preference_satisfied"]),
+      ...pick(execution, ["placement", "backend", "reason", "observation", "keep_alive", "preference_satisfied"]),
       ...(completionPlanning ? { completion_planning: completionPlanning } : {}),
       ...(reservation ? { memory_reservation: reservation } : {}),
     };
@@ -137,10 +142,24 @@ function compactResearchResult(content: Fields): { shaped: Fields; sections: str
 /** Tools whose results are views of saved responses; saving them again would only copy files. */
 const UNSAVED_TOOLS = new Set(["read_response"]);
 
+/** The finished job's result of a `task_jobs {action:"get"}` payload, when it has one. */
+function finishedJob(tool: string, args: Fields | undefined, content: Fields): { job: Fields; result: Fields } | undefined {
+  if (tool !== "task_jobs" || args?.action !== "get") return undefined;
+  const job = object(content.job);
+  const result = object(job?.result);
+  return job && result ? { job, result } : undefined;
+}
+
 function shapeResult(tool: string, args: Fields | undefined, content: Fields, isError: boolean, saved: boolean) {
   // A preview is the routing decision itself, so it always stays whole. Without a saved file
   // nothing may move out of the view: there would be nowhere left to read it.
   const full = args?.receipt === "full" || args?.preview === true || !saved;
+  // A finished job's receipt is the one `run_task` would have returned: shape it the same way.
+  const finished = finishedJob(tool, args, content);
+  if (finished) {
+    if (full || args?.returnEmbeddings === true) return { shaped: content, sections: [] };
+    return { shaped: { ...content, job: { ...finished.job, result: compactTaskResult(finished.result) } }, sections: ["receipt"] };
+  }
   if (tool === "delegate_research") return full ? { shaped: content, sections: [] } : compactResearchResult(content);
   // A deferred acknowledgement carries only the job; its result arrives through task_jobs.
   if (tool !== "run_task" || isError || content.deferred === true) return { shaped: content, sections: [] };
@@ -157,6 +176,118 @@ function shapeResult(tool: string, args: Fields | undefined, content: Fields, is
   return { shaped, sections };
 }
 
+/**
+ * Longest answer text `output: "auto"` returns inline: about 2,000 tokens. Claude Code warns above
+ * 10,000 tokens of MCP output and caps it at 25,000 by default (code.claude.com/docs/en/mcp);
+ * other hosts cut sooner.
+ */
+export const AUTO_INLINE_CHARS = 8000;
+
+/** Input fields of the tools whose answers `output` and `outputPath` apply to. */
+export const outputInput = {
+  output: z.enum(["auto", "inline", "file"]).optional()
+    .describe("auto (default): inline up to 8,000 chars, else a summary plus check lines and where to read the rest; inline: always whole; file: always the summary view"),
+  outputPath: z.string().min(1).optional()
+    .describe("also write the answer as Markdown here, creating or replacing it (inside the readable roots); default when shortened: FreeLlama home tmp/<timestamp>.md"),
+};
+
+/** The saved record's path to the whole answer text: `{tool, arguments, result: {content: [{text}]}}`. */
+export const SAVED_TEXT_SECTION = "/result/content/0/text";
+
+const KEPT_LINE = /^(check|handoff_file|verification|cited): /;
+const LABEL = /^\[[^\]\n]*\] /;
+
+/**
+ * The short view of an answer text: its `[model · ...]` label, the opening lines, every `check:`,
+ * `handoff_file:`, `verification:` and `cited:` line unchanged, then `where` the whole text can be read.
+ */
+export function shortView(text: string, where: string): string {
+  const label = LABEL.exec(text)?.[0].trim();
+  const lines = text.replace(LABEL, "").split("\n");
+  const kept = lines.filter((line) => KEPT_LINE.test(line));
+  const summary = summaryOf(lines.filter((line) => !KEPT_LINE.test(line)).join("\n"));
+  return [label, summary, ...kept, where].filter((part) => part !== undefined && part !== "").join("\n");
+}
+
+type OutputView = {
+  text: string;
+  output?: { mode: string; chars: number; file: string };
+  output_file?: string;
+  /** Where the whole answer can be read, set when the view was shortened. */
+  where?: string;
+  /** The whole text, for finding its copies in the structured result. */
+  answer?: string;
+};
+
+/**
+ * The text of a finished `run_task` or `delegate_research` result for the call's `output` and
+ * `outputPath`. The caller's `outputPath` is written (created or replaced) whatever the mode; a
+ * shortened view without one is written to a new file in OUTPUT_TMP_DIR. An answer never disappears:
+ * it is shortened only when the whole text is readable in a file or the saved response, and a failed
+ * write is named in the text.
+ */
+function viewText(args: Fields | undefined, text: string, responseFile: string | undefined): OutputView {
+  const mode = typeof args?.output === "string" ? args.output : "auto";
+  const shorten = mode === "file" || (mode === "auto" && text.length > AUTO_INLINE_CHARS);
+  const answer = text.replace(LABEL, "");
+  const content = { source: "From FreeLlama", summary: summaryOf(answer), result: answer };
+  let written: string | undefined;
+  const notes: string[] = [];
+  try {
+    if (typeof args?.outputPath === "string") written = writeOutputFile(args.outputPath, content);
+    else if (shorten) written = writeDefaultOutput(content);
+  } catch (error) {
+    notes.push(`output_file not written: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  const file = written ?? (shorten ? responseFile : undefined);
+  const tail = notes.length > 0 ? `\n${notes.join("\n")}` : "";
+  if (!shorten) {
+    return { text: `${text}${written ? `\noutput_file: ${written}` : ""}${tail}`, ...(written ? { output_file: written } : {}) };
+  }
+  if (!file) return { text: `${text}${tail}\nnot shortened (${text.length} chars): no output file could be written and the response store is off, so this text is the only copy` };
+  const where = written
+    ? `output_file: ${written} (the full answer, ${text.length} chars)`
+    : `full answer (${text.length} chars): read_response{file:"${responseFile}", section:"${SAVED_TEXT_SECTION}"}`;
+  return {
+    text: `${shortView(text, where)}${tail}`,
+    output: { mode, chars: text.length, file },
+    ...(written ? { output_file: written } : {}),
+    where,
+    answer: text,
+  };
+}
+
+/** Copies shorter than this are never replaced: they are labels and one-liners, not the answer. */
+const MIN_COPY_CHARS = 400;
+
+/**
+ * `value` with every long string that is the shortened answer, or a piece of it (a batch answer
+ * holds one section per item), replaced by `pointer`. The saved response keeps them.
+ */
+function withoutAnswerCopies(value: unknown, answer: string, pointer: string): unknown {
+  if (typeof value === "string") return value.length >= MIN_COPY_CHARS && answer.includes(value.trim()) ? pointer : value;
+  if (Array.isArray(value)) return value.map((item) => withoutAnswerCopies(item, answer, pointer));
+  const fields = object(value);
+  return fields ? Object.fromEntries(Object.entries(fields).map(([key, item]) => [key, withoutAnswerCopies(item, answer, pointer)])) : value;
+}
+
+/** `content` with its first text part replaced, or undefined when the result has no text to reshape. */
+function reshapedContent(result: ToolResult & { content?: unknown }, args: Fields | undefined, responseFile: string | undefined) {
+  const parts = result.content;
+  const first = Array.isArray(parts) ? object(parts[0]) : undefined;
+  if (!Array.isArray(parts) || first?.type !== "text" || typeof first.text !== "string") return undefined;
+  const view = viewText(args, first.text, responseFile);
+  return { view, content: [{ ...first, text: view.text }, ...parts.slice(1)] };
+}
+
+/** Results whose answer text `output` and `outputPath` apply to: finished, not routing or acknowledgements. */
+function hasAnswerText(tool: string, args: Fields | undefined, content: Fields, isError: boolean): boolean {
+  if (isError) return false;
+  if (finishedJob(tool, args, content)) return true;
+  if (tool !== "run_task" && tool !== "delegate_research") return false;
+  return args?.preview !== true && args?.defer !== true && content.deferred !== true;
+}
+
 /** The model a result came from, for the store index. */
 function resultModel(content: Fields | undefined): string | undefined {
   const model = content?.selected_model ?? object(content?.route)?.selected_model;
@@ -167,7 +298,8 @@ function resultModel(content: Fields | undefined): string | undefined {
  * One tool result as the agent receives it: timed, saved whole to the response store (the path
  * travels as `response_file`), and for a successful `run_task` or any `delegate_research` reduced
  * to what the agent acts on unless the call asked for `receipt: "full"`. `sections` names what
- * the file holds beyond that view (read_response returns one). The answer is never shortened.
+ * the file holds beyond that view (read_response returns one). The answer text shortens only as
+ * `output` says (see viewText), and only when its whole text is readable elsewhere.
  */
 export async function finishResult<T extends ToolResult>(
   tool: string,
@@ -186,13 +318,21 @@ export async function finishResult<T extends ToolResult>(
     return file ? { ...timed, _meta: { ...timed._meta, "freellama/response_file": file } } : timed;
   }
   const { shaped, sections } = shapeResult(tool, object(args), content, timed.isError === true, file !== undefined);
+  const reshaped = hasAnswerText(tool, object(args), content, timed.isError === true)
+    ? reshapedContent(timed as ToolResult & { content?: unknown }, object(args), file)
+    : undefined;
+  const { where, answer } = reshaped?.view ?? {};
+  const lean = where !== undefined && answer !== undefined ? withoutAnswerCopies(shaped, answer, `answer moved: ${where}`) as Fields : shaped;
   return {
     ...timed,
+    ...(reshaped ? { content: reshaped.content } : {}),
     structuredContent: {
-      ...shaped,
+      ...lean,
       timing: content.timing,
       ...(file ? { response_file: file } : {}),
       ...(file && sections.length > 0 ? { sections } : {}),
+      ...(reshaped?.view.output ? { output: reshaped.view.output } : {}),
+      ...(reshaped?.view.output_file ? { output_file: reshaped.view.output_file } : {}),
     },
   };
 }

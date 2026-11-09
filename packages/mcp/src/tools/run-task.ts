@@ -18,7 +18,8 @@ import { applyTaskFiles, inputLabels, type FileReceipt } from "../task-files.js"
 import { nearestText, validateEmbeddingVectors, type NearestRequest } from "../nearest.js";
 import { applyJob, mergeProfiles, neededCapabilities, pickLiveJobModel, type JobProfile } from "../job-mode.js";
 import { LOCAL_JOBS, RUN_TASK_JOBS, WORKFLOW_NAMES, WORKFLOWS, type JobName, type WorkflowName } from "../local-prompts.js";
-import { HANDOFF_NAME, summaryOf, writeHandoff } from "../handoffs.js";
+import { checkOutputPath, HANDOFF_NAME, summaryOf, writeHandoff } from "../handoffs.js";
+import { outputInput } from "../tool-results.js";
 import { resultChecks, withChecks } from "../result-checks.js";
 
 // Typed where the agent acts on a field; Ollama-owned payloads (`response`) stay open.
@@ -579,6 +580,7 @@ export function registerRunTaskTool(server: McpServer): void {
           .describe("compact (default): full receipt at response_file; full: inline"),
         defer: z.boolean().optional(),
         saveAs: z.string().regex(HANDOFF_NAME).optional().describe("answer to handoffs/<name>.md, returned as handoff_file"),
+        ...outputInput,
         returnEmbeddings: z.boolean().optional(),
         nearest: z
           .object({
@@ -614,6 +616,7 @@ export function registerRunTaskTool(server: McpServer): void {
       job,
       workflow,
       saveAs,
+      outputPath,
       objective,
       model,
       sessionId,
@@ -651,6 +654,11 @@ export function registerRunTaskTool(server: McpServer): void {
       maxParallelism,
     }, extra: ToolExtra) => {
       try {
+        // Refuse a bad outputPath before any model work; the write itself happens with the result (tool-results.ts).
+        if (outputPath !== undefined) {
+          if (preview || defer) return errorResult(new Error("`outputPath` saves a finished answer; it is not valid with `preview` or `defer`."));
+          checkOutputPath(outputPath);
+        }
         // A workflow names its job; a different explicit job is a contradiction.
         if (workflow !== undefined) {
           const flowJob = WORKFLOWS[workflow].job;

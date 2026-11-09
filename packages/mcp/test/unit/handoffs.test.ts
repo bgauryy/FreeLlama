@@ -2,7 +2,7 @@ import { WORKFLOW_NAMES } from "../../src/local-prompts.js";
 // saveAs handoffs: the file format, the readable root that lets a later task read one, and sweep
 // results saved whole. MCP prompts: each returns the exact call. No serve or Ollama.
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -17,9 +17,11 @@ vi.hoisted(() => {
 });
 vi.mock("../../src/serve-client.js", () => ({ runTaskRequest: vi.fn(), getTaskJob: vi.fn(), cancelTaskJob: vi.fn(), route: vi.fn() }));
 
-import { HANDOFF_DIR, summaryOf, writeHandoff } from "../../src/handoffs.js";
+import { checkOutputPath, HANDOFF_DIR, OUTPUT_TMP_DIR, pruneOutputDir, summaryOf, writeDefaultOutput, writeHandoff, writeOutputFile } from "../../src/handoffs.js";
 import { applyTaskFiles, fileRoots } from "../../src/task-files.js";
-import { withJob } from "../../src/tools/run-task.js";
+import { registerRunTaskTool, withJob } from "../../src/tools/run-task.js";
+import { registerDelegateResearchTool } from "../../src/tools/delegate-research.js";
+import { runTaskRequest } from "../../src/serve-client.js";
 import { registerSweepTool } from "../../src/tools/sweep.js";
 import { defaultFlags, SweepRunner, type Executor } from "../../src/sweep/runner.js";
 import { SweepStore, SWEEP_ROOT } from "../../src/sweep/store.js";
@@ -78,6 +80,95 @@ describe("handoff files", () => {
     expect(body).toMatch(/## Summary\n\nsweep .* completed: 2\/2 chunks, 1 flagged, 0 unsure, 1 clear, 0 failed/);
     expect(body).toMatch(/## Result\n\n- .*a\.ts:L1-L\d+: flagged \(bug 0\.93\)\n$/);
     expect((await handlers.get("sweep")!({ action: "status", sweepId: started.id, saveAs: "x" }, {})).content[0].text).toMatch(/apply to action "results" only/);
+  });
+});
+
+describe("outputPath files", () => {
+  const scratch = () => realpathSync(mkdtempSync(path.join(tmpdir(), "freellama-output-")));
+  const content = { source: "From run_task", summary: "s", result: "the answer" };
+
+  it("writes a Markdown file, creating missing directories, and replaces any existing regular file", () => {
+    const dir = scratch();
+    const target = path.join(dir, "a", "b", "out.md");
+    expect(writeOutputFile(target, content)).toBe(target);
+    expect(readFileSync(target, "utf8")).toMatch(/^# out\.md\n\nFrom run_task, \d{4}-.*## Result\n\nthe answer\n$/s);
+    expect(writeOutputFile(target, { ...content, result: "newer" })).toBe(target);
+    expect(readFileSync(target, "utf8")).toContain("## Result\n\nnewer\n");
+    writeFileSync(path.join(dir, "mine.md"), "# my notes\n");
+    writeOutputFile(path.join(dir, "mine.md"), content);
+    expect(readFileSync(path.join(dir, "mine.md"), "utf8")).toContain("## Result\n\nthe answer\n");
+  });
+
+  it("refuses paths outside the writable roots, inside .git, through a symlink escape, and directories", () => {
+    const dir = scratch();
+    const outside = scratch();
+    expect(() => checkOutputPath(path.join(outside, "x.md"), [dir])).toThrow(/outside the writable roots/);
+    expect(() => checkOutputPath(path.join(dir, "..", "x.md"), [dir])).toThrow(/outside the writable roots/);
+    expect(() => checkOutputPath(path.join(dir, ".git", "hooks", "x.md"), [dir])).toThrow(/inside a \.git directory/);
+    symlinkSync(outside, path.join(dir, "link"));
+    expect(() => checkOutputPath(path.join(dir, "link", "x.md"), [dir])).toThrow(/outside the writable roots/);
+    writeFileSync(path.join(outside, "secret.md"), "x");
+    symlinkSync(path.join(outside, "secret.md"), path.join(dir, "file-link.md"));
+    expect(() => checkOutputPath(path.join(dir, "file-link.md"), [dir])).toThrow(/outside the writable roots/);
+    mkdirSync(path.join(dir, "folder"));
+    expect(() => checkOutputPath(path.join(dir, "folder"), [dir])).toThrow(/not a regular file/);
+    expect(checkOutputPath(path.join(dir, "new", "x.md"), [dir])).toBe(path.join(dir, "new", "x.md"));
+  });
+
+  it("writes default output files that never collide, under a directory a later task can read", () => {
+    expect(OUTPUT_TMP_DIR).toBe(path.join(process.env.FREELLAMA_HOME!, "tmp"));
+    const home = mkdtempSync(path.join(tmpdir(), "freellama-roots-home-"));
+    expect(fileRoots({ FREELLAMA_HOME: home }, "/")).toContain(path.join(realpathSync(home), "tmp"));
+    const dir = path.join(home, "tmp");
+    const now = new Date("2026-11-09T10:11:12.345Z");
+    const first = writeDefaultOutput(content, dir, now, 7);
+    const second = writeDefaultOutput(content, dir, now, 7);
+    expect(first).not.toBe(second);
+    expect(path.basename(first)).toMatch(/^2026-11-09T10-11-12-345Z-\d+-\d+\.md$/);
+    const { payload } = applyTaskFiles({ task: "completion", prompt: "Use this:" }, [first], fileRoots({ FREELLAMA_HOME: home }, "/"));
+    expect(payload.prompt).toContain("## Result\n\nthe answer");
+  });
+
+  it("prunes default output files older than the TTL on the next write, and skips what it cannot remove", () => {
+    const dir = path.join(mkdtempSync(path.join(tmpdir(), "freellama-prune-")), "tmp");
+    mkdirSync(dir);
+    const now = new Date("2026-11-09T00:00:00.000Z");
+    const age = (name: string, days: number, body = "x") => {
+      const file = path.join(dir, name);
+      writeFileSync(file, body);
+      const when = new Date(now.getTime() - days * 86_400_000);
+      utimesSync(file, when, when);
+    };
+    age("old.md", 8);
+    age("recent.md", 6);
+    age("old.txt", 30);
+    mkdirSync(path.join(dir, "folder.md"));
+    const fresh = writeDefaultOutput(content, dir, now, 7);
+    expect(readdirSync(dir).sort()).toEqual(["folder.md", "old.txt", path.basename(fresh), "recent.md"].sort());
+    // TTL 0 keeps everything; a missing directory is not an error.
+    age("older.md", 400);
+    writeDefaultOutput(content, dir, now, 0);
+    expect(existsSync(path.join(dir, "older.md"))).toBe(true);
+    expect(() => pruneOutputDir(path.join(dir, "missing"), now.getTime(), 7)).not.toThrow();
+  });
+
+  it("is refused by run_task and delegate_research before any model work, and with preview or defer", async () => {
+    const handlers = new Map<string, (args: any, extra: any) => Promise<any>>();
+    const server = { registerTool: (name: string, _config: unknown, handler: any) => handlers.set(name, handler) } as unknown as McpServer;
+    registerRunTaskTool(server);
+    registerDelegateResearchTool(server);
+    const extra = { signal: new AbortController().signal };
+    const dir = scratch();
+    const bad = path.join(path.parse(dir).root, "freellama-not-a-root", "x.md");
+    const run = handlers.get("run_task")!;
+    expect((await run({ prompt: "p", outputPath: bad }, extra)).content[0].text).toMatch(/outside the writable roots/);
+    expect((await run({ prompt: "p", outputPath: path.join(dir, ".git", "x.md") }, extra)).content[0].text).toMatch(/inside a \.git directory/);
+    expect((await run({ outputPath: bad, tasks: [{ id: "a", independent: true, task: { prompt: "p" } }] }, extra)).content[0].text).toMatch(/outside the writable roots/);
+    for (const flag of [{ preview: true }, { defer: true }]) {
+      expect((await run({ prompt: "p", outputPath: path.join(dir, "ok.md"), ...flag }, extra)).content[0].text).toMatch(/not valid with `preview` or `defer`/);
+    }
+    expect((await handlers.get("delegate_research")!({ question: "q", workspacePath: dir, outputPath: bad }, extra)).content[0].text).toMatch(/outside the writable roots/);
+    expect(runTaskRequest).not.toHaveBeenCalled();
   });
 });
 

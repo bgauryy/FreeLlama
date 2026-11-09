@@ -93,7 +93,8 @@ describe("model knowledge through the built MCP server", () => {
   });
 
   it("enriches installed inventory while preserving benchmark and policy evidence", async () => {
-    const result = await models({ view: "installed", includeLibrary: true });
+    // Benchmark and policy evidence are full-record fields: the default slim set leaves them out.
+    const result = await models({ view: "installed", includeLibrary: true, includeVerbose: true });
     expect(result.models[0]).toMatchObject({ benchmark: { tokens_per_second: 42 }, policy_rank: { coding: 0 },
       knowledge: { library: { status: "matched" }, supportedFeatures: ["completion", "future-feature"] } });
     expect(requests.filter((url) => url === "/api/tags")).toHaveLength(1);

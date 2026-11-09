@@ -25,6 +25,29 @@ const modelsResultSchema = z.object({
 }).loose();
 
 
+// What the installed/resident text shows plus the identifiers a caller acts on, including observed
+// placement (callers must not infer it). Everything else (benchmark, policy rank, learned loops,
+// thinking, context defaults, ...) needs includeVerbose.
+const SLIM_MODEL_KEYS = [
+  "name", "model", "size", "capabilities", "resident", "resident_size", "resident_vram", "resident_context",
+  "advertised_context", "placement",
+] as const;
+
+function slimModel(entry: Record<string, unknown>, includeKnowledge: boolean): Record<string, unknown> {
+  const slim: Record<string, unknown> = {};
+  for (const key of SLIM_MODEL_KEYS) if (entry[key] !== undefined) slim[key] = entry[key];
+  const execution = entry.execution as { placement?: unknown; upstream?: unknown; observation?: unknown } | undefined;
+  if (execution && typeof execution === "object") {
+    slim.execution = {
+      ...(execution.placement !== undefined ? { placement: execution.placement } : {}),
+      ...(execution.upstream !== undefined ? { upstream: execution.upstream } : {}),
+      ...(execution.observation !== undefined ? { observation: execution.observation } : {}),
+    };
+  }
+  if (includeKnowledge && entry.knowledge !== undefined) slim.knowledge = entry.knowledge;
+  return slim;
+}
+
 /**
  * Share of host memory one library tag may occupy before it is reported as not fitting. Leaves
  * headroom for resident runners, context/KV caches and the OS; it is a download-size screen, not
@@ -305,8 +328,8 @@ export function registerModelsTool(server: McpServer): void {
         if (selectedView !== "library" && selectedView !== "raw" && [limit, cursor].some((value) => value !== undefined)) {
           return errorResult(new Error(`\`limit\` and \`cursor\` apply only to views "library" and "raw", not "${selectedView}".`));
         }
-        if (selectedView !== "detail" && includeVerbose !== undefined) {
-          return errorResult(new Error('`includeVerbose` is valid only for view "detail".'));
+        if (selectedView !== "detail" && selectedView !== "installed" && selectedView !== "resident" && includeVerbose !== undefined) {
+          return errorResult(new Error('`includeVerbose` is valid only for views "installed", "resident" and "detail".'));
         }
         if (selectedView !== "detail" && selectedView !== "library" && model !== undefined) {
           return errorResult(new Error('`model` is valid only for views "detail" and "library".'));
@@ -352,7 +375,8 @@ export function registerModelsTool(server: McpServer): void {
                 },
               };
             });
-            return structuredResult({ ...data, models }, { text: residentModelsText({ models }) });
+            const shown = includeVerbose ? models : models.map((entry) => slimModel(entry, false));
+            return structuredResult({ ...data, models: shown }, { text: residentModelsText({ models }) });
           }
 
           case "detail": {
@@ -400,7 +424,9 @@ export function registerModelsTool(server: McpServer): void {
             const data = result.structuredContent as { models?: Array<Record<string, unknown>> };
             const installed = { ...data, models: await enrichInstalledModels(data.models ?? [], ollamaLibrary, includeLibrary ?? false,
               async (upstream) => (await ollamaFetch(upstream ?? ollamaEndpoint, "/api/tags") as { models?: Array<Record<string, unknown>> }).models ?? []) };
-            return structuredResult(installed, { text: installedModelsText(installed) });
+            const shown = includeVerbose ? installed
+              : { ...installed, models: installed.models.map((entry) => slimModel(entry, includeLibrary === true)) };
+            return structuredResult(shown, { text: installedModelsText(installed) });
           }
         }
       } catch (error) {

@@ -524,6 +524,6 @@ Verify: local answers are candidates. Each run_task result ends with check: line
 
 Coding: the answer is SEARCH/REPLACE blocks. ${APPLY_EDITS}
 
-Hand a result on: saveAs:"<name>" writes the answer to handoffs/<name>.md and returns handoff_file; a later run_task reads it with files:[handoff_file].
+Hand a result on: saveAs:"<name>" writes the answer to handoffs/<name>.md and returns handoff_file; a later run_task reads it with files:[handoff_file]. Answers over 8,000 characters come back as a summary with check: lines and an output_file holding the whole answer; output:"inline" returns the whole text, outputPath:"<path>" writes (or replaces) that file inside your project.
 
 Approval: pull a model only after the user approves one exact tag and its size (ollama_pull approvedSizeBytes). Unload only a model you warmed or the user named; delete only a tag the user names. A memory refusal names what holds memory: tell the user and never stop their processes.`;

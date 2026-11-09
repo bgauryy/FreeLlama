@@ -117,7 +117,7 @@ export function installedModelsText(data: Fields): string {
       ].filter(Boolean).join("  "),
     );
   }
-  lines.push("Context, policy rank and benchmark per model: structuredContent; one model: models{view:\"detail\", model}.");
+  lines.push("Context, policy rank and benchmark per model: models{view:\"installed\", includeVerbose:true}; one model: models{view:\"detail\", model}.");
   return lines.join("\n");
 }
 

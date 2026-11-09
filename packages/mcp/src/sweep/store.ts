@@ -75,7 +75,19 @@ export type Manifest = {
   error?: string;
   startedAt: string;
   finishedAt?: string;
+  /** The server process running the sweep; absent in records from older versions. */
+  owner?: { pid: number };
 };
+
+/** True when a process with this pid exists (EPERM still means it exists). */
+export function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
 
 export const hashText = (text: string) => createHash("sha256").update(text).digest("hex").slice(0, 32);
 

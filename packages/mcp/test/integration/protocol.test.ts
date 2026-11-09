@@ -582,16 +582,18 @@ describe("tool contract", () => {
     // 6,800 before and 6,956 after
     // the 2026-11-08 job mode: run_task `job` (62) and `saveAs` (32), sweep `saveAs` (30) and one
     // instruction sentence (32), which replace the prompt, options and prefixes an agent would write;
-    // +60 for delegate_research adapter "coder" and agent.commands (edits an isolated copy, returns a diff).
+    // +60 for delegate_research adapter "coder" and agent.commands (edits an isolated copy, returns a diff);
+    // +~165 (7,404) for `output` and `outputPath` on run_task and delegate_research plus one instruction
+    // clause: they keep long local answers out of the agent's context and under host output limits.
     const modelFacing = tools.map(({ name, description, inputSchema }) => ({ name, description, inputSchema }));
     const surfaceTokens = Math.round(
       (JSON.stringify(modelFacing).length + (client.getInstructions() ?? "").length) / 4,
     );
-    expect(surfaceTokens, `model-facing surface grew to ~${surfaceTokens} tokens`).toBeLessThan(7250);
+    expect(surfaceTokens, `model-facing surface grew to ~${surfaceTokens} tokens`).toBeLessThan(7450);
     // The whole tools/list payload, output schemas included (7,522 tokens on 2026-11-01, 6,412 on 2026-11-07,
-    // 7,846 on 2026-11-08 with sweep and ollama_pull, 7,890 before and 8,055 after job mode).
+    // 7,846 on 2026-11-08 with sweep and ollama_pull, 7,890 before and 8,055 after job mode, 8,503 with output and outputPath).
     const wireTokens = Math.round((JSON.stringify(tools).length + (client.getInstructions() ?? "").length) / 4);
-    expect(wireTokens, `tools/list grew to ~${wireTokens} tokens`).toBeLessThan(8350);
+    expect(wireTokens, `tools/list grew to ~${wireTokens} tokens`).toBeLessThan(8600);
   });
 
   it("offers one prompt per job, each returning the exact call, and the freellama guide", async () => {
@@ -608,6 +610,10 @@ describe("tool contract", () => {
     expect((guide.messages[0]!.content as { text: string }).text).toMatch(/approves one exact tag and its size/);
     expect(client.getInstructions()).toMatch(/run_task\{workflow\} \(fix-bug, write-tests.*\) or run_task\{job\}: FreeLlama picks the model and gives it step-by-step instructions/);
     expect(byName.get("run_task")!.inputSchema.properties.workflow.enum).toEqual(WORKFLOW_NAMES);
+    for (const name of ["run_task", "delegate_research"]) {
+      expect(byName.get(name)!.inputSchema.properties.output.enum, name).toEqual(["auto", "inline", "file"]);
+      expect(byName.get(name)!.inputSchema.properties.outputPath.type, name).toBe("string");
+    }
     expect(byName.get("run_task")!.inputSchema.properties.job.enum).toEqual([
       "classify", "find-code", "duplicates", "ocr", "image-recognition", "image-search", "coding", "summarize",
     ]);
