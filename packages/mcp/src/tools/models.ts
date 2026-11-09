@@ -9,22 +9,21 @@ import {
   structuredResult,
 } from "../helpers.js";
 import { libraryTrialCandidate } from "../model-search.js";
-import { CATALOG_JOBS, catalogText, catalogView } from "../model-catalog.js";
-import { serveAuthHeaders } from "../serve-http.js";
+import { CATALOG_JOBS, catalogText, catalogView, installedMatch, type InstalledModel } from "../model-catalog.js";
 import { installedModelsText, modelDetailText, residentModelsText } from "../result-text.js";
-import { DEFAULT_SERVE_ENDPOINT } from "../config.js";
-import { HUB_EMBEDDING_TASKS, HuggingFaceClient, huggingFaceReference } from "../huggingface.js";
+import { HUB_EMBEDDING_TASKS, huggingFaceReference } from "../huggingface.js";
 import {
-  enrichInstalledModels, isRemoteModel, libraryReference, modelKnowledge, OllamaLibraryClient, publicModelGuidance,
+  enrichInstalledModels, isRemoteModel, libraryReference, modelKnowledge, publicModelGuidance,
 } from "../model-knowledge.js";
+import { catalogLiveState, huggingFace, installedInventory, liveAvailableBytes, ollamaLibrary } from "../model-library.js";
+
+export { installedInventory, libraryTagSize, type TagSizeLookup } from "../model-library.js";
 
 const modelsResultSchema = z.object({
   models: z.array(z.record(z.string(), z.unknown())).optional(), tags: z.array(z.record(z.string(), z.unknown())).optional(), page: z.unknown().optional(),
   knowledge: z.unknown().optional(), library: z.unknown().optional(),
 }).loose();
 
-const ollamaLibrary = new OllamaLibraryClient();
-const huggingFace = new HuggingFaceClient();
 
 /**
  * Share of host memory one library tag may occupy before it is reported as not fitting. Leaves
@@ -44,23 +43,34 @@ const HUB_TASKS = new Map<string, string[]>([
 ]);
 
 // Annotate public tags with local installation and a download-size memory screen, then pick a trial tag.
-function annotateTags<T extends { tag: string; sizeBytes: number | null; cloud: boolean }>(
-  tags: T[], installed: Set<string> | null, memoryBytes: number | null, embedding: boolean,
+// Ollama keeps a Hugging Face pull under the name it was given, so names compare case-insensitively;
+// a tag whose digest is installed under another name reports that name in `installed_as`.
+/** Weights plus a context, KV cache and runner: an estimate until the first load is measured. */
+export const estimatedNeedBytes = (sizeBytes: number) => Math.round(sizeBytes * 1.2 + 2e9);
+
+export function annotateTags<T extends { tag: string; sizeBytes: number | null; cloud: boolean; digest?: string | null }>(
+  tags: T[], installed: readonly InstalledModel[] | null, memoryBytes: number | null, embedding: boolean,
+  availableBytes: number | null = null,
 ) {
   const budget = memoryBytes ? memoryBytes * HOST_MEMORY_FIT_FRACTION : null;
-  // Ollama keeps a Hugging Face pull under the name it was given; compare case-insensitively.
-  const local = installed ? new Set([...installed].map((name) => name.toLowerCase())) : null;
   const annotated = tags.map((t) => ({
     ...t,
-    installed: local ? local.has(t.tag.toLowerCase()) : null,
+    ...(installed ? installedMatch(t.tag, installed, t.digest) : { installed: null }),
     fitsInMemory: budget && t.sizeBytes ? t.sizeBytes <= budget : null,
-    fitScope: "host_memory_budget_only",
+    // The machine can hold it in principle (above); this says whether it loads with what is free now.
+    ...(t.sizeBytes && !t.cloud ? { estimatedNeedBytes: estimatedNeedBytes(t.sizeBytes) } : {}),
+    fitsNow: availableBytes !== null && t.sizeBytes && !t.cloud ? estimatedNeedBytes(t.sizeBytes) <= availableBytes : null,
+    fitScope: availableBytes !== null ? "host_budget_and_free_memory_now" : "host_memory_budget_only",
   }));
-  const sized = annotated.filter((t) => t.fitsInMemory === true && !t.cloud && t.sizeBytes);
-  const best = budget
-    ? sized.sort((a, b) => embedding ? (a.sizeBytes ?? 0) - (b.sizeBytes ?? 0) : (b.sizeBytes ?? 0) - (a.sizeBytes ?? 0))[0]
+  const order = (a: { sizeBytes: number | null }, b: { sizeBytes: number | null }) =>
+    embedding ? (a.sizeBytes ?? 0) - (b.sizeBytes ?? 0) : (b.sizeBytes ?? 0) - (a.sizeBytes ?? 0);
+  const sized = annotated.filter((t) => t.fitsInMemory === true && !t.cloud && t.sizeBytes).sort(order);
+  // Prefer a tag that loads now; a larger one that only fits the host budget needs memory freed first.
+  const best = budget ? (sized.find((t) => t.fitsNow === true) ?? sized[0]) : undefined;
+  const memoryNote = best && best.fitsNow === false && availableBytes !== null
+    ? `Needs about ${(estimatedNeedBytes(best.sizeBytes!) / 1e9).toFixed(1)} GB free; ${(availableBytes / 1e9).toFixed(1)} GB is free now. Close other programs before loading it, or pick a smaller tag.`
     : undefined;
-  return { annotated, budget, best };
+  return { annotated, budget, best, memoryNote };
 }
 
 const NO_PROFILE = "No machine profile (freellama serve unreachable), so memory fit could not be checked and no tag is recommended. Start serve, or read the sizes yourself.";
@@ -91,12 +101,11 @@ async function libraryLookup({
   ollamaEndpoint?: string;
 }) {
   const localState = async () => {
-    let installed: Set<string> | null = null;
+    let installed: InstalledModel[] | null = null;
     let installedUnavailable: string | undefined;
     let memoryBytes: number | null = null;
     try {
-      const tags = (await ollamaFetch(ollamaEndpoint, "/api/tags")) as { models?: Array<{ name?: string }> };
-      installed = new Set((tags.models ?? []).map((m) => m.name ?? ""));
+      installed = await installedInventory(ollamaEndpoint);
     } catch (error) {
       // Unknown is not "not installed": report null plus the reason instead of a false negative.
       installedUnavailable = `Local inventory could not be read (${error instanceof Error ? error.message : String(error)}); installed is null.`;
@@ -107,7 +116,7 @@ async function libraryLookup({
     } catch {
       // serve unreachable: recommendationUnavailable below explains the missing fit check.
     }
-    return { installed, installedUnavailable, memoryBytes };
+    return { installed, installedUnavailable, memoryBytes, availableBytes: await liveAvailableBytes(endpoint) };
   };
 
   if (!model && cursor !== undefined) {
@@ -116,9 +125,9 @@ async function libraryLookup({
   try {
     if (model && huggingFaceReference(model)) {
       const hub = await huggingFace.lookup(model);
-      const { installed, installedUnavailable, memoryBytes } = await localState();
+      const { installed, installedUnavailable, memoryBytes, availableBytes } = await localState();
       const embedding = HUB_EMBEDDING_TASKS.has(hub.task ?? "");
-      const { annotated, budget, best } = annotateTags(hub.tags, installed, memoryBytes, embedding);
+      const { annotated, budget, best, memoryNote } = annotateTags(hub.tags, installed, memoryBytes, embedding, availableBytes);
       const tagPage = pageLiveList(annotated, limit, cursor, (tag) => tag.tag);
       return structuredResult({
         family: hub.family,
@@ -136,10 +145,11 @@ async function libraryLookup({
         tags: tagPage.items,
         page: { returned: tagPage.returned, total: tagPage.total, next_cursor: tagPage.next_cursor },
         pull: hub.tags.length
-          ? `ollama_manage {action:"pull", model:"<tag>"} after approval; Ollama picks Q4_K_M for a bare ${hub.family} when the repo has it.`
+          ? `ollama_pull {model:"<tag>", approvedSizeBytes:<that tag's sizeBytes>} after the user approves the tag and size; Ollama picks Q4_K_M for a bare ${hub.family} when the repo has it.`
           : "This repository has no GGUF files Ollama can pull.",
         recommendationUnavailable: budget ? undefined : NO_PROFILE,
-        recommendation: best ? libraryTrialCandidate(best.tag, embedding) : null,
+        availableBytesNow: availableBytes,
+        recommendation: best ? { ...libraryTrialCandidate(best.tag, embedding), ...(memoryNote ? { memoryNow: memoryNote } : {}) } : null,
       });
     }
     if (model) {
@@ -151,9 +161,9 @@ async function libraryLookup({
         tagsUnavailable: library.message, library, recommendation: null });
       // An available record always carries at least one tag; the client reports none as parse_error.
       const tags = library.tags!;
-      const { installed, installedUnavailable, memoryBytes } = await localState();
+      const { installed, installedUnavailable, memoryBytes, availableBytes } = await localState();
       const isEmbeddingFamily = library.card!.capabilities.includes("embedding");
-      const { annotated, budget, best } = annotateTags(tags, installed, memoryBytes, isEmbeddingFamily);
+      const { annotated, budget, best, memoryNote } = annotateTags(tags, installed, memoryBytes, isEmbeddingFamily, availableBytes);
       const tagPage = pageLiveList(annotated, limit, cursor, (tag) => tag.tag);
       return structuredResult({
         family,
@@ -167,8 +177,10 @@ async function libraryLookup({
         fitBudgetBytes: budget,
         tags: tagPage.items,
         page: { returned: tagPage.returned, total: tagPage.total, next_cursor: tagPage.next_cursor },
+        pull: `ollama_pull {model:"<tag>", approvedSizeBytes:<that tag's sizeBytes>} after the user approves the tag and size; a tag with installed_as is already here under that name.`,
         recommendationUnavailable: budget ? undefined : NO_PROFILE,
-        recommendation: best ? libraryTrialCandidate(best.tag, isEmbeddingFamily) : null,
+        availableBytesNow: availableBytes,
+        recommendation: best ? { ...libraryTrialCandidate(best.tag, isEmbeddingFamily), ...(memoryNote ? { memoryNow: memoryNote } : {}) } : null,
       });
     }
 
@@ -209,7 +221,7 @@ async function libraryLookup({
     const ollamaRows = (ollama?.models ?? []).slice(0, limit ?? 10).map((m) => ({ ...m, source: "ollama" as const }));
     const hubRows = hub?.models ?? [];
     const { installed, installedUnavailable } = await localState();
-    const local = installed ? [...installed].map((n) => n.toLowerCase()) : null;
+    const local = installed ? installed.map((entry) => entry.name.toLowerCase()) : null;
     const isInstalled = (name: string) => local ? local.some((n) => n.split(":")[0] === name.toLowerCase()) : null;
     const reason = (result: PromiseSettledResult<unknown>) =>
       result.status === "rejected" ? (result.reason instanceof Error ? result.reason.message : String(result.reason)) : undefined;
@@ -233,28 +245,13 @@ async function libraryLookup({
 }
 
 /** What is installed and how much memory is available; unknown stays null rather than "no". */
-async function catalogLiveState(endpoint: string | undefined, ollamaEndpoint: string | undefined): Promise<[ReadonlySet<string> | null, number | null]> {
-  let installed: ReadonlySet<string> | null = null;
-  let available: number | null = null;
-  try {
-    const tags = (await ollamaFetch(ollamaEndpoint, "/api/tags")) as { models?: Array<{ name?: string }> };
-    installed = new Set((tags.models ?? []).map((m) => m.name ?? ""));
-  } catch { /* reported as null */ }
-  try {
-    const response = await fetch(`${(endpoint ?? DEFAULT_SERVE_ENDPOINT).replace(/\/$/, "")}/_freellama/v1/status`, { headers: await serveAuthHeaders(), signal: AbortSignal.timeout(3000) });
-    const status = await response.json() as { host?: { available_memory_bytes?: number } };
-    available = status.host?.available_memory_bytes ?? null;
-  } catch { /* reported as null */ }
-  return [installed, available];
-}
-
 export function registerModelsTool(server: McpServer): void {
   server.registerTool(
     "models",
     {
       description:
         "Use when: choosing a model (view:catalog: tested picks per job, what is installed and fits now), listing installed or loaded models, inspecting one, or searching ollama.com and Hugging Face GGUF repos (view:library). " +
-        "Do not use when: running work (run_task) or pulling (ollama_manage). Returns: models; library lists families, then one family's tags.",
+        "Do not use when: running work (run_task) or pulling (ollama_pull). Returns: models; library lists families, then one family's tags.",
       inputSchema: z.object({
         view: z
           .enum(["catalog", "installed", "resident", "detail", "raw", "library"])
@@ -282,6 +279,8 @@ export function registerModelsTool(server: McpServer): void {
         ollamaEndpoint: ollamaEndpointParam,
       }).strict(),
       outputSchema: modelsResultSchema,
+      // Nothing here changes state. view:library searches ollama.com and the Hugging Face Hub, so the
+      // tool is open-world: that is the spec default for openWorldHint, so it is not restated.
       annotations: { readOnlyHint: true },
     },
     async ({ view, job, model, includeVerbose, includeLibrary, includeReadme, query, capabilities, order, source, limit, cursor, endpoint, ollamaEndpoint }) => {

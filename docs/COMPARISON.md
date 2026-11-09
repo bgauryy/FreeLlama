@@ -6,8 +6,7 @@ Moved from the root README.
 
 FreeLlama is not an inference engine: Ollama loads and runs the model, FreeLlama decides whether,
 where and how each task runs. Other projects' behavior is taken from their docs and source, checked
-on 2026-11-01. Moving-branch features may differ from installed releases; see the
-[Ollama resource audit](OLLAMA_RESOURCE_AUDIT_2026-11-01.md).
+on 2026-11-01. Moving-branch features may differ from installed releases.
 
 | Decision | Other local stacks | FreeLlama |
 |---|---|---|

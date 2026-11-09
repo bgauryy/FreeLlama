@@ -47,6 +47,11 @@
 # OLLAMA_CONTEXT_LENGTH, or its VRAM tier) covers the request, so the runner stays shared with raw
 # clients and keeps Ollama's out-of-memory retry. "explicit" always sends the sized num_ctx.
 # context_mode = "ollama_default"
+# "off" (default) sends shift:false on managed chat, so a generation that reaches the context limit
+# stops instead of discarding its earliest tokens. Ollama reloads a runner when a request's shift
+# differs from the one it was loaded with, and raw clients usually omit it: "ollama_default" omits
+# shift too, so raw and managed chat share one runner. truncate:false is sent either way.
+# context_shift = "off"
 # Never rely on an Ollama default above this many tokens (a large default costs KV-cache memory).
 # auto_context_max = 32768
 # Override the probed Ollama default when the server's environment is not visible (remote or
@@ -77,7 +82,7 @@
 # [warming]
 # min_seconds = 15
 # max_seconds = 900
-# base_seconds = 60
+# base_seconds = 300
 # reuse_gain_seconds = 30
 # load_multiplier = 2.0
 # pressure_factor = 0.25

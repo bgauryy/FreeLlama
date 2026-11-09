@@ -14,7 +14,6 @@
 use std::{collections::BTreeMap, fmt::Write as _};
 
 use anyhow::{Result, bail};
-use clap::ValueEnum as _;
 use serde_json::Value;
 
 use super::TaskKind;
@@ -45,15 +44,11 @@ pub fn slug(model: &str) -> String {
 /// Names every accepted kind when `value` is not one of them.
 pub fn parse_task_kind(value: &str) -> Result<TaskKind, String> {
     let task = value.replace('-', "_");
-    TaskKind::value_variants()
-        .iter()
-        .copied()
+    TaskKind::ALL
+        .into_iter()
         .find(|kind| kind.as_str() == task)
         .ok_or_else(|| {
-            let names: Vec<&str> = TaskKind::value_variants()
-                .iter()
-                .map(|kind| kind.as_str())
-                .collect();
+            let names: Vec<&str> = TaskKind::ALL.iter().map(|kind| kind.as_str()).collect();
             format!(
                 "unknown task {}; choose one of {} (`-` and `_` are interchangeable: code-repair = code_repair)",
                 python_repr_str(value),

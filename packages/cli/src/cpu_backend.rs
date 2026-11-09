@@ -33,12 +33,54 @@ pub(crate) struct CpuBackend {
     pub(crate) endpoint: String,
 }
 
+/// How long a stopping Ollama may take to unload its runners after SIGTERM before it is killed.
+const STOP_GRACE: Duration = Duration::from_secs(5);
+
 impl Drop for CpuBackend {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        // Ask the whole process group (Ollama and its runner children) to stop, so runners are
+        // not orphaned holding RAM; kill the group only after the grace period.
+        let graceful = signal_group(self.child.id(), "TERM");
+        let deadline = Instant::now() + STOP_GRACE;
+        while graceful && Instant::now() < deadline {
+            match self.child.try_wait() {
+                Ok(Some(_)) | Err(_) => break,
+                Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+            }
+        }
+        if !matches!(self.child.try_wait(), Ok(Some(_))) {
+            signal_group(self.child.id(), "KILL");
+            if let Err(error) = self.child.kill()
+                && error.kind() != std::io::ErrorKind::InvalidInput
+            {
+                eprintln!("freellama: could not kill the CPU Ollama: {error}");
+            }
+        }
+        if let Err(error) = self.child.wait() {
+            eprintln!("freellama: could not reap the CPU Ollama: {error}");
+        }
         eprintln!("freellama: stopped the CPU Ollama at {}", self.endpoint);
     }
+}
+
+/// Send `signal` to the process group the CPU Ollama leads; `false` when that is not possible.
+/// Uses `kill(1)` because the workspace denies `unsafe_code`, which `libc::kill` would need.
+#[cfg(unix)]
+fn signal_group(pid: u32, signal: &str) -> bool {
+    Command::new("kill")
+        .arg(format!("-{signal}"))
+        .arg("--")
+        .arg(format!("-{pid}"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(not(unix))]
+fn signal_group(_pid: u32, _signal: &str) -> bool {
+    false
 }
 
 async fn answers(client: &reqwest::Client, endpoint: &str) -> bool {
@@ -75,7 +117,11 @@ pub(crate) async fn spawn(port: u16, binary: &str, log: Option<&Path>) -> Result
             None => Stdio::null(),
         })
     };
-    let child = Command::new(binary)
+    let mut command = Command::new(binary);
+    // Its own process group, so shutdown can signal Ollama together with its runner children.
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    let child = command
         .arg("serve")
         .env("OLLAMA_HOST", format!("127.0.0.1:{port}"))
         .envs(CPU_ENVIRONMENT)

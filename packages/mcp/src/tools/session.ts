@@ -22,7 +22,9 @@ export function registerSessionTool(server: McpServer): void {
         endpoint: endpointParam,
       }).strict(),
       outputSchema: sessionResultSchema,
-      annotations: { destructiveHint: true },
+      // kill and delete act only on a session this client created (its id): they stop that
+      // session's own tasks and forget it, never other clients' work or anything outside FreeLlama.
+      annotations: { destructiveHint: false },
     },
     async ({ action, sessionId, endpoint }) => {
       try {

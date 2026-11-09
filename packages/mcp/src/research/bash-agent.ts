@@ -5,7 +5,6 @@
 //
 // Run as `node bash-agent.js` with FREELLAMA_TARGET_MODEL (or FREELLAMA_BENCH_MODEL),
 // FREELLAMA_BENCH_WORKSPACE, FREELLAMA_BENCH_PROMPT and FREELLAMA_AGENT_RESULT set.
-import { pathToFileURL } from "node:url";
 import { type Action, type AdapterSpec, isPositiveInt } from "./adapter.js";
 import { runAdapter } from "./agent-loop.js";
 import { parseJsonAction } from "./actions.js";
@@ -13,6 +12,10 @@ import { ValidationError } from "./errors.js";
 import { BASH_SYSTEM_PROMPT } from "./prompts.js";
 import { ReadOnlyShell, assertCommandConfined } from "./sandbox.js";
 import { trimSpace } from "./text.js";
+import { workspaceOverview } from "./workspace-overview.js";
+import { validateRead, validateSearch } from "./structured-actions.js";
+import { structuredCall } from "./structured-call.js";
+import { isEntry } from "./entry.js";
 
 export { assertCommandConfined };
 
@@ -29,8 +32,11 @@ export function parseAction(content: string): Action {
   if (action === "finish" && typeof value.answer !== "string") {
     throw new ValidationError("finish action requires a string answer");
   }
-  if (action !== "shell" && action !== "page" && action !== "finish") {
-    throw new ValidationError(`unsupported action for bash adapter: ${String(action)}`);
+  if (action === "search") validateSearch(value);
+  if (action === "read") validateRead(value);
+  if (action === "list" && value.path !== undefined && typeof value.path !== "string") throw new ValidationError("list path must be a string");
+  if (!["shell", "search", "read", "list", "page", "finish"].includes(String(action))) {
+    throw new ValidationError(`unsupported action for bash adapter: ${String(action)} (use search, read, list, shell, page or finish)`);
   }
   return value;
 }
@@ -49,12 +55,16 @@ export async function runShell(root: string, commandText: string, timeoutSeconds
 export const BASH_ADAPTER: AdapterSpec = {
   defaultToolTimeoutSeconds: 30,
   systemPrompt: () => BASH_SYSTEM_PROMPT,
+  briefing: workspaceOverview,
   parseAction,
   open: (workspace) => {
     const shell = new ReadOnlyShell(workspace).enter();
     return {
       shell,
       toolCall: (action, _workspace, runtime) => {
+        if (action.action === "search" || action.action === "read" || action.action === "list") {
+          return structuredCall(shell, action, runtime.tool_timeout_seconds);
+        }
         const commandText = String(action.command ?? "");
         return {
           signature: { command: commandText },
@@ -74,6 +84,6 @@ export const BASH_ADAPTER: AdapterSpec = {
   }),
 };
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isEntry(import.meta.url, "bash-agent")) {
   process.exitCode = await runAdapter(BASH_ADAPTER);
 }

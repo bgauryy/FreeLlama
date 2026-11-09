@@ -15,20 +15,16 @@ import { fileURLToPath } from "node:url";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const exe = process.platform === "win32" ? "freellama.exe" : "freellama";
 const requireFromHere = createRequire(import.meta.url);
-const PLATFORM_SUFFIXES = process.platform === "linux"
-  ? (process.report?.getReport()?.header?.glibcVersionRuntime ? ["-gnu", "-musl"] : ["-musl", "-gnu"])
-  : process.platform === "win32" ? ["-msvc"] : [""];
-const platformIds = [...new Set(PLATFORM_SUFFIXES.map((suffix) => `${process.platform}-${process.arch}${suffix}`))];
+const ABI_SUFFIX = { linux: "-gnu", win32: "-msvc" }[process.platform] ?? "";
+const platformId = `${process.platform}-${process.arch}${ABI_SUFFIX}`;
 const candidates = [
   path.join(root, "..", "..", "target", "release", exe), // in-repo dev, no packing needed
 ];
 
-for (const id of platformIds) {
-  try {
-    candidates.push(path.join(path.dirname(requireFromHere.resolve(`@octocodeai/freellama-native-${id}/package.json`)), exe));
-  } catch {
-    // Optional packages for other platforms are intentionally absent after install.
-  }
+try {
+  candidates.push(path.join(path.dirname(requireFromHere.resolve(`@octocodeai/freellama-native-${platformId}/package.json`)), exe));
+} catch {
+  // Optional packages for other platforms are intentionally absent after install.
 }
 
 const binary = candidates.find((p) => existsSync(p));

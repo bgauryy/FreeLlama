@@ -5,7 +5,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::{AdaptiveMode, ContextMode, PinnedTunables, RuntimeFile, Tunables, default_task_cost};
+use super::{
+    AdaptiveMode, ContextMode, ContextShift, PinnedTunables, RuntimeFile, Tunables,
+    default_task_cost,
+};
 
 /// CPU-backend admission units when nothing else sets them.
 const DEFAULT_CPU_MAX_CONCURRENT_TASKS: usize = 1;
@@ -176,12 +179,10 @@ pub(super) fn resolve(
         AdaptiveMode::Cpu,
         "default"
     );
-    let mut task_costs: BTreeMap<_, _> =
-        <super::super::TaskKind as clap::ValueEnum>::value_variants()
-            .iter()
-            .copied()
-            .map(|task| (task, default_task_cost(task)))
-            .collect();
+    let mut task_costs: BTreeMap<_, _> = super::super::TaskKind::ALL
+        .into_iter()
+        .map(|task| (task, default_task_cost(task)))
+        .collect();
     if let Some(overrides) = &file.task_costs {
         task_costs.extend(overrides.iter().map(|(task, cost)| (*task, *cost)));
         sources.insert("task_costs", "file");
@@ -194,6 +195,14 @@ pub(super) fn resolve(
         None::<ContextMode>,
         file.context_mode,
         ContextMode::OllamaDefault,
+        "default"
+    );
+    let context_shift = pick!(
+        "context_shift",
+        None::<ContextShift>,
+        None::<ContextShift>,
+        file.context_shift,
+        ContextShift::Off,
         "default"
     );
     let ollama_default_context = pick!(
@@ -388,6 +397,7 @@ pub(super) fn resolve(
         adaptive_concurrency,
         task_costs,
         context_mode,
+        context_shift,
         ollama_default_context,
         auto_context_max,
         usage_queue_capacity,

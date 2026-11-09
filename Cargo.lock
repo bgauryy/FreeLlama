@@ -453,6 +453,7 @@ dependencies = [
  "clap",
  "hmac",
  "http-body",
+ "http-body-util",
  "libc",
  "napi",
  "napi-build",

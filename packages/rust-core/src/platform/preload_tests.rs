@@ -123,6 +123,7 @@ async fn prediction_does_not_queue_when_foreground_claims_capacity_after_prechec
         .acquire(
             1,
             TaskPriority::Interactive,
+            None,
             tokio::time::Instant::now() + Duration::from_secs(1),
         )
         .await

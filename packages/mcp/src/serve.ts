@@ -102,14 +102,12 @@ function serveBinaryCandidates(): string[] {
     path.join(REPO_ROOT, "target", "debug", exe),
   ];
   const requireFromHere = createRequire(fileURLToPath(import.meta.url));
-  const suffixes = process.platform === "linux" ? ["-gnu", "-musl"] : process.platform === "win32" ? ["-msvc"] : [""];
-  for (const suffix of suffixes) {
-    try {
-      const manifest = requireFromHere.resolve(`@octocodeai/freellama-native-${process.platform}-${process.arch}${suffix}/package.json`);
-      candidates.push(path.join(path.dirname(manifest), exe));
-    } catch {
-      // Optional platform packages for other targets are absent by design.
-    }
+  const abiSuffix = ({ linux: "-gnu", win32: "-msvc" } as Record<string, string>)[process.platform] ?? "";
+  try {
+    const manifest = requireFromHere.resolve(`@octocodeai/freellama-native-${process.platform}-${process.arch}${abiSuffix}/package.json`);
+    candidates.push(path.join(path.dirname(manifest), exe));
+  } catch {
+    // Optional platform packages for other targets are absent by design.
   }
   if (process.env.FREELLAMA_SERVE_BINARY) candidates.unshift(process.env.FREELLAMA_SERVE_BINARY);
   return candidates;

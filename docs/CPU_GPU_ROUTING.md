@@ -236,6 +236,9 @@ Each backend has its own weighted admission pool and its own load lock (see
 [Load lock and use lease](#load-lock-and-use-lease)). CPU and GPU model loads therefore do not block
 each other, and a GPU burst cannot spend the CPU helper's permit:
 
+Within a priority class, each pool prefers a waiter whose model is already running on its backend
+(or was admitted there last), within bounded skips; see [the admission design](ARCHITECTURE.md#managed-task-execution).
+
 Both pools also share local host-pressure sampling and forecast-memory reservations. Independent
 queues do not imply independent RAM on a unified-memory machine. A request can wait for available
 headroom even when its backend has a free weighted permit. Inspect `admission.resources` in health

@@ -34,14 +34,19 @@ describe("doctor", () => {
     expect(result.structuredContent?.host_runtime_signals).toBeTruthy();
   });
 
-  it("targets ollamaEndpoint and rejects the removed endpoint alias", async () => {
+  it("targets ollamaEndpoint, and endpoint (alias serveEndpoint) names serve, not Ollama", async () => {
     const dead = "http://127.0.0.1:9999";
     const result = (await client.callTool({ name: "doctor", arguments: { ollamaEndpoint: dead } })) as ToolResult;
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toMatch(/connect|unreachable/i);
-    const alias = (await client.callTool({ name: "doctor", arguments: { endpoint: dead } })) as ToolResult;
-    expect(alias.isError).toBe(true);
-    expect(alias.content[0].text).not.toMatch(/connect|unreachable/i);
+    for (const name of ["endpoint", "serveEndpoint"]) {
+      const serve = (await client.callTool({ name: "doctor", arguments: { [name]: dead } })) as ToolResult;
+      expect(serve.isError ?? false, name).toBe(false);
+      expect(serve.structuredContent.status, name).toBe("degraded");
+      expect(serve.structuredContent.problems.join(" "), name).toMatch(/freellama serve unreachable/);
+    }
+    const both = (await client.callTool({ name: "doctor", arguments: { endpoint: dead, serveEndpoint: "http://127.0.0.1:9998" } })) as ToolResult;
+    expect(both.isError).toBe(true);
   });
 });
 

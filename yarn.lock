@@ -1153,11 +1153,8 @@ __metadata:
   dependencies:
     "@modelcontextprotocol/sdk": "npm:^1.32.2"
     "@octocodeai/freellama-native-darwin-arm64": "npm:0.9.0"
-    "@octocodeai/freellama-native-darwin-x64": "npm:0.9.0"
     "@octocodeai/freellama-native-linux-arm64-gnu": "npm:0.9.0"
-    "@octocodeai/freellama-native-linux-arm64-musl": "npm:0.9.0"
     "@octocodeai/freellama-native-linux-x64-gnu": "npm:0.9.0"
-    "@octocodeai/freellama-native-linux-x64-musl": "npm:0.9.0"
     "@octocodeai/freellama-native-win32-arm64-msvc": "npm:0.9.0"
     "@octocodeai/freellama-native-win32-x64-msvc": "npm:0.9.0"
     "@types/node": "npm:^22.20.5"
@@ -1169,15 +1166,9 @@ __metadata:
   dependenciesMeta:
     "@octocodeai/freellama-native-darwin-arm64":
       optional: true
-    "@octocodeai/freellama-native-darwin-x64":
-      optional: true
     "@octocodeai/freellama-native-linux-arm64-gnu":
       optional: true
-    "@octocodeai/freellama-native-linux-arm64-musl":
-      optional: true
     "@octocodeai/freellama-native-linux-x64-gnu":
-      optional: true
-    "@octocodeai/freellama-native-linux-x64-musl":
       optional: true
     "@octocodeai/freellama-native-win32-arm64-msvc":
       optional: true
@@ -1194,33 +1185,15 @@ __metadata:
   languageName: unknown
   linkType: soft
 
-"@octocodeai/freellama-native-darwin-x64@npm:0.9.0, @octocodeai/freellama-native-darwin-x64@workspace:packages/native/darwin-x64":
-  version: 0.0.0-use.local
-  resolution: "@octocodeai/freellama-native-darwin-x64@workspace:packages/native/darwin-x64"
-  languageName: unknown
-  linkType: soft
-
 "@octocodeai/freellama-native-linux-arm64-gnu@npm:0.9.0, @octocodeai/freellama-native-linux-arm64-gnu@workspace:packages/native/linux-arm64-gnu":
   version: 0.0.0-use.local
   resolution: "@octocodeai/freellama-native-linux-arm64-gnu@workspace:packages/native/linux-arm64-gnu"
   languageName: unknown
   linkType: soft
 
-"@octocodeai/freellama-native-linux-arm64-musl@npm:0.9.0, @octocodeai/freellama-native-linux-arm64-musl@workspace:packages/native/linux-arm64-musl":
-  version: 0.0.0-use.local
-  resolution: "@octocodeai/freellama-native-linux-arm64-musl@workspace:packages/native/linux-arm64-musl"
-  languageName: unknown
-  linkType: soft
-
 "@octocodeai/freellama-native-linux-x64-gnu@npm:0.9.0, @octocodeai/freellama-native-linux-x64-gnu@workspace:packages/native/linux-x64-gnu":
   version: 0.0.0-use.local
   resolution: "@octocodeai/freellama-native-linux-x64-gnu@workspace:packages/native/linux-x64-gnu"
-  languageName: unknown
-  linkType: soft
-
-"@octocodeai/freellama-native-linux-x64-musl@npm:0.9.0, @octocodeai/freellama-native-linux-x64-musl@workspace:packages/native/linux-x64-musl":
-  version: 0.0.0-use.local
-  resolution: "@octocodeai/freellama-native-linux-x64-musl@workspace:packages/native/linux-x64-musl"
   languageName: unknown
   linkType: soft
 
@@ -1241,11 +1214,8 @@ __metadata:
   resolution: "@octocodeai/freellama@workspace:packages/cli"
   dependencies:
     "@octocodeai/freellama-native-darwin-arm64": "npm:0.9.0"
-    "@octocodeai/freellama-native-darwin-x64": "npm:0.9.0"
     "@octocodeai/freellama-native-linux-arm64-gnu": "npm:0.9.0"
-    "@octocodeai/freellama-native-linux-arm64-musl": "npm:0.9.0"
     "@octocodeai/freellama-native-linux-x64-gnu": "npm:0.9.0"
-    "@octocodeai/freellama-native-linux-x64-musl": "npm:0.9.0"
     "@octocodeai/freellama-native-win32-arm64-msvc": "npm:0.9.0"
     "@octocodeai/freellama-native-win32-x64-msvc": "npm:0.9.0"
     "@types/node": "npm:^22.20.5"
@@ -1255,15 +1225,9 @@ __metadata:
   dependenciesMeta:
     "@octocodeai/freellama-native-darwin-arm64":
       optional: true
-    "@octocodeai/freellama-native-darwin-x64":
-      optional: true
     "@octocodeai/freellama-native-linux-arm64-gnu":
       optional: true
-    "@octocodeai/freellama-native-linux-arm64-musl":
-      optional: true
     "@octocodeai/freellama-native-linux-x64-gnu":
-      optional: true
-    "@octocodeai/freellama-native-linux-x64-musl":
       optional: true
     "@octocodeai/freellama-native-win32-arm64-msvc":
       optional: true

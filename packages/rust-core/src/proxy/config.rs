@@ -42,6 +42,10 @@ pub struct ProxyConfig {
     pub(crate) telemetry: Option<Telemetry>,
     pub(crate) hooks: Option<Arc<dyn super::RawModelHooks>>,
     pub(crate) upstreams: Vec<super::OpenAiUpstream>,
+    /// Buffered-body budget; `None` uses the process-wide one.
+    pub(crate) body_budget: Option<super::BodyBudget>,
+    /// Request body limit; `None` reads `FREELLAMA_MAX_REQUEST_BYTES`.
+    pub(crate) max_request_bytes: Option<usize>,
 }
 
 impl ProxyConfig {
@@ -62,7 +66,24 @@ impl ProxyConfig {
             telemetry: None,
             hooks: None,
             upstreams: Vec::new(),
+            body_budget: None,
+            max_request_bytes: None,
         }
+    }
+
+    /// Override the request body limit without touching the process environment.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_max_request_bytes(mut self, bytes: usize) -> Self {
+        self.max_request_bytes = Some(bytes);
+        self
+    }
+
+    /// Share this buffered-body budget, as `serve` does between its control API and the proxy.
+    #[must_use]
+    pub(crate) fn with_body_budget(mut self, budget: super::BodyBudget) -> Self {
+        self.body_budget = Some(budget);
+        self
     }
 
     /// Route OpenAI-compatible requests for models these engines serve to them.

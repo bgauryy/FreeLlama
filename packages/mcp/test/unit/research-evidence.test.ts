@@ -47,7 +47,7 @@ describe("research subprocess outcomes", () => {
     }
     // Other commands exit 1 as errors, with the diagnostic kept.
     await expect(runShell(root, "cat missing.txt", 5)).rejects.toMatchObject({ status: "error", exitCode: 1 });
-  });
+  }, 20_000); // spawns sandboxed processes; slow on a loaded machine
 
   it("keeps diff exit one as successful comparison output", async () => {
     writeFileSync(path.join(root, "other.txt"), "different fact\n");

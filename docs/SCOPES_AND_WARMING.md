@@ -256,7 +256,7 @@ Matching environment values override `[warming]` file values.
 |---|---|---:|---|
 | `min_seconds` | `FREELLAMA_KEEP_ALIVE_MIN_SECONDS` | `15` | Minimum automatic duration. |
 | `max_seconds` | `FREELLAMA_KEEP_ALIVE_MAX_SECONDS` | `900` | Maximum automatic duration. |
-| `base_seconds` | `FREELLAMA_KEEP_ALIVE_BASE_SECONDS` | `60` | Base duration before measured reuse and load cost. |
+| `base_seconds` | `FREELLAMA_KEEP_ALIVE_BASE_SECONDS` | `300` | Base duration before measured reuse and load cost; matches Ollama's five-minute default. |
 | `reuse_gain_seconds` | `FREELLAMA_KEEP_ALIVE_REUSE_GAIN_SECONDS` | `30` | Additional duration per recent use. |
 | `load_multiplier` | `FREELLAMA_KEEP_ALIVE_LOAD_MULTIPLIER` | `2.0` | Multiplier for measured load seconds. |
 | `pressure_factor` | `FREELLAMA_KEEP_ALIVE_PRESSURE_FACTOR` | `0.25` | Duration factor while observed resource pressure holds admission. |

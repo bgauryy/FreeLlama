@@ -2,6 +2,9 @@
 // managed request bodies, refusal receipts, retry classification and prompt-cache accounting. The
 // HTTP client lives in transport-http.ts.
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import path from "node:path";
 import { canonicalJson, isRecord } from "./canonical-json.js";
 import { ValidationError, isSystemError } from "./errors.js";
 import {
@@ -236,6 +239,32 @@ export class PromptCacheUsage {
  * adaptive feedback with ordinary `run_task` calls. Raw Ollama stays available for controlled
  * benchmark comparisons.
  */
+let resolvedShift: "off" | "ollama_default" | undefined;
+
+/**
+ * The operator's `context_shift` (runtime.toml, top level; FREELLAMA_CONTEXT_SHIFT overrides), so
+ * raw research chat sends the same `shift` as managed chat and shares its runner instead of
+ * forcing Ollama to reload it. "off" (the default) sends shift:false; "ollama_default" omits it.
+ */
+export function contextShift(env: NodeJS.ProcessEnv = process.env, reset = false): "off" | "ollama_default" {
+  if (resolvedShift !== undefined && !reset) return resolvedShift;
+  const read = (value: string | undefined): "off" | "ollama_default" | undefined =>
+    (value === "ollama_default" || value === "off" ? value : undefined);
+  let value = read(env.FREELLAMA_CONTEXT_SHIFT?.trim());
+  if (!value) {
+    const file = env.FREELLAMA_RUNTIME_CONFIG
+      || path.join(env.FREELLAMA_HOME || path.join(homedir(), ".octocode", "freellama"), "runtime.toml");
+    try {
+      const topLevel = readFileSync(file, "utf8").split(/^\s*\[/m)[0] ?? "";
+      value = read(/^\s*context_shift\s*=\s*"([^"]*)"/m.exec(topLevel)?.[1]);
+    } catch {
+      // No runtime file: the default applies.
+    }
+  }
+  resolvedShift = value ?? "off";
+  return resolvedShift;
+}
+
 export function chatRequest(
   endpointInput: string,
   model: string,
@@ -270,7 +299,7 @@ export function chatRequest(
     messages,
     stream: false,
     truncate: false,
-    shift: false,
+    ...(contextShift() === "ollama_default" ? {} : { shift: false }),
     format: "json",
     think,
     keep_alive: keepAlive,

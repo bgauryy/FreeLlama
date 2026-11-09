@@ -238,20 +238,21 @@ pub(crate) async fn forward_managed_task(
     if let Some(guard) = &mut completion_guard {
         guard.complete();
     }
-    let save = state.footprints.lock().await.observe(
+    // Measurements are taken while the slot is held; the disk writes happen after it is
+    // released, so a slow database never delays the next queued task. Both writes converge in
+    // any order (footprints keep the larger size, feedback merges sample ids), so a later task
+    // persisting first loses nothing.
+    let footprint_save = state.footprints.lock().await.observe(
         &execution.upstream,
         execution_receipt["model_digest"].as_str(),
         &placement,
     );
-    if let Some(save) = save {
-        save.persist().await;
-    }
     execution_receipt["observation"] = placement;
     let slots_total = execution.admission.total();
     // Report throttling rather than hiding it. A caller that fans out embeddings needs to know it
     // is queueing here — otherwise the only symptom is latency it cannot attribute.
     let slots_available = execution.admission.available();
-    let feedback_receipt = {
+    let (mut feedback_receipt, feedback_snapshot) = {
         let mut feedback = state.feedback.write().await;
         let by_task = if execution.placement == Backend::Cpu {
             &mut feedback.cpu
@@ -281,38 +282,39 @@ pub(crate) async fn forward_managed_task(
         } else {
             "physical_placement_unverified_or_mismatched"
         });
-        let snapshot = feedback.clone();
-        drop(feedback);
-        let persistence = if feedback_accepted {
-            if let Some(store) = state.store.clone() {
-                // A synchronous database write on a runtime worker stalls every task sharing it.
-                let written =
-                    tokio::task::spawn_blocking(move || persist_feedback(&store, &snapshot))
-                        .await
-                        .unwrap_or_else(|error| {
-                            Err(anyhow::anyhow!("feedback writer panicked: {error}"))
-                        });
-                match written {
-                    Ok(()) => {
-                        *state.feedback_persistence_error.write().await = None;
-                        json!({"enabled": true, "persisted": true, "schema_version": FEEDBACK_SCHEMA_VERSION})
-                    }
-                    Err(error) => {
-                        let message = error.to_string();
-                        *state.feedback_persistence_error.write().await = Some(message.clone());
-                        json!({"enabled": true, "persisted": false, "error": message})
-                    }
-                }
-            } else {
-                json!({"enabled": false, "persisted": false})
-            }
-        } else {
-            json!({"enabled": state.store.is_some(), "persisted": false, "reason": "sample_not_accepted"})
-        };
-        receipt["persistence"] = persistence;
-        receipt
+        // Only an accepted sample changes what is worth writing.
+        let snapshot = state
+            .store
+            .clone()
+            .filter(|_| feedback_accepted)
+            .map(|store| (store, feedback.clone()));
+        (receipt, snapshot)
     };
     drop(slot);
+    if let Some(save) = footprint_save {
+        save.persist().await;
+    }
+    feedback_receipt["persistence"] = if let Some((store, snapshot)) = feedback_snapshot {
+        // A synchronous database write on a runtime worker stalls every task sharing it.
+        let written = tokio::task::spawn_blocking(move || persist_feedback(&store, &snapshot))
+            .await
+            .unwrap_or_else(|error| Err(anyhow::anyhow!("feedback writer panicked: {error}")));
+        match written {
+            Ok(()) => {
+                *state.feedback_persistence_error.write().await = None;
+                json!({"enabled": true, "persisted": true, "schema_version": FEEDBACK_SCHEMA_VERSION})
+            }
+            Err(error) => {
+                let message = error.to_string();
+                *state.feedback_persistence_error.write().await = Some(message.clone());
+                json!({"enabled": true, "persisted": false, "error": message})
+            }
+        }
+    } else if feedback_accepted {
+        json!({"enabled": false, "persisted": false})
+    } else {
+        json!({"enabled": state.store.is_some(), "persisted": false, "reason": "sample_not_accepted"})
+    };
     let output_check = super::super::repetition::output_check(&value);
     let artifact_verified = execution_receipt["observation"]["resident"] == true
         && execution_receipt["model_digest"]
@@ -389,4 +391,128 @@ pub(crate) async fn forward_managed_task(
         receipt["embedding_identity"] = identity;
     }
     Ok(Json(receipt))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use axum::{
+        Json, Router,
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+        routing::{get, post},
+    };
+    use serde_json::{Value, json};
+    use tower::ServiceExt as _;
+
+    use crate::platform::{
+        PlatformConfig,
+        resources::{HostResources, MemoryPressure, ResourceGovernor, ResourcePolicy},
+    };
+
+    const GIB: u64 = 1 << 30;
+
+    /// A resident model whose `/api/ps` entry verifies GPU placement, so feedback is accepted.
+    async fn resident_ollama() -> (String, tokio::task::JoinHandle<()>) {
+        let router = Router::new()
+            .route(
+                "/api/tags",
+                get(|| async {
+                    Json(json!({"models":[{"name":"m:latest","digest":"digest-m","size":GIB}]}))
+                }),
+            )
+            .route(
+                "/api/ps",
+                get(|| async {
+                    Json(
+                        json!({"models":[{"name":"m:latest","model":"m:latest","digest":"digest-m",
+                    "size":GIB,"size_vram":GIB,"context_length":2048}]}),
+                    )
+                }),
+            )
+            .route(
+                "/api/show",
+                post(|| async {
+                    Json(json!({"capabilities":["completion"],"model_info":{
+                    "general.architecture":"llama","llama.context_length":32768}}))
+                }),
+            )
+            .route(
+                "/api/chat",
+                post(|| async {
+                    Json(
+                        json!({"message":{"role":"assistant","content":"ok"},"done":true,
+                    "eval_count":4,"eval_duration":40_000_000_u64,"prompt_eval_count":8}),
+                    )
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        (upstream, server)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_admission_slot_is_released_before_learned_state_is_written() {
+        let (upstream, server) = resident_ollama().await;
+        let store = crate::store::Store::in_memory().unwrap();
+        let mut config = PlatformConfig::new("127.0.0.1:0", upstream, None, None)
+            .with_store(store.clone())
+            .with_max_concurrent_tasks(2)
+            .with_max_queue_wait(Duration::from_secs(10));
+        config.resource_governor =
+            ResourceGovernor::with_sampler(ResourcePolicy::default(), || HostResources {
+                source: "forward_contract".into(),
+                total_memory_bytes: Some(64 * GIB),
+                available_memory_bytes: Some(48 * GIB),
+                memory_pressure: Some(MemoryPressure::Normal),
+                gpu_memory_total_bytes: Some(32 * GIB),
+                gpu_memory_free_bytes: Some(24 * GIB),
+                gpu_telemetry_source: Some("injected".into()),
+                ..HostResources::default()
+            })
+            .unwrap();
+        let (router, state) = crate::platform::build(&config).unwrap();
+        let (release, released) = std::sync::mpsc::channel();
+        store.stall_until(released);
+        let task = tokio::spawn(
+            router.oneshot(
+                Request::post("/_freellama/v1/tasks")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"task":"completion","model":"m:latest","objective":"fastest",
+                            "prompt":"hi","request_options":{"options":{"num_predict":4}}})
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            ),
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while state.gpu_admission.receipt()["released"] != 1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the slot is returned while the database write is still blocked");
+        assert!(
+            !task.is_finished(),
+            "the response waits for its persistence receipt"
+        );
+        assert_eq!(state.gpu_admission.receipt()["in_flight"], 0);
+        release.send(()).unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let status = response.status();
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["feedback"]["accepted"], true, "{body}");
+        assert_eq!(body["feedback"]["persistence"]["persisted"], true, "{body}");
+        server.abort();
+    }
 }

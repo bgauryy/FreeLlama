@@ -37,7 +37,7 @@ Prefer the MCP server when the host has it; the same operations run from a shell
 | `doctor` (its `platform_health.readiness`) | `ready` (exit 0 only when serve can run work) |
 | `read_response{file,section?,offset?,limit?}` | read the `response_file` JSON directly |
 | `session{action:"create"}`, `scope{...}` | `session`, `scope create`, `scope get`, `scope fork`, `scope delete` |
-| `models{view:"library"}`, `models{view:"detail"}`, `ollama_manage{action:"pull"}`, `ollama_delete`, `delegate_research` | MCP only |
+| `models{view:"library"}`, `models{view:"detail"}`, `ollama_pull{model,approvedSizeBytes}`, `ollama_delete`, `delegate_research`, `sweep{...}` | MCP only |
 
 ## Know who owns execution
 
@@ -48,7 +48,7 @@ A CPU preference cannot move an arbitrary tag, and one managed call contains one
 
 ## Prerequisite and diagnose
 
-1. Call `models{view:"catalog"}` (tested picks per job, what is installed and fits now), then `models{view:"installed"}` and `models{view:"resident"}`. Call `doctor` when `models` errors or Ollama is unreachable. FreeLlama does not install or replace Ollama; if Ollama is missing or unreachable, direct the operator to `https://ollama.com/download` or `ollama serve`, then stop—do not recommend or pull a model.
+1. Call `models{view:"catalog", job}` (tested picks per job, whether each is installed and fits now) and pass that pick as `model`; add `models{view:"installed"}` or `models{view:"resident"}` only when the catalog does not answer. Call `doctor{view:"status"}` when a call fails or before a large batch. FreeLlama does not install or replace Ollama; if Ollama is missing or unreachable, direct the operator to `https://ollama.com/download` or `ollama serve`, then stop—do not recommend or pull a model.
 2. When memory fit matters, read `doctor.machine.memory_bytes` (total RAM; `memory_kind` is `unified` only when RAM is shared with the accelerator; on discrete GPUs read VRAM from `/api/ps`, never derive it from RAM). Treat `execution.backend` as configuration and `execution.observation.processor` as physical evidence. A mismatch or partial placement warning invalidates feedback. For authenticated serve, set `FREELLAMA_AUTH_TOKEN_FILE` to the same permission-restricted file used at startup.
 3. Check admission slots with `doctor{view:"status"}` (HTTP clients: `/_freellama/v1/health`). Zero slots means queueing up to the configured wait, not a reservation.
 4. `run_task`, `delegate_research`, installed/resident models and health need `freellama serve` (the MCP server starts it on `127.0.0.1:11435`). `freellama proxy` only retries raw `/api/*` calls; a 404 on a control route means a proxy is answering, not serve.
@@ -101,6 +101,17 @@ Ask for missing workload/modality, quality, latency, context, privacy, download,
 
 `fastest` without evidence is only a capability filter and can pick a tiny model for code repair. For quality-sensitive work preview with `minConfidence:"medium"`; it needs both a task policy from correctness evaluations (`freellama policy from-eval`) and a local `bench-all` report. Never manufacture a policy from throughput. See [Model selection](https://github.com/bgauryy/FreeLlama/blob/main/docs/MODEL_SELECTION.md).
 
+### G — sweep a large job in small chunks
+
+Use `sweep` when a check over a code tree, a log or a docs site splits into independent chunks. You choose the questions and verify the result; the local model does the reading.
+
+1. `sweep{action:"start", files|urls, model:<classify pick>, questions}`; add `verifyModel` for a stronger second look at flagged or unsure chunks.
+2. `sweep{action:"wait", sweepId}` until it completes (each call is up to 50 s). Do other work meanwhile.
+3. `sweep{action:"results", sweepId}` lists the flagged chunks with their `path:Lstart-Lend` or `url#n`. Read 3 to 5 of them yourself before relying on the rest.
+4. Later, start again with `baseline:<sweepId>`: unchanged chunks reuse the saved results, and `filter:"changed"` shows what happened since.
+
+Recipe: `freellama://docs/cookbooks/sweep`.
+
 ### F — diagnose a failure
 
 Run `doctor`, `doctor{view:"status"}` and `models{view:"resident"}`, then match the symptom. `doctor` reports `status:"degraded"` with `problems` when serve is unreachable or its readiness check names what it waits for (`ollama`, `catalog`, `cpu_backend`). A compacted result's `sections` name what its `response_file` holds; `read_response` returns one section or page.
@@ -120,9 +131,10 @@ Run `doctor`, `doctor{view:"status"}` and `models{view:"resident"}`, then match 
 - One model, one context: send the same `contextTokens` to a model and warm at that context; a different `num_ctx` reloads the runner and drops its prompt cache.
 - Stable prefix first: system prompt, tool list and documents before the variable part, and append rather than edit. Warm a long prefix once (`ollama_manage{action:"warm",model,systemPrompt}`) or keep follow-ups in a `scope`; read `metrics.cached_prompt_tokens` to confirm reuse.
 - Spend output deliberately: keep the `think:false` defaults outside coding, set `num_predict` from the output contract, and use `stopOnRepetition` for models known to loop.
-- Free memory explicitly: `ollama_manage{action:"unload",model}` before switching to a large model; never stack two large models without the memory arithmetic. A load that does not fit waits, then is refused; do not retry it in a loop, free memory or pick a smaller model.
+- Free memory you own: when a burst ends, `ollama_manage{action:"unload",model}` the model you warmed; never unload another client's model unless the user names it, and never stack two large models without the memory arithmetic. A load that does not fit waits, then is refused; do not retry it in a loop, free memory or pick a smaller model.
 - Keep your own context small: use the inline answer and verdict, and fetch only the `response_file` section you need with `read_response`.
-- Progress: send a `progressToken` and a waiting task reports `waiting for memory`, `loading MODEL (~N s)`, `running`. A long wait is the machine protecting itself, not a hang.
+- Progress: send a `progressToken` and a waiting task or warm reports `waiting for memory`, `loading MODEL (~N s)`, `running`, repeated with the elapsed time every 10 s while a phase lasts; batches also report `k/N items done`. A long wait is the machine protecting itself, not a hang.
+- One task reads all its `files` together: a glob gives one answer. For one answer per file, send `tasks:[{id, independent:true, task:{files:[path]}}]`.
 - Big jobs are yours to chunk; FreeLlama never splits input, because where to cut changes the answer. Split a long document into pieces that fit the model's window (the receipt's `execution.context_sizing` shows the estimate and `bytes_per_token_milli`; a prompt past the 32k automatic cap is refused fast, so pass `contextTokens` or split; with `contextTokens`, text over 8 bytes per token of that window is refused before any load; both refusals are `context_window_exceeded`). Send the pieces as one `run_task{tasks:[...]}` batch (up to 64 items), or as deferred jobs for long runs, then merge the answers yourself. An embedding item longer than about 3 bytes × the model's context is unsafe: one over 8 bytes per token of the window is refused before any load (`embedding_item_exceeds_context`, with the item indices); chunk it and embed the chunks.
 
 ## Routine agent work that local models handle well (measured)

@@ -35,12 +35,11 @@ pub(crate) fn ledger_worker(
     }
 }
 
-/// Daily totals over every stored record, aggregated by the database.
-/// Daily totals inside the report window: older rows stay on disk but are never shown, so startup
-/// does not scan them.
+/// Daily totals inside the in-memory window, aggregated by the database. Older rows stay on disk
+/// and the usage view reads them on request, so startup does not scan them.
 pub(crate) fn replay(store: &Store) -> anyhow::Result<Vec<crate::store::DailyUsage>> {
     let since = (unix_day(super::now_seconds()) + 1)
-        .saturating_sub(u64::from(super::REPORT_WINDOW_DAYS))
+        .saturating_sub(u64::from(super::MEMORY_WINDOW_DAYS))
         * 86_400;
     store.usage_daily_totals(since)
 }

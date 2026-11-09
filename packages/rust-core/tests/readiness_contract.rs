@@ -99,7 +99,7 @@ async fn preview_warns_when_a_cold_model_exceeds_the_memory_estimate() {
     assert_eq!(
         result["execution"]["resource_assessment"]["required_available_bytes"],
         // 4000-byte file with unknown KV shape: + 25% assumed KV + 10% graph margin.
-        5400
+        4900 // file 4000 + assumed KV for 8K of 16K (500) + graph 400
     );
     assert_eq!(
         governor.snapshot().await.reserved_bytes,
@@ -139,7 +139,7 @@ async fn fitting_preview_reports_model_footprint_without_acquiring_it() {
     );
     assert_eq!(
         result["execution"]["memory_reservation"]["required_available_bytes"],
-        5400
+        4900 // file 4000 + assumed KV for 8K of 16K (500) + graph 400
     );
     assert_eq!(governor.snapshot().await.reserved_bytes, 0);
     server.abort();

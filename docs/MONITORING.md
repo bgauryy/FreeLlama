@@ -31,8 +31,10 @@ token and keeps it only for the browser tab.
 `status` answers "why is my task waiting?" in one call:
 
 - **`backends.gpu` / `backends.cpu`**: admission (units in use, current limit, ceiling, queue depth,
-  oldest wait, refusal and timeout counters), the adaptive limiter state, and the circuit breaker
-  (`closed`, `open` with seconds remaining, or `half_open`).
+  oldest wait, refusal and timeout counters, and `affinity_promotions`: grants given ahead of older
+  same-priority work because the waiter's model was already running or admitted last), the
+  adaptive limiter state, and the circuit breaker (`closed`, `open` with seconds remaining, or
+  `half_open`).
 - **`raw_proxy`**: active and waiting raw streams against their cap and wait budget.
 - **`loaded_models`**: Ollama's `/api/ps` with total and VRAM bytes, context length, expiry, and
   whether the model is pinned.
@@ -74,7 +76,10 @@ cancellation closes the upstream request; physical computation may continue on a
 `ollama.config` describes the primary process; `ollama.cpu_config` describes the CPU process when
 configured. Process attribution matches `OLLAMA_HOST` to the selected endpoint, so separate
 parallelism and KV cache settings size each backend independently. Fallback sources remain visible
-when process settings cannot be observed.
+when process settings cannot be observed. Each config's `effective` block reports the resolved
+`num_parallel`, `context_length`, `flash_attention` (`on`, `off`, or `auto` when unset) and the KV
+cache it sizes for (`kv_cache_type`, `kv_cache_percent_of_f16`); see
+[KV cache and flash attention](TUNING.md#kv-cache-and-flash-attention).
 
 Process settings are cached for five seconds and refreshed on discovery or monitoring requests,
 including after an Ollama restart. Each config receipt includes `observed_at` and
@@ -100,6 +105,17 @@ Each backend's admission `queue_depth` includes both `slot_waiters` and `resourc
 A resource waiter returns its execution slot after two seconds but remains in the bounded queue
 until capacity recovers, its deadline expires, or it is cancelled.
 
+Model affinity is bounded: `affinity_max_skips` (4) and `affinity_max_wait_ms` (2000) in the same
+receipt are how often, and how long, an older waiter can be passed over before its class is served
+in arrival order again. A rising `affinity_promotions` with flat queue waits means fewer model
+switches; see [the admission design](ARCHITECTURE.md#managed-task-execution).
+
+`GET /health` reports `admission.request_body_budget` (`total_bytes`, `available_bytes`): the
+process-wide memory for request bodies being read or held by running requests,
+`FREELLAMA_MAX_BUFFERED_BYTES` (256 MiB by default). When it is full, a new upload waits up to the
+queue wait and is then refused with 503 `request_body_budget_exhausted`; raise it, or lower
+`FREELLAMA_MAX_REQUEST_BYTES`, when large uploads are normal.
+
 ## Record usage
 
 Every managed task, and every raw Ollama or OpenAI-compatible generation, updates in-memory usage
@@ -121,8 +137,11 @@ failure records a failed write. Inspect `usage_ledger` in `status`, or `ledger` 
 persisted totals. Error evidence remains visible after later successful writes.
 
 The ledger is the `usage` table of the shared database (`~/.octocode/freellama/freellama.sqlite`). `serve`
-computes daily totals over every stored record at startup (in the database, so startup does not hold
-the history in memory) and never deletes records. Successful writes
+keeps daily totals for the last 35 days in memory, computed in the database at startup, and never
+deletes records. `usage --days N` past 35 days reads the older days from the database on request
+(`retention.older_days: "ledger"`); with `--ephemeral` they are `"not_retained"`. Memory holds at
+most 256 models per day, and the task counters at most 256 models: raw requests can name any
+model, so further names are counted under `other`. Successful writes
 contribute to restart totals; completion is not a zero-loss persistence promise. Embedded callers
 can use the bounded `flush_ledger` barrier for orderly teardown; it confirms attempted writes, not
 recovery of dropped/failed records. `--home` moves the database; `--ephemeral` keeps totals in
@@ -135,7 +154,7 @@ memory only.
 `freellama_load_seconds_total`, `freellama_raw_requests_total`, `freellama_evictions_total`,
 `freellama_circuit_open_total`, `freellama_concurrency_limit_changes_total`); task counters are
 labelled by model, backend, task, and outcome, raw requests by kind and outcome, and the rest by
-backend. Gauges cover admission, queues, the raw proxy, host and GPU memory,
+backend. `freellama_admission_affinity_promotions_total` counts model-affinity grants per backend. Gauges cover admission, queues, the raw proxy, host and GPU memory,
 loaded models, and `freellama_ollama_num_parallel`. Point Prometheus, Grafana Agent, or any
 OpenMetrics-compatible scraper at it.
 
@@ -222,8 +241,11 @@ rather than an error. Every change is counted in metrics and shown in `status`.
 
 ## Model residency and eviction
 
-Omitted managed `keep_alive` values use finite retention informed by measured reuse and loading.
-Explicit values take precedence. For governed prewarming, profile compatibility, and retention
+Omitted managed `keep_alive` values use finite retention informed by measured reuse and loading,
+starting from `base_seconds` (300, Ollama's own default) and shortened by `pressure_factor` under a
+host hold. Explicit values take precedence. The background pressure sweep releases, under
+FreeLlama's own low-memory estimate, only runners idle longer than `base_seconds ×
+pressure_factor` (75 s by default); swapping or OS memory pressure releases any idle runner. For governed prewarming, profile compatibility, and retention
 settings, see [Scope history and model warming](SCOPES_AND_WARMING.md).
 
 When a model about to load needs room, FreeLlama unloads idle runners itself (`keep_alive: 0`)
@@ -259,6 +281,16 @@ why, the `trigger` (`gpu_memory`, `model_memory_budget` or `host_memory`) and `u
 and the page show the latest one that unloaded something. Eviction runs once per task, after
 admission and before the memory wait, and is never cancelled halfway by a deadline. Set
 `evict_idle_models = false` to leave residency entirely to Ollama.
+
+`memory_reservation` names the `kv_cache_type` and `flash_attention` state it sized for. With a
+quantized cache it also carries `ollama_f16_preflight_bytes`, the f16-cache size Ollama's own fit
+check predicts. On a CPU or
+unified-memory backend, `ollama_preflight_threshold_bytes` is 80% of the available memory the load
+was admitted against; when the reserved estimate fits under it and the f16 figure does not, the
+receipt adds `ollama_may_evict_or_offload: true` and a one-line `ollama_preflight_reason`: Ollama may
+unload other runners or offload layers even though FreeLlama found room. Run previews carry the
+same fields. The reservation itself is unchanged: measurements still take precedence over the
+estimate.
 
 ### The residency audit
 
@@ -317,6 +349,13 @@ on a discrete GPU only) Ollama's VRAM tier, from total VRAM minus `OLLAMA_GPU_OV
 23 GiB, 32768 below 47 GiB, 262144 from 47 GiB. Receipts show `context_sizing.num_ctx_sent` and the default used.
 Memory estimates always use the context Ollama can allocate. Use `"explicit"` to always
 send `num_ctx`.
+
+The context-shift setting is part of a runner's identity too: Ollama reloads a runner when a
+request's `shift` differs from the one it was loaded with, and its default is on for most models.
+`context_shift = "off"` (the default) sends `shift: false` on managed chat, so a generation that
+reaches the context limit stops instead of discarding its earliest tokens, at the cost of a reload
+when raw clients use the same model. `"ollama_default"` omits `shift` so raw and managed chat share
+the runner. Both modes send `truncate: false`. `status` reports it under `ollama.context_shift`.
 
 ## Change settings without a restart
 

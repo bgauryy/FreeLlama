@@ -61,9 +61,9 @@ to an explicit non-default endpoint; see `FREELLAMA_MCP_AUTOSTART_SERVE` in
 ## Platform support
 
 The native addon is named by target triple (`freellama.<platform>-<arch>[-<abi>].node`). The base
-package has eight npm optional dependencies, one each for macOS arm64/x64, Linux arm64/x64 with
-glibc or musl, and Windows arm64/x64 with MSVC. `native/index.js` tries the checkout artifact first,
-then the host's optional package. A release is supported only when all eight artifact packages pass
+package has one npm optional dependency per platform in `scripts/release-platforms.mjs` (macOS
+arm64, Linux arm64/x64 with glibc, Windows arm64/x64 with MSVC). `native/index.js` tries the checkout artifact first,
+then the host's optional package. A release is supported only when every artifact package passes
 the publish verifier; an installation made with `--omit=optional` cannot load the addon. `engines`
 requires Node >= 20.
 
@@ -84,8 +84,8 @@ these tools call.
 
 `packages/mcp/` is the portable JavaScript package. Its `package.json` lists the platform packages
 as exact-version optional dependencies; it intentionally does not embed a `.node` binary. Publish
-the eight `packages/native/*` packages first, then publish `@octocodeai/freellama` (`npx @octocodeai/freellama`) and `@octocodeai/freellama-mcp-server` (`npx @octocodeai/freellama-mcp-server`)
-at the same version. `yarn release:verify:publish` refuses a release if any of the ten packages
+every `packages/native/*` package first, then publish `@octocodeai/freellama` (`npx @octocodeai/freellama`) and `@octocodeai/freellama-mcp-server` (`npx @octocodeai/freellama-mcp-server`)
+at the same version. `yarn release:verify:publish` refuses a release if any of these packages
 omits `assets/logo.jpg`, or if any platform package has a missing, empty, or unpacked
 executable/addon pair.
 

@@ -2,7 +2,7 @@
 // Can FreeLlama's local models take routine work off a coding agent on a real repository?
 // 1) issue -> code: embed per-file "cards" of the octocode native crates and rank them for each
 //    real GitHub issue; 2) duplicates among real issues; 3) issue triage with the decision model;
-// 4) OCR of real screens. Writes LOCAL_ASSIST.md. Usage: node scripts/local-test/assist.mjs [serve]
+// 4) OCR of real screens. Writes .octocode/local-test/LOCAL_ASSIST.md (git-ignored). Usage: node scripts/local-test/assist.mjs [serve]
 import { execFileSync } from "node:child_process";
 import { readFileSync, readdirSync, statSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -135,7 +135,8 @@ for (const s of screens) {
 }
 
 for (const model of [EMB, DEC, OCR]) await http("POST", "/unload", { model });
-writeFileSync(path.join(ROOT, "LOCAL_ASSIST.md"), `# LOCAL_ASSIST: local models doing an agent's routine work on a real repository
+mkdirSync(path.join(ROOT, ".octocode", "local-test"), { recursive: true });
+writeFileSync(path.join(ROOT, ".octocode", "local-test", "LOCAL_ASSIST.md"), `# LOCAL_ASSIST: local models doing an agent's routine work on a real repository
 
 Real data: the octocode repository (${files.length} Rust source files of its native crates) and its
 ${ISSUES.length} most recent GitHub issues. Apple M2 Pro, 32 GB, Ollama 0.40.13, FreeLlama 0.8.0, with

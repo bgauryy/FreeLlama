@@ -243,7 +243,7 @@ async fn recovery_admits_waiting_work_and_completion_releases_forecast_memory() 
     let pending = tokio::spawn(async move { platform.oneshot(task()).await.unwrap() });
     available.store(9000, Ordering::SeqCst);
     let (_, release) = next_execution(&mut receive).await;
-    assert_eq!(governor.snapshot().await.reserved_bytes, 5400); // file + assumed KV + graph margin
+    assert_eq!(governor.snapshot().await.reserved_bytes, 4525); // file 4000 + assumed KV for 2K of 16K (125) + graph 400
     release.send(()).unwrap();
     let response = pending.await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
@@ -490,7 +490,7 @@ async fn cancelling_active_managed_work_releases_its_forecast_reservation() {
     let (platform, mut receive, servers) = platform(governor.clone(), Duration::from_secs(1)).await;
     let pending = tokio::spawn(async move { platform.oneshot(task()).await.unwrap() });
     let (_, release) = next_execution(&mut receive).await;
-    assert_eq!(governor.snapshot().await.reserved_bytes, 5400);
+    assert_eq!(governor.snapshot().await.reserved_bytes, 4525);
     pending.abort();
     assert!(pending.await.unwrap_err().is_cancelled());
     assert_eq!(governor.snapshot().await.reserved_bytes, 0);

@@ -50,6 +50,11 @@ export function sourceBearingLookup(call: unknown, workspace: string): boolean {
     const queries = Array.isArray(args.queries) ? args.queries : [args.queries];
     return queries.length > 0 && queries.every(isRecord);
   }
+  // Structured actions: a read of a workspace file, or a search that printed hits, is a lookup.
+  if (call.raw_name === "read") return typeof args.path === "string" && sourcePath(args.path, workspace);
+  if (call.raw_name === "search") return !/^\(no matches\)/.test(output);
+  // A read-only gh command that printed something read GitHub itself.
+  if (call.raw_name === "gh") return !/^\(no results\)/.test(output);
   if (call.raw_name !== "shell" || typeof args.command !== "string") return false;
   try {
     const pipeline = segments(args.command);

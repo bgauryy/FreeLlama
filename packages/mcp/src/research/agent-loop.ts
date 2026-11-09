@@ -1,4 +1,4 @@
-// The research adapter chat loop shared by the restricted-shell and octocode adapters. An adapter
+// The research adapter chat loop shared by the restricted-shell, octocode and coder adapters. An adapter
 // supplies its system prompt, action parser, tool runner and labels; this module owns the
 // subprocess contract: environment, context fitting, transport retries, parse repair, paging,
 // repeat suppression, forced finalization, and the result.json document.
@@ -20,6 +20,7 @@ import {
 } from "./transport.js";
 import { requestJsonAsJob } from "./transport-jobs.js";
 import { resolvePath } from "./workspace-path.js";
+import { evidencePaths, groundingNote, groundingRepairNotice, missingPaths, pathsIn, sourceRepairNotice, toolErrorHint } from "./grounding.js";
 
 export type { Action, AdapterHooks, AdapterSession, AdapterSpec, ToolCall } from "./adapter.js";
 
@@ -107,7 +108,7 @@ async function runLoop(spec: AdapterSpec, hooks: AdapterHooks, env: Env, inputs:
   }
   let messages: Message[] = [
     { role: "system", content: spec.systemPrompt(workspace) },
-    { role: "user", content: prompt },
+    { role: "user", content: withBriefing(prompt, spec, workspace) },
   ];
   const calls: Record<string, unknown>[] = [];
   const usage: Record<string, unknown> = { input_tokens: 0, output_tokens: 0, cache_read_tokens: null, cache_write_tokens: null };
@@ -211,9 +212,25 @@ async function runLoop(spec: AdapterSpec, hooks: AdapterHooks, env: Env, inputs:
   const observations = hooks.observationStore ? hooks.observationStore(pageSize) : new ObservationStore(pageSize);
   let session: AdapterSession | undefined;
   try {
-    session = spec.open ? await spec.open(workspace) : undefined;
+    try {
+      session = spec.open ? await spec.open(workspace) : undefined;
+    } catch (error) {
+      // A refused setup (the coder's copy cannot be made) is a reported failure, not a crash.
+      if (!isValidationError(error)) throw error;
+      answer = `research adapter could not start: ${error.message}`;
+      writeFailureResult(resultPath, answer);
+      print(answer);
+      return 1;
+    }
+    // Tools run in, and answers are checked against, the session's directory (the coder's copy).
+    const root = session?.workspace ?? workspace;
     let parseFailures = 0;
     let exhausted = true;
+    // Repeats answered from earlier steps; a second one means the model is circling, so finalize.
+    let repeats = 0;
+    let groundingRepaired = false;
+    let sourceRepaired = false;
+    const seenOutputs: string[] = [];
     for (let turn = 0; turn < runtime.max_turns; turn += 1) {
       const at = { turn: turn + 1, maxTurns: runtime.max_turns };
       phaseAt = at;
@@ -267,13 +284,45 @@ async function runLoop(spec: AdapterSpec, hooks: AdapterHooks, env: Env, inputs:
         continue;
       }
       if (action.action === "finish") {
+        const proposed = trimSpace(String(action.answer ?? ""));
+        const missing = missingPaths(proposed, root);
+        // One repair turn when the answer cites a file that is not there; it costs no tool call.
+        if (missing.length > 0 && !groundingRepaired) {
+          groundingRepaired = true;
+          progress?.({ event: "repair", ...at });
+          messages.push({ role: "assistant", content: echo(action) });
+          messages.push({ role: "user", content: groundingRepairNotice(missing, evidencePaths(seenOutputs, root)) });
+          if (!refit()) {
+            answer = proposed + groundingNote(missing);
+            exhausted = false;
+            break;
+          }
+          continue;
+        }
+        // An answer must say where it comes from: one repair turn when it names no file although
+        // the run's own results named some (a "no, not found" answer has no such results). An
+        // adapter whose answer reports work done (the coder) opts out with `requireSource: false`.
+        const evidence = spec.requireSource !== false && missing.length === 0 && !sourceRepaired && pathsIn(proposed).length === 0
+          ? evidencePaths(seenOutputs, root) : [];
+        if (evidence.length > 0) {
+          sourceRepaired = true;
+          progress?.({ event: "repair", ...at });
+          messages.push({ role: "assistant", content: echo(action) });
+          messages.push({ role: "user", content: sourceRepairNotice(evidence) });
+          if (!refit()) {
+            answer = proposed;
+            exhausted = false;
+            break;
+          }
+          continue;
+        }
         progress?.({ event: "finish", ...at });
-        answer = trimSpace(String(action.answer ?? ""));
+        answer = missing.length > 0 ? proposed + groundingNote(missing) : proposed;
         exhausted = false;
         break;
       }
       const started = performance.now();
-      const call = session!.toolCall(action, workspace, runtime);
+      const call = session!.toolCall(action, root, runtime);
       // An exact repeat costs a turn and a second copy of an observation the model has already
       // seen. Answer it from the prior step instead of re-running the tool.
       const signature = callSignature(call.signature);
@@ -284,6 +333,7 @@ async function runLoop(spec: AdapterSpec, hooks: AdapterHooks, env: Env, inputs:
         progress?.({ event: "action", ...at, action, repeat: true });
         observation = REPEAT_NOTICE;
         status = "repeat";
+        repeats += 1;
       } else {
         progress?.({ event: "action", ...at, action });
         try {
@@ -293,7 +343,7 @@ async function runLoop(spec: AdapterSpec, hooks: AdapterHooks, env: Env, inputs:
           if (!isToolError(error)) throw error;
           status = error instanceof ToolExitError ? error.status : "error";
           exitCode = error instanceof ToolExitError ? error.exitCode : undefined;
-          observation = `${status === "empty" ? "tool search" : "tool error"}: ${error.message}`;
+          observation = `${status === "empty" ? "tool search" : "tool error"}: ${error.message}${toolErrorHint(error.message)}`;
         }
         seenCalls.set(signature, calls.length + 1);
       }
@@ -307,11 +357,13 @@ async function runLoop(spec: AdapterSpec, hooks: AdapterHooks, env: Env, inputs:
       const remaining = runtime.max_turns - calls.length;
       const step = calls.length;
       observations.put(step, observation, call.ledger(status));
+      seenOutputs.push(observation);
       messages.push({ role: "user", content: observations.message(step) + spec.remaining(remaining) });
       if (!refit()) {
         exhausted = false;
         break;
       }
+      if (repeats >= 2) break;
     }
     if (exhausted) {
       progress?.({ event: "finalize", maxTurns: runtime.max_turns });
@@ -323,6 +375,8 @@ async function runLoop(spec: AdapterSpec, hooks: AdapterHooks, env: Env, inputs:
           const finalAction = spec.parseAction(content(response));
           if (finalAction.action !== "finish") throw new ValidationError("forced final response was not finish");
           answer = trimSpace(String(finalAction.answer ?? ""));
+          const missing = missingPaths(answer, root);
+          if (missing.length > 0) answer += groundingNote(missing);
         } catch (error) {
           if (!isTransportError(error) && !isValidationError(error)) throw error;
           let diagnostic: string;
@@ -333,7 +387,9 @@ async function runLoop(spec: AdapterSpec, hooks: AdapterHooks, env: Env, inputs:
     }
 
     if (!answer) answer = failure ?? "agent stopped without a final answer";
+    const report = spec.report ? await spec.report(session) : {};
     const result = {
+      ...report,
       final_answer: answer,
       tool_calls: calls,
       usage,
@@ -367,5 +423,15 @@ async function runLoop(spec: AdapterSpec, hooks: AdapterHooks, env: Env, inputs:
   } finally {
     session?.close?.();
     observations.close();
+  }
+}
+
+/** The question plus the adapter's workspace facts; a failed briefing never fails the run. */
+function withBriefing(prompt: string, spec: AdapterSpec, workspace: string): string {
+  try {
+    const briefing = spec.briefing?.(workspace);
+    return briefing ? `${prompt}\n\n${briefing}` : prompt;
+  } catch {
+    return prompt;
   }
 }

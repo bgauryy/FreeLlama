@@ -15,9 +15,10 @@ server-launch config (for example `.mcp.json`'s `env` block) or the launching sh
 | `FREELLAMA_MCP_DEFAULT_ADAPTER` | `bash` | `delegate_research`'s adapter (`octocode` to switch) |
 | `FREELLAMA_MCP_MAX_TURNS` | `8` | Max agent turns for `delegate_research` |
 | `FREELLAMA_MCP_DELEGATE_TIMEOUT_SECONDS` | `180` | Whole-subprocess timeout for `delegate_research` |
-| `FREELLAMA_MCP_PULL_TIMEOUT_SECONDS` | `1200` | Default `ollama_manage` `"pull"` timeout |
+| `FREELLAMA_MCP_PULL_TIMEOUT_SECONDS` | `1200` | Default `ollama_pull` timeout |
 | `FREELLAMA_MCP_FETCH_TIMEOUT_SECONDS` | `30` | Timeout for other direct Ollama HTTP calls |
-| `FREELLAMA_MCP_ALLOWED_ROOTS` | checkout: this repository; published: must be set | Platform-separated allowlist of directories `delegate_research` may read (`:` on macOS/Linux, `;` on Windows) |
+| `FREELLAMA_MCP_ALLOWED_ROOTS` | checkout: this repository; published: unset | Required for `delegate_research` in a published install: unset, every call with a `workspacePath` is refused. Platform-separated allowlist of directories it may read (`:` on macOS/Linux, `;` on Windows), for example `/Users/me/code/project:/Users/me/work`. `run_task` and `audio` `files` use `FREELLAMA_FILE_ROOTS` instead |
+| `FREELLAMA_FILE_ROOTS` | unset | Platform-separated extra directories `run_task` and `audio` may read `files` from and `audio` may write `outputFile` to, besides the temp directory and the server's working directory (the working directory is skipped when it is `/` or the home directory) |
 | `FREELLAMA_MCP_MODEL_EVIDENCE` | checkout: `packages/mcp/evidence/model-evidence.json`; published: unset | Path to per-model research grades (see "Runtime evidence") |
 | `FREELLAMA_EXTERNAL_COST_MODEL` | unset | External-model label in estimated avoided-cost telemetry; set all three cost variables or none |
 | `FREELLAMA_EXTERNAL_COST_INPUT_USD_PER_M` | unset | External input USD per million tokens |
@@ -30,6 +31,11 @@ server-launch config (for example `.mcp.json`'s `env` block) or the launching sh
 | `FREELLAMA_SERVE_BINARY` | checkout `target/release`/`debug`, then the platform package | Binary used for serve autostart |
 | `FREELLAMA_AGENT_OS_SANDBOX` | `auto` | Bash adapter OS confinement: `bwrap` on Linux, `sandbox-exec` on macOS, when present. `off` keeps only the restricted shell |
 | `FREELLAMA_AGENT_OCTOCODE_PACKAGE` | `octocode@19.1.0` | Pinned npm spec the Octocode adapter runs through `npx` |
+| `FREELLAMA_MCP_ALLOW_CODER` | unset (off) | `1` enables `delegate_research` `adapter:"coder"`, which edits files and runs the caller's `agent.commands` in an isolated copy of the workspace (see [the coder adapter](README.md#the-coder-adapter)) |
+| `FREELLAMA_CODER_RUN_TIMEOUT_SECONDS` | `300` (at most `1800`) | Timeout of one coder `run`; the whole call is still bounded by `agent.timeoutSeconds` (coder default at least 600 s) |
+| `FREELLAMA_CODER_MAX_COPY_BYTES` | `209715200` (200 MB) | Size cap of a coder copy of a workspace that is not a git repository (`node_modules`, `target`, `dist` and `.git` excluded) |
+| `FREELLAMA_CODER_WRITABLE` | unset | Platform-separated extra directories the coder's allowed commands may write, such as `~/.cargo` for `cargo test`; an entry that holds or lies inside the workspace is refused |
+| `FREELLAMA_CODER_UNSANDBOXED_RUN` | unset | `1` lets the coder `run` without an OS sandbox (`sandbox-exec` or `bwrap`); without one, `run` is refused |
 
 Serve-side placement settings (read by `freellama serve`, not the MCP process):
 
@@ -82,7 +88,9 @@ between model templates.
 
 **Security:** `delegate_research` grants a local model read access to `workspacePath`. The path is
 confined to `FREELLAMA_MCP_ALLOWED_ROOTS` (default: this repository in a checkout; unset in a published
-install until you set it), resolved through symlinks so a link inside an allowed root can't escape
+install, where it is required and every call is refused until you set it). A relative `workspacePath`
+resolves against the server's working directory unless that is `/` or the home directory, then is
+resolved through symlinks so a link inside an allowed root can't escape
 it. The default `bash` adapter runs an allowlist of read-only tools in a restricted shell with a
 scrubbed environment and, where available, an OS sandbox; it also rejects command substitution,
 home-directory paths, `..`, and absolute paths outside that workspace. Production deployments should generate a permission-restricted token with

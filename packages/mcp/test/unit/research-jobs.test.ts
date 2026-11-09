@@ -1,6 +1,6 @@
 // Managed research turns as deferred jobs: phase messages, results and errors equal to the
 // synchronous call, refusal without losing cancellation, and the MCP server's cleanup of open jobs.
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -243,6 +243,9 @@ describe("research loop managed lifecycle", () => {
     const root = mkdtempSync(path.join(tmpdir(), "freellama-jobs-loop-"));
     roots.push(root);
     writeFileSync(path.join(root, "prompt.txt"), "Where is foo?", "utf8");
+    // The answer cites src/a.ts; it exists, so the answer passes the cited-path check.
+    mkdirSync(path.join(root, "src"), { recursive: true });
+    writeFileSync(path.join(root, "src", "a.ts"), "foo", "utf8");
     const serve = fakeServe({
       polls: [poll({ status: "loading", reason: "forwarding_to_ollama", selected_model: "gpt-oss:20b", detail: { expected_load_ms: 8_700 } }), completed],
     });

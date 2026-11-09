@@ -346,7 +346,7 @@ where
         "OLLAMA_KV_CACHE_TYPE": {
             "value": getenv("OLLAMA_KV_CACHE_TYPE"),
             "effective_default": "f16",
-            "note": "q8_0 roughly halves KV-cache memory for a given context length; Ollama describes the precision loss as very small, but the quality effect is model and task dependent. It is process-wide, so qualify model quality before rollout. It needs Flash Attention, which is automatic on supported backends. Repository benchmark evidence (not a current-host observation) found prefix reuse can materially reduce warm-prefix latency; validate it on the deployed model before sizing context or cache policy.",
+            "note": "q8_0 roughly halves KV-cache memory for a given context length; Ollama describes the precision loss as very small, but the quality effect is model and task dependent. It is process-wide, so qualify model quality before rollout. It needs Flash Attention, which is automatic on supported backends; OLLAMA_FLASH_ATTENTION=0 keeps the cache f16. Ollama's own fit check still predicts an f16 cache, so a load that fits quantized can still make Ollama evict runners or offload layers; FreeLlama receipts flag that as memory_reservation.ollama_may_evict_or_offload. Repository benchmark evidence (not a current-host observation) found prefix reuse can materially reduce warm-prefix latency; validate it on the deployed model before sizing context or cache policy.",
         },
         "OLLAMA_FLASH_ATTENTION": {
             "value": getenv("OLLAMA_FLASH_ATTENTION"),

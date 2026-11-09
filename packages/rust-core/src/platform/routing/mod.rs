@@ -10,7 +10,6 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -28,9 +27,8 @@ use candidates::{
 use profile::{TaskProfile, profile, requested_context};
 pub use session::SessionAffinity;
 
-#[derive(
-    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Default, ValueEnum,
-)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
 #[serde(rename_all = "snake_case")]
 pub enum TaskKind {
     #[default]
@@ -47,6 +45,20 @@ pub enum TaskKind {
 }
 
 impl TaskKind {
+    /// Every task kind, in declaration order. The library owns this list so it needs no CLI
+    /// dependency; the `cli` feature's `clap::ValueEnum` derive is tested against it.
+    pub const ALL: [Self; 9] = [
+        Self::Completion,
+        Self::Coding,
+        Self::CodeRepair,
+        Self::Tools,
+        Self::Browser,
+        Self::Vision,
+        Self::Embedding,
+        Self::LongContext,
+        Self::Decision,
+    ];
+
     /// Wire name, identical to the serde `snake_case` form.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -66,10 +78,7 @@ impl TaskKind {
     /// The task with this wire name.
     #[must_use]
     pub fn from_wire(name: &str) -> Option<Self> {
-        <Self as clap::ValueEnum>::value_variants()
-            .iter()
-            .copied()
-            .find(|task| task.as_str() == name)
+        Self::ALL.into_iter().find(|task| task.as_str() == name)
     }
 }
 
@@ -79,9 +88,8 @@ impl TaskKind {
 /// which model is eligible. Admission uses weighted fair scheduling (interactive 3, normal 2,
 /// background 1), so low-priority work makes bounded progress instead of starving behind a
 /// continuous interactive stream.
-#[derive(
-    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Default, ValueEnum,
-)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
 #[serde(rename_all = "snake_case")]
 pub enum TaskPriority {
     Interactive,
@@ -90,7 +98,8 @@ pub enum TaskPriority {
     Background,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, ValueEnum)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
 #[serde(rename_all = "snake_case")]
 pub enum Objective {
     Fastest,
@@ -101,7 +110,8 @@ pub enum Objective {
 
 /// A caller's backend preference. Operators retain authority over which exact models are assigned
 /// to the CPU backend; this value only chooses among models that are already eligible there.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, ValueEnum)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionPreference {
     #[default]
@@ -139,7 +149,8 @@ impl std::fmt::Display for Backend {
 /// Minimum proof required before a route may be returned. `Observed` intentionally refuses a
 /// cold model: warm it once with configured evidence, inspect the receipt, then require physical
 /// evidence for subsequent work where CPU/GPU placement is a hard constraint.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, ValueEnum)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
 #[serde(rename_all = "snake_case")]
 pub enum PlacementEvidence {
     #[default]
@@ -714,17 +725,26 @@ fn route_evidence(
 
 #[cfg(test)]
 mod task_kind_tests {
-    use clap::ValueEnum;
-
     use super::TaskKind;
 
     #[test]
     fn as_str_matches_the_serde_wire_name_for_every_task() {
-        for task in TaskKind::value_variants() {
+        for task in TaskKind::ALL {
             assert_eq!(
                 serde_json::to_value(task).unwrap(),
                 serde_json::json!(task.as_str())
             );
+            assert_eq!(TaskKind::from_wire(task.as_str()), Some(task));
         }
+    }
+
+    /// The CLI's `--task` values come from the derive; the library's list must not drift from it.
+    #[cfg(feature = "cli")]
+    #[test]
+    fn the_cli_value_enum_lists_exactly_the_library_task_kinds() {
+        assert_eq!(
+            <TaskKind as clap::ValueEnum>::value_variants(),
+            TaskKind::ALL
+        );
     }
 }

@@ -14,16 +14,7 @@ const version = JSON.parse(readFileSync(path.join(root, "package.json"), "utf8")
 const npm = process.platform === "win32" ? "npm.cmd" : "npm";
 const shell = process.platform === "win32";
 
-function hostTarget() {
-  const candidates = PLATFORM_PACKAGES.filter((t) => t.os === process.platform && t.cpu === process.arch);
-  if (process.platform === "linux") {
-    const glibc = Boolean(process.report?.getReport()?.header?.glibcVersionRuntime);
-    return candidates.find((t) => (t.libc === "musl") === !glibc) ?? candidates[0];
-  }
-  return candidates[0];
-}
-
-const target = hostTarget();
+const target = PLATFORM_PACKAGES.find((t) => t.os === process.platform && t.cpu === process.arch);
 if (!target) throw new Error(`no release package for ${process.platform}-${process.arch}`);
 const failures = [];
 const check = (name, ok, detail) => {

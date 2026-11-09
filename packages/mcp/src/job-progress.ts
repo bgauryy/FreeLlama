@@ -55,6 +55,12 @@ const SUBMIT_FALLBACK_CODES = new Set(["task_job_input_too_large", "task_jobs_fu
 /** The worker already ran, but the registry could not retain its result or error. */
 const RETENTION_FAILURE_CODES = new Set(["task_job_result_too_large", "task_job_error_too_large"]);
 const FIRST_POLL_MS = 250;
+/**
+ * A phase that lasts this long is reported again with its elapsed time, so a cold load or a long
+ * memory wait still sends progress: clients that reset their request timeout on progress keep
+ * the call alive, and a person sees it is not stuck.
+ */
+const HEARTBEAT_MS = 10_000;
 const MAX_POLL_MS = 2_000;
 /** Consecutive failed polls before the transport error is reported; any success resets it. */
 const MAX_POLL_FAILURES = 5;
@@ -279,6 +285,8 @@ export async function runWithJobProgress(
   try {
     let lastMessage = "";
     let lastPhase = "";
+    let lastReportAt = Date.now();
+    let phaseStartedAt = lastReportAt;
     let delay = FIRST_POLL_MS;
     let failures = 0;
     for (;;) {
@@ -286,15 +294,21 @@ export async function runWithJobProgress(
         cancel();
         throw aborted(id, await cancellationState());
       }
+      const now = Date.now();
+      const phase = `${String(job.status)}|${String(job.reason)}`;
+      if (phase !== lastPhase) {
+        lastPhase = phase;
+        phaseStartedAt = now;
+        delay = FIRST_POLL_MS;
+      }
       const message = jobProgressMessage(job);
       if (message !== lastMessage) {
         report(message);
         lastMessage = message;
-      }
-      const phase = `${String(job.status)}|${String(job.reason)}`;
-      if (phase !== lastPhase) {
-        lastPhase = phase;
-        delay = FIRST_POLL_MS;
+        lastReportAt = now;
+      } else if (now - lastReportAt >= HEARTBEAT_MS && !TERMINAL.has(String(job.status))) {
+        report(`${message} (${seconds(now - phaseStartedAt)})`);
+        lastReportAt = now;
       }
       if (TERMINAL.has(String(job.status))) break;
       await wait(delay, signal);

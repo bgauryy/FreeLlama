@@ -230,8 +230,20 @@ function describeAction(action: Fields, workspace: string): string {
       return describeShellCommand(String(action.command ?? ""));
     case "octocode":
       return describeOctocodeCall(String(action.tool ?? "?"), object(action.queries) ?? {}, workspace);
+    case "search":
+      return `search '${String(action.pattern ?? "")}'${action.glob ? ` in ${String(action.glob)}` : ""}${action.path ? ` under ${String(action.path)}` : ""}`;
+    case "read":
+      return `read ${String(action.path ?? "?")}${action.start ? `:${String(action.start)}${action.end ? `-${String(action.end)}` : ""}` : ""}`;
+    case "list":
+      return `list ${String(action.path ?? ".")}`;
     case "page":
       return `page ${String(action.page)} of step ${String(action.step)}`;
+    // Coder actions: the path or command only; the edit text and file content stay in the trail.
+    case "edit":
+    case "write":
+      return `${String(action.action)} ${String(action.path ?? "?")}`;
+    case "run":
+      return `run '${String(action.command ?? "")}'`;
     default:
       return JSON.stringify(action);
   }

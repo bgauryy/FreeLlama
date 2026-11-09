@@ -1,4 +1,4 @@
-// ollama_manage pull → verify → ollama_delete round trip, asserted net-zero against the
+// ollama_pull → verify → ollama_delete round trip, asserted net-zero against the
 // installed-model list. Uses the smallest real tag (~400MB download on first run). Skipped when
 // the tag is already installed: deleting a model the user actually has is not a test's call.
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -11,7 +11,7 @@ const TAG = "qwen2.5:0.5b";
 
 // Running the suite is not approval to download or delete a model. The operator must approve
 // this exact tag and the current reported byte size separately.
-describe.runIf(process.env.FREELLAMA_TEST_PULL_TAG === TAG && !!process.env.FREELLAMA_TEST_PULL_SIZE_BYTES)("ollama_manage / ollama_delete lifecycle", () => {
+describe.runIf(process.env.FREELLAMA_TEST_PULL_TAG === TAG && !!process.env.FREELLAMA_TEST_PULL_SIZE_BYTES)("ollama_pull / ollama_delete lifecycle", () => {
   let client: Client;
   let before: string[];
 
@@ -55,7 +55,7 @@ describe.runIf(process.env.FREELLAMA_TEST_PULL_TAG === TAG && !!process.env.FREE
     expect(tag?.sizeBytes, "exact tag and current reported download size must be available").toBeGreaterThan(0);
     expect(String(tag?.sizeBytes), "approved size changed; obtain fresh exact-tag approval").toBe(process.env.FREELLAMA_TEST_PULL_SIZE_BYTES);
 
-    const pull = await call("ollama_manage", { action: "pull", model: TAG });
+    const pull = await call("ollama_pull", { model: TAG, approvedSizeBytes: Number(process.env.FREELLAMA_TEST_PULL_SIZE_BYTES) });
     expect(pull.isError ?? false, pull.content[0].text).toBe(false);
     expect(await installed()).toContain(TAG);
 

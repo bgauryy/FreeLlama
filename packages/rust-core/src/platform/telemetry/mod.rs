@@ -5,7 +5,7 @@
 //! startup; pending records are not durable yet.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     num::NonZeroUsize,
     sync::{Arc, Mutex as StdMutex, mpsc},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -16,9 +16,16 @@ use serde_json::{Value, json};
 
 mod ledger;
 
-/// The longest window the usage view can show; `/usage?days=` is clamped to it and startup
-/// replays only this window.
+/// The longest window the usage view can show; `/usage?days=` is clamped to it.
 pub(crate) const REPORT_WINDOW_DAYS: u32 = 400;
+/// Days of per-day usage kept in memory, today included. Startup replays only this window, and
+/// the usage view reads older days from the ledger, which keeps every record.
+pub(crate) const MEMORY_WINDOW_DAYS: u32 = 35;
+/// Distinct models kept per day in memory, and in the process-lifetime task counters. Raw
+/// requests can name any model, so later names fold into [`OTHER_KEY`].
+const MAX_KEYS_PER_DAY: usize = 256;
+/// Where usage for names past [`MAX_KEYS_PER_DAY`] is counted.
+pub(crate) const OTHER_KEY: &str = "other";
 mod prometheus;
 
 use ledger::{civil_day, day_number, ledger_worker, replay, unix_day};
@@ -127,10 +134,15 @@ struct TaskCounters {
 struct Inner {
     /// (model, backend, task, outcome)
     tasks: BTreeMap<(String, String, String, String), TaskCounters>,
-    /// (day, model)
+    /// The distinct models in `tasks`, at most `MAX_KEYS_PER_DAY` plus `OTHER_KEY`.
+    task_models: BTreeSet<String>,
+    /// (day, model), for the last `MEMORY_WINDOW_DAYS` days.
     usage: BTreeMap<(String, String), UsageTotals>,
-    /// (day number, client) -> tokens processed for that client key.
+    /// (day number, client) -> tokens processed for that client key, for today only (budgets read
+    /// nothing else). Client names come from configured keys, so they are never folded.
     clients: BTreeMap<(u64, String), u64>,
+    /// The first day number still held in `usage`; pruning runs when the window moves past it.
+    retained_from: u64,
     /// (kind, outcome) for raw passthrough requests.
     raw: BTreeMap<(String, String), u64>,
     /// backend -> models unloaded to make room.
@@ -198,20 +210,15 @@ impl Telemetry {
             match replay(&store) {
                 Ok(days) => {
                     let mut inner = telemetry.lock();
+                    prune(&mut inner, unix_day(now_seconds()));
                     for day in days {
                         inner.ledger_records += day.tasks;
-                        inner.usage.insert(
-                            (day.day, day.model),
-                            UsageTotals {
-                                tasks: day.tasks,
-                                errors: day.errors,
-                                prompt_tokens: day.prompt_tokens,
-                                cached_prompt_tokens: day.cached_prompt_tokens,
-                                output_tokens: day.output_tokens,
-                                busy_ms: day.busy_ms,
-                                queue_wait_ms: day.queue_wait_ms,
-                            },
-                        );
+                        let model = bounded_name(&inner.usage, &day.day, &day.model);
+                        inner
+                            .usage
+                            .entry((day.day.clone(), model))
+                            .or_default()
+                            .merge(&UsageTotals::from(&day));
                     }
                 }
                 Err(error) => telemetry.lock().ledger_error = Some(error.to_string()),
@@ -249,10 +256,18 @@ impl Telemetry {
     pub(super) fn record_task(&self, record: TaskRecord) {
         {
             let mut inner = self.lock();
+            let model = if inner.task_models.contains(&record.model)
+                || inner.task_models.len() < MAX_KEYS_PER_DAY
+            {
+                record.model.clone()
+            } else {
+                OTHER_KEY.to_owned()
+            };
+            inner.task_models.insert(model.clone());
             let counters = inner
                 .tasks
                 .entry((
-                    record.model.clone(),
+                    model,
                     record.backend.clone(),
                     record.task.clone(),
                     record.outcome.clone(),
@@ -370,16 +385,78 @@ impl Telemetry {
             .or_default() += 1;
     }
 
-    /// Daily totals for the last `days` days (including today), newest first, plus a per-model
-    /// roll-up over the same window.
+    /// Daily totals for the last `days` days (including today) held in memory, at most
+    /// [`MEMORY_WINDOW_DAYS`]; [`Self::usage_report`] adds older days from the ledger.
     pub(super) fn usage(&self, days: u32) -> Value {
+        self.usage_with(days, &[])
+    }
+
+    /// The usage view for `days` days. Days older than the in-memory window come from the
+    /// ledger, read off the async runtime; without a ledger they are reported as not retained.
+    pub(super) async fn usage_report(&self, days: u32) -> Value {
         let today = unix_day(now_seconds());
-        let first = today.saturating_sub(u64::from(days.max(1)) - 1);
+        let first = window_start(today, days);
+        let memory_first = window_start(today, MEMORY_WINDOW_DAYS);
+        if first >= memory_first {
+            let mut view = self.usage_with(days, &[]);
+            view["retention"] =
+                json!({"in_memory_days": MEMORY_WINDOW_DAYS, "older_days": "not_requested"});
+            return view;
+        }
+        let Some(store) = self.ledger.clone() else {
+            let mut view = self.usage_with(days, &[]);
+            view["retention"] =
+                json!({"in_memory_days": MEMORY_WINDOW_DAYS, "older_days": "not_retained"});
+            return view;
+        };
+        let older = tokio::task::spawn_blocking(move || store.usage_daily_totals(first * 86_400))
+            .await
+            .map_err(|error| anyhow::anyhow!("usage history reader failed: {error}"))
+            .and_then(|rows| rows);
+        match older {
+            Ok(rows) => {
+                // Days inside the memory window come from memory, which also holds records the
+                // writer has not stored yet; only older days are taken from the ledger.
+                let rows: Vec<_> = rows
+                    .into_iter()
+                    .filter(|row| day_number(&row.day).is_some_and(|day| day < memory_first))
+                    .collect();
+                let mut view = self.usage_with(days, &rows);
+                view["retention"] =
+                    json!({"in_memory_days": MEMORY_WINDOW_DAYS, "older_days": "ledger"});
+                view
+            }
+            Err(error) => {
+                let mut view = self.usage_with(days, &[]);
+                view["retention"] = json!({"in_memory_days": MEMORY_WINDOW_DAYS, "older_days": "unavailable", "error": format!("{error:#}")});
+                view
+            }
+        }
+    }
+
+    /// Newest-first daily totals plus a per-model roll-up, from memory and `older` ledger rows.
+    fn usage_with(&self, days: u32, older: &[crate::store::DailyUsage]) -> Value {
+        let today = unix_day(now_seconds());
+        let first = window_start(today, days);
+        let older: Vec<((&str, &str), UsageTotals)> = older
+            .iter()
+            .map(|row| {
+                (
+                    (row.day.as_str(), row.model.as_str()),
+                    UsageTotals::from(row),
+                )
+            })
+            .collect();
         let inner = self.lock();
         let mut by_day: BTreeMap<&str, BTreeMap<&str, &UsageTotals>> = BTreeMap::new();
         let mut by_model: BTreeMap<&str, UsageTotals> = BTreeMap::new();
         let mut total = UsageTotals::default();
-        for ((day, model), totals) in &inner.usage {
+        let held = inner
+            .usage
+            .iter()
+            .map(|((day, model), totals)| ((day.as_str(), model.as_str()), totals));
+        let replayed = older.iter().map(|(key, totals)| (*key, totals));
+        for ((day, model), totals) in held.chain(replayed) {
             if day_number(day).is_none_or(|number| number < first) {
                 continue;
             }
@@ -446,19 +523,78 @@ impl Telemetry {
     }
 }
 
+impl From<&crate::store::DailyUsage> for UsageTotals {
+    fn from(day: &crate::store::DailyUsage) -> Self {
+        Self {
+            tasks: day.tasks,
+            errors: day.errors,
+            prompt_tokens: day.prompt_tokens,
+            cached_prompt_tokens: day.cached_prompt_tokens,
+            output_tokens: day.output_tokens,
+            busy_ms: day.busy_ms,
+            queue_wait_ms: day.queue_wait_ms,
+        }
+    }
+}
+
+/// The first day number of a `days`-day window ending `today`.
+fn window_start(today: u64, days: u32) -> u64 {
+    today.saturating_sub(u64::from(days.max(1)) - 1)
+}
+
+/// Drop days that left the in-memory window, and client totals from before today. Runs once per
+/// day: only a moved window has anything to drop.
+fn prune(inner: &mut Inner, today: u64) {
+    let first = window_start(today, MEMORY_WINDOW_DAYS);
+    if inner.retained_from >= first {
+        return;
+    }
+    inner.retained_from = first;
+    // `YYYY-MM-DD` keys order chronologically, so everything from `first` on splits off intact.
+    inner.usage = inner.usage.split_off(&(civil_day(first), String::new()));
+    inner.clients = inner.clients.split_off(&(today, String::new()));
+}
+
+/// `name` while `group` holds it or fewer than [`MAX_KEYS_PER_DAY`] names, else [`OTHER_KEY`].
+fn bounded_name<G: Ord + Clone, V>(
+    map: &BTreeMap<(G, String), V>,
+    group: &G,
+    name: &str,
+) -> String {
+    let mut held = 0;
+    for ((key, existing), _) in map.range((group.clone(), String::new())..) {
+        if key != group {
+            break;
+        }
+        if existing == name {
+            return name.to_owned();
+        }
+        held += 1;
+    }
+    if held < MAX_KEYS_PER_DAY {
+        name.to_owned()
+    } else {
+        OTHER_KEY.to_owned()
+    }
+}
+
 fn add_usage(inner: &mut Inner, record: &TaskRecord) {
-    if let Some(client) = &record.client {
-        let tokens = inner
-            .clients
-            .entry((unix_day(record.ts), client.clone()))
-            .or_default();
+    let today = unix_day(now_seconds());
+    prune(inner, today);
+    let day = unix_day(record.ts);
+    if let Some(client) = &record.client
+        && day >= today
+    {
+        let tokens = inner.clients.entry((day, client.clone())).or_default();
         *tokens = tokens.saturating_add(record.processed_tokens());
     }
-    inner
-        .usage
-        .entry((civil_day(unix_day(record.ts)), record.model.clone()))
-        .or_default()
-        .add(record);
+    if day < inner.retained_from {
+        // Outside the in-memory window; the ledger keeps it for the usage view.
+        return;
+    }
+    let day = civil_day(day);
+    let model = bounded_name(&inner.usage, &day, &record.model);
+    inner.usage.entry((day, model)).or_default().add(record);
 }
 
 pub(super) fn now_seconds() -> u64 {

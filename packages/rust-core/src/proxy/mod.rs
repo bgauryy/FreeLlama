@@ -15,6 +15,7 @@ use axum::{
     response::IntoResponse,
     routing::any,
 };
+use http_body::Body as _;
 use reqwest::{Client, Url};
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -25,6 +26,7 @@ use crate::platform::resources::{
 use crate::platform::{Backend, PlacementRule, Telemetry};
 
 mod admission;
+mod body_budget;
 mod config;
 mod hooks;
 mod retry;
@@ -34,6 +36,7 @@ mod usage;
 
 use admission::AdmittedBody;
 pub use admission::{RawAdmission, RawRejection};
+pub(crate) use body_budget::{BodyBudget, expected_body_bytes};
 pub use config::ProxyConfig;
 pub use hooks::{
     Caller, ForecastFuture, HookFuture, LeaseFuture, RawFinished, RawForecast, RawModelHooks,
@@ -87,6 +90,8 @@ struct ProxyState {
     hooks: Option<Arc<dyn RawModelHooks>>,
     upstreams: Option<upstreams::Upstreams>,
     max_request_bytes: usize,
+    /// Shared with every server in the process: bytes of buffered request bodies.
+    body_budget: BodyBudget,
 }
 
 /// Resolve an incoming Ollama path against the configured upstream.
@@ -157,13 +162,16 @@ pub fn app(config: ProxyConfig) -> Result<Router> {
         hooks: config.hooks,
         upstreams: (!config.upstreams.is_empty())
             .then(|| upstreams::Upstreams::new(config.upstreams)),
-        max_request_bytes: crate::net::max_request_bytes(),
+        max_request_bytes: config
+            .max_request_bytes
+            .unwrap_or_else(crate::net::max_request_bytes),
+        body_budget: config.body_budget.unwrap_or_else(BodyBudget::shared),
     };
     Ok(Router::new().fallback(any(forward)).with_state(state))
 }
 
 async fn shutdown() {
-    let _ = tokio::signal::ctrl_c().await;
+    crate::net::shutdown_signal().await;
 }
 
 /// How a raw request is admitted. Only generations take the execution lock and memory checks.
@@ -488,6 +496,16 @@ fn json_response(status: StatusCode, body: String) -> Response<Body> {
         .expect("static response is valid")
 }
 
+/// Whether reading a body failed on the length limit (`to_bytes` wraps the limit's
+/// [`http_body_util::LengthLimitError`]) rather than on a broken or aborted upload.
+fn exceeds_length_limit(error: &(dyn std::error::Error + 'static)) -> bool {
+    std::iter::successors(Some(error), |error| error.source()).any(|error| {
+        error
+            .downcast_ref::<http_body_util::LengthLimitError>()
+            .is_some()
+    })
+}
+
 fn too_large(limit: usize) -> Response<Body> {
     json_response(
         StatusCode::PAYLOAD_TOO_LARGE,
@@ -496,6 +514,19 @@ fn too_large(limit: usize) -> Response<Body> {
         )})
         .to_string(),
     )
+}
+
+/// Too many request bodies are buffered at once; this one was never read.
+fn body_budget_exhausted(error: body_budget::BodyBudgetExhausted) -> Response<Body> {
+    let mut response = json_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        serde_json::json!({"error": error.to_string(), "code": "request_body_budget_exhausted", "retry_after_seconds": 1})
+            .to_string(),
+    );
+    response
+        .headers_mut()
+        .insert("retry-after", axum::http::HeaderValue::from_static("1"));
+    response
 }
 
 fn refusal(status: StatusCode, message: &str, retry_after_seconds: u64) -> Response<Body> {
@@ -525,6 +556,19 @@ async fn forward(State(state): State<ProxyState>, request: Request) -> impl Into
     if declared.is_some_and(|bytes| bytes > state.max_request_bytes) {
         return too_large(state.max_request_bytes);
     }
+    // Reserve the body's size before reading it, so concurrent uploads cannot each hold the full
+    // request limit in memory. A body without a declared length reserves the limit. The
+    // reservation lives as long as the buffered bytes: until this handler returns.
+    let expected =
+        declared.unwrap_or_else(|| expected_body_bytes(&body.size_hint(), state.max_request_bytes));
+    let budget_wait = state
+        .admission
+        .as_ref()
+        .map_or(state.raw_queue_wait, RawAdmission::wait);
+    let _body_reservation = match state.body_budget.reserve(expected, budget_wait).await {
+        Ok(reservation) => reservation,
+        Err(exhausted) => return body_budget_exhausted(exhausted),
+    };
     // Buffer the body before taking any lock: a retried attempt must resend the exact same bytes,
     // and a slow or incomplete upload must never hold the shared execution lock while it trickles.
     let body_bytes = match tokio::time::timeout(
@@ -538,7 +582,7 @@ async fn forward(State(state): State<ProxyState>, request: Request) -> impl Into
         Ok(Err(error)) => {
             eprintln!("proxy error: buffer request body: {error:#}");
             // A chunked upload has no length up front; its overflow surfaces here.
-            return if format!("{error:#}").contains("length limit exceeded") {
+            return if exceeds_length_limit(&error) {
                 too_large(state.max_request_bytes)
             } else {
                 json_response(
@@ -1247,5 +1291,152 @@ mod tests {
                 "{body}"
             );
         }
+    }
+
+    /// A full buffered-body budget refuses a body it would have to read, before reading it, and
+    /// still forwards requests with no body.
+    #[tokio::test]
+    async fn a_full_body_budget_refuses_uploads_with_a_code_but_not_empty_requests() {
+        use axum::{
+            body::{Body, to_bytes},
+            http::{Request, StatusCode},
+        };
+        use tower::ServiceExt as _;
+
+        let upstream = axum::Router::new().fallback(|| async { "ok" });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+        let budget = super::BodyBudget::new(4096);
+        let app = super::app(
+            super::ProxyConfig::new("127.0.0.1:0", format!("http://{address}"), false)
+                .with_body_budget(budget.clone()),
+        )
+        .unwrap();
+        let held = budget
+            .reserve(4096, std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        let upload = || {
+            Request::post("/api/show")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"model":"m"}"#))
+                .unwrap()
+        };
+        let refused = app.clone().oneshot(upload()).await.unwrap();
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(refused.headers()["retry-after"], "1");
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(refused.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["code"], "request_body_budget_exhausted");
+        let empty = app
+            .clone()
+            .oneshot(Request::get("/api/tags").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            empty.status(),
+            StatusCode::OK,
+            "an empty body reserves nothing"
+        );
+        drop(held);
+        let forwarded = app.oneshot(upload()).await.unwrap();
+        assert_eq!(forwarded.status(), StatusCode::OK);
+        assert_eq!(
+            budget.receipt()["available_bytes"],
+            4096,
+            "returned with the body"
+        );
+        server.abort();
+    }
+
+    /// A body without a declared length (chunked) that passes the limit is refused with the same
+    /// 413 as one whose `content-length` declares it; a body that fails for another reason is a
+    /// 400. Detection follows the error's source chain to `LengthLimitError`, not its text.
+    #[tokio::test]
+    async fn an_oversized_chunked_body_is_refused_with_413_and_a_broken_one_with_400() {
+        use axum::{
+            body::{Body, Bytes, to_bytes},
+            http::{Request, StatusCode},
+        };
+        use std::{
+            pin::Pin,
+            task::{Context, Poll},
+        };
+        use tower::ServiceExt as _;
+
+        /// Frames without a size hint, ending in `error` when one is given.
+        struct Chunked {
+            frames: Vec<Bytes>,
+            error: Option<std::io::Error>,
+        }
+        impl http_body::Body for Chunked {
+            type Data = Bytes;
+            type Error = std::io::Error;
+            fn poll_frame(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+            ) -> Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
+                let this = self.get_mut();
+                Poll::Ready(if this.frames.is_empty() {
+                    this.error.take().map(Err)
+                } else {
+                    Some(Ok(http_body::Frame::data(this.frames.remove(0))))
+                })
+            }
+        }
+        let app = super::app(
+            super::ProxyConfig::new("127.0.0.1:0", "http://127.0.0.1:9", false)
+                .with_body_budget(super::BodyBudget::new(4096))
+                .with_max_request_bytes(16),
+        )
+        .unwrap();
+        let send = |body: Body, declared: Option<usize>| {
+            let mut request =
+                Request::post("/api/generate").header("content-type", "application/json");
+            if let Some(bytes) = declared {
+                request = request.header("content-length", bytes);
+            }
+            app.clone().oneshot(request.body(body).unwrap())
+        };
+        let read = |response: axum::response::Response| async move {
+            let status = response.status();
+            let body: serde_json::Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            (status, body)
+        };
+        let expected = serde_json::json!({
+            "error": "request body is over 16 bytes; raise FREELLAMA_MAX_REQUEST_BYTES to accept it"
+        });
+        let chunked = Body::new(Chunked {
+            frames: vec![
+                Bytes::from_static(b"0123456789"),
+                Bytes::from_static(b"0123456789"),
+            ],
+            error: None,
+        });
+        assert_eq!(
+            read(send(chunked, None).await.unwrap()).await,
+            (StatusCode::PAYLOAD_TOO_LARGE, expected.clone())
+        );
+        let declared = Body::from(vec![b'x'; 20]);
+        assert_eq!(
+            read(send(declared, Some(20)).await.unwrap()).await,
+            (StatusCode::PAYLOAD_TOO_LARGE, expected)
+        );
+        let broken = Body::new(Chunked {
+            frames: vec![Bytes::from_static(b"{")],
+            error: Some(std::io::Error::other("length limit exceeded")),
+        });
+        assert_eq!(
+            read(send(broken, None).await.unwrap()).await,
+            (
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({"error": "could not read request body"})
+            ),
+            "an upload error that merely mentions the limit is not an oversized body"
+        );
     }
 }

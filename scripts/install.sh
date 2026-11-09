@@ -42,10 +42,10 @@ asset="freellama-${platform}"
 base="https://github.com/bgauryy/FreeLlama/releases/download/${release_version}"
 temporary_dir="$(mktemp -d)"
 trap 'rm -rf "$temporary_dir"' EXIT HUP INT TERM
-curl -fL --proto '=https' --tlsv1.2 "${base}/${asset}" -o "${temporary_dir}/${asset}"
 curl -fL --proto '=https' --tlsv1.2 "${base}/SHA256SUMS" -o "${temporary_dir}/SHA256SUMS"
 expected="$(awk -v file="$asset" '$2 == file {print $1}' "${temporary_dir}/SHA256SUMS")"
-[ -n "$expected" ] || { echo "No checksum published for ${asset}" >&2; exit 1; }
+[ -n "$expected" ] || { echo "${release_version} has no prebuilt binary for ${platform}; build from source with: cargo build --release" >&2; exit 1; }
+curl -fL --proto '=https' --tlsv1.2 "${base}/${asset}" -o "${temporary_dir}/${asset}"
 if command -v sha256sum >/dev/null 2>&1; then
   actual="$(sha256sum "${temporary_dir}/${asset}" | awk '{print $1}')"
 elif command -v shasum >/dev/null 2>&1; then

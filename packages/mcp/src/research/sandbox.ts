@@ -20,7 +20,7 @@
 //
 // Layer 1 lives in sandbox-validate.ts; the differential corpus in
 // test/fixtures/shell-sandbox-corpus.json pins every verdict.
-import { accessSync, constants as fsConstants, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { accessSync, constants as fsConstants, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { probe, runProcess } from "./proc.js";
@@ -34,15 +34,16 @@ export {
   READ_ONLY_GIT, READ_ONLY_TOOLS, SAFE_BUILTINS, assertCommandConfined, segments, validateCommand,
 } from "./sandbox-validate.js";
 
-function macosProfile(workspace: string, scratch: string): string {
+function macosProfile(workspace: string, scratch: string, readPaths: string[] = []): string {
   const quote = (value: string) => `"${value.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`;
+  const extra = readPaths.map((dir) => ` (subpath ${quote(dir)})`).join("");
   return `(version 1)
 (allow default)
 (deny network*)
 (deny file-write*)
 (allow file-write* (literal "/dev/null") (literal "/dev/tty") (literal "/dev/dtracehelper") (subpath ${quote(scratch)}))
 (deny file-read-data (subpath "/Users") (subpath "/Volumes") (subpath "/private/var/root"))
-(allow file-read-data (subpath ${quote(workspace)}) (subpath ${quote(scratch)}))
+(allow file-read-data (subpath ${quote(workspace)}) (subpath ${quote(scratch)})${extra})
 `;
 }
 
@@ -75,9 +76,12 @@ export class ReadOnlyShell {
   env: Record<string, string> = {};
   bash = "/bin/bash";
   private scratch: string | null = null;
+  /** Directories outside the workspace the shell may also read, such as a worktree's git directory. */
+  private readonly readPaths: string[];
 
-  constructor(workspace: string) {
+  constructor(workspace: string, options: { readPaths?: string[] } = {}) {
     this.workspace = workspace;
+    this.readPaths = options.readPaths ?? [];
   }
 
   enter(): this {
@@ -125,7 +129,7 @@ export class ReadOnlyShell {
     const sandboxExec = which("sandbox-exec");
     if (sandboxExec) {
       const profile = path.join(scratch, "profile.sb");
-      writeFileSync(profile, macosProfile(this.workspace, scratch), "utf8");
+      writeFileSync(profile, macosProfile(this.workspace, scratch, this.readPaths), "utf8");
       const prefix = [sandboxExec, "-f", profile];
       if (probe([...prefix, this.bash, "-c", "true"], this.env)) {
         this.kind = "sandbox-exec+restricted-bash";
@@ -140,6 +144,7 @@ export class ReadOnlyShell {
       }
       prefix.push(
         "--ro-bind", this.workspace, this.workspace,
+        ...this.readPaths.flatMap((dir) => ["--ro-bind", dir, dir]),
         "--ro-bind", binDir, binDir,
         "--bind", scratch, scratch,
         "--chdir", this.workspace, "--",
@@ -150,6 +155,28 @@ export class ReadOnlyShell {
       }
     }
     return [];
+  }
+
+  /**
+   * Run one read-only tool with an argument vector, no shell: the structured `search` action uses
+   * it so a pattern such as `${x}` or `(` is data, never shell syntax. Same OS sandbox, PATH and
+   * scrubbed environment as `run`; exit 1 of a search means no matches.
+   */
+  /** Whether `tool` was found on the caller's PATH when the shell was entered. */
+  hasTool(tool: string): boolean {
+    return this.scratch !== null && existsSync(path.join(this.scratch, "bin", tool));
+  }
+
+  async runTool(argv: string[], timeoutSeconds: number): Promise<string> {
+    const [tool, ...args] = argv;
+    if (!tool || !(READ_ONLY_TOOLS as readonly string[]).includes(tool) || this.scratch === null) {
+      throw new ValidationError(`tool ${tool ?? "(none)"} is not available to structured actions`);
+    }
+    const result = await runProcess([...this.prefix, path.join(this.scratch, "bin", tool), ...args],
+      { cwd: this.workspace, env: this.env, timeoutSeconds });
+    if (result.returncode === 1 && !trimSpace(result.stderr)) return "(no matches)";
+    if (result.returncode !== 0) throw new ToolExitError(result.returncode, result.stdout + result.stderr);
+    return trimSpace(result.stdout) ? result.stdout : "(no matches)";
   }
 
   async run(commandText: string, timeoutSeconds: number): Promise<string> {

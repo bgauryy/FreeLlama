@@ -16,6 +16,10 @@ import {
 } from "../helpers.js";
 import { applyTaskFiles, inputLabels, type FileReceipt } from "../task-files.js";
 import { nearestText, validateEmbeddingVectors, type NearestRequest } from "../nearest.js";
+import { applyJob, mergeProfiles, neededCapabilities, pickLiveJobModel, type JobProfile } from "../job-mode.js";
+import { LOCAL_JOBS, RUN_TASK_JOBS, WORKFLOW_NAMES, WORKFLOWS, type JobName, type WorkflowName } from "../local-prompts.js";
+import { HANDOFF_NAME, summaryOf, writeHandoff } from "../handoffs.js";
+import { resultChecks, withChecks } from "../result-checks.js";
 
 // Typed where the agent acts on a field; Ollama-owned payloads (`response`) stay open.
 const taskResultSchema = z.object({
@@ -34,6 +38,7 @@ const taskResultSchema = z.object({
   response_file: z.string().optional(),
   sections: z.array(z.string()).optional(),
   telemetry: z.unknown().optional(),
+  handoff_file: z.string().optional(),
 }).loose();
 const batchResultSchema = z.object({
   results: z.array(z.object({
@@ -122,6 +127,7 @@ function withFiles<T extends TaskPayload & { files?: string[] }>(task: T, label?
 export const BATCH_SHARED_FIELDS: ReadonlySet<string> = new Set([
   "task", "model", "objective", "sessionId", "contextTokens", "executionPreference", "systemPrompt", "questions",
   "format", "think", "options", "keepAlive", "priority", "timeoutSeconds", "maxWaitSeconds", "stopOnRepetition", "tools",
+  "minConfidence", "requiredCapabilities", "minPlacementEvidence",
 ]);
 
 function withoutUndefined<T extends object>(value: T): Partial<T> {
@@ -348,6 +354,11 @@ async function runCancellableBatch(
     }
     return pending.shift()!;
   };
+  let settled = 0;
+  const settle = (id: string, ok: boolean) => {
+    settled += 1;
+    report?.(`${settled}/${tasks.length} items done (${id} ${ok ? "ok" : "failed"})`);
+  };
   await Promise.all(Array.from({ length: parallelism }, async () => {
     while (pending.length > 0) {
       const index = next();
@@ -364,17 +375,40 @@ async function runCancellableBatch(
         if (item.task.task === "embedding") validateEmbeddingVectors(object(response.response)?.embeddings,
           Array.isArray(item.task.input) ? item.task.input.length : 1);
         results[index] = { id: item.id, ok: true, response, ...(jobIds.length ? { accepted_job_ids: jobIds } : {}) };
+        settle(item.id, true);
       } catch (error) {
         let body: Fields | undefined;
         try { body = object(JSON.parse(error instanceof Error ? error.message : String(error))); } catch { /* retain plain transport failures */ }
         results[index] = { id: item.id, ok: false, error: body ?? { error: error instanceof Error ? error.message : String(error) },
           ...(jobIds.length ? { accepted_job_ids: jobIds } : {}) };
+        settle(item.id, false);
       }
     }
   }));
   return JSON.stringify({ independent_only: true, max_parallelism: parallelism,
     scheduler: { scope: "bounded_client_dispatch_and_global_managed_admission", policy: "weighted_fair_round_robin", weights: BATCH_PRIORITY_WEIGHTS,
       note: "each accepted job remains cancellable; priority is enforced by core admission" }, results });
+}
+
+/**
+ * One context window per model in a batch. Ollama reloads a runner whose num_ctx differs, so items
+ * of one model sized apart (one item's explicit contextTokens, its siblings sized by the core from
+ * their own prompts) reload it mid-batch. The core owns prompt-based sizing (it needs the model's
+ * learned token ratio and window), so this only spreads what the caller chose: when any item of an
+ * explicitly named model sets contextTokens, every item of that model gets the largest value.
+ * Scoped items keep their own, since their history is sized against it. A batch where no item of a
+ * model sets contextTokens is left to the core, as a single call is.
+ */
+export function shareBatchContext<T extends { task: Pick<BatchItem["task"], "model" | "contextTokens" | "scopeId"> }>(tasks: T[]): T[] {
+  const widest = new Map<string, number>();
+  for (const { task } of tasks) {
+    if (task.model === undefined || task.scopeId !== undefined || task.contextTokens === undefined) continue;
+    widest.set(task.model, Math.max(widest.get(task.model) ?? 0, task.contextTokens));
+  }
+  return tasks.map((item) => {
+    const shared = item.task.model === undefined || item.task.scopeId !== undefined ? undefined : widest.get(item.task.model);
+    return shared === undefined || item.task.contextTokens === shared ? item : { ...item, task: { ...item.task, contextTokens: shared } };
+  });
 }
 
 async function runBatch(
@@ -391,6 +425,7 @@ async function runBatch(
     const problem = validateTaskPayload(item.task, `batch item ${item.id}`);
     if (problem) return errorResult(new Error(problem));
   }
+  tasks = shareBatchContext(tasks);
   const payload = {
     tasks: tasks.map(({ id, independent, task }) => ({
       id,
@@ -483,6 +518,8 @@ export function registerRunTaskTool(server: McpServer): void {
       inputSchema: z.object({
         endpoint: endpointParam,
         task: taskParam.removeDefault().optional(),
+        job: z.enum(RUN_TASK_JOBS).optional().describe("picks a model that fits now and fills prompt, systemPrompt, options, think, prefixes; your fields win"),
+        workflow: z.enum(WORKFLOW_NAMES as [WorkflowName, ...WorkflowName[]]).optional().describe("step-by-step instructions for the local model (fix-bug, write-tests, review-code, summarize-log, extract-json, read-fields...); implies its job"),
         objective: objectiveParam,
         model: z.string().min(1).optional().describe(
           "exact tag; omitted: routing picks by capability only and may choose one that does not fit now, so name the catalog's pick for the job",
@@ -530,7 +567,7 @@ export function registerRunTaskTool(server: McpServer): void {
         topLogprobs: z.number().int().nonnegative().optional(),
         minConfidence: minConfidenceParam,
         priority: z.enum(["interactive", "normal", "background"]).optional(),
-        maxWaitSeconds: z.number().int().positive().optional().describe("capped by the operator's max_queue_wait_seconds (default 120); a lowered waits show as wait_limit"),
+        maxWaitSeconds: z.number().int().positive().optional().describe("capped by the operator's max_queue_wait_seconds (default 120); lowered waits show as wait_limit"),
         timeoutSeconds: z.number().int().positive().optional(),
         stopOnRepetition: z
           .boolean()
@@ -541,6 +578,7 @@ export function registerRunTaskTool(server: McpServer): void {
           .optional()
           .describe("compact (default): full receipt at response_file; full: inline"),
         defer: z.boolean().optional(),
+        saveAs: z.string().regex(HANDOFF_NAME).optional().describe("answer to handoffs/<name>.md, returned as handoff_file"),
         returnEmbeddings: z.boolean().optional(),
         nearest: z
           .object({
@@ -573,6 +611,9 @@ export function registerRunTaskTool(server: McpServer): void {
     async ({
       endpoint,
       task,
+      job,
+      workflow,
+      saveAs,
       objective,
       model,
       sessionId,
@@ -610,6 +651,12 @@ export function registerRunTaskTool(server: McpServer): void {
       maxParallelism,
     }, extra: ToolExtra) => {
       try {
+        // A workflow names its job; a different explicit job is a contradiction.
+        if (workflow !== undefined) {
+          const flowJob = WORKFLOWS[workflow].job;
+          if (job !== undefined && job !== flowJob) return errorResult(new Error(`workflow "${workflow}" runs job "${flowJob}"; remove \`job\`.`));
+          job = flowJob;
+        }
         const singleFields = {
           task, objective, model, sessionId, scopeId, scopeRevision, contextTokens, executionPreference,
           minPlacementEvidence, requiredCapabilities, prompt, systemPrompt, images, messages, input, files, state, questions,
@@ -617,6 +664,7 @@ export function registerRunTaskTool(server: McpServer): void {
           timeoutSeconds, stopOnRepetition, defer, returnEmbeddings, nearest: nearestRequest, preview,
         };
         if (tasks !== undefined) {
+          if (saveAs !== undefined) return errorResult(new Error("`saveAs` saves one answer; it is not valid with `tasks`."));
           // `defer` is the one single-call field a batch accepts: it submits every item as its own job.
           const stray = Object.entries(singleFields).filter(([name, value]) => value !== undefined && name !== "defer").map(([name]) => name);
           const unsupported = stray.filter((name) => !BATCH_TASK_FIELDS.has(name)).map((name) => `\`${name}\``);
@@ -631,10 +679,28 @@ export function registerRunTaskTool(server: McpServer): void {
           }
           // Shared fields are sent once and apply to every item that does not set its own.
           const shared = Object.fromEntries(stray.map((name) => [name, singleFields[name as keyof typeof singleFields]]));
-          const items: BatchItem[] = tasks.map((item) => ({ ...item, task: { ...shared, ...withoutUndefined(parseBatchTask(item)) } as BatchItem["task"] }));
-          return await runBatch(items, maxParallelism, endpoint, extra, defer === true);
+          let items: BatchItem[] = tasks.map((item) => ({ ...item, task: { ...shared, ...withoutUndefined(parseBatchTask(item)) } as BatchItem["task"] }));
+          let profile: JobProfile | undefined;
+          if (job !== undefined) ({ items, profile } = await withBatchJob(job, items, endpoint, workflow));
+          return withJob(withBatchChecks(await runBatch(items, maxParallelism, endpoint, extra, defer === true), job, items), profile);
         }
         if (maxParallelism !== undefined) return errorResult(new Error("`maxParallelism` is valid only with `tasks`."));
+        if (saveAs !== undefined && (preview || defer)) return errorResult(new Error("`saveAs` saves a finished answer; it is not valid with `preview` or `defer`."));
+        let profile: JobProfile | undefined;
+        if (job !== undefined) {
+          if (scopeId !== undefined) return errorResult(new Error("`job` picks the model and prompt, and a scope has its own: remove `job` or `scopeId`."));
+          const prefer = workflow !== undefined ? (WORKFLOWS[workflow] as { prefer?: "capable" }).prefer : undefined;
+          const picked = model === undefined ? await pickLiveJobModel(job, endpoint, prefer, neededCapabilities({ tools, think })) : undefined;
+          const applied = applyJob(job, { task, model, prompt, systemPrompt, messages, options, think, input, format, tools, nearest: nearestRequest }, picked, preview === true, workflow);
+          ({ prompt, systemPrompt, options, think, input, model } = applied.fields);
+          format = applied.fields.format as typeof format;
+          task = applied.fields.task as typeof task;
+          nearestRequest = applied.fields.nearest as typeof nearestRequest;
+          profile = applied.profile;
+        }
+        // Checks read the result itself (uncertain answers, close matches, unsupported facts, edits
+        // that do not match the file) and are saved with a handoff too.
+        const finish = <R,>(result: R): R => withJob(withChecks(result, job, task ?? "completion", tools), profile, saveAs);
         const canonicalTask = task ?? "completion";
         if (preview) {
           const executionOnlyFields = ([
@@ -685,9 +751,9 @@ export function registerRunTaskTool(server: McpServer): void {
         // The core enforces minConfidence inside route(), so preview and synchronous execution
         // refuse there, with the core's actionable message, before any generation.
         if (preview) {
-          return withText(parsedResult(
+          return finish(withText(parsedResult(
             await route(endpoint, canonicalTask, objective, model, sessionId, contextTokens, effectiveRequiredCapabilities, minConfidence, executionPreference, minPlacementEvidence),
-          ), routeText);
+          ), routeText));
         }
         const filled = withFiles({ task, files, prompt, images, input, state, documentPrefix: nearestRequest?.documentPrefix });
         ({ prompt, images, input, state } = filled.task);
@@ -757,7 +823,7 @@ export function registerRunTaskTool(server: McpServer): void {
         const result = parsedResult(slicedEmbedding
           ? await embedInSlices(target, request, input as unknown[], report, extra.signal)
           : await runManagedTask(target, request, report, extra.signal));
-        if (isStructuredSuccess(result) && result.structuredContent.deferred === true) return withText(result, deferText);
+        if (isStructuredSuccess(result) && result.structuredContent.deferred === true) return finish(withText(result, deferText));
         if (request.task === "embedding" && nearestRequest === undefined && isStructuredSuccess(result)) {
           validateEmbeddingVectors(object(result.structuredContent.response)?.embeddings, Array.isArray(input) ? input.length : 1);
         }
@@ -774,19 +840,66 @@ export function registerRunTaskTool(server: McpServer): void {
           finished.structuredContent.files_read = filled.files;
         }
         if (nearestRequest !== undefined && isStructuredSuccess(finished)) {
-          return rankedResult(finished, nearestRequest.query !== undefined, items.length);
+          return finish(rankedResult(finished, nearestRequest.query !== undefined, items.length));
         }
         // The vectors stay in the saved response; the inline result and its text omit them.
         if (!returnEmbeddings && isStructuredSuccess(finished)) {
           const trimmed = summarizeEmbeddings(finished.structuredContent);
-          if (trimmed) return { ...finished, content: [{ type: "text" as const, text: taskAnswerText(trimmed) ?? "" }] };
+          if (trimmed) return finish({ ...finished, content: [{ type: "text" as const, text: taskAnswerText(trimmed) ?? "" }] });
         }
-        return finished;
+        return finish(finished);
       } catch (error) {
         return errorResult(error);
       }
     },
   );
+}
+
+/** Job mode over a batch: one model pick for the items that name none, then each item's defaults. */
+async function withBatchJob(job: JobName, items: BatchItem[], endpoint: string | undefined, workflow?: WorkflowName): Promise<{ items: BatchItem[]; profile: JobProfile }> {
+  // Ranking (`nearest`) belongs to one call over all the items, which a batch item cannot carry.
+  if (LOCAL_JOBS[job].task === "embedding") throw new Error(`job "${job}" ranks every item in one call with \`nearest\`; send it without \`tasks\`, naming the inputs in \`files\`.`);
+  const prefer = workflow !== undefined ? (WORKFLOWS[workflow] as { prefer?: "capable" }).prefer : undefined;
+  // One pick serves every item that names no model, so it must cover what any of them needs.
+  const needs = [...new Set(items.filter((item) => item.task.model === undefined)
+    .flatMap((item) => neededCapabilities(item.task as { tools?: unknown[]; think?: unknown })))];
+  const picked = items.some((item) => item.task.model === undefined) ? await pickLiveJobModel(job, endpoint, prefer, needs) : undefined;
+  const profiles: JobProfile[] = [];
+  const filled = items.map((item) => {
+    try {
+      const { fields, profile } = applyJob(job, item.task, picked, false, workflow);
+      profiles.push(profile);
+      return { ...item, task: fields as BatchItem["task"] };
+    } catch (error) {
+      throw new Error(`batch item ${item.id}: ${(error as Error).message}`);
+    }
+  });
+  return { items: filled, profile: mergeProfiles(job, profiles) };
+}
+
+type Shown = { content?: Array<{ type: string; text?: string }>; structuredContent?: Fields; isError?: boolean };
+
+/**
+ * A finished result with `job_profile` (what job mode filled in) and, for `saveAs`, the answer text
+ * written as a handoff whose path is `handoff_file`. Errors pass through: there is nothing to hand on.
+ */
+export function withJob<R>(result: R, profile: JobProfile | undefined, saveAs?: string, dir?: string): R {
+  const shown = result as Shown;
+  if (shown.isError || !shown.structuredContent || (profile === undefined && saveAs === undefined)) return result;
+  const structuredContent: Fields = { ...shown.structuredContent, ...(profile ? { job_profile: profile } : {}) };
+  let content = shown.content;
+  if (saveAs !== undefined) {
+    // The answer as the agent reads it, without its `[model · lifecycle]` label.
+    const answer = (content ?? []).map((part) => part.text ?? "").join("\n").replace(/^\[[^\]\n]*\] /, "");
+    const model = profile?.model ?? object(structuredContent.route)?.selected_model ?? structuredContent.selected_model;
+    const file = writeHandoff(saveAs, {
+      source: `From run_task${profile ? ` job ${profile.job}` : ""}${typeof model === "string" ? `, model ${model}` : ""}`,
+      summary: summaryOf(answer), result: answer,
+    }, dir);
+    structuredContent.handoff_file = file;
+    content = (content ?? []).map((part, index) => (index === 0 && part.type === "text" ? { ...part, text: `${part.text ?? ""}\nhandoff_file: ${file}` } : part));
+  }
+  return { ...result, structuredContent, content } as R;
 }
 
 /** An embedding result the core ranked by `nearest`: labelled matches inline, vectors only on request. */
@@ -799,4 +912,34 @@ function rankedResult(
   if (!ranked) return errorResult(new Error("serve returned no nearest ranking for the embedding task"));
   const header = withQuery ? `closest of ${itemCount} items to the query:` : `most similar pairs among ${itemCount} items:`;
   return { ...finished, content: [{ type: "text" as const, text: `${header}\n${nearestText(ranked)}` }] };
+}
+
+
+/**
+ * Per-item checks for a batch: each item's result is read the way a single call's is, and only
+ * items with something specific to check are listed, so 50 confident answers stay one line.
+ */
+function withBatchChecks<R>(result: R, job: string | undefined, items: BatchItem[]): R {
+  const shown = result as { content?: Array<{ type: string; text?: string }>; structuredContent?: Fields; isError?: boolean };
+  const rows = Array.isArray(shown.structuredContent?.results) ? shown.structuredContent.results as unknown[] : [];
+  if (shown.isError || rows.length === 0) return result;
+  const taskOf = new Map(items.map((item) => [item.id, String(item.task.task ?? "completion")]));
+  const toolsOf = new Map(items.map((item) => [item.id, item.task.tools as unknown[] | undefined]));
+  const flagged: string[] = [];
+  const checks: Record<string, string[]> = {};
+  for (const raw of rows) {
+    const row = object(raw);
+    if (!row || row.ok !== true) continue;
+    const id = String(row.id);
+    const receipt = object(row.response) ?? {};
+    const lines = resultChecks({ job, task: taskOf.get(id), answer: taskAnswerText(receipt) ?? "", structured: receipt, tools: toolsOf.get(id) });
+    if (lines.length === 0 || /^every answer is outside|^every number and quoted name|^all \d+ SEARCH|^\d+ tool call\(s\) match/.test(lines[0]!)) continue;
+    checks[id] = lines;
+    flagged.push(`${id}: ${lines.join("; ")}`);
+  }
+  if (flagged.length === 0) return result;
+  const content = (shown.content ?? []).map((part, index) => (index === 0 && part.type === "text"
+    ? { ...part, text: `${part.text ?? ""}\n\ncheck these items first:\n${flagged.slice(0, 20).map((line) => `- ${line}`).join("\n")}${flagged.length > 20 ? `\n- … ${flagged.length - 20} more in structuredContent.checks` : ""}` }
+    : part));
+  return { ...result, structuredContent: { ...shown.structuredContent, checks }, content } as R;
 }

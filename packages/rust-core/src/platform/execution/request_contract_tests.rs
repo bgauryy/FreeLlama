@@ -185,3 +185,40 @@ fn vision_without_an_image_is_refused_before_admission() {
     // Completion needs no image.
     assert!(require_payload(&input(json!({"prompt":"describe"}))).is_ok());
 }
+
+#[test]
+fn context_shift_off_sends_shift_false_and_ollama_default_omits_it_keeping_truncate() {
+    let plain = model(
+        "plain",
+        &["completion"],
+        json!({"values":[false],"default":false}),
+    );
+    let decision = select_route(
+        &input(json!({"prompt":"x"})).route,
+        std::slice::from_ref(&plain),
+        &SessionAffinity::default(),
+    )
+    .unwrap();
+    let keep_alive = json!("300s");
+    for (shift, expected) in [
+        (ContextShift::Off, Some(json!(false))),
+        (ContextShift::OllamaDefault, None),
+    ] {
+        let mut chat = input(json!({"prompt":"answer"}));
+        let (path, body) = build_managed_request(&mut chat, &decision, &keep_alive, shift).unwrap();
+        assert_eq!(path, "/api/chat");
+        assert_eq!(
+            body.get("shift").cloned(),
+            expected,
+            "{shift:?} managed chat"
+        );
+        assert_eq!(body["truncate"], false, "{shift:?} managed chat");
+
+        let mut warm = input(json!({"model":"plain"}));
+        warm.operation = crate::platform::ManagedOperation::Warm;
+        let (path, body) = build_managed_request(&mut warm, &decision, &keep_alive, shift).unwrap();
+        assert_eq!(path, "/api/chat");
+        assert_eq!(body.get("shift").cloned(), expected, "{shift:?} warm chat");
+        assert_eq!(body["truncate"], false, "{shift:?} warm chat");
+    }
+}

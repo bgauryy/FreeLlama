@@ -1,7 +1,7 @@
 // audio: speech to text and text to speech on local models, through serve's Ollama passthrough
 // (`/v1/audio/*`), which applies the same admission and memory checks as other raw generation.
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { writeFileSync } from "node:fs";
+import { existsSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import * as z from "zod";
@@ -10,7 +10,7 @@ import { checkAudioCapability } from "../audio-capability.js";
 import { endpointParam, errorResult, refusalLine, structuredResult } from "../helpers.js";
 import { ensureServe } from "../serve.js";
 import { serveAuthHeaders } from "../serve-http.js";
-import { MAX_AUDIO_FILE_BYTES, isWav, readAllowedFile } from "../task-files.js";
+import { MAX_AUDIO_FILE_BYTES, fileRoots, isWav, readAllowedFile, within } from "../task-files.js";
 
 /** Ollama's speech output: 16-bit mono PCM at 24 kHz, after a 44-byte WAV header. */
 const WAV_BYTES_PER_SECOND = 24_000 * 2;
@@ -34,7 +34,7 @@ export function registerAudioTool(server: McpServer): void {
         language: z.string().min(1).optional().describe("spoken language, ISO 639-1"),
         toLanguage: z.string().min(1).optional().describe("translate; default en"),
         prompt: z.string().min(1).optional().describe("context words"),
-        outputFile: z.string().min(1).optional().describe("speak; default temp dir"),
+        outputFile: z.string().min(1).optional().describe("speak: a new .wav under the readable roots; default temp dir"),
         endpoint: endpointParam,
       }).strict(),
       outputSchema: audioResultSchema,
@@ -54,6 +54,21 @@ export function registerAudioTool(server: McpServer): void {
         const started = performance.now();
         if (action === "speak") {
           if (text === undefined) return errorResult(new Error('action "speak" requires `text`.'));
+          // Checked before synthesis, so a refused path costs no model load.
+          const target = path.resolve(outputFile ?? path.join(tmpdir(), `freellama-speech-${Date.now()}.wav`));
+          // Writes obey the same roots as reads, and never replace an existing file.
+          let directory: string;
+          try {
+            directory = realpathSync(path.dirname(target));
+          } catch {
+            return errorResult(new Error(`outputFile directory does not exist: ${path.dirname(target)}`));
+          }
+          const roots = fileRoots();
+          if (!roots.some((root) => within(directory, root))) {
+            return errorResult(new Error(`outputFile ${target} is outside the writable roots (${roots.join(", ")})`));
+          }
+          if (path.extname(target).toLowerCase() !== ".wav") return errorResult(new Error("outputFile must end in .wav"));
+          if (existsSync(target)) return errorResult(new Error(`outputFile ${target} already exists; choose a new path`));
           await checkAudioCapability(base, model, action, headers, extra.signal);
           const response = await fetch(`${base}/v1/audio/speech`, {
             method: "POST",
@@ -63,8 +78,12 @@ export function registerAudioTool(server: McpServer): void {
           });
           if (!response.ok) return errorResult(new Error(`speak with ${model} failed: ${refusalLine(await response.text(), response.status)}`));
           const audio = Buffer.from(await response.arrayBuffer());
-          const target = path.resolve(outputFile ?? path.join(tmpdir(), `freellama-speech-${Date.now()}.wav`));
-          writeFileSync(target, audio);
+          try {
+            writeFileSync(path.join(directory, path.basename(target)), audio, { flag: "wx" });
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "EEXIST") return errorResult(new Error(`outputFile ${target} already exists; choose a new path`));
+            throw error;
+          }
           const seconds = Math.round((Math.max(0, audio.length - 44) / WAV_BYTES_PER_SECOND) * 10) / 10;
           return structuredResult(
             { file: target, bytes: audio.length, seconds, model, elapsed_ms: Math.round(performance.now() - started) },

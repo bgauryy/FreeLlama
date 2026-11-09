@@ -102,6 +102,8 @@ impl OllamaSettings {
                 )
             })
             .collect::<serde_json::Map<_, _>>();
+        // The same resolution that sizes this backend's KV cache in memory forecasts.
+        let hints = super::footprint::RuntimeHints::from_lookup(|name| self.lookup(name));
         json!({
             "observed_at": self.observed_at,
             "observation_scope": "process_snapshot",
@@ -110,6 +112,11 @@ impl OllamaSettings {
             "effective": {
                 "num_parallel": self.num_parallel(),
                 "context_length": self.context_length(),
+                // "auto" (unset) is sized like "on"; a model or backend without flash attention
+                // falls back to an F16 cache, which its first measured footprint corrects.
+                "flash_attention": hints.flash_attention,
+                "kv_cache_type": hints.kv_cache_type(),
+                "kv_cache_percent_of_f16": hints.kv_cache_percent,
             },
             "process_inspection": self.process_inspection,
         })
@@ -485,6 +492,35 @@ mod tests {
         assert_eq!(settings.num_parallel(), 2);
         assert_eq!(settings.source("OLLAMA_NUM_PARALLEL"), "freellama_env");
         assert_eq!(settings.source("OLLAMA_MAX_QUEUE"), "ollama_default");
+    }
+
+    #[test]
+    fn the_receipt_reports_effective_flash_attention_and_kv_factor() {
+        let effective = |process: &[(&str, &str)]| {
+            let process = process
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                .collect::<BTreeMap<_, _>>();
+            resolve(Some(&process), |_| None, |_| None, String::new()).receipt()["effective"]
+                .clone()
+        };
+        let auto = effective(&[("OLLAMA_KV_CACHE_TYPE", "q8_0")]);
+        assert_eq!(auto["flash_attention"], "auto");
+        assert_eq!(auto["kv_cache_type"], "q8_0");
+        assert_eq!(auto["kv_cache_percent_of_f16"], 50);
+        let off = effective(&[
+            ("OLLAMA_FLASH_ATTENTION", "0"),
+            ("OLLAMA_KV_CACHE_TYPE", "q8_0"),
+        ]);
+        assert_eq!(off["flash_attention"], "off");
+        assert_eq!(off["kv_cache_type"], "f16");
+        assert_eq!(off["kv_cache_percent_of_f16"], 100);
+        let on = effective(&[
+            ("OLLAMA_FLASH_ATTENTION", "1"),
+            ("OLLAMA_KV_CACHE_TYPE", "q4_0"),
+        ]);
+        assert_eq!(on["flash_attention"], "on");
+        assert_eq!(on["kv_cache_percent_of_f16"], 25);
     }
 
     #[test]

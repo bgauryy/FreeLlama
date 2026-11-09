@@ -1,6 +1,11 @@
+import { fileURLToPath } from "node:url";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { MODEL_EVIDENCE } from "../../src/delegate.js";
+
+// The repository root holds AGENTS.md; the run's cwd differs between `yarn test` at the root and
+// in packages/mcp, so source citations resolve against this fixed workspace.
+const REPO_ROOT = fileURLToPath(new URL("../../../..", import.meta.url));
 
 const fixture = vi.hoisted(() => ({
   handlers: new Map<string, (...args: any[]) => Promise<any>>(),
@@ -95,6 +100,21 @@ describe("delegate_research refusal forwarding", () => {
     },
   );
 
+  it("runs the github adapter without a workspacePath, in its private temp directory", async () => {
+    fixture.result = { final_answer: "defined in server/routes.go", tool_calls: [] };
+    fixture.exec.mockImplementation(() => Object.assign(Promise.resolve(), { child: { kill: vi.fn() } }));
+    const handler = fixture.handlers.get("delegate_research")!;
+    const result = await handler({ question: "Where is X defined in ollama/ollama?", adapter: "github", model: "unmeasured-fixture:latest" },
+      { signal: new AbortController().signal });
+    expect(result.isError).toBeFalsy();
+    expect(fixture.exec.mock.calls[0]![2].env.FREELLAMA_BENCH_WORKSPACE).toBe("/mock-delegate");
+    const local = await handler({ question: "Where is X?", adapter: "bash", model: "unmeasured-fixture:latest" },
+      { signal: new AbortController().signal });
+    expect(local.isError).toBe(true);
+    expect(local.content[0].text).toMatch(/workspacePath is required for adapter "bash"/);
+    expect(fixture.exec).toHaveBeenCalledTimes(1);
+  });
+
   it("forwards the managed receipt as an MCP error and still removes temporary files", async () => {
     const receipt = {
       error: "physical placement is not verified: configured=gpu, observed=unknown",
@@ -164,7 +184,7 @@ describe("delegate_research refusal forwarding", () => {
       model_metadata: { execution_receipts: [{ model, execution: { model_digest: observed, observation: { resident: true, digest: observed } } }] },
     };
     fixture.exec.mockImplementation(() => Object.assign(Promise.resolve({ stdout: "", stderr: "" }), { child: { kill: vi.fn() } }));
-    const result = await fixture.handlers.get("delegate_research")!({ question: "Where is this declared?", workspacePath: process.cwd(), model },
+    const result = await fixture.handlers.get("delegate_research")!({ question: "Where is this declared?", workspacePath: REPO_ROOT, model },
       { signal: new AbortController().signal });
     expect(result.structuredContent.verification).toMatchObject({
       grounded: mode !== "diagnostic", recommendation: mode === "source" ? "accept" : mode === "diagnostic" ? "escalate" : "verify",

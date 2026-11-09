@@ -69,6 +69,23 @@ describe("runWithJobProgress", () => {
     expect(delays.at(-1)).toBe(250);
   });
 
+  it("repeats a long phase with its elapsed time so a waiting client still sees progress", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const loading = { status: "running", reason: "loading_model", selected_model: "m" };
+      const calls = scripted([loading, loading, loading, { status: "completed", result: {} }]);
+      const messages: string[] = [];
+      await runWithJobProgress(calls, (message) => messages.push(message), {
+        wait: async () => { vi.setSystemTime(Date.now() + 11_000); },
+      });
+      const repeats = messages.filter((message) => / \(\d+ s\)$/.test(message));
+      expect(repeats.length).toBeGreaterThanOrEqual(2);
+      expect(messages.at(-1)).toBe("completed");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("throws the error body the synchronous call would have thrown", async () => {
     const calls = scripted([{ status: "failed", error: { id: ID, ok: false, status: 409, error: "scope revision changed", code: "scope_conflict" } }]);
     await expect(runWithJobProgress(calls, () => undefined, { wait: noWait }))

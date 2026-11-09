@@ -366,6 +366,15 @@ After six capacity bypasses, the scheduler reserves released capacity for the ol
 so a stream of small requests cannot indefinitely starve a larger request. Cancellation releases
 that reservation. Admission, resource waiting, and transition locking share one queue deadline.
 
+Within the class the round robin picks, admission prefers model affinity: the oldest fitting waiter
+whose selected model has a task running on that backend, or was the backend's most recently
+admitted model, goes ahead of older waiters for other models, which would otherwise make Ollama
+load or swap a runner. Affinity never crosses priority classes, never admits a waiter that does not
+fit, and never overrides the capacity reservation. It is bounded by aging: a waiter passed over four
+times, or queued for two seconds, restores FIFO order for its class. Affinity uses only admission's
+own record of admitted work, never an Ollama call. Each pool's receipt counts
+`affinity_promotions`; health reports the bounds under `admission.priority_fairness.model_affinity`.
+
 A task waiting for host resources returns its execution slot after two seconds and continues
 waiting within the same deadline. It remains counted against the backend's bounded queue, so
 memory pressure cannot create an invisible backlog. Health reports slot and resource waiters
@@ -396,7 +405,10 @@ The K/V preflight derives single-sequence F16 K+V bytes-per-token for any archit
 metadata declares the block count and head counts. Explicit key/value dimensions take precedence
 over embedding length divided by heads; sliding-window, shared-KV, recurrent, cross-attention, and
 unknown layouts report unknown. F16 is advisory because quantized KV can
-use less memory. The coarse model-file budget refuses files over 80% of local CPU/unified RAM only
+use less memory: reservations scale it by each backend's `OLLAMA_KV_CACHE_TYPE` unless
+`OLLAMA_FLASH_ATTENTION` forces flash attention off (unset is Ollama's `auto`), and keep Ollama's
+F16 fit-check figure beside the quantized one to flag a load Ollama may evict or offload for
+([KV cache and flash attention](TUNING.md#kv-cache-and-flash-attention)). The coarse model-file budget refuses files over 80% of local CPU/unified RAM only
 for loopback backends. Forecasts use each backend's independently attributed parallelism and KV
 cache settings where process inspection is available, with explicit fallback sources otherwise.
 Process observations refresh on requests after five seconds; measurements made under different
@@ -443,7 +455,7 @@ Previews use the same footprint lookup, subtract existing reservations, and expo
 resource readiness. Insufficient model headroom reports `held_insufficient_capacity`, or
 `runnable_low_memory_estimate` under `--low-memory advisory`. Preview capacity is advisory and conservative, never a reservation.
 
-Managed CPU/unified-memory tasks reserve estimated additional model-file and known F16 KV bytes
+Managed CPU/unified-memory tasks reserve estimated additional model-file and known KV bytes
 across both backends. Verified runner footprints replace that estimate only for the same backend,
 immutable model digest, and equal-or-larger observed context. Exact resident digest/context matches
 avoid double-counting existing allocations. The reservation is rechecked after winning the load lock
@@ -459,8 +471,12 @@ that covers the UTF-8 prompt/schema estimate, output reserve, and 512-token temp
 by the selected model's advertised limit. Larger requests require explicit context or compaction.
 Multimodal and embedding requests retain their profiles. The execution receipt exposes
 `context_sizing`; previews contain routing fields only and therefore retain task defaults.
-Managed chat sends `truncate:false` and `shift:false` so supporting Ollama backends refuse overflow
-instead of silently losing earlier instructions. Managed embeddings send `truncate:false` too.
+Managed chat sends `truncate:false`, so supporting Ollama backends refuse an oversized prompt
+instead of silently losing earlier instructions, and by default `shift:false`, so a generation that
+reaches the context limit stops instead of discarding its earliest tokens. Ollama reloads a runner
+whose launch-time context-shift setting differs from a request's, so the runtime setting
+`context_shift = "ollama_default"` omits `shift` to share runners with raw clients that leave it at
+Ollama's default; `truncate:false` stays in both modes. Managed embeddings send `truncate:false` too.
 Thread selection defaults to Ollama on every platform. `FREELLAMA_CPU_NUM_THREAD` explicitly
 overrides the dedicated CPU backend; explicit request options take precedence. FreeLlama does not
 guess physical cores from half the logical CPU count. `runtime_options` reports forwarded values;
@@ -484,7 +500,12 @@ wait. The response body holds the model's use lease through EOF or disconnect. A
 allocation cannot be forecast is refused with 503 `model_forecast_unavailable`. Metadata GET/HEAD, `/api/show`, model-store calls (pull, push, copy, delete, and
 blob uploads), and empty `keep_alive:0` unload requests take no lock and bypass pressure. Raw
 inference waits at most two seconds for host pressure to clear, then returns 503 with `Retry-After`. Raw request-body collection has the configured request deadline too; an incomplete upload
-returns HTTP 408 and releases its guards without contacting Ollama. Admission receipts report
+returns HTTP 408 and releases its guards without contacting Ollama. Before any body is read, raw
+and control-API requests reserve its size (`Content-Length`, or the request limit when none is
+declared) from one process-wide buffered-body budget, `FREELLAMA_MAX_BUFFERED_BYTES` (256 MiB by
+default), and return it when the buffered body is released. A request that finds the budget full
+waits up to the raw queue wait (control API: the managed queue wait), then gets 503
+`request_body_budget_exhausted` with `Retry-After`; empty bodies reserve nothing. Admission receipts report
 `queue_wait_ms`, `resource_wait_ms`, `transition_wait_ms`, and
 their sum as `total_wait_ms`. Health and route receipts expose sampled pressure and reservations.
 
@@ -538,7 +559,7 @@ The same selection function supplies preview receipts and managed task execution
 estimate an execution payload it does not accept; its placement is a non-reserving snapshot.
 Execution receipts expose `completion_planning`, including estimated costs and whether the comparison
 influenced selection. Ollama's cached-token counts inform prefill-rate learning; FreeLlama does not
-export or manage KV tensors. See [implementation scope](OLLAMA_IMPLEMENTATION_PLAN.md).
+export or manage KV tensors.
 
 Raw proxy traffic always uses the primary upstream. For setup and runtime verification, see
 [Run models on CPU and GPU](CPU_GPU_ROUTING.md).

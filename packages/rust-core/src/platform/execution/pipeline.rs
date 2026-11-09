@@ -166,7 +166,9 @@ async fn run_admitted_task(
     let requested_cost = task_cost_for(input.route.task, batch_items, &state.tunables());
     let models =
         super::super::catalog::discover_for_route(&state, input.route.model.as_deref()).await?;
-    let sessions = state.sessions.read().await;
+    // Snapshot the small affinity map: holding the read guard across routing's Ollama calls
+    // queued every session write behind one `/api/ps`, and routing takes `feedback` next.
+    let sessions = state.sessions.read().await.clone();
     let mut managed = select_managed_route(
         &state,
         &input.route,
@@ -176,7 +178,6 @@ async fn run_admitted_task(
         Some(&input),
     )
     .await?;
-    drop(sessions);
     // A `vision` capability tag is metadata, not evidence the build reads images (MLX conversions
     // have shipped without the vision head). Automatic image routing therefore needs an operator
     // policy naming the model for `vision`; otherwise the caller names a model it has trialled.
@@ -271,7 +272,12 @@ async fn run_admitted_task(
     if immediate_unload {
         execution_receipt["keep_alive"] = json!({"mode":"explicit","value":0,"reason":"caller_immediate_unload_with_placement_observation","finite":true});
     }
-    let (path, mut body) = build_managed_request(&mut input, &decision, &keep_alive)?;
+    let (path, mut body) = build_managed_request(
+        &mut input,
+        &decision,
+        &keep_alive,
+        state.tunables().context_shift,
+    )?;
     // `/v1/systemone` reads no options, so CPU placement there rests on the backend process.
     if path != "/v1/systemone" {
         apply_execution_options(&mut body, &execution);
@@ -299,7 +305,7 @@ async fn run_admitted_task(
     let (mut slot, mut cost, mut queue_wait_ms) = if opportunistic {
         let permit = execution
             .admission
-            .try_acquire_idle(requested_cost as usize)
+            .try_acquire_idle(requested_cost as usize, Some(&decision.selected_model))
             .ok_or_else(|| opportunistic_skip("backend has active or queued work"))?;
         let cost = u32::try_from(permit.units()).unwrap_or(u32::MAX);
         (permit, cost, 0)
@@ -309,6 +315,7 @@ async fn run_admitted_task(
             &execution,
             requested_cost,
             input.priority,
+            &decision.selected_model,
             queue_deadline,
             None,
         )
@@ -477,6 +484,7 @@ async fn run_admitted_task(
                     &execution,
                     requested_cost,
                     input.priority,
+                    &decision.selected_model,
                     queue_deadline,
                     Some(resource_waiter),
                 )
@@ -614,6 +622,15 @@ async fn run_admitted_task(
         }
     };
     resource_wait_ms = resource_wait_ms.saturating_add(recheck_started.elapsed().as_millis());
+    // The recheck's available figure already subtracts this task's first reservation.
+    let admitted_available = resource_recheck
+        .receipt
+        .assessment
+        .as_ref()
+        .and_then(|assessment| assessment.effective_available_bytes)
+        .map(|bytes| bytes.saturating_add(resource_permit.receipt.reserved_bytes));
+    let mut footprint = footprint;
+    super::memory::annotate_ollama_preflight(&mut footprint, &execution, admitted_available);
     execution_receipt["resource_revalidation"] = json!(resource_recheck.receipt);
     let previous = execution_receipt["memory_reservation"].clone();
     execution_receipt["memory_reservation"] = footprint;

@@ -1,3 +1,4 @@
+import { WORKFLOW_NAMES } from "../../src/local-prompts.js";
 // Protocol-completeness checks: every tool must advertise machine-readable behaviour hints, and
 // every non-error result must actually carry structured content. These are the parts a client
 // reads to decide whether to prompt a human and how to parse a result — prose in a description
@@ -16,7 +17,7 @@ import { connectClient, REPO_ROOT, serveAuthHeaders, serveIsUp, SERVE_ENDPOINT }
 type Tool = { name: string; description?: string; annotations?: any; outputSchema?: any; inputSchema?: any; title?: string };
 type ToolResult = { isError?: boolean; content: { text: string }[]; structuredContent?: any };
 
-const EXPECTED_TOOLS = ["doctor", "models", "run_task", "task_jobs", "session", "ollama_manage", "ollama_delete", "delegate_research", "scope", "read_response", "audio"];
+const EXPECTED_TOOLS = ["doctor", "models", "run_task", "task_jobs", "session", "ollama_manage", "ollama_pull", "ollama_delete", "delegate_research", "scope", "read_response", "audio", "sweep"];
 
 // Whether `freellama serve` is up decides which half of the contract is checkable.
 const serveUp = await serveIsUp();
@@ -57,16 +58,20 @@ describe("tool contract", () => {
     expect(instructions).toMatch(/Offload when what you send plus what you read back costs less/);
     expect(instructions).toMatch(/10 or more similar items, or an input over about 2,000 tokens/);
     expect(instructions).toMatch(/Do it yourself: judgment you must stand behind/);
-    expect(instructions).toMatch(/Name inputs with files \(paths or globs such as src\/\*\*\/\*\.rs, under the server's working directory, the temp directory or FREELLAMA_FILE_ROOTS\); pasted text and base64 images are your own output tokens/);
-    expect(instructions).toMatch(/Put what a batch's items share \(task, model, systemPrompt, questions, tools\) once at the top level/);
-    expect(instructions).toMatch(/Pass model from models\{view:"catalog", job\}.*routing without model picks by capability only and may choose one that does not fit now/);
+    expect(instructions).toMatch(/Name inputs with files \(paths or globs under the server's working directory, the temp directory or FREELLAMA_FILE_ROOTS\); pasted text and base64 images are your own output tokens/);
+    expect(instructions).toMatch(/One task reads all its files together, so a glob gives one answer; for one answer per file send tasks:\[\{id, independent:true, task:\{files:\[path\]\}\}\]/);
+    expect(instructions).toMatch(/what the items share \(task, model, systemPrompt, questions, tools, format, options\) once at the top level/);
+    expect(instructions).toMatch(/Hosts cut calls near 60 s: for a cold load, a long input or a large batch pass defer:true/);
+    expect(instructions).toMatch(/For a large divisible check .* use sweep: it judges small chunks in the background, saves each result/);
+    expect(instructions).toMatch(/models\{view:"catalog", job\}.*pass that pick as model: routing without model picks by capability only and may choose one that does not fit now/);
     expect(instructions).toMatch(/Keep one model per batch when you can; each extra model is a load and may evict another/);
     expect(instructions).toMatch(/Warming a model saves local time, not your tokens/);
     expect(instructions).toMatch(/You own prompts, output format and verification: local answers are candidates/);
     expect(instructions).toMatch(/treat low decision probabilities as unknown/);
-    expect(instructions).toMatch(/models\{view:"catalog"\}.*freellama:\/\/docs\/cookbooks\/<job>.*models\{view:"installed"\}.*doctor\{view:"status"\}.*Choose by capability, not by name/s);
+    expect(instructions).toMatch(/models\{view:"catalog", job\}.*freellama:\/\/docs\/cookbooks\/<job>.*doctor\{view:"status"\} when a call fails.*Choose by capability, not by name/s);
     expect(instructions).toMatch(/never stop their processes, then retry once they free memory, or use a smaller installed model with the same capability/);
-    expect(instructions).toMatch(/before ollama_manage pull, ask the user for one exact tag and its reported size; search results are not permission/);
+    expect(instructions).toMatch(/before ollama_pull, ask the user for one exact tag \(name:tag\) and its reported size, and pass that size as approvedSizeBytes; search results are not permission/);
+    expect(instructions).toMatch(/check isError first, then read the text/);
     expect(instructions).toMatch(/Unload only a model you warmed \(when its burst ends\) or one the user named; delete only a tag the user names/);
     expect(instructions).toContain("A server restart loses scopes, sessions and jobs");
     expect(instructions).toMatch(/executionPreference only chooses among eligible backends/);
@@ -89,7 +94,8 @@ describe("tool contract", () => {
     expect(runTask.inputSchema.properties.nearest.description).toMatch(/default 5, max 100/);
     expect(runTask.inputSchema.properties.maxWaitSeconds.description).toMatch(/max_queue_wait_seconds.*wait_limit/);
     expect(byName.get("ollama_manage")!.inputSchema.properties.maxWaitSeconds.description).toMatch(/max_queue_wait_seconds.*wait_limit/);
-    expect(byName.get("ollama_manage")!.description).toMatch(/pull downloads one exact tag the user approved with its size/);
+    expect(byName.get("ollama_manage")!.description).toMatch(/Do not use when: downloading \(ollama_pull; action pull is deprecated and refused\)/);
+    expect(byName.get("ollama_pull")!.inputSchema.required).toContain("approvedSizeBytes");
     expect(byName.get("ollama_manage")!.description).toMatch(/unload frees memory \(a model you warmed or the user named\)/);
     expect(byName.get("task_jobs")!.description).toMatch(/run_task \{defer:true\}/);
     expect(byName.get("delegate_research")!.description).toMatch(/killed after 180 s.*near 60 s/);
@@ -99,8 +105,8 @@ describe("tool contract", () => {
     const requiredTaskFields = byName.get("run_task")!.inputSchema.required ?? [];
     expect(requiredTaskFields).not.toContain("scopeId");
     expect(requiredTaskFields).not.toContain("scopeRevision");
-    expect(instructions).toContain("check isError first; prefer structuredContent");
-    expect(instructions).toContain("Pass page.next_cursor back unchanged");
+    expect(instructions).toContain("check isError first, then read the text");
+    expect(instructions).toContain("Pass page.next_cursor (models) and next_offset (read_response) back unchanged");
     expect(byName.get("delegate_research")!.description).toContain("discard verification.recommendation=escalate");
   });
 
@@ -199,10 +205,10 @@ describe("tool contract", () => {
       timeoutSeconds: 1,
     });
     expect(stopTimeout.isError).toBe(true);
-    expect(stopTimeout.content[0].text).toMatch(/valid only for actions "pull" and "warm"/);
+    expect(stopTimeout.content[0].text).toMatch(/valid only for action "warm" \(and for ollama_pull\)/);
     const warmField = await call("ollama_manage", { action: "pull", model: "x:1", systemPrompt: "s" });
     expect(warmField.isError).toBe(true);
-    expect(warmField.content[0].text).toMatch(/`systemPrompt` applies to action "warm" only/);
+    expect(warmField.content[0].text).toMatch(/no longer downloads.*ollama_pull/);
 
     const createWithId = await call("session", { action: "create", sessionId: "00000000-0000-4000-8000-000000000000" });
     expect(createWithId.isError).toBe(true);
@@ -298,13 +304,10 @@ describe("tool contract", () => {
     }
   });
 
-  it("marks model deletion, session termination, and scope history deletion machine-readably destructive", () => {
+  it("marks model deletion machine-readably destructive; job, session and scope actions touch only the caller's own records", () => {
     expect(byName.get("ollama_delete")!.annotations.destructiveHint).toBe(true);
     expect(tools.filter((tool) => tool.annotations?.destructiveHint === true).map((tool) => tool.name).sort()).toEqual([
       "ollama_delete",
-      "scope",
-      "session",
-      "task_jobs",
     ]);
     // Belt and braces: the prose warning must survive too.
     expect(byName.get("ollama_delete")!.description).toMatch(/DESTRUCTIVE AND IRREVERSIBLE/);
@@ -527,9 +530,9 @@ describe("tool contract", () => {
     expect(Date.now() - started).toBeLessThan(5000);
   });
 
-  it("delegate_research offers exactly its three adapters", () => {
+  it("delegate_research offers exactly its four adapters", () => {
     const adapterTool = byName.get("delegate_research")!;
-    expect([...adapterTool.inputSchema.properties.adapter.enum].sort()).toEqual(["bash", "github", "octocode"]);
+    expect([...adapterTool.inputSchema.properties.adapter.enum].sort()).toEqual(["bash", "coder", "github", "octocode"]);
   });
 
   it("delegate_research exposes typed budgets and keeps deployment tuning out of requests", () => {
@@ -543,7 +546,10 @@ describe("tool contract", () => {
     expect(properties.contextTokens.type).toBe("integer");
     expect(properties.maxTurns.exclusiveMinimum).toBe(0);
     expect(properties.outputTokens.exclusiveMinimum).toBe(0);
-    expect(Object.keys(properties).sort()).toEqual(["contextTokens", "maxTurns", "outputTokens"]);
+    expect(Object.keys(properties).sort()).toEqual(["commands", "contextTokens", "maxTurns", "outputTokens", "timeoutSeconds"]);
+    expect(properties.commands.maxItems).toBe(10);
+    // Bigger models need longer runs; the caller may extend up to 30 minutes.
+    expect(properties.timeoutSeconds.maximum).toBe(1800);
     expect(properties.retryAttempts).toBeUndefined();
     expect(properties.context).toBeUndefined();
     expect((agent.anyOf?.[0] ?? agent).additionalProperties).toBe(false);
@@ -568,15 +574,43 @@ describe("tool contract", () => {
     // catalog, which replace pasted inputs, per-item repetition and returned vectors worth far more;
     // 7,223 before the 2026-11-07 rewrite, 5,416 after it (prose halved where another layer already
     // said it, and the batch item schema lists only the fields that differ per item), 5,607 after the
-    // 2026-11-07 usage rules (catalog pick, one model per batch, shared tools, tool_calls and OCR notes).
+    // 2026-11-07 usage rules (catalog pick, one model per batch, shared tools, tool_calls and OCR notes),
+    // 6,752 on 2026-11-08 with two tools that replace agent work worth far more: sweep (674: chunked
+    // background checks the agent would otherwise read whole) and ollama_pull (242: size-checked pull
+    // approval), plus the glob, defer and sweep rules in the instructions; 7,157 with run_task workflow
+    // (step-by-step local-model instructions per task, which replace per-task prompting by the agent);
+    // 6,800 before and 6,956 after
+    // the 2026-11-08 job mode: run_task `job` (62) and `saveAs` (32), sweep `saveAs` (30) and one
+    // instruction sentence (32), which replace the prompt, options and prefixes an agent would write;
+    // +60 for delegate_research adapter "coder" and agent.commands (edits an isolated copy, returns a diff).
     const modelFacing = tools.map(({ name, description, inputSchema }) => ({ name, description, inputSchema }));
     const surfaceTokens = Math.round(
       (JSON.stringify(modelFacing).length + (client.getInstructions() ?? "").length) / 4,
     );
-    expect(surfaceTokens, `model-facing surface grew to ~${surfaceTokens} tokens`).toBeLessThan(5700);
-    // The whole tools/list payload, output schemas included (7,522 tokens on 2026-11-01, 6,412 on 2026-11-07).
+    expect(surfaceTokens, `model-facing surface grew to ~${surfaceTokens} tokens`).toBeLessThan(7250);
+    // The whole tools/list payload, output schemas included (7,522 tokens on 2026-11-01, 6,412 on 2026-11-07,
+    // 7,846 on 2026-11-08 with sweep and ollama_pull, 7,890 before and 8,055 after job mode).
     const wireTokens = Math.round((JSON.stringify(tools).length + (client.getInstructions() ?? "").length) / 4);
-    expect(wireTokens, `tools/list grew to ~${wireTokens} tokens`).toBeLessThan(6730);
+    expect(wireTokens, `tools/list grew to ~${wireTokens} tokens`).toBeLessThan(8350);
+  });
+
+  it("offers one prompt per job, each returning the exact call, and the freellama guide", async () => {
+    const { prompts } = await client.listPrompts();
+    // One prompt per workflow (from local-prompts.ts), plus the tools that take no instructions.
+    expect(prompts.map((prompt) => prompt.name).sort()).toEqual([
+      ...WORKFLOW_NAMES, "classify", "duplicates", "find-code", "freellama", "github-research", "research", "sweep",
+    ].sort());
+    const table = await client.getPrompt({ name: "read-table", arguments: { files: "shots/error.png" } });
+    expect((table.messages[0]!.content as { text: string }).text).toContain('run_task {"workflow":"read-table","files":["shots/error.png"]}');
+    const fix = await client.getPrompt({ name: "fix-bug", arguments: { files: "src/a.ts", request: "TypeError: x is undefined" } });
+    expect((fix.messages[0]!.content as { text: string }).text).toMatch(/"workflow":"fix-bug".*SEARCH text occurs exactly once/s);
+    const guide = await client.getPrompt({ name: "freellama" });
+    expect((guide.messages[0]!.content as { text: string }).text).toMatch(/approves one exact tag and its size/);
+    expect(client.getInstructions()).toMatch(/run_task\{workflow\} \(fix-bug, write-tests.*\) or run_task\{job\}: FreeLlama picks the model and gives it step-by-step instructions/);
+    expect(byName.get("run_task")!.inputSchema.properties.workflow.enum).toEqual(WORKFLOW_NAMES);
+    expect(byName.get("run_task")!.inputSchema.properties.job.enum).toEqual([
+      "classify", "find-code", "duplicates", "ocr", "image-recognition", "image-search", "coding", "summarize",
+    ]);
   });
 
   it("lists self-contained schemas with no $ref and no $schema dialect key", () => {

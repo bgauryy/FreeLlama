@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 
 use super::super::error::ApiError;
 use super::super::{
-    Backend, CatalogModel, OllamaRequestOptions, RouteDecision, TaskInput, TaskKind,
+    Backend, CatalogModel, ContextShift, OllamaRequestOptions, RouteDecision, TaskInput, TaskKind,
 };
 use super::ExecutionTarget;
 
@@ -386,10 +386,21 @@ fn refuse_oversized_embedding_items(input: &Value, window: Option<u64>) -> Resul
     .with_code("embedding_item_exceeds_context"))
 }
 
+/// Add `shift: false` to a managed chat body unless the operator chose Ollama's default.
+/// `truncate: false` is sent in both modes, so an oversized prompt is always refused.
+fn apply_context_shift(body: &mut Value, context_shift: ContextShift) {
+    if context_shift == ContextShift::Off
+        && let Some(object) = body.as_object_mut()
+    {
+        object.insert("shift".to_owned(), json!(false));
+    }
+}
+
 pub(crate) fn build_managed_request(
     input: &mut TaskInput,
     decision: &RouteDecision,
     keep_alive: &Value,
+    context_shift: ContextShift,
 ) -> Result<(&'static str, Value), ApiError> {
     if matches!(input.route.task, TaskKind::Decision) {
         return build_decision_request(input, decision, keep_alive);
@@ -420,18 +431,16 @@ pub(crate) fn build_managed_request(
         if !messages.is_empty() {
             options["num_predict"] = json!(0);
         }
-        return Ok((
-            "/api/chat",
-            json!({
-                "model": decision.selected_model,
-                "messages": messages,
-                "stream": false,
-                "truncate": false,
-                "shift": false,
-                "keep_alive": keep_alive,
-                "options": options,
-            }),
-        ));
+        let mut body = json!({
+            "model": decision.selected_model,
+            "messages": messages,
+            "stream": false,
+            "truncate": false,
+            "keep_alive": keep_alive,
+            "options": options,
+        });
+        apply_context_shift(&mut body, context_shift);
+        return Ok(("/api/chat", body));
     }
     if matches!(input.route.task, TaskKind::Embedding) {
         let value = input
@@ -476,10 +485,10 @@ pub(crate) fn build_managed_request(
                 && input.request_options.format.is_none()
         }),
         "truncate": false,
-        "shift": false,
         "keep_alive": keep_alive,
         "options": decision.options,
     });
+    apply_context_shift(&mut body, context_shift);
     body.as_object_mut()
         .expect("request body is an object")
         .extend(

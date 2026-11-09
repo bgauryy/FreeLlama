@@ -141,7 +141,12 @@ describe.runIf(releaseServeAvailable)("behavior: every tool against the live sys
 
     const tags = (await call("models", { view: "library", model: "qwen3-vl" }, 60_000)).structuredContent;
     expect(tags.recommendation).toBeTruthy();
-    expect(tags.tags.every((entry: any) => entry.fitScope === "host_memory_budget_only")).toBe(true);
+    // With serve's live memory the scope also covers what is free now; without it, the host budget only.
+    expect(tags.tags.every((entry: any) => ["host_memory_budget_only", "host_budget_and_free_memory_now"].includes(entry.fitScope))).toBe(true);
+    if (typeof tags.availableBytesNow === "number") {
+      const pick = tags.tags.find((entry: any) => entry.tag === tags.recommendation.tag);
+      expect(pick.fitsNow === true || typeof tags.recommendation.memoryNow === "string").toBe(true);
+    }
     expect(tags.tags.find((entry: any) => entry.tag === tags.recommendation.tag)?.fitsInMemory).toBe(true);
     // A 235B model must not be reported as fitting this machine.
     expect(tags.tags.some((entry: any) => (entry.sizeBytes ?? 0) > 100e9 && entry.fitsInMemory === false)).toBe(true);

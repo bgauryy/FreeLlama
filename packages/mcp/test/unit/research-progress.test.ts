@@ -1,5 +1,5 @@
 // delegate_research progress: adapter events, the stderr line protocol, and their MCP messages.
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -134,6 +134,9 @@ describe("research loop progress", () => {
     const root = mkdtempSync(path.join(tmpdir(), "freellama-progress-test-"));
     roots.push(root);
     writeFileSync(path.join(root, "prompt.txt"), "Where is foo?", "utf8");
+    // The answer cites src/a.ts; it exists, so the answer passes the cited-path check.
+    mkdirSync(path.join(root, "src"), { recursive: true });
+    writeFileSync(path.join(root, "src", "a.ts"), "foo", "utf8");
     const replies = [
       { action: "shell", command: "grep -rn foo src" },
       "not json",

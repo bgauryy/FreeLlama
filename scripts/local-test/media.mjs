@@ -2,7 +2,7 @@
 // Audio and multimodal embeddings through the real MCP server, one small model at a time:
 // speak known sentences (text to speech), transcribe them back (speech to text) and score the word
 // error; translate one; rank rendered screenshots against text queries with a multimodal
-// embedding model; compare it with nomic on code search. Writes LOCAL_MEDIA.md.
+// embedding model; compare it with nomic on code search. Writes .octocode/local-test/LOCAL_MEDIA.md (git-ignored).
 // Usage: node scripts/local-test/media.mjs [serve]
 import { execFileSync, spawn } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
@@ -144,6 +144,7 @@ for (const row of rows) log(row);
 log(`\nRight file in the top 3: nomic **${hits[NOMIC]}/${CODE.length}**, embeddinggemma-2 **${hits[MM]}/${CODE.length}**.\n`);
 for (const model of [NOMIC, MM]) await call("ollama_manage", { action: "unload", model });
 
-writeFileSync(path.join(ROOT, "LOCAL_MEDIA.md"), `${lines.join("\n")}\n`);
+mkdirSync(path.join(ROOT, ".octocode", "local-test"), { recursive: true });
+writeFileSync(path.join(ROOT, ".octocode", "local-test", "LOCAL_MEDIA.md"), `${lines.join("\n")}\n`);
 mcp.kill();
 process.exit(0);

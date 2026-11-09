@@ -38,8 +38,8 @@ use forward::{AdmissionTimings, ForwardRequest, forward_managed_task};
 pub(super) use memory::memory_kv_preflight_with_memory;
 use memory::{Forecast, memory_kv_preflight, reserve_task_resources};
 pub(super) use memory::{
-    cold_model_memory_requirement, evict_idle_models, host_memory_relevant, make_room,
-    model_memory_requirement, requested_context,
+    annotate_ollama_preflight, cold_model_memory_requirement, evict_idle_models,
+    host_memory_relevant, make_room, model_memory_requirement, requested_context,
 };
 pub(super) use observe::physical_placement_observation;
 use observe::resident_entry;

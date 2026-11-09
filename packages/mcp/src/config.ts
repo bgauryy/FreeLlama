@@ -1,6 +1,6 @@
 // Environment-derived configuration and the `delegate_research` workspace boundary.
 // Every default is overridable via an env var so no deployment needs a recompile.
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { realpath } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -42,11 +42,13 @@ function adapterPath(file: string): string {
 }
 
 // Interchangeable research adapters with one env contract and result shape: `bash` (the default),
-// `octocode` (the installed CLI's local tools) and `github` (its GitHub tools).
+// `octocode` (the installed CLI's local tools), `github` (its GitHub tools) and `coder` (edits and
+// runs allowed commands in an isolated copy; operator opt-in with FREELLAMA_MCP_ALLOW_CODER=1).
 export const RESEARCH_ADAPTERS = {
   bash: adapterPath("bash-agent.js"),
   octocode: adapterPath("octocode-agent.js"),
   github: adapterPath("github-agent.js"),
+  coder: adapterPath("coder-agent.js"),
 } as const;
 export type ResearchAdapter = keyof typeof RESEARCH_ADAPTERS;
 
@@ -73,6 +75,20 @@ export const DEFAULT_SERVE_ENDPOINT = process.env.FREELLAMA_SERVE_ENDPOINT ?? "h
 export const DEFAULT_DELEGATE_MODEL: string | undefined = process.env.FREELLAMA_MCP_DEFAULT_MODEL?.trim() || undefined;
 export const DEFAULT_DELEGATE_MAX_TURNS = envInt("FREELLAMA_MCP_MAX_TURNS", 8);
 export const DEFAULT_DELEGATE_TIMEOUT_SECONDS = envInt("FREELLAMA_MCP_DELEGATE_TIMEOUT_SECONDS", 180);
+
+/** The longest research run a caller may ask for. */
+export const MAX_DELEGATE_TIMEOUT_SECONDS = 1_800;
+
+/**
+ * How long a research run may take: the configured default for a model up to 4 GB, plus 20 s per
+ * further GB (a 27B model decodes several times slower than a 3B), at most 20 minutes; an explicit
+ * `agent.timeoutSeconds` wins.
+ */
+export function researchTimeoutSeconds(sizeBytes: number | undefined, requested: number | undefined): number {
+  if (requested !== undefined) return Math.min(requested, MAX_DELEGATE_TIMEOUT_SECONDS);
+  const extraGb = sizeBytes ? Math.max(0, sizeBytes / 1e9 - 4) : 0;
+  return Math.min(Math.round(DEFAULT_DELEGATE_TIMEOUT_SECONDS + extraGb * 20), 1_200);
+}
 export const DEFAULT_PULL_TIMEOUT_SECONDS = envInt("FREELLAMA_MCP_PULL_TIMEOUT_SECONDS", 1200);
 export const DEFAULT_OLLAMA_FETCH_TIMEOUT_SECONDS = envInt("FREELLAMA_MCP_FETCH_TIMEOUT_SECONDS", 30);
 // The FreeLlama home, shared with `serve` (packages/rust-core/src/store.rs `default_home`).
@@ -114,29 +130,65 @@ function allowedResearchRoots(): Promise<string[]> {
   return resolvedRootsPromise;
 }
 
-export async function assertAllowedWorkspace(workspacePath: string): Promise<string> {
+/** The real path of `dir`, or its lexical form when it cannot be resolved. */
+function realDirectory(dir: string): string {
+  try {
+    return realpathSync(dir);
+  } catch {
+    return path.resolve(dir);
+  }
+}
+
+/**
+ * Make `workspacePath` absolute. A relative path resolves against the server's working directory,
+ * by the rule `files` uses (task-files.ts `fileRoots`): only when that directory is a project, not
+ * `/` or the home directory a host may start the server from.
+ */
+export function resolveWorkspacePath(workspacePath: string, cwd = process.cwd(), home = homedir()): string {
+  if (path.isAbsolute(workspacePath)) return workspacePath;
+  const working = realDirectory(cwd);
+  if (working === realDirectory(path.parse(path.resolve(cwd)).root) || working === realDirectory(home)) {
+    throw new Error(
+      `workspacePath "${workspacePath}" is relative, and the server's working directory (${cwd}) is ` +
+        "the filesystem root or the home directory, so it names no project. Pass an absolute path to the directory to research.",
+    );
+  }
+  return path.resolve(cwd, workspacePath);
+}
+
+/** The refusal for an install with no research roots: what to set, with an example. */
+export function missingResearchRootsMessage(workspacePath: string): string {
+  const example = path.delimiter === ";" ? "C:\\code\\project;D:\\work" : "/Users/me/code/project:/Users/me/work";
+  return (
+    `workspacePath "${workspacePath}" is rejected: delegate_research has no allowed research roots. ` +
+    "A published install requires FREELLAMA_MCP_ALLOWED_ROOTS in the MCP server's environment (the `env` of its client config), " +
+    `a list of absolute directories separated by "${path.delimiter}", for example FREELLAMA_MCP_ALLOWED_ROOTS="${example}". ` +
+    "Ask the user which directories it may read, then restart the server. run_task `files` uses FREELLAMA_FILE_ROOTS instead; " +
+    "a FreeLlama checkout defaults to its repo root."
+  );
+}
+
+export async function assertAllowedWorkspace(
+  workspacePath: string,
+  options: { roots?: string[]; cwd?: string; home?: string } = {},
+): Promise<string> {
   // `realpath`, not just `path.resolve`: resolve() is pure string arithmetic, so a symlink placed
   // inside an allowed root and pointing at $HOME (or /) passes a prefix check while actually
   // handing the local model everything on the other side of the link. The roots go through
   // realpath too, or the comparison would fail legitimately on macOS, where paths like /tmp are
   // themselves symlinks.
+  const absolute = resolveWorkspacePath(workspacePath, options.cwd, options.home);
   let resolved: string;
   try {
-    resolved = await realpath(path.resolve(workspacePath));
+    resolved = await realpath(absolute);
   } catch {
     throw new Error(
-      `workspacePath "${workspacePath}" does not exist or is not readable. It must be an ` +
-        "absolute path to a directory that exists on this machine.",
+      `workspacePath "${workspacePath}"${absolute === workspacePath ? "" : ` (resolved to ${absolute})`} does not exist or is not readable. ` +
+        "It must be a directory that exists on this machine.",
     );
   }
-  const roots = await allowedResearchRoots();
-  if (roots.length === 0) {
-    throw new Error(
-      `workspacePath "${workspacePath}" is rejected because no research roots are configured. ` +
-        "Set FREELLAMA_MCP_ALLOWED_ROOTS (a platform-separated list of absolute paths) to the directories " +
-        "`delegate_research` may read. In a FreeLlama checkout this defaults to the repo root.",
-    );
-  }
+  const roots = options.roots ? options.roots.map(realDirectory) : await allowedResearchRoots();
+  if (roots.length === 0) throw new Error(missingResearchRootsMessage(workspacePath));
   const allowed = roots.some(
     (root) => resolved === root || resolved.startsWith(`${root}${path.sep}`),
   );
@@ -159,6 +211,8 @@ const DELEGATE_ENV_ALLOWLIST = new Set([
   "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy",
   "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE",
   "XDG_CACHE_HOME", "XDG_DATA_HOME", "npm_config_cache",
+  // Toolchain homes the coder adapter's allowed commands (cargo, corepack) resolve from.
+  "CARGO_HOME", "RUSTUP_HOME", "COREPACK_HOME",
 ]);
 
 export function delegateEnvironment(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {

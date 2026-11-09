@@ -14,7 +14,9 @@ import { installProcessLifecycle } from "./lifecycle.js";
 import { startServeInBackground } from "./serve.js";
 import { withNormalizedToolSchemas } from "./schema-dialect.js";
 import { withToolResults } from "./tool-results.js";
+import { useLogLevelFilter } from "./progress.js";
 import { registerDocsResources } from "./docs-resources.js";
+import { registerBuiltinPrompts } from "./builtin-prompts.js";
 import { registerDoctorTool } from "./tools/doctor.js";
 import { registerSessionTool } from "./tools/session.js";
 import { registerModelsTool } from "./tools/models.js";
@@ -25,26 +27,37 @@ import { registerOllamaLifecycleTools } from "./tools/ollama-lifecycle.js";
 import { registerDelegateResearchTool } from "./tools/delegate-research.js";
 import { registerReadResponseTool } from "./tools/read-response.js";
 import { registerAudioTool } from "./tools/audio.js";
+import { registerSweepTool } from "./tools/sweep.js";
 
 installProcessLifecycle();
 
 const INSTRUCTIONS = `FreeLlama runs bounded work on local Ollama models so you spend fewer of your own tokens. Offload when what you send plus what you read back costs less than doing the work yourself and the answer is cheap to check: 10 or more similar items, or an input over about 2,000 tokens that you would otherwise read whole. Do it yourself: judgment you must stand behind (security review, design, merge decisions), edits across files, or one short item.
 
-Start with models{view:"catalog"} (tested picks per job; cookbooks at freellama://docs/cookbooks/<job>), then models{view:"installed"} and doctor{view:"status"}. Choose by capability, not by name. Pass model from models{view:"catalog", job} for the job: routing without model picks by capability only and may choose one that does not fit now. Keep one model per batch when you can; each extra model is a load and may evict another.
+Start with models{view:"catalog", job} (tested picks per job, whether each is installed and fits now; cookbooks at freellama://docs/cookbooks/<job>), and pass that pick as model: routing without model picks by capability only and may choose one that does not fit now. Or pass run_task{workflow} (fix-bug, write-tests, review-code, summarize-log, extract-json, read-fields, describe-screen...) or run_task{job}: FreeLlama picks the model and gives it step-by-step instructions for the task (your fields win); MCP prompts show each workflow's call. Call doctor{view:"status"} when a call fails or before a large batch. Choose by capability, not by name. Keep one model per batch when you can; each extra model is a load and may evict another.
 
-Name inputs with files (paths or globs such as src/**/*.rs, under the server's working directory, the temp directory or FREELLAMA_FILE_ROOTS); pasted text and base64 images are your own output tokens. Put what a batch's items share (task, model, systemPrompt, questions, tools) once at the top level. Warming a model saves local time, not your tokens.
+Name inputs with files (paths or globs under the server's working directory, the temp directory or FREELLAMA_FILE_ROOTS); pasted text and base64 images are your own output tokens. One task reads all its files together, so a glob gives one answer; for one answer per file send tasks:[{id, independent:true, task:{files:[path]}}] (up to 64), with what the items share (task, model, systemPrompt, questions, tools, format, options) once at the top level. For a large divisible check (code tree, logs, docs site) use sweep: it judges small chunks in the background, saves each result and reports only flagged or changed chunks. Hosts cut calls near 60 s: for a cold load, a long input or a large batch pass defer:true and poll task_jobs{action:"get", jobId}. Warming a model saves local time, not your tokens.
 
 You own prompts, output format and verification: local answers are candidates, so check 3 to 5 (more where a mistake costs more) before relying on the rest, and treat low decision probabilities as unknown.
 Memory: a refusal names the programs holding memory; tell the user and never stop their processes, then retry once they free memory, or use a smaller installed model with the same capability.
-Approval: before ollama_manage pull, ask the user for one exact tag and its reported size; search results are not permission. Unload only a model you warmed (when its burst ends) or one the user named; delete only a tag the user names.
-Results: check isError first; prefer structuredContent. Pass page.next_cursor back unchanged. A server restart loses scopes, sessions and jobs. CPU/GPU placement is operator-configured; executionPreference only chooses among eligible backends. Docs: freellama://docs/index.`;
+Approval: before ollama_pull, ask the user for one exact tag (name:tag) and its reported size, and pass that size as approvedSizeBytes; search results are not permission. Unload only a model you warmed (when its burst ends) or one the user named; delete only a tag the user names.
+Results: check isError first, then read the text; open structuredContent or read_response{file:response_file, section} only for a receipt field your next step needs. Pass page.next_cursor (models) and next_offset (read_response) back unchanged. A server restart loses scopes, sessions and jobs. CPU/GPU placement is operator-configured; executionPreference only chooses among eligible backends. Docs: freellama://docs/index.`;
 
 const server = withToolResults(new McpServer(
   { name: "freellama", version: SERVER_VERSION },
   { instructions: INSTRUCTIONS, capabilities: { logging: {} } },
 ));
 
+// Log notices honor the client's logging/setLevel, which the SDK applies only to its own sender.
+{
+  const core = server.server as unknown as { isMessageIgnored?: (level: string, sessionId?: string) => boolean };
+  if (typeof core.isMessageIgnored === "function") {
+    const ignored = core.isMessageIgnored.bind(core);
+    useLogLevelFilter((level, sessionId) => ignored(level, sessionId));
+  }
+}
+
 registerDocsResources(server);
+registerBuiltinPrompts(server);
 // Registration order is the tools/list order clients display.
 registerDoctorTool(server);
 registerSessionTool(server);
@@ -55,6 +68,7 @@ registerTaskJobsTool(server);
 registerOllamaLifecycleTools(server);
 registerDelegateResearchTool(server);
 registerAudioTool(server);
+registerSweepTool(server);
 registerReadResponseTool(server);
 
 const transport = withNormalizedToolSchemas(new StdioServerTransport());

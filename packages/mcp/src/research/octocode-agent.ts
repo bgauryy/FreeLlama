@@ -5,7 +5,6 @@
 //
 // Run as `node octocode-agent.js` with FREELLAMA_TARGET_MODEL (or FREELLAMA_BENCH_MODEL),
 // FREELLAMA_BENCH_WORKSPACE, FREELLAMA_BENCH_PROMPT and FREELLAMA_AGENT_RESULT set.
-import { pathToFileURL } from "node:url";
 import { type Action, type AdapterSpec, isPositiveInt } from "./adapter.js";
 import { runAdapter } from "./agent-loop.js";
 import { parseJsonAction } from "./actions.js";
@@ -15,6 +14,9 @@ import { runProcess } from "./proc.js";
 import { githubSystemPrompt, octocodeSystemPrompt } from "./prompts.js";
 import { trimSpace } from "./text.js";
 import { escapesRoot, joinPath, resolvePath } from "./workspace-path.js";
+import { workspaceOverview } from "./workspace-overview.js";
+import { runGh, validateGhArgs } from "./gh-action.js";
+import { isEntry } from "./entry.js";
 
 export const OCTOCODE_TOOLS: ReadonlySet<string> = new Set([
   "structureSearch", "localSearch", "localFetch", "astSearch", "lspSearch",
@@ -58,11 +60,15 @@ function normalizeAction(value: Action, tools: ReadonlySet<string>): Action {
   return { action: "octocode", tool, ...(query === undefined ? {} : { queries: query }) } as Action;
 }
 
-function actionParser(tools: ReadonlySet<string>) {
+function actionParser(tools: ReadonlySet<string>, gh = false) {
   const names = [...tools].sort().join(", ");
   return (content: string): Action => {
     const value = normalizeAction(parseJsonAction(content), tools);
     const action = value.action;
+    if (gh && action === "gh") {
+      validateGhArgs(value.args);
+      return value;
+    }
     if (action === "octocode") {
       const tool = value.tool;
       if (typeof tool !== "string" || !tools.has(tool)) {
@@ -80,7 +86,7 @@ function actionParser(tools: ReadonlySet<string>) {
       throw new ValidationError("finish action requires a string answer");
     }
     if (action !== "octocode" && action !== "page" && action !== "finish") {
-      throw new ValidationError(`unsupported action for octocode adapter: ${String(action)}`);
+      throw new ValidationError(`unsupported action for octocode adapter: ${String(action)}${gh ? " (use octocode, gh, page or finish)" : ""}`);
     }
     return value;
   };
@@ -121,13 +127,26 @@ function adapterFor(options: {
   prompt: (workspace: string) => string;
   run: typeof runOctocode;
   metadata: string;
+  briefing?: (workspace: string) => string;
+  /** Also accept the read-only `gh` action (GitHub adapter). */
+  gh?: boolean;
 }): AdapterSpec {
   return {
     defaultToolTimeoutSeconds: 45,
     systemPrompt: options.prompt,
-    parseAction: actionParser(options.tools),
+    ...(options.briefing ? { briefing: options.briefing } : {}),
+    parseAction: actionParser(options.tools, options.gh),
     open: () => ({
       toolCall: (action, workspace, runtime) => {
+        if (options.gh && action.action === "gh") {
+          const args = validateGhArgs(action.args);
+          return {
+            signature: { gh: args },
+            run: () => runGh(args, workspace, runtime.tool_timeout_seconds),
+            record: { name: "gh", raw_name: "gh", arguments: { args } },
+            ledger: (status) => ({ action: "gh", status, source: args.join(" ") }),
+          };
+        }
         const toolName = String(action.tool ?? "");
         const queries = queryList(action.queries);
         return {
@@ -148,9 +167,9 @@ function adapterFor(options: {
   };
 }
 
-export const OCTOCODE_ADAPTER = adapterFor({ tools: OCTOCODE_TOOLS, prompt: octocodeSystemPrompt, run: runOctocode, metadata: "octocode_cli_agent_v2" });
-export const GITHUB_ADAPTER = adapterFor({ tools: GITHUB_TOOLS, prompt: githubSystemPrompt, run: runGithub, metadata: "octocode_github_agent_v1" });
+export const OCTOCODE_ADAPTER = adapterFor({ tools: OCTOCODE_TOOLS, prompt: octocodeSystemPrompt, run: runOctocode, metadata: "octocode_cli_agent_v2", briefing: workspaceOverview });
+export const GITHUB_ADAPTER = adapterFor({ tools: GITHUB_TOOLS, prompt: githubSystemPrompt, run: runGithub, metadata: "octocode_github_agent_v2", gh: true });
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isEntry(import.meta.url, "octocode-agent")) {
   process.exitCode = await runAdapter(OCTOCODE_ADAPTER);
 }

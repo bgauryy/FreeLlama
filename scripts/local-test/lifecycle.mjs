@@ -2,9 +2,9 @@
 // How FreeLlama runs models on this machine: cold and warm calls, keep-alive, unload, switching,
 // queueing and priorities, prompt caching, the idle sweep, CPU vs GPU, and edge cases. Small models
 // only, one step at a time, each scenario waiting until FreeLlama says its model fits. Writes
-// LOCAL_LIFECYCLE.md. Usage: node scripts/local-test/lifecycle.mjs [serveEndpoint]
+// .octocode/local-test/LOCAL_LIFECYCLE.md (git-ignored). Usage: node scripts/local-test/lifecycle.mjs [serveEndpoint]
 import { spawn } from "node:child_process";
-import { cpSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 
@@ -177,7 +177,8 @@ for (const [label, method, url, body] of [
 }
 
 for (const model of [EMB, DEC, OCR]) await http("POST", "/unload", { model });
-writeFileSync(path.join(ROOT, "LOCAL_LIFECYCLE.md"), `# LOCAL_LIFECYCLE: how FreeLlama runs models on this machine
+mkdirSync(path.join(ROOT, ".octocode", "local-test"), { recursive: true });
+writeFileSync(path.join(ROOT, ".octocode", "local-test", "LOCAL_LIFECYCLE.md"), `# LOCAL_LIFECYCLE: how FreeLlama runs models on this machine
 
 Measured ${new Date().toISOString().slice(0, 16).replace("T", " ")} UTC on an Apple M2 Pro (32 GB unified memory), Ollama 0.40.13,
 FreeLlama 0.8.0 at ${SERVE}, with other work running on the machine. Small models only

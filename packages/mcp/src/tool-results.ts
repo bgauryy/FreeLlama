@@ -64,11 +64,13 @@ function compactCompletionPlanning(value: unknown): Fields | undefined {
  */
 function compactReceipt(receipt: Fields): Fields {
   const execution = object(receipt.execution);
-  const reservation = pick(object(execution?.memory_reservation), ["evicted_idle_models", "eviction", "required_available_bytes", "source"]);
+  const reservation = pick(object(execution?.memory_reservation), ["evicted_idle_models", "eviction", "required_available_bytes", "source",
+    // Ollama's own fit check predicts an f16 cache; when that alone fails, it may evict or offload.
+    "ollama_may_evict_or_offload", "ollama_preflight_reason", "ollama_f16_preflight_bytes"]);
   const completionPlanning = compactCompletionPlanning(execution?.completion_planning);
   const compact: Fields = {};
   for (const key of ["selected_model", "response", "output_check", "metrics", "telemetry", "scope", "warm", "job", "deferred",
-    "nearest", "files_read", "embedding_requests", "embedding_identity", "accepted_job_ids"]) {
+    "nearest", "files_read", "embedding_requests", "embedding_identity", "accepted_job_ids", "job_profile", "handoff_file"]) {
     if (receipt[key] !== undefined) compact[key] = receipt[key];
   }
   const response = withoutThinking(object(receipt.response));

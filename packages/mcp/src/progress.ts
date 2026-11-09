@@ -3,6 +3,7 @@
 /** The part of the SDK's request-handler `extra` that progress and cancellation use. */
 export type ToolExtra = {
   signal: AbortSignal;
+  sessionId?: string;
   _meta?: { progressToken?: string | number };
   sendNotification: (notification:
     | {
@@ -16,6 +17,17 @@ export type ToolExtra = {
 };
 
 export type ProgressSink = (message: string) => void;
+
+/** Whether the client's `logging/setLevel` filters out `level`; installed once by the server. */
+let logLevelFilter: ((level: string, sessionId?: string) => boolean) | undefined;
+
+/**
+ * Make `notice` honor the level a client set with `logging/setLevel`. A request-scoped
+ * `sendNotification` bypasses the SDK's own filter, which only `sendLoggingMessage` applies.
+ */
+export function useLogLevelFilter(filter: (level: string, sessionId?: string) => boolean): void {
+  logLevelFilter = filter;
+}
 
 /**
  * A sink that sends `notifications/progress` when the client sent a progressToken, else
@@ -39,6 +51,7 @@ export function progressSink(extra: Partial<ToolExtra> | undefined): ProgressSin
  * progress: kept for what a person may act on, such as a long memory wait or what to close.
  */
 export function notice(extra: Partial<ToolExtra> | undefined, level: "info" | "warning", message: string): void {
+  if (logLevelFilter?.(level, extra?.sessionId)) return;
   void extra?.sendNotification?.({ method: "notifications/message", params: { level, logger: "freellama", data: message } })
     .catch(() => undefined);
 }

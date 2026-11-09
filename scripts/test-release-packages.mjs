@@ -13,7 +13,7 @@ const workspaceVersion = JSON.parse(readFileSync(path.join(repo, "package.json")
 const untouchedBinary = `binary ${workspaceVersion}\nfreellama-source-commit=${"a".repeat(40)}\n`;
 const scratch = path.join(repo, ".octocode/tmp/prepublish/packaging");
 mkdirSync(scratch, { recursive: true });
-const adapters = ["bash-agent.js", "octocode-agent.js"];
+const adapters = ["bash-agent.js", "octocode-agent.js", "github-agent.js", "coder-agent.js"];
 
 const commit = "a".repeat(40);
 const marker = `freellama-source-commit=${commit}`;

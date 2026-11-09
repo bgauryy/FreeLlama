@@ -28,4 +28,4 @@
 
 **When a load is refused,** the message says how much memory is available and needed. Tell the user, and never stop their processes. Retry once they free memory, or use a smaller installed model with the same capability; do not retry in a loop.
 
-Per-model memory, load time and cache results are in `LOCAL_RIVALS.md`.
+Each pick's memory need is `memory_gb` in `models {view:"catalog"}`; measured models and their speeds are in [Choose local models](../MODEL_SELECTION.md).

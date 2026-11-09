@@ -6,7 +6,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
-  DEFAULT_DELEGATE_MAX_TURNS, DEFAULT_DELEGATE_MODEL, DEFAULT_DELEGATE_TIMEOUT_SECONDS, DEFAULT_RESEARCH_ADAPTER,
+  DEFAULT_DELEGATE_MAX_TURNS, DEFAULT_DELEGATE_MODEL, DEFAULT_RESEARCH_ADAPTER, MAX_DELEGATE_TIMEOUT_SECONDS, researchTimeoutSeconds,
   DEFAULT_SERVE_ENDPOINT, DEFAULT_TOKEN_CALIBRATION_DIR, RESEARCH_ADAPTERS, type ResearchAdapter, assertAllowedWorkspace,
   delegateEnvironment,
 } from "../config.js";
@@ -16,6 +16,7 @@ import { progressSink } from "../progress.js";
 import { cancelOpenJobs, researchProgressFilter } from "../research-progress.js";
 import { PROGRESS_ENV } from "../research/progress-events.js";
 import { sourceBearingLookup } from "../research/source-evidence.js";
+import { searchHitCitations } from "../research/grounding.js";
 import { EXTERNAL_COST } from "../telemetry.js";
 import {
   costTelemetry, endpointParam,
@@ -25,6 +26,9 @@ import {
   MODEL_EVIDENCE, STRONG_MODEL_HINT, assessDelegatedAnswer, extractExistingWorkspacePath, parseAdapterResult, qualifiedModelGrade,
   researchErrorResult, verifiedResearchDigest,
 } from "../delegate.js";
+import {
+  CODER_DEFAULT_MAX_TURNS, CODER_MIN_TIMEOUT_SECONDS, coderCommandsSchema, coderRefusal, coderToolResult, prepareCoderRun, type CoderRun,
+} from "./coder.js";
 
 const researchResultSchema = z.object({
   answer: z.string(), summary: z.string(), citations: z.unknown().optional(), verification: z.unknown(), usage: z.unknown().optional(), telemetry: z.unknown().optional(),
@@ -50,13 +54,15 @@ export function registerDelegateResearchTool(server: McpServer): void {
     {
       description:
         "Use when: a read-only question about files under workspacePath (where is X, what calls Y) would take several searches; it needs a local model that calls tools well: tools metadata does not prove it, so take the catalog's research-agent pick. " +
-        "Do not use when: editing, facts outside the workspace (GitHub excepted: adapter:\"github\", which still needs a `workspacePath`), final judgment, or a question one search answers; run_task embedding with `nearest` finds files faster. " +
-        "Up to 8 turns, killed after 180 s by default; no defer (a host that cuts calls near 60 s may drop it). " +
-        "Returns: citations/answer; discard verification.recommendation=escalate, otherwise verify citations.",
+        "Do not use when: editing (adapter:\"coder\" edits an isolated copy, if the operator enabled it), facts outside the workspace (GitHub excepted: adapter:\"github\", which needs no `workspacePath`), final judgment, or a question one search answers; run_task embedding with `nearest` finds files faster. " +
+        "Up to 8 turns, killed after 180 s by default (longer for bigger models, or agent.timeoutSeconds); no defer (a host that cuts calls near 60 s may drop it). " +
+        "Returns: citations/answer; discard verification.recommendation=escalate, otherwise verify citations. coder: review diff, then run its applyCommand.",
       inputSchema: z.object({
         question: z.string().min(1),
-        workspacePath: z.string().min(1),
-        adapter: z.enum(["bash", "octocode", "github"]).optional().describe("bash (default) or octocode search workspacePath; github searches GitHub"),
+        workspacePath: z.string().min(1).optional().describe(
+          "directory to research, under FREELLAMA_MCP_ALLOWED_ROOTS; absolute, or relative to the server's working directory. Required except for adapter github",
+        ),
+        adapter: z.enum(["bash", "octocode", "github", "coder"]).optional().describe("bash (default) or octocode search workspacePath; github searches GitHub"),
         model: z.string().min(1).optional(),
         endpoint: endpointParam,
         agent: z
@@ -64,6 +70,9 @@ export function registerDelegateResearchTool(server: McpServer): void {
             maxTurns: z.number().int().positive().optional(),
             contextTokens: z.number().int().positive().optional(),
             outputTokens: z.number().int().positive().optional(),
+            timeoutSeconds: z.number().int().positive().max(MAX_DELEGATE_TIMEOUT_SECONDS).optional()
+              .describe("default scales with the model's size"),
+            commands: coderCommandsSchema,
           })
           .strict()
           .optional(),
@@ -73,15 +82,24 @@ export function registerDelegateResearchTool(server: McpServer): void {
           .describe("compact (default): trail at response_file; full: inline"),
       }).strict(),
       outputSchema: researchResultSchema,
+      // Read-only lookup; adapter "github" searches GitHub over the internet, so the tool is
+      // open-world, which is the spec default for openWorldHint and is not restated.
       annotations: { destructiveHint: false },
     },
     // `receipt` only shapes the inline view (tool-results.ts); the tool always returns everything.
     async ({ question, workspacePath, adapter, model, endpoint, agent }, extra) => {
       const chosenAdapter: ResearchAdapter = adapter ?? DEFAULT_RESEARCH_ADAPTER;
-      let resolvedWorkspace: string;
+      // The GitHub adapter reads nothing local: the workspace is only its tools' working
+      // directory, so without one it runs in the private temp directory made below.
+      let resolvedWorkspace: string | undefined;
       let chosenModel: string;
       try {
-        resolvedWorkspace = await assertAllowedWorkspace(workspacePath);
+        if (workspacePath === undefined && chosenAdapter !== "github") {
+          throw new Error(`workspacePath is required for adapter "${chosenAdapter}": the absolute directory to research (or one relative to the server's working directory). Only adapter "github" runs without one.`);
+        }
+        const refusal = coderRefusal(chosenAdapter, agent?.commands);
+        if (refusal) throw refusal;
+        resolvedWorkspace = workspacePath === undefined ? undefined : await assertAllowedWorkspace(workspacePath);
         chosenModel = model ?? DEFAULT_DELEGATE_MODEL ?? await routedResearchModel(endpoint);
       } catch (error) {
         return researchErrorResult(error);
@@ -113,8 +131,12 @@ export function registerDelegateResearchTool(server: McpServer): void {
       const dir = await mkdtemp(path.join(tmpdir(), "freellama-delegate-"));
       const promptFile = path.join(dir, "prompt.md");
       const resultFile = path.join(dir, "result.json");
+      const workspace = resolvedWorkspace ?? dir;
+      // The coder's isolated copy and patch file; the copy is removed in `finally` however the run ended.
+      let coder: CoderRun | undefined;
       try {
         await writeFile(promptFile, `${question}\n`, "utf8");
+        if (chosenAdapter === "coder") coder = await prepareCoderRun(agent?.commands);
         const adapter = RESEARCH_ADAPTERS[chosenAdapter];
         if (!existsSync(adapter)) {
           return researchErrorResult(
@@ -124,6 +146,16 @@ export function registerDelegateResearchTool(server: McpServer): void {
             ),
           );
         }
+        // A bigger model decodes slower; its run gets more time before it is killed.
+        let sizeBytes: number | undefined;
+        if (agent?.timeoutSeconds === undefined) {
+          try {
+            const catalog = JSON.parse(await listModels(endpoint)) as { models?: { name?: string; size?: number }[] };
+            sizeBytes = catalog.models?.find((entry) => entry.name === chosenModel)?.size;
+          } catch { /* Unknown size: the default applies. */ }
+        }
+        const researchTimeout = researchTimeoutSeconds(sizeBytes, agent?.timeoutSeconds);
+        const timeoutSeconds = coder && agent?.timeoutSeconds === undefined ? Math.max(researchTimeout, CODER_MIN_TIMEOUT_SECONDS) : researchTimeout;
         // The adapter always reports lifecycle events for cleanup. A client progressToken only
         // controls whether the filter also forwards human-facing notifications.
         const report = progressSink(extra);
@@ -133,10 +165,11 @@ export function registerDelegateResearchTool(server: McpServer): void {
           FREELLAMA_TARGET_MODEL: chosenModel,
           FREELLAMA_AGENT_MANAGED_ENDPOINT: endpoint ?? DEFAULT_SERVE_ENDPOINT,
           FREELLAMA_AGENT_TOKEN_CALIBRATION_DIR: DEFAULT_TOKEN_CALIBRATION_DIR,
-          FREELLAMA_BENCH_WORKSPACE: resolvedWorkspace,
+          FREELLAMA_BENCH_WORKSPACE: workspace,
           FREELLAMA_BENCH_PROMPT: promptFile,
           FREELLAMA_AGENT_RESULT: resultFile,
-          FREELLAMA_AGENT_MAX_TURNS: String(agent?.maxTurns ?? DEFAULT_DELEGATE_MAX_TURNS),
+          FREELLAMA_AGENT_MAX_TURNS: String(agent?.maxTurns ?? (coder ? CODER_DEFAULT_MAX_TURNS : DEFAULT_DELEGATE_MAX_TURNS)),
+          ...coder?.env,
           ...(agent?.contextTokens !== undefined ? { FREELLAMA_AGENT_NUM_CTX: String(agent.contextTokens) } : {}),
           ...(agent?.outputTokens !== undefined ? { FREELLAMA_AGENT_NUM_PREDICT: String(agent.outputTokens) } : {}),
         };
@@ -148,8 +181,8 @@ export function registerDelegateResearchTool(server: McpServer): void {
         const running = runDelegate(process.execPath, [adapter], {
           signal: extra.signal,
           env: environment,
-          stderrFilter: researchProgressFilter(report ?? (() => undefined), resolvedWorkspace, openJobs),
-          timeoutMs: DEFAULT_DELEGATE_TIMEOUT_SECONDS * 1000,
+          stderrFilter: researchProgressFilter(report ?? (() => undefined), workspace, openJobs),
+          timeoutMs: timeoutSeconds * 1000,
           // The answer is read from `resultFile`, never from stdout — but execFile's usual 1 MB
           // maxBuffer still applies to the agent's own progress logging, and overflowing it kills
           // the subprocess and surfaces as a research failure with no explanation. Give the logs
@@ -191,7 +224,7 @@ export function registerDelegateResearchTool(server: McpServer): void {
             adapterError ??
               new Error(
                 "research adapter exited without writing a readable result file — it was killed " +
-                  `before it could report. Check that the model is loadable and that ${DEFAULT_DELEGATE_TIMEOUT_SECONDS}s ` +
+                  `before it could report. Check that the model is loadable and that ${timeoutSeconds}s ` +
                   "is enough for this question.",
               ),
           );
@@ -206,8 +239,14 @@ export function registerDelegateResearchTool(server: McpServer): void {
         // whichever adapter ran.
         const evidence = result.tool_calls.map((call, index) => {
           const queries = call.arguments?.queries;
-          const target = Array.isArray(queries) ? queries[0]?.path : queries?.path;
-          const rawDetail = call.arguments?.command ?? null;
+          const target = Array.isArray(queries) ? queries[0]?.path
+            : queries?.path ?? (call.raw_name === "read" || call.raw_name === "list" ? call.arguments?.path : undefined);
+          const targetPath = typeof target === "string" ? target : undefined;
+          // Structured actions carry their fields instead of a command line.
+          const structured = call.raw_name === "search" || call.raw_name === "read" || call.raw_name === "list";
+          const command = call.arguments?.command;
+          const rawDetail = typeof command === "string" ? command
+            : structured ? `${call.raw_name} ${JSON.stringify(call.arguments ?? {})}` : null;
           const detail = rawDetail ?? null;
           return {
             step: index + 1,
@@ -216,12 +255,12 @@ export function registerDelegateResearchTool(server: McpServer): void {
             // lets a reader tell a run that read three files from one that failed three commands —
             // indistinguishable in the trail before, and graded identically.
             status: call.status,
-            source_lookup: sourceBearingLookup(call, resolvedWorkspace),
+            source_lookup: sourceBearingLookup(call, workspace),
             ...(typeof call.exit_code === "number" ? { exit_code: call.exit_code } : {}),
-            path: target
-              ? path.relative(resolvedWorkspace, path.resolve(resolvedWorkspace, target))
+            path: targetPath
+              ? path.relative(workspace, path.resolve(workspace, targetPath))
               : detail
-                ? extractExistingWorkspacePath(detail, resolvedWorkspace)
+                ? extractExistingWorkspacePath(detail, workspace)
                 : null,
             detail,
           };
@@ -253,6 +292,15 @@ export function registerDelegateResearchTool(server: McpServer): void {
           arguments: call.arguments ?? null,
           result: typeof call.result === "string" ? call.result : (call.result ?? null),
         }));
+        // A grep hit on the file the answer names is a line the caller can open; add it when no
+        // read of that file is cited already.
+        const readPaths = new Set(citations.map((citation) => citation.path).filter(Boolean));
+        for (const hit of searchHitCitations(observations, result.final_answer, workspace)) {
+          if (!readPaths.has(hit.path)) citations.push(hit as unknown as (typeof citations)[number]);
+        }
+        if (coder) {
+          return coderToolResult({ result, adapterError, evidence, observations, model: chosenModel, workspace });
+        }
         if (adapterError) {
           const diagnostic = `research adapter failed: ${result.final_answer}` +
             (evidenceText ? `\nEvidence collected before the failure:\n${evidenceText}` : "");
@@ -310,6 +358,7 @@ export function registerDelegateResearchTool(server: McpServer): void {
       } catch (error) {
         return researchErrorResult(error);
       } finally {
+        coder?.cleanup(workspace);
         await rm(dir, { recursive: true, force: true });
       }
     },
