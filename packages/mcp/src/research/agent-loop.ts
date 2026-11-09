@@ -20,7 +20,7 @@ import {
 } from "./transport.js";
 import { requestJsonAsJob } from "./transport-jobs.js";
 import { resolvePath } from "./workspace-path.js";
-import { evidencePaths, groundingNote, groundingRepairNotice, missingPaths, pathsIn, sourceRepairNotice, toolErrorHint } from "./grounding.js";
+import { evidencePaths, groundingNote, groundingRepairNotice, missingPaths, observedPaths, pathsIn, sourceRepairNotice, toolErrorHint, unseenPaths } from "./grounding.js";
 
 export type { Action, AdapterHooks, AdapterSession, AdapterSpec, ToolCall } from "./adapter.js";
 
@@ -44,8 +44,15 @@ const numberOr = (value: unknown, fallback: number): number =>
 /** Model-facing echo of an action, byte-stable across runs. */
 const echo = (action: Action) => canonicalJson(action, { sortKeys: false, ensureAscii: false });
 
+/**
+ * An adapter spec plus how its cited paths are grounded: "workspace" (default) checks them on local
+ * disk; "observed" checks them against the run's own tool outputs, for adapters whose files live
+ * elsewhere (GitHub).
+ */
+export type GroundedAdapterSpec = AdapterSpec & { grounding?: "workspace" | "observed" };
+
 /** Run one adapter process to completion and return its exit code. */
-export async function runAdapter(spec: AdapterSpec, hooks: AdapterHooks = {}): Promise<number> {
+export async function runAdapter(spec: GroundedAdapterSpec, hooks: AdapterHooks = {}): Promise<number> {
   const env = hooks.env ?? process.env;
   let resultPath: string | null = null;
   try {
@@ -77,7 +84,7 @@ interface RunInputs {
   resultPath: string;
 }
 
-async function runLoop(spec: AdapterSpec, hooks: AdapterHooks, env: Env, inputs: RunInputs): Promise<number> {
+async function runLoop(spec: GroundedAdapterSpec, hooks: AdapterHooks, env: Env, inputs: RunInputs): Promise<number> {
   const { model, workspace, prompt, resultPath } = inputs;
   const print = hooks.print ?? ((line: string) => process.stdout.write(`${line}\n`));
   const progress = hooks.progress ?? progressEmitter(env);
@@ -231,6 +238,9 @@ async function runLoop(spec: AdapterSpec, hooks: AdapterHooks, env: Env, inputs:
     let groundingRepaired = false;
     let sourceRepaired = false;
     const seenOutputs: string[] = [];
+    const observed = spec.grounding === "observed";
+    const ungrounded = (text: string) => observed ? unseenPaths(text, seenOutputs) : missingPaths(text, root);
+    const evidenceFor = () => observed ? observedPaths(seenOutputs) : evidencePaths(seenOutputs, root);
     for (let turn = 0; turn < runtime.max_turns; turn += 1) {
       const at = { turn: turn + 1, maxTurns: runtime.max_turns };
       phaseAt = at;
@@ -285,15 +295,15 @@ async function runLoop(spec: AdapterSpec, hooks: AdapterHooks, env: Env, inputs:
       }
       if (action.action === "finish") {
         const proposed = trimSpace(String(action.answer ?? ""));
-        const missing = missingPaths(proposed, root);
+        const missing = ungrounded(proposed);
         // One repair turn when the answer cites a file that is not there; it costs no tool call.
         if (missing.length > 0 && !groundingRepaired) {
           groundingRepaired = true;
           progress?.({ event: "repair", ...at });
           messages.push({ role: "assistant", content: echo(action) });
-          messages.push({ role: "user", content: groundingRepairNotice(missing, evidencePaths(seenOutputs, root)) });
+          messages.push({ role: "user", content: groundingRepairNotice(missing, evidenceFor(), observed) });
           if (!refit()) {
-            answer = proposed + groundingNote(missing);
+            answer = proposed + groundingNote(missing, observed);
             exhausted = false;
             break;
           }
@@ -303,7 +313,7 @@ async function runLoop(spec: AdapterSpec, hooks: AdapterHooks, env: Env, inputs:
         // the run's own results named some (a "no, not found" answer has no such results). An
         // adapter whose answer reports work done (the coder) opts out with `requireSource: false`.
         const evidence = spec.requireSource !== false && missing.length === 0 && !sourceRepaired && pathsIn(proposed).length === 0
-          ? evidencePaths(seenOutputs, root) : [];
+          ? evidenceFor() : [];
         if (evidence.length > 0) {
           sourceRepaired = true;
           progress?.({ event: "repair", ...at });
@@ -317,7 +327,7 @@ async function runLoop(spec: AdapterSpec, hooks: AdapterHooks, env: Env, inputs:
           continue;
         }
         progress?.({ event: "finish", ...at });
-        answer = missing.length > 0 ? proposed + groundingNote(missing) : proposed;
+        answer = missing.length > 0 ? proposed + groundingNote(missing, observed) : proposed;
         exhausted = false;
         break;
       }
@@ -375,8 +385,8 @@ async function runLoop(spec: AdapterSpec, hooks: AdapterHooks, env: Env, inputs:
           const finalAction = spec.parseAction(content(response));
           if (finalAction.action !== "finish") throw new ValidationError("forced final response was not finish");
           answer = trimSpace(String(finalAction.answer ?? ""));
-          const missing = missingPaths(answer, root);
-          if (missing.length > 0) answer += groundingNote(missing);
+          const missing = ungrounded(answer);
+          if (missing.length > 0) answer += groundingNote(missing, observed);
         } catch (error) {
           if (!isTransportError(error) && !isValidationError(error)) throw error;
           let diagnostic: string;

@@ -106,11 +106,12 @@ describe("files on run_task", () => {
     expect(() => expandFileEntries(["src/**/*.py"], globRoot)).toThrow(/no files match/);
   });
 
-  it("reads under the working directory, the temp directory, FREELLAMA_FILE_ROOTS and the handoffs", () => {
+  it("reads under the working directory, the temp directory, FREELLAMA_FILE_ROOTS, the handoffs and the default output directory", () => {
     const roots = fileRoots({ FREELLAMA_FILE_ROOTS: [root, "/nonexistent-root"].join(path.delimiter), FREELLAMA_HOME: root }, root);
     expect(roots).toContain(realpathSync(root));
-    expect(roots.at(-1)).toBe(path.join(realpathSync(root), "handoffs"));
-    expect(roots.length).toBe(5);
+    expect(roots.at(-2)).toBe(path.join(realpathSync(root), "handoffs"));
+    expect(roots.at(-1)).toBe(path.join(realpathSync(root), "tmp"));
+    expect(roots.length).toBe(6);
   });
 
   it("does not treat a working directory of / or the home directory as a project root", () => {

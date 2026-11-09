@@ -88,7 +88,7 @@ export function chunkLines(text: string, limit = EMBEDDING_CHUNK_BYTES): Array<{
  * Directories `files` may read under: the server's working directory (the agent's project when a
  * client starts the server there), the OS temp directory (where screenshots and tool output land),
  * `FREELLAMA_FILE_ROOTS` (path-delimited), and the handoffs a task wrote with `saveAs`
- * (`${FREELLAMA_HOME}/handoffs`). Reading stays inside what the agent could already reach in its
+ * (`${FREELLAMA_HOME}/handoffs`) and the answers written to `${FREELLAMA_HOME}/tmp`. Reading stays inside what the agent could already reach in its
  * project, so a file the host would not show the agent is not read here either.
  */
 export function fileRoots(env: NodeJS.ProcessEnv = process.env, cwd = process.cwd(), home = homedir()): string[] {
@@ -99,7 +99,9 @@ export function fileRoots(env: NodeJS.ProcessEnv = process.env, cwd = process.cw
   const project = broad.has(resolvedRoot(cwd)) ? [] : [cwd];
   // The same directory as handoffs.ts HANDOFF_DIR, derived from `env` so callers can pass their own.
   const handoffs = path.join(env.FREELLAMA_HOME || path.join(home, ".octocode", "freellama"), "handoffs");
-  return [...project, tmpdir(), ...configured, handoffs].map(resolvedRoot);
+  // And handoffs.ts OUTPUT_TMP_DIR: where shortened answers are written when no `outputPath` was given.
+  const outputs = path.join(env.FREELLAMA_HOME || path.join(home, ".octocode", "freellama"), "tmp");
+  return [...project, tmpdir(), ...configured, handoffs, outputs].map(resolvedRoot);
 }
 
 /**

@@ -11,6 +11,8 @@ import {
   delegateEnvironment,
 } from "../config.js";
 import { cancelTaskJob, listModels, route } from "../serve-client.js";
+import { catalogView } from "../model-catalog.js";
+import { catalogLiveState } from "../model-library.js";
 import { killDelegateTree, liveDelegates, runDelegate } from "../lifecycle.js";
 import { progressSink } from "../progress.js";
 import { cancelOpenJobs, researchProgressFilter } from "../research-progress.js";
@@ -18,6 +20,8 @@ import { PROGRESS_ENV } from "../research/progress-events.js";
 import { sourceBearingLookup } from "../research/source-evidence.js";
 import { searchHitCitations } from "../research/grounding.js";
 import { EXTERNAL_COST } from "../telemetry.js";
+import { checkOutputPath } from "../handoffs.js";
+import { outputInput } from "../tool-results.js";
 import {
   costTelemetry, endpointParam,
   structuredResult,
@@ -34,6 +38,34 @@ const researchResultSchema = z.object({
   answer: z.string(), summary: z.string(), citations: z.unknown().optional(), verification: z.unknown(), usage: z.unknown().optional(), telemetry: z.unknown().optional(),
 }).loose();
 
+
+const RESEARCH_ROLES = ["stronger", "default", "small"];
+/** The small pick scored 1/6 on GitHub questions (model_catalog.json research-agent), so GitHub research never defaults to it. */
+const GITHUB_RESEARCH_ROLES = ["stronger", "default"];
+
+/**
+ * The measured research-agent pick to use without `model`: the first installed pick (strongest first)
+ * that models{view:"catalog"} reports fitting now; else the installed default or stronger pick, since
+ * fits-now is a snapshot and serve's memory gate admits, waits or refuses the load itself. GitHub
+ * research skips the small pick. Undefined when none is installed or the state is unreadable.
+ */
+async function catalogResearchModel(endpoint: string | undefined, adapter: ResearchAdapter): Promise<{ model: string; reason: string } | undefined> {
+  try {
+    const [installed, available] = await catalogLiveState(endpoint, undefined);
+    const picks = catalogView("research-agent", installed, available).jobs[0]?.picks ?? [];
+    const nameOf = (pick: (typeof picks)[number]) =>
+      "installed_as" in pick && typeof pick.installed_as === "string" ? pick.installed_as : pick.tag;
+    for (const role of adapter === "github" ? GITHUB_RESEARCH_ROLES : RESEARCH_ROLES) {
+      const pick = picks.find((entry) => entry.role === role && entry.installed === true && entry.fits_now === true);
+      if (pick) return { model: nameOf(pick), reason: `catalog ${role} pick, installed, fits now` };
+    }
+    for (const role of ["default", "stronger"]) {
+      const pick = picks.find((entry) => entry.role === role && entry.installed === true);
+      if (pick) return { model: nameOf(pick), reason: `catalog ${role} pick, installed; not fitting now, so serve's memory gate decides` };
+    }
+  } catch { /* Unreadable catalog state falls back to routing. */ }
+  return undefined;
+}
 
 async function routedResearchModel(endpoint: string | undefined): Promise<string> {
   const decision = JSON.parse(
@@ -53,7 +85,7 @@ export function registerDelegateResearchTool(server: McpServer): void {
     "delegate_research",
     {
       description:
-        "Use when: a read-only question about files under workspacePath (where is X, what calls Y) would take several searches; it needs a local model that calls tools well: tools metadata does not prove it, so take the catalog's research-agent pick. " +
+        "Use when: a read-only question about files under workspacePath (where is X, what calls Y) would take several searches; without `model` it uses the catalog's research-agent pick that is installed and fits now. " +
         "Do not use when: editing (adapter:\"coder\" edits an isolated copy, if the operator enabled it), facts outside the workspace (GitHub excepted: adapter:\"github\", which needs no `workspacePath`), final judgment, or a question one search answers; run_task embedding with `nearest` finds files faster. " +
         "Up to 8 turns, killed after 180 s by default (longer for bigger models, or agent.timeoutSeconds); no defer (a host that cuts calls near 60 s may drop it). " +
         "Returns: citations/answer; discard verification.recommendation=escalate, otherwise verify citations. coder: review diff, then run its applyCommand.",
@@ -80,6 +112,7 @@ export function registerDelegateResearchTool(server: McpServer): void {
           .enum(["compact", "full"])
           .optional()
           .describe("compact (default): trail at response_file; full: inline"),
+        ...outputInput,
       }).strict(),
       outputSchema: researchResultSchema,
       // Read-only lookup; adapter "github" searches GitHub over the internet, so the tool is
@@ -87,20 +120,36 @@ export function registerDelegateResearchTool(server: McpServer): void {
       annotations: { destructiveHint: false },
     },
     // `receipt` only shapes the inline view (tool-results.ts); the tool always returns everything.
-    async ({ question, workspacePath, adapter, model, endpoint, agent }, extra) => {
+    async ({ question, workspacePath, adapter, model, endpoint, agent, outputPath }, extra) => {
       const chosenAdapter: ResearchAdapter = adapter ?? DEFAULT_RESEARCH_ADAPTER;
       // The GitHub adapter reads nothing local: the workspace is only its tools' working
       // directory, so without one it runs in the private temp directory made below.
       let resolvedWorkspace: string | undefined;
       let chosenModel: string;
+      let modelReason = "explicit model";
       try {
+        // Refuse a bad outputPath before the research runs; the write happens with the result (tool-results.ts).
+        if (outputPath !== undefined) checkOutputPath(outputPath);
         if (workspacePath === undefined && chosenAdapter !== "github") {
           throw new Error(`workspacePath is required for adapter "${chosenAdapter}": the absolute directory to research (or one relative to the server's working directory). Only adapter "github" runs without one.`);
         }
         const refusal = coderRefusal(chosenAdapter, agent?.commands);
         if (refusal) throw refusal;
         resolvedWorkspace = workspacePath === undefined ? undefined : await assertAllowedWorkspace(workspacePath);
-        chosenModel = model ?? DEFAULT_DELEGATE_MODEL ?? await routedResearchModel(endpoint);
+        if (model) chosenModel = model;
+        else if (DEFAULT_DELEGATE_MODEL) {
+          chosenModel = DEFAULT_DELEGATE_MODEL;
+          modelReason = "FREELLAMA_MCP_DEFAULT_MODEL";
+        } else {
+          const picked = await catalogResearchModel(endpoint, chosenAdapter);
+          if (picked) {
+            chosenModel = picked.model;
+            modelReason = picked.reason;
+          } else {
+            chosenModel = await routedResearchModel(endpoint);
+            modelReason = "routing (no catalog research pick installed)";
+          }
+        }
       } catch (error) {
         return researchErrorResult(error);
       }
@@ -321,9 +370,10 @@ export function registerDelegateResearchTool(server: McpServer): void {
           `Delegated answer ready: ${result.tool_calls.length} tool call(s)` +
           (failed > 0 ? `, ${failed} of which did not succeed` : "") +
           `; ${result.usage.input_tokens ?? "?"} input / ${result.usage.output_tokens ?? "?"} output local tokens; ` +
-          `verification=${verification.recommendation}. Read structuredContent.answer and citations.`;
+          `verification=${verification.recommendation}; research model: ${chosenModel} (${modelReason}). Read structuredContent.answer and citations.`;
         const payload = {
             adapter: chosenAdapter,
+            researchModel: { model: chosenModel, reason: modelReason },
             verification,
             answer: result.final_answer,
             // recommendation + why live under `verification`; `citations` completes the triple so a
@@ -353,7 +403,7 @@ export function registerDelegateResearchTool(server: McpServer): void {
           `${result.final_answer}\n\n` +
           `verification: ${verification.recommendation}` +
           (cited.length ? `\ncited: ${cited.join(", ")}` : "") +
-          `\n(${chosenModel}, ${result.tool_calls.length} tool call(s))`;
+          `\n(research model: ${chosenModel} (${modelReason}), ${result.tool_calls.length} tool call(s))`;
         return structuredResult(payload, { text: answerText });
       } catch (error) {
         return researchErrorResult(error);

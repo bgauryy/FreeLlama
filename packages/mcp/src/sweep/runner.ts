@@ -6,7 +6,7 @@ import { randomUUID } from "node:crypto";
 import { TOOL_JOBS } from "../local-prompts.js";
 import { collectFiles, crawl, type CollectedChunk } from "./sources.js";
 import {
-  hashText, SweepStore, type Change, type Chunk, type ChunkResult, type FlagRule, type Manifest, type SweepConfig, type Verdict,
+  hashText, processAlive, SweepStore, type Change, type Chunk, type ChunkResult, type FlagRule, type Manifest, type SweepConfig, type Verdict,
 } from "./store.js";
 
 type Fields = Record<string, unknown>;
@@ -86,6 +86,10 @@ export type SweepView = {
   pages?: number;
   skipped: number;
   error?: string;
+  /** The exact tool call that continues an interrupted, cancelled or partly failed sweep. */
+  resume?: { action: "resume"; sweepId: string };
+  /** Set while another live server process runs the sweep. */
+  ownerPid?: number;
   startedAt: string;
   finishedAt?: string;
   elapsedSeconds: number;
@@ -134,6 +138,8 @@ export class SweepRunner {
   resume(id: string): SweepView {
     if (this.active.has(id)) return this.view(id);
     const manifest = this.store.manifest(id);
+    const other = this.foreignOwner(manifest);
+    if (other !== undefined) throw new Error(`sweep ${id} is still running in server process ${other}; wait for it or stop that process first`);
     if (manifest.phase === "collecting") throw new Error("this sweep was interrupted while collecting pages; start a new sweep");
     manifest.phase = "running";
     delete manifest.finishedAt;
@@ -195,8 +201,12 @@ export class SweepRunner {
       if (result.change === "changed") counts.changed += 1;
       if (result.change === "new") counts.added += 1;
     }
-    // A sweep this process is not running cannot still be running: the server restarted mid-sweep.
-    const phase = (manifest.phase === "running" || manifest.phase === "collecting") && !this.active.has(id) ? "interrupted" : manifest.phase;
+    // A sweep nobody is running cannot still be running: its server process exited mid-sweep.
+    // One owned by another live process is still running there.
+    const ownerPid = manifest.phase === "running" || manifest.phase === "collecting" ? this.foreignOwner(manifest) : undefined;
+    const phase = (manifest.phase === "running" || manifest.phase === "collecting") && !this.active.has(id) && ownerPid === undefined
+      ? "interrupted" : manifest.phase;
+    const resumable = phase === "interrupted" || phase === "cancelled" || (phase === "completed" && counts.failed > 0) || (phase === "failed" && counts.total > 0);
     const elapsedSeconds = Math.round(((manifest.finishedAt ? Date.parse(manifest.finishedAt) : Date.now()) - Date.parse(manifest.startedAt)) / 1000);
     const pending = Math.max(0, counts.total - counts.done - counts.failed);
     const ms = this.active.get(id)?.ms ?? [];
@@ -205,10 +215,19 @@ export class SweepRunner {
       id, name: manifest.config.name, phase, model: manifest.config.model,
       counts: { ...counts, pending, removed: manifest.removed?.length ?? 0 },
       pages: manifest.pages, skipped: manifest.skipped.length, error: manifest.error,
+      ...(resumable && !(manifest.phase === "collecting") ? { resume: { action: "resume" as const, sweepId: id } } : {}),
+      ...(ownerPid !== undefined ? { ownerPid } : {}),
       startedAt: manifest.startedAt, finishedAt: manifest.finishedAt, elapsedSeconds,
       etaSeconds: phase === "running" && average !== undefined ? Math.round((pending * average) / 1000 / Math.max(1, manifest.config.maxParallelism)) : undefined,
       files: this.store.files(id),
     };
+  }
+
+  /** The pid of another live server process that owns this sweep's run, if any. */
+  private foreignOwner(manifest: Manifest): number | undefined {
+    if (manifest.phase !== "running" && manifest.phase !== "collecting") return undefined;
+    const pid = manifest.owner?.pid;
+    return pid !== undefined && pid !== process.pid && !this.active.has(manifest.config.id) && processAlive(pid) ? pid : undefined;
   }
 
   private emit(id: string, message: string) {
@@ -216,6 +235,8 @@ export class SweepRunner {
   }
 
   private launch(manifest: Manifest, resuming = false) {
+    manifest.owner = { pid: process.pid };
+    this.store.saveManifest(manifest);
     const abort = new AbortController();
     const active: Active = { abort, done: Promise.resolve(), ms: [] };
     this.active.set(manifest.config.id, active);

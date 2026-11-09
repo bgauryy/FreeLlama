@@ -1,7 +1,18 @@
-import { describe, expect, it } from "vitest";
-import { finishResult, withTiming } from "../../src/tool-results.js";
+import { describe, expect, it, vi } from "vitest";
+
+vi.hoisted(() => {
+  const { mkdtempSync } = process.getBuiltinModule("node:fs") as typeof import("node:fs");
+  const { tmpdir } = process.getBuiltinModule("node:os") as typeof import("node:os");
+  const { join } = process.getBuiltinModule("node:path") as typeof import("node:path");
+  // Default output files land under ${FREELLAMA_HOME}/tmp: config.ts reads it when first imported.
+  process.env.FREELLAMA_HOME = mkdtempSync(join(tmpdir(), "freellama-output-home-"));
+});
+
+import { AUTO_INLINE_CHARS, finishResult, SAVED_TEXT_SECTION, withTiming } from "../../src/tool-results.js";
+import { OUTPUT_TMP_DIR } from "../../src/handoffs.js";
+import { readResponse } from "../../src/tools/read-response.js";
 import { ResponseStore } from "../../src/response-store.js";
-import { mkdir, mkdtemp, readdir, readFile, stat, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -268,5 +279,214 @@ describe("smart responses", () => {
     });
     expect(saves).toEqual([]);
     expect((result.structuredContent as Record<string, any>).response_file).toBeUndefined();
+  });
+});
+
+describe("answer output: auto, inline, file and outputPath", () => {
+  const label = "[m:1 · cold load] ";
+  const answerOf = (size: number) => `${label}${Array.from({ length: 40 }, (_, i) => `line ${i} ${"x".repeat(Math.max(0, Math.floor(size / 40) - 12))}`).join("\n")}`;
+  const withLines = (text: string) => `${text}\ncheck: 2 numbers are not in the source\ncheck: close match\nhandoff_file: /h/notes.md`;
+  const resultOf = (text: string) => ({
+    content: [{ type: "text" as const, text }],
+    structuredContent: { selected_model: "m:1", response: { message: { content: text } } },
+  });
+  const run = (tool: string, args: Record<string, unknown>, text: string, store?: Pick<ResponseStore, "save">) =>
+    finishResult(tool, args, resultOf(text), 1, "t", store);
+  const storeIn = async () => new ResponseStore(await mkdtemp(path.join(tmpdir(), "responses-")), 1024 * 1024);
+  const textOf = (result: { content: { text: string }[] }) => result.content[0]!.text;
+  const off = { save: async () => undefined };
+  const scratch = async () => mkdtemp(path.join(tmpdir(), "outputs-"));
+  const outputs = async () => (await readdir(OUTPUT_TMP_DIR).catch(() => [])).filter((name) => name.endsWith(".md"));
+  /** Make the default output directory unusable (a regular file where it should be) while `body` runs. */
+  const withBlockedOutputDir = async (body: () => Promise<void>) => {
+    await rm(OUTPUT_TMP_DIR, { recursive: true, force: true });
+    await writeFile(OUTPUT_TMP_DIR, "not a directory");
+    try {
+      await body();
+    } finally {
+      await rm(OUTPUT_TMP_DIR, { force: true });
+    }
+  };
+
+  it("returns an answer of at most AUTO_INLINE_CHARS whole and a longer one as a short view with its output file", async () => {
+    expect(AUTO_INLINE_CHARS).toBe(8000);
+    const store = await storeIn();
+    const exact = "a".repeat(AUTO_INLINE_CHARS);
+    const before = await outputs();
+    const whole = await run("run_task", {}, exact, store);
+    expect(textOf(whole as never)).toBe(exact);
+    expect((whole.structuredContent as Record<string, any>).output).toBeUndefined();
+    expect(await outputs()).toEqual(before);
+
+    const long = withLines(answerOf(AUTO_INLINE_CHARS + 500));
+    const short = await run("run_task", { output: "auto" }, long, store);
+    const content = short.structuredContent as Record<string, any>;
+    const lines = textOf(short as never).split("\n");
+    expect(lines[0]).toBe("[m:1 · cold load]");
+    expect(lines[1]).toMatch(/^line 0 x+/);
+    expect(textOf(short as never)).not.toContain("line 39");
+    expect(textOf(short as never)).toContain("check: 2 numbers are not in the source\ncheck: close match\nhandoff_file: /h/notes.md");
+    expect(lines.at(-1)).toBe(`output_file: ${content.output_file} (the full answer, ${long.length} chars)`);
+    expect(textOf(short as never).length).toBeLessThan(1500);
+    expect(content.output).toEqual({ mode: "auto", chars: long.length, file: content.output_file });
+    // structuredContent points at the file instead of repeating the answer.
+    expect(content.response.message.content).toBe(`answer moved: output_file: ${content.output_file} (the full answer, ${long.length} chars)`);
+    expect(path.dirname(content.output_file)).toBe(OUTPUT_TMP_DIR);
+    expect(path.basename(content.output_file)).toMatch(/^\d{4}-\d\d-\d\dT\d\d-\d\d-\d\d-\d{3}Z-\d+-\d+\.md$/);
+    expect(await readFile(content.output_file, "utf8")).toContain(`## Result\n\n${long.replace(label, "").trim()}\n`);
+    expect((await stat(content.output_file)).mode & 0o777).toBe(0o600);
+    expect(await outputs()).toContain(path.basename(content.output_file));
+  });
+
+  it("returns a 10k-char answer under 4,000 chars in total, with the whole text in the file and the saved response", async () => {
+    const store = await storeIn();
+    const long = answerOf(10_000);
+    const receipt = { ...resultOf(long).structuredContent, results: [{ id: "a", ok: true, response: { response: { message: { content: long } } } }] };
+    const input = { content: [{ type: "text" as const, text: long }], structuredContent: receipt };
+    const inline = await finishResult("run_task", { output: "inline" }, input, 1, "t", store);
+    const auto = await finishResult("run_task", {}, input, 1, "t", store);
+    const size = (result: unknown) => JSON.stringify({ content: (result as any).content, structuredContent: (result as any).structuredContent }).length;
+    console.log(`10k answer total chars: inline ${size(inline)}, auto ${size(auto)}`);
+    expect(size(inline)).toBeGreaterThan(20_000);
+    expect(size(auto)).toBeLessThan(4_000);
+    const content = auto.structuredContent as Record<string, any>;
+    expect(JSON.stringify(content)).not.toContain("line 39");
+    expect(content.results[0].response.response.message.content).toContain("answer moved: output_file:");
+    expect(await readFile(content.output_file, "utf8")).toContain("line 39");
+    const savedFile = JSON.parse(await readFile(content.response_file, "utf8"));
+    expect(savedFile.result.structuredContent.response.message.content).toBe(long);
+    expect(savedFile.result.structuredContent.results[0].response.response.message.content).toBe(long);
+  });
+
+  it("keeps host telemetry and nested metrics out of the inline receipt and in the file", async () => {
+    const store = await storeIn();
+    const receipt = { selected_model: "m", response: { message: { content: "pong" } }, execution: { placement: "gpu" }, telemetry: { host: "x".repeat(2000) },
+      metrics: { eval_count: 3, load_duration_ns: 5, detail: { big: "y".repeat(500) } } };
+    const result = await finishResult("run_task", {}, { structuredContent: receipt }, 1, "t", store);
+    const content = result.structuredContent as Record<string, any>;
+    expect(content.telemetry).toBeUndefined();
+    expect(content.metrics).toEqual({ eval_count: 3, load_duration_ns: 5 });
+    expect(JSON.parse(await readFile(content.response_file, "utf8")).result.structuredContent.telemetry.host).toHaveLength(2000);
+  });
+
+  it("gives parallel and same-millisecond answers different default files", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const answers = await Promise.all([1, 2, 3].map((n) => run("run_task", { output: "file" }, `answer ${n}`, off)));
+      const files = answers.map((answer) => (answer.structuredContent as Record<string, any>).output_file);
+      expect(new Set(files).size).toBe(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("addresses the whole saved text with the JSON pointer it names", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "responses-"));
+    const store = new ResponseStore(root, 1024 * 1024);
+    const long = withLines(answerOf(20_000));
+    const short = await run("run_task", {}, long, store);
+    const file = (short.structuredContent as Record<string, any>).response_file as string;
+    const view = await readResponse({ file, section: SAVED_TEXT_SECTION, limit: 1_000_000 }, root) as { structuredContent: Record<string, any> };
+    expect(view.structuredContent.value).toBe(long);
+    expect(view.structuredContent.total).toBe(long.length);
+  });
+
+  it("keeps an over-threshold answer whole and writes nothing for output inline, and shortens a small one for output file", async () => {
+    const store = await storeIn();
+    const long = answerOf(12_000);
+    const before = await outputs();
+    expect(textOf(await run("run_task", { output: "inline" }, long, store) as never)).toBe(long);
+    expect(await outputs()).toEqual(before);
+    const small = await run("run_task", { output: "file" }, withLines("[m:1] short answer"), store);
+    expect(textOf(small as never)).toMatch(/^\[m:1\]\nshort answer\ncheck: 2 numbers.*\ncheck: close match\nhandoff_file: \/h\/notes\.md\noutput_file: .*\.md \(the full answer, \d+ chars\)$/);
+    expect((small.structuredContent as Record<string, any>).output.mode).toBe("file");
+  });
+
+  it("keeps the research verdict and citations in the short view", async () => {
+    const store = await storeIn();
+    const text = `${answerOf(12_000)}\n\nverification: escalate\ncited: src/a.ts, src/b.ts\n(m:1, 3 tool call(s))`;
+    const short = textOf(await run("delegate_research", {}, text, store) as never);
+    expect(short).toContain("verification: escalate\ncited: src/a.ts, src/b.ts\noutput_file: ");
+    expect(short).not.toContain("tool call(s)");
+  });
+
+  it("leaves errors, previews, acknowledgements and other tools alone", async () => {
+    const store = await storeIn();
+    const long = answerOf(12_000);
+    const before = await outputs();
+    expect(textOf(await run("read_response", { output: "file" }, long, store) as never)).toBe(long);
+    const failed = await finishResult("run_task", { output: "file" }, { ...resultOf(long), isError: true }, 1, "t", store);
+    expect(textOf(failed as never)).toBe(long);
+    expect(textOf(await run("run_task", { output: "file", preview: true }, long, store) as never)).toBe(long);
+    expect(textOf(await run("run_task", { output: "file", defer: true }, long, store) as never)).toBe(long);
+    const ack = await finishResult("run_task", { output: "file" }, { content: [{ type: "text", text: long }], structuredContent: { deferred: true, job: { id: "j", status: "queued" } } }, 1, "t", store);
+    expect(textOf(ack as never)).toBe(long);
+    expect(await outputs()).toEqual(before);
+  });
+
+  it("falls back to the saved response when the default file cannot be written, and keeps the answer whole when that is off too", async () => {
+    const long = answerOf(12_000);
+    await withBlockedOutputDir(async () => {
+      const store = await storeIn();
+      const saved = await run("run_task", {}, long, store);
+      const content = saved.structuredContent as Record<string, any>;
+      expect(textOf(saved as never)).toMatch(/output_file not written: /);
+      expect(textOf(saved as never).split("\n")).toContain(`full answer (${long.length} chars): read_response{file:"${content.response_file}", section:"${SAVED_TEXT_SECTION}"}`);
+      expect(content.output).toEqual({ mode: "auto", chars: long.length, file: content.response_file });
+      expect(content.output_file).toBeUndefined();
+
+      const result = await run("run_task", {}, long, off);
+      expect(textOf(result as never).startsWith(`${long}\noutput_file not written: `)).toBe(true);
+      expect(textOf(result as never)).toContain(`\nnot shortened (${long.length} chars): `);
+      expect((result.structuredContent as Record<string, any>).output).toBeUndefined();
+    });
+    // An answer that was not going to shorten, with the store off, stays as it is.
+    expect(textOf(await run("run_task", {}, "short", off) as never)).toBe("short");
+  });
+
+  it("writes outputPath as Markdown, creating directories, returns output_file, and points the short view at it", async () => {
+    const dir = await scratch();
+    const target = path.join(dir, "notes", "answer.md");
+    const long = withLines(answerOf(12_000));
+    const before = await outputs();
+    const result = await run("run_task", { outputPath: target }, long, off);
+    const content = result.structuredContent as Record<string, any>;
+    const real = path.join(await realpath(dir), "notes", "answer.md");
+    expect(content.output_file).toBe(real);
+    expect(content.output).toEqual({ mode: "auto", chars: long.length, file: real });
+    expect(textOf(result as never).split("\n").at(-1)).toBe(`output_file: ${real} (the full answer, ${long.length} chars)`);
+    const body = await readFile(real, "utf8");
+    expect(body.startsWith("# answer.md\n\nFrom FreeLlama, ")).toBe(true);
+    expect(body).toContain(`## Result\n\n${long.replace(label, "").trim()}\n`);
+    expect((await stat(real)).mode & 0o777).toBe(0o600);
+    expect((await stat(path.dirname(real))).mode & 0o777).toBe(0o700);
+    // The caller chose the file, so no default file is written.
+    expect(await outputs()).toEqual(before);
+
+    // inline: the text stays whole and the file is a copy; the caller's path is replaced, whoever wrote it.
+    const copy = await run("run_task", { outputPath: target, output: "inline" }, "second answer", off);
+    expect(textOf(copy as never)).toBe(`second answer\noutput_file: ${real}`);
+    expect(await readFile(real, "utf8")).toContain("## Result\n\nsecond answer\n");
+    const mine = path.join(dir, "mine.md");
+    await writeFile(mine, "# my notes\n");
+    await run("run_task", { outputPath: mine, output: "inline" }, "replaced", off);
+    expect(await readFile(mine, "utf8")).toContain("## Result\n\nreplaced\n");
+  });
+
+  it("keeps the whole answer inline and names the error when the outputPath write fails", async () => {
+    const dir = await scratch();
+    const long = answerOf(12_000);
+    // A directory is not a regular file: refused at the write, after the work, and the answer stays whole.
+    const refused = await run("run_task", { outputPath: dir, output: "file" }, long, off);
+    expect(textOf(refused as never)).toContain(`${long}\noutput_file not written: outputPath ${dir} exists and is not a regular file`);
+    expect((refused.structuredContent as Record<string, any>).output_file).toBeUndefined();
+
+    // A parent that is a file: with a store the short view points at the saved response.
+    const taken = path.join(dir, "taken.md");
+    await writeFile(taken, "x");
+    const store = await storeIn();
+    const blocked = await run("run_task", { outputPath: path.join(taken, "x.md") }, long, store);
+    expect(textOf(blocked as never)).toMatch(/output_file not written: /);
+    expect(textOf(blocked as never)).toMatch(/full answer \(\d+ chars\): read_response/);
   });
 });

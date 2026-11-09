@@ -60,8 +60,12 @@ function viewText(view: SweepView): string {
   const eta = view.etaSeconds !== undefined ? `, about ${Math.max(1, Math.round(view.etaSeconds / 60))} min left` : "";
   const next = view.phase === "running" || view.phase === "collecting"
     ? `sweep{action:"wait", sweepId:"${view.id}"} to follow it`
-    : view.phase === "interrupted" || view.phase === "cancelled" || c.failed > 0
-      ? `sweep{action:"resume", sweepId:"${view.id}"} continues it`
+    : view.resume
+      ? `${view.phase === "interrupted" ? "its server process exited; " : ""}sweep{action:"resume", sweepId:"${view.id}"} continues it, reusing saved chunk results`
+      : view.phase === "interrupted"
+        ? "it stopped while collecting pages and cannot resume: start a new sweep"
+        : c.failed > 0
+          ? `sweep{action:"resume", sweepId:"${view.id}"} retries the failed chunks`
       : `sweep{action:"results", sweepId:"${view.id}"} lists flagged chunks`;
   return `sweep ${view.id} ${view.phase}${view.error ? ` (${view.error})` : ""}: ${c.done + c.failed}/${c.total} chunks${view.pages !== undefined ? ` from ${view.pages} pages` : ""}, ` +
     `${c.flagged} flagged, ${c.unsure} unsure, ${c.clear} clear, ${c.failed} failed${changes}${eta}. Next: ${next}.`;

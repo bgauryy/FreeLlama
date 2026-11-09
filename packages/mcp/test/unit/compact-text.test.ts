@@ -1,5 +1,6 @@
 // The text of results that carry no `summary`: compact, factual, and bounded. The handlers are
-// driven with the native/serve boundary mocked; structuredContent must stay the whole object.
+// driven with the native/serve boundary mocked. structuredContent stays the whole object, except
+// models installed/resident, which return a slim per-model set unless includeVerbose is true.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const upstream = vi.hoisted(() => ({

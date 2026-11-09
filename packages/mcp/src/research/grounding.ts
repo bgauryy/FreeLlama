@@ -33,14 +33,28 @@ export function evidencePaths(observations: string[], workspace: string, limit =
   return found;
 }
 
-export function groundingRepairNotice(missing: string[], evidence: string[]): string {
-  return `These paths in your answer do not exist in the workspace: ${missing.join(", ")}. `
-    + (evidence.length > 0 ? `Paths your own commands returned: ${evidence.join(", ")}. ` : "")
-    + "Return a finish action again that cites only paths that exist; if the evidence does not establish the answer, say so.";
+/**
+ * Cited paths that none of the run's own tool outputs mention: for an adapter whose files are not on
+ * local disk (GitHub), a path the model actually saw is grounded and an invented one is not.
+ */
+export function unseenPaths(answer: string, observations: string[]): string[] {
+  return pathsIn(answer).filter((candidate) => !observations.some((text) => text.includes(candidate)));
 }
 
-export function groundingNote(missing: string[]): string {
-  return `\n[freellama: cited path(s) not found in the workspace: ${missing.join(", ")}; treat this answer as unverified]`;
+/** Paths named in the run's own observations, whether or not they exist locally (at most `limit`). */
+export function observedPaths(observations: string[], limit = 10): string[] {
+  return [...new Set(observations.flatMap((text) => pathsIn(text)))].slice(0, limit);
+}
+
+export function groundingRepairNotice(missing: string[], evidence: string[], observed = false): string {
+  return `These paths in your answer ${observed ? "did not appear in any tool result" : "do not exist in the workspace"}: ${missing.join(", ")}. `
+    + (evidence.length > 0 ? `Paths your own commands returned: ${evidence.join(", ")}. ` : "")
+    + `Return a finish action again that cites only paths ${observed ? "your tool results showed" : "that exist"};`
+    + " if the evidence does not establish the answer, say so.";
+}
+
+export function groundingNote(missing: string[], observed = false): string {
+  return `\n[freellama: cited path(s) ${observed ? "not seen in any tool result" : "not found in the workspace"}: ${missing.join(", ")}; treat this answer as unverified]`;
 }
 
 /** A hint for tool errors a model repeats when it mixes up grep and rg flags. */

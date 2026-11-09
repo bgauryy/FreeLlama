@@ -192,7 +192,7 @@ command reports the core catalog and does not expose these enrichment flags.
 |---|---|---|---|
 | `includeLibrary` | `installed`, `detail` | `false` | Requests public metadata; the default makes no website calls |
 | `includeReadme` | Library step 2, or `detail` with `includeLibrary:true` | `false` | Returns the README text with its format |
-| `includeVerbose` | `detail` | `false` | Returns Ollama's license and Modelfile fields independently of README enrichment |
+| `includeVerbose` | `installed`, `resident`, `detail` | `false` | `installed`/`resident`: full per-model records (benchmark, policy rank, execution observation, thinking, context defaults) instead of the slim set; `detail`: Ollama's license and Modelfile fields, independently of README enrichment |
 | `limit`, `cursor` | `raw`, library tag listings; `limit` also applies to library search | Tag/raw page size 20; search limit 10; maximum 50 | Pages large lists; the tag cursor rejects a changed tag list |
 | `query`, `capabilities`, `order`, `source` | Library search | Popular order, both sources | Filter by capability word (such as `decision`), order by `popular` or `newest`, or limit to `ollama` or `huggingface` |
 | `ollamaEndpoint` | Direct Ollama views and library inventory reads | Configured Ollama endpoint | Chooses the Ollama instance; enriched managed inventory uses each model's assigned backend |

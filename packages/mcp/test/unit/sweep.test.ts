@@ -178,4 +178,50 @@ describe("sweep runner", () => {
     release();
     await runner.waitFor(sweep.id, 5_000);
   });
+
+  /** A record as a server process that died mid-sweep leaves it: phase running, owner gone, two of three chunks judged. */
+  const deadSweep = (root: string, owner?: { pid: number }) => {
+    const store = new SweepStore(path.join(root, ".sweeps"));
+    store.create({ config: { ...base([]), id: "11111111-1111-4111-8111-111111111111", createdAt: "2026-01-01T00:00:00.000Z", flags: base([]).flags }, phase: "running",
+      chunks: [], skipped: [], startedAt: "2026-01-01T00:00:00.000Z", ...(owner ? { owner } : {}) });
+    const id = "11111111-1111-4111-8111-111111111111";
+    const manifest = store.manifest(id);
+    for (const [n, text] of [["a", "const a = 1;"], ["b", "const b = 2; // leak"], ["c", "const c = 3;"]] as const) {
+      const chunk = { id: `c0000${n}`, label: `${n}.ts`, source: `${n}.ts`, hash: n, bytes: text.length };
+      manifest.chunks.push(chunk);
+      store.addChunk(id, chunk, text);
+    }
+    store.saveManifest(manifest);
+    for (const n of ["a", "b"]) store.addResult(id, { chunk: `c0000${n}`, status: "done", verdict: "clear", answers: {}, attempts: 1, model: "decider", ms: 1, at: "x" });
+    return { store, id };
+  };
+
+  it("says interrupted, with the exact resume call, for a sweep whose owner process is gone", async () => {
+    const { store, id } = deadSweep(workspace(), { pid: 2_147_483_000 });
+    const runner = new SweepRunner(store, fakeModel(), async () => undefined);
+    const started = Date.now();
+    await runner.waitFor(id, 50_000);
+    expect(Date.now() - started).toBeLessThan(1_000);
+    const view = runner.view(id);
+    expect(view).toMatchObject({ phase: "interrupted", counts: { done: 2, pending: 1 }, resume: { action: "resume", sweepId: id } });
+  });
+
+  it("treats a sweep owned by another live process as running and refuses to resume it", () => {
+    const { store, id } = deadSweep(workspace(), { pid: process.ppid });
+    const runner = new SweepRunner(store, fakeModel(), async () => undefined);
+    expect(runner.view(id)).toMatchObject({ phase: "running", ownerPid: process.ppid });
+    expect(() => runner.resume(id)).toThrow(/still running in server process/);
+  });
+
+  it("resumes an interrupted sweep without re-judging finished chunks", async () => {
+    const { store, id } = deadSweep(workspace());
+    expect(new SweepRunner(store, fakeModel(), async () => undefined).view(id).phase).toBe("interrupted");
+    const calls: string[] = [];
+    const runner = new SweepRunner(store, fakeModel(calls), async () => undefined);
+    runner.resume(id);
+    await runner.waitFor(id, 5_000);
+    expect(calls).toEqual(["decision:decider"]);
+    expect(runner.view(id)).toMatchObject({ phase: "completed", counts: { done: 3, pending: 0, flagged: 0 } });
+    expect(runner.view(id).resume).toBeUndefined();
+  });
 });

@@ -5,5 +5,6 @@ import { GITHUB_ADAPTER } from "./octocode-agent.js";
 import { isEntry } from "./entry.js";
 
 if (isEntry(import.meta.url, "github-agent")) {
-  process.exitCode = await runAdapter(GITHUB_ADAPTER);
+  // Remote files are not on local disk: a cited path counts when the run's own gh results showed it.
+  process.exitCode = await runAdapter({ ...GITHUB_ADAPTER, grounding: "observed" });
 }
