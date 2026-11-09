@@ -42,7 +42,7 @@ for (const target of targets) {
   for (const file of [addonName(target.id), executableName(target.id)]) {
     requireEmbeddedVersion(path.join(out, file), version);
   }
-  if (target.os === process.platform && target.cpu === process.arch && target.libc !== "musl") {
+  if (target.os === process.platform && target.cpu === process.arch) {
     const reported = [
       createRequire(import.meta.url)(path.join(out, addonName(target.id))).version(),
       execFileSync(path.join(out, executableName(target.id)), ["--version"], { encoding: "utf8" }).trim(),

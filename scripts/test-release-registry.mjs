@@ -71,7 +71,7 @@ test("all missing release versions pass after checking the complete package matr
   try {
     const result = await f.run();
     assert.equal(result.code, 0, result.stderr);
-    assert.equal(f.requests.length, 10);
+    assert.equal(f.requests.length, packages.length);
     assert.deepEqual(new Set(f.requests.map(({ name }) => name)), new Set(packages.map(([, name]) => name)));
     assert.ok(f.requests.every(({ method, accept }) => method === "GET" && accept === "application/json"));
   } finally { await f.cleanup(); }
@@ -85,7 +85,7 @@ for (const [label, collision] of [["CLI", packages[0][1]], ["last native platfor
       assert.notEqual(result.code, 0);
       assert.match(result.stderr, /already published/);
       assert.ok(result.stderr.includes(`${collision}@${version}`), result.stderr);
-      assert.equal(f.requests.length, 10);
+      assert.equal(f.requests.length, packages.length);
     } finally { await f.cleanup(); }
   });
 }
@@ -100,7 +100,7 @@ for (const status of [401, 403, 500]) {
       const result = await f.run();
       assert.notEqual(result.code, 0);
       assert.match(result.stderr, new RegExp(`HTTP ${status}`));
-      assert.equal(f.requests.length, 10);
+      assert.equal(f.requests.length, packages.length);
     } finally { await f.cleanup(); }
   });
 }

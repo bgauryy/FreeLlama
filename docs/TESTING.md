@@ -223,7 +223,7 @@ tier, and each writes a dated report to the git-ignored `.octocode/local-test/`.
 
 ```bash
 # Collect each target's `freellama` executable and `freellama.<target>.node`
-# under release-artifacts/<target>/, then stage all eight platform packages.
+# under release-artifacts/<target>/, then stage every platform package in scripts/release-platforms.mjs.
 node scripts/assemble-release.mjs release-artifacts release
 yarn release:verify:publish   # also requires each artifact's embedded commit == HEAD, clean tree
 yarn release:smoke            # packed-install smoke of the host platform package

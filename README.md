@@ -14,8 +14,8 @@ agent still decides what to offload and verifies the answer.
 
 - [Ollama](https://ollama.com/download) running (`ollama list` works) with at least one model.
   FreeLlama never downloads a model without your approval.
-- Node.js 22 or newer. Prebuilt binaries for macOS, Linux (glibc and musl) and Windows on arm64 and
-  x64 ship as npm optional dependencies; keep those enabled.
+- Node.js 22 or newer. Prebuilt binaries for macOS arm64, Linux arm64/x64 (glibc) and Windows
+  arm64/x64 ship as npm optional dependencies; keep those enabled.
 
 ## Install
 
