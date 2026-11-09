@@ -10,12 +10,66 @@ tokens and context. For each task it picks an installed model that fits, loads a
 only when they fit in memory, and returns the result with a receipt of where and how it ran. Your
 agent still decides what to offload and verifies the answer.
 
+```mermaid
+flowchart LR
+    agent["Coding agent<br/>Claude Code, Cursor, any MCP host"]
+    cli["freellama CLI"]
+    raw["Ollama-compatible client"]
+    subgraph fl["FreeLlama, on your machine"]
+        mcp["MCP server<br/>Node.js + Rust addon"]
+        serve["freellama serve<br/>127.0.0.1:11435"]
+        research["Research adapter<br/>read-only, allowlisted files"]
+    end
+    gpu[("Ollama<br/>GPU: Metal, CUDA, ROCm")]
+    cpu[("Optional CPU-only Ollama")]
+
+    agent -->|"MCP over stdio"| mcp
+    mcp -->|"control API"| serve
+    cli -->|"control API"| serve
+    raw -.->|"/api and /v1 stream through"| serve
+    mcp -.->|"delegate_research"| research
+    research -->|"each model turn is a managed task"| serve
+    serve -->|"route, admit, load, run"| gpu
+    serve -.->|"operator-assigned models"| cpu
+```
+
+## Why FreeLlama
+
+Coding agents spend paid tokens and context on work a model on your own machine can do: embedding a
+repository, reading screenshots and scans, summarizing or classifying hundreds of files. Pointing
+the agent straight at Ollama does not fix that, because the agent cannot see:
+
+- **Which model fits the job.** A tag name does not show capabilities, context window or memory
+  footprint.
+- **Whether there is room.** One more load can push the machine into swap, several agents can pile
+  onto one GPU, and a hot or busy machine slows everything.
+- **Whether it worked.** A model can repeat itself until its token cap, and nothing says whether the
+  task ran on the GPU or fell back to the CPU.
+
+FreeLlama answers all three on every call, which makes offloading safe to do by default: the paid
+model keeps the judgment, the local model does the volume, and each answer comes back with a receipt
+you can check. The name means less metered inference, not only Meta's Llama models. More in
+[Features](docs/FEATURES.md#why-freellama).
+
 ## Requirements
 
-- [Ollama](https://ollama.com/download) running (`ollama list` works) with at least one model.
-  FreeLlama never downloads a model without your approval.
-- Node.js 22 or newer. Prebuilt binaries for macOS arm64, Linux arm64/x64 (glibc) and Windows
-  arm64/x64 ship as npm optional dependencies; keep those enabled.
+| You need | Why |
+|---|---|
+| [Ollama](https://ollama.com/download) running (`ollama list` works) with at least one model | FreeLlama manages Ollama; it does not install, start or replace it, and never downloads a model without your approval |
+| Node.js 22 or newer | Runs the MCP server and the `freellama` npm launcher |
+| One of the platforms below | npm installs the matching prebuilt binary as an optional dependency; do not install with `--omit=optional` |
+
+| Platform | Prebuilt package |
+|---|---|
+| macOS, Apple silicon (arm64) | `@octocodeai/freellama-native-darwin-arm64` |
+| Linux x64, glibc | `@octocodeai/freellama-native-linux-x64-gnu` |
+| Linux arm64, glibc | `@octocodeai/freellama-native-linux-arm64-gnu` |
+| Windows x64 | `@octocodeai/freellama-native-win32-x64-msvc` |
+| Windows arm64 | `@octocodeai/freellama-native-win32-arm64-msvc` |
+
+Intel Macs and musl Linux (such as Alpine) have no prebuilt binary: build from source with Rust 1.89
+or newer ([Build from source](docs/BUILD_AND_NOTES.md#build-from-source)). Optional: a second,
+CPU-only Ollama process for small helper models ([CPU/GPU routing](docs/CPU_GPU_ROUTING.md)).
 
 ## Install
 
@@ -91,6 +145,74 @@ freellama status        # queues, memory holds, loaded models
 Replace `MODEL_TAG` with a tag from `models`. `init`, `doctor` and `catalog` work without `serve`.
 Every command has `--help`; the [CLI guide](docs/CLI.md) covers the rest. While `serve` runs, a
 status page is at `http://127.0.0.1:11435/_freellama/ui`.
+
+## Under the hood
+
+Every managed call, from the MCP server, the CLI or the HTTP API, runs through the same Rust core
+and the same gates: route, admit, load, run, observe. Nothing is decided from a model's name.
+
+| Owner | Does |
+|---|---|
+| Your agent | Decides what to offload, writes the prompt, verifies the answer |
+| FreeLlama | Picks the model, queues fairly, checks memory and host signals, coordinates loads, writes the receipt |
+| Ollama | Stores models, loads runners, generates tokens |
+
+### Life of one task
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as Agent
+    participant M as MCP server
+    participant S as freellama serve
+    participant O as Ollama
+    A->>M: run_task (task kind, model, prompt)
+    M->>S: POST /_freellama/v1/tasks
+    Note over S: Route: filter installed models by capability<br/>and context window, rank by policy,<br/>local benchmarks and loop history
+    Note over S: Admit: fair queue per backend, weighted 3/2/1<br/>for interactive, normal and background work,<br/>then memory, swap, CPU-load and heat checks
+    alt queue full, no room, or wait budget spent
+        S-->>M: 429 or 503 with the reason
+    else admitted
+        opt model not resident
+            S->>O: load it under the backend's load lock
+        end
+        S->>O: chat, generate or embed
+        O-->>S: streamed tokens, checked for loops every 16 tokens<br/>when the repetition stop is on
+        S->>O: GET /api/ps
+        O-->>S: where the runner actually ran, GPU or CPU
+        S-->>M: result + receipt
+    end
+    M-->>A: answer + receipt: route, admission, timing, placement
+```
+
+An explicit `model` always wins over routing; FreeLlama never swaps in another model. With
+`defer:true` the same path runs in the background and `task_jobs` returns the receipt.
+
+### The memory gate
+
+A model load has to fit before it starts, so a new load cannot push the machine into swap:
+
+```mermaid
+flowchart TD
+    T(["Task admitted"]) --> R{"Model already<br/>resident?"}
+    R -->|"yes"| Run(["Run on the resident runner<br/>no new memory"])
+    R -->|"no"| P{"OS memory pressure,<br/>or swapping on a large load?"}
+    P -->|"yes"| Hold["Hold the load"]
+    P -->|"no"| F{"Fits in available memory<br/>and leaves the reserve free?"}
+    F -->|"yes"| Load(["Load, then run"])
+    F -->|"no"| U["Unload idle runners"]
+    U --> F2{"Fits now?"}
+    F2 -->|"yes"| Load
+    F2 -->|"no"| Hold
+    Hold --> W{"Room freed before<br/>the deadline?"}
+    W -->|"yes"| P
+    W -->|"no"| X(["503 naming the hold<br/>and the largest memory users"])
+```
+
+Resident models keep serving through a hold, except at critical OS memory pressure. Load estimates
+come from model metadata (including the K/V cache at the requested context), and Ollama stays the
+final authority on memory. `--low-memory advisory` admits a tight load with a warning instead of
+waiting. Details: [Architecture](docs/ARCHITECTURE.md#managed-task-execution).
 
 ## What to offload
 
