@@ -78,7 +78,8 @@ function candidateModels() {
 }
 
 function runCase(workflow, model, item) {
-  const args = [CLI, "run", "-w", workflow, "-m", model, "--json", "-o", "temperature=0", ...(item.prompt ? [item.prompt] : [])];
+  // The shipped sampling presets apply (no temperature override), so this measures what agents get.
+  const args = [CLI, "run", "-w", workflow, "-m", model, "--json", "--no-stream", ...(item.prompt ? [item.prompt] : [])];
   const started = Date.now();
   let receipt;
   try {

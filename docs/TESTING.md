@@ -223,13 +223,16 @@ tier, and each writes a dated report to the git-ignored `.octocode/local-test/`.
 | `scripts/local-test/octocode-agent.mjs` | A local model driving Octocode through `delegate_research` |
 | `scripts/local-test/workflows.mjs` | Each text workflow (summarize-text, summarize-log, summarize-diff, extract-json, explain-code, review-code, fix-bug) on each candidate model through `fllama run -w -m`. Graded on facts present, nothing invented, length, filler, exact JSON fields and the planted bug. Pass `--models a,b`, `--workflows x,y`, `--out file.json`. Re-run it after changing a workflow prompt or a catalog pick |
 
-Workflow eval of 2026-11-10 (Apple M2 Pro, a few cases per workflow, so treat it as directional):
+Workflow eval of 2026-11-10 (Apple M2 Pro, 12 cases, so treat it as directional). The second
+run used the reworded prompts and the shipped sampling presets (the first forced temperature 0):
 
-| Workflow | `lfm3:1.7b` | `bonsai-2:9b` | Change made |
+| Workflow | `lfm3:1.7b` first → second | `bonsai-2:9b` first → second | Change made |
 |---|---|---|---|
-| summarize-text | 0/3 → 2/3 | 3/3 | No-padding prompt; `prefer: "capable"` |
-| summarize-log | 0/2 | 2/2 | Already `prefer: "capable"` |
-| extract-json, summarize-diff, fix-bug | all pass | all pass | None (`lfm3` is 3–5x slower on code because it thinks) |
+| summarize-text | 0/3 → 3/3 | 3/3 → 3/3 | No-padding prompt; `prefer: "capable"` |
+| summarize-log | 0/2 → 1/2 (one run looped to 1,688 words) | 2/2 → 2/2 | Line-by-line format, no-padding closing; already `prefer: "capable"` |
+| explain-code, review-code | 3/3 → 3/3 | 1/3 → 3/3 | Callers only when shown; quote the faulty code instead of line numbers the input lacks |
+| summarize-diff, extract-json, fix-bug | all pass | all pass | Diff risks only when the diff shows them |
+| **All** | **7/12 → 11/12** | **10/12 → 12/12** | |
 
 ## Verify release packages
 

@@ -198,7 +198,9 @@ describe("run_task with job", () => {
     expect(sent).toMatchObject({ task: "completion", model: "lfm3:1.7b-q4_K_M", request_options: { options: { temperature: 0.1, top_k: 50, repeat_penalty: 1.1 } } });
     expect(sent.messages[0]).toMatchObject({ role: "system", content: LOCAL_JOBS.summarize.systemPrompt });
     expect(sent.messages[1]).toMatchObject({ role: "user", content: "Which steps failed?" });
-    expect(result.structuredContent.job_profile).toEqual({ job: "summarize", model: "lfm3:1.7b-q4_K_M", applied: ["task", "model", "systemPrompt", "options"] });
+    expect(result.structuredContent.job_profile).toEqual({ job: "summarize", model: "lfm3:1.7b-q4_K_M", applied: ["task", "model", "systemPrompt", "think", "options"] });
+    // Bounded output: the summarize job turns thinking off, as its workflows do.
+    expect(sent.request_options.think).toBe(false);
   });
 
   it("lets an explicit model skip the pick, and refuses when no pick fits", async () => {

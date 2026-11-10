@@ -108,13 +108,13 @@ const ocrPrompt = (kind: keyof typeof OCR_PLAIN, model: string | undefined): str
 // own (applyJob in job-mode.ts). Short on purpose: these models are 2-30B.
 
 /** How a coding workflow returns a change. */
-const EDIT_FORMAT = `Return each change to an existing file as the file's path (copied from its "--- file:" line), then:
+const EDIT_FORMAT = `Return each change to an existing file as the file's path alone on one line (for "--- file: src/a.ts ---" write src/a.ts), then:
 <<<<<<< SEARCH
 exact current lines (5 to 30, unique in the file, indentation exact)
 =======
 replacement lines
 >>>>>>> REPLACE
-Copy SEARCH lines character for character; prefer several small blocks to one large one. For a new file, or one under 30 lines, give its path on one line and the whole file in one fenced block. If the file was not shown, give the code in one fenced block and say which file and function it belongs in.`;
+Copy SEARCH lines character for character; prefer several small blocks to one large one. Give a whole file, as its path on one line and the file in one fenced block, only for a new file. If the file was not shown, give the code in one fenced block and say which file and function it belongs in.`;
 
 export type Workflow = {
   /** The job whose model picks run it. */
@@ -139,7 +139,9 @@ export type Workflow = {
  * Every text workflow starts here: small models invent tool calls when they see file paths. Job
  * mode drops this line when the caller sends `tools`.
  */
-export const NO_TOOLS = "You have no tools and cannot open files: everything you need is in this message. Answer in plain text.";
+export const NO_TOOLS = "You have no tools and cannot open files: everything you need is in this message.";
+/** The closing line every text workflow shares: small models pad with what the input lacks, or with greetings. */
+const NO_PADDING = "Skip anything the input does not show. No introduction, closing or offer of help.";
 
 export const WORKFLOWS = {
   "read-text": {
@@ -155,6 +157,8 @@ export const WORKFLOWS = {
     prompt: (request) => `Extract these fields from the image: ${request ?? "all labelled fields"}. Format the output as a JSON object with these keys, values exactly as printed; use "###" for a field the image does not show.`,
   },
   "answer-image": {
+    // Bounded output; the vision picks think by default, which only adds time here.
+    think: false,
     job: "image-recognition", title: "Answer a question about an image", input: "files: the images; prompt: the question",
     system: `Answer the question about the image.
 1. Find the part of the image the question is about.
@@ -164,15 +168,13 @@ If the image does not show it, answer "not visible". Never guess at what is cut 
   },
   "describe-screen": {
     job: "image-recognition", title: "Describe a screenshot for a developer: text, errors, state", input: "files: the screenshot; prompt: what to look for (optional)",
-    system: `You describe a software screenshot for a developer, in short bullets, in this order:
-- the app or page shown;
-- headings and main text, quoted exactly;
-- any error, warning or empty state, quoted exactly;
-- the state of the controls that matter (selected, disabled, filled in);
-- anything that looks broken or misaligned.
-Describe only what is visible.`,
+    think: false,
+    system: `Describe the screenshot for a developer in at most 6 short bullets, in this order: the app or page; headings and main text, quoted exactly; errors, warnings or empty states, quoted exactly; the state of the controls that matter (selected, disabled, filled in); anything broken or misaligned.
+If the request names something to look for, answer that first.
+Describe only what is visible. ${NO_PADDING}`,
   },
   "change-code": {
+    prefer: "capable",
     job: "coding", title: "Make one small code change", input: "files: the file to change; prompt: the change",
     system: `${NO_TOOLS}
 You make one small code change.
@@ -180,7 +182,7 @@ You make one small code change.
 2. Follow the file's existing names, style and error handling.
 3. Change as few lines as the task needs; touch nothing else.
 ${EDIT_FORMAT}
-Explain nothing unless asked. If the task is a question, answer it in a few lines.`,
+Explain nothing unless asked.`,
   },
   "fix-bug": {
     prefer: "capable",
@@ -220,26 +222,26 @@ Answer with the test file's path on one line, then the whole file in one fenced 
     job: "coding", title: "Find real defects in code (not style)", input: "files: the code; prompt: what to focus on (optional)",
     system: `${NO_TOOLS}
 You review the code shown for real defects only: wrong logic, unhandled errors, off-by-one, null or undefined access, leaks, injection, races. Ignore style and naming.
-For each defect write one line: path:line - the problem - the fix.
-Report at most 5, the surest first. If you find none, answer "no defects found". Never invent a line you did not see.`,
+For each defect write one line: path - the faulty code quoted exactly (one line) - the problem - the fix.
+Report at most 5, the surest first. If you find none, answer "no defects found". Never invent code you did not see. No introduction or closing.`,
   },
   "explain-code": {
     job: "coding", title: "Explain code to someone about to change it", input: "files: the code; prompt: what to explain (optional)",
     system: `${NO_TOOLS}
 Explain the code shown to a developer who is about to change it, in at most 6 bullets:
-what it does (one sentence); its inputs and outputs; side effects (files, network, shared state); what calls it, if visible; the one thing most likely to break when it changes.
-Name functions and variables exactly.`,
+what it does (one sentence); its inputs and outputs; side effects (files, network, shared state); its callers, when the code shown includes them; the one thing most likely to break when it changes.
+Name functions and variables exactly. ${NO_PADDING}`,
   },
   "summarize-log": {
     think: false,
     prefer: "capable",
     job: "summarize", title: "Summarize a log: errors grouped, counted, first failure", input: "files: the log; prompt: what you are investigating (optional)",
     system: `${NO_TOOLS}
-You read a log for a developer. Report:
-1. Errors and warnings, grouped by message, each with its count and first and last timestamp.
-2. The first error in time order, quoted exactly.
-3. The likely cause, only if the log shows it.
-Quote messages exactly, skip routine lines, at most 10 bullets.`,
+Summarize the log for a developer debugging it. Write only these lines, in order, skipping any the log gives nothing for:
+- one bullet per distinct error or warning: the message quoted exactly, then (×count, first–last timestamp);
+- First error: the earliest error line, quoted exactly;
+- Cause: one sentence, only if a log line states it.
+At most 8 bullets. Skip routine lines. ${NO_PADDING}`,
   },
   "summarize-text": {
     think: false,
@@ -252,16 +254,15 @@ Quote messages exactly, skip routine lines, at most 10 bullets.`,
 Summarize the text for someone who will act on it: its decisions, numbers, deadlines and open questions, plus whatever the request asks for.
 Use as few short bullets as the text needs; one is right for one sentence, and the summary is never longer than the text.
 Never write a bullet about something the text does not say (no "not provided", "not specified" or "no details"); write "not stated" only for something the request explicitly asks for. Never guess.
-Quote numbers, names, versions and paths exactly. No introduction or closing.`,
+Quote numbers, names, versions and paths exactly. No introduction, closing or offer of help.`,
   },
   "summarize-diff": {
     think: false,
     prefer: "capable",
     job: "summarize", title: "Summarize a diff for a reviewer: changes and risks", input: "files: the diff or patch",
     system: `${NO_TOOLS}
-You summarize a code diff for a reviewer, in at most 8 bullets:
-one line per file on what changed; any change in behaviour; risks such as a removed check, a changed default, a new dependency or a missing test.
-Name files, functions and settings exactly.`,
+Summarize the diff for a reviewer in at most 8 bullets: one per changed file (what changed, naming functions and settings exactly), then one per behaviour change or risk the diff itself shows (a removed check, a changed default, a new dependency, code changed with no test changed).
+If the diff shows no risk, write no risk bullet. ${NO_PADDING}`,
   },
   "extract-json": {
     think: false,
@@ -413,6 +414,8 @@ export const LOCAL_JOBS: Record<JobName, LocalJob> = {
     job: "summarize", task: "completion", catalogJob: "coding", defaultPicks: picksOf("coding"),
     prompt: () => "Summarize the text below.",
     systemPrompt: WORKFLOWS["summarize-text"].system,
+    // The same bounded output as the summarize-text workflow: thinking only adds time and leaks in.
+    think: false,
     models: CHAT_MODELS,
     notes: "The coding picks: the same chat models apply (docs/cookbooks/batch-text.md). Check every number and name you reuse.",
     sources: [...CHAT_SOURCES, cookbook("batch-text")],

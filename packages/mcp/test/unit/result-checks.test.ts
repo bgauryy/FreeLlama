@@ -97,3 +97,29 @@ describe("result-derived checks", () => {
     expect((result.structuredContent as Record<string, unknown>).checks).toHaveLength(1);
   });
 });
+
+describe("padding checks", () => {
+  it("names filler, absent-detail bullets and leaked thinking, and stays quiet on a clean answer", async () => {
+    const { paddingChecks } = await import("../../src/result-checks.js");
+    expect(paddingChecks("- Disk on node 3 was full.\n- No other details provided.\nLet me know if you need more.")).toEqual([
+      'filler ("Let me know if"); drop that sentence',
+      "1 line(s) only say what the input lacks; drop them",
+    ]);
+    expect(paddingChecks("<think>hmm</think>OK")).toEqual(["the answer contains <think> reasoning; use only the text after it"]);
+    expect(paddingChecks("- Disk on node 3 was full; redeployed at 14:10.")).toEqual([]);
+  });
+});
+
+describe("edit block paths", () => {
+  it("strips the input framing a model copies whole (`--- file: src/a.ts ---`)", () => {
+    const answer = "--- file: src/a.ts ---\n<<<<<<< SEARCH\nconst a = 1;\n=======\nconst a = 2;\n>>>>>>> REPLACE";
+    expect(editBlocks(answer)).toEqual([{ path: "src/a.ts", search: "const a = 1;" }]);
+  });
+});
+
+describe("workflow-aware checks", () => {
+  it("does not ask review-code or explain-code for edit blocks", () => {
+    const answer = "src/a.ts - `return sum(xs) / len(xs)` - divides by zero on an empty list - return 0.0 first";
+    expect(resultChecks({ job: "coding", task: "coding", workflow: "review-code", answer, structured: {} }).join(" ")).not.toMatch(/SEARCH/);
+  });
+});

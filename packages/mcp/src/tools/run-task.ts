@@ -708,7 +708,7 @@ export function registerRunTaskTool(server: McpServer): void {
         }
         // Checks read the result itself (uncertain answers, close matches, unsupported facts, edits
         // that do not match the file) and are saved with a handoff too.
-        const finish = <R,>(result: R): R => withJob(withChecks(result, job, task ?? "completion", tools), profile, saveAs);
+        const finish = <R,>(result: R): R => withJob(withChecks(result, job, task ?? "completion", tools, workflow), profile, saveAs);
         const canonicalTask = task ?? "completion";
         if (preview) {
           const executionOnlyFields = ([

@@ -22,7 +22,10 @@ const CLOSE = 0.02;
 const WEAK = 0.45;
 
 /** `tools`: the tool definitions sent with the task, if any. */
-export type CheckContext = { job?: string; task?: string; answer: string; structured: Fields; tools?: unknown[] };
+export type CheckContext = { job?: string; task?: string; answer: string; structured: Fields; tools?: unknown[]; workflow?: string };
+
+/** Coding workflows whose answer is edits; review-code and explain-code answer in prose. */
+const PROSE_CODING_WORKFLOWS = new Set(["review-code", "explain-code"]);
 
 function decisionChecks(answers: Fields): string[] {
   const unsure: string[] = [];
@@ -87,7 +90,8 @@ export function editBlocks(answer: string): EditBlock[] {
   const blocks: EditBlock[] = [];
   for (const match of answer.matchAll(/^([^\n<>=]+?)[ \t]*\n(?:[ \t]*`{3,}[\w+.-]*[ \t]*\n)?<{7} SEARCH\n([\s\S]*?)\n={7}\n[\s\S]*?\n>{7} REPLACE/gm)) {
     // Models decorate the path line: `--- path`, `+++ path`, `file: path`, headings, bold, backticks.
-    const path = match[1]!.trim().replace(/^(?:#+\s*|[*`]+|-{3}\s*|\+{3}\s*|(?:file|path):\s*)+|[*`:]+$/gi, "").trim();
+    // `--- file: src/a.ts ---` copied whole from the input framing leaves a trailing `---`.
+    const path = match[1]!.trim().replace(/^(?:#+\s*|[*`]+|-{3}\s*|\+{3}\s*|(?:file|path):\s*)+|(?:\s*-{3}|[*`:]+)+$/gi, "").trim();
     blocks.push({ path: path.startsWith("```") ? "" : path, search: match[2]! });
   }
   return blocks;
@@ -207,27 +211,48 @@ export function resultChecks(context: CheckContext): string[] {
   const nearest = object(context.structured.nearest);
   if (nearest) return nearestChecks(nearest);
   const files = readPaths(context.structured);
-  if (context.job === "coding" || context.task === "coding" || context.task === "code_repair") {
+  const edits = !PROSE_CODING_WORKFLOWS.has(context.workflow ?? "");
+  if (edits && (context.job === "coding" || context.task === "coding" || context.task === "code_repair")) {
     const checks = codingChecks(context.answer, files);
     if (checks.length > 0) return checks;
   }
-  if (context.task === "vision" || context.job === "ocr" || context.job === "image-recognition") return visionChecks(context);
+  const padding = paddingChecks(context.answer);
+  if (context.task === "vision" || context.job === "ocr" || context.job === "image-recognition") return [...padding, ...visionChecks(context)];
   const sources = files.map(readText).filter((text): text is string => text !== undefined);
   if (sources.length > 0 && context.answer.trim()) {
     const missing = unsupportedFacts(context.answer, sources);
-    return missing.length > 0
+    return [...padding, ...(missing.length > 0
       ? [`not in the source: ${missing.slice(0, 8).join(", ")}${missing.length > 8 ? ", …" : ""}; verify these before reusing them`]
-      : ["every number and quoted name in the answer appears in the source"];
+      : ["every number and quoted name in the answer appears in the source"])];
   }
-  return [];
+  return padding;
+}
+
+/** Phrases that add nothing to an answer: small models append them unasked. */
+const FILLER = /\b(let me know if|i hope this helps|feel free to|as an ai\b|here(?:'s| is) (?:a|the|your) (?:summary|breakdown|answer))/i;
+/** A bullet about what the input lacks, which a summary should leave out. */
+const ABSENT = /^\s*(?:[-*•]|\d+[.)])\s.*\b(?:not (?:provided|specified|mentioned|stated|given|visible)|no (?:further |other |additional )?(?:details|information|data) (?:provided|given|available))\b/i;
+
+/**
+ * Padding and leaked reasoning in a text answer: what to strip before reusing it. Thinking that
+ * reached the content (`<think>`) is the model's scratch work, not its answer.
+ */
+export function paddingChecks(answer: string): string[] {
+  const checks: string[] = [];
+  if (/<\/?think>/i.test(answer)) checks.push("the answer contains <think> reasoning; use only the text after it");
+  const filler = answer.match(FILLER)?.[0];
+  if (filler) checks.push(`filler ("${filler}"); drop that sentence`);
+  const absent = answer.split("\n").filter((line) => ABSENT.test(line)).length;
+  if (absent > 0) checks.push(`${absent} line(s) only say what the input lacks; drop them`);
+  return checks;
 }
 
 /** The result with `checks` in structuredContent and as `check:` lines after the answer. */
-export function withChecks<R>(result: R, job: string | undefined, task: string | undefined, tools?: unknown[]): R {
+export function withChecks<R>(result: R, job: string | undefined, task: string | undefined, tools?: unknown[], workflow?: string): R {
   const shown = result as { content?: Array<{ type: string; text?: string }>; structuredContent?: Fields; isError?: boolean };
   if (shown.isError || !shown.structuredContent) return result;
   const answer = (shown.content ?? []).map((part) => part.text ?? "").join("\n").replace(/^\[[^\]\n]*\] /, "");
-  const checks = resultChecks({ job, task, answer, structured: shown.structuredContent, tools });
+  const checks = resultChecks({ job, task, answer, structured: shown.structuredContent, tools, workflow });
   if (checks.length === 0) return result;
   const content = (shown.content ?? []).map((part, index) => (index === 0 && part.type === "text"
     ? { ...part, text: `${part.text ?? ""}\n${checks.map((check) => `check: ${check}`).join("\n")}` }
