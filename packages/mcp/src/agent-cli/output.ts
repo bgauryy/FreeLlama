@@ -112,3 +112,10 @@ export function refusalOf(text: string): { message: string; code?: string; unava
   const unavailable = /admission|memory|capacity|queue|fits now|no catalog pick|inventory_unavailable|no_model_fits|not running|unavailable/i.test(`${code ?? ""} ${message}`);
   return { message, ...(code ? { code } : {}), unavailable };
 }
+
+/** A refusal or failure with the HTTP status a gateway client should see. */
+export class GatewayError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+  }
+}

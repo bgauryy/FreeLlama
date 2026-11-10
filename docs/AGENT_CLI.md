@@ -94,24 +94,41 @@ curl http://127.0.0.1:11437/v1/chat/completions -d '{"model":"freellama/review-c
 `fllama chat NAME` does the same on an ephemeral port for the length of one REPL, and adds `check:`
 lines to each answer for the person reading it.
 
-How a chat request maps:
+### Protocols
 
-- **One user turn with no system message** becomes `run_task {workflow, prompt}`, so job mode
-  applies everything it applies over MCP.
-- **A longer conversation without a system message** gets the workflow's system prompt prepended
-  and runs on the job's pick.
-- **A conversation that carries its own system message** is sent as is; only the model, options and
-  think setting come from the job.
-- **Field mapping.** `options` and `num_ctx`, `format`, `think`, `keep_alive` and `tools` map
-  directly. From OpenAI: `max_tokens`/`max_completion_tokens` → `num_predict`, `response_format` →
-  `format`, `reasoning_effort` → `think`, and base64 `image_url` parts → images. The gateway fetches
-  no URLs and reads no files.
+| Endpoint | Clients | Virtual model handling |
+|---|---|---|
+| `POST /api/chat`, `/api/generate` (Ollama) | `ollama` CLI, Continue, Roo, Aider (`ollama_chat/`), Goose, Zed, Open WebUI, LangChain `ChatOllama` | Streamed by Ollama (its default); `stream:false` runs as a managed task |
+| `POST /v1/chat/completions` (OpenAI) | opencode, Cline, LangChain `ChatOpenAI`, Open WebUI, OpenAI SDKs | `stream:true` streamed by Ollama; otherwise a managed task |
+| `POST /v1/messages` (Anthropic) | Claude Code (`ANTHROPIC_BASE_URL`), Goose's anthropic engine, Zed | Streamed or not, by Ollama |
+| `POST /v1/responses` (OpenAI Responses) | Codex CLI (`wire_api = "responses"`), opencode's Responses runtime | Streamed or not, by Ollama |
+| `GET /api/tags`, `/v1/models`, `POST /api/show` | every client's model list | Virtual models first, then the installed tags |
+| anything else | | Passed through to `serve` unchanged |
 
-Responses keep each protocol's shape. Ollama answers stream NDJSON, with stats in the done chunk.
-OpenAI answers return a `chat.completion`, or SSE with `stream:true`. Both carry a `freellama`
-field with the real model, `checks`, `job_profile` and `cached_prompt_tokens`. A managed task is
-not streamed token by token, so the answer arrives as one chunk.
+**Streamed requests and the Anthropic and Responses shapes.** The gateway resolves the virtual
+model: it takes the job's pick that fits now, the workflow's system prompt, the documented options
+and think setting, and the routed context size (`num_ctx` on the native API only; Ollama's OpenAI
+layer has no field for it). It rewrites the request with these and forwards it through `serve`'s
+passthrough to Ollama's own endpoint. Tokens and tool calls therefore stream exactly as Ollama
+streams them, in each protocol's format, with `serve`'s raw admission and telemetry. On the native
+API the done chunk gains a `freellama` field (`model`, `checks`, `job`, `num_ctx`), and
+`fllama chat` adds the `check:` lines to the answer.
+
+**Non-streaming Ollama and OpenAI chats** run as managed `run_task` calls. They get memory
+reservation, eviction, a full receipt (`freellama.cached_prompt_tokens`, `job_profile`) and checks,
+and arrive in one chunk.
+
+**What the caller sends wins.** A caller's system message, think or reasoning setting, sampling
+values and format are kept; job mode fills only what is missing. On one user turn with no system
+message, the workflow may rewrite the turn (OCR prefixes, field lists). OpenAI and Anthropic
+sampling map to `temperature`, `top_p` and `top_k`. Thinking off maps to `reasoning_effort: "none"`
+for OpenAI, `thinking: {type: "disabled"}` for Anthropic, and `think` for Responses. Images must
+be base64; the gateway fetches no URLs and reads no files.
 
 A refusal that waiting can fix, such as no capacity, no memory, no Ollama or no pick that fits now,
 is HTTP 503 with the human-readable message; other failures are 500. The gateway listens on
 loopback only and refuses browser requests from non-loopback origins.
+
+Local models are small. Pointing Claude Code or Codex at a virtual model works at the protocol
+level, but a 2–9B model is weak at long agent loops, and Anthropic does not support routing
+Claude Code to non-Claude models. The workflows are built for bounded tasks.

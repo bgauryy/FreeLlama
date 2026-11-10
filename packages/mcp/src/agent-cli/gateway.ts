@@ -9,13 +9,17 @@
 // loopback are refused, as Ollama does by default.
 import { createHash } from "node:crypto";
 import http from "node:http";
+import { Readable } from "node:stream";
 import { applyJob, pickLiveJobModel } from "../job-mode.js";
 import { LOCAL_JOBS, RUN_TASK_JOBS, WORKFLOWS, WORKFLOW_NAMES, type JobName, type WorkflowName } from "../local-prompts.js";
 import { ensureServe } from "../serve.js";
 import { DEFAULT_SERVE_ENDPOINT } from "../config.js";
 import { callTool, resultText, type ToolResult } from "./registry.js";
-import { refusalOf, splitAnswer } from "./output.js";
+import { GatewayError, refusalOf, splitAnswer } from "./output.js";
+
+export { GatewayError };
 import { UsageError } from "./args.js";
+import { rewriteAnthropic, rewriteOllamaChat, rewriteOllamaGenerate, rewriteOpenAiChat, rewriteResponses, streamChecks, type Rewrite } from "./virtual.js";
 
 export const VIRTUAL_PREFIX = "freellama/";
 const CHAT_TASKS = new Set(["coding", "completion", "vision"]);
@@ -65,12 +69,6 @@ export type ChatAnswer = {
   receipt: Record<string, unknown>;
 };
 
-/** A refusal or failure with the HTTP status a client should see. */
-export class GatewayError extends Error {
-  constructor(message: string, readonly status: number) {
-    super(message);
-  }
-}
 
 const record = (value: unknown): Record<string, unknown> | undefined =>
   value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
@@ -348,6 +346,67 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{ url:
   const withChecks = (answer: ChatAnswer) =>
     options.checksInContent && answer.checks.length > 0 ? `${answer.content}\n\n${answer.checks.map((check) => `check: ${check}`).join("\n")}` : answer.content;
 
+  const rewriters: Record<string, (model: VirtualModel, body: Record<string, unknown>, endpoint?: string) => Promise<Rewrite>> = {
+    "/api/chat": rewriteOllamaChat, "/api/generate": rewriteOllamaGenerate, "/v1/chat/completions": rewriteOpenAiChat,
+    "/v1/messages": rewriteAnthropic, "/v1/responses": rewriteResponses,
+  };
+
+  /** Rewrite a virtual-model request and send it to Ollama's own endpoint through serve. */
+  async function forwardVirtual(
+    path: string, model: VirtualModel, body: Record<string, unknown>, request: http.IncomingMessage, response: http.ServerResponse, signal: AbortSignal,
+  ): Promise<void> {
+    const { body: rewritten, resolution } = await rewriters[path]!(model, body, explicitEndpoint);
+    log(`${String(body.model)} -> ${resolution.model} (${path}, streamed by Ollama)`);
+    const headers: Record<string, string> = { "content-type": "application/json" };
+    for (const name of ["authorization", "x-api-key", "anthropic-version", "anthropic-beta"]) {
+      const value = request.headers[name];
+      if (typeof value === "string") headers[name] = value;
+    }
+    const reply = await fetch(new URL(path, serveEndpoint), { method: "POST", headers, body: JSON.stringify(rewritten), signal });
+    const native = path === "/api/chat" || path === "/api/generate";
+    if (!reply.ok || !reply.body || !native) {
+      response.writeHead(reply.status, Object.fromEntries([...reply.headers].filter(([name]) => !["content-length", "content-encoding", "transfer-encoding"].includes(name))));
+      if (!reply.body) return void response.end();
+      Readable.fromWeb(reply.body as import("node:stream/web").ReadableStream).pipe(response);
+      return;
+    }
+    // Ollama's NDJSON passes through line by line; the done line gains FreeLlama's checks.
+    response.writeHead(200, { "content-type": "application/x-ndjson" });
+    const decoder = new TextDecoder();
+    let pending = "";
+    let answer = "";
+    const emit = (line: string) => {
+      if (line.trim() === "") return;
+      let chunk: Record<string, unknown>;
+      try {
+        chunk = JSON.parse(line) as Record<string, unknown>;
+      } catch {
+        response.write(`${line}\n`);
+        return;
+      }
+      const piece = path === "/api/chat" ? record(chunk.message)?.content : chunk.response;
+      if (typeof piece === "string") answer += piece;
+      if (chunk.done !== true) {
+        response.write(`${line}\n`);
+        return;
+      }
+      const checks = streamChecks(resolution, answer, Array.isArray(body.tools) ? body.tools : undefined);
+      if (options.checksInContent && checks.length > 0) {
+        const note = `\n\n${checks.map((check) => `check: ${check}`).join("\n")}`;
+        response.write(`${JSON.stringify({ model: chunk.model, created_at: chunk.created_at, ...(path === "/api/chat" ? { message: { role: "assistant", content: note } } : { response: note }), done: false })}\n`);
+      }
+      response.write(`${JSON.stringify({ ...chunk, freellama: clean({ model: resolution.model, checks, job: resolution.job, num_ctx: resolution.numCtx }) })}\n`);
+    };
+    for await (const bytes of reply.body as AsyncIterable<Uint8Array>) {
+      pending += decoder.decode(bytes, { stream: true });
+      const lines = pending.split("\n");
+      pending = lines.pop() ?? "";
+      lines.forEach(emit);
+    }
+    emit(pending + decoder.decode());
+    response.end();
+  }
+
   const server = http.createServer(async (request, response) => {
     const abort = new AbortController();
     response.on("close", () => { if (!response.writableFinished) abort.abort(); });
@@ -374,7 +433,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{ url:
         const data = [...virtualModels().map((model) => ({ id: model.name, object: "model", created, owned_by: "freellama" })), ...(Array.isArray(real?.data) ? real.data : [])];
         return sendJson(response, 200, { object: "list", data });
       }
-      const handled = request.method === "POST" && ["/api/chat", "/api/generate", "/api/show", "/v1/chat/completions"].includes(path);
+      const handled = request.method === "POST" && ["/api/chat", "/api/generate", "/api/show", "/v1/chat/completions", "/v1/messages", "/v1/responses"].includes(path);
       if (!handled) {
         await ensureServe(explicitEndpoint);
         return proxy(request, response, serveEndpoint);
@@ -393,9 +452,17 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{ url:
       }
       if (path === "/api/show") return sendJson(response, 200, ollamaShow(model));
       const requested = String(body.model);
-      if (path !== "/v1/chat/completions" && isLoadOnly(body, path)) {
+      if ((path === "/api/chat" || path === "/api/generate") && isLoadOnly(body, path)) {
         const done = { model: requested, created_at: now, done: true, done_reason: "load" };
         return sendJson(response, 200, path === "/api/chat" ? { ...done, message: { role: "assistant", content: "" } } : { ...done, response: "" });
+      }
+      // Streams (Ollama's default) and the Anthropic and Responses shapes run on Ollama's own
+      // endpoint with the resolved model and prompts: real token and tool-call streaming. A
+      // non-streaming Ollama or OpenAI chat is a managed run_task with its full receipt.
+      const native = path === "/api/chat" || path === "/api/generate";
+      if ((native ? body.stream !== false : body.stream === true) || path === "/v1/messages" || path === "/v1/responses") {
+        await ensureServe(explicitEndpoint);
+        return await forwardVirtual(path, model, body, request, response, abort.signal);
       }
       const chat: ChatRequest = path === "/v1/chat/completions" ? fromOpenAiRequest(body) : {
         messages: path === "/api/chat"

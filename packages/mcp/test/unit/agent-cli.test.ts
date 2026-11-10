@@ -4,9 +4,10 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vites
 const fixture = vi.hoisted(() => ({
   run: vi.fn(),
   live: vi.fn(),
+  route: vi.fn(),
 }));
 vi.mock("../../src/serve-client.js", () => ({
-  runTaskRequest: fixture.run, getTaskJob: vi.fn(), cancelTaskJob: vi.fn(), route: vi.fn(),
+  runTaskRequest: fixture.run, getTaskJob: vi.fn(), cancelTaskJob: vi.fn(), route: (...args: unknown[]) => fixture.route(...args),
   createSession: vi.fn(), deleteSession: vi.fn(), killSession: vi.fn(), listModels: vi.fn(), warmModelRequest: vi.fn(),
   listTaskJobs: vi.fn(), createScope: vi.fn(), getScope: vi.fn(), forkScope: vi.fn(), deleteScope: vi.fn(),
 }));
@@ -43,6 +44,8 @@ beforeEach(() => {
   fixture.run.mockImplementation(async () => answer("Fixed."));
   fixture.live.mockReset();
   fixture.live.mockResolvedValue([[{ name: "lfm3:1.7b-q4_K_M", capabilities: ["completion"] }], 64e9]);
+  fixture.route.mockReset();
+  fixture.route.mockResolvedValue(JSON.stringify({ selected_model: "lfm3:1.7b-q4_K_M", options: { num_ctx: 4096 } }));
 });
 
 describe("fllama run flags", () => {
@@ -238,31 +241,89 @@ describe("virtual models", () => {
 
 describe("gateway over HTTP", () => {
   let gateway: Awaited<ReturnType<typeof startGateway>>;
+  // A stand-in for serve's Ollama passthrough: records what it is sent and answers in Ollama's shapes.
+  const upstream: Array<{ path: string; body: Record<string, any>; headers: Record<string, unknown> }> = [];
+  let serve: import("node:http").Server;
   beforeAll(async () => {
-    gateway = await startGateway({ port: 0, serveEndpoint: "http://127.0.0.1:9" });
+    const http = await import("node:http");
+    serve = http.createServer((request, response) => {
+      let raw = "";
+      request.on("data", (chunk) => { raw += chunk; });
+      request.on("end", () => {
+        upstream.push({ path: request.url ?? "", body: JSON.parse(raw || "{}"), headers: request.headers });
+        if (request.url === "/api/chat") {
+          response.writeHead(200, { "content-type": "application/x-ndjson" });
+          response.write(`${JSON.stringify({ model: "lfm3:1.7b-q4_K_M", message: { role: "assistant", content: "Fi" }, done: false })}\n`);
+          response.write(`${JSON.stringify({ model: "lfm3:1.7b-q4_K_M", message: { role: "assistant", content: "xed." }, done: false })}\n${JSON.stringify({ model: "lfm3:1.7b-q4_K_M", message: { role: "assistant", content: "" }, done: true, done_reason: "stop", eval_count: 2 })}\n`);
+          response.end();
+        } else if (request.url === "/v1/messages") {
+          response.writeHead(200, { "content-type": "text/event-stream" });
+          response.end('event: message_start\ndata: {"type":"message_start"}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n');
+        } else {
+          response.writeHead(404, { "content-type": "application/json" });
+          response.end('{"error":"not found"}');
+        }
+      });
+    });
+    await new Promise<void>((resolve) => serve.listen(0, "127.0.0.1", () => resolve()));
+    const address = serve.address() as { port: number };
+    gateway = await startGateway({ port: 0, serveEndpoint: `http://127.0.0.1:${address.port}` });
   });
-  afterAll(() => gateway.close());
+  afterAll(async () => {
+    await gateway.close();
+    await new Promise<void>((resolve) => serve.close(() => resolve()));
+  });
+  beforeEach(() => { upstream.length = 0; });
   const post = (path: string, body: unknown, headers: Record<string, string> = {}) =>
     fetch(`${gateway.url}${path}`, { method: "POST", body: JSON.stringify(body), headers });
 
-  it("streams an Ollama chat answer as NDJSON with the receipt's stats and checks", async () => {
-    const reply = await post("/api/chat", { model: "freellama/fix-bug:latest", messages: [{ role: "user", content: "crash" }] });
+  it("streams a virtual Ollama chat through Ollama itself, rewritten with the pick, system prompt, options and context", async () => {
+    const reply = await post("/api/chat", { model: "freellama/fix-bug:latest", messages: [{ role: "user", content: "crash" }], options: { temperature: 0 } });
     const lines = (await reply.text()).trim().split("\n").map((line) => JSON.parse(line));
-    expect(lines[0]).toMatchObject({ model: "freellama/fix-bug:latest", message: { role: "assistant", content: "Fixed." }, done: false });
-    expect(lines[1]).toMatchObject({ done: true, done_reason: "stop", prompt_eval_count: 120, eval_count: 8, freellama: { model: "lfm3:1.7b-q4_K_M", cached_prompt_tokens: 100 } });
+    expect(lines.map((line) => line.message?.content)).toEqual(["Fi", "xed.", ""]);
+    expect(lines.at(-1)).toMatchObject({ done: true, freellama: { model: "lfm3:1.7b-q4_K_M", job: "coding", num_ctx: 4096 } });
+    const sent = upstream[0]!;
+    expect(sent.path).toBe("/api/chat");
+    expect(sent.body.model).toBe("lfm3:1.7b-q4_K_M");
+    expect(sent.body.messages[0].role).toBe("system");
+    expect(sent.body.messages.at(-1)).toEqual({ role: "user", content: "crash" });
+    // The caller's temperature wins; the routed window and the job's other options fill in.
+    expect(sent.body.options).toMatchObject({ temperature: 0, num_ctx: 4096 });
+    expect(fixture.run).not.toHaveBeenCalled();
+  });
+
+  it("leaves a caller's own system message and think setting alone", async () => {
+    fixture.live.mockResolvedValue([[{ name: "lfm3:1.7b-q4_K_M", capabilities: ["completion", "thinking"] }], 64e9]);
+    await (await post("/api/chat", { model: "freellama/summarize", think: true, messages: [{ role: "system", content: "mine" }, { role: "user", content: "x" }] })).text();
+    expect(upstream[0]!.body.messages).toEqual([{ role: "system", content: "mine" }, { role: "user", content: "x" }]);
+    expect(upstream[0]!.body.think).toBe(true);
+  });
+
+  it("serves Anthropic Messages for a virtual model through Ollama's own endpoint", async () => {
+    const reply = await post("/v1/messages", { model: "freellama/review-code", max_tokens: 100, stream: true, messages: [{ role: "user", content: "def f(): pass" }] }, { "x-api-key": "ollama", "anthropic-version": "2023-06-01" });
+    expect(await reply.text()).toContain("message_stop");
+    const sent = upstream[0]!;
+    expect(sent.body).toMatchObject({ model: "lfm3:1.7b-q4_K_M", stream: true });
+    expect(typeof sent.body.system).toBe("string");
+    expect(sent.headers["anthropic-version"]).toBe("2023-06-01");
+  });
+
+  it("runs a non-streaming Ollama chat as a managed task with its receipt's stats", async () => {
+    const reply = await post("/api/chat", { model: "freellama/fix-bug:latest", stream: false, messages: [{ role: "user", content: "crash" }] });
+    expect(await reply.json()).toMatchObject({ message: { content: "Fixed." }, done: true, prompt_eval_count: 120, freellama: { model: "lfm3:1.7b-q4_K_M", cached_prompt_tokens: 100 } });
+    expect(upstream).toHaveLength(0);
   });
 
   it("answers the ollama CLI's preload and show without running a model", async () => {
     expect(await (await post("/api/chat", { model: "freellama/fix-bug:latest", messages: [] })).json()).toMatchObject({ done: true, done_reason: "load" });
     expect(await (await post("/api/show", { model: "freellama/describe-screen" })).json()).toMatchObject({ capabilities: ["completion", "vision"] });
     expect(fixture.run).not.toHaveBeenCalled();
+    expect(upstream).toHaveLength(0);
   });
 
-  it("serves OpenAI chat completions, streamed as SSE when asked", async () => {
+  it("serves OpenAI chat completions as a managed task when not streamed", async () => {
     const plain = await (await post("/v1/chat/completions", { model: "freellama/review-code", messages: [{ role: "user", content: "x" }] })).json();
     expect(plain).toMatchObject({ object: "chat.completion", choices: [{ message: { content: "Fixed." }, finish_reason: "stop" }] });
-    const stream = await (await post("/v1/chat/completions", { model: "freellama/review-code", stream: true, messages: [{ role: "user", content: "x" }] })).text();
-    expect(stream.trim().split("\n\n").at(-1)).toBe("data: [DONE]");
   });
 
   it("reports a spent output budget as finish_reason length", async () => {
@@ -271,11 +332,13 @@ describe("gateway over HTTP", () => {
     expect(reply.choices[0]).toMatchObject({ finish_reason: "length", message: { content: "", reasoning: "hmm" } });
   });
 
-  it("reports a job that cannot pick a model as 503 with its message", async () => {
+  it("reports a job that cannot pick a model as 503 with its message, streamed or not", async () => {
     fixture.live.mockResolvedValue([null, null]);
-    const reply = await post("/api/chat", { model: "freellama/fix-bug", stream: false, messages: [{ role: "user", content: "x" }] });
-    expect(reply.status).toBe(503);
-    expect((await reply.json()).error).toMatch(/installed models could not be read .*job_inventory_unavailable/);
+    for (const stream of [false, true]) {
+      const reply = await post("/api/chat", { model: "freellama/fix-bug", stream, messages: [{ role: "user", content: "x" }] });
+      expect(reply.status).toBe(503);
+      expect((await reply.json()).error).toMatch(/installed models could not be read .*job_inventory_unavailable/);
+    }
   });
 
   it("lists virtual models with a digest the ollama CLI can print, and refuses other origins", async () => {
