@@ -2,7 +2,7 @@
 status: Implemented
 question: How should an agent, a person or any Ollama/OpenAI client use FreeLlama's model picks, prompts, admission and checks without speaking MCP?
 confidence: high for the CLI and the mapping; medium for third-party client compatibility (only the ollama 0.40.15 CLI and curl were exercised)
-next: Exercise the gateway with a live model, the OpenAI SDK, Open WebUI and Continue; then decide on managed token streaming.
+next: Run Claude Code, Codex, opencode and Open WebUI against the gateway end to end; measure prompt-cache reuse across chat turns.
 ---
 
 # RFC 0001: `fllama`, an agent CLI, and FreeLlama virtual models over the Ollama and OpenAI APIs
@@ -18,8 +18,10 @@ faces over one engine:
    OpenAI SDK can therefore use FreeLlama's configuration with no client changes. `fllama chat` is
    the real `ollama` REPL pointed at that gateway.
 
-The main limitation is that answers arrive in one chunk: a managed task is not streamed token by
-token.
+Streamed requests on virtual models are rewritten and run on Ollama's own endpoints, so tokens
+and tool calls stream natively in all four protocols: Ollama, OpenAI Chat, OpenAI Responses and
+Anthropic Messages. The main limitation is that streamed requests get `serve`'s raw admission,
+not the managed memory reservation; non-streaming chats keep the full managed path.
 
 ## Summary
 
@@ -68,6 +70,26 @@ get untuned prompts, no fit check, and nothing that tells them what to verify.
 Exclusions: token streaming, new routing logic, Rust changes, and new authority. `fllama pull` is
 `ollama pull` and needs the user's approval like any pull. `fllama tool ollama_pull` still requires
 `approvedSizeBytes`.
+
+## Is it better than calling Ollama directly?
+
+These are measured on this machine (Apple M2 Pro, 32 GB, Ollama 0.40.15, Chrome and an IDE
+running, 5–10 GB free), 2026-11-10.
+
+| | Ollama directly | Through FreeLlama | Evidence |
+|---|---|---|---|
+| Model choice | The caller must know a tag. A tag that does not fit swaps or fails | The tested pick that is installed and fits now | `review-code` fell back from `bonsai-2:9b` (10.3 GB, "no room now") to `lfm3` with 6.5 GB free. `--ask` ran on `strands-decider` (1.2 GB), where routing's `nimble-v3` needed 14.5 GB and was refused |
+| Prompts and options | Model defaults | Workflow system prompt, documented per-family options and think setting | Untuned direct call: 61 tokens (thinking) to answer "OK", 0.92 s. Managed default: 2 tokens, 0.47 s. `--schema` extraction returned exact JSON |
+| Memory safety | Loads and lets the OS swap | Waits for memory, names what holds it, refuses at its deadline | "waiting for memory: need 1.3 GB, 5.1 GB available …; largest memory users: Google Chrome Helper ×34 5.3 GB, rustc 4.8 GB" |
+| Agent ergonomics | `ollama run` blocks forever on an agent harness's open stdin socket | stdin read only from a pipe or file; answer-only stdout; `check:` lines; exit codes; `--json` | Observed hang with `ollama run`; none with `fllama run` |
+| Overhead | 0 | About 0.4 s per CLI call (0.1 s Node start plus job submit and poll) | Same model, prompt and 2 output tokens: 0.07 s direct vs 0.45 s |
+| Streaming | Native | Native for streamed requests (rewritten and forwarded); one chunk for managed non-streaming calls | First token 0.4–0.5 s warm on all four protocols |
+
+Verdict: FreeLlama wins wherever the caller does not already know the right tag and memory is
+contended, which is the normal case on a developer machine. Plain Ollama wins for a known small
+model on an idle machine, where 0.4 s matters. Prompt-cache reuse across chat turns was not
+demonstrated: identical prompts hit the cache (290 of 802 tokens on a repeat call), but changing
+the context window reloads the runner and drops it.
 
 ## Proposed design
 
@@ -118,6 +140,21 @@ applies this rule, at the adapter, without changing job mode:
 - The heartbeat `HEAD /` gets a 200.
 - The CLI appends `:latest` to names, and virtual names accept it.
 
+**Streaming and the other protocols (decided after the protocol survey).** These clients need real
+token streaming and native tool calls, and Claude Code stalls on a buffered reply. They speak:
+
+- Anthropic Messages: Claude Code.
+- OpenAI Responses only: Codex CLI.
+- OpenAI Chat: opencode, Cline, LangChain, Open WebUI.
+- Ollama native: Continue, Roo, Aider, Goose, Zed.
+
+Instead of writing four encoders, the gateway resolves a virtual model and rewrites the request
+(`virtual.ts`): the model, system prompt, sampling, think or reasoning setting, and `num_ctx` on the
+native API. It then forwards the request through `serve` to Ollama's own endpoint for that
+protocol. Ollama 0.40 serves `/v1/messages` and `/v1/responses` itself, and real tags already
+passed through. Native streams are read as they pass, so the done chunk can carry `check:` lines.
+A2A and ACP were surveyed and not served: no coding tool uses either to reach a model backend.
+
 **Errors.** A tool's JSON refusal reaches clients as its human-readable `error` and `code`.
 Refusals that waiting can fix are 503: capacity, memory, Ollama down, inventory unavailable, or no
 pick that fits now. Everything else is 500.
@@ -136,12 +173,24 @@ Is this the best way? Each option compared:
 
 | Option | Pros | Cons | Verdict |
 |---|---|---|---|
-| **A. Own CLI + virtual-model gateway over the MCP handlers (chosen)** | One engine; nothing duplicated; contract parity with MCP for free; Ollama's CLI and ecosystem reused as the front end; works for shell agents and OpenAI/Ollama clients | No token streaming; a second listener (11437) beside `serve`; virtual models exist only where the gateway runs | Chosen |
+| **A. Own CLI + virtual-model gateway over the MCP handlers (chosen)** | One engine; nothing duplicated; contract parity with MCP for free; Ollama's CLI, protocol encoders and streaming reused; works for shell agents and Ollama, OpenAI and Anthropic clients | Streamed requests get raw admission only; a second listener (11437) beside `serve`; virtual models exist only where the gateway runs | Chosen |
 | B. Ollama Modelfiles: `ollama create freellama-fix-bug` with `FROM <pick>`, `SYSTEM`, `PARAMETER` | Zero runtime; every Ollama and OpenAI client sees it natively, streaming included | Pick frozen at create time (no fit-now); no admission, file reading or checks; writes models into the user's store (a mutation needing approval); per-model profiles need one Modelfile per pick | Good complement: a possible `fllama export-modelfiles` for clients that cannot change base URL |
 | C. Add jobs and workflows to Rust `freellama task` and `serve` | One binary; streaming possible in `serve` | Ports job mode, workflows, file reading and checks to Rust: two owners of prompts | Rejected for now; revisit if prompts become a shared data file |
 | D. A custom chat REPL in `fllama` | Full control | Rebuilds what `ollama run` already does well | Dropped in favor of the `ollama` REPL on the gateway |
 | E. CLI as an MCP client over stdio | Zero coupling | A process and a JSON-RPC session per call; summarized output files | Rejected |
 | F. Status quo (`OLLAMA_HOST` → `serve`) | Exists | Admission only: no picks, prompts or checks | Kept for raw tags (the gateway forwards them) |
+
+Competitors (surveyed 2026-11-10):
+
+- **fabric** `--serveOllama` is the closest match: patterns served as Ollama models. It has no
+  OpenAI or Anthropic protocol and no hardware-aware pick.
+- **aichat** (roles, `--serve`), **simonw/llm** (templates, fragments, `--schema`, `-x`), **LiteLLM**
+  (task routing, context fallbacks), **llama-swap**, **Open WebUI** workspace models, **LocalAI**,
+  **LM Studio** presets and Ollama Modelfiles all cover parts of this.
+- None picks a model by what fits in memory now.
+- Adopted from them: llm's `--schema` short form and `-x`.
+- Still open: a user workflow directory that overrides built-ins (fabric, llm), retry on a
+  larger-context model (LiteLLM), and a run log you can continue (llm).
 
 What would change the choice:
 
@@ -205,8 +254,12 @@ Still owed:
 
 ## Open questions
 
-- Non-blocking: managed token streaming would make chat and `stream:true` incremental. It needs a
-  streaming task route in `serve`.
+- Non-blocking: streamed requests get `serve`'s raw admission (host-pressure holds and the raw
+  stream cap), not the managed memory reservation and eviction. A managed streaming task route in
+  `serve` would unify the two paths.
+- Non-blocking: a user workflow directory (`~/.octocode/freellama/workflows/`) that overrides
+  built-ins, as fabric and llm do. It needs a rule for how operator-authored prompts coexist with
+  `local-prompts.ts` as the single owner.
 - Non-blocking: `fllama export-modelfiles` (alternative B) for clients that cannot change their
   base URL. Creating models in the user's store needs explicit approval per tag.
 - Non-blocking: whether the Rust `freellama` launcher should forward `run`, `chat` and `gateway` to
