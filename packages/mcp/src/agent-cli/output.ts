@@ -75,7 +75,21 @@ export function renderResult(result: ToolResult, options: RenderOptions, showThi
   const thinking = thinkingOf(structured);
   if (thinking && !options.hideThinking && (options.verbose || showThinking) && !options.quiet) stderr.push(`thinking: ${thinking}`);
   if (!options.quiet) stderr.push(...checks);
+  if (options.extract) {
+    const block = firstCodeBlock(answer);
+    if (block === undefined) {
+      stderr.push("fllama: --extract found no code block; printing the whole answer");
+      return { stdout: answer, stderr, exitCode: 0 };
+    }
+    return { stdout: block, stderr, exitCode: 0 };
+  }
   return { stdout: answer, stderr, exitCode: 0 };
+}
+
+/** The body of the first fenced code block (``` or ~~~), without its fences and language tag. */
+export function firstCodeBlock(text: string): string | undefined {
+  const match = /^(`{3,}|~{3,})[^\n]*\n([\s\S]*?)^\1[ \t]*$/m.exec(text);
+  return match ? match[2]!.replace(/\n$/, "") : undefined;
 }
 
 /**

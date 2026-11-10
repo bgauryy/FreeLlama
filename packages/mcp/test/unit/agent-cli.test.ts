@@ -64,8 +64,9 @@ describe("fllama run flags", () => {
       ["nimble", "--ask", "Refund?", "--ask", "Team?", "--choice", "billing=Payments", "--choice", "other", "--ask", "Urgency?", "--level", "Routine", "--level", "Now"],
       "ticket text",
     );
+    // `ollama run nimble --ask …`: the first word is still the model.
     expect(args).toMatchObject({
-      task: "decision", state: "nimble\n\nticket text",
+      model: "nimble", task: "decision", state: "ticket text",
       questions: {
         q1: { type: "noul", instructions: "Refund?" },
         q2: { type: "choice", instructions: "Team?", criteria: { billing: "Payments", other: null } },
@@ -73,6 +74,23 @@ describe("fllama run flags", () => {
       },
     });
     expect(() => parseRunArgs(["--choice", "a=b"])).toThrow(/must follow the --ask/);
+  });
+
+  it("runs a question with no model on the classify job's tested pick, not on routing's first rank", () => {
+    const { args } = parseRunArgs(["--ask", "Refund?"], "charged twice");
+    expect(args).toEqual({ job: "classify", state: "charged twice", questions: { q1: { type: "noul", instructions: "Refund?" } } });
+    expect(parseRunArgs(["--ask", "Refund?", "-t", "decision"], "x").args.job).toBeUndefined();
+  });
+
+  it("turns --schema's short form or JSON into a format schema", () => {
+    expect(parseRunArgs(["-w", "extract-json", "--schema", "name, age int, tags list: up to five"], "text").args.format).toEqual({
+      type: "object",
+      properties: { name: { type: "string" }, age: { type: "integer" }, tags: { type: "array", items: { type: "string" }, description: "up to five" } },
+      required: ["name", "age", "tags"],
+    });
+    expect(parseRunArgs(["m:1", "x", "--schema", '{"type":"object","properties":{"a":{"type":"string"}}}']).args.format).toMatchObject({ properties: { a: {} } });
+    expect(() => parseRunArgs(["m:1", "x", "--schema", "age years"])).toThrow(/--schema field "age years"/);
+    expect(() => parseRunArgs(["m:1", "x", "--schema", "a", "--format", "json"])).toThrow(/remove --format/);
   });
 
   it("maps stdin and the prompt by task: embedding lines with a nearest query, chat text after the prompt", () => {
@@ -124,6 +142,13 @@ describe("fllama output", () => {
     expect(renderResult({ isError: true, content: [{ type: "text", text: refusal }] }, { ...render, json: true }).stdout).toBe(refusal);
     expect(refusalOf(refusal).unavailable).toBe(true);
     expect(refusalOf("model output was invalid").unavailable).toBe(false);
+  });
+
+  it("prints only the first code block with --extract, or the whole answer with a note", () => {
+    const text = "[m] Here is the fix:\n```ts\nconst a = 1;\n\nconst b = 2;\n```\nand another\n```\nx\n```";
+    expect(renderResult({ content: [{ type: "text", text }], structuredContent: {} }, { ...render, extract: true }).stdout).toBe("const a = 1;\n\nconst b = 2;");
+    const plain = renderResult({ content: [{ type: "text", text: "[m] no code" }], structuredContent: {} }, { ...render, extract: true });
+    expect(plain).toMatchObject({ stdout: "no code", stderr: ["fllama: --extract found no code block; printing the whole answer"] });
   });
 
   it("prints a deferred job's id on stdout", () => {
@@ -195,7 +220,7 @@ describe("virtual models", () => {
     expect(request).toMatchObject({ messages: [{ role: "user", content: "what is this", images: ["AAAA"] }], options: { num_predict: 64, temperature: 0.1 }, format: "json", think: "low" });
     expect(() => fromOpenAiRequest({ messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: "https://x/y.png" } }] }] })).toThrow(/fetches nothing/);
     const completion = openAiCompletion({
-      model: "m", content: "", toolCalls: [{ function: { name: "f", arguments: { a: 1 } } }], checks: ["c"], metrics: { prompt_tokens: 3, output_tokens: 2 }, receipt: {},
+      model: "m", content: "", toolCalls: [{ function: { name: "f", arguments: { a: 1 } } }], checks: ["c"], doneReason: "stop", metrics: { prompt_tokens: 3, output_tokens: 2 }, receipt: {},
     }, "freellama/auto", 1);
     expect(completion).toMatchObject({
       model: "freellama/auto", usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 },
@@ -238,6 +263,12 @@ describe("gateway over HTTP", () => {
     expect(plain).toMatchObject({ object: "chat.completion", choices: [{ message: { content: "Fixed." }, finish_reason: "stop" }] });
     const stream = await (await post("/v1/chat/completions", { model: "freellama/review-code", stream: true, messages: [{ role: "user", content: "x" }] })).text();
     expect(stream.trim().split("\n\n").at(-1)).toBe("data: [DONE]");
+  });
+
+  it("reports a spent output budget as finish_reason length", async () => {
+    fixture.run.mockImplementation(async () => answer("", { response: { message: { role: "assistant", content: "", thinking: "hmm" }, done_reason: "length" } }));
+    const reply = await (await post("/v1/chat/completions", { model: "freellama/auto", max_tokens: 5, messages: [{ role: "user", content: "x" }] })).json();
+    expect(reply.choices[0]).toMatchObject({ finish_reason: "length", message: { content: "", reasoning: "hmm" } });
   });
 
   it("reports a job that cannot pick a model as 503 with its message", async () => {

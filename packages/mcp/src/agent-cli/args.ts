@@ -8,7 +8,7 @@ import { LOCAL_JOBS, RUN_TASK_JOBS, WORKFLOWS, type JobName, type WorkflowName }
 /** A caller mistake: printed as one line, exit code 2. */
 export class UsageError extends Error {}
 
-export type RenderOptions = { json: boolean; verbose: boolean; quiet: boolean; hideThinking: boolean };
+export type RenderOptions = { json: boolean; verbose: boolean; quiet: boolean; hideThinking: boolean; extract?: boolean };
 
 export type RunPlan = {
   /** `run_task` arguments, validated later by the tool's own schema. */
@@ -55,6 +55,8 @@ const OPTIONS = {
   defer: { type: "boolean" },
   preview: { type: "boolean" },
   "save-as": { type: "string" },
+  schema: { type: "string" },
+  extract: { type: "boolean", short: "x" },
   json: { type: "boolean" },
   quiet: { type: "boolean", short: "q" },
   endpoint: { type: "string" },
@@ -106,6 +108,38 @@ function thinkValue(value: string | undefined): boolean | string | undefined {
   if (value === "true" || value === "false") return value === "true";
   if (!["high", "medium", "low"].includes(value)) throw new UsageError(`--think takes true, false, high, medium or low, got "${value}".`);
   return value;
+}
+
+const SCHEMA_TYPES: Record<string, Record<string, unknown>> = {
+  str: { type: "string" }, string: { type: "string" }, int: { type: "integer" }, integer: { type: "integer" },
+  float: { type: "number" }, number: { type: "number" }, bool: { type: "boolean" }, boolean: { type: "boolean" },
+  list: { type: "array", items: { type: "string" } },
+};
+
+/**
+ * `--schema`: a JSON schema (`{...}` or `@file.json`), or the short form llm uses: fields split by
+ * commas or newlines, each `name [str|int|float|bool|list][: description]`, all required.
+ * `--schema 'name, age int, tags list: up to five'`.
+ */
+export function schemaValue(value: string): Record<string, unknown> {
+  const text = valueOrFile(value, "--schema").trim();
+  if (text.startsWith("{")) {
+    const parsed = jsonValue(text, "--schema");
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new UsageError("--schema JSON must be an object schema.");
+    return parsed as Record<string, unknown>;
+  }
+  const properties: Record<string, Record<string, unknown>> = {};
+  for (const field of text.split(/[,\n]/).map((part) => part.trim()).filter(Boolean)) {
+    const at = field.indexOf(":");
+    const head = (at < 0 ? field : field.slice(0, at)).trim().split(/\s+/);
+    const description = at < 0 ? undefined : field.slice(at + 1).trim();
+    const [name, kind = "str", ...extra] = head;
+    const type = SCHEMA_TYPES[kind.toLowerCase()];
+    if (!name || !type || extra.length > 0) throw new UsageError(`--schema field "${field}": write \`name [str|int|float|bool|list][: description]\`.`);
+    properties[name] = { ...type, ...(description ? { description } : {}) };
+  }
+  if (Object.keys(properties).length === 0) throw new UsageError("--schema names no fields.");
+  return { type: "object", properties, required: Object.keys(properties) };
 }
 
 type Question = { type: "noul" | "choice" | "score"; instructions: string; criteria?: Record<string, string | null> | string[] };
@@ -172,6 +206,7 @@ FreeLlama flags:
   --ctx N  context window   --top N  matches for embedding jobs   --tools JSON|@F  tool definitions
   --objective fastest|balanced|quality   --prefer cpu|gpu   --min-confidence low|medium
   --session UUID  --priority interactive|normal|background  --timeout S  --max-wait S
+  --schema 'name, age int, tags list'|JSON|@F  structured output   -x, --extract  print only the first code block
   --defer  return a job id (fllama job ID)   --preview  route only   --save-as NAME  write a handoff
   --json  full receipt on stdout   -q, --quiet  no stderr notes   --endpoint URL  serve endpoint
 
@@ -194,6 +229,7 @@ export function parseRunArgs(argv: string[], stdin?: string): RunPlan & { help: 
   const positionals = [...parsed.positionals];
   const render: RenderOptions = {
     json: values.json === true, verbose: values.verbose === true, quiet: values.quiet === true, hideThinking: values.hidethinking === true,
+    ...(values.extract ? { extract: true } : {}),
   };
   if (values.help) return { args: {}, render, promptless: true, help: true };
 
@@ -202,16 +238,19 @@ export function parseRunArgs(argv: string[], stdin?: string): RunPlan & { help: 
   if (values.voice !== undefined) throw new UsageError("--voice is speech output; use `fllama tool audio '{\"action\":\"speak\",...}'` (fllama tool audio --help).");
 
   const questions = questionsFrom(tokens);
+  // `ollama run nimble --ask …`: the first word is still the model. With no model, a question
+  // runs on the classify job's tested pick that fits now, not on whatever routing ranks first.
   const job = jobOf(values.job, values.workflow);
-  const named = values.model !== undefined || job !== undefined || values.task !== undefined || questions !== undefined;
+  const named = values.model !== undefined || job !== undefined || values.task !== undefined;
   let model = values.model;
   if (!named && positionals.length > 0 && !/\s/.test(positionals[0]!)) model = positionals.shift();
   const prompt = positionals.length > 0 ? positionals.join(" ") : undefined;
   const input = stdin !== undefined && stdin.trim() !== "" ? stdin : undefined;
 
-  const task = questions !== undefined ? (values.task ?? "decision") : values.task;
-  if (questions !== undefined && task !== "decision") throw new UsageError(`--ask makes a decision task; remove --task ${task}.`);
-  const kind = task ?? (job ? LOCAL_JOBS[job].task : undefined);
+  // The classify job names its own task; an explicit one must still be "decision".
+  const task = questions !== undefined && (model !== undefined || values.task !== undefined) ? (values.task ?? "decision") : values.task;
+  if (questions !== undefined && values.task !== undefined && values.task !== "decision") throw new UsageError(`--ask makes a decision task; remove --task ${task}.`);
+  const kind = task ?? (job ? LOCAL_JOBS[job].task : questions !== undefined ? "decision" : undefined);
 
   const options: Record<string, unknown> = {};
   let contextTokens = positiveInt(values.ctx, "--ctx");
@@ -223,10 +262,13 @@ export function parseRunArgs(argv: string[], stdin?: string): RunPlan & { help: 
   }
 
   const files = [...(values.file ?? []), ...(values.image ?? [])];
+  if (values.schema !== undefined && values.format !== undefined) throw new UsageError("--schema sets the output format; remove --format.");
+  const format = values.schema !== undefined ? schemaValue(values.schema)
+    : values.format === undefined ? undefined : values.format === "json" ? "json" : jsonValue(values.format, "--format");
   const args: Record<string, unknown> = {
     endpoint: values.endpoint,
     model,
-    job: values.workflow === undefined ? job : undefined,
+    job: values.workflow === undefined ? job ?? (questions !== undefined && model === undefined && values.task === undefined ? "classify" : undefined) : undefined,
     workflow: values.workflow as WorkflowName | undefined,
     task,
     objective: values.objective,
@@ -234,7 +276,7 @@ export function parseRunArgs(argv: string[], stdin?: string): RunPlan & { help: 
     systemPrompt: values.system === undefined ? undefined : valueOrFile(values.system, "--system"),
     contextTokens,
     options: Object.keys(options).length > 0 ? options : undefined,
-    format: values.format === undefined ? undefined : values.format === "json" ? "json" : jsonValue(values.format, "--format"),
+    format,
     think: thinkValue(values.think),
     keepAlive: values.keepalive,
     tools: values.tools === undefined ? undefined : jsonValue(values.tools, "--tools"),

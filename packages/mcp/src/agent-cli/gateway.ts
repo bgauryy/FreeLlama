@@ -59,6 +59,8 @@ export type ChatAnswer = {
   thinking?: string;
   toolCalls?: unknown[];
   checks: string[];
+  /** Ollama's done_reason: `stop`, or `length` when the output budget ran out. */
+  doneReason: string;
   metrics: Record<string, unknown>;
   receipt: Record<string, unknown>;
 };
@@ -141,6 +143,7 @@ export async function runVirtualChat(model: VirtualModel, request: ChatRequest, 
     ...(typeof message?.thinking === "string" && message.thinking !== "" ? { thinking: message.thinking } : {}),
     ...(Array.isArray(message?.tool_calls) && message.tool_calls.length > 0 ? { toolCalls: message.tool_calls } : {}),
     checks: Array.isArray(receipt.checks) ? receipt.checks.map(String) : [],
+    doneReason: typeof record(receipt.response)?.done_reason === "string" ? String(record(receipt.response)!.done_reason) : "stop",
     metrics: record(receipt.metrics) ?? {},
     receipt,
   };
@@ -236,7 +239,8 @@ export function openAiCompletion(answer: ChatAnswer, requested: string, created 
     choices: [{
       index: 0,
       message: clean({ role: "assistant", content: answer.content, reasoning: answer.thinking, tool_calls: answer.toolCalls ? openAiToolCalls(answer.toolCalls) : undefined }),
-      finish_reason: answer.toolCalls ? "tool_calls" : "stop",
+      // A thinking model can spend the whole budget before answering: `length` says so.
+      finish_reason: answer.toolCalls ? "tool_calls" : answer.doneReason === "length" ? "length" : "stop",
     }],
     usage: { prompt_tokens: prompt, completion_tokens: output, total_tokens: prompt + output },
     freellama: extension(answer),
@@ -419,7 +423,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{ url:
         return response.end("data: [DONE]\n\n");
       }
       const message = clean({ role: "assistant", content, thinking: answer.thinking, tool_calls: answer.toolCalls });
-      const final = { model: requested, created_at: new Date().toISOString(), done: true, done_reason: "stop", ...ollamaStats(answer.metrics), freellama: extension(answer) };
+      const final = { model: requested, created_at: new Date().toISOString(), done: true, done_reason: answer.doneReason, ...ollamaStats(answer.metrics), freellama: extension(answer) };
       const piece = path === "/api/chat" ? { message } : clean({ response: content, thinking: answer.thinking });
       if (body.stream === false) return sendJson(response, 200, { ...final, ...piece });
       // Ollama streams NDJSON by default: the answer in one chunk, then the done chunk with stats.
