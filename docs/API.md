@@ -38,12 +38,12 @@ checkout ([install](AGENT_CLI.md)). See the [reference](AGENT_CLI.md) for flags 
 
 | Command | Does |
 |---|---|
-| `fllama run [MODEL] [PROMPT…]` | One managed task. Takes `ollama run` flags plus `-w/--workflow`, `-j/--job`, `-f/--file`, `--schema`, `-x`, `--json` and more |
+| `fllama run [MODEL] [PROMPT…]` | One task, streamed on a terminal. Takes `ollama run` flags plus `-w/--workflow`, `-j/--job`, `-f/--file`, `--each`, `--schema`, `-x`, `--json` and more |
 | `fllama chat [NAME]` | The real `ollama` REPL on a virtual model or a tag |
 | `fllama gateway [--port] [--endpoint]` | Serves the [gateway endpoints](#gateway-endpoints) |
 | `fllama workflows` | Workflows and jobs, with what each expects |
 | `fllama catalog [JOB]` | Tested picks per job: installed, fits now |
-| `fllama job [ID] [--cancel]` | Lists deferred tasks, or gets or cancels one |
+| `fllama job [ID] [--wait\|--cancel] [--endpoint URL]` | Lists deferred tasks, or gets, waits for or cancels one |
 | `fllama tool NAME [JSON\|@FILE\|-]` | Calls any [MCP tool](#mcp-tools) with its own schema. `fllama tools` lists them; `--help` shows a schema |
 | `fllama list\|ls\|ps\|show\|pull\|push\|rm\|cp\|create\|stop\|serve\|signin\|signout\|launch` | Passed to `ollama` unchanged. `fllama serve` is `ollama serve` |
 

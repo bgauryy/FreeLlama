@@ -56,7 +56,7 @@ export function renderResult(result: ToolResult, options: RenderOptions, showThi
   const stderr: string[] = [];
   const job = record(structured.job);
   if (structured.deferred === true && typeof job?.id === "string") {
-    if (!options.quiet) stderr.push(`deferred; poll with: fllama job ${job.id}`);
+    if (!options.quiet) stderr.push(`deferred; wait for it with: fllama job ${job.id} --wait`);
     return { stdout: job.id, stderr, exitCode: 0 };
   }
   const { label, answer: body, checks } = splitAnswer(resultText(result));
@@ -71,6 +71,11 @@ export function renderResult(result: ToolResult, options: RenderOptions, showThi
     const stats = statsLine(structured);
     if (stats) stderr.push(stats);
   }
+  // An answer cut at the output limit reads complete but is not.
+  if (record(structured.response)?.done_reason === "length" && !options.quiet) stderr.push("fllama: the answer stopped at the output limit; raise -o num_predict=N for the rest");
+  // An embedding run prints its vectors (`ollama run EMBEDDING_MODEL "text"` does).
+  const vectors = record(structured.response)?.embeddings;
+  if (Array.isArray(vectors) && vectors.length > 0) return { stdout: JSON.stringify(vectors.length === 1 ? vectors[0] : vectors), stderr, exitCode: 0 };
   const thinking = thinkingOf(structured);
   if (thinking && !options.hideThinking && (options.verbose || showThinking) && !options.quiet) stderr.push(`thinking: ${thinking}`);
   if (!options.quiet) stderr.push(...checks);

@@ -54,7 +54,13 @@ const TERMINAL = new Set(["completed", "failed", "cancelled", "expired"]);
 const SUBMIT_FALLBACK_CODES = new Set(["task_job_input_too_large", "task_jobs_full", "task_jobs_input_budget"]);
 /** The worker already ran, but the registry could not retain its result or error. */
 const RETENTION_FAILURE_CODES = new Set(["task_job_result_too_large", "task_job_error_too_large"]);
-const FIRST_POLL_MS = 250;
+/**
+ * The first poll comes soon and the interval doubles up to MAX_POLL_MS: a short task (most local
+ * tasks finish in 100-300 ms on a warm runner) is reported within a few tens of milliseconds of
+ * finishing, not at the first 250 ms tick or the next one at 625 ms (measured), while a long
+ * task still settles to one cheap local poll every two seconds.
+ */
+const FIRST_POLL_MS = 25;
 /**
  * A phase that lasts this long is reported again with its elapsed time, so a cold load or a long
  * memory wait still sends progress: clients that reset their request timeout on progress keep
@@ -316,7 +322,7 @@ export async function runWithJobProgress(
         cancel();
         throw aborted(id, await cancellationState());
       }
-      delay = Math.min(MAX_POLL_MS, Math.round(delay * 1.5));
+      delay = Math.min(MAX_POLL_MS, delay * 2);
       try {
         const polled = object(object(JSON.parse(await calls.get(id)))?.job);
         if (polled) job = polled;

@@ -51,7 +51,8 @@ token and keeps it only for the browser tab.
   A remote endpoint is never probed and is reported as unknown.
 - **`usage_today`**: tasks, errors, tokens, and busy time since midnight UTC.
 - **`task_jobs`**: deferred task IDs, selected models, configured backends, priorities, total
-  deadlines, states, and waiting reasons. States cover discovery, admission, resources, runner
+  deadlines, states, and waiting reasons. MCP `doctor {view:"status"}` keeps only the active jobs
+  plus counts by state; `task_jobs {action:"list"}` lists them all. States cover discovery, admission, resources, runner
   transitions, loading, execution, and completion. Metadata excludes the original payload.
 
 A task receipt explains its own wait. `admission.mode` is `resident_shared` (the runner was

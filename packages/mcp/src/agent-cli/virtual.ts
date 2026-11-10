@@ -19,7 +19,22 @@ export const CHAT_JOB: JobName = "summarize";
 /** Decision and embedding jobs need fields a chat cannot carry; `fllama run` serves them. */
 const CHAT_TASKS = new Set(["coding", "completion", "vision"]);
 
-export type VirtualModel = { name: string; title: string; job?: JobName; workflow?: WorkflowName; vision: boolean };
+export type VirtualModel = {
+  name: string;
+  title: string;
+  job?: JobName;
+  workflow?: WorkflowName;
+  vision: boolean;
+  /** A real tag the caller chose: no job prompts, but the same context, shift and admission handling. */
+  tag?: string;
+  /** The task kind a direct tag runs as (vision when it sends images). */
+  task?: string;
+};
+
+/** A real tag as a resolvable model, for direct use with FreeLlama's runner and admission handling. */
+export function directModel(tag: string, task = "completion"): VirtualModel {
+  return { name: tag, title: tag, tag, task, vision: task === "vision" };
+}
 
 /** A refusal or failure with the HTTP status a gateway client should see. */
 export class GatewayError extends Error {
@@ -79,6 +94,7 @@ export type Resolution = {
   /** The route's memory assessment for loading the model (`ready`, or the hold that applies), with its reason. */
   assessment?: { status: string; detail: string };
   job?: JobName;
+  workflow?: WorkflowName;
   task: string;
 };
 
@@ -88,6 +104,7 @@ export type Resolution = {
  * capability, not free memory, and can choose a model that is then refused.
  */
 export async function pickVirtual(model: VirtualModel, caller: Pick<CallerChoices, "tools" | "think">, serveEndpoint?: string): Promise<string | undefined> {
+  if (model.tag) return model.tag;
   const prefer = model.workflow ? (WORKFLOWS[model.workflow] as { prefer?: "capable" }).prefer : undefined;
   try {
     return await pickLiveJobModel(model.job ?? CHAT_JOB, serveEndpoint, prefer, neededCapabilities(caller));
@@ -118,7 +135,7 @@ export function jobFields(model: VirtualModel & { job: JobName }, picked: string
  * only when the caller sent none.
  */
 export async function resolveVirtual(model: VirtualModel, turns: Turn[], caller: CallerChoices, serveEndpoint?: string): Promise<Resolution> {
-  const task = model.job ? LOCAL_JOBS[model.job].task : "completion";
+  const task = model.task ?? (model.job ? LOCAL_JOBS[model.job].task : "completion");
   const picked = await pickVirtual(model, caller, serveEndpoint);
   // A route preview runs nothing and reserves nothing. It names auto's model and the context window.
   let preview;
@@ -143,7 +160,10 @@ export async function resolveVirtual(model: VirtualModel, turns: Turn[], caller:
   const resident = await residentContext(selected, serveEndpoint);
   if (resident !== undefined) resolution.residentContext = resident;
   const needed = estimatedTokens(turns, caller.options);
-  if (resident !== undefined && (typeof routed !== "number" || resident >= routed || resident >= needed)) {
+  // Reuse holds the conversation and keeps its cache, but a runner far bigger than the task holds
+  // K/V memory for nothing (measured: a 32K lfm3 runner serving 2K tasks); past 4x, resize.
+  const fitsTask = resident !== undefined && resident >= needed && resident <= 4 * Math.max(needed, typeof routed === "number" ? routed : 0);
+  if (resident !== undefined && (fitsTask || (typeof routed === "number" && resident === routed))) {
     resolution.numCtx = resident;
     resolution.contextSource = "resident_runner";
   } else if (typeof routed === "number") {
@@ -153,6 +173,7 @@ export async function resolveVirtual(model: VirtualModel, turns: Turn[], caller:
   if (!model.job) return resolution;
 
   resolution.job = model.job;
+  if (model.workflow) resolution.workflow = model.workflow;
   const fields = jobFields(model as VirtualModel & { job: JobName }, selected, turns, caller);
   const last = turns.at(-1);
   if (!caller.system && fields.systemPrompt !== undefined) resolution.system = fields.systemPrompt;
@@ -437,7 +458,27 @@ export const REWRITERS: Record<string, Rewriter> = {
   "/v1/messages": rewriteAnthropic, "/v1/responses": rewriteResponses,
 };
 
+export type Forward = Rewrite & { runner: "resident" | "warmed" | "assessed"; numCtx?: number };
+
+/**
+ * Everything before a request goes to Ollama's own endpoint: resolve and rewrite it, match serve's
+ * context-shift setting on the native API (a runner load option), and admit a cold load. Shared by
+ * the gateway and `fllama run`'s streaming path.
+ */
+export async function prepareForward(path: string, model: VirtualModel, body: Fields, serveEndpoint?: string, signal?: AbortSignal): Promise<Forward> {
+  const rewriter = REWRITERS[path];
+  if (!rewriter) throw new GatewayError(`no rewrite for ${path}`, 500);
+  const { body: rewritten, resolution } = await rewriter(model, body, serveEndpoint);
+  // Only the native API carries the runner profile; the OpenAI and Anthropic layers run at
+  // Ollama's defaults.
+  const native = path === "/api/chat" || path === "/api/generate";
+  if (native && rewritten.shift === undefined && await managedShiftOff(serveEndpoint)) rewritten.shift = false;
+  const numCtx = native ? record(rewritten.options)?.num_ctx as number | undefined : undefined;
+  const runner = await admitRunner(resolution, native ? { numCtx } : undefined, serveEndpoint, signal);
+  return { body: rewritten, resolution, runner, ...(numCtx !== undefined ? { numCtx } : {}) };
+}
+
 /** The `check:` lines job mode's result checks give for a finished streamed answer. */
 export function streamChecks(resolution: Resolution, answer: string, tools?: unknown[]): string[] {
-  return resultChecks({ job: resolution.job, task: resolution.task, answer, structured: { response: { message: { role: "assistant", content: answer } } }, tools });
+  return resultChecks({ job: resolution.job, task: resolution.task, workflow: resolution.workflow, answer, structured: { response: { message: { role: "assistant", content: answer } } }, tools });
 }

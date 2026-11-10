@@ -1,7 +1,7 @@
 // `fllama run` / `fllama chat` flags -> `run_task` arguments. Pure: no I/O except reading the
 // `@file` values the caller names. `ollama run` flags keep their meaning; a flag whose effect a
 // managed task cannot honor is refused with the command that can, never silently dropped.
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { parseArgs, type ParseArgsConfig } from "node:util";
 import { LOCAL_JOBS, RUN_TASK_JOBS, WORKFLOWS, type JobName, type WorkflowName } from "../local-prompts.js";
 import { withoutUndefined } from "./util.js";
@@ -9,7 +9,11 @@ import { withoutUndefined } from "./util.js";
 /** A caller mistake: printed as one line, exit code 2. */
 export class UsageError extends Error {}
 
-export type RenderOptions = { json: boolean; verbose: boolean; quiet: boolean; hideThinking: boolean; extract?: boolean };
+export type RenderOptions = {
+  json: boolean; verbose: boolean; quiet: boolean; hideThinking: boolean; extract?: boolean;
+  /** true: --stream, false: --no-stream, undefined: stream when stdout is a terminal. */
+  stream?: boolean;
+};
 
 type RunPlan = {
   /** `run_task` arguments, validated later by the tool's own schema. */
@@ -17,7 +21,25 @@ type RunPlan = {
   render: RenderOptions;
   /** No prompt, input, files or question: `run` on a TTY becomes a chat. */
   promptless: boolean;
+  /** --each: one task per file named by -f, run as one batch. */
+  each?: boolean;
+  /** The model came from the first word (`fllama run WORD …`), so it may be a prompt after all. */
+  positionalModel?: boolean;
 };
+
+/** Ollama attaches an image named in the prompt (`ollama run llava "what is in ./a.png"`); so does fllama. */
+const IMAGE_FILE = /\.(?:png|jpe?g|webp|gif|bmp)$/i;
+function isImageFile(word: string): boolean {
+  const path = word.replace(/^["']|["']$/g, "");
+  try {
+    return IMAGE_FILE.test(path) && existsSync(path) && statSync(path).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/** Routing fields only: what `--preview` (route without running) accepts. */
+const PREVIEW_FIELDS = new Set(["endpoint", "model", "job", "workflow", "task", "objective", "contextTokens", "sessionId", "minConfidence", "executionPreference", "preview"]);
 
 const OPTIONS = {
   // ollama run
@@ -59,6 +81,9 @@ const OPTIONS = {
   schema: { type: "string" },
   extract: { type: "boolean", short: "x" },
   json: { type: "boolean" },
+  each: { type: "boolean" },
+  stream: { type: "boolean" },
+  "no-stream": { type: "boolean" },
   quiet: { type: "boolean", short: "q" },
   endpoint: { type: "string" },
   help: { type: "boolean", short: "h" },
@@ -104,10 +129,11 @@ function optionPair(pair: string): [string, unknown] {
   return [key, raw.trim() !== "" && Number.isFinite(number) ? number : raw];
 }
 
+/** true, false, or a level the model names (`ollama show MODEL`: low, medium, high, xhigh…); serve checks it against the model. */
 function thinkValue(value: string | undefined): boolean | string | undefined {
   if (value === undefined) return undefined;
   if (value === "true" || value === "false") return value === "true";
-  if (!["high", "medium", "low"].includes(value)) throw new UsageError(`--think takes true, false, high, medium or low, got "${value}".`);
+  if (!/^[a-z][a-z0-9_-]{0,15}$/.test(value)) throw new UsageError(`--think takes true, false or a level the model lists (ollama show MODEL), got "${value}".`);
   return value;
 }
 
@@ -217,8 +243,10 @@ FreeLlama flags:
   --objective fastest|balanced|quality   --prefer cpu|gpu   --min-confidence low|medium
   --session UUID  --priority interactive|normal|background  --timeout S  --max-wait S
   --schema 'name, age int, tags list'|JSON|@F  structured output   -x, --extract  print only the first code block
-  --defer  return a job id (fllama job ID)   --preview  route only   --save-as NAME  write a handoff
+  --each  one answer per -f file, run as one batch   --defer  return a job id (fllama job ID)
+  --preview  route only (payload flags are ignored)   --save-as NAME  write a handoff
   --json  full receipt on stdout   -q, --quiet  no stderr notes   --endpoint URL  serve endpoint
+  --stream / --no-stream  tokens as they arrive (default on a terminal) / one managed answer (default in a pipe)
 
 Answers go to stdout; check: lines (verify these) and notes go to stderr.`;
 
@@ -240,7 +268,9 @@ export function parseRunArgs(argv: string[], stdin?: string): RunPlan & { help: 
   const render: RenderOptions = {
     json: values.json === true, verbose: values.verbose === true, quiet: values.quiet === true, hideThinking: values.hidethinking === true,
     ...(values.extract ? { extract: true } : {}),
+    ...(values.stream ? { stream: true } : values["no-stream"] ? { stream: false } : {}),
   };
+  if (values.stream && values["no-stream"]) throw new UsageError("--stream and --no-stream contradict each other.");
   if (values.help) return { args: {}, render, promptless: true, help: true };
 
   if (values.dimensions !== undefined) throw new UsageError("--dimensions truncates raw embedding vectors, which managed tasks do not return; use `ollama run MODEL --dimensions N`.");
@@ -253,13 +283,21 @@ export function parseRunArgs(argv: string[], stdin?: string): RunPlan & { help: 
   const job = jobOf(values.job, values.workflow);
   const named = values.model !== undefined || job !== undefined || values.task !== undefined;
   let model = values.model;
-  if (!named && positionals.length > 0 && !/\s/.test(positionals[0]!)) model = positionals.shift();
+  let positionalModel = false;
+  if (!named && positionals.length > 0 && !/\s/.test(positionals[0]!) && !isImageFile(positionals[0]!)) {
+    model = positionals.shift();
+    positionalModel = true;
+  }
+  // Image paths in the prompt become attached images, as in `ollama run`.
+  const promptImages = positionals.filter(isImageFile).map((word) => word.replace(/^["']|["']$/g, ""));
   const prompt = positionals.length > 0 ? positionals.join(" ") : undefined;
   const input = stdin !== undefined && stdin.trim() !== "" ? stdin : undefined;
 
   // The classify job names its own task; an explicit one must still be "decision".
-  const task = questions !== undefined && (model !== undefined || values.task !== undefined) ? (values.task ?? "decision") : values.task;
-  if (questions !== undefined && values.task !== undefined && values.task !== "decision") throw new UsageError(`--ask makes a decision task; remove --task ${task}.`);
+  // `freellama` documents code-repair and long-context; the task schema names them with underscores.
+  const taskFlag = values.task?.replace(/-/g, "_");
+  const task = questions !== undefined && (model !== undefined || taskFlag !== undefined) ? (taskFlag ?? "decision") : taskFlag;
+  if (questions !== undefined && taskFlag !== undefined && taskFlag !== "decision") throw new UsageError(`--ask makes a decision task; remove --task ${task}.`);
   const kind = task ?? (job ? LOCAL_JOBS[job].task : questions !== undefined ? "decision" : undefined);
 
   const options: Record<string, unknown> = {};
@@ -271,7 +309,7 @@ export function parseRunArgs(argv: string[], stdin?: string): RunPlan & { help: 
     else options[key] = value;
   }
 
-  const files = [...(values.file ?? []), ...(values.image ?? [])];
+  const files = [...(values.file ?? []), ...(values.image ?? []), ...promptImages];
   if (values.schema !== undefined && values.format !== undefined) throw new UsageError("--schema sets the output format; remove --format.");
   const format = values.schema !== undefined ? schemaValue(values.schema)
     : values.format === undefined ? undefined : values.format === "json" ? "json" : jsonValue(values.format, "--format");
@@ -318,5 +356,8 @@ export function parseRunArgs(argv: string[], stdin?: string): RunPlan & { help: 
   }
   if (values.top !== undefined && kind !== "embedding") throw new UsageError("--top ranks embedding matches; use it with an embedding job (find-code, duplicates, image-search).");
   const promptless = prompt === undefined && input === undefined && files.length === 0 && questions === undefined;
-  return { args: withoutUndefined(args), render, promptless, help: false };
+  if (values.each && files.length === 0) throw new UsageError("--each runs one task per file; name the files with -f PATH|GLOB.");
+  // A preview routes without running: payload fields (prompt, files, options…) do not apply to it.
+  const routed = values.preview ? Object.fromEntries(Object.entries(args).filter(([name]) => PREVIEW_FIELDS.has(name))) : args;
+  return { args: withoutUndefined(routed), render, promptless, help: false, ...(values.each ? { each: true } : {}), ...(positionalModel ? { positionalModel: true } : {}) };
 }

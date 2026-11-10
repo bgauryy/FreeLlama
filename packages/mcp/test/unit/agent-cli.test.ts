@@ -25,6 +25,7 @@ import { chatTaskArgs, fromOpenAiRequest, openAiCompletion } from "../../src/age
 import { virtualModel, virtualModels } from "../../src/agent-cli/virtual.js";
 import { TOOL_REGISTRATIONS } from "../../src/tools/registrations.js";
 import { toolRegistry } from "../../src/agent-cli/registry.js";
+import { streamRun, streamTarget } from "../../src/agent-cli/stream.js";
 import { chatModelName, main } from "../../src/agent-cli/main.js";
 
 const render = { json: false, verbose: false, quiet: false, hideThinking: false };
@@ -66,7 +67,9 @@ describe("fllama run flags", () => {
     const { args } = parseRunArgs(["m:1", "hi", "--think", "--keepalive", "5m", "--format", '{"type":"object","properties":{}}']);
     expect(args).toMatchObject({ think: true, keepAlive: "5m", format: { type: "object", properties: {} } });
     expect(parseRunArgs(["m:1", "hi", "--think=low"]).args.think).toBe("low");
-    expect(() => parseRunArgs(["m:1", "--think=maybe"])).toThrow(UsageError);
+    // Level names are the model's (qwen3.8 lists xhigh); serve validates them against /api/show.
+    expect(parseRunArgs(["m:1", "hi", "--think=xhigh"]).args.think).toBe("xhigh");
+    expect(() => parseRunArgs(["m:1", "--think=Not A Level"])).toThrow(UsageError);
   });
 
   it("turns --ask/--choice/--level into decision questions over stdin", () => {
@@ -172,7 +175,7 @@ describe("fllama output", () => {
 
   it("prints a deferred job's id on stdout", () => {
     const rendered = renderResult({ structuredContent: { deferred: true, job: { id: "abc", status: "queued" } } }, render);
-    expect(rendered).toEqual({ stdout: "abc", stderr: ["deferred; poll with: fllama job abc"], exitCode: 0 });
+    expect(rendered).toEqual({ stdout: "abc", stderr: ["deferred; wait for it with: fllama job abc --wait"], exitCode: 0 });
   });
 });
 
@@ -379,11 +382,18 @@ describe("gateway over HTTP", () => {
   });
 
   it("keeps a loaded runner's window, so nothing reloads and its prompt cache survives", async () => {
-    loaded = [{ name: "lfm3:1.7b-q4_K_M", context_length: 32768 }];
+    loaded = [{ name: "lfm3:1.7b-q4_K_M", context_length: 16384 }];
     const lines = (await (await post("/api/chat", { model: "freellama/summarize", messages: [{ role: "user", content: "x" }] })).text()).trim().split("\n");
-    expect(upstream[0]!.body.options.num_ctx).toBe(32768);
-    expect(JSON.parse(lines.at(-1)!).freellama).toMatchObject({ num_ctx: 32768, context_source: "resident_runner" });
+    expect(upstream[0]!.body.options.num_ctx).toBe(16384);
+    expect(JSON.parse(lines.at(-1)!).freellama).toMatchObject({ num_ctx: 16384, context_source: "resident_runner" });
     expect(fixture.warm).not.toHaveBeenCalled();
+  });
+
+  it("resizes a runner more than 4x bigger than the task, instead of holding its K/V memory", async () => {
+    loaded = [{ name: "lfm3:1.7b-q4_K_M", context_length: 131072 }];
+    await (await post("/api/chat", { model: "freellama/summarize", messages: [{ role: "user", content: "x" }] })).text();
+    expect(upstream[0]!.body.options.num_ctx).toBeLessThan(131072);
+    expect(fixture.warm).toHaveBeenCalledTimes(1);
   });
 
   it("refuses a stream whose load the memory gate refuses, without reaching Ollama", async () => {
@@ -466,5 +476,75 @@ describe("gateway over HTTP", () => {
     expect(tags.models[0].digest).toMatch(/^[0-9a-f]{64}$/);
     expect((await fetch(`${gateway.url}/api/tags`, { headers: { origin: "https://evil.example" } })).status).toBe(403);
     expect(await (await post("/api/generate", { model: "freellama/describe-screen", stream: false, images: ["AAAA"] })).json()).not.toMatchObject({ done_reason: "load" });
+  });
+});
+
+describe("fllama run streaming", () => {
+  let serve: import("node:http").Server;
+  let endpoint = "";
+  const sent: Array<Record<string, any>> = [];
+  let reply: string[] = [];
+  beforeAll(async () => {
+    const http = await import("node:http");
+    serve = http.createServer((request, response) => {
+      let raw = "";
+      request.on("data", (chunk) => { raw += chunk; });
+      request.on("end", () => {
+        if (request.url === "/api/ps") return void response.end(JSON.stringify({ models: [] }));
+        if (request.url === "/_freellama/v1/config") return void response.end(JSON.stringify({ context_shift: "off" }));
+        sent.push(JSON.parse(raw || "{}"));
+        response.writeHead(200, { "content-type": "application/x-ndjson" });
+        response.end(reply.map((line) => `${line}\n`).join(""));
+      });
+    });
+    await new Promise<void>((resolve) => serve.listen(0, "127.0.0.1", () => resolve()));
+    endpoint = `http://127.0.0.1:${(serve.address() as { port: number }).port}`;
+  });
+  afterAll(() => new Promise<void>((resolve) => serve.close(() => resolve())));
+  beforeEach(() => {
+    sent.length = 0;
+    reply = [
+      JSON.stringify({ message: { role: "assistant", content: "Hel" }, done: false }),
+      JSON.stringify({ message: { role: "assistant", content: "lo" }, done: false }),
+      JSON.stringify({ message: { role: "assistant", content: "" }, done: true, done_reason: "stop", eval_count: 2, eval_duration: 1e8, prompt_eval_count: 5 }),
+    ];
+  });
+  const capture = () => {
+    const out: string[] = [];
+    const err: string[] = [];
+    return { out, err, io: { out: (text: string) => out.push(`${text}\n`), err: (text: string) => err.push(text), write: (text: string) => out.push(text) } };
+  };
+
+  it("streams a direct tag's tokens in order, with serve's shift setting and an admitted load", async () => {
+    const { out, io } = capture();
+    const code = await streamRun(streamTarget({ model: "lfm3:1.7b-q4_K_M", prompt: "hi" })!, { model: "lfm3:1.7b-q4_K_M", prompt: "hi", endpoint }, render, io, new AbortController().signal, false);
+    expect(code).toBe(0);
+    expect(out.join("")).toBe("Hello\n");
+    expect(sent[0]).toMatchObject({ model: "lfm3:1.7b-q4_K_M", stream: true, shift: false, messages: [{ role: "user", content: "hi" }] });
+    expect(fixture.warm).toHaveBeenCalledTimes(1);
+  });
+
+  it("streams a workflow on its pick with the workflow's system prompt, and prints stats with --verbose", async () => {
+    const { err, io } = capture();
+    await streamRun(streamTarget({ workflow: "summarize-text", prompt: "text" })!, { workflow: "summarize-text", prompt: "text", endpoint }, { ...render, verbose: true }, io, new AbortController().signal, false);
+    expect(sent[0]!.messages[0].role).toBe("system");
+    expect(err.at(-1)).toMatch(/output 2 tokens, 20\.0 tokens\/s/);
+  });
+
+  it("fails an empty answer and keeps decisions, batches and tools on the managed path", async () => {
+    reply = [JSON.stringify({ message: { role: "assistant", content: "" }, done: true, done_reason: "length" })];
+    const { err, io } = capture();
+    expect(await streamRun(streamTarget({ model: "m:1", prompt: "x" })!, { model: "m:1", prompt: "x", endpoint }, render, io, new AbortController().signal, false)).toBe(1);
+    expect(err.join("\n")).toMatch(/empty answer: the output budget ran out/);
+    expect(streamTarget({ job: "classify", questions: {} })).toBeUndefined();
+    expect(streamTarget({ prompt: "x", tools: [{}] })).toBeUndefined();
+    expect(streamTarget({ prompt: "x", defer: true })).toBeUndefined();
+  });
+});
+
+describe("agent guide", () => {
+  it("names every workflow, so a new one cannot be left out of the freellama prompt", async () => {
+    const { AGENT_GUIDE, WORKFLOW_NAMES } = await import("../../src/local-prompts.js");
+    for (const name of WORKFLOW_NAMES) expect(AGENT_GUIDE).toContain(name);
   });
 });

@@ -36,8 +36,8 @@ yarn install && yarn build && node packages/mcp/dist/agent-cli.js --help
 | `fllama gateway [--port 11437]` | Keeps the virtual models available over `/api/*` and `/v1/*` for other clients |
 | `fllama workflows` | Workflows and jobs, with what each expects |
 | `fllama catalog [JOB]` | Tested picks per job: installed, fits now |
-| `fllama job ID [--cancel]` | A deferred task's result; with no ID, the job list |
-| `fllama tool NAME [JSON\|@FILE\|-]` | Any FreeLlama MCP tool, with its own input schema; `fllama tools` lists them |
+| `fllama job ID [--wait\|--cancel] [--endpoint URL]` | A deferred task's result (`--wait` blocks until it ends and prints only the answer); with no ID, the job list |
+| `fllama tool NAME [JSON\|@FILE\|-]` | Any FreeLlama MCP tool, with its own input schema; `fllama tools` lists them. `fllama tool sweep` with `start` or `resume` stays until the sweep ends (a sweep runs in the process that started it) |
 | `fllama list\|ls\|ps\|show\|pull\|push\|rm\|cp\|create\|stop\|serve\|signin\|signout\|launch …` | Passed to `ollama` unchanged |
 
 Passthrough means `ollama` semantics: `fllama serve` starts **Ollama** (`ollama serve`), not
@@ -60,15 +60,25 @@ echo "Invoice 2291, Acme, 1,240.50 EUR" | fllama run -w extract-json --schema "i
 fllama run -w explain-code -f path/to/a.ts -x > answer.txt   # the first code block only
 ```
 
+**Streaming.** On a terminal, tokens stream as they are generated, as in `ollama run`, while the
+request still gets the job's pick and prompts, the loaded runner's window and the memory gate for
+a cold load. `check:` lines and `--verbose` stats follow the answer. In a pipe, or with
+`--no-stream`, one managed answer comes back with its full receipt; `--stream` forces streaming.
+Decisions, embeddings, tools, batches and deferred runs always use the managed path.
+
 **Model or prompt.** The first word is a model only when no `--model`, `--job`, `--workflow` or
-`--task` is given and it has no whitespace, because an Ollama tag cannot contain any. So
+`--task` is given and it has no whitespace, because an Ollama tag cannot contain any. A word that is
+not an installed tag and has nothing after it is the prompt (`fllama run hello`). An unknown tag
+before a prompt is a usage error that names the nearest installed tags; `fllama` never pulls. An
+embedding model prints the prompt's vector, and an image path written in the prompt is attached,
+both as in `ollama run`. So
 `fllama run lfm3:1.7b-q4_K_M "Why?"` pins a model, and `fllama run nimble --ask …` asks `nimble`,
 as `ollama run` does. A bare prompt such as `fllama run "Why is the sky blue?"` runs on the tested
 chat pick that fits now. With no model, `--ask` runs on the `classify` job's tested pick.
 
 **Thinking.** `--think=false` stops a thinking model from spending its output budget before it
-answers. `--think=low|medium|high` works only on models that advertise levels (`ollama show
-MODEL`); other models refuse it.
+answers. A level (`--think=low`, `--think=xhigh`…) must be one the model lists (`ollama show
+MODEL`); a model without levels uses its default.
 
 **stdin.** Input piped (`cmd | fllama run`), redirected (`< file`) or passed by a program is read:
 as the `state` for a decision, one item per line for an embedding job, otherwise after the prompt.
@@ -89,14 +99,15 @@ or globs, repeatable), `--image`, `-s/--system TEXT|@FILE`, `-o/--option k=v`, `
 
 **Structured output and code.**  `--schema` takes a JSON schema (`{…}` or `@file.json`) or llm's
 short form, where every field is required: `--schema 'name, age int, tags list: up to five'`
-(types `str`, `int`, `float`, `bool`, `list`). `-x/--extract` prints only the first fenced code
+(types `str`, `int`, `float`, `bool`, `list`). `--each` runs the request once per `-f` file (globs expanded, up to 64) as one batch, one `## path`
+section per file: `fllama run -w review-code --each -f 'src/*.ts'`. `-x/--extract` prints only the first fenced code
 block, or the whole answer with a note when there is none. It extracts text; it does not make a
 patch you can `git apply`. `fix-bug` answers in SEARCH/REPLACE blocks for you to apply.
 
 **Output.** stdout carries only the answer. stderr carries `check:` lines (act on them before
 relying on the answer), a `handoff_file:` line for `--save-as`, and refusals. `--verbose` adds the
 model, the fields job mode filled in, timings and the cached prompt tokens. `--json` prints the
-whole receipt. Exit codes: 0 success, 1 refused, failed or empty (a thinking model that spent its
+whole receipt. An answer that stopped at the output limit gets a note on stderr. Exit codes: 0 success, 1 refused, failed or empty (a thinking model that spent its
 whole budget; rerun with `--think=false`), 2 usage, 130 interrupted. Ctrl-C cancels the running job.
 `--ask` answers are named after the question (`Is a refund requested?` → `refund-requested: true
 (p 0.89)`).

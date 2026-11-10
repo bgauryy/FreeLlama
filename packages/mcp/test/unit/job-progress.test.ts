@@ -63,10 +63,11 @@ describe("runWithJobProgress", () => {
     const calls = scripted([same, same, same, same, same, same, same, same, { status: "running" }, { status: "completed", result: {} }]);
     const delays: number[] = [];
     await runWithJobProgress(calls, () => undefined, { wait: async (ms) => { delays.push(ms); } });
-    expect(delays[0]).toBe(250);
+    // The first poll is quick so a short task is reported soon after it finishes.
+    expect(delays[0]).toBe(25);
     expect(Math.max(...delays)).toBeLessThanOrEqual(2_000);
     expect(delays.slice(1, 8).every((delay, index) => delay >= delays[index]!)).toBe(true);
-    expect(delays.at(-1)).toBe(250);
+    expect(delays.at(-1)).toBe(25);
   });
 
   it("repeats a long phase with its elapsed time so a waiting client still sees progress", async () => {
@@ -239,7 +240,8 @@ describe("runWithJobProgress", () => {
       await expect(runWithJobProgress(calls, () => undefined, { signal: controller.signal, wait, onJob }))
         .rejects.toThrow(/cancellation was requested for deferred job .* and acknowledged by serve/);
       expect(calls.cancel).toHaveBeenCalledTimes(3);
-      expect(waits).toEqual([250, 250, 500]);
+      // One quick first poll, then the cancel request's own backoff.
+      expect(waits).toEqual([25, 250, 500]);
       expect(onJob.mock.calls).toEqual([[ID, true], [ID, false]]);
     });
 

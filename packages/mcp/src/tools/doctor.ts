@@ -45,6 +45,19 @@ export function doctorStatus(report: Fields): { status: "ok" | "degraded"; probl
 }
 
 /** "Ollama unreachable on backend gpu (…)" for each backend whose residency query failed. */
+/**
+ * The status view's jobs as counts by state plus the jobs still active: the full list (often half
+ * of the status payload) is task_jobs{action:"list"}'s to give, not every status call's.
+ */
+export function jobsSummary(value: unknown): Fields | unknown {
+  const jobs = value && typeof value === "object" && Array.isArray((value as Fields).jobs) ? (value as Fields).jobs as Fields[] : undefined;
+  if (!jobs) return value;
+  const terminal = new Set(["completed", "failed", "cancelled", "expired"]);
+  const counts: Record<string, number> = {};
+  for (const job of jobs) counts[String(job.status ?? "unknown")] = (counts[String(job.status ?? "unknown")] ?? 0) + 1;
+  return { ...(value as Fields), jobs: jobs.filter((job) => !terminal.has(String(job.status))), counts, note: 'finished jobs are counted only; task_jobs{action:"list"} lists them' };
+}
+
 export function ollamaProblems(status: Fields): string[] {
   const loaded = Array.isArray(status.loaded_models) ? status.loaded_models : [];
   return loaded.flatMap((entry) => {
@@ -89,6 +102,7 @@ export function registerDoctorTool(server: McpServer): void {
               live.structuredContent.status = "degraded";
               live.structuredContent.problems = problems;
             }
+            live.structuredContent.task_jobs = jobsSummary(live.structuredContent.task_jobs);
           }
           return withText(live, statusText);
         }

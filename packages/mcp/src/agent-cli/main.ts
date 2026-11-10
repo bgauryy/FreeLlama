@@ -10,6 +10,10 @@ import { SERVER_VERSION } from "../native.js";
 import { parseRunArgs, RUN_USAGE, UsageError, valueOrFile } from "./args.js";
 import { callTool, resultText, toolRegistry } from "./registry.js";
 import { renderResult } from "./output.js";
+import { expandFileEntries } from "../task-files.js";
+import { installedInventory } from "../model-library.js";
+import type { InstalledModel } from "../model-catalog.js";
+import { streamRun, streamTarget } from "./stream.js";
 import { startGateway } from "./gateway.js";
 import { CHAT_JOB, VIRTUAL_PREFIX, virtualModels } from "./virtual.js";
 import { pickLiveJobModel } from "../job-mode.js";
@@ -24,7 +28,7 @@ const USAGE = `fllama: run local Ollama models with FreeLlama's tested picks, pr
   fllama gateway [--port 11437]            serve virtual models over the Ollama, OpenAI and Anthropic APIs
   fllama workflows                         workflows and jobs, with what each expects
   fllama catalog [JOB]                     tested picks per job: installed, fits now
-  fllama job ID [--cancel]                 a deferred task's result
+  fllama job ID [--wait|--cancel] [--endpoint URL]   a deferred task's result (--wait: block until it ends)
   fllama tool NAME [JSON|@FILE|-]          call one FreeLlama MCP tool; fllama tools lists them
   fllama list|ps|show|pull|rm|cp|create|stop|push|serve ...   passed to ollama unchanged (serve = ollama serve)
 
@@ -39,10 +43,11 @@ Examples:
 stdout is the answer; check: lines (verify these first) and notes go to stderr. Exit 0 ok, 1 refused
 or failed, 2 usage, 130 interrupted. A pull, rm or create still needs the user's approval.`;
 
-type Io = { out: (text: string) => void; err: (text: string) => void };
+type Io = { out: (text: string) => void; err: (text: string) => void; write?: (text: string) => void };
 const stdio: Io = {
   out: (text) => process.stdout.write(text.endsWith("\n") ? text : `${text}\n`),
   err: (text) => process.stderr.write(text.endsWith("\n") ? text : `${text}\n`),
+  write: (text) => process.stdout.write(text),
 };
 
 /**
@@ -111,8 +116,20 @@ async function run(argv: string[], io: Io): Promise<number> {
     return chat(name === undefined ? [] : [name], io);
   }
   const signal = interruptSignal();
-  // A bare prompt runs on the tested chat pick that fits now; routing alone ignores free memory.
   const { args } = plan;
+  // `fllama run WORD …`: check the word against the installed tags, as `ollama run` would.
+  if (plan.positionalModel && typeof args.model === "string") {
+    const settled = await settleModelWord(args, args.model);
+    if (settled) return settled(io);
+  }
+  if (plan.each) return runEach(args, plan, io, signal);
+  // On a terminal, tokens stream as `ollama run` shows them; in a pipe one managed answer comes back.
+  const wantStream = plan.render.stream ?? (process.stdout.isTTY === true && !plan.render.json && !plan.render.extract);
+  const target = wantStream && !plan.render.json && !plan.render.extract ? streamTarget(args) : undefined;
+  if (target) {
+    return streamRun(target, args, plan.render, { ...io, write: io.write ?? ((text) => io.out(text)) }, signal, process.stderr.isTTY === true);
+  }
+  // A bare prompt runs on the tested chat pick that fits now; routing alone ignores free memory.
   if (["model", "job", "workflow", "task", "preview"].every((field) => args[field] === undefined) && typeof args.prompt === "string") {
     args.model = await pickLiveJobModel(CHAT_JOB, args.endpoint as string | undefined).catch(() => undefined);
   }
@@ -122,6 +139,61 @@ async function run(argv: string[], io: Io): Promise<number> {
     return 130;
   }
   const rendered = renderResult(result, plan.render, process.stderr.isTTY === true);
+  for (const line of rendered.stderr) io.err(line);
+  if (rendered.stdout !== "") io.out(rendered.stdout);
+  return rendered.exitCode;
+}
+
+/**
+ * A first word taken as a model: an installed tag stays one (an embedding-only tag embeds its
+ * prompt and prints the vector, as `ollama run` does); a word that is no tag and has no prompt after
+ * it is the prompt; an unknown tag before a prompt is a usage error naming the nearest tags.
+ * Returns a printer when the run is decided here.
+ */
+async function settleModelWord(args: Record<string, unknown>, word: string): Promise<((io: Io) => number) | undefined> {
+  let installed: InstalledModel[];
+  try {
+    installed = await installedInventory(undefined);
+  } catch {
+    return undefined; // Inventory unreadable: let the call report what is down.
+  }
+  const lower = word.toLowerCase();
+  const match = installed.find((model) => model.name.toLowerCase() === lower || model.name.toLowerCase() === `${lower}:latest`);
+  if (match) {
+    args.model = match.name;
+    const caps = match.capabilities ?? [];
+    if (caps.includes("embedding") && !caps.includes("completion") && args.task === undefined && typeof args.prompt === "string") {
+      args.task = "embedding";
+      args.input = args.prompt;
+      args.returnEmbeddings = true;
+      delete args.prompt;
+    }
+    return undefined;
+  }
+  if (args.prompt === undefined && !word.includes(":") && !word.includes("/")) {
+    // `fllama run hello`: no tag of that name, nothing after it; it is the prompt.
+    delete args.model;
+    args.prompt = word;
+    return undefined;
+  }
+  // The tag the word starts (lfm3:1.7b -> lfm3:1.7b-q4_K_M) first, then the same family.
+  const family = lower.split(":")[0]!;
+  const rank = (name: string) => (name.toLowerCase().startsWith(lower) ? 0 : name.toLowerCase().startsWith(`${family}:`) ? 1 : 2);
+  const near = installed.map((model) => model.name)
+    .filter((name) => name.toLowerCase().startsWith(family) || name.toLowerCase().includes(lower))
+    .sort((a, b) => rank(a) - rank(b)).slice(0, 3);
+  throw new UsageError(`"${word}" is not an installed model${near.length ? `; did you mean ${near.join(", ")}?` : "; `fllama list` shows the installed tags"} (fllama never pulls; ask before \`ollama pull\`)`);
+}
+
+/** --each: one task per file (globs expanded), the same request on each, as one batch. */
+async function runEach(args: Record<string, unknown>, plan: ReturnType<typeof parseRunArgs>, io: Io, signal: AbortSignal): Promise<number> {
+  const paths = expandFileEntries(args.files as string[]);
+  if (paths.length === 0) throw new UsageError("--each: no file matches the -f patterns.");
+  if (paths.length > 64) throw new UsageError(`--each: ${paths.length} files; a batch takes at most 64 (narrow the glob, or use fllama tool sweep for a tree).`);
+  const { files: _files, prompt, ...shared } = args;
+  const tasks = paths.map((path) => ({ id: path, independent: true, task: { files: [path], ...(typeof prompt === "string" ? { prompt } : {}) } }));
+  const result = await callTool("run_task", { ...shared, tasks }, { signal, onMessage: progressPrinter(io, plan.render.verbose, plan.render.quiet) });
+  const rendered = renderResult(result, plan.render, false);
   for (const line of rendered.stderr) io.err(line);
   if (rendered.stdout !== "") io.out(rendered.stdout);
   return rendered.exitCode;
@@ -214,11 +286,41 @@ async function tool(argv: string[], io: Io): Promise<number> {
     io.out(`${name}: ${registered.description}\n\ninput schema:\n${JSON.stringify(registered.inputSchema.toJSONSchema?.() ?? {}, null, 2)}`);
     return 0;
   }
-  const result = await callTool(name, await toolArgs(raw), { signal: interruptSignal(), onMessage: progressPrinter(io, false, false) });
+  const signal = interruptSignal();
+  const args = await toolArgs(raw);
+  let result = await callTool(name, args, { signal, onMessage: progressPrinter(io, false, false) });
+  // A sweep runs in the process that started it: a one-shot command follows it to the end, or
+  // exiting would interrupt it.
+  const sweepId = result.structuredContent?.id;
+  if (name === "sweep" && (args.action === "start" || args.action === "resume") && !result.isError && typeof sweepId === "string") {
+    while (!signal.aborted && ["running", "collecting"].includes(String(result.structuredContent?.phase))) {
+      result = await callTool("sweep", { action: "wait", sweepId }, { signal, onMessage: progressPrinter(io, true, false) });
+      if (result.isError) break;
+    }
+  }
   const rendered = renderResult(result, { json, verbose: false, quiet: false, hideThinking: true });
   for (const line of rendered.stderr) io.err(line);
   if (rendered.stdout !== "") io.out(rendered.stdout);
   return rendered.exitCode;
+}
+
+/** `fllama job ID --wait`: poll until the job ends, then print only its answer (checks on stderr). */
+async function waitJob(id: string, io: Io, endpoint?: string): Promise<number> {
+  const signal = interruptSignal();
+  for (let delay = 100; !signal.aborted; delay = Math.min(2_000, delay * 2)) {
+    const result = await callTool("task_jobs", { action: "get", jobId: id, ...(endpoint ? { endpoint } : {}) }, { signal });
+    const job = result.structuredContent?.job as Record<string, unknown> | undefined;
+    if (result.isError || ["completed", "failed", "cancelled", "expired"].includes(String(job?.status))) {
+      // The job's line comes first in the text; the answer follows it.
+      const text = (result.content ?? []).map((part) => part.text ?? "").join("\n").split("\n").slice(1).join("\n");
+      const rendered = renderResult({ ...result, content: [{ type: "text", text }] }, { json: false, verbose: false, quiet: false, hideThinking: true }, false);
+      for (const line of rendered.stderr) io.err(line);
+      if (rendered.stdout !== "") io.out(rendered.stdout);
+      return job?.status === "completed" ? rendered.exitCode : 1;
+    }
+    await new Promise((resolve) => setTimeout(resolve, delay));
+  }
+  return 130;
 }
 
 function tools(io: Io): number {
@@ -270,9 +372,15 @@ export async function main(argv: string[], io: Io = stdio): Promise<number> {
       // A run_task job (summarize) shows the catalog job whose picks it runs on (coding).
       case "catalog": return await tool(["models", JSON.stringify({ view: "catalog", ...(rest[0] ? { job: (LOCAL_JOBS as Record<string, { catalogJob: string }>)[rest[0]]?.catalogJob ?? rest[0] } : {}) })], io);
       case "job": {
-        const [id, flag] = rest;
-        if (id === undefined) return await tool(["task_jobs", JSON.stringify({ action: "list" })], io);
-        return await tool(["task_jobs", JSON.stringify({ action: flag === "--cancel" ? "cancel" : "get", jobId: id })], io);
+        // A job lives on the serve that ran it: --endpoint names that serve, as on `fllama run`.
+        const at = rest.indexOf("--endpoint");
+        const endpoint = at >= 0 ? rest[at + 1] : undefined;
+        const words = at >= 0 ? rest.filter((_, index) => index !== at && index !== at + 1) : rest;
+        const [id, flag] = words;
+        const where = endpoint ? { endpoint } : {};
+        if (id === undefined) return await tool(["task_jobs", JSON.stringify({ action: "list", ...where })], io);
+        if (flag === "--wait") return await waitJob(id, io, endpoint);
+        return await tool(["task_jobs", JSON.stringify({ action: flag === "--cancel" ? "cancel" : "get", jobId: id, ...where })], io);
       }
       default:
         throw new UsageError(`unknown command "${command}"; fllama --help lists them.`);
