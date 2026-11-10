@@ -2,11 +2,10 @@
 // caller should act on (check: lines) or asked to see (--verbose: model, timings, cache, filled fields).
 import type { RenderOptions } from "./args.js";
 import { resultText, type ToolResult } from "./registry.js";
+import { record } from "./util.js";
 
-export type Rendered = { stdout: string; stderr: string[]; exitCode: number };
+type Rendered = { stdout: string; stderr: string[]; exitCode: number };
 
-const record = (value: unknown): Record<string, unknown> | undefined =>
-  value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 
 /** `[model · lifecycle] answer\ncheck: …` -> label, answer lines, check lines. */
 export function splitAnswer(text: string): { label?: string; answer: string; checks: string[] } {
@@ -21,7 +20,7 @@ export function splitAnswer(text: string): { label?: string; answer: string; che
 const seconds = (ns: unknown) => (typeof ns === "number" ? `${(ns / 1e9).toFixed(2)} s` : undefined);
 
 /** One line of the receipt's measurements, as `ollama run --verbose` would show them. */
-export function statsLine(structured: Record<string, unknown>): string | undefined {
+function statsLine(structured: Record<string, unknown>): string | undefined {
   const metrics = record(structured.metrics);
   if (!metrics) return undefined;
   const parts = [
@@ -87,7 +86,7 @@ export function renderResult(result: ToolResult, options: RenderOptions, showThi
 }
 
 /** The body of the first fenced code block (``` or ~~~), without its fences and language tag. */
-export function firstCodeBlock(text: string): string | undefined {
+function firstCodeBlock(text: string): string | undefined {
   const match = /^(`{3,}|~{3,})[^\n]*\n([\s\S]*?)^\1[ \t]*$/m.exec(text);
   return match ? match[2]!.replace(/\n$/, "") : undefined;
 }
@@ -113,9 +112,3 @@ export function refusalOf(text: string): { message: string; code?: string; unava
   return { message, ...(code ? { code } : {}), unavailable };
 }
 
-/** A refusal or failure with the HTTP status a gateway client should see. */
-export class GatewayError extends Error {
-  constructor(message: string, readonly status: number) {
-    super(message);
-  }
-}

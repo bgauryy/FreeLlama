@@ -17,17 +17,7 @@ import { withToolResults } from "./tool-results.js";
 import { useLogLevelFilter } from "./progress.js";
 import { registerDocsResources } from "./docs-resources.js";
 import { registerBuiltinPrompts } from "./builtin-prompts.js";
-import { registerDoctorTool } from "./tools/doctor.js";
-import { registerSessionTool } from "./tools/session.js";
-import { registerModelsTool } from "./tools/models.js";
-import { registerScopeTool } from "./tools/scope.js";
-import { registerRunTaskTool } from "./tools/run-task.js";
-import { registerTaskJobsTool } from "./tools/task-jobs.js";
-import { registerOllamaLifecycleTools } from "./tools/ollama-lifecycle.js";
-import { registerDelegateResearchTool } from "./tools/delegate-research.js";
-import { registerReadResponseTool } from "./tools/read-response.js";
-import { registerAudioTool } from "./tools/audio.js";
-import { registerSweepTool } from "./tools/sweep.js";
+import { TOOL_REGISTRATIONS } from "./tools/registrations.js";
 
 installProcessLifecycle();
 
@@ -58,18 +48,8 @@ const server = withToolResults(new McpServer(
 
 registerDocsResources(server);
 registerBuiltinPrompts(server);
-// Registration order is the tools/list order clients display.
-registerDoctorTool(server);
-registerSessionTool(server);
-registerModelsTool(server);
-registerScopeTool(server);
-registerRunTaskTool(server);
-registerTaskJobsTool(server);
-registerOllamaLifecycleTools(server);
-registerDelegateResearchTool(server);
-registerAudioTool(server);
-registerSweepTool(server);
-registerReadResponseTool(server);
+// Registration order (tools/registrations.ts) is the tools/list order clients display.
+for (const register of TOOL_REGISTRATIONS) register(server);
 
 const transport = withNormalizedToolSchemas(new StdioServerTransport());
 await server.connect(transport);

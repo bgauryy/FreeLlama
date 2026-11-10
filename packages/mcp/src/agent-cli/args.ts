@@ -4,13 +4,14 @@
 import { readFileSync } from "node:fs";
 import { parseArgs, type ParseArgsConfig } from "node:util";
 import { LOCAL_JOBS, RUN_TASK_JOBS, WORKFLOWS, type JobName, type WorkflowName } from "../local-prompts.js";
+import { withoutUndefined } from "./util.js";
 
 /** A caller mistake: printed as one line, exit code 2. */
 export class UsageError extends Error {}
 
 export type RenderOptions = { json: boolean; verbose: boolean; quiet: boolean; hideThinking: boolean; extract?: boolean };
 
-export type RunPlan = {
+type RunPlan = {
   /** `run_task` arguments, validated later by the tool's own schema. */
   args: Record<string, unknown>;
   render: RenderOptions;
@@ -93,7 +94,7 @@ function positiveInt(value: string | undefined, flag: string): number | undefine
 }
 
 /** `k=v` with v read as a number or boolean when it is one: Ollama options are typed. */
-export function optionPair(pair: string): [string, unknown] {
+function optionPair(pair: string): [string, unknown] {
   const at = pair.indexOf("=");
   if (at <= 0) throw new UsageError(`--option needs key=value, got "${pair}".`);
   const key = pair.slice(0, at);
@@ -121,7 +122,7 @@ const SCHEMA_TYPES: Record<string, Record<string, unknown>> = {
  * commas or newlines, each `name [str|int|float|bool|list][: description]`, all required.
  * `--schema 'name, age int, tags list: up to five'`.
  */
-export function schemaValue(value: string): Record<string, unknown> {
+function schemaValue(value: string): Record<string, unknown> {
   const text = valueOrFile(value, "--schema").trim();
   if (text.startsWith("{")) {
     const parsed = jsonValue(text, "--schema");
@@ -309,8 +310,4 @@ export function parseRunArgs(argv: string[], stdin?: string): RunPlan & { help: 
   if (values.top !== undefined && kind !== "embedding") throw new UsageError("--top ranks embedding matches; use it with an embedding job (find-code, duplicates, image-search).");
   const promptless = prompt === undefined && input === undefined && files.length === 0 && questions === undefined;
   return { args: withoutUndefined(args), render, promptless, help: false };
-}
-
-export function withoutUndefined(fields: Record<string, unknown>): Record<string, unknown> {
-  return Object.fromEntries(Object.entries(fields).filter(([, value]) => value !== undefined));
 }

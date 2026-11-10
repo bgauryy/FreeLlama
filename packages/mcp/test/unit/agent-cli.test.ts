@@ -19,7 +19,11 @@ vi.mock("../../src/model-library.js", async (importOriginal) => ({
 import { parseRunArgs, UsageError } from "../../src/agent-cli/args.js";
 import { renderResult, refusalOf, splitAnswer } from "../../src/agent-cli/output.js";
 import { callTool } from "../../src/agent-cli/registry.js";
-import { chatTaskArgs, fromOpenAiRequest, openAiCompletion, originAllowed, startGateway, virtualModel, virtualModels } from "../../src/agent-cli/gateway.js";
+import { hostAllowed, originAllowed, startGateway } from "../../src/agent-cli/gateway.js";
+import { chatTaskArgs, fromOpenAiRequest, openAiCompletion } from "../../src/agent-cli/managed.js";
+import { virtualModel, virtualModels } from "../../src/agent-cli/virtual.js";
+import { TOOL_REGISTRATIONS } from "../../src/tools/registrations.js";
+import { toolRegistry } from "../../src/agent-cli/registry.js";
 import { chatModelName, main } from "../../src/agent-cli/main.js";
 
 const render = { json: false, verbose: false, quiet: false, hideThinking: false };
@@ -224,7 +228,7 @@ describe("virtual models", () => {
     expect(() => fromOpenAiRequest({ messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: "https://x/y.png" } }] }] })).toThrow(/fetches nothing/);
     const completion = openAiCompletion({
       model: "m", content: "", toolCalls: [{ function: { name: "f", arguments: { a: 1 } } }], checks: ["c"], doneReason: "stop", metrics: { prompt_tokens: 3, output_tokens: 2 }, receipt: {},
-    }, "freellama/auto", 1);
+    }, "freellama/auto");
     expect(completion).toMatchObject({
       model: "freellama/auto", usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 },
       choices: [{ finish_reason: "tool_calls", message: { tool_calls: [{ type: "function", function: { name: "f", arguments: '{"a":1}' } }] } }],
@@ -232,10 +236,30 @@ describe("virtual models", () => {
     });
   });
 
-  it("refuses browser pages from other origins", () => {
+  it("refuses browser pages from other origins and rebound DNS names", () => {
     expect(originAllowed(undefined)).toBe(true);
     expect(originAllowed("http://localhost:3000")).toBe(true);
     expect(originAllowed("https://evil.example")).toBe(false);
+    expect(hostAllowed("127.0.0.1:11437")).toBe(true);
+    expect(hostAllowed("[::1]:11437")).toBe(true);
+    expect(hostAllowed("evil.example:11437")).toBe(false);
+  });
+
+  it("treats OpenAI developer messages as system and reasoning_effort none as thinking off", () => {
+    const request = fromOpenAiRequest({ messages: [{ role: "developer", content: "be brief" }, { role: "user", content: "x" }], reasoning_effort: "none", stop: "END" });
+    expect(request).toMatchObject({ messages: [{ role: "system", content: "be brief" }, { role: "user" }], think: false, options: { stop: ["END"] } });
+  });
+
+  it("leaves an image-only turn to the workflow's own instruction", async () => {
+    expect(await chatTaskArgs(virtualModel("freellama/describe-screen")!, { messages: [{ role: "user", content: "", images: ["AAAA"] }] }))
+      .toEqual({ workflow: "describe-screen", images: ["AAAA"] });
+  });
+
+  it("registers the same tools for MCP and the CLI, from one list", () => {
+    const names: string[] = [];
+    for (const register of TOOL_REGISTRATIONS) register({ registerTool: (name: string) => names.push(name) } as never);
+    expect([...toolRegistry().keys()]).toEqual(names);
+    expect(names).toContain("run_task");
   });
 });
 
@@ -253,9 +277,20 @@ describe("gateway over HTTP", () => {
         upstream.push({ path: request.url ?? "", body: JSON.parse(raw || "{}"), headers: request.headers });
         if (request.url === "/api/chat") {
           response.writeHead(200, { "content-type": "application/x-ndjson" });
-          response.write(`${JSON.stringify({ model: "lfm3:1.7b-q4_K_M", message: { role: "assistant", content: "Fi" }, done: false })}\n`);
-          response.write(`${JSON.stringify({ model: "lfm3:1.7b-q4_K_M", message: { role: "assistant", content: "xed." }, done: false })}\n${JSON.stringify({ model: "lfm3:1.7b-q4_K_M", message: { role: "assistant", content: "" }, done: true, done_reason: "stop", eval_count: 2 })}\n`);
-          response.end();
+          const second = JSON.stringify({ model: "lfm3:1.7b-q4_K_M", message: { role: "assistant", content: "xed." }, done: false });
+          response.write(`${JSON.stringify({ model: "lfm3:1.7b-q4_K_M", message: { role: "assistant", content: "Fi" }, done: false })}\n${second.slice(0, 20)}`);
+          // The second line arrives split across two chunks.
+          setTimeout(() => {
+            response.write(`${second.slice(20)}\n${JSON.stringify({ model: "lfm3:1.7b-q4_K_M", message: { role: "assistant", content: "" }, done: true, done_reason: "stop", eval_count: 2 })}\n`);
+            response.end();
+          }, 20);
+        } else if (request.url === "/v1/chat/completions" || request.url === "/v1/responses") {
+          // A slow SSE stream: a client may leave in the middle of it.
+          response.writeHead(200, { "content-type": "text/event-stream" });
+          response.write('data: {"choices":[{"delta":{"content":"a"}}]}\n\n');
+          const timer = setInterval(() => response.write('data: {"choices":[{"delta":{"content":"b"}}]}\n\n'), 10);
+          setTimeout(() => { clearInterval(timer); response.end("data: [DONE]\n\n"); }, 200);
+          response.on("close", () => clearInterval(timer));
         } else if (request.url === "/v1/messages") {
           response.writeHead(200, { "content-type": "text/event-stream" });
           response.end('event: message_start\ndata: {"type":"message_start"}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n');
@@ -274,8 +309,8 @@ describe("gateway over HTTP", () => {
     await new Promise<void>((resolve) => serve.close(() => resolve()));
   });
   beforeEach(() => { upstream.length = 0; });
-  const post = (path: string, body: unknown, headers: Record<string, string> = {}) =>
-    fetch(`${gateway.url}${path}`, { method: "POST", body: JSON.stringify(body), headers });
+  const post = (path: string, body: unknown, headers: Record<string, string> = {}, signal?: AbortSignal) =>
+    fetch(`${gateway.url}${path}`, { method: "POST", body: JSON.stringify(body), headers, signal });
 
   it("streams a virtual Ollama chat through Ollama itself, rewritten with the pick, system prompt, options and context", async () => {
     const reply = await post("/api/chat", { model: "freellama/fix-bug:latest", messages: [{ role: "user", content: "crash" }], options: { temperature: 0 } });
@@ -290,6 +325,24 @@ describe("gateway over HTTP", () => {
     // The caller's temperature wins; the routed window and the job's other options fill in.
     expect(sent.body.options).toMatchObject({ temperature: 0, num_ctx: 4096 });
     expect(fixture.run).not.toHaveBeenCalled();
+  });
+
+  it("survives a client that leaves mid-stream, and keeps serving", async () => {
+    const controller = new AbortController();
+    const reply = await post("/v1/chat/completions", { model: "freellama/review-code", stream: true, messages: [{ role: "user", content: "x" }] }, {}, controller.signal);
+    const reader = reply.body!.getReader();
+    await reader.read();
+    controller.abort();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const tags = await fetch(`${gateway.url}/api/tags`);
+    expect(tags.status).toBe(200);
+  });
+
+  it("maps a JSON workflow's format and thinking off onto a streamed OpenAI request", async () => {
+    await (await post("/v1/chat/completions", { model: "freellama/extract-json", stream: true, messages: [{ role: "user", content: '{"type":"object","properties":{"a":{"type":"string"}}}' }] })).text();
+    const sent = upstream[0]!.body;
+    expect(sent.response_format).toMatchObject({ type: "json_schema", json_schema: { schema: { properties: { a: {} } } } });
+    expect(sent.reasoning_effort).toBe("none");
   });
 
   it("leaves a caller's own system message and think setting alone", async () => {
@@ -345,5 +398,6 @@ describe("gateway over HTTP", () => {
     const tags = await (await fetch(`${gateway.url}/api/tags`)).json();
     expect(tags.models[0].digest).toMatch(/^[0-9a-f]{64}$/);
     expect((await fetch(`${gateway.url}/api/tags`, { headers: { origin: "https://evil.example" } })).status).toBe(403);
+    expect(await (await post("/api/generate", { model: "freellama/describe-screen", stream: false, images: ["AAAA"] })).json()).not.toMatchObject({ done_reason: "load" });
   });
 });

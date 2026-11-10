@@ -10,12 +10,13 @@ import { SERVER_VERSION } from "../native.js";
 import { parseRunArgs, RUN_USAGE, UsageError, valueOrFile } from "./args.js";
 import { callTool, resultText, toolRegistry } from "./registry.js";
 import { renderResult } from "./output.js";
-import { startGateway, VIRTUAL_PREFIX, virtualModels } from "./gateway.js";
+import { startGateway } from "./gateway.js";
+import { VIRTUAL_PREFIX, virtualModels } from "./virtual.js";
 
 /** Ollama's own commands: `fllama list` is `ollama list`, byte for byte. */
-export const OLLAMA_COMMANDS = new Set(["serve", "create", "show", "stop", "pull", "push", "signin", "signout", "list", "ls", "ps", "cp", "rm", "launch"]);
+const OLLAMA_COMMANDS = new Set(["serve", "create", "show", "stop", "pull", "push", "signin", "signout", "list", "ls", "ps", "cp", "rm", "launch"]);
 
-export const USAGE = `fllama: run local Ollama models with FreeLlama's tested picks, prompts and admission.
+const USAGE = `fllama: run local Ollama models with FreeLlama's tested picks, prompts and admission.
 
   fllama run [MODEL] [PROMPT...] [flags]   one task; ollama run flags plus -w/--workflow, -j/--job, -f/--file ...
   fllama chat [NAME] [ollama run flags]    the ollama REPL on a FreeLlama virtual model (freellama/fix-bug) or a tag
