@@ -316,7 +316,10 @@ async fn run_admitted_task(
             requested_cost,
             input.priority,
             &decision.selected_model,
-            queue_deadline,
+            super::admit::QueueDeadline {
+                at: queue_deadline,
+                wait: queue_wait,
+            },
             None,
         )
         .await?
@@ -440,7 +443,14 @@ async fn run_admitted_task(
                         .admission
                         .register_resource_waiter()
                         .map_err(|failure| {
-                            admission_error(&state, &execution, input.priority, cost, failure)
+                            admission_error(
+                                &state,
+                                &execution,
+                                input.priority,
+                                cost,
+                                failure,
+                                queue_wait,
+                            )
                         })?;
                 drop(slot);
                 let reserved = reserve_while_models_drain(
@@ -485,7 +495,10 @@ async fn run_admitted_task(
                     requested_cost,
                     input.priority,
                     &decision.selected_model,
-                    queue_deadline,
+                    super::admit::QueueDeadline {
+                        at: queue_deadline,
+                        wait: queue_wait,
+                    },
                     Some(resource_waiter),
                 )
                 .await?;

@@ -163,9 +163,10 @@ fn every_ollama_env_advisory_states_its_effective_default() {
     let entries = table.as_object().expect("advisory table is an object");
     assert_eq!(
         entries.len(),
-        11,
-        "doctor documents eleven memory-governing settings: nine OLLAMA_* plus LLAMA_ARG_FIT and \
-         LLAMA_ARG_FIT_TARGET, which govern memory but lack the prefix an auditor greps for"
+        12,
+        "doctor documents twelve memory-governing settings: nine OLLAMA_* plus LLAMA_ARG_FIT, \
+         LLAMA_ARG_FIT_TARGET and LLAMA_ARG_CACHE_RAM, which govern memory but lack the prefix an \
+         auditor greps for"
     );
     for (key, entry) in entries {
         assert!(
@@ -219,7 +220,7 @@ fn ollama_env_advisories_report_the_configured_value() {
 fn categorized_ollama_config_covers_installed_production_settings() {
     let report = ollama_config_diagnostics("0.33.2", |_| None);
     assert_eq!(report["server_version"], "0.33.2");
-    assert_eq!(report["coverage"]["known_settings"], 21);
+    assert_eq!(report["coverage"]["known_settings"], 25);
 
     let categories = report["categories"].as_object().expect("categories object");
     for category in [

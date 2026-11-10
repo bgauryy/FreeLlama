@@ -12,13 +12,21 @@ use super::ExecutionTarget;
 /// `model` is the selected model: within a priority class, admission prefers work for a model
 /// already running on this backend, within a bounded number of skips.
 /// Returns the held permit, the cost charged, and how long the caller queued.
+/// When admission gives up, and the wait that deadline came from: the caller's `max_wait_seconds`
+/// when it lowered the server's limit, so a refusal names the limit that actually applied.
+#[derive(Clone, Copy)]
+pub(crate) struct QueueDeadline {
+    pub(crate) at: tokio::time::Instant,
+    pub(crate) wait: std::time::Duration,
+}
+
 pub(crate) async fn admit(
     state: &PlatformState,
     execution: &ExecutionTarget,
     requested_cost: u32,
     priority: TaskPriority,
     model: &str,
-    deadline: tokio::time::Instant,
+    deadline: QueueDeadline,
     resource_waiter: Option<ResourceWaitGuard>,
 ) -> Result<(AdmissionPermit, u32, u128), ApiError> {
     let budget = u32::try_from(execution.admission.total())
@@ -27,11 +35,13 @@ pub(crate) async fn admit(
     let cost = requested_cost.min(budget).max(1);
     let units = requested_cost.max(1) as usize;
     let acquired = if let Some(waiter) = resource_waiter {
-        waiter.acquire(units, priority, Some(model), deadline).await
+        waiter
+            .acquire(units, priority, Some(model), deadline.at)
+            .await
     } else {
         execution
             .admission
-            .acquire(units, priority, Some(model), deadline)
+            .acquire(units, priority, Some(model), deadline.at)
             .await
     };
     match acquired {
@@ -40,7 +50,14 @@ pub(crate) async fn admit(
                 .expect("admission charge cannot exceed the u32 requested cost");
             Ok((permit, charged, queued))
         }
-        Err(failure) => Err(admission_error(state, execution, priority, cost, failure)),
+        Err(failure) => Err(admission_error(
+            state,
+            execution,
+            priority,
+            cost,
+            failure,
+            deadline.wait,
+        )),
     }
 }
 
@@ -50,9 +67,10 @@ pub(super) fn admission_error(
     priority: TaskPriority,
     cost: u32,
     failure: AdmissionFailure,
+    wait: std::time::Duration,
 ) -> ApiError {
     let budget = execution.admission.total();
-    let wait = state.tunables().max_queue_wait();
+    let server_wait = state.tunables().max_queue_wait();
     // Lanes are how many tasks of this cost run at once (a vision task can take the whole
     // budget), not budget units.
     let lanes = (budget / usize::try_from(cost.max(1)).unwrap_or(usize::MAX)).max(1);
@@ -74,6 +92,14 @@ pub(super) fn admission_error(
             } else {
                 "--max-queued-tasks"
             },
+        ),
+        // A caller that lowered its wait can raise it; only the operator can raise the pool.
+        AdmissionFailure::TimedOut if wait < server_wait => (
+            format!(
+                "no admission slot within your {}s max_wait_seconds",
+                wait.as_secs()
+            ),
+            "max_wait_seconds (the server allows up to its max_queue_wait_seconds)",
         ),
         AdmissionFailure::TimedOut => (
             format!("no admission slot within {}s", wait.as_secs()),
