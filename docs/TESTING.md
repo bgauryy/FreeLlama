@@ -25,7 +25,7 @@ yarn build
 ```
 
 The root build compiles the host Rust release binary, NAPI addon, and MCP JavaScript bundles
-(server and research adapters). The native `.node` addon remains external to the JavaScript bundle because it is selected
+(server, `fllama` agent CLI, and research adapters). The native `.node` addon remains external to the JavaScript bundle because it is selected
 by platform triple at runtime. Published packages resolve it from an OS/CPU/libc-specific optional
 dependency rather than compiling Rust during installation.
 
@@ -144,8 +144,11 @@ Usage-ledger unit contracts cover ordered writes, bounded queue overflow, failed
 validation, replay, and flush behavior. `monitoring_contract` also checks that a blocked ledger path
 does not hold task completion. Persistence remains best effort, not a zero-loss promise.
 
-MCP `serve.test.ts` checks startup permission failure, retry, child-lifecycle isolation, and the
-background start at launch. The
+MCP `serve.test.ts` checks startup permission failure, retry, child-lifecycle isolation, the
+background start at launch, and the detached serve `fllama` starts (log file, release once ready, log
+tail on an early exit). `agent-cli.test.ts` covers `fllama run` flag mapping and output, registry
+parity with the MCP server's tool list, virtual models, and the gateway's Ollama, OpenAI and Anthropic
+protocols, including a client that leaves mid-stream. The
 protocol integration contracts verify that spawn failure leaves the MCP connection usable and that
 fixture-backed library requests fail on unexpected product errors. External catalog availability
 is separate from these deterministic checks.
@@ -234,7 +237,8 @@ deterministic suite, and inspect every platform package dry run before publishin
 Publish the eight `@octocodeai/freellama-native-*` packages before `@octocodeai/freellama` and `@octocodeai/freellama-mcp-server`, all
 at the exact same version, then the crates with `cargo publish --workspace` (`--dry-run` first packages
 and compiles both crates from their published sources). A successful local pack dry run proves package contents; it does not
-prove registry publication or another hardware class.
+prove registry publication or another hardware class. Both release scripts require
+`packages/mcp/dist/agent-cli.js` (the `fllama` bin) in the MCP package.
 
 ## Test one layer while iterating
 

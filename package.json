@@ -41,7 +41,8 @@
     "release:verify": "node scripts/verify-release-packages.mjs",
     "release:verify:publish": "FREELLAMA_REQUIRE_ALL_PLATFORMS=1 node scripts/verify-release-packages.mjs",
     "build:licenses": "node scripts/bundle-licenses.mjs",
-    "test:release": "node --test scripts/test-release-packages.mjs scripts/test-release-registry.mjs",
+    "test:release": "node scripts/sync-readmes.mjs --check && node --test scripts/test-release-packages.mjs scripts/test-release-registry.mjs",
+    "docs:sync-readmes": "node scripts/sync-readmes.mjs",
     "release:smoke": "node scripts/smoke-packed-install.mjs",
     "release:verify:registry": "node scripts/verify-release-registry.mjs"
   },

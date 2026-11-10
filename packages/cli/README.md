@@ -49,7 +49,7 @@ the agent straight at Ollama does not fix that, because the agent cannot see:
 FreeLlama answers all three on every call, which makes offloading safe to do by default: the paid
 model keeps the judgment, the local model does the volume, and each answer comes back with a receipt
 you can check. The name means less metered inference, not only Meta's Llama models. More in
-[Features](docs/FEATURES.md#why-freellama).
+[Features](https://github.com/bgauryy/FreeLlama/blob/main/docs/FEATURES.md#why-freellama).
 
 ## Requirements
 
@@ -68,8 +68,8 @@ you can check. The name means less metered inference, not only Meta's Llama mode
 | Windows arm64 | `@octocodeai/freellama-native-win32-arm64-msvc` |
 
 Intel Macs and musl Linux (such as Alpine) have no prebuilt binary: build from source with Rust 1.89
-or newer ([Build from source](docs/BUILD_AND_NOTES.md#build-from-source)). Optional: a second,
-CPU-only Ollama process for small helper models ([CPU/GPU routing](docs/CPU_GPU_ROUTING.md)).
+or newer ([Build from source](https://github.com/bgauryy/FreeLlama/blob/main/docs/BUILD_AND_NOTES.md#build-from-source)). Optional: a second,
+CPU-only Ollama process for small helper models ([CPU/GPU routing](https://github.com/bgauryy/FreeLlama/blob/main/docs/CPU_GPU_ROUTING.md)).
 
 ## Install
 
@@ -95,7 +95,16 @@ directories that tool may read (`:`-separated on macOS and Linux, `;` on Windows
 `delegate_research` call is refused (its `adapter:"github"` runs without a workspace); the other tools
 do not need it, and `run_task` `files` uses `FREELLAMA_FILE_ROOTS` instead. Add it with
 `claude mcp add freellama -e FREELLAMA_MCP_ALLOWED_ROOTS=/absolute/path/to/your-project -- npx -y @octocodeai/freellama-mcp-server`
-or an `"env": { ... }` entry in JSON. All settings: [MCP configuration](packages/mcp/CONFIGURATION.md).
+or an `"env": { ... }` entry in JSON. All settings: [MCP configuration](https://github.com/bgauryy/FreeLlama/blob/main/packages/mcp/CONFIGURATION.md).
+
+Without `model` (and without `FREELLAMA_MCP_DEFAULT_MODEL`), `delegate_research` uses the first
+research-agent catalog pick (stronger, default, small) that is installed and fits in memory now;
+GitHub research skips the small pick, which scored 1 of 6 there. When none fits, it takes the
+installed default (then stronger) pick and lets serve's memory gate admit, wait or refuse the load;
+with no pick installed it falls back to routing. The receipt's `researchModel` says which and why.
+GitHub answers are grounded against the adapter's own `gh` results; local adapters check the workspace on disk. A sweep whose
+server process exited reports `interrupted` with the `sweep{action:"resume", sweepId}` call, which
+reuses saved chunk results; sweeps never resume on their own.
 
 ### CLI (for the terminal)
 
@@ -107,11 +116,22 @@ freellama --version
 Without installing, prefix commands with `npx @octocodeai/freellama`. Without Node.js, use
 `cargo install freellama-cli` (Rust 1.89+; the command is still `freellama`).
 
+### Agent CLI and gateway (`fllama`)
+
+```bash
+npx -p @octocodeai/freellama-mcp-server fllama --help
+```
+
+`fllama` works like `ollama run`, but runs each request through FreeLlama: the job's tested
+model, its prompts, file reading and the memory gate. `fllama gateway` serves the same workflows as
+models (`freellama/fix-bug`) to any Ollama, OpenAI or Anthropic client. See
+[`fllama`](https://github.com/bgauryy/FreeLlama/blob/main/docs/AGENT_CLI.md).
+
 ## Quick start
 
 ### From your agent
 
-Ask in plain words; the agent picks the tool ([MCP reference](packages/mcp/README.md)):
+Ask in plain words; the agent picks the tool ([MCP reference](https://github.com/bgauryy/FreeLlama/blob/main/packages/mcp/README.md)):
 
 - "List my local models and tell me which one fits coding tasks."
 - "Use FreeLlama to summarize these 40 files with a local model, then check three summaries."
@@ -142,13 +162,21 @@ freellama task --task completion --model MODEL_TAG "Reply with exactly OK."
 freellama status        # queues, memory holds, loaded models
 ```
 
+Or let FreeLlama choose the model and prompts, as `ollama run` would run one:
+
+```bash
+git diff | fllama run -w summarize-diff                       # the summarize pick that fits now
+fllama run -w fix-bug -f src/parser.ts "drops the last token"  # answer on stdout, check: lines on stderr
+fllama gateway   # then: OLLAMA_HOST=127.0.0.1:11437 ollama run freellama/explain-code
+```
+
 Replace `MODEL_TAG` with a tag from `models`. `init`, `doctor` and `catalog` work without `serve`.
-Every command has `--help`; the [CLI guide](docs/CLI.md) covers the rest. While `serve` runs, a
+Every command has `--help`; the [CLI guide](https://github.com/bgauryy/FreeLlama/blob/main/docs/CLI.md) covers the rest. While `serve` runs, a
 status page is at `http://127.0.0.1:11435/_freellama/ui`.
 
 ## Under the hood
 
-Every managed call, from the MCP server, the CLI or the HTTP API, runs through the same Rust core
+Every managed call, from the MCP server, `fllama`, the CLI or the HTTP API, runs through the same Rust core
 and the same gates: route, admit, load, run, observe. Nothing is decided from a model's name.
 
 | Owner | Does |
@@ -188,6 +216,39 @@ sequenceDiagram
 An explicit `model` always wins over routing; FreeLlama never swaps in another model. With
 `defer:true` the same path runs in the background and `task_jobs` returns the receipt.
 
+#### Where an answer goes
+
+Every result is saved whole (`response_file`; read one part with `read_response{file, section}`).
+`run_task` and `delegate_research` take two more fields that choose what comes back inline:
+
+- `output`: `auto` (default) returns the answer inline up to 8,000 characters (about 2,000 tokens),
+  and above that a short view: the label line, the first lines of the answer, every `check:`,
+  `handoff_file:`, `verification:` and `cited:` line unchanged, and the file holding the whole
+  answer. `inline` always returns the whole text; `file` always returns the short view. The
+  default exists because hosts limit tool output (Claude Code warns above 10,000 tokens and caps
+  it at 25,000 by default) and every inline character costs the calling agent tokens.
+  A shortened view also replaces the answer's text inside `structuredContent` with
+  `answer moved: <output_file or read_response location>` and adds `output: {mode, chars, file}`.
+- `outputPath`: also write the answer there as Markdown (the `saveAs` handoff format), returned as
+  `output_file`. The caller owns the path: a new file is created and an existing one replaced. It
+  must resolve inside the readable roots (the project, the temp directory, `FREELLAMA_FILE_ROOTS`),
+  outside any `.git` directory, and not be a directory. It is checked before the model runs, so it
+  is refused with `preview` or `defer`; with `tasks` one file holds the combined text. A failed
+  write keeps the whole answer inline and names the error.
+
+A shortened view without an `outputPath` writes the answer to a new
+`${FREELLAMA_HOME}/tmp/<timestamp>-<pid>-<n>.md` (default `~/.octocode/freellama`) and ends with
+`output_file: <path> (the full answer, N chars)`; a later `run_task{files:[output_file]}` can read
+it. Those files are deleted after `FREELLAMA_RESPONSE_TTL_DAYS` (default 7; `0` keeps them). If
+that write fails, the view points at the saved response
+(`read_response{file, section:"/result/content/0/text"}`); with neither, the whole answer is
+returned with a note.
+
+`task_jobs{action:"get"}` shapes a finished deferred job the same way (its own `output`, default
+`auto`). Receipts keep the routing, timing and token counts inline; telemetry and nested metrics move
+to the saved `response_file`. `models{view:"installed"}` and `resident` return a slim per-model set;
+`includeVerbose:true` returns the full records.
+
 ### The memory gate
 
 A model load has to fit before it starts, so a new load cannot push the machine into swap:
@@ -212,7 +273,7 @@ flowchart TD
 Resident models keep serving through a hold, except at critical OS memory pressure. Load estimates
 come from model metadata (including the K/V cache at the requested context), and Ollama stays the
 final authority on memory. `--low-memory advisory` admits a tight load with a warning instead of
-waiting. Details: [Architecture](docs/ARCHITECTURE.md#managed-task-execution).
+waiting. Details: [Architecture](https://github.com/bgauryy/FreeLlama/blob/main/docs/ARCHITECTURE.md#managed-task-execution).
 
 ## What to offload
 
@@ -236,32 +297,34 @@ Treat local answers as candidates and spot-check some before relying on the rest
   with a reason, and resident models keep serving.
 - Unloads only models it warmed or that you name; idle models are unloaded under memory pressure.
 - Holds CPU-bound work on a busy or hot machine and names the signal in the receipt.
-- Binds to loopback; for remote access see [Production](docs/PRODUCTION.md).
+- Binds to loopback; for remote access see [Production](https://github.com/bgauryy/FreeLlama/blob/main/docs/PRODUCTION.md).
 
 ## Documentation
 
 | Topic | Page |
 |---|---|
-| All guides | [Documentation index](docs/README.md) |
-| CLI commands and flags | [CLI](docs/CLI.md) |
-| MCP tools, schemas, agent workflow | [MCP reference](packages/mcp/README.md), [MCP configuration](packages/mcp/CONFIGURATION.md) |
-| Operating procedure for agents | [FreeLlama skill](skills/freellama/SKILL.md) |
-| Features, routing and admission in depth, why FreeLlama | [Features](docs/FEATURES.md) |
-| How it compares with Ollama, llama.cpp, llama-swap, LocalAI | [Comparison](docs/COMPARISON.md) |
-| Choosing a model | [Model selection](docs/MODEL_SELECTION.md), [local model catalog](docs/LOCAL_MODELS.md) |
-| Model forms, measured results | [Model forms and results](docs/MODEL_FORMS_AND_RESULTS.md) |
-| Recipes per job | [Cookbooks](docs/cookbooks/README.md) |
-| CPU/GPU setup and placement | [CPU/GPU routing](docs/CPU_GPU_ROUTING.md) |
-| Queues, memory, live tuning | [Monitoring](docs/MONITORING.md) |
-| Faster, lighter local models; Ollama settings | [Tuning](docs/TUNING.md) |
-| Background jobs and recovery | [Deferred jobs](docs/DEFERRED_JOBS.md) |
-| History, affinity, warming | [Scopes and warming](docs/SCOPES_AND_WARMING.md) |
-| Deployment and releases | [Production](docs/PRODUCTION.md) |
-| Build from source, operating notes | [Build and notes](docs/BUILD_AND_NOTES.md), [Testing](docs/TESTING.md) |
-| Architecture and ownership | [Architecture](docs/ARCHITECTURE.md) |
-| Embedding the Rust core | [Rust core](packages/rust-core/README.md) |
+| All guides | [Documentation index](https://github.com/bgauryy/FreeLlama/blob/main/docs/README.md) |
+| Every API on one page: MCP tools, `fllama`, gateway, CLI, control API, passthrough | [Every API](https://github.com/bgauryy/FreeLlama/blob/main/docs/API.md) |
+| CLI commands and flags | [CLI](https://github.com/bgauryy/FreeLlama/blob/main/docs/CLI.md) |
+| `ollama run`-style CLI; workflows as models for Ollama, OpenAI and Anthropic clients | [`fllama`](https://github.com/bgauryy/FreeLlama/blob/main/docs/AGENT_CLI.md) |
+| MCP tools, schemas, agent workflow | [MCP reference](https://github.com/bgauryy/FreeLlama/blob/main/packages/mcp/README.md), [MCP configuration](https://github.com/bgauryy/FreeLlama/blob/main/packages/mcp/CONFIGURATION.md) |
+| Operating procedure for agents | [FreeLlama skill](https://github.com/bgauryy/FreeLlama/blob/main/skills/freellama/SKILL.md) |
+| Features, routing and admission in depth, why FreeLlama | [Features](https://github.com/bgauryy/FreeLlama/blob/main/docs/FEATURES.md) |
+| How it compares with Ollama, llama.cpp, llama-swap, LocalAI, fabric, aichat, llm, LiteLLM | [Comparison](https://github.com/bgauryy/FreeLlama/blob/main/docs/COMPARISON.md) |
+| Choosing a model | [Model selection](https://github.com/bgauryy/FreeLlama/blob/main/docs/MODEL_SELECTION.md), [local model catalog](https://github.com/bgauryy/FreeLlama/blob/main/docs/LOCAL_MODELS.md) |
+| Model forms, measured results | [Model forms and results](https://github.com/bgauryy/FreeLlama/blob/main/docs/MODEL_FORMS_AND_RESULTS.md) |
+| Recipes per job | [Cookbooks](https://github.com/bgauryy/FreeLlama/blob/main/docs/cookbooks/README.md) |
+| CPU/GPU setup and placement | [CPU/GPU routing](https://github.com/bgauryy/FreeLlama/blob/main/docs/CPU_GPU_ROUTING.md) |
+| Queues, memory, live tuning | [Monitoring](https://github.com/bgauryy/FreeLlama/blob/main/docs/MONITORING.md) |
+| Faster, lighter local models; Ollama settings | [Tuning](https://github.com/bgauryy/FreeLlama/blob/main/docs/TUNING.md) |
+| Background jobs and recovery | [Deferred jobs](https://github.com/bgauryy/FreeLlama/blob/main/docs/DEFERRED_JOBS.md) |
+| History, affinity, warming | [Scopes and warming](https://github.com/bgauryy/FreeLlama/blob/main/docs/SCOPES_AND_WARMING.md) |
+| Deployment and releases | [Production](https://github.com/bgauryy/FreeLlama/blob/main/docs/PRODUCTION.md) |
+| Build from source, operating notes | [Build and notes](https://github.com/bgauryy/FreeLlama/blob/main/docs/BUILD_AND_NOTES.md), [Testing](https://github.com/bgauryy/FreeLlama/blob/main/docs/TESTING.md) |
+| Architecture and ownership | [Architecture](https://github.com/bgauryy/FreeLlama/blob/main/docs/ARCHITECTURE.md) |
+| Embedding the Rust core | [Rust core](https://github.com/bgauryy/FreeLlama/blob/main/packages/rust-core/README.md) |
 
 ## License
 
-Copyright (c) 2026 Guy Bary. Licensed under [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT),
+Copyright (c) 2026 Guy Bary. Licensed under [Apache-2.0](https://github.com/bgauryy/FreeLlama/blob/main/LICENSE-APACHE) or [MIT](https://github.com/bgauryy/FreeLlama/blob/main/LICENSE-MIT),
 at your option.

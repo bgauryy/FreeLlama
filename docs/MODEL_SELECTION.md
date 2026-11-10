@@ -124,7 +124,7 @@ These examples do not establish that a tag is installed or suitable on your host
 
 Dedicated OCR models answer best to the prompts their model card documents; name the image in
 `run_task {files}` rather than pasting base64 `images`. A model that repeats its answer until its
-output limit stops early with `stopOnRepetition`, on by default without `num_predict`. See [Route images](https://github.com/bgauryy/FreeLlama/blob/main/packages/mcp/README.md#route-images)
+output limit stops early with `stopOnRepetition`, on by default without `num_predict`. See [Loop control](FEATURES.md#loop-control)
 for the early stop and the `output_check` receipt.
 
 `muse-glimmer:30b-mlx` was a credible alternative and answered 29 of 30 questions correctly

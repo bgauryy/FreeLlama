@@ -116,6 +116,17 @@ freellama --version
 Without installing, prefix commands with `npx @octocodeai/freellama`. Without Node.js, use
 `cargo install freellama-cli` (Rust 1.89+; the command is still `freellama`).
 
+### Agent CLI and gateway (`fllama`)
+
+```bash
+npx -p @octocodeai/freellama-mcp-server fllama --help
+```
+
+`fllama` works like `ollama run`, but runs each request through FreeLlama: the job's tested
+model, its prompts, file reading and the memory gate. `fllama gateway` serves the same workflows as
+models (`freellama/fix-bug`) to any Ollama, OpenAI or Anthropic client. See
+[`fllama`](docs/AGENT_CLI.md).
+
 ## Quick start
 
 ### From your agent
@@ -151,13 +162,21 @@ freellama task --task completion --model MODEL_TAG "Reply with exactly OK."
 freellama status        # queues, memory holds, loaded models
 ```
 
+Or let FreeLlama choose the model and prompts, as `ollama run` would run one:
+
+```bash
+git diff | fllama run -w summarize-diff                       # the summarize pick that fits now
+fllama run -w fix-bug -f src/parser.ts "drops the last token"  # answer on stdout, check: lines on stderr
+fllama gateway   # then: OLLAMA_HOST=127.0.0.1:11437 ollama run freellama/explain-code
+```
+
 Replace `MODEL_TAG` with a tag from `models`. `init`, `doctor` and `catalog` work without `serve`.
 Every command has `--help`; the [CLI guide](docs/CLI.md) covers the rest. While `serve` runs, a
 status page is at `http://127.0.0.1:11435/_freellama/ui`.
 
 ## Under the hood
 
-Every managed call, from the MCP server, the CLI or the HTTP API, runs through the same Rust core
+Every managed call, from the MCP server, `fllama`, the CLI or the HTTP API, runs through the same Rust core
 and the same gates: route, admit, load, run, observe. Nothing is decided from a model's name.
 
 | Owner | Does |
@@ -285,11 +304,13 @@ Treat local answers as candidates and spot-check some before relying on the rest
 | Topic | Page |
 |---|---|
 | All guides | [Documentation index](docs/README.md) |
+| Every API on one page: MCP tools, `fllama`, gateway, CLI, control API, passthrough | [Every API](docs/API.md) |
 | CLI commands and flags | [CLI](docs/CLI.md) |
+| `ollama run`-style CLI; workflows as models for Ollama, OpenAI and Anthropic clients | [`fllama`](docs/AGENT_CLI.md) |
 | MCP tools, schemas, agent workflow | [MCP reference](packages/mcp/README.md), [MCP configuration](packages/mcp/CONFIGURATION.md) |
 | Operating procedure for agents | [FreeLlama skill](skills/freellama/SKILL.md) |
 | Features, routing and admission in depth, why FreeLlama | [Features](docs/FEATURES.md) |
-| How it compares with Ollama, llama.cpp, llama-swap, LocalAI | [Comparison](docs/COMPARISON.md) |
+| How it compares with Ollama, llama.cpp, llama-swap, LocalAI, fabric, aichat, llm, LiteLLM | [Comparison](docs/COMPARISON.md) |
 | Choosing a model | [Model selection](docs/MODEL_SELECTION.md), [local model catalog](docs/LOCAL_MODELS.md) |
 | Model forms, measured results | [Model forms and results](docs/MODEL_FORMS_AND_RESULTS.md) |
 | Recipes per job | [Cookbooks](docs/cookbooks/README.md) |

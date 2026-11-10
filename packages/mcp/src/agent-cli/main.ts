@@ -20,12 +20,12 @@ const USAGE = `fllama: run local Ollama models with FreeLlama's tested picks, pr
 
   fllama run [MODEL] [PROMPT...] [flags]   one task; ollama run flags plus -w/--workflow, -j/--job, -f/--file ...
   fllama chat [NAME] [ollama run flags]    the ollama REPL on a FreeLlama virtual model (freellama/fix-bug) or a tag
-  fllama gateway [--port 11437]            serve virtual models over the Ollama and OpenAI APIs
+  fllama gateway [--port 11437]            serve virtual models over the Ollama, OpenAI and Anthropic APIs
   fllama workflows                         workflows and jobs, with what each expects
   fllama catalog [JOB]                     tested picks per job: installed, fits now
   fllama job ID [--cancel]                 a deferred task's result
   fllama tool NAME [JSON|@FILE|-]          call one FreeLlama MCP tool; fllama tools lists them
-  fllama list|ps|show|pull|rm|cp|create|stop|push|serve ...   passed to ollama unchanged
+  fllama list|ps|show|pull|rm|cp|create|stop|push|serve ...   passed to ollama unchanged (serve = ollama serve)
 
 Examples:
   git diff | fllama run -w summarize-diff
@@ -146,7 +146,7 @@ async function gateway(argv: string[], io: Io): Promise<number> {
     if (flag === "--port") port = Number(argv[++index]);
     else if (flag === "--endpoint") serveEndpoint = argv[++index];
     else if (flag === "-h" || flag === "--help") {
-      io.out("usage: fllama gateway [--port 11437] [--endpoint SERVE_URL]\nServes freellama/<workflow> virtual models over the Ollama (/api) and OpenAI (/v1) APIs on loopback; every other request goes to serve.");
+      io.out("usage: fllama gateway [--port 11437] [--endpoint SERVE_URL]\nServes freellama/<workflow> virtual models on loopback over the Ollama (/api), OpenAI (/v1/chat/completions, /v1/responses) and Anthropic (/v1/messages) APIs; every other request goes to serve.");
       return 0;
     } else throw new UsageError(`unknown gateway flag "${flag}"`);
   }
@@ -156,6 +156,7 @@ async function gateway(argv: string[], io: Io): Promise<number> {
   io.err(`fllama gateway on ${started.url}: ${virtualModels().length} virtual models; other requests go to serve.
   ollama:  OLLAMA_HOST=${hostPort} ollama run freellama/fix-bug
   openai:  base URL ${started.url}/v1, model "freellama/review-code"
+  claude:  ANTHROPIC_BASE_URL=${started.url}  (Codex: wire_api = "responses", base_url ${started.url}/v1)
   list:    OLLAMA_HOST=${hostPort} ollama list`);
   await new Promise<void>((resolve) => {
     process.once("SIGINT", resolve);

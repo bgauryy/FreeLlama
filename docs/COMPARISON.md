@@ -6,7 +6,7 @@ Moved from the root README.
 
 FreeLlama is not an inference engine: Ollama loads and runs the model, FreeLlama decides whether,
 where and how each task runs. Other projects' behavior is taken from their docs and source, checked
-on 2026-11-01. Moving-branch features may differ from installed releases.
+on 2026-11-01 (the [task presets](#task-presets-shell-use-and-protocols) section on 2026-11-10). Moving-branch features may differ from installed releases.
 
 | Decision | Other local stacks | FreeLlama |
 |---|---|---|
@@ -21,6 +21,34 @@ on 2026-11-01. Moving-branch features may differ from installed releases.
 | Loading or waiting? | Ollama streams generation and reports final timing; outer admission and host-resource phases belong to the coordinator. | MCP progress notifications (when the client sends a `progressToken`): `queued`, `waiting for memory: need 9.1 GB, 6.4 GB available`, `loading MODEL (~N s)`, `running`; the answer line adds `loaded N s, evicted X`. `GET /ready` answers 503 naming what is missing (`ollama`, `cpu_backend`, `catalog`). |
 | What reaches the agent's context? | Ollama returns its native response; presentation and filtering depend on the client. | A compact result (answer, verdict, model, tokens) plus a `response_file` holding thinking, vectors, research observations and receipts, read a section or page at a time with `read_response`. |
 | Where did it run? | Ollama exposes running-model memory/placement in `/api/ps` and generation timing in responses. | A receipt with the chosen model and why, queue and resource waits, and the placement Ollama reported in `/api/ps`, so a silent CPU fallback is visible. |
+
+## Task presets, shell use and protocols
+
+`fllama` and its gateway ([reference](AGENT_CLI.md)) compete with tools that wrap a model in a
+named preset and serve it to other clients. Their behavior below is taken from their docs, checked
+on 2026-11-10.
+
+| Question | Other tools | FreeLlama |
+|---|---|---|
+| Named task presets? | fabric has patterns, and user patterns override built-ins ([fabric](https://github.com/danielmiessler/fabric)). aichat has roles: Markdown files with model and sampling front matter ([roles](https://github.com/sigoden/aichat/wiki/Role-Guide)). llm has YAML templates with system, options, schema and tools ([templates](https://llm.datasette.io/en/stable/templates.html)). Open WebUI Workspace Models wrap a base model ([models](https://docs.openwebui.com/features/workspace/models/)). LM Studio has config presets ([presets](https://lmstudio.ai/docs/app/presets)). Ollama has Modelfiles ([Modelfile](https://docs.ollama.com/modelfile)). | Workflows and jobs (`fllama workflows`): a step-by-step system prompt per task, plus the sampling values, think setting and embedding prefixes that each model family documents, with citations in [`local-prompts.ts`](https://github.com/bgauryy/FreeLlama/blob/main/packages/mcp/src/local-prompts.ts). |
+| Which model runs a preset? | Fixed in the preset: fabric `FABRIC_MODEL_PATTERN_NAME`, a role's or template's model, a Modelfile's `FROM`. LiteLLM routes by request complexity ([auto routing](https://docs.litellm.ai/docs/proxy/auto_routing)). LM Studio estimates memory only on request ([`lms load --estimate-only`](https://lmstudio.ai/docs/cli/load)). | The job's tested pick that is installed **and fits in memory now**, the strongest one first for `capable` workflows. Live, with 6.5 GB free: `review-code` moved from `bonsai-2:9b` (10.3 GB) to `lfm3`, and `--ask` ran on `strands-decider` (1.2 GB) instead of a 14.5 GB model. |
+| Presets served as models? | fabric `--serveOllama` lists patterns as Ollama models ([REST API](https://github.com/danielmiessler/fabric/blob/main/docs/rest-api.md)). Open WebUI serves custom models over its OpenAI-style API ([endpoints](https://docs.openwebui.com/reference/api-endpoints/)). A Modelfile becomes a real tag. | `freellama/<workflow>` on the Ollama, OpenAI Chat, OpenAI Responses and Anthropic Messages APIs from one listener, so the `ollama` CLI, Continue, opencode, Codex and Claude Code reach the same configuration. |
+| Which protocols? | aichat `--serve` speaks OpenAI ([CLI guide](https://github.com/sigoden/aichat/wiki/Command-Line-Guide)). llama-swap speaks OpenAI and Anthropic ([llama-swap](https://github.com/mostlygeek/llama-swap)). Ollama speaks its own API, OpenAI and Anthropic ([OpenAI](https://docs.ollama.com/api/openai-compatibility), [Anthropic](https://docs.ollama.com/api/anthropic-compatibility)). | All four. Streamed requests are rewritten and streamed by Ollama itself, so tokens and tool calls stream in every format. |
+| Built for an agent's shell? | llm: fragments, `--schema`, `-x`, a SQLite log ([usage](https://llm.datasette.io/en/stable/usage.html)). aichat: `-f` for files, directories and URLs, plus `--dry-run`. mods has been retired in favour of `crush run` ([mods](https://github.com/charmbracelet/mods)). `ollama run` waits for EOF on any stdin that is not a terminal. | stdout carries only the answer. `check:` lines name what to verify; exit codes are 0, 1, 2 and 130. `-f` takes paths or globs. `--schema` and `-x` follow llm. `--json` prints the receipt. stdin is read only from a pipe or file, so an agent harness's open socket never hangs it. |
+| Memory and admission? | Clients of these tools load whatever the preset names. | The same managed admission as MCP: wait for memory, name what holds it, refuse at the deadline. Streamed gateway requests get `serve`'s raw admission. |
+
+What FreeLlama lacks next to them:
+
+- a user directory of presets that overrides built-ins (fabric, llm, aichat);
+- presets installed from a URL or a community library (llm loaders, LM Studio Hub, Open WebUI);
+- `-f` from URLs or command output (aichat);
+- a run log that can be continued (llm);
+- retry on a larger-context model when the input is too long (LiteLLM `context_window_fallbacks`).
+
+The cost of `fllama` over a direct `ollama` call on identical work is about 0.4 s per call:
+0.07 s vs 0.45 s, with the same model, prompt and 2 output tokens, on 2026-11-10. Its defaults can
+win that back. Without flags, a direct call let `lfm3` think for 61 tokens to answer "OK" (0.92 s);
+the managed call answered in 2 tokens (0.47 s).
 
 Limits: FreeLlama does not change Ollama's decode speed, does not fail over between engines, and runs
 CPU work only on a second, CPU-only Ollama process (`serve --spawn-cpu-backend` starts and stops one for you).

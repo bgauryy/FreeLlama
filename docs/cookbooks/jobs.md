@@ -55,6 +55,6 @@ Draft one small change:
 
 **When nothing fits now,** the refusal lists each pick, the memory it needs and what is free. Tell the user; pass `model` for an installed model with the same capability, or ask them to approve pulling one exact tag at its size.
 
-**MCP prompts.** Clients that show prompts (often as slash commands) list one per job: `ocr`, `image`, `classify`, `find-code`, `duplicates`, `coding`, `summarize`, `research`, `github-research` and `sweep`. Each returns the exact call to make; `freellama` explains when to offload and how to check results.
+**MCP prompts.** Clients that show prompts (often as slash commands) list one per workflow (`read-text`, `read-table`, `read-fields`, `answer-image`, `describe-screen`, `change-code`, `fix-bug`, `implement`, `write-tests`, `review-code`, `explain-code`, `summarize-log`, `summarize-text`, `summarize-diff`, `extract-json`), plus `classify`, `find-code`, `duplicates`, `research`, `github-research` and `sweep`. Each returns the exact call to make; `freellama` explains when to offload and how to check results. From a shell, `fllama run -w <workflow>` or `fllama run -j <job>` makes the same call, and `fllama workflows` lists them.
 
 **Check it:** as the job's own recipe says; read 3 to 5 results before relying on the rest.

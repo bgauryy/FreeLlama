@@ -4,9 +4,10 @@
 FreeLlama. It picks the tested model for the job that is installed and fits now, applies the job's
 documented prompts and options, waits for managed admission and memory checks, and returns `check:`
 lines that tell you what to verify. The same configuration is also served as **virtual models**
-(`freellama/fix-bug`) over the Ollama and OpenAI APIs. That way the `ollama` CLI, Open WebUI,
-Continue, LangChain and OpenAI SDKs can use it without MCP. The design and its trade-offs are in
-[RFC 0001](rfcs/0001-fllama-agent-cli.md).
+(`freellama/fix-bug`) over the Ollama, OpenAI Chat, OpenAI Responses and Anthropic Messages APIs.
+That lets the `ollama` CLI, Continue, opencode, Codex, Claude Code, Open WebUI, LangChain and the
+SDKs use it without MCP. [Every API](API.md) shows all of FreeLlama's surfaces on one page. The
+design and its trade-offs are in [RFC 0001](rfcs/0001-fllama-agent-cli.md).
 
 `fllama` ships as the second binary of `@octocodeai/freellama-mcp-server`:
 
@@ -27,10 +28,13 @@ node packages/mcp/dist/agent-cli.js --help
 | `fllama catalog [JOB]` | Tested picks per job: installed, fits now |
 | `fllama job ID [--cancel]` | A deferred task's result; with no ID, the job list |
 | `fllama tool NAME [JSON\|@FILE\|-]` | Any FreeLlama MCP tool, with its own input schema; `fllama tools` lists them |
-| `fllama list\|ps\|show\|pull\|rm\|cp\|create\|stop\|push\|serve …` | Passed to `ollama` unchanged |
+| `fllama list\|ls\|ps\|show\|pull\|push\|rm\|cp\|create\|stop\|serve\|signin\|signout\|launch …` | Passed to `ollama` unchanged |
 
-A pull, `rm` or `create` passed to `ollama` still needs the user's approval for the exact tag
-([agent invariants](../AGENTS.md#agent-facing-invariants)).
+Passthrough means `ollama` semantics: `fllama serve` starts **Ollama** (`ollama serve`), not
+`freellama serve`. A pull, `rm` or `create` still needs the user's approval for the exact tag, and
+so does `fllama tool ollama_pull` or `ollama_delete`
+([agent invariants](../AGENTS.md#agent-facing-invariants)). `fllama tool delegate_research` reads
+only workspaces under `FREELLAMA_MCP_ALLOWED_ROOTS`, the same as over MCP.
 
 ## `fllama run`
 
@@ -41,11 +45,15 @@ fllama run -j find-code -f 'src/**/*.ts' --top 3 "where are CLI flags parsed"
 fllama run --ask "Is a refund requested?" < ticket.txt
 fllama run --ask "Which team?" --choice billing="Payments" --choice technical="Software" < ticket.txt
 fllama run gemma4 "Why is the sky blue?" --think=low --verbose
+echo "Invoice 2291, Acme, 1,240.50 EUR" | fllama run -w extract-json --schema "invoice_id, vendor, total float, currency"
+fllama run -w fix-bug -f src/a.ts "off by one in paging" -x > patch.txt
 ```
 
-**Model or prompt.** The first word is a model only when no `--model`, `--job`, `--workflow`,
-`--task` or `--ask` is given and it has no whitespace, because an Ollama tag cannot contain any. So
-`fllama run "Why is the sky blue?"` routes by capability, and `fllama run gemma4 "Why?"` pins.
+**Model or prompt.** The first word is a model only when no `--model`, `--job`, `--workflow` or
+`--task` is given and it has no whitespace, because an Ollama tag cannot contain any. So
+`fllama run "Why is the sky blue?"` routes by capability, `fllama run gemma4 "Why?"` pins a model,
+and `fllama run nimble --ask …` asks `nimble`, as `ollama run` does. With no model, `--ask` runs on
+the `classify` job's tested pick.
 
 **stdin.** Piped (`cmd | fllama run`) or redirected (`< file`) input is read: as the `state` for a
 decision, one item per line for an embedding job, otherwise after the prompt. Any other stdin is
@@ -62,6 +70,11 @@ or globs, repeatable), `--image`, `-s/--system TEXT|@FILE`, `-o/--option k=v`, `
 `--top N`, `--tools JSON|@FILE`, `--objective`, `--prefer cpu|gpu`, `--min-confidence`, `--session`,
 `--priority`, `--timeout`, `--max-wait`, `--defer`, `--preview`, `--save-as NAME`, `--json`,
 `-q/--quiet`, `--endpoint URL`. `fllama run --help` lists them.
+
+**Structured output and code.** `--schema` takes a JSON schema (`{…}` or `@file.json`) or llm's
+short form, where every field is required: `--schema 'name, age int, tags list: up to five'`
+(types `str`, `int`, `float`, `bool`, `list`). `-x/--extract` prints only the first fenced code
+block, or the whole answer with a note when there is none.
 
 **Output.** stdout carries only the answer. stderr carries `check:` lines (act on them before
 relying on the answer), a `handoff_file:` line for `--save-as`, and refusals. `--verbose` adds the

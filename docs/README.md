@@ -11,13 +11,14 @@ Start with the [repository README](https://github.com/bgauryy/FreeLlama/blob/mai
 | Connect an agent and choose a tool | [MCP server](https://github.com/bgauryy/FreeLlama/blob/main/packages/mcp/README.md) |
 | Follow the agent's operating workflow | [FreeLlama skill](https://github.com/bgauryy/FreeLlama/blob/main/skills/freellama/SKILL.md) |
 | Look up commands and task controls | [CLI reference](CLI.md) |
-| Run local models from a shell like `ollama run`, or serve FreeLlama workflows to Ollama and OpenAI clients | [`fllama` agent CLI and gateway](AGENT_CLI.md) |
+| See every API on one page: MCP tools, `fllama`, the gateway, the CLI, the control API and passthrough | [Every API](API.md) |
+| Run local models from a shell like `ollama run`, or serve FreeLlama workflows to Ollama, OpenAI and Anthropic clients | [`fllama` agent CLI and gateway](AGENT_CLI.md) |
 | Choose a model for a job | `models {view:"catalog"}`, `freellama catalog`, or the [local model catalog](LOCAL_MODELS.md) |
 | Follow a recipe for one job | [Cookbooks](cookbooks/README.md) |
 | Teach an agent the Octocode CLI in under 30 lines | [Local tools](octocode/LOCAL.md), [GitHub tools](octocode/GITHUB.md) |
 | Understand task and resource ownership | [Architecture](ARCHITECTURE.md) |
 | See every feature, routing and admission in depth, and why FreeLlama exists | [Features](FEATURES.md) |
-| Compare FreeLlama with Ollama, llama.cpp, llama-swap and LocalAI | [Comparison](COMPARISON.md) |
+| Compare FreeLlama with Ollama, llama.cpp, llama-swap, LocalAI, fabric, aichat, llm and LiteLLM | [Comparison](COMPARISON.md) |
 | See supported model forms and dated measured results | [Model forms and results](MODEL_FORMS_AND_RESULTS.md) |
 | Reduce reloads, prompt cost and memory; tune Ollama settings | [Tuning](TUNING.md) |
 | Build from source; read operating notes (response store, port 11435, certificates) | [Build and notes](BUILD_AND_NOTES.md) |
@@ -27,7 +28,7 @@ Start with the [repository README](https://github.com/bgauryy/FreeLlama/blob/mai
 | Inspect queues, memory, usage, and live settings | [Monitoring](MONITORING.md) |
 | Retain history, affinity, or residency | [Scopes and warming](SCOPES_AND_WARMING.md) |
 | Understand raw Ollama compatibility | [Ollama sidecar](ARCHITECTURE.md#ollama-sidecar) |
-| Evaluate context offload and its cost | [Token economics](https://github.com/bgauryy/FreeLlama/blob/main/packages/mcp/README.md#token-economics) |
+| Evaluate context offload and its cost | [Token economics](FEATURES.md#small-agent-context) |
 | Deploy the management layer | [Production runbook](PRODUCTION.md) |
 | Run development and release checks | [Testing](TESTING.md), [release packages](TESTING.md#verify-release-packages) |
 | Embed the routing core | [Rust core](https://github.com/bgauryy/FreeLlama/blob/main/packages/rust-core/README.md) |

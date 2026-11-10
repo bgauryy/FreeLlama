@@ -13,11 +13,14 @@ yarn install
 yarn build
 ```
 
-`yarn build` writes the MCP server, `packages/mcp/dist/index.js` (shebang, executable). During
+`yarn build` writes the MCP server, `packages/mcp/dist/index.js` (shebang, executable), and the
+`fllama` agent CLI, `dist/agent-cli.js` (the package's `fllama` bin). During
 checkout development it loads `native/freellama.<triple>.node`. Published installs resolve the
 matching `@octocodeai/freellama-native-<target>` optional package instead, so the base MCP package remains
-portable. The research adapters compile to `dist/research/{bash-agent,octocode-agent}.js`, and the
-repository `docs/` guides are copied into `docs/`.
+portable. The research adapters compile to `dist/research/{bash,octocode,github,coder}-agent.js`, and the
+repository `docs/` guides are copied into `docs/`. MCP tools are registered from
+`src/tools/registrations.ts`, which both `src/index.ts` and the `fllama` registry
+(`src/agent-cli/registry.ts`) use, so the two surfaces expose the same tools.
 
 Piecewise, if you are iterating on one layer:
 
@@ -25,7 +28,7 @@ Piecewise, if you are iterating on one layer:
 # 1. Native addon → packages/mcp/native/freellama.<triple>.node
 yarn build:native
 
-# 2. This server → dist/index.js and dist/research/*.js via esbuild, plus docs/
+# 2. This server → dist/index.js, dist/agent-cli.js and dist/research/*.js via esbuild, plus docs/
 yarn workspace @octocodeai/freellama-mcp-server build
 ```
 
@@ -102,8 +105,10 @@ Treat `npm publish` as a public release action. Follow the
 - **No routing reimplementation.** `run_task`, `run_task {preview:true}`, and the installed-model list are HTTP
   calls into a running `freellama serve`, matching the CLI requests in `packages/cli/src/requests.rs`. `doctor` talks to Ollama
   and the host's portable machine-discovery layer directly. `ollama_manage` / `ollama_delete` hit Ollama's HTTP API. `delegate_research`
-  is a subprocess. Routing decisions still live in exactly one place — the Rust core; see
-  [what the MCP layer computes](README.md#what-the-mcp-layer-computes).
+  is a subprocess. Routing decisions still live in exactly one place — the Rust core; the MCP layer validates
+  request shapes and derives display fields such as answer text, resident placement labels, library
+  `fitsInMemory` and the research verdict. See the
+  [responsibility boundary](https://github.com/bgauryy/FreeLlama/blob/main/docs/ARCHITECTURE.md#responsibility-boundary).
 - **One connection pool.** `packages/rust-core/src/serve_client.rs` holds a single `reqwest::Client` in a
   `OnceLock` and clones the handle per request; `napi.rs` and the CLI share it.
 - **`unsafe_code` stays isolated.** The crate is `deny(unsafe_code)` except `napi.rs`, which

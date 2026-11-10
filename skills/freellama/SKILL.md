@@ -5,21 +5,28 @@ description: "Use when delegating token-heavy work to local Ollama models throug
 
 # FreeLlama
 
-Operate FreeLlama as governed local-model delegation, not as a frontier-model replacement. The eleven MCP tools and their request shapes are listed in the [MCP reference](https://github.com/bgauryy/FreeLlama/blob/main/packages/mcp/README.md#tools).
+Operate FreeLlama as governed local-model delegation, not as a frontier-model replacement. The thirteen MCP tools are listed in [Every FreeLlama API](https://github.com/bgauryy/FreeLlama/blob/main/docs/API.md#mcp-tools); each tool's input schema is its request shape.
 
 Flow: `PREREQUISITE → DIAGNOSE → DECIDE → EXECUTE → VERIFY`
 
 ## Connect through MCP or the CLI
 
-Prefer the MCP server when the host has it; the same operations run from a shell through the CLI.
+Prefer the MCP server when the host has it; the same operations run from a shell through `fllama` or the CLI.
 
 - **MCP:** `claude mcp add freellama -- npx -y @octocodeai/freellama-mcp-server` (other hosts: the same
   `npx` command in their JSON config). It starts `freellama serve` on `127.0.0.1:11435` at launch.
 - **CLI:** `npx -y @octocodeai/freellama <command>`, JSON on stdout. `doctor`, `init`, `catalog`, `auth-token`,
   `serve`, `proxy`, `bench-all` and `policy` need no running serve; the managed commands (models, route, task,
   jobs, warm, unload, status, usage, session, scope, ready, config, machine) need one: the MCP server's, or `npx -y @octocodeai/freellama serve` kept running in
-  the background. `--endpoint` or `FREELLAMA_SERVE_ENDPOINT` selects another one. The CLI has no
-  decoding options (`num_predict`, `temperature`); use MCP or the HTTP API when you need them.
+  the background. `--endpoint` or `FREELLAMA_SERVE_ENDPOINT` selects another one. `freellama task` has no
+  decoding options (`num_predict`, `temperature`); use `fllama run -o k=v` (with `--think`,
+  `--format`/`--schema`), MCP or the HTTP API when you need them.
+- **`fllama`:** `npx -y -p @octocodeai/freellama-mcp-server fllama <command>` calls the MCP tool handlers
+  in-process, so shell agents get MCP behavior without an MCP host: `fllama run -w WORKFLOW|-j JOB [-f FILE] "PROMPT"`
+  (answer on stdout, `check:` lines on stderr) and `fllama tool NAME JSON` for any of the thirteen tools.
+  `fllama gateway` (`127.0.0.1:11437`) serves `freellama/<workflow|job|auto>` virtual models to Ollama,
+  OpenAI and Anthropic clients. Approvals still apply to `fllama tool ollama_pull|ollama_delete` and
+  `fllama pull|rm|create`. See [agent CLI](https://github.com/bgauryy/FreeLlama/blob/main/docs/AGENT_CLI.md).
 
 | MCP tool call | CLI command |
 |---|---|
@@ -30,14 +37,14 @@ Prefer the MCP server when the host has it; the same operations run from a shell
 | `run_task{task:"embedding",input}` | `task --task embedding --input-file FILE` (one item per line) |
 | `run_task{task:"decision",state,questions}` | `task --task decision --questions JSON\|@FILE "STATE"` (or `--input-file STATE_FILE`) |
 | `run_task{task:"embedding",input,nearest:{query}}` | `task --task embedding --input-file FILE --nearest QUERY [--top N]` (one item per line) |
-| `run_task{files}`, `audio{action,model,file or text}` | MCP only (the CLI reads `--input-file` and `--image`) |
+| `run_task{files}`, `audio{action,model,file or text}` | `fllama run -f FILE`, `fllama tool audio JSON` (`freellama task` reads `--input-file` and `--image`) |
 | `ollama_manage{action:"warm",model,contextTokens}` | `warm --model TAG --context-tokens N` |
 | `run_task{defer:true}`, `task_jobs` | `task --defer ...`, `jobs`, `jobs --id ID [--cancel or --remove]` |
 | `ollama_manage{action:"unload",model}` | `unload --model TAG` (waits for the model's running tasks; never loads it first) |
 | `doctor` (its `platform_health.readiness`) | `ready` (exit 0 only when serve can run work) |
 | `read_response{file,section?,offset?,limit?}` | read the `response_file` JSON directly |
 | `session{action:"create"}`, `scope{...}` | `session`, `scope create`, `scope get`, `scope fork`, `scope delete` |
-| `models{view:"library"}`, `models{view:"detail"}`, `ollama_pull{model,approvedSizeBytes}`, `ollama_delete`, `delegate_research`, `sweep{...}` | MCP only |
+| `models{view:"library"}`, `models{view:"detail"}`, `ollama_pull{model,approvedSizeBytes}`, `ollama_delete`, `delegate_research`, `sweep{...}` | `fllama tool NAME JSON` (same approvals and allowed roots) |
 
 ## Know who owns execution
 

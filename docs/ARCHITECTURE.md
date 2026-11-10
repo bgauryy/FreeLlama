@@ -72,6 +72,7 @@ flowchart TB
     subgraph clients["Clients"]
         CLI["freellama CLI"]
         MCP["MCP client"]
+        FLL["fllama CLI / gateway"]
         RUST["Embedded Rust application"]
         RAW["Ollama-compatible client"]
     end
@@ -89,6 +90,8 @@ flowchart TB
 
     CLI --> CORE
     MCP --> CORE
+    FLL -->|"in-process MCP handlers"| API
+    FLL -->|"streamed rewrites"| PX
     RUST --> CORE
     CORE --> API
     RAW --> PX
@@ -100,10 +103,14 @@ flowchart TB
     ADAPTER --> GPU
 ```
 
-The CLI and MCP server do not reimplement routing. CLI commands other than `serve`, `doctor`,
-`init`, and benchmarking are HTTP clients of a running `freellama serve`. The MCP server reaches the
-same control API through the feature-gated NAPI boundary, and unless `FREELLAMA_MCP_AUTOSTART_SERVE=0`
+The CLI and MCP server do not reimplement routing. `freellama` commands other than `serve`, `proxy`,
+`doctor`, `init`, `catalog` (it falls back to the shipped catalog), `auth-token`, `bench-all`, and
+`policy from-eval` are HTTP clients of a running `freellama serve`. The MCP server reaches the same control API through the feature-gated NAPI boundary, and unless `FREELLAMA_MCP_AUTOSTART_SERVE=0`
 it starts the bundled `serve` in the background at launch when nothing answers on the default endpoint.
+`fllama` calls the same MCP tool handlers in-process. Its gateway runs a non-streamed Ollama or OpenAI
+chat on a `freellama/<workflow|job|auto>` virtual model as managed `run_task`, rewrites streamed and
+Anthropic or OpenAI Responses requests for serve's Ollama passthrough, and proxies everything else to
+serve ([agent CLI](AGENT_CLI.md)).
 
 ## Request classification
 
@@ -128,6 +135,7 @@ The control API exposes these endpoints:
 | Method and path | Purpose | Inference |
 |---|---|---|
 | `GET /_freellama/v1/health` | Health, admission capacity, and configured backends | No |
+| `GET /_freellama/v1/ready` | 200 once the primary Ollama (and CPU backend, when configured) answers and its catalog reads; otherwise 503 naming what is missing | No |
 | `GET /_freellama/v1/machine` | Machine profile | No |
 | `GET /_freellama/v1/models` | Normalized installed catalog, evidence, residency, and execution backend | No |
 | `POST /_freellama/v1/routes` | Deterministic route decision | No |
@@ -139,6 +147,7 @@ The control API exposes these endpoints:
 | `POST /_freellama/v1/scopes/:id/fork` | Fork history at an expected revision | No |
 | `DELETE /_freellama/v1/scopes/:id` | Delete retained history | No |
 | `POST /_freellama/v1/warm` | Admitted load of an exact installed runner profile | Load only |
+| `POST /_freellama/v1/unload` | Unload a resident model once its running tasks finish; a model that is not loaded reports `not_resident` | No |
 | `POST /_freellama/v1/tasks` | Managed chat, vision, tools, or embedding task (body shape under [Request shapes](#request-shapes)) | Yes |
 | `POST /_freellama/v1/task-batches` | Caller-declared independent tasks with ordered per-item receipts | Yes |
 | `GET /_freellama/v1/jobs` | Deferred job metadata without prompts or results | No |
@@ -146,7 +155,8 @@ The control API exposes these endpoints:
 | `POST /_freellama/v1/jobs/:id/cancel` | Cancel one deferred task and release its local permits | No new inference |
 | `DELETE /_freellama/v1/jobs/:id` | Cancel active work, release local permits, and remove its retained record | No new inference |
 
-Status, usage, metrics, and runtime-config endpoints are listed in [monitoring](MONITORING.md).
+Status, usage, metrics, and runtime-config (`config`, `config/reload`) endpoints are listed in
+[monitoring](MONITORING.md); [API](API.md) lists every surface.
 
 ### Request shapes
 
@@ -569,8 +579,9 @@ Raw proxy traffic always uses the primary upstream. For setup and runtime verifi
 The MCP server keeps general model work (`run_task`), file-backed research (`delegate_research`, a
 confined adapter subprocess), and destructive lifecycle operations (`ollama_manage`,
 `ollama_delete`) in separate tools, so `run_task` never acquires file access and lifecycle
-operations are not hidden inside a generic action. The canonical tool table, schemas, and security
-annotations are in the [MCP server reference](https://github.com/bgauryy/FreeLlama/blob/main/packages/mcp/README.md#tools).
+operations are not hidden inside a generic action. Tool schemas and security annotations
+are registered in `packages/mcp/src/tools/registrations.ts`; the tool list is in
+[API](API.md#mcp-tools). `fllama tool NAME JSON` calls the same handlers from a shell.
 
 ## Grounded research flow
 
@@ -643,7 +654,8 @@ flowchart LR
 
 Raw source, images, and embedding vectors do not need to enter the frontier model's context.
 Embedding vectors are withheld by default because they are large and not human-readable. For the
-measured accounting, see [Token economics](https://github.com/bgauryy/FreeLlama/blob/main/packages/mcp/README.md#token-economics).
+compact receipts, saved response files, and the avoided-cost estimate, see
+[Small agent context](FEATURES.md#small-agent-context).
 
 ## State and failure behavior
 

@@ -16,6 +16,8 @@ token and keeps it only for the browser tab.
 
 | Endpoint | CLI | MCP | What it returns |
 |---|---|---|---|
+| `GET /health` | | `doctor` (`platform_health`) | Liveness, admission capacity, and configured backends; answers as soon as serve listens |
+| `GET /ready` | `freellama ready` | `doctor` (`readiness`) | 200 once the primary Ollama (and CPU backend, when configured) answers and its catalog reads; otherwise 503 with `waiting_for` |
 | `GET /status` | `freellama status` | `doctor {view:"status"}` | Live view of every backend, the raw proxy, loaded models, host, Ollama settings, and today's usage |
 | `GET /usage?days=N` | `freellama usage --days N` | `doctor {view:"usage", days:N}` | Totals per day and per model (default 7 days) |
 | `GET /metrics` | | | Prometheus text exposition |
