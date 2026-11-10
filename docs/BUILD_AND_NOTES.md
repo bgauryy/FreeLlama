@@ -1,6 +1,5 @@
 # Build from source and operating notes
 
-Moved from the root README.
 
 ## Good to know
 

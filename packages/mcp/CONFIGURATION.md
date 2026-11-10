@@ -113,3 +113,47 @@ slots or relax memory guards. Existing queued work keeps its captured cost. See
 file, so its evidence table is empty unless you set `FREELLAMA_MCP_MODEL_EVIDENCE`. An unmeasured
 model yields a `verify` verdict, and an unreadable evidence file is reported on stderr and treated
 as empty. Tool descriptions state the rules.
+
+## Research model and sweeps
+
+Without `model` (and without `FREELLAMA_MCP_DEFAULT_MODEL`), `delegate_research` uses the first
+research-agent catalog pick (stronger, default, small) that is installed and fits in memory now;
+GitHub research skips the small pick, which scored 1 of 6 there. When none fits, it takes the
+installed default (then stronger) pick and lets serve's memory gate admit, wait or refuse the load;
+with no pick installed it falls back to routing. The receipt's `researchModel` says which and why.
+GitHub answers are grounded against the adapter's own `gh` results; local adapters check the workspace on disk. A sweep whose
+server process exited reports `interrupted` with the `sweep{action:"resume", sweepId}` call, which
+reuses saved chunk results; sweeps never resume on their own.
+
+## Where an answer goes
+
+Every result is saved whole (`response_file`; read one part with `read_response{file, section}`).
+`run_task` and `delegate_research` take two more fields that choose what comes back inline:
+
+- `output`: `auto` (default) returns the answer inline up to 8,000 characters (about 2,000 tokens),
+  and above that a short view: the label line, the first lines of the answer, every `check:`,
+  `handoff_file:`, `verification:` and `cited:` line unchanged, and the file holding the whole
+  answer. `inline` always returns the whole text; `file` always returns the short view. The
+  default exists because hosts limit tool output (Claude Code warns above 10,000 tokens and caps
+  it at 25,000 by default) and every inline character costs the calling agent tokens.
+  A shortened view also replaces the answer's text inside `structuredContent` with
+  `answer moved: <output_file or read_response location>` and adds `output: {mode, chars, file}`.
+- `outputPath`: also write the answer there as Markdown (the `saveAs` handoff format), returned as
+  `output_file`. The caller owns the path: a new file is created and an existing one replaced. It
+  must resolve inside the readable roots (the project, the temp directory, `FREELLAMA_FILE_ROOTS`),
+  outside any `.git` directory, and not be a directory. It is checked before the model runs, so it
+  is refused with `preview` or `defer`; with `tasks` one file holds the combined text. A failed
+  write keeps the whole answer inline and names the error.
+
+A shortened view without an `outputPath` writes the answer to a new
+`${FREELLAMA_HOME}/tmp/<timestamp>-<pid>-<n>.md` (default `~/.octocode/freellama`) and ends with
+`output_file: <path> (the full answer, N chars)`; a later `run_task{files:[output_file]}` can read
+it. Those files are deleted after `FREELLAMA_RESPONSE_TTL_DAYS` (default 7; `0` keeps them). If
+that write fails, the view points at the saved response
+(`read_response{file, section:"/result/content/0/text"}`); with neither, the whole answer is
+returned with a note.
+
+`task_jobs{action:"get"}` shapes a finished deferred job the same way (its own `output`, default
+`auto`). Receipts keep the routing, timing and token counts inline; telemetry and nested metrics move
+to the saved `response_file`. `models{view:"installed"}` and `resident` return a slim per-model set;
+`includeVerbose:true` returns the full records.

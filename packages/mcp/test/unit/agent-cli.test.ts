@@ -78,9 +78,9 @@ describe("fllama run flags", () => {
     expect(args).toMatchObject({
       model: "nimble", task: "decision", state: "ticket text",
       questions: {
-        q1: { type: "noul", instructions: "Refund?" },
-        q2: { type: "choice", instructions: "Team?", criteria: { billing: "Payments", other: null } },
-        q3: { type: "score", instructions: "Urgency?", criteria: ["Routine", "Now"] },
+        refund: { type: "noul", instructions: "Refund?" },
+        team: { type: "choice", instructions: "Team?", criteria: { billing: "Payments", other: null } },
+        urgency: { type: "score", instructions: "Urgency?", criteria: ["Routine", "Now"] },
       },
     });
     expect(() => parseRunArgs(["--choice", "a=b"])).toThrow(/must follow the --ask/);
@@ -88,7 +88,9 @@ describe("fllama run flags", () => {
 
   it("runs a question with no model on the classify job's tested pick, not on routing's first rank", () => {
     const { args } = parseRunArgs(["--ask", "Refund?"], "charged twice");
-    expect(args).toEqual({ job: "classify", state: "charged twice", questions: { q1: { type: "noul", instructions: "Refund?" } } });
+    expect(args).toEqual({ job: "classify", state: "charged twice", questions: { refund: { type: "noul", instructions: "Refund?" } } });
+    // Names come from the question's words and stay unique.
+    expect(Object.keys(parseRunArgs(["--ask", "Is a refund requested?", "--ask", "Is a refund requested?"], "x").args.questions as object)).toEqual(["refund-requested", "refund-requested-2"]);
     expect(parseRunArgs(["--ask", "Refund?", "-t", "decision"], "x").args.job).toBeUndefined();
   });
 
@@ -161,6 +163,13 @@ describe("fllama output", () => {
     expect(plain).toMatchObject({ stdout: "no code", stderr: ["fllama: --extract found no code block; printing the whole answer"] });
   });
 
+  it("fails an empty, thinking-only answer with the CLI flag that fixes it", () => {
+    const text = "[m] (empty answer: the model spent its output (200 tokens) thinking; pass think:false or raise options.num_predict)";
+    expect(renderResult({ content: [{ type: "text", text }], structuredContent: {} }, render)).toEqual({
+      stdout: "", stderr: ["fllama: empty answer: the model spent its output thinking; rerun with --think=false or raise -o num_predict=N"], exitCode: 1,
+    });
+  });
+
   it("prints a deferred job's id on stdout", () => {
     const rendered = renderResult({ structuredContent: { deferred: true, job: { id: "abc", status: "queued" } } }, render);
     expect(rendered).toEqual({ stdout: "abc", stderr: ["deferred; poll with: fllama job abc"], exitCode: 0 });
@@ -205,6 +214,11 @@ describe("virtual models", () => {
     expect(virtualModel("freellama/describe-screen")?.vision).toBe(true);
     expect(chatModelName("review-code")).toBe("freellama/review-code");
     expect(chatModelName("gemma4:2b")).toBe("gemma4:2b");
+  });
+
+  it("runs freellama/auto on the chat pick that fits now, not on routing's first rank", async () => {
+    expect(await chatTaskArgs(virtualModel("freellama/auto")!, { messages: [{ role: "user", content: "hi" }] }))
+      .toEqual({ task: "completion", objective: "balanced", model: "lfm3:1.7b-q4_K_M", prompt: "hi" });
   });
 
   it("sends one user turn as a workflow prompt, so job mode applies everything", async () => {

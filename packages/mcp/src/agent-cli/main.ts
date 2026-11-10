@@ -11,7 +11,8 @@ import { parseRunArgs, RUN_USAGE, UsageError, valueOrFile } from "./args.js";
 import { callTool, resultText, toolRegistry } from "./registry.js";
 import { renderResult } from "./output.js";
 import { startGateway } from "./gateway.js";
-import { VIRTUAL_PREFIX, virtualModels } from "./virtual.js";
+import { CHAT_JOB, VIRTUAL_PREFIX, virtualModels } from "./virtual.js";
+import { pickLiveJobModel } from "../job-mode.js";
 
 /** Ollama's own commands: `fllama list` is `ollama list`, byte for byte. */
 const OLLAMA_COMMANDS = new Set(["serve", "create", "show", "stop", "pull", "push", "signin", "signout", "list", "ls", "ps", "cp", "rm", "launch"]);
@@ -45,18 +46,38 @@ const stdio: Io = {
 };
 
 /**
- * Piped (`a | fllama run`) or redirected (`< file`) input. Only a FIFO or a regular file is read:
- * agent harnesses often hand a command an open socket that never reaches EOF, where `ollama run`
- * waits forever.
+ * Piped (`a | fllama run`), redirected (`< file`) or programmatic input. A FIFO or a file is read
+ * to its end. A socket (how Node, and many agent harnesses, wire a child's stdin) is read only if
+ * data or end-of-input arrives within STDIN_PROBE_MS: a program that passes input sends it at
+ * once, while a harness's open socket that never ends is treated as no input instead of hanging
+ * the call the way `ollama run` does.
  */
-function readStdin(): string | undefined {
+const STDIN_PROBE_MS = 250;
+async function readStdin(): Promise<string | undefined> {
+  let stat;
   try {
-    const stat = fstatSync(0);
-    if (!stat.isFIFO() && !stat.isFile()) return undefined;
-    return readFileSync(0, "utf8");
+    stat = fstatSync(0);
   } catch {
     return undefined;
   }
+  if (stat.isFIFO() || stat.isFile()) return readFileSync(0, "utf8");
+  if (!stat.isSocket()) return undefined;
+  return new Promise((resolve) => {
+    const chunks: Buffer[] = [];
+    const done = (text: string | undefined) => {
+      clearTimeout(timer);
+      process.stdin.removeAllListeners("data").removeAllListeners("end").removeAllListeners("error");
+      resolve(text);
+    };
+    const timer = setTimeout(() => {
+      if (chunks.length > 0) return;
+      process.stdin.destroy();
+      done(undefined);
+    }, STDIN_PROBE_MS);
+    process.stdin.on("data", (chunk: Buffer) => chunks.push(chunk));
+    process.stdin.on("end", () => done(chunks.length > 0 ? Buffer.concat(chunks).toString("utf8") : undefined));
+    process.stdin.on("error", () => done(undefined));
+  });
 }
 
 /** Ctrl-C aborts the call (the handler cancels its job); a second one exits at once. */
@@ -78,7 +99,7 @@ function progressPrinter(io: Io, verbose: boolean, quiet: boolean) {
 }
 
 async function run(argv: string[], io: Io): Promise<number> {
-  const stdin = readStdin();
+  const stdin = await readStdin();
   const plan = parseRunArgs(argv, stdin);
   if (plan.help) {
     io.out(RUN_USAGE);
@@ -90,7 +111,12 @@ async function run(argv: string[], io: Io): Promise<number> {
     return chat(name === undefined ? [] : [name], io);
   }
   const signal = interruptSignal();
-  const result = await callTool("run_task", plan.args, { signal, onMessage: progressPrinter(io, plan.render.verbose, plan.render.quiet) });
+  // A bare prompt runs on the tested chat pick that fits now; routing alone ignores free memory.
+  const { args } = plan;
+  if (["model", "job", "workflow", "task", "preview"].every((field) => args[field] === undefined) && typeof args.prompt === "string") {
+    args.model = await pickLiveJobModel(CHAT_JOB, args.endpoint as string | undefined).catch(() => undefined);
+  }
+  const result = await callTool("run_task", args, { signal, onMessage: progressPrinter(io, plan.render.verbose, plan.render.quiet) });
   if (signal.aborted) {
     io.err(resultText(result) || "fllama: cancelled");
     return 130;
@@ -166,9 +192,9 @@ async function gateway(argv: string[], io: Io): Promise<number> {
   return 0;
 }
 
-function toolArgs(raw: string | undefined): Record<string, unknown> {
+async function toolArgs(raw: string | undefined): Promise<Record<string, unknown>> {
   if (raw === undefined) return {};
-  const text = raw === "-" ? readFileSync(0, "utf8") : valueOrFile(raw, "arguments");
+  const text = raw === "-" ? (await readStdin()) ?? "" : valueOrFile(raw, "arguments");
   try {
     const parsed: unknown = JSON.parse(text);
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed as Record<string, unknown>;
@@ -188,7 +214,7 @@ async function tool(argv: string[], io: Io): Promise<number> {
     io.out(`${name}: ${registered.description}\n\ninput schema:\n${JSON.stringify(registered.inputSchema.toJSONSchema?.() ?? {}, null, 2)}`);
     return 0;
   }
-  const result = await callTool(name, toolArgs(raw), { signal: interruptSignal(), onMessage: progressPrinter(io, false, false) });
+  const result = await callTool(name, await toolArgs(raw), { signal: interruptSignal(), onMessage: progressPrinter(io, false, false) });
   const rendered = renderResult(result, { json, verbose: false, quiet: false, hideThinking: true });
   for (const line of rendered.stderr) io.err(line);
   if (rendered.stdout !== "") io.out(rendered.stdout);
@@ -241,7 +267,8 @@ export async function main(argv: string[], io: Io = stdio): Promise<number> {
       case "tool": return await tool(rest, io);
       case "tools": return tools(io);
       case "workflows": return workflows(io);
-      case "catalog": return await tool(["models", JSON.stringify({ view: "catalog", ...(rest[0] ? { job: rest[0] } : {}) })], io);
+      // A run_task job (summarize) shows the catalog job whose picks it runs on (coding).
+      case "catalog": return await tool(["models", JSON.stringify({ view: "catalog", ...(rest[0] ? { job: (LOCAL_JOBS as Record<string, { catalogJob: string }>)[rest[0]]?.catalogJob ?? rest[0] } : {}) })], io);
       case "job": {
         const [id, flag] = rest;
         if (id === undefined) return await tool(["task_jobs", JSON.stringify({ action: "list" })], io);

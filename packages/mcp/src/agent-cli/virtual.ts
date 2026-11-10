@@ -14,6 +14,8 @@ import { record, withoutEmpty, type Fields } from "./util.js";
 import { DEFAULT_SERVE_ENDPOINT } from "../config.js";
 
 export const VIRTUAL_PREFIX = "freellama/";
+/** The job whose picks serve a general chat: its picks are the tested chat models. */
+export const CHAT_JOB: JobName = "summarize";
 /** Decision and embedding jobs need fields a chat cannot carry; `fllama run` serves them. */
 const CHAT_TASKS = new Set(["coding", "completion", "vision"]);
 
@@ -80,13 +82,18 @@ export type Resolution = {
   task: string;
 };
 
-/** The job's tested pick that is installed and fits now; undefined for `auto` (routing picks). */
+/**
+ * The job's tested pick that is installed and fits now. `auto` has no job prompts, but its model
+ * is still the general chat pick that fits now (the summarize job's picks): routing alone ranks by
+ * capability, not free memory, and can choose a model that is then refused.
+ */
 export async function pickVirtual(model: VirtualModel, caller: Pick<CallerChoices, "tools" | "think">, serveEndpoint?: string): Promise<string | undefined> {
-  if (!model.job) return undefined;
   const prefer = model.workflow ? (WORKFLOWS[model.workflow] as { prefer?: "capable" }).prefer : undefined;
   try {
-    return await pickLiveJobModel(model.job, serveEndpoint, prefer, neededCapabilities(caller));
+    return await pickLiveJobModel(model.job ?? CHAT_JOB, serveEndpoint, prefer, neededCapabilities(caller));
   } catch (error) {
+    // auto falls back to routing when no chat pick is installed or fits.
+    if (!model.job) return undefined;
     throw refusalError((error as Error).message);
   }
 }

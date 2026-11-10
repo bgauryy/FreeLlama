@@ -41,7 +41,8 @@ export async function chatTaskArgs(model: VirtualModel, request: ChatRequest, se
     tools: request.tools?.length ? request.tools : undefined,
     contextTokens,
   };
-  const target = model.workflow ? { workflow: model.workflow } : model.job ? { job: model.job } : { task: "completion", objective: "balanced" };
+  const target = model.workflow ? { workflow: model.workflow } : model.job ? { job: model.job }
+    : { task: "completion", objective: "balanced", model: await pickVirtual(model, request, serveEndpoint) };
   const messages = request.messages.filter((message) => message.role !== "system" || (message.content ?? "") !== "");
   const last = messages.at(-1);
   if (!last) throw new GatewayError("the conversation has no messages", 400);

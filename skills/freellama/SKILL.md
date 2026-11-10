@@ -21,7 +21,8 @@ Prefer the MCP server when the host has it; the same operations run from a shell
   the background. `--endpoint` or `FREELLAMA_SERVE_ENDPOINT` selects another one. `freellama task` has no
   decoding options (`num_predict`, `temperature`); use `fllama run -o k=v` (with `--think`,
   `--format`/`--schema`), MCP or the HTTP API when you need them.
-- **`fllama`:** `npx -y -p @octocodeai/freellama-mcp-server fllama <command>` calls the MCP tool handlers
+- **`fllama`:** `npx -y -p @octocodeai/freellama-mcp-server fllama <command>` (0.11.0 and later; from a
+  checkout: `node packages/mcp/dist/agent-cli.js`) calls the MCP tool handlers
   in-process, so shell agents get MCP behavior without an MCP host: `fllama run -w WORKFLOW|-j JOB [-f FILE] "PROMPT"`
   (answer on stdout, `check:` lines on stderr) and `fllama tool NAME JSON` for any of the thirteen tools.
   `fllama gateway` (`127.0.0.1:11437`) serves `freellama/<workflow|job|auto>` virtual models to Ollama,

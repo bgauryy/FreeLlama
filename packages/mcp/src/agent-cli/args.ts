@@ -155,7 +155,7 @@ function questionsFrom(tokens: ReturnType<typeof parseArgs>["tokens"]): Record<s
     if (token.kind !== "option" || !["ask", "choice", "level"].includes(token.name)) continue;
     const value = token.value ?? "";
     if (token.name === "ask") {
-      questions.push([`q${questions.length + 1}`, { type: "noul", instructions: value }]);
+      questions.push([questionName(value, questions.map(([name]) => name)), { type: "noul", instructions: value }]);
       continue;
     }
     const current = questions.at(-1)?.[1];
@@ -175,6 +175,15 @@ function questionsFrom(tokens: ReturnType<typeof parseArgs>["tokens"]): Record<s
     }
   }
   return questions.length > 0 ? Object.fromEntries(questions) : undefined;
+}
+
+/** A short answer label from the question's first words (`Is a refund requested?` -> `refund-requested`), unique among `taken`. */
+function questionName(question: string, taken: string[]): string {
+  const STOP = new Set(["is", "are", "the", "a", "an", "does", "do", "this", "it", "which", "what", "how", "of", "to", "for", "be"]);
+  const base = question.toLowerCase().replace(/[^a-z0-9\s-]/g, " ").split(/\s+/).filter((word) => word && !STOP.has(word)).slice(0, 3).join("-") || "question";
+  let name = base.slice(0, 40);
+  for (let n = 2; taken.includes(name); n += 1) name = `${base.slice(0, 36)}-${n}`;
+  return name;
 }
 
 /** The job a run belongs to: the named one, or the workflow's. */

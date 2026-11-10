@@ -1,6 +1,5 @@
 # Make local models faster and lighter
 
-Moved from the root README.
 
 ## Make local models faster and lighter
 

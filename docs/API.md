@@ -2,7 +2,7 @@
 
 FreeLlama exposes one engine through several doors. Pick the door that matches your client. Each
 section below lists everything behind it and links to the guide that owns the details. Everything
-here was checked against the code on the `fllama` branch.
+here was checked against the code (2026-11-10).
 
 ## Which one to use
 
@@ -33,8 +33,8 @@ starts `11436`, and `fllama gateway` `11437`.
 
 ## `fllama` commands
 
-`fllama` ships with `@octocodeai/freellama-mcp-server`. See the [reference](AGENT_CLI.md) for
-flags and output rules.
+`fllama` ships with `@octocodeai/freellama-mcp-server` from 0.11.0; before that, run it from a
+checkout ([install](AGENT_CLI.md)). See the [reference](AGENT_CLI.md) for flags and output rules.
 
 | Command | Does |
 |---|---|

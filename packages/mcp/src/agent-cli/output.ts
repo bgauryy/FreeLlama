@@ -74,6 +74,11 @@ export function renderResult(result: ToolResult, options: RenderOptions, showThi
   const thinking = thinkingOf(structured);
   if (thinking && !options.hideThinking && (options.verbose || showThinking) && !options.quiet) stderr.push(`thinking: ${thinking}`);
   if (!options.quiet) stderr.push(...checks);
+  // A thinking model that spent the whole budget answers nothing: that is a failure for a script.
+  if (/^\(empty (answer|response)/.test(answer)) {
+    const hint = answer.includes("thinking") ? "the model spent its output thinking; rerun with --think=false or raise -o num_predict=N" : "the model returned nothing";
+    return { stdout: "", stderr: [...stderr, `fllama: empty answer: ${hint}`], exitCode: 1 };
+  }
   if (options.extract) {
     const block = firstCodeBlock(answer);
     if (block === undefined) {

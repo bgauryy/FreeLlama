@@ -9,13 +9,23 @@ That lets the `ollama` CLI, Continue, opencode, Codex, Claude Code, Open WebUI, 
 SDKs use it without MCP. [Every API](API.md) shows all of FreeLlama's surfaces on one page. The
 design and its trade-offs are in [RFC 0001](rfcs/0001-fllama-agent-cli.md).
 
-`fllama` ships as the second binary of `@octocodeai/freellama-mcp-server`:
+`fllama` ships as the second binary of `@octocodeai/freellama-mcp-server` from release 0.11.0.
+Until that is published, run it from a checkout:
 
 ```bash
-npx -p @octocodeai/freellama-mcp-server fllama --help
-# in a checkout, after `yarn build`:
-node packages/mcp/dist/agent-cli.js --help
+npx -p @octocodeai/freellama-mcp-server fllama --help      # 0.11.0 and later
+# from a checkout:
+yarn install && yarn build && node packages/mcp/dist/agent-cli.js --help
 ```
+
+## First five minutes
+
+1. `fllama catalog`: the tested pick for each job, and whether it is installed and fits now.
+2. `fllama workflows`: what each workflow does and what it expects.
+3. Your first task: `git diff | fllama run -w summarize-diff`. The answer goes to stdout.
+4. Read stderr. Act on any `check:` line before you rely on the answer. Exit code 1 means the task
+   was refused or failed, or the answer came back empty.
+5. Optional: `fllama gateway`, then `OLLAMA_HOST=127.0.0.1:11437 ollama run freellama/explain-code`.
 
 ## Commands
 
@@ -40,25 +50,31 @@ only workspaces under `FREELLAMA_MCP_ALLOWED_ROOTS`, the same as over MCP.
 
 ```bash
 git diff | fllama run -w summarize-diff
-fllama run -w fix-bug -f src/parser.ts "The parser drops the last token"
-fllama run -j find-code -f 'src/**/*.ts' --top 3 "where are CLI flags parsed"
+fllama run -w fix-bug -f path/to/parser.ts "The parser drops the last token"
+fllama run -j find-code -f 'path/to/src/**/*.ts' --top 3 "where are CLI flags parsed"
 fllama run --ask "Is a refund requested?" < ticket.txt
 fllama run --ask "Which team?" --choice billing="Payments" --choice technical="Software" < ticket.txt
-fllama run gemma4 "Why is the sky blue?" --think=low --verbose
+fllama run "Why is the sky blue?" --verbose            # the chat pick that fits now
+fllama run lfm3:1.7b-q4_K_M "Why?" --think=false        # a tag from `fllama catalog`
 echo "Invoice 2291, Acme, 1,240.50 EUR" | fllama run -w extract-json --schema "invoice_id, vendor, total float, currency"
-fllama run -w fix-bug -f src/a.ts "off by one in paging" -x > patch.txt
+fllama run -w explain-code -f path/to/a.ts -x > answer.txt   # the first code block only
 ```
 
 **Model or prompt.** The first word is a model only when no `--model`, `--job`, `--workflow` or
 `--task` is given and it has no whitespace, because an Ollama tag cannot contain any. So
-`fllama run "Why is the sky blue?"` routes by capability, `fllama run gemma4 "Why?"` pins a model,
-and `fllama run nimble --ask …` asks `nimble`, as `ollama run` does. With no model, `--ask` runs on
-the `classify` job's tested pick.
+`fllama run lfm3:1.7b-q4_K_M "Why?"` pins a model, and `fllama run nimble --ask …` asks `nimble`,
+as `ollama run` does. A bare prompt such as `fllama run "Why is the sky blue?"` runs on the tested
+chat pick that fits now. With no model, `--ask` runs on the `classify` job's tested pick.
 
-**stdin.** Piped (`cmd | fllama run`) or redirected (`< file`) input is read: as the `state` for a
-decision, one item per line for an embedding job, otherwise after the prompt. Any other stdin is
-ignored, including the open socket many agent harnesses pass, so an agent's call never waits for
-input that will not come.
+**Thinking.** `--think=false` stops a thinking model from spending its output budget before it
+answers. `--think=low|medium|high` works only on models that advertise levels (`ollama show
+MODEL`); other models refuse it.
+
+**stdin.** Input piped (`cmd | fllama run`), redirected (`< file`) or passed by a program is read:
+as the `state` for a decision, one item per line for an embedding job, otherwise after the prompt.
+A socket on stdin (how Node and many agent harnesses wire a child) is read only when data or its
+end arrives within 250 ms, so an agent harness's open socket never hangs the call the way it
+hangs `ollama run`.
 
 **Ollama flags.** `--format json|SCHEMA`, `--think[=true|false|high|medium|low]`, `--hidethinking`,
 `--keepalive`, `--verbose`, `--ask`/`--choice`/`--level`, `--nowordwrap` and `--insecure` keep their
@@ -71,16 +87,19 @@ or globs, repeatable), `--image`, `-s/--system TEXT|@FILE`, `-o/--option k=v`, `
 `--priority`, `--timeout`, `--max-wait`, `--defer`, `--preview`, `--save-as NAME`, `--json`,
 `-q/--quiet`, `--endpoint URL`. `fllama run --help` lists them.
 
-**Structured output and code.** `--schema` takes a JSON schema (`{…}` or `@file.json`) or llm's
+**Structured output and code.**  `--schema` takes a JSON schema (`{…}` or `@file.json`) or llm's
 short form, where every field is required: `--schema 'name, age int, tags list: up to five'`
 (types `str`, `int`, `float`, `bool`, `list`). `-x/--extract` prints only the first fenced code
-block, or the whole answer with a note when there is none.
+block, or the whole answer with a note when there is none. It extracts text; it does not make a
+patch you can `git apply`. `fix-bug` answers in SEARCH/REPLACE blocks for you to apply.
 
 **Output.** stdout carries only the answer. stderr carries `check:` lines (act on them before
 relying on the answer), a `handoff_file:` line for `--save-as`, and refusals. `--verbose` adds the
 model, the fields job mode filled in, timings and the cached prompt tokens. `--json` prints the
-whole receipt. Exit codes: 0 success, 1 refused or failed, 2 usage, 130 interrupted. Ctrl-C cancels
-the running job.
+whole receipt. Exit codes: 0 success, 1 refused, failed or empty (a thinking model that spent its
+whole budget; rerun with `--think=false`), 2 usage, 130 interrupted. Ctrl-C cancels the running job.
+`--ask` answers are named after the question (`Is a refund requested?` → `refund-requested: true
+(p 0.89)`).
 
 **serve.** When nothing answers on the default endpoint, `fllama` starts `freellama serve` in the
 background once, logging to `~/.octocode/freellama/serve.log`. It prints the PID and how to stop it,
@@ -101,10 +120,19 @@ Decision and embedding jobs need fields a chat cannot carry, so `fllama run` ser
 fllama gateway                                         # 127.0.0.1:11437
 OLLAMA_HOST=127.0.0.1:11437 ollama run freellama/explain-code
 OLLAMA_HOST=127.0.0.1:11437 ollama list                # virtual models, then installed tags
-curl http://127.0.0.1:11437/v1/chat/completions -d '{"model":"freellama/review-code","messages":[{"role":"user","content":"..."}]}'
+curl http://127.0.0.1:11437/v1/chat/completions -d '{"model":"freellama/review-code",
+  "messages":[{"role":"user","content":"def avg(xs): return sum(xs)/len(xs)"}]}'
+curl http://127.0.0.1:11437/v1/messages -H 'anthropic-version: 2023-06-01' -d '{"model":"freellama/explain-code",
+  "max_tokens":400,"thinking":{"type":"disabled"},"messages":[{"role":"user","content":"What does git rebase --onto do?"}]}'
 ```
 
-`fllama chat NAME` does the same on an ephemeral port for the length of one REPL, and adds `check:`
+A thinking model spends `max_tokens` on thinking first; a small budget can come back empty with
+`finish_reason: "length"`. Turn thinking off (`"thinking":{"type":"disabled"}`,
+`"reasoning_effort":"none"`, `"think":false`) or raise the budget. Responses streamed by Ollama
+name the real model; FreeLlama's managed responses name the virtual one.
+
+`summarize` and the other jobs run on their catalog job's picks (`fllama catalog summarize` shows
+the coding picks it uses). `fllama chat NAME` does the same on an ephemeral port for the length of one REPL, and adds `check:`
 lines to each answer for the person reading it.
 
 ### Protocols

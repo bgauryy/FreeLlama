@@ -1,6 +1,5 @@
 # How FreeLlama compares
 
-Moved from the root README.
 
 ## How it compares
 
