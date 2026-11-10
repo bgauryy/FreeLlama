@@ -16,7 +16,7 @@ import { DEFAULT_SERVE_ENDPOINT } from "../config.js";
 import { ensureServe } from "../serve.js";
 import { answerText, fromOllamaRequest, fromOpenAiRequest, ollamaResponse, openAiCompletion, runManagedChat } from "./managed.js";
 import { record, withoutUndefined, type Fields } from "./util.js";
-import { GatewayError, REWRITERS, streamChecks, virtualModel, virtualModels, type Resolution, type VirtualModel } from "./virtual.js";
+import { admitRunner, GatewayError, managedShiftOff, REWRITERS, streamChecks, virtualModel, virtualModels, type Resolution, type VirtualModel } from "./virtual.js";
 
 type GatewayOptions = {
   host?: string;
@@ -172,7 +172,13 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{ url:
   /** Rewrite a virtual-model request and send it to Ollama's own endpoint through serve. */
   async function forward(path: string, model: VirtualModel, body: Fields, request: http.IncomingMessage, response: http.ServerResponse, signal: AbortSignal): Promise<void> {
     const { body: rewritten, resolution } = await REWRITERS[path]!(model, body, explicitEndpoint);
-    log(`${String(body.model)} -> ${resolution.model} (${path}, streamed by Ollama)`);
+    // Only the native API carries the runner profile; the OpenAI and Anthropic layers run at
+    // Ollama's defaults. A native request matches serve's managed runners so it reuses them.
+    const native = NATIVE.has(path);
+    if (native && rewritten.shift === undefined && await managedShiftOff(explicitEndpoint)) rewritten.shift = false;
+    const numCtx = native ? record(rewritten.options)?.num_ctx as number | undefined : undefined;
+    const runner = await admitRunner(resolution, native ? { numCtx } : undefined, explicitEndpoint, signal);
+    log(`${String(body.model)} -> ${resolution.model} (${path}, ${runner === "warmed" ? "loaded through admission, " : runner === "assessed" ? "memory assessed, " : ""}streamed by Ollama${numCtx ? `, num_ctx ${numCtx} from ${resolution.contextSource}` : ""})`);
     const headers: Record<string, string> = { "content-type": "application/json" };
     for (const name of FORWARDED_HEADERS) {
       const value = request.headers[name];
@@ -284,7 +290,7 @@ function withChecksOnDone(path: string, resolution: Resolution, body: Fields, ch
         const note = `\n\n${checks.map((check) => `check: ${check}`).join("\n")}`;
         yield `${JSON.stringify({ model: chunk.model, created_at: chunk.created_at, ...(path === "/api/chat" ? { message: { role: "assistant", content: note } } : { response: note }), done: false })}\n`;
       }
-      yield `${JSON.stringify({ ...chunk, freellama: withoutUndefined({ model: resolution.model, checks, job: resolution.job, num_ctx: resolution.numCtx }) })}\n`;
+      yield `${JSON.stringify({ ...chunk, freellama: withoutUndefined({ model: resolution.model, checks, job: resolution.job, num_ctx: resolution.numCtx, context_source: resolution.contextSource }) })}\n`;
     }
     for await (const bytes of source) {
       pending += decoder.decode(bytes, { stream: true });

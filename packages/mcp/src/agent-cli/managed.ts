@@ -6,7 +6,7 @@ import { UsageError } from "./args.js";
 import { splitAnswer } from "./output.js";
 import { callTool, resultText, type ToolResult } from "./registry.js";
 import { record, withoutUndefined, type Fields } from "./util.js";
-import { GatewayError, jobFields, pickVirtual, refusalError, thinkFromEffort, type VirtualModel } from "./virtual.js";
+import { GatewayError, jobFields, pickVirtual, refusalError, residentContext, thinkFromEffort, type VirtualModel } from "./virtual.js";
 import type { JobName } from "../local-prompts.js";
 
 type Message = { role: string; content?: string; images?: string[]; tool_calls?: unknown[]; [key: string]: unknown };
@@ -54,7 +54,9 @@ export async function chatTaskArgs(model: VirtualModel, request: ChatRequest, se
     const picked = (await pickVirtual(model, request, serveEndpoint))!;
     const turns = messages.map((message) => ({ role: message.role, content: message.content ?? "" }));
     const system = jobFields(model as VirtualModel & { job: JobName }, picked, turns, { tools: request.tools }).systemPrompt;
-    return withoutUndefined({ ...common, ...target, model: picked, messages: system === undefined ? messages : [{ role: "system", content: system }, ...messages] });
+    // A later turn keeps the loaded runner's window, so the conversation's prompt cache survives.
+    const resident = contextTokens === undefined ? await residentContext(picked, serveEndpoint) : undefined;
+    return withoutUndefined({ ...common, ...target, model: picked, contextTokens: contextTokens ?? resident, messages: system === undefined ? messages : [{ role: "system", content: system }, ...messages] });
   }
   return withoutUndefined({ ...common, ...target, messages });
 }

@@ -5,10 +5,11 @@ const fixture = vi.hoisted(() => ({
   run: vi.fn(),
   live: vi.fn(),
   route: vi.fn(),
+  warm: vi.fn(),
 }));
 vi.mock("../../src/serve-client.js", () => ({
   runTaskRequest: fixture.run, getTaskJob: vi.fn(), cancelTaskJob: vi.fn(), route: (...args: unknown[]) => fixture.route(...args),
-  createSession: vi.fn(), deleteSession: vi.fn(), killSession: vi.fn(), listModels: vi.fn(), warmModelRequest: vi.fn(),
+  createSession: vi.fn(), deleteSession: vi.fn(), killSession: vi.fn(), listModels: vi.fn(), warmModelRequest: (...args: unknown[]) => fixture.warm(...args),
   listTaskJobs: vi.fn(), createScope: vi.fn(), getScope: vi.fn(), forkScope: vi.fn(), deleteScope: vi.fn(),
 }));
 vi.mock("../../src/model-library.js", async (importOriginal) => ({
@@ -50,6 +51,8 @@ beforeEach(() => {
   fixture.live.mockResolvedValue([[{ name: "lfm3:1.7b-q4_K_M", capabilities: ["completion"] }], 64e9]);
   fixture.route.mockReset();
   fixture.route.mockResolvedValue(JSON.stringify({ selected_model: "lfm3:1.7b-q4_K_M", options: { num_ctx: 4096 } }));
+  fixture.warm.mockReset();
+  fixture.warm.mockResolvedValue(JSON.stringify({ status: "warmed", model: "lfm3:1.7b-q4_K_M" }));
 });
 
 describe("fllama run flags", () => {
@@ -267,6 +270,8 @@ describe("gateway over HTTP", () => {
   let gateway: Awaited<ReturnType<typeof startGateway>>;
   // A stand-in for serve's Ollama passthrough: records what it is sent and answers in Ollama's shapes.
   const upstream: Array<{ path: string; body: Record<string, any>; headers: Record<string, unknown> }> = [];
+  // What the fake Ollama reports as loaded (`/api/ps`).
+  let loaded: Array<{ name: string; context_length: number }> = [];
   let serve: import("node:http").Server;
   beforeAll(async () => {
     const http = await import("node:http");
@@ -274,6 +279,14 @@ describe("gateway over HTTP", () => {
       let raw = "";
       request.on("data", (chunk) => { raw += chunk; });
       request.on("end", () => {
+        if (request.url === "/api/ps") {
+          response.writeHead(200, { "content-type": "application/json" });
+          return void response.end(JSON.stringify({ models: loaded }));
+        }
+        if (request.url === "/_freellama/v1/config") {
+          response.writeHead(200, { "content-type": "application/json" });
+          return void response.end(JSON.stringify({ effective: { context: { context_shift: "off" } } }));
+        }
         upstream.push({ path: request.url ?? "", body: JSON.parse(raw || "{}"), headers: request.headers });
         if (request.url === "/api/chat") {
           response.writeHead(200, { "content-type": "application/x-ndjson" });
@@ -308,7 +321,7 @@ describe("gateway over HTTP", () => {
     await gateway.close();
     await new Promise<void>((resolve) => serve.close(() => resolve()));
   });
-  beforeEach(() => { upstream.length = 0; });
+  beforeEach(() => { upstream.length = 0; loaded = []; });
   const post = (path: string, body: unknown, headers: Record<string, string> = {}, signal?: AbortSignal) =>
     fetch(`${gateway.url}${path}`, { method: "POST", body: JSON.stringify(body), headers, signal });
 
@@ -322,9 +335,49 @@ describe("gateway over HTTP", () => {
     expect(sent.body.model).toBe("lfm3:1.7b-q4_K_M");
     expect(sent.body.messages[0].role).toBe("system");
     expect(sent.body.messages.at(-1)).toEqual({ role: "user", content: "crash" });
-    // The caller's temperature wins; the routed window and the job's other options fill in.
-    expect(sent.body.options).toMatchObject({ temperature: 0, num_ctx: 4096 });
+    // The caller's temperature wins; the routed window (raised to hold the turn) and the job's other options fill in.
+    expect(sent.body.options.temperature).toBe(0);
+    expect(sent.body.options.num_ctx).toBeGreaterThanOrEqual(4096);
     expect(fixture.run).not.toHaveBeenCalled();
+  });
+
+  it("sends serve's context-shift setting on native streams, so they reuse managed runners", async () => {
+    await (await post("/api/chat", { model: "freellama/summarize", messages: [{ role: "user", content: "x" }] })).text();
+    expect(upstream[0]!.body.shift).toBe(false);
+  });
+
+  it("checks the memory assessment before an OpenAI-layer stream loads a model, and refuses a held load", async () => {
+    fixture.route.mockResolvedValue(JSON.stringify({
+      selected_model: "lfm3:1.7b-q4_K_M", options: { num_ctx: 4096 },
+      execution: { resource_assessment: { status: "held_insufficient_capacity", reason: "needs 9 GB, 4 GB free" } },
+    }));
+    const reply = await post("/v1/chat/completions", { model: "freellama/review-code", stream: true, messages: [{ role: "user", content: "x" }] });
+    expect(reply.status).toBe(503);
+    expect((await reply.json()).error).toMatch(/held_insufficient_capacity: needs 9 GB/);
+    expect(upstream).toHaveLength(0);
+    expect(fixture.warm).not.toHaveBeenCalled();
+  });
+
+  it("loads a model that is not resident through managed admission before streaming", async () => {
+    await (await post("/api/chat", { model: "freellama/summarize", messages: [{ role: "user", content: "x" }] })).text();
+    expect(fixture.warm).toHaveBeenCalledTimes(1);
+    expect(fixture.warm.mock.calls[0]![1]).toMatchObject({ model: "lfm3:1.7b-q4_K_M", context_tokens: upstream[0]!.body.options.num_ctx });
+  });
+
+  it("keeps a loaded runner's window, so nothing reloads and its prompt cache survives", async () => {
+    loaded = [{ name: "lfm3:1.7b-q4_K_M", context_length: 32768 }];
+    const lines = (await (await post("/api/chat", { model: "freellama/summarize", messages: [{ role: "user", content: "x" }] })).text()).trim().split("\n");
+    expect(upstream[0]!.body.options.num_ctx).toBe(32768);
+    expect(JSON.parse(lines.at(-1)!).freellama).toMatchObject({ num_ctx: 32768, context_source: "resident_runner" });
+    expect(fixture.warm).not.toHaveBeenCalled();
+  });
+
+  it("refuses a stream whose load the memory gate refuses, without reaching Ollama", async () => {
+    fixture.warm.mockRejectedValue(new Error(JSON.stringify({ code: "resource_admission_unavailable", error: "host resource admission deadline exceeded; needs 9 GB, 4 GB free" })));
+    const reply = await post("/api/chat", { model: "freellama/summarize", messages: [{ role: "user", content: "x" }] });
+    expect(reply.status).toBe(503);
+    expect((await reply.json()).error).toMatch(/needs 9 GB/);
+    expect(upstream).toHaveLength(0);
   });
 
   it("survives a client that leaves mid-stream, and keeps serving", async () => {

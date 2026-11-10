@@ -11,6 +11,7 @@ import { UsageError } from "./args.js";
 import { refusalOf } from "./output.js";
 import { callTool, resultText } from "./registry.js";
 import { record, withoutEmpty, type Fields } from "./util.js";
+import { DEFAULT_SERVE_ENDPOINT } from "../config.js";
 
 export const VIRTUAL_PREFIX = "freellama/";
 /** Decision and embedding jobs need fields a chat cannot carry; `fllama run` serves them. */
@@ -67,8 +68,14 @@ export type Resolution = {
   options: Fields;
   think?: boolean | string;
   format?: unknown;
-  /** The context window routing chose for this model and task. */
+  /** The context window to request: the loaded runner's when it can hold the conversation, else routing's. */
   numCtx?: number;
+  /** Where numCtx came from: the loaded runner (no reload, its prompt cache kept) or routing. */
+  contextSource?: "resident_runner" | "route";
+  /** The context the model is loaded with now; undefined when it is not loaded. */
+  residentContext?: number;
+  /** The route's memory assessment for loading the model (`ready`, or the hold that applies), with its reason. */
+  assessment?: { status: string; detail: string };
   job?: JobName;
   task: string;
 };
@@ -117,8 +124,25 @@ export async function resolveVirtual(model: VirtualModel, turns: Turn[], caller:
   const route = preview.structuredContent ?? {};
   const selected = picked ?? (typeof route.selected_model === "string" ? route.selected_model : undefined);
   if (!selected) throw new GatewayError("routing chose no model for a general chat", 503);
-  const numCtx = record(route.options)?.num_ctx;
-  const resolution: Resolution = { model: selected, options: {}, task, ...(typeof numCtx === "number" ? { numCtx } : {}) };
+  const routed = record(route.options)?.num_ctx;
+  const resolution: Resolution = { model: selected, options: {}, task };
+  const assessment = record(record(route.execution)?.resource_assessment);
+  if (typeof assessment?.status === "string") {
+    resolution.assessment = { status: assessment.status, detail: String(assessment.reason ?? assessment.summary ?? record(route.execution)?.reason ?? "") };
+  }
+  // A request with another num_ctx reloads the runner and loses its prompt cache (measured: 95% of
+  // a multi-turn prompt cached on an unchanged window, none when it changed). Keep the loaded
+  // runner's window whenever it holds the conversation.
+  const resident = await residentContext(selected, serveEndpoint);
+  if (resident !== undefined) resolution.residentContext = resident;
+  const needed = estimatedTokens(turns, caller.options);
+  if (resident !== undefined && (typeof routed !== "number" || resident >= routed || resident >= needed)) {
+    resolution.numCtx = resident;
+    resolution.contextSource = "resident_runner";
+  } else if (typeof routed === "number") {
+    resolution.numCtx = Math.max(routed, needed);
+    resolution.contextSource = "route";
+  }
   if (!model.job) return resolution;
 
   resolution.job = model.job;
@@ -130,6 +154,101 @@ export async function resolveVirtual(model: VirtualModel, turns: Turn[], caller:
   if (caller.think === undefined && fields.think !== undefined) resolution.think = fields.think;
   if (caller.format === undefined && fields.format !== undefined) resolution.format = fields.format;
   return resolution;
+}
+
+/** A conservative token count for a conversation plus its output budget (about 3 characters a token). */
+function estimatedTokens(turns: Turn[], options: Fields | undefined): number {
+  const chars = turns.reduce((sum, turn) => sum + turn.content.length, 0);
+  const output = typeof options?.num_predict === "number" && options.num_predict > 0 ? options.num_predict : 2_048;
+  // The workflow's system prompt is not counted yet; 1,024 tokens of headroom cover it.
+  return Math.ceil(chars / 3) + output + 1_024;
+}
+
+/** The context `model` is loaded with now, from Ollama's `/api/ps` through serve; undefined when not loaded. */
+export async function residentContext(model: string, serveEndpoint = DEFAULT_SERVE_ENDPOINT): Promise<number | undefined> {
+  try {
+    const reply = await fetch(new URL("/api/ps", serveEndpoint), { signal: AbortSignal.timeout(3_000) });
+    if (!reply.ok) return undefined;
+    const models = record(await reply.json())?.models;
+    const entry = (Array.isArray(models) ? models : []).map(record).find((item) => item?.name === model || item?.model === model);
+    return typeof entry?.context_length === "number" ? entry.context_length : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Make sure a forwarded request never cold-loads past FreeLlama's memory gate.
+ *
+ * Native requests carry the runner profile (`num_ctx`, `shift`), so a model that is not loaded
+ * with it is loaded first through managed admission (memory reservation, eviction of idle models,
+ * waiting, refusal with the reason), exactly as run_task would, and Ollama then streams from that
+ * runner. The OpenAI and Anthropic layers cannot set the profile, so warming would only load the
+ * model twice; for them a model that is not loaded must pass the route's memory assessment.
+ */
+export async function admitRunner(resolution: Resolution, profile: { numCtx?: number } | undefined, serveEndpoint?: string, signal?: AbortSignal): Promise<"resident" | "warmed" | "assessed"> {
+  if (profile === undefined) {
+    if (resolution.residentContext !== undefined) return "resident";
+    const assessment = resolution.assessment;
+    if (assessment && assessment.status !== "ready") {
+      throw new GatewayError(`${resolution.model} cannot be loaded now (${assessment.status}${assessment.detail ? `: ${assessment.detail}` : ""}); retry later or free memory`, 503);
+    }
+    return "assessed";
+  }
+  if (resolution.residentContext !== undefined && (profile.numCtx === undefined || resolution.residentContext === profile.numCtx)) return "resident";
+  let result;
+  try {
+    result = await callTool("ollama_manage", {
+      action: "warm", model: resolution.model, task: resolution.task, ...(profile.numCtx !== undefined ? { contextTokens: profile.numCtx } : {}),
+      ...(serveEndpoint ? { endpoint: serveEndpoint } : {}),
+    }, { signal });
+  } catch (error) {
+    throw new GatewayError((error as Error).message, error instanceof UsageError ? 400 : 500);
+  }
+  if (result.isError) throw refusalError(resultText(result));
+  return "warmed";
+}
+
+const shiftSettings = new Map<string, Promise<boolean>>();
+
+/**
+ * Whether serve's managed requests turn Ollama's context shift off (its default: a conversation
+ * that outgrows the window fails instead of silently losing its start). `shift` is a runner load
+ * option in Ollama, so a request that differs from the loaded runner reloads it; forwarded native
+ * requests send serve's value to share the runner. Read once per serve endpoint.
+ */
+export function managedShiftOff(serveEndpoint = DEFAULT_SERVE_ENDPOINT): Promise<boolean> {
+  let setting = shiftSettings.get(serveEndpoint);
+  if (!setting) {
+    setting = (async () => {
+      try {
+        const reply = await fetch(new URL("/_freellama/v1/config", serveEndpoint), { signal: AbortSignal.timeout(3_000) });
+        const value = findKey(await reply.json(), "context_shift");
+        return value === undefined ? true : value !== "on" && value !== true;
+      } catch {
+        return true;
+      }
+    })();
+    shiftSettings.set(serveEndpoint, setting);
+  }
+  return setting;
+}
+
+function findKey(value: unknown, key: string): unknown {
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = findKey(item, key);
+      if (found !== undefined) return found;
+    }
+  } else if (value && typeof value === "object") {
+    const fields = value as Fields;
+    if (key in fields && (typeof fields[key] !== "object" || fields[key] === null)) return fields[key];
+    for (const child of Object.values(fields)) {
+      const found = findKey(child, key);
+      if (found !== undefined) return found;
+    }
+  }
+  return undefined;
 }
 
 /** Text of a message's content in any shape: a string, OpenAI parts or Anthropic blocks. */
