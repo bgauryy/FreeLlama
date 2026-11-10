@@ -123,7 +123,7 @@ flowchart LR
 
 | Note | Detail |
 |---|---|
-| Agent commands on npm | Version 0.10.0 predates them; they ship from the next release. Today, from a checkout: `yarn install && yarn build && node packages/cli/bin/freellama.js run --help` |
+| Agent commands on npm | From 0.11.0. From a checkout: `yarn install && yarn build && node packages/cli/bin/freellama.js run --help` |
 | Without installing | Prefix any command with `npx @octocodeai/freellama` |
 | The service | The MCP server and the agent commands start `freellama serve` on `127.0.0.1:11435` if none is running. Neither installs or starts Ollama |
 | `delegate_research` | Reads only the directories in `FREELLAMA_MCP_ALLOWED_ROOTS` (`:`-separated; `;` on Windows), for example `claude mcp add freellama -e FREELLAMA_MCP_ALLOWED_ROOTS=/absolute/path/to/your-project -- npx -y @octocodeai/freellama-mcp-server`. `run_task` `files` uses `FREELLAMA_FILE_ROOTS` instead |

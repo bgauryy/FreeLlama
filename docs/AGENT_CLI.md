@@ -21,9 +21,9 @@ npm install -g @octocodeai/freellama     # one command: freellama
 | `freellama run`, `chat`, `gateway`, `workflows`, `job`, `tool`, `tools` | Node, from `@octocodeai/freellama-mcp-server` (installed as a dependency) | Node.js 22+ |
 | `freellama status` | Human view on a terminal; JSON when piped or with `--json` | — |
 
-The npm release that adds the agent commands comes after 0.10.0. Until it is published, build a
-checkout (`yarn install && yarn build`) and run `node packages/cli/bin/freellama.js …`. A
-`cargo install freellama-cli` binary has the operator commands only.
+The agent commands ship in npm 0.11.0 and later. From a checkout, run `yarn install && yarn build`,
+then `node packages/cli/bin/freellama.js …`. A `cargo install freellama-cli` binary has the operator
+commands only.
 
 ## Which command
 

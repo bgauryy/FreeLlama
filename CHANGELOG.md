@@ -4,6 +4,54 @@ All notable changes to FreeLlama are recorded here. Versions follow [Semantic Ve
 every npm package (`@octocodeai/freellama`, `@octocodeai/freellama-mcp-server`, the native platform
 packages) and the Rust crates share one version, set with `yarn release:version <semver>`.
 
+## [0.11.0] - 2026-11-10
+
+### Added
+
+- **Agent commands in `freellama`.** `npm install -g @octocodeai/freellama` now also gives:
+  - `freellama run`: one task with `ollama run` flags plus workflows (`-w`), jobs (`-j`), files (`-f`),
+    structured output (`--schema`), decisions (`--ask`, `--choice`, `--level`), batches (`--each`),
+    background jobs (`--defer`), `--dimensions` and fill-in-the-middle (`--suffix`). It streams on a
+    terminal and prints only the answer in a pipe.
+  - `freellama chat`: the `ollama` chat on a workflow (`freellama/review-code`) or a tag.
+  - `freellama gateway`: workflows served as models (`freellama/<name>`) over the Ollama, OpenAI Chat,
+    OpenAI Responses and Anthropic Messages APIs, with native token streaming.
+  - `freellama workflows`, `job ID [--wait|--cancel]`, `tool NAME JSON`, `tools`, and a human
+    `status` view on a terminal (`--json` or a pipe keeps the JSON receipt).
+  - The npm launcher runs these in Node from `@octocodeai/freellama-mcp-server`, now a dependency of
+    `@octocodeai/freellama`; every other command stays on the Rust binary.
+- **Ollama pre-flight.** When Ollama is not installed, `run`, `chat`, `gateway` and `status` stop at
+  once with `Please install Ollama: https://ollama.com/download` (exit 1); when it is installed but
+  stopped, they say how to start it (exit 75). The MCP server's unreachable-Ollama error names the
+  install link too.
+- **Exit codes.** 0 answered, 75 busy or short of memory (retry), 1 refused or failed, 2 usage,
+  130 interrupted.
+- **Long-poll jobs.** `GET /_freellama/v1/jobs/{id}?wait_ms=N` (up to 5 s) returns as soon as the job
+  ends; a short task on a loaded model finishes in about 0.2 s.
+- **Persistent embedding index** for `find-code` in `${FREELLAMA_HOME}/embedding-index/`: a repeated
+  search embeds only changed chunks (89 chunks: 7.3 s first, 0.28 s next). `FREELLAMA_EMBED_INDEX=0`
+  turns it off.
+- **Embedding `dimensions`** on `run_task` and the CLI.
+- `doctor` reports `OLLAMA_DEBUG_LOG_REQUESTS` and `LLAMA_ARG_CACHE_RAM` posture.
+
+### Changed
+
+- Smaller `run_task` schema (12,180 → 7,958 characters) and receipts (a single result 2,279 → 1,624
+  characters; a five-item batch 11,042 → 6,079).
+- Streamed and raw requests keep the resident runner: `serve` learns each model's default context
+  window, and the gateway matches serve's `shift` setting, so Ollama's prompt cache survives between
+  turns (proxy overhead about 55 → 2 ms).
+- Workflow prompts: no-padding instructions, `think:false` where reasoning only adds tokens, and the
+  capable pick for `change-code` and `summarize-text` (workflow eval: 1.7B model 7/12 → 11/12).
+- `check:` lines flag padding and filler.
+
+### Fixed
+
+- The gateway no longer crashes on a client abort, aborts the upstream request, and refuses rebound
+  DNS names.
+- An image-only generate is no longer treated as a model preload.
+- `freellama run` no longer waits on an agent's open, empty stdin.
+
 ## [0.10.0] - 2026-11-09
 
 ### Added

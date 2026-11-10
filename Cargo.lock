@@ -428,7 +428,7 @@ dependencies = [
 
 [[package]]
 name = "freellama-cli"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -445,7 +445,7 @@ dependencies = [
 
 [[package]]
 name = "freellama-core"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "axum",
