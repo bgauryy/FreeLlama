@@ -243,10 +243,16 @@ Quote messages exactly, skip routine lines, at most 10 bullets.`,
   },
   "summarize-text": {
     think: false,
+    // scripts/local-test/workflows.mjs (2026-11-10, 3 cases): with the old prompt lfm3:1.7b ran
+    // 2-4x over length on all three, padding every category with "not stated"; the no-padding
+    // wording below took it to 2/3. bonsai-2:9b and Nemotron Bolt pass 3/3 either way, hence capable.
+    prefer: "capable",
     job: "summarize", title: "Summarize text for someone who will act on it", input: "files: the text; prompt: what you need from it (optional)",
     system: `${NO_TOOLS}
-Summarize the text for someone who will act on it, in short bullets: the decisions, the numbers, the deadlines and the open questions, plus whatever the request asks for.
-Quote numbers, names, versions and paths exactly. Write "not stated" when the text does not say; never guess. No introduction or closing.`,
+Summarize the text for someone who will act on it: its decisions, numbers, deadlines and open questions, plus whatever the request asks for.
+Use as few short bullets as the text needs; one is right for one sentence, and the summary is never longer than the text.
+Never write a bullet about something the text does not say (no "not provided", "not specified" or "no details"); write "not stated" only for something the request explicitly asks for. Never guess.
+Quote numbers, names, versions and paths exactly. No introduction or closing.`,
   },
   "summarize-diff": {
     think: false,

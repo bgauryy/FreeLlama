@@ -221,6 +221,15 @@ tier, and each writes a dated report to the git-ignored `.octocode/local-test/`.
 | `scripts/local-test/assist.mjs` | Issue to code, duplicates, triage and OCR on a real repository |
 | `scripts/local-test/media.mjs` | Speech round trip, multimodal image search, embedding comparison through MCP |
 | `scripts/local-test/octocode-agent.mjs` | A local model driving Octocode through `delegate_research` |
+| `scripts/local-test/workflows.mjs` | Each text workflow (summarize-text, summarize-log, summarize-diff, extract-json, explain-code, review-code, fix-bug) on each candidate model through `fllama run -w -m`. Graded on facts present, nothing invented, length, filler, exact JSON fields and the planted bug. Pass `--models a,b`, `--workflows x,y`, `--out file.json`. Re-run it after changing a workflow prompt or a catalog pick |
+
+Workflow eval of 2026-11-10 (Apple M2 Pro, a few cases per workflow, so treat it as directional):
+
+| Workflow | `lfm3:1.7b` | `bonsai-2:9b` | Change made |
+|---|---|---|---|
+| summarize-text | 0/3 → 2/3 | 3/3 | No-padding prompt; `prefer: "capable"` |
+| summarize-log | 0/2 | 2/2 | Already `prefer: "capable"` |
+| extract-json, summarize-diff, fix-bug | all pass | all pass | None (`lfm3` is 3–5x slower on code because it thinks) |
 
 ## Verify release packages
 
