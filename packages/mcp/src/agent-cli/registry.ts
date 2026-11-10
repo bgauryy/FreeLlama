@@ -45,7 +45,7 @@ function toolExtra(options: CallOptions = {}): ToolExtra {
   const { onMessage } = options;
   return {
     signal: options.signal ?? new AbortController().signal,
-    ...(onMessage ? { _meta: { progressToken: "fllama" } } : {}),
+    ...(onMessage ? { _meta: { progressToken: "freellama" } } : {}),
     sendNotification: async (notification) => {
       if (!onMessage) return;
       if (notification.method === "notifications/progress") onMessage("progress", notification.params.message ?? "");
@@ -57,7 +57,7 @@ function toolExtra(options: CallOptions = {}): ToolExtra {
 /** Validate `args` with the tool's own schema (a refusal is a UsageError) and run its handler. */
 export async function callTool(name: string, args: Record<string, unknown>, options: CallOptions = {}): Promise<ToolResult> {
   const tool = toolRegistry().get(name);
-  if (!tool) throw new UsageError(`unknown tool "${name}"; \`fllama tools\` lists them.`);
+  if (!tool) throw new UsageError(`unknown tool "${name}"; \`freellama tools\` lists them.`);
   const parsed = tool.inputSchema.safeParse(args);
   if (!parsed.success) {
     throw new UsageError(`${name}: ${parsed.error.issues.map((issue) => `${issue.path.length ? `${issue.path.join(".")}: ` : ""}${issue.message}`).join("; ")}`);

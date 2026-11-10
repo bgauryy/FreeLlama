@@ -1,4 +1,5 @@
 // Shared MCP result helpers, Zod parameter schemas, the confidence gate, and payload trimming.
+import { OLLAMA_MISSING, ollamaInstalled } from "./ollama-presence.js";
 import * as z from "zod";
 import { DEFAULT_OLLAMA_ENDPOINT, DEFAULT_OLLAMA_FETCH_TIMEOUT_SECONDS, DEFAULT_SERVE_ENDPOINT } from "./config.js";
 import { modelNames, seconds } from "./job-progress.js";
@@ -214,26 +215,19 @@ export const BATCH_TASK_FIELDS: ReadonlySet<string> = new Set(Object.keys(batchT
 export type BatchTask = z.infer<typeof batchTaskParam>;
 export type BatchItem = { id: string; independent: true; task: BatchTask };
 
-// What the model sees: only the fields that usually differ between items, loosely typed. Every
-// other batch field is still accepted (`catchall`) and `parseBatchTask` validates the whole item.
+// What the model sees: one loose task object per item, described in a line. Every field is
+// validated against the full strict shape by `parseBatchTask`, so the item schema need not repeat
+// the run_task fields an agent already sees at the top level (it cost about 1.5 KB per session).
 export const batchItemParam = z.object({
   id: z.string().min(1),
   independent: z.literal(true),
+  // The fields that usually differ between items, named so an agent sees them; any other run_task
+  // field is accepted too, and parseBatchTask checks every one strictly.
   task: z.object({
-    prompt: z.string().optional(),
+    ...Object.fromEntries(["prompt", "messages", "state", "input", "files", "images", "model", "task", "questions", "options", "keepAlive", "format", "think"]
+      .map((name) => [name, z.unknown().optional()])),
+    // Typed where an agent writes structure the local model reads: instructions and tool descriptors.
     systemPrompt: systemPromptParam,
-    messages: z.array(z.unknown()).optional(),
-    state: z.unknown().optional(),
-    input: z.unknown().optional(),
-    files: z.array(z.string()).optional(),
-    images: z.array(z.string()).optional(),
-    model: z.string().optional(),
-    task: taskParam.removeDefault().optional(),
-    questions: z.record(z.string(), z.unknown()).optional(),
-    options: z.record(z.string(), z.unknown()).optional(),
-    keepAlive: z.string().optional(),
-    format: z.unknown().optional(),
-    think: z.unknown().optional(),
     tools: localToolsParam,
   }).catchall(z.unknown()),
 }).strict();
@@ -651,7 +645,9 @@ export function errorResult(error: unknown) {
   const actionableMessage = managedServeUnavailable
     ? `${message}\n\nFreeLlama managed serve is unreachable. Start it with \`freellama serve\`, or set \`FREELLAMA_SERVE_ENDPOINT\` to a running managed endpoint; then retry. Run \`doctor\` to inspect the configured endpoint.`
     : ollamaUnavailable
-      ? `${message}\n\nOllama is not running at that address. Ask the user to start Ollama (the app, or \`ollama serve\`); retrying before that cannot succeed.`
+      ? ollamaInstalled()
+        ? `${message}\n\nOllama is not running at that address. Ask the user to start Ollama (the app, or \`ollama serve\`); retrying before that cannot succeed.`
+        : `${message}\n\n${OLLAMA_MISSING} Ask the user to install it; nothing can run until then.`
       : receipt && message.length > 600 ? refusalLine(message) : message;
   return { content: [{ type: "text" as const, text: actionableMessage }], isError: true,
     ...(receipt ? { structuredContent: receipt } : {}) };

@@ -12,7 +12,7 @@ as the probability of yes; `score` gives a level from 2 to 10 descriptions, lowe
 From a shell, the same as `ollama run --ask`:
 
 ```bash
-fllama run --ask "What kind of issue is this?" --choice bug="Something is broken" --choice feature="A request for new capability" \
+freellama run --ask "What kind of issue is this?" --choice bug="Something is broken" --choice feature="A request for new capability" \
   --ask "Does this need action today?" < issue.md
 ```
 
@@ -31,7 +31,7 @@ Many items: send the question once and let each item carry only its own text or 
 CLI: `freellama task --task decision --questions @questions.json --input-file issue.md` prints the
 JSON receipt; the answers are under `.response.answers`.
 
-**Read the result:** from MCP and `fllama run`, one line per question, such as
+**Read the result:** from MCP and `freellama run`, one line per question, such as
 `kind: bug (p 0.95, confidence 0.79)`.
 
 **Check it:** spot-check 3 to 5 answers, and treat a low probability as unknown. Add an explicit `other` option when no listed label may fit. Do not use this model's `score` answers for severity.

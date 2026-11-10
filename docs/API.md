@@ -9,7 +9,7 @@ here was checked against the code (2026-11-10).
 | You are | Use | Start with |
 |---|---|---|
 | An agent with MCP (Claude Code, Codex, Cursor…) | [MCP tools](#mcp-tools) | `models {view:"catalog", job}`, then `run_task {workflow}` |
-| An agent or script with only a shell | [`fllama`](#fllama-commands) | `git diff \| fllama run -w summarize-diff` |
+| An agent or script with only a shell | [Agent commands](#agent-commands) | `git diff \| freellama run -w summarize-diff` |
 | An Ollama, OpenAI or Anthropic client (Continue, opencode, Open WebUI, LangChain, an SDK) | [Gateway](#gateway-endpoints) | base URL `http://127.0.0.1:11437`, model `freellama/review-code` |
 | An operator | [`freellama` CLI](#freellama-commands) | `freellama init`, `freellama serve`, `freellama status` |
 | A program that wants receipts and routing | [Control API](#control-api) | `POST /_freellama/v1/tasks` |
@@ -18,8 +18,8 @@ here was checked against the code (2026-11-10).
 ```mermaid
 flowchart LR
     MCP["MCP client"] --> H["MCP tool handlers<br/>(job mode, prompts, files, checks)"]
-    SH["fllama run / tool"] --> H
-    GW["fllama gateway :11437"] -->|"non-streaming chat"| H
+    SH["freellama run / tool"] --> H
+    GW["freellama gateway :11437"] -->|"non-streaming chat"| H
     GW -->|"streamed or Anthropic / Responses:<br/>rewritten with the pick and prompts"| PX
     H --> API["serve control API<br/>/_freellama/v1/*"]
     CLI["freellama CLI"] --> API
@@ -29,23 +29,21 @@ flowchart LR
 ```
 
 Ports: Ollama `11434`, `freellama serve` `11435`, the CPU backend that `serve --spawn-cpu-backend`
-starts `11436`, and `fllama gateway` `11437`.
+starts `11436`, and `freellama gateway` `11437`.
 
-## `fllama` commands
+## Agent commands
 
-`fllama` ships with `@octocodeai/freellama-mcp-server` from 0.11.0; before that, run it from a
-checkout ([install](AGENT_CLI.md)). See the [reference](AGENT_CLI.md) for flags and output rules.
+`freellama run`, `chat`, `gateway`, `workflows`, `job`, `tool` and `tools` (and `status` on a terminal) are part of `@octocodeai/freellama`: its launcher runs them in Node from `@octocodeai/freellama-mcp-server`, a dependency ([install](AGENT_CLI.md#install)). See the [reference](AGENT_CLI.md) for flags and output rules.
 
 | Command | Does |
 |---|---|
-| `fllama run [MODEL] [PROMPT…]` | One task, streamed on a terminal. Takes `ollama run` flags plus `-w/--workflow`, `-j/--job`, `-f/--file`, `--each`, `--schema`, `-x`, `--json` and more |
-| `fllama chat [NAME]` | The real `ollama` REPL on a virtual model or a tag |
-| `fllama gateway [--port] [--endpoint]` | Serves the [gateway endpoints](#gateway-endpoints) |
-| `fllama workflows` | Workflows and jobs, with what each expects |
-| `fllama catalog [JOB]` | Tested picks per job: installed, fits now |
-| `fllama job [ID] [--wait\|--cancel] [--endpoint URL]` | Lists deferred tasks, or gets, waits for or cancels one |
-| `fllama tool NAME [JSON\|@FILE\|-]` | Calls any [MCP tool](#mcp-tools) with its own schema. `fllama tools` lists them; `--help` shows a schema |
-| `fllama list\|ls\|ps\|show\|pull\|push\|rm\|cp\|create\|stop\|serve\|signin\|signout\|launch` | Passed to `ollama` unchanged. `fllama serve` is `ollama serve` |
+| `freellama run [MODEL] [PROMPT…]` | One task, streamed on a terminal. Takes `ollama run` flags plus `-w/--workflow`, `-j/--job`, `-f/--file`, `--each`, `--schema`, `-x`, `--json` and more |
+| `freellama chat [NAME]` | The real `ollama` REPL on a virtual model or a tag |
+| `freellama gateway [--port] [--endpoint]` | Serves the [gateway endpoints](#gateway-endpoints) |
+| `freellama workflows` | Workflows and jobs, with what each expects |
+| `freellama status` | On a terminal: memory, queues, loaded models, active jobs (piped or `--json`: the JSON receipt) |
+| `freellama job [ID] [--wait\|--cancel] [--endpoint URL]` | Lists deferred tasks, or gets, waits for or cancels one |
+| `freellama tool NAME [JSON\|@FILE\|-]` | Calls any [MCP tool](#mcp-tools) with its own schema. `freellama tools` lists them; `--help` shows a schema |
 
 ## Gateway endpoints
 
@@ -56,7 +54,7 @@ The gateway serves these virtual models:
 - `freellama/<job>`: coding, summarize, ocr, image-recognition.
 - `freellama/auto`: routing picks the model.
 
-Any other model name passes through to `serve`. The [reference](AGENT_CLI.md#virtual-models-and-the-gateway)
+Any other model name passes through to `serve`. The [reference](AGENT_CLI.md#the-gateway-workflows-as-models)
 explains the mapping.
 
 | Endpoint | Protocol | A virtual model… |
@@ -73,7 +71,7 @@ explains the mapping.
 ## MCP tools
 
 There are 13 tools, registered from [`tools/registrations.ts`](https://github.com/bgauryy/FreeLlama/blob/main/packages/mcp/src/tools/registrations.ts).
-`fllama tool NAME` reaches every one of them.
+`freellama tool NAME` reaches every one of them.
 
 | Tool | Use it to |
 |---|---|
@@ -81,7 +79,7 @@ There are 13 tools, registered from [`tools/registrations.ts`](https://github.co
 | `session` | Keep related `run_task` calls on one model: create, kill, delete |
 | `models` | See catalog picks per job, installed and loaded models, one model's details, or search ollama.com and Hugging Face (`view:"library"`) |
 | `scope` | Keep chat history on the server, with revisions: create, get, fork, delete |
-| `run_task` | Run bounded work on a local model: `job` or `workflow`, `files`, decisions, embeddings with `nearest`, vision, tools, up to 64 batch items, `defer`, `preview` |
+| `run_task` | Run bounded work on a local model: `job` or `workflow`, `files`, decisions, embeddings with `nearest` (indexed, and `dimensions`), vision, tools, up to 64 batch items, `defer`, `preview` |
 | `task_jobs` | List, get, cancel or remove deferred work |
 | `ollama_pull` | Download one exact tag the user approved, at its reported size (`approvedSizeBytes`) |
 | `ollama_manage` | Load or free a model |
@@ -125,7 +123,7 @@ Every route needs the bearer token when one is configured, except `GET /_freella
 | Decide and run | `POST routes` (no inference), `POST tasks`, `POST task-batches` |
 | Affinity and history | `POST sessions`, `DELETE sessions/{id}`, `POST sessions/{id}/kill`; `POST scopes`, `GET scopes/{id}`, `DELETE scopes/{id}`, `POST scopes/{id}/fork` |
 | Residency | `POST warm`, `POST unload` |
-| Deferred jobs | `GET jobs`, `GET jobs/{id}`, `DELETE jobs/{id}`, `POST jobs/{id}/cancel` |
+| Deferred jobs | `GET jobs`, `GET jobs/{id}` (`?wait_ms=N` long-polls up to 5 s: it answers when the job changes), `DELETE jobs/{id}`, `POST jobs/{id}/cancel` |
 | Monitoring | `GET metrics`, `GET status`, `GET usage`, `GET config`, `POST config/reload`, and the `GET /_freellama/ui` page |
 
 Request shapes are in [Architecture](ARCHITECTURE.md#request-shapes); monitoring fields are in

@@ -1,7 +1,7 @@
 {
   "name": "@octocodeai/freellama",
   "version": "0.10.0",
-  "description": "Local Ollama model gateway, router, and benchmarker — CLI. Wraps the compiled Rust binary from packages/rust-core.",
+  "description": "Local Ollama model gateway, router, and benchmarker \u2014 CLI. Wraps the compiled Rust binary from packages/rust-core.",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/bgauryy/FreeLlama.git",
@@ -16,7 +16,9 @@
     "coding-agent"
   ],
   "type": "module",
-  "bin": "bin/freellama.js",
+  "bin": {
+    "freellama": "bin/freellama.js"
+  },
   "files": [
     "bin",
     "README.md",
@@ -35,6 +37,9 @@
   },
   "author": "Guy Bary",
   "license": "Apache-2.0 OR MIT",
+  "dependencies": {
+    "@octocodeai/freellama-mcp-server": "0.10.0"
+  },
   "optionalDependencies": {
     "@octocodeai/freellama-native-darwin-arm64": "0.10.0",
     "@octocodeai/freellama-native-linux-arm64-gnu": "0.10.0",

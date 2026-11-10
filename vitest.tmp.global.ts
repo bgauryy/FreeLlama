@@ -32,5 +32,8 @@ export default function setup(): () => void {
 	process.env.TMPDIR = dir;
 	process.env.TEMP = dir;
 	process.env.TMP = dir;
+	// State a test writes (response files, handoffs, the embedding index) stays in this run's
+	// directory, never in the developer's real FreeLlama home.
+	process.env.FREELLAMA_HOME ??= join(dir, "freellama-home");
 	return () => rmSync(dir, { recursive: true, force: true, maxRetries: 3 });
 }

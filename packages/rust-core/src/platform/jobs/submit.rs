@@ -92,6 +92,7 @@ pub(super) fn prepare(
         finished: None,
         result: None,
         error: None,
+        changed: std::sync::Arc::new(tokio::sync::Notify::new()),
         cancel,
         done: done_receiver,
         completion_committed: false,

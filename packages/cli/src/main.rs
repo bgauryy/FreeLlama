@@ -212,6 +212,22 @@ async fn run() -> Result<()> {
         Command::Policy {
             action: PolicyAction::FromEval(args),
         } => policy_cmd::from_eval(args).await?,
+        // The npm launcher hands these to Node before this binary runs; reaching here means a
+        // cargo install, which has the operator commands only.
+        Command::Run(_)
+        | Command::Chat(_)
+        | Command::Gateway(_)
+        | Command::Workflows(_)
+        | Command::Job(_)
+        | Command::Tool(_)
+        | Command::Tools(_) => {
+            return Err(PlainError(
+                "run, chat, gateway, workflows, job, tool and tools need Node.js: install them with \
+                 `npm install -g @octocodeai/freellama` (this binary alone has the operator commands)"
+                    .into(),
+            )
+            .into());
+        }
     }
     Ok(())
 }

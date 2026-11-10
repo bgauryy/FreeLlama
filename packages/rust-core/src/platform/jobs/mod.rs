@@ -78,6 +78,9 @@ struct Job {
     persistence_state: &'static str,
     /// Encoded input size, counted against [`MAX_PENDING_INPUT_BYTES`] until the job finishes.
     input_bytes: usize,
+    /// Woken on every status change, so a long poll (`GET /jobs/{id}?wait_ms=N`) answers the
+    /// moment a job moves instead of at the caller's next timer tick.
+    changed: std::sync::Arc<tokio::sync::Notify>,
 }
 
 impl Job {

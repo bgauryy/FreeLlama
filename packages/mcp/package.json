@@ -20,10 +20,7 @@
   },
   "type": "module",
   "main": "dist/index.js",
-  "bin": {
-    "freellama-mcp-server": "dist/index.js",
-    "fllama": "dist/agent-cli.js"
-  },
+  "bin": "dist/index.js",
   "files": [
     "dist",
     "native/index.js",

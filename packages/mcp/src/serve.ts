@@ -24,7 +24,7 @@ const STARTUP_CEILING_MS = 120_000;
 
 let child: ChildProcess | null = null;
 /**
- * Detached mode (the `fllama` CLI): serve gets its own process group and logs to a file, and once
+ * Detached mode (the `freellama` CLI): serve gets its own process group and logs to a file, and once
  * ready the caller lets go of it, so it outlives a one-shot command and the next one reuses it.
  * The MCP server keeps the attached default: serve stops with it.
  */

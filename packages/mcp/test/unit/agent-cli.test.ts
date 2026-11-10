@@ -56,7 +56,7 @@ beforeEach(() => {
   fixture.warm.mockResolvedValue(JSON.stringify({ status: "warmed", model: "lfm3:1.7b-q4_K_M" }));
 });
 
-describe("fllama run flags", () => {
+describe("freellama run flags", () => {
   it("reads the first word as a model only when it could be a tag and nothing else names one", () => {
     expect(parseRunArgs(["gemma4", "Why", "blue?"]).args).toMatchObject({ model: "gemma4", prompt: "Why blue?" });
     expect(parseRunArgs(["Why is the sky blue?"]).args).toEqual({ prompt: "Why is the sky blue?" });
@@ -121,10 +121,12 @@ describe("fllama run flags", () => {
   });
 
   it("refuses flags whose effect a managed task cannot honor, naming what can", () => {
-    expect(() => parseRunArgs(["m:1", "--dimensions", "256"])).toThrow(/ollama run MODEL --dimensions/);
-    expect(() => parseRunArgs(["m:1", "--voice", "x"])).toThrow(/fllama tool audio/);
+    // --dimensions now shortens managed embedding vectors; a chat task still refuses it.
+    expect(parseRunArgs(["-j", "find-code", "--dimensions", "256", "q"]).args.dimensions).toBe(256);
+    expect(() => parseRunArgs(["-w", "fix-bug", "--dimensions", "256", "x"])).toThrow(/embedding/);
+    expect(() => parseRunArgs(["m:1", "--voice", "x"])).toThrow(/freellama tool audio/);
     expect(() => parseRunArgs(["m:1", "--truncate=false"])).toThrow(UsageError);
-    expect(() => parseRunArgs(["-w", "no-such"])).toThrow(/fllama workflows/);
+    expect(() => parseRunArgs(["-w", "no-such"])).toThrow(/freellama workflows/);
     expect(() => parseRunArgs(["--bogus"])).toThrow(UsageError);
   });
 
@@ -134,7 +136,7 @@ describe("fllama run flags", () => {
   });
 });
 
-describe("fllama output", () => {
+describe("freellama output", () => {
   it("puts only the answer on stdout and check:/handoff lines on stderr", () => {
     const text = "[lfm3 · loaded] line one\nline two\ncheck: SEARCH block 1 does not match the file\nhandoff_file: /tmp/h.md";
     expect(splitAnswer(text)).toEqual({ label: "lfm3 · loaded", answer: "line one\nline two\nhandoff_file: /tmp/h.md", checks: ["check: SEARCH block 1 does not match the file"] });
@@ -153,8 +155,12 @@ describe("fllama output", () => {
 
   it("prints a JSON refusal's message, keeps it whole for --json, and exits 1", () => {
     const refusal = JSON.stringify({ code: "job_no_model_fits", error: "no catalog pick fits now" });
-    expect(renderResult({ isError: true, content: [{ type: "text", text: refusal }] }, render)).toEqual({ stdout: "", stderr: ["no catalog pick fits now (job_no_model_fits)"], exitCode: 1 });
-    expect(renderResult({ isError: true, content: [{ type: "text", text: refusal }] }, { ...render, json: true }).stdout).toBe(refusal);
+    // A refusal that waiting can fix exits 75 (EX_TEMPFAIL) and says when to retry.
+    expect(renderResult({ isError: true, content: [{ type: "text", text: refusal }] }, render)).toEqual({ stdout: "", stderr: ["no catalog pick fits now (job_no_model_fits)", "freellama: retryable (exit 75)"], exitCode: 75 });
+    expect(renderResult({ isError: true, content: [{ type: "text", text: refusal }] }, { ...render, json: true })).toMatchObject({ stdout: refusal, exitCode: 75 });
+    const busy = JSON.stringify({ code: "admission_timeout", error: "server busy", retry_after_seconds: 3 });
+    expect(renderResult({ isError: true, content: [{ type: "text", text: busy }] }, render).stderr.at(-1)).toBe("freellama: retryable; retry after 3s (exit 75)");
+    expect(renderResult({ isError: true, content: [{ type: "text", text: "bad schema" }] }, render).exitCode).toBe(1);
     expect(refusalOf(refusal).unavailable).toBe(true);
     expect(refusalOf("model output was invalid").unavailable).toBe(false);
   });
@@ -163,23 +169,23 @@ describe("fllama output", () => {
     const text = "[m] Here is the fix:\n```ts\nconst a = 1;\n\nconst b = 2;\n```\nand another\n```\nx\n```";
     expect(renderResult({ content: [{ type: "text", text }], structuredContent: {} }, { ...render, extract: true }).stdout).toBe("const a = 1;\n\nconst b = 2;");
     const plain = renderResult({ content: [{ type: "text", text: "[m] no code" }], structuredContent: {} }, { ...render, extract: true });
-    expect(plain).toMatchObject({ stdout: "no code", stderr: ["fllama: --extract found no code block; printing the whole answer"] });
+    expect(plain).toMatchObject({ stdout: "no code", stderr: ["freellama: --extract found no code block; printing the whole answer"] });
   });
 
   it("fails an empty, thinking-only answer with the CLI flag that fixes it", () => {
     const text = "[m] (empty answer: the model spent its output (200 tokens) thinking; pass think:false or raise options.num_predict)";
     expect(renderResult({ content: [{ type: "text", text }], structuredContent: {} }, render)).toEqual({
-      stdout: "", stderr: ["fllama: empty answer: the model spent its output thinking; rerun with --think=false or raise -o num_predict=N"], exitCode: 1,
+      stdout: "", stderr: ["freellama: empty answer: the model spent its output thinking; rerun with --think=false or raise -o num_predict=N"], exitCode: 1,
     });
   });
 
   it("prints a deferred job's id on stdout", () => {
     const rendered = renderResult({ structuredContent: { deferred: true, job: { id: "abc", status: "queued" } } }, render);
-    expect(rendered).toEqual({ stdout: "abc", stderr: ["deferred; wait for it with: fllama job abc --wait"], exitCode: 0 });
+    expect(rendered).toEqual({ stdout: "abc", stderr: ["deferred; wait for it with: freellama job abc --wait"], exitCode: 0 });
   });
 });
 
-describe("fllama tool registry", () => {
+describe("freellama tool registry", () => {
   it("runs the real run_task handler: a workflow gets the job's pick and system prompt", async () => {
     const result = await callTool("run_task", parseRunArgs(["-w", "fix-bug", "parser drops a token"]).args);
     expect(result.isError).toBeFalsy();
@@ -192,13 +198,13 @@ describe("fllama tool registry", () => {
 
   it("refuses what MCP refuses, with the tool's own schema", async () => {
     await expect(callTool("run_task", { bogus: 1 })).rejects.toThrow(/run_task: .*bogus/);
-    await expect(callTool("no_such_tool", {})).rejects.toThrow(/fllama tools/);
+    await expect(callTool("no_such_tool", {})).rejects.toThrow(/freellama tools/);
   });
 
   it("exits 2 on a usage error and 0 on help", async () => {
     const lines: string[] = [];
     const io = { out: (text: string) => lines.push(text), err: (text: string) => lines.push(text) };
-    expect(await main(["run", "--dimensions", "3", "x"], io)).toBe(2);
+    expect(await main(["run", "-w", "fix-bug", "--dimensions", "3", "x"], io)).toBe(2);
     expect(await main(["--help"], io)).toBe(0);
     expect(await main(["nope"], io)).toBe(2);
   });
@@ -479,7 +485,7 @@ describe("gateway over HTTP", () => {
   });
 });
 
-describe("fllama run streaming", () => {
+describe("freellama run streaming", () => {
   let serve: import("node:http").Server;
   let endpoint = "";
   const sent: Array<Record<string, any>> = [];
@@ -492,7 +498,7 @@ describe("fllama run streaming", () => {
       request.on("end", () => {
         if (request.url === "/api/ps") return void response.end(JSON.stringify({ models: [] }));
         if (request.url === "/_freellama/v1/config") return void response.end(JSON.stringify({ context_shift: "off" }));
-        sent.push(JSON.parse(raw || "{}"));
+        sent.push({ ...JSON.parse(raw || "{}"), _path: request.url });
         response.writeHead(200, { "content-type": "application/x-ndjson" });
         response.end(reply.map((line) => `${line}\n`).join(""));
       });
@@ -531,6 +537,20 @@ describe("fllama run streaming", () => {
     expect(err.at(-1)).toMatch(/output 2 tokens, 20\.0 tokens\/s/);
   });
 
+  it("fills in the middle on /api/generate with the prompt and --suffix", async () => {
+    reply = [
+      JSON.stringify({ response: "  return a + b", done: false }),
+      JSON.stringify({ response: "", done: true, done_reason: "stop" }),
+    ];
+    const { out, io } = capture();
+    const args = { model: "qwen-coder:1", prompt: "def add(a, b):\n", suffix: "\n\nprint(add(1, 2))", endpoint };
+    expect(await streamRun(streamTarget(args)!, args, render, io, new AbortController().signal, false)).toBe(0);
+    expect(out.join("")).toBe("  return a + b\n");
+    expect(sent[0]).toMatchObject({ _path: "/api/generate", model: "qwen-coder:1", prompt: "def add(a, b):\n", suffix: "\n\nprint(add(1, 2))" });
+    expect(streamTarget({ suffix: "x", prompt: "y" })).toBeUndefined();
+    expect(() => parseRunArgs(["-w", "fix-bug", "--suffix", "x", "y"])).toThrow(/fills in the middle/);
+  });
+
   it("fails an empty answer and keeps decisions, batches and tools on the managed path", async () => {
     reply = [JSON.stringify({ message: { role: "assistant", content: "" }, done: true, done_reason: "length" })];
     const { err, io } = capture();
@@ -548,3 +568,29 @@ describe("agent guide", () => {
     for (const name of WORKFLOW_NAMES) expect(AGENT_GUIDE).toContain(name);
   });
 });
+
+describe("run_task's advertised schema is loose, its accepted one is not", () => {
+  it.each([
+    [{ workflow: "no-such-workflow", prompt: "x" }, /workflow/],
+    [{ task: "decision", state: "x", questions: { q: { type: "noul" } } }, /instructions/],
+    [{ task: "embedding", input: "x", nearest: { query: "q", bogus: 1 } }, /nearest/],
+    [{ prompt: "x", sessionId: "zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz" }, /sessionId/],
+    [{ prompt: "x", tools: [{ type: "function" }] }, /tools/],
+    [{ messages: [{ role: "wizard", content: "x" }] }, /messages/],
+  ])("refuses %j", async (args, message) => {
+    // Refused either by the advertised schema (a usage error) or by the handler's strict check.
+    let text: string;
+    try {
+      const result = await callTool("run_task", args as Record<string, unknown>);
+      expect(result.isError).toBe(true);
+      text = resultTextOf(result);
+    } catch (error) {
+      text = (error as Error).message;
+    }
+    expect(text).toMatch(message);
+  });
+});
+
+function resultTextOf(result: { content?: Array<{ text?: string }> }): string {
+  return (result.content ?? []).map((part) => part.text ?? "").join("\n");
+}

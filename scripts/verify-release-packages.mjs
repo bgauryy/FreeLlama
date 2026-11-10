@@ -84,6 +84,10 @@ for (const [directory, expectedName] of publicPackages) {
     if ([...paths].some((file) => file.startsWith("vendor/"))) {
       throw new Error(`${directory}: CLI binaries belong only in optional platform packages`);
     }
+    // `freellama run`, `chat`, `gateway`… run from the MCP package of the same release.
+    if (packageManifest.dependencies?.["@octocodeai/freellama-mcp-server"] !== version) {
+      throw new Error(`${directory}: dependency @octocodeai/freellama-mcp-server must match workspace version ${version}`);
+    }
   } else {
     for (const file of [
       "dist/index.js", "dist/agent-cli.js", "native/index.js", "native/index.d.ts", "native/package.json",

@@ -12,7 +12,7 @@ prompts, task dependencies, judgment, and verification. Ollama and the host exec
 | Architecture and ownership | [Architecture](docs/ARCHITECTURE.md) |
 | MCP tool choice, request shapes, and agent workflow | [MCP reference](packages/mcp/README.md) |
 | Every API surface on one page | [Every API](docs/API.md) |
-| Shell access and Ollama, OpenAI and Anthropic protocol access to jobs and workflows | [`fllama` agent CLI and gateway](docs/AGENT_CLI.md) |
+| Shell access and Ollama, OpenAI and Anthropic protocol access to jobs and workflows | [agent commands and gateway](docs/AGENT_CLI.md) |
 | Ollama/model operation procedure | [FreeLlama skill](skills/freellama/SKILL.md) |
 | CPU/GPU topology and observed placement | [CPU/GPU routing](docs/CPU_GPU_ROUTING.md) |
 | Runtime resource limits and status | [Monitoring](docs/MONITORING.md) |
@@ -40,8 +40,8 @@ prompts, task dependencies, judgment, and verification. Ollama and the host exec
   the caller sends wins. Act on a result's `check:` lines before relying on it.
 - An empty LSP result is ambiguous. Retry or search instead; a cold zero does not prove a language
   is unsupported. Structural code search requires `pattern` or `rule`, not `keywords` alone.
-- `fllama` adds a door, not authority. `fllama tool ollama_pull|ollama_delete` and
-  `fllama pull|rm|create` follow the same approval rules. `fllama serve` is `ollama serve`. MCP
+- The agent commands (`freellama run`, `chat`, `gateway`, `tool`…) add a door, not authority:
+  `freellama tool ollama_pull|ollama_delete` follow the same approval rules. MCP
   tools register from `packages/mcp/src/tools/registrations.ts` alone, and virtual-model
   resolution lives only in `packages/mcp/src/agent-cli/virtual.ts`.
 - Research adapter implementations live only in `packages/mcp/src/research/`. Preserve full audit

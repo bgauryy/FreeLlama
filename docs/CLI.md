@@ -6,7 +6,7 @@ and Ollama-compatible passthrough. Use the [README CLI section](https://github.c
 use and this reference to look up commands and controls.
 
 To use local models from a shell the way `ollama run` works, with job picks, workflows and files,
-use [`fllama`](AGENT_CLI.md). [Every API](API.md) puts all the surfaces on one page.
+use the [agent commands](AGENT_CLI.md) (`freellama run`, `chat`, `gateway`…). [Every API](API.md) puts all the surfaces on one page.
 
 ## Choose a command
 
@@ -389,16 +389,16 @@ to stdout unless `--out` is given, and reports a refusal as one `error: ...` lin
 
 ## Compare the CLI and MCP surfaces
 
-| Need | `freellama` (this CLI) | MCP | `fllama` |
+| Need | Operator commands | MCP | Agent commands (`run`, `chat`, `gateway`, `tool`) |
 |---|---|---|---|
 | Run the service, the proxy, benchmarks, policies, tokens | `serve`, `proxy`, `bench-all`, `policy from-eval`, `auth-token` | — | — |
-| One task with a job's pick, prompts and files | `task` (by task kind, no jobs) | `run_task {job\|workflow, files}` | `fllama run -j\|-w … -f …` |
-| Batches, embeddings with `nearest`, decisions | `task` (one item) | `run_task {tasks}`, `nearest`, `questions` | `fllama run -j find-code`, `--ask`; batches through `fllama tool run_task` |
-| Model library search and pulls | — | `models {view:"library"}`, `ollama_pull` | `fllama tool models\|ollama_pull`, or `fllama pull` (approval still applies) |
-| Research, sweeps, speech, saved responses | — | `delegate_research`, `sweep`, `audio`, `read_response` | `fllama tool NAME JSON` |
-| Ollama, OpenAI and Anthropic clients | `serve` passthrough (real tags) | — | `fllama gateway` (virtual models and real tags) |
+| One task with a job's pick, prompts and files | `task` (by task kind, no jobs) | `run_task {job\|workflow, files}` | `freellama run -j\|-w … -f …` |
+| Batches, embeddings with `nearest`, decisions | `task` (one item) | `run_task {tasks}`, `nearest`, `questions` | `freellama run -j find-code`, `--ask`; batches through `freellama tool run_task` |
+| Model library search and pulls | — | `models {view:"library"}`, `ollama_pull` | `freellama tool models\|ollama_pull` (approval still applies) |
+| Research, sweeps, speech, saved responses | — | `delegate_research`, `sweep`, `audio`, `read_response` | `freellama tool NAME JSON` |
+| Ollama, OpenAI and Anthropic clients | `serve` passthrough (real tags) | — | `freellama gateway` (virtual models and real tags) |
 
-`fllama tool` reaches all 13 MCP tools with the same schemas, because both surfaces register from
+`freellama tool` reaches all 13 MCP tools with the same schemas, because both surfaces register from
 one list. For the MCP tool contracts, read the
 [MCP package reference](https://github.com/bgauryy/FreeLlama/blob/main/packages/mcp/README.md)
 and [Every API](API.md#mcp-tools).

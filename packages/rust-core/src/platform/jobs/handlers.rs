@@ -4,9 +4,10 @@ use std::sync::{Arc, Mutex};
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
 };
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::platform::{PlatformState, error::ApiError};
@@ -33,9 +34,19 @@ pub(in crate::platform) async fn list(
     Ok(Json(current))
 }
 
+/// The longest a job read waits for a change: below every client's control timeout.
+const MAX_LONG_POLL: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[derive(Debug, Default, Deserialize)]
+pub(in crate::platform) struct GetQuery {
+    /// Wait up to this long (capped at five seconds) for the job to change before answering.
+    wait_ms: Option<u64>,
+}
+
 pub(in crate::platform) async fn get(
     State(state): State<PlatformState>,
     Path(id): Path<String>,
+    Query(query): Query<GetQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let job = match lookup(&state.jobs, &id) {
         Ok(job) => job,
@@ -48,11 +59,41 @@ pub(in crate::platform) async fn get(
             return Err(error);
         }
     };
+    let Some(wait) = query
+        .wait_ms
+        .map(|ms| std::time::Duration::from_millis(ms).min(MAX_LONG_POLL))
+    else {
+        let receipt = job
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .receipt(true);
+        return Ok(Json(json!({"job":receipt})));
+    };
+    // Register for the next change before reading the status, so a change between the read
+    // and the wait still wakes this request.
+    let changed = job
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .changed
+        .clone();
+    let notified = changed.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+    let terminal = job
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .status
+        .terminal();
+    if !terminal {
+        let _ = tokio::time::timeout(wait, notified).await;
+    }
     let receipt = job
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .receipt(true);
-    Ok(Json(json!({"job":receipt})))
+    // `long_poll` tells a client this serve waits, so it need not sleep between reads; an
+    // older serve ignores `wait_ms` and omits it.
+    Ok(Json(json!({"job":receipt,"long_poll":true})))
 }
 
 pub(in crate::platform) async fn cancel(
@@ -61,7 +102,7 @@ pub(in crate::platform) async fn cancel(
 ) -> Result<Json<Value>, ApiError> {
     if lookup(&state.jobs, &id).is_err() {
         // Recovery never claims to cancel a worker owned by a different process.
-        return get(State(state), Path(id)).await;
+        return get(State(state), Path(id), Query(GetQuery::default())).await;
     }
     let job = cancel_job(&state, &id).await?;
     let receipt = job
@@ -86,6 +127,7 @@ async fn cancel_job(state: &PlatformState, id: &str) -> Result<Arc<Mutex<Job>>, 
             current.status = JobStatus::Cancelling;
             current.reason = "cancellation_requested";
             let _ = current.cancel.send(true);
+            current.changed.notify_waiters();
         }
         current.done.clone()
     };

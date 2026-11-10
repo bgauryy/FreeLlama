@@ -236,7 +236,7 @@ Set these values in the MCP host environment:
 - `FREELLAMA_MCP_ALLOWED_ROOTS`: exact directories available to `delegate_research`.
 - `FREELLAMA_SERVE_ENDPOINT`: authenticated FreeLlama endpoint.
 
-`fllama gateway` listens on loopback only and has no authentication of its own: it refuses
+`freellama gateway` listens on loopback only and has no authentication of its own: it refuses
 non-loopback `Origin` and `Host` headers and forwards the client's `authorization` and `x-api-key`
 headers to serve.
 

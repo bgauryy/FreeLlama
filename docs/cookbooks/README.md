@@ -19,6 +19,6 @@ Short recipes for one job each: when to use it, which model, the exact call, and
 | Let FreeLlama pick the model and prompt for a job | [jobs](jobs.md) |
 | Memory, context and caching | [memory-and-caching](memory-and-caching.md) |
 
-From a shell, each `run_task` job runs with `fllama run -j <job>` (or `-w <workflow>`); the speech, research and sweep recipes run with `fllama tool audio|delegate_research|sweep '<arguments>'` ([agent CLI](../AGENT_CLI.md)).
+From a shell, each `run_task` job runs with `freellama run -j <job>` (or `-w <workflow>`); the speech, research and sweep recipes run with `freellama tool audio|delegate_research|sweep '<arguments>'` ([agent CLI](../AGENT_CLI.md)).
 
 Every call here is checked against the tool schemas by a test. Measured results come from one machine: an Apple M2 Pro with 32 GB. Measure on yours before you rely on them.

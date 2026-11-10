@@ -273,4 +273,7 @@ pub(crate) struct OllamaRequestOptions {
     pub(crate) options: Option<Map<String, Value>>,
     pub(crate) logprobs: Option<bool>,
     pub(crate) top_logprobs: Option<u32>,
+    /// Embedding tasks: shorten each vector to this many dimensions (`/api/embed` `dimensions`),
+    /// for models trained to allow it (Matryoshka embeddings such as embeddinggemma or nomic).
+    pub(crate) dimensions: Option<u32>,
 }

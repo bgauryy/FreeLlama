@@ -7,11 +7,11 @@ use std::{
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
 };
 use uuid::Uuid;
 
-use super::handlers::{cancel, get, list, remove};
+use super::handlers::{GetQuery, cancel, get, list, remove};
 use super::progress::JobProgress;
 use super::registry::{
     JobRegistry, PendingRegistration, RegistryFull, fits_retention_limit, journal,
@@ -228,10 +228,14 @@ async fn durable_receipts_recover_terminal_results_and_mark_interrupted_work_unk
         .await
         .unwrap();
     let (_, restarted) = super::super::build(&config).unwrap();
-    let recovered = get(State(restarted.clone()), Path(id.clone()))
-        .await
-        .unwrap()
-        .0;
+    let recovered = get(
+        State(restarted.clone()),
+        Path(id.clone()),
+        Query(GetQuery::default()),
+    )
+    .await
+    .unwrap()
+    .0;
     assert_eq!(
         recovered["job"]["error"]["code"],
         "task_job_outcome_unknown"
@@ -250,10 +254,14 @@ async fn durable_receipts_recover_terminal_results_and_mark_interrupted_work_unk
         )
         .await
         .unwrap();
-    let recovered = get(State(restarted.clone()), Path(id.clone()))
-        .await
-        .unwrap()
-        .0;
+    let recovered = get(
+        State(restarted.clone()),
+        Path(id.clone()),
+        Query(GetQuery::default()),
+    )
+    .await
+    .unwrap()
+    .0;
     assert_eq!(recovered["job"]["result"]["answer"], 42);
     assert_eq!(
         list(State(restarted.clone())).await.unwrap().0["jobs"]
@@ -265,7 +273,11 @@ async fn durable_receipts_recover_terminal_results_and_mark_interrupted_work_unk
     let _ = remove(State(restarted.clone()), Path(id.clone()))
         .await
         .unwrap();
-    assert!(get(State(restarted), Path(id)).await.is_err());
+    assert!(
+        get(State(restarted), Path(id), Query(GetQuery::default()))
+            .await
+            .is_err()
+    );
 }
 
 #[test]
@@ -348,6 +360,7 @@ fn job(finished: Option<Instant>) -> Job {
         persistence_error: None,
         persistence_state: "disabled",
         input_bytes: 0,
+        changed: std::sync::Arc::new(tokio::sync::Notify::new()),
     }
 }
 
@@ -466,4 +479,33 @@ fn retention_counts_encoded_json_bytes_and_accepts_the_exact_boundary() {
     assert!(!fits_retention_limit(&json!(
         "é".repeat(MAX_RESULT_BYTES / 2)
     )));
+}
+
+#[tokio::test]
+async fn a_long_poll_answers_when_the_job_changes_not_at_its_deadline() {
+    let job = Arc::new(Mutex::new(job(None)));
+    let changed = job.lock().unwrap().changed.clone();
+    let poller = {
+        let job = job.clone();
+        tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let notified = changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), notified).await;
+            (started.elapsed(), job.lock().unwrap().status)
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    {
+        let mut current = job.lock().unwrap();
+        current.status = JobStatus::Completed;
+        current.changed.notify_waiters();
+    }
+    let (waited, status) = poller.await.unwrap();
+    assert_eq!(status, JobStatus::Completed);
+    assert!(
+        waited < std::time::Duration::from_secs(1),
+        "woke after {waited:?}"
+    );
 }

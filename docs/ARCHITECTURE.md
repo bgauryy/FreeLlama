@@ -72,7 +72,7 @@ flowchart TB
     subgraph clients["Clients"]
         CLI["freellama CLI"]
         MCP["MCP client"]
-        FLL["fllama CLI / gateway"]
+        FLL["freellama CLI / gateway"]
         RUST["Embedded Rust application"]
         RAW["Ollama-compatible client"]
     end
@@ -107,7 +107,7 @@ The CLI and MCP server do not reimplement routing. `freellama` commands other th
 `doctor`, `init`, `catalog` (it falls back to the shipped catalog), `auth-token`, `bench-all`, and
 `policy from-eval` are HTTP clients of a running `freellama serve`. The MCP server reaches the same control API through the feature-gated NAPI boundary, and unless `FREELLAMA_MCP_AUTOSTART_SERVE=0`
 it starts the bundled `serve` in the background at launch when nothing answers on the default endpoint.
-`fllama` calls the same MCP tool handlers in-process. Its gateway runs a non-streamed Ollama or OpenAI
+The agent commands (`freellama run`, `chat`, `gateway`…) call the same MCP tool handlers in-process. Its gateway runs a non-streamed Ollama or OpenAI
 chat on a `freellama/<workflow|job|auto>` virtual model as managed `run_task`, rewrites streamed and
 Anthropic or OpenAI Responses requests for serve's Ollama passthrough, and proxies everything else to
 serve ([agent CLI](AGENT_CLI.md)).
@@ -581,7 +581,7 @@ confined adapter subprocess), and destructive lifecycle operations (`ollama_mana
 `ollama_delete`) in separate tools, so `run_task` never acquires file access and lifecycle
 operations are not hidden inside a generic action. Tool schemas and security annotations
 are registered in `packages/mcp/src/tools/registrations.ts`; the tool list is in
-[API](API.md#mcp-tools). `fllama tool NAME JSON` calls the same handlers from a shell.
+[API](API.md#mcp-tools). `freellama tool NAME JSON` calls the same handlers from a shell.
 
 ## Grounded research flow
 

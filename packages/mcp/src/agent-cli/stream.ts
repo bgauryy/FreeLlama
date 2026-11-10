@@ -1,4 +1,4 @@
-// `fllama run` on a terminal: tokens stream as Ollama generates them, the way `ollama run` shows
+// `freellama run` on a terminal: tokens stream as Ollama generates them, the way `ollama run` shows
 // them, while the request still gets FreeLlama's handling: the job's pick and prompts (or a direct
 // tag), the loaded runner's window, serve's context-shift setting and managed admission for a cold
 // load (virtual.ts prepareForward). Checks and stats follow on stderr. Tasks a stream cannot carry
@@ -6,6 +6,7 @@
 import { DEFAULT_SERVE_ENDPOINT } from "../config.js";
 import { applyTaskFiles } from "../task-files.js";
 import type { RenderOptions } from "./args.js";
+import { EXIT_RETRY } from "./output.js";
 import { record, type Fields } from "./util.js";
 import { directModel, GatewayError, prepareForward, streamChecks, virtualModel, type VirtualModel } from "./virtual.js";
 
@@ -13,6 +14,8 @@ type Io = { out: (text: string) => void; err: (text: string) => void; write: (te
 
 /** The model a streamed run resolves, or undefined when the task needs the managed path. */
 export function streamTarget(args: Fields): VirtualModel | undefined {
+  // Fill in the middle runs on the named model only.
+  if (args.suffix !== undefined) return typeof args.model === "string" ? directModel(args.model) : undefined;
   if (["tools", "defer", "preview", "saveAs", "questions", "state", "input", "nearest", "sessionId", "scopeId"].some((field) => args[field] !== undefined)) return undefined;
   if (args.task === "decision" || args.task === "embedding") return undefined;
   if (typeof args.workflow === "string") return virtualModel(`freellama/${args.workflow}`);
@@ -41,13 +44,19 @@ export async function streamRun(target: VirtualModel, args: Fields, render: Rend
   const { payload } = applyTaskFiles({ task: target.vision ? "vision" : "completion", prompt: args.prompt as string | undefined }, args.files as string[] | undefined);
   const images = (payload as { images?: string[] }).images;
   const options = { ...record(args.options), ...(typeof args.contextTokens === "number" ? { num_ctx: args.contextTokens } : {}) };
+  // Fill in the middle is a completion between `prompt` and `suffix` on /api/generate; every
+  // other run is a chat.
+  const fill = typeof args.suffix === "string";
+  const path = fill ? "/api/generate" : "/api/chat";
   const body: Fields = {
     model: target.name,
     stream: true,
-    messages: [
-      ...(typeof args.systemPrompt === "string" ? [{ role: "system", content: args.systemPrompt }] : []),
-      { role: "user", content: payload.prompt ?? "", ...(images?.length ? { images } : {}) },
-    ],
+    ...(fill ? { prompt: payload.prompt ?? "", suffix: args.suffix } : {
+      messages: [
+        ...(typeof args.systemPrompt === "string" ? [{ role: "system", content: args.systemPrompt }] : []),
+        { role: "user", content: payload.prompt ?? "", ...(images?.length ? { images } : {}) },
+      ],
+    }),
     ...(Object.keys(options).length > 0 ? { options } : {}),
     ...(args.think !== undefined ? { think: args.think } : {}),
     ...(args.format !== undefined ? { format: args.format } : {}),
@@ -55,27 +64,32 @@ export async function streamRun(target: VirtualModel, args: Fields, render: Rend
   };
   let prepared;
   try {
-    prepared = await prepareForward("/api/chat", target, body, endpoint, signal);
+    prepared = await prepareForward(path, target, body, endpoint, signal);
   } catch (error) {
     if (signal.aborted) return 130;
-    io.err(error instanceof GatewayError ? error.message : `fllama: ${(error as Error).message}`);
+    io.err(error instanceof GatewayError ? error.message : `freellama: ${(error as Error).message}`);
+    // A refusal waiting can fix (busy, memory, Ollama down) is retryable.
+    if (error instanceof GatewayError && error.status === 503) {
+      io.err(`freellama: retryable (exit ${EXIT_RETRY})`);
+      return EXIT_RETRY;
+    }
     return 1;
   }
   const { resolution } = prepared;
   if (render.verbose) io.err(`[${resolution.model} · num_ctx ${prepared.numCtx ?? "default"} from ${resolution.contextSource ?? "Ollama"}${prepared.runner === "warmed" ? " · loaded through admission" : ""}]`);
   let reply: Response;
   try {
-    reply = await fetch(new URL("/api/chat", endpoint ?? DEFAULT_SERVE_ENDPOINT), {
+    reply = await fetch(new URL(path, endpoint ?? DEFAULT_SERVE_ENDPOINT), {
       method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(prepared.body), signal,
     });
   } catch (error) {
     if (signal.aborted) return 130;
-    io.err(`fllama: serve did not answer: ${(error as Error).message}`);
+    io.err(`freellama: serve did not answer: ${(error as Error).message}`);
     return 1;
   }
   if (!reply.ok || !reply.body) {
     const text = await reply.text().catch(() => "");
-    io.err(`fllama: ${String(record(safeJson(text))?.error ?? (text || `HTTP ${reply.status}`))}`);
+    io.err(`freellama: ${String(record(safeJson(text))?.error ?? (text || `HTTP ${reply.status}`))}`);
     return 1;
   }
   const decoder = new TextDecoder();
@@ -87,7 +101,7 @@ export async function streamRun(target: VirtualModel, args: Fields, render: Rend
     const chunk = record(safeJson(line));
     if (!chunk) return;
     if (typeof chunk.error === "string") throw new Error(chunk.error);
-    const message = record(chunk.message);
+    const message = fill ? { content: chunk.response, thinking: chunk.thinking } : record(chunk.message);
     const thought = message?.thinking;
     if (typeof thought === "string" && thought !== "" && showThinking && !render.hideThinking && !render.quiet) {
       if (!thinking) io.err("thinking:");
@@ -116,16 +130,16 @@ export async function streamRun(target: VirtualModel, args: Fields, render: Rend
       io.write("\n");
       return 130;
     }
-    io.err(`fllama: ${(error as Error).message}`);
+    io.err(`freellama: ${(error as Error).message}`);
     return 1;
   }
   if (answer !== "" && !answer.endsWith("\n")) io.write("\n");
   if (answer.trim() === "") {
     const why = done?.done_reason === "length" ? "the output budget ran out (thinking?); rerun with --think=false or raise -o num_predict=N" : "the model returned nothing";
-    io.err(`fllama: empty answer: ${why}`);
+    io.err(`freellama: empty answer: ${why}`);
     return 1;
   }
-  if (done?.done_reason === "length" && !render.quiet) io.err("fllama: the answer stopped at the output limit; raise -o num_predict=N for the rest");
+  if (done?.done_reason === "length" && !render.quiet) io.err("freellama: the answer stopped at the output limit; raise -o num_predict=N for the rest");
   if (!render.quiet) for (const check of streamChecks(resolution, answer)) io.err(`check: ${check}`);
   if (render.verbose && done) io.err(doneStats(done));
   return 0;

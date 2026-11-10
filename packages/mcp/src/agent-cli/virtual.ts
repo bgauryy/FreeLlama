@@ -16,7 +16,7 @@ import { DEFAULT_SERVE_ENDPOINT } from "../config.js";
 export const VIRTUAL_PREFIX = "freellama/";
 /** The job whose picks serve a general chat: its picks are the tested chat models. */
 export const CHAT_JOB: JobName = "summarize";
-/** Decision and embedding jobs need fields a chat cannot carry; `fllama run` serves them. */
+/** Decision and embedding jobs need fields a chat cannot carry; `freellama run` serves them. */
 const CHAT_TASKS = new Set(["coding", "completion", "vision"]);
 
 export type VirtualModel = {
@@ -463,7 +463,7 @@ export type Forward = Rewrite & { runner: "resident" | "warmed" | "assessed"; nu
 /**
  * Everything before a request goes to Ollama's own endpoint: resolve and rewrite it, match serve's
  * context-shift setting on the native API (a runner load option), and admit a cold load. Shared by
- * the gateway and `fllama run`'s streaming path.
+ * the gateway and `freellama run`'s streaming path.
  */
 export async function prepareForward(path: string, model: VirtualModel, body: Fields, serveEndpoint?: string, signal?: AbortSignal): Promise<Forward> {
   const rewriter = REWRITERS[path];

@@ -7,7 +7,8 @@ type Fields = Record<string, unknown>;
 export type JobCalls = {
   /** The task request with `defer:true`. */
   submit: () => Promise<string>;
-  get: (id: string) => Promise<string>;
+  /** `waitMs`: ask serve to hold the read until the job changes (a long poll); older serves ignore it. */
+  get: (id: string, waitMs?: number) => Promise<string>;
   cancel: (id: string) => Promise<string>;
   /**
    * The unchanged synchronous call, used only when submission was refused before execution;
@@ -68,6 +69,11 @@ const FIRST_POLL_MS = 25;
  */
 const HEARTBEAT_MS = 10_000;
 const MAX_POLL_MS = 2_000;
+/**
+ * How long one read may wait for the job to change on a serve that long-polls. A change answers
+ * at once; the cap keeps a cancellation (checked between reads) responsive.
+ */
+const LONG_POLL_MS = 1_000;
 /** Consecutive failed polls before the transport error is reported; any success resets it. */
 const MAX_POLL_FAILURES = 5;
 /** Cancel requests sent before the cancellation is reported as unknown. */
@@ -294,6 +300,7 @@ export async function runWithJobProgress(
     let lastReportAt = Date.now();
     let phaseStartedAt = lastReportAt;
     let delay = FIRST_POLL_MS;
+    let longPoll = false;
     let failures = 0;
     for (;;) {
       if (signal?.aborted) {
@@ -317,14 +324,17 @@ export async function runWithJobProgress(
         lastReportAt = now;
       }
       if (TERMINAL.has(String(job.status))) break;
-      await wait(delay, signal);
+      // A long-polling serve answers when the job changes, so there is nothing to sleep for.
+      if (!longPoll) await wait(delay, signal);
       if (signal?.aborted) {
         cancel();
         throw aborted(id, await cancellationState());
       }
       delay = Math.min(MAX_POLL_MS, delay * 2);
       try {
-        const polled = object(object(JSON.parse(await calls.get(id)))?.job);
+        const reply = object(JSON.parse(await calls.get(id, LONG_POLL_MS)));
+        if (reply?.long_poll === true) longPoll = true;
+        const polled = object(reply?.job);
         if (polled) job = polled;
         failures = 0;
       } catch (error) {

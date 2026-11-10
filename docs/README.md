@@ -10,7 +10,7 @@ Start with the [repository README](https://github.com/bgauryy/FreeLlama/blob/mai
 |---|---|
 | Install and run one task | [README](https://github.com/bgauryy/FreeLlama/blob/main/README.md#install) |
 | Find which API fits your client | [Every API](API.md) |
-| Run tasks from a shell, or serve workflows to Ollama, OpenAI and Anthropic clients | [`fllama`](AGENT_CLI.md) |
+| Run tasks from a shell, or serve workflows to Ollama, OpenAI and Anthropic clients | [Agent commands and gateway](AGENT_CLI.md) |
 
 ## Choose a guide
 

@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // Per-workflow quality eval: each text workflow's cases on each candidate model, run exactly as an
-// agent runs them (`fllama run -w WORKFLOW -m MODEL`, so the same prompts, options and checks),
+// agent runs them (`freellama run -w WORKFLOW -m MODEL`, so the same prompts, options and checks),
 // graded deterministically: required facts present, invented ones absent, length bounds, filler,
-// exact JSON fields, the planted bug named. Needs a running Ollama and the built fllama
+// exact JSON fields, the planted bug named. Needs a running Ollama and the built freellama
 // (`yarn build`); models must already be installed (nothing is pulled).
 //
 //   node scripts/local-test/workflows.mjs [--models a,b] [--workflows x,y] [--out report.json]

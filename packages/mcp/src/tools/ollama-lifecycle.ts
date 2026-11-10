@@ -295,7 +295,7 @@ export function registerOllamaLifecycleTools(server: McpServer, pullDependencies
             ? await warmModelRequest(endpoint, request)
             : await runWithJobProgress({
               submit: () => warmModelRequest(endpoint, { ...request, defer: true }),
-              get: (id) => getTaskJob(endpoint, id),
+              get: (id, waitMs) => getTaskJob(endpoint, id, waitMs),
               cancel: (id) => cancelTaskJob(endpoint, id),
               // Reached only when serve refused the job before running it (registry full).
               sync: () => warmModelRequest(endpoint, request),

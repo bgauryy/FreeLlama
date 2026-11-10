@@ -48,15 +48,21 @@ function thinkingOf(structured: Record<string, unknown>): string | undefined {
 export function renderResult(result: ToolResult, options: RenderOptions, showThinking = false): Rendered {
   const structured = result.structuredContent ?? {};
   if (result.isError) {
+    const text = resultText(result);
+    const refusal = refusalOf(text);
+    // 75 (EX_TEMPFAIL): busy, short of memory or Ollama down; the same call can succeed later.
+    const exitCode = refusal.unavailable ? EXIT_RETRY : 1;
     // --json keeps the refusal's fields (code, picks, what holds memory) for a script to read.
-    if (options.json) return { stdout: resultText(result), stderr: [], exitCode: 1 };
-    return { stdout: "", stderr: [refusalOf(resultText(result)).message], exitCode: 1 };
+    if (options.json) return { stdout: text, stderr: [], exitCode };
+    const retry = retryAfterSeconds(text);
+    const note = exitCode === EXIT_RETRY ? [`freellama: retryable${retry !== undefined ? `; retry after ${retry}s` : ""} (exit ${EXIT_RETRY})`] : [];
+    return { stdout: "", stderr: [refusal.message, ...note], exitCode };
   }
   if (options.json) return { stdout: JSON.stringify(result.structuredContent ?? { text: resultText(result) }, null, 2), stderr: [], exitCode: 0 };
   const stderr: string[] = [];
   const job = record(structured.job);
   if (structured.deferred === true && typeof job?.id === "string") {
-    if (!options.quiet) stderr.push(`deferred; wait for it with: fllama job ${job.id} --wait`);
+    if (!options.quiet) stderr.push(`deferred; wait for it with: freellama job ${job.id} --wait`);
     return { stdout: job.id, stderr, exitCode: 0 };
   }
   const { label, answer: body, checks } = splitAnswer(resultText(result));
@@ -72,7 +78,7 @@ export function renderResult(result: ToolResult, options: RenderOptions, showThi
     if (stats) stderr.push(stats);
   }
   // An answer cut at the output limit reads complete but is not.
-  if (record(structured.response)?.done_reason === "length" && !options.quiet) stderr.push("fllama: the answer stopped at the output limit; raise -o num_predict=N for the rest");
+  if (record(structured.response)?.done_reason === "length" && !options.quiet) stderr.push("freellama: the answer stopped at the output limit; raise -o num_predict=N for the rest");
   // An embedding run prints its vectors (`ollama run EMBEDDING_MODEL "text"` does).
   const vectors = record(structured.response)?.embeddings;
   if (Array.isArray(vectors) && vectors.length > 0) return { stdout: JSON.stringify(vectors.length === 1 ? vectors[0] : vectors), stderr, exitCode: 0 };
@@ -82,12 +88,12 @@ export function renderResult(result: ToolResult, options: RenderOptions, showThi
   // A thinking model that spent the whole budget answers nothing: that is a failure for a script.
   if (/^\(empty (answer|response)/.test(answer)) {
     const hint = answer.includes("thinking") ? "the model spent its output thinking; rerun with --think=false or raise -o num_predict=N" : "the model returned nothing";
-    return { stdout: "", stderr: [...stderr, `fllama: empty answer: ${hint}`], exitCode: 1 };
+    return { stdout: "", stderr: [...stderr, `freellama: empty answer: ${hint}`], exitCode: 1 };
   }
   if (options.extract) {
     const block = firstCodeBlock(answer);
     if (block === undefined) {
-      stderr.push("fllama: --extract found no code block; printing the whole answer");
+      stderr.push("freellama: --extract found no code block; printing the whole answer");
       return { stdout: answer, stderr, exitCode: 0 };
     }
     return { stdout: block, stderr, exitCode: 0 };
@@ -122,3 +128,15 @@ export function refusalOf(text: string): { message: string; code?: string; unava
   return { message, ...(code ? { code } : {}), unavailable };
 }
 
+/** Exit code for a refusal that waiting can fix (sysexits.h EX_TEMPFAIL). */
+export const EXIT_RETRY = 75;
+
+/** The `retry_after_seconds` a JSON refusal carries, if any. */
+function retryAfterSeconds(text: string): number | undefined {
+  try {
+    const value = record(JSON.parse(text))?.retry_after_seconds;
+    return typeof value === "number" ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}

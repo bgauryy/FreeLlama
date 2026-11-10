@@ -1,4 +1,4 @@
-// `fllama run` / `fllama chat` flags -> `run_task` arguments. Pure: no I/O except reading the
+// `freellama run` / `freellama chat` flags -> `run_task` arguments. Pure: no I/O except reading the
 // `@file` values the caller names. `ollama run` flags keep their meaning; a flag whose effect a
 // managed task cannot honor is refused with the command that can, never silently dropped.
 import { existsSync, readFileSync, statSync } from "node:fs";
@@ -23,11 +23,11 @@ type RunPlan = {
   promptless: boolean;
   /** --each: one task per file named by -f, run as one batch. */
   each?: boolean;
-  /** The model came from the first word (`fllama run WORD …`), so it may be a prompt after all. */
+  /** The model came from the first word (`freellama run WORD …`), so it may be a prompt after all. */
   positionalModel?: boolean;
 };
 
-/** Ollama attaches an image named in the prompt (`ollama run llava "what is in ./a.png"`); so does fllama. */
+/** Ollama attaches an image named in the prompt (`ollama run llava "what is in ./a.png"`); so does freellama. */
 const IMAGE_FILE = /\.(?:png|jpe?g|webp|gif|bmp)$/i;
 function isImageFile(word: string): boolean {
   const path = word.replace(/^["']|["']$/g, "");
@@ -79,6 +79,7 @@ const OPTIONS = {
   preview: { type: "boolean" },
   "save-as": { type: "string" },
   schema: { type: "string" },
+  suffix: { type: "string" },
   extract: { type: "boolean", short: "x" },
   json: { type: "boolean" },
   each: { type: "boolean" },
@@ -216,15 +217,15 @@ function questionName(question: string, taken: string[]): string {
 function jobOf(job: string | undefined, workflow: string | undefined): JobName | undefined {
   if (workflow !== undefined) {
     const flow = (WORKFLOWS as Record<string, { job: JobName }>)[workflow];
-    if (!flow) throw new UsageError(`unknown workflow "${workflow}"; \`fllama workflows\` lists them.`);
+    if (!flow) throw new UsageError(`unknown workflow "${workflow}"; \`freellama workflows\` lists them.`);
     return flow.job;
   }
   if (job === undefined) return undefined;
-  if (!(RUN_TASK_JOBS as readonly string[]).includes(job)) throw new UsageError(`unknown job "${job}"; \`fllama workflows\` lists them.`);
+  if (!(RUN_TASK_JOBS as readonly string[]).includes(job)) throw new UsageError(`unknown job "${job}"; \`freellama workflows\` lists them.`);
   return job as JobName;
 }
 
-export const RUN_USAGE = `usage: fllama run [MODEL] [PROMPT...] [flags]
+export const RUN_USAGE = `usage: freellama run [MODEL] [PROMPT...] [flags]
 
 Runs one task through FreeLlama: with --job or --workflow it picks the tested model that is
 installed and fits now and gives it that job's prompts and options. Piped stdin is the input.
@@ -233,7 +234,7 @@ With no prompt on a terminal it starts a chat.
 ollama run flags: --format json|SCHEMA  --think[=true|false|high|medium|low]  --hidethinking
   --keepalive 5m  --verbose  --ask Q [--choice key=desc ...|--level L ...]  --nowordwrap
 FreeLlama flags:
-  -w, --workflow NAME   fix-bug, write-tests, review-code, summarize-log, extract-json ... (fllama workflows)
+  -w, --workflow NAME   fix-bug, write-tests, review-code, summarize-log, extract-json ... (freellama workflows)
   -j, --job NAME        classify, find-code, duplicates, ocr, image-recognition, coding, summarize ...
   -m, --model TAG       exact installed tag (wins over the job's pick)
   -t, --task KIND       completion, coding, code-repair, tools, vision, embedding, long-context, decision
@@ -243,7 +244,8 @@ FreeLlama flags:
   --objective fastest|balanced|quality   --prefer cpu|gpu   --min-confidence low|medium
   --session UUID  --priority interactive|normal|background  --timeout S  --max-wait S
   --schema 'name, age int, tags list'|JSON|@F  structured output   -x, --extract  print only the first code block
-  --each  one answer per -f file, run as one batch   --defer  return a job id (fllama job ID)
+  --suffix TEXT|@F  fill in the middle: PROMPT is the code before the gap (models with the insert capability)
+  --each  one answer per -f file, run as one batch   --defer  return a job id (freellama job ID)
   --preview  route only (payload flags are ignored)   --save-as NAME  write a handoff
   --json  full receipt on stdout   -q, --quiet  no stderr notes   --endpoint URL  serve endpoint
   --stream / --no-stream  tokens as they arrive (default on a terminal) / one managed answer (default in a pipe)
@@ -253,7 +255,7 @@ Answers go to stdout; check: lines (verify these) and notes go to stderr.`;
 /**
  * Parse `run`/`chat` argv. `stdin` is the piped input, if any. The first positional is a model
  * only when nothing else names one and it has no whitespace (an Ollama tag cannot), so
- * `fllama run "Why is the sky blue?"` routes and `fllama run gemma4 "Why?"` pins.
+ * `freellama run "Why is the sky blue?"` routes and `freellama run gemma4 "Why?"` pins.
  */
 export function parseRunArgs(argv: string[], stdin?: string): RunPlan & { help: boolean } {
   const normalized = argv.map((arg) => (OPTIONAL_VALUE.has(arg) ? `${arg}=true` : arg));
@@ -273,9 +275,9 @@ export function parseRunArgs(argv: string[], stdin?: string): RunPlan & { help: 
   if (values.stream && values["no-stream"]) throw new UsageError("--stream and --no-stream contradict each other.");
   if (values.help) return { args: {}, render, promptless: true, help: true };
 
-  if (values.dimensions !== undefined) throw new UsageError("--dimensions truncates raw embedding vectors, which managed tasks do not return; use `ollama run MODEL --dimensions N`.");
+
   if (values.truncate !== undefined && values.truncate !== "true") throw new UsageError("--truncate=false is not supported by managed embeddings; use `ollama run MODEL --truncate=false`.");
-  if (values.voice !== undefined) throw new UsageError("--voice is speech output; use `fllama tool audio '{\"action\":\"speak\",...}'` (fllama tool audio --help).");
+  if (values.voice !== undefined) throw new UsageError("--voice is speech output; use `freellama tool audio '{\"action\":\"speak\",...}'` (freellama tool audio --help).");
 
   const questions = questionsFrom(tokens);
   // `ollama run nimble --ask …`: the first word is still the model. With no model, a question
@@ -337,7 +339,13 @@ export function parseRunArgs(argv: string[], stdin?: string): RunPlan & { help: 
     defer: values.defer,
     preview: values.preview,
     saveAs: values["save-as"],
+    dimensions: positiveInt(values.dimensions, "--dimensions"),
+    // Fill in the middle: the prompt is the code before the gap, this is the code after it.
+    suffix: values.suffix === undefined ? undefined : valueOrFile(values.suffix, "--suffix"),
   };
+  if (args.suffix !== undefined && (job !== undefined || values.workflow !== undefined || questions !== undefined)) {
+    throw new UsageError("--suffix fills in the middle on one model: name it (freellama run MODEL PREFIX --suffix SUFFIX), without -w, -j or --ask.");
+  }
 
   if (kind === "decision") {
     // The question is about the input: stdin, a file, or the prompt words.
@@ -354,6 +362,7 @@ export function parseRunArgs(argv: string[], stdin?: string): RunPlan & { help: 
     const text = [prompt, input].filter((part) => part !== undefined).join("\n\n");
     if (text !== "") args.prompt = text;
   }
+  if (values.dimensions !== undefined && kind !== undefined && kind !== "embedding") throw new UsageError("--dimensions shortens embedding vectors; use it with an embedding model or job.");
   if (values.top !== undefined && kind !== "embedding") throw new UsageError("--top ranks embedding matches; use it with an embedding job (find-code, duplicates, image-search).");
   const promptless = prompt === undefined && input === undefined && files.length === 0 && questions === undefined;
   if (values.each && files.length === 0) throw new UsageError("--each runs one task per file; name the files with -f PATH|GLOB.");

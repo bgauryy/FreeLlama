@@ -14,12 +14,12 @@ yarn build
 ```
 
 `yarn build` writes the MCP server, `packages/mcp/dist/index.js` (shebang, executable), and the
-`fllama` agent CLI, `dist/agent-cli.js` (the package's `fllama` bin). During
+agent CLI, `dist/agent-cli.js` (the `freellama run`, `chat`, `gateway`… commands, which the CLI package's launcher runs). During
 checkout development it loads `native/freellama.<triple>.node`. Published installs resolve the
 matching `@octocodeai/freellama-native-<target>` optional package instead, so the base MCP package remains
 portable. The research adapters compile to `dist/research/{bash,octocode,github,coder}-agent.js`, and the
 repository `docs/` guides are copied into `docs/`. MCP tools are registered from
-`src/tools/registrations.ts`, which both `src/index.ts` and the `fllama` registry
+`src/tools/registrations.ts`, which both `src/index.ts` and the agent CLI registry
 (`src/agent-cli/registry.ts`) use, so the two surfaces expose the same tools.
 
 Piecewise, if you are iterating on one layer:

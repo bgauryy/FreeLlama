@@ -50,7 +50,9 @@ function pick(source: Fields | undefined, keys: string[]): Fields | undefined {
 /** Keep the core's routing explanation and candidate totals; detailed phase estimates stay saved. */
 function compactCompletionPlanning(value: unknown): Fields | undefined {
   const planning = object(value);
-  if (!planning) return undefined;
+  // A plan that changed nothing and weighed no candidate says nothing an agent acts on.
+  if (!planning || (planning.applied !== true && !(Array.isArray(planning.candidates) && planning.candidates.length > 0)
+    && !(Array.isArray(planning.payload_fit_rejections) && planning.payload_fit_rejections.length > 0))) return undefined;
   const compact = pick(planning, ["mode", "applied", "snapshot_only", "payload_fit_rejections"]) ?? {};
   if (Array.isArray(planning.candidates)) {
     compact.candidates = planning.candidates.map((candidate) =>
@@ -64,7 +66,7 @@ function compactCompletionPlanning(value: unknown): Fields | undefined {
  * ended, what it cost, why and where it ran, and what it unloaded. Detailed routing phases,
  * host-telemetry snapshots and feedback internals stay in the response file.
  */
-function compactReceipt(receipt: Fields): Fields {
+function compactReceipt(receipt: Fields, item = false): Fields {
   const execution = object(receipt.execution);
   const reservation = pick(object(execution?.memory_reservation), ["evicted_idle_models", "eviction", "required_available_bytes", "source",
     // Ollama's own fit check predicts an f16 cache; when that alone fails, it may evict or offload.
@@ -80,13 +82,25 @@ function compactReceipt(receipt: Fields): Fields {
   // Host telemetry snapshots stay in the file; metrics keep their scalar counts and durations.
   const metrics = object(receipt.metrics);
   if (metrics) compact.metrics = Object.fromEntries(Object.entries(metrics).filter(([, value]) => value === null || typeof value !== "object"));
-  const route = pick(object(receipt.route), ["selected_model", "task", "confidence", "reasons", "output_reserve_tokens"]);
+  const route = pick(object(receipt.route), ["selected_model", "task", "confidence", "reasons"]);
   if (route) compact.route = route;
+  // A batch item keeps its answer, cost, model and any completion plan; the rest of where and how
+  // each item ran is in the file.
+  if (item) {
+    const planned = pick(execution, ["backend", "reason"]);
+    if (execution && (planned || completionPlanning)) compact.execution = { ...planned, ...(completionPlanning ? { completion_planning: completionPlanning } : {}) };
+    return compact;
+  }
   const admission = pick(object(receipt.admission), ["mode", "queue_wait_ms", "transition_wait_ms", "resource_wait_ms", "total_wait_ms"]);
   if (admission) compact.admission = admission;
   if (execution) {
+    // The physical placement and how long the runner stays: their derivations stay in the file.
+    const observation = pick(object(execution.observation), ["status", "processor", "context_length"]);
+    const keepAlive = pick(object(execution.keep_alive), ["value", "reason"]);
     compact.execution = {
-      ...pick(execution, ["placement", "backend", "reason", "observation", "keep_alive", "preference_satisfied"]),
+      ...pick(execution, ["placement", "backend", "reason", "preference_satisfied"]),
+      ...(observation ? { observation } : {}),
+      ...(keepAlive ? { keep_alive: keepAlive } : {}),
       ...(completionPlanning ? { completion_planning: completionPlanning } : {}),
       ...(reservation ? { memory_reservation: reservation } : {}),
     };
@@ -120,7 +134,7 @@ function compactTaskResult(content: Fields): Fields {
       results: content.results.map((row) => {
         const item = object(row);
         const response = object(item?.response);
-        return item && response ? { ...item, response: compactReceipt(response) } : row;
+        return item && response ? { ...item, response: compactReceipt(response, true) } : row;
       }),
     };
   }
@@ -186,9 +200,9 @@ export const AUTO_INLINE_CHARS = 8000;
 /** Input fields of the tools whose answers `output` and `outputPath` apply to. */
 export const outputInput = {
   output: z.enum(["auto", "inline", "file"]).optional()
-    .describe("auto (default): inline up to 8,000 chars, else a summary plus check lines and where to read the rest; inline: always whole; file: always the summary view"),
+    .describe("auto (default): inline up to 8,000 chars, else a summary and where the rest is"),
   outputPath: z.string().min(1).optional()
-    .describe("also write the answer as Markdown here, creating or replacing it (inside the readable roots); default when shortened: FreeLlama home tmp/<timestamp>.md"),
+    .describe("also write the answer here as Markdown (inside the readable roots)"),
 };
 
 /** The saved record's path to the whole answer text: `{tool, arguments, result: {content: [{text}]}}`. */

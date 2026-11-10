@@ -1,4 +1,4 @@
-// MCP artifacts: dist/index.js (the server), dist/agent-cli.js (`fllama`) and dist/research/{bash,octocode,github,coder}-agent.js (the
+// MCP artifacts: dist/index.js (the server), dist/agent-cli.js (the agent commands: `freellama run`, `chat`, `gateway`…) and dist/research/{bash,octocode,github,coder}-agent.js (the
 // research adapters it spawns). Native .node stays next door (cannot go in a JS bundle).
 import { build } from "esbuild";
 import { chmodSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -28,7 +28,7 @@ const js = readFileSync(outfile, "utf8").replace(/^(?:#!.*\n)+/, "");
 writeFileSync(outfile, `#!/usr/bin/env node\n${js}`);
 chmodSync(outfile, 0o755);
 
-// `fllama`, the agent CLI: same bundle rules as the server.
+// The agent commands (`freellama run`, `chat`, `gateway`…): same bundle rules as the server.
 const cliFile = path.join(distDir, "agent-cli.js");
 await build({
   absWorkingDir: pkg,

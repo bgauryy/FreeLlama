@@ -119,6 +119,9 @@ pub(super) async fn forward(
     let mut model = matches!(kind, RawRequestKind::Generation | RawRequestKind::Unload)
         .then(|| RawModel::parse(&body_bytes))
         .flatten();
+    // Whether the caller chose the window; one that did not runs at Ollama's default, which is
+    // learned from /api/ps once this request is served.
+    let requested_context = model.as_ref().and_then(|model| model.context);
     let wait = state
         .admission
         .as_ref()
@@ -334,6 +337,13 @@ pub(super) async fn forward(
     match response {
         Ok(response) => {
             count("forwarded");
+            if generation
+                && requested_context.is_none()
+                && response.status().is_success()
+                && let Some(model) = &model
+            {
+                learn_default_context(&state, &model.name);
+            }
             let mut usage = None;
             if response.status().is_success()
                 && let (Some(hooks), Some(model)) = (&state.hooks, &model)
@@ -378,6 +388,32 @@ pub(super) async fn forward(
             )
         }
     }
+}
+
+/// Record the window Ollama loaded `model` with for a request that set no `num_ctx`: that is
+/// Ollama's default for it. Read in the background; a failed read leaves the default unknown.
+fn learn_default_context(state: &ProxyState, model: &str) {
+    let client = state.client.clone();
+    let url = format!("{}/api/ps", state.upstream.trim_end_matches('/'));
+    let learned = Arc::clone(&state.learned_context);
+    let model = model.to_owned();
+    tokio::spawn(async move {
+        let Ok(response) = client.get(url).send().await else {
+            return;
+        };
+        let Ok(ps) = response.json::<serde_json::Value>().await else {
+            return;
+        };
+        if let Some(context) = crate::ollama_http::find_ps_entry(&ps, &model)
+            .and_then(|entry| entry["context_length"].as_u64())
+            .filter(|context| *context > 0)
+        {
+            learned
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(super::context_key(&model).to_owned(), context);
+        }
+    });
 }
 
 #[cfg(test)]

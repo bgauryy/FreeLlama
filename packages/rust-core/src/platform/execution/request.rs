@@ -93,6 +93,16 @@ pub(crate) fn apply_request_options(
             "decision tasks take state and questions only; /v1/systemone accepts no options, format, think, or logprobs"
         )));
     }
+    if request.dimensions.is_some() && !matches!(task, TaskKind::Embedding) {
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "request_options.dimensions shortens embedding vectors; it applies to embedding tasks only"
+        )));
+    }
+    if request.dimensions == Some(0) {
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "request_options.dimensions must be at least 1"
+        )));
+    }
     if matches!(task, TaskKind::Embedding)
         && (request.format.is_some()
             || request.think.is_some()
@@ -449,16 +459,17 @@ pub(crate) fn build_managed_request(
             .context("embedding task requires input")
             .map_err(ApiError::bad_request)?;
         refuse_oversized_embedding_items(&value, decision.options["num_ctx"].as_u64())?;
-        return Ok((
-            "/api/embed",
-            json!({
-                "model": decision.selected_model,
-                "input": value,
-                "truncate": false,
-                "keep_alive": keep_alive,
-                "options": decision.options,
-            }),
-        ));
+        let mut body = json!({
+            "model": decision.selected_model,
+            "input": value,
+            "truncate": false,
+            "keep_alive": keep_alive,
+            "options": decision.options,
+        });
+        if let Some(dimensions) = input.request_options.dimensions {
+            body["dimensions"] = json!(dimensions);
+        }
+        return Ok(("/api/embed", body));
     }
 
     let messages = if input.messages.is_empty() {

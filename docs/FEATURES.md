@@ -76,8 +76,8 @@ An explicit `model` always wins over routing.
 ## Features
 
 Each feature is reachable from MCP, the CLI and the HTTP control API under `/_freellama/v1` unless a
-cell says otherwise. Every MCP tool is also reachable from a shell with `fllama tool <name> JSON`, and
-`run_task` with `fllama run` ([agent CLI](AGENT_CLI.md)).
+cell says otherwise. Every MCP tool is also reachable from a shell with `freellama tool <name> JSON`, and
+`run_task` with `freellama run` ([agent CLI](AGENT_CLI.md)).
 
 | Feature | What you get | MCP tool | CLI | HTTP |
 |---|---|---|---|---|
@@ -86,20 +86,20 @@ cell says otherwise. Every MCP tool is also reachable from a shell with `fllama 
 | [CPU and GPU backends](#cpu-and-gpu-backends) | Helper models on CPU next to GPU work, with proof of where each ran | `run_task {executionPreference}` | `serve --cpu-upstream --cpu-model` | `POST /tasks` |
 | Decisions | Label, triage or yes/no-check items with a decision model: one forward pass, one line per answer | `run_task {task:"decision", state, questions}` | `task --task decision --questions` | `POST /tasks` |
 | Ranked search and duplicates | Embed files or texts and get the closest items to a query, or the most similar pairs, as labels with scores instead of vectors; files are chunked by lines and labelled `path:Lstart-Lend` | `run_task {task:"embedding", files, nearest}` | `task --task embedding --input-file F --nearest QUERY` | — |
-| Speech | Transcribe or translate a WAV, or speak text to a WAV file, on a local audio model | `audio` | `fllama tool audio` | Ollama `/v1/audio/*` through serve |
+| Speech | Transcribe or translate a WAV, or speak text to a WAV file, on a local audio model | `audio` | `freellama tool audio` | Ollama `/v1/audio/*` through serve |
 | Inputs by path | The server reads the files an agent names, so logs, screenshots and source files are never pasted into its output | `run_task {files}` | `task --input-file`, `--image` | — |
 | [Loop control](#loop-control) | A repeating answer stops early with every token kept | `run_task {stopOnRepetition}` | `task --stop-on-repetition` | `stop_on_repetition` |
 | [Machine awareness](#machine-awareness) | GPU, cores, memory, GPU load and heat read from the OS | `doctor` | `machine`, `doctor` | `GET /machine` |
 | [Batches, jobs and history](#batches-jobs-and-history) | Fan-out, submit now and collect later, multi-turn chat without resending history | `run_task {tasks}` / `{defer}`, `task_jobs`, `scope`, `session` | `task --defer`, `jobs`, `scope`, `session` | `/task-batches`, `/jobs`, `/scopes`, `/sessions` |
 | Warm-up and unload | Load a model ahead of use through the same memory checks; unload a resident one once its tasks finish (never loads first) | `ollama_manage {action:"warm"}`, `ollama_manage {action:"unload"}` | `warm`, `unload` | `POST /warm`, `POST /unload` |
 | Model catalog and cookbooks | Tested picks per job with their evidence, what is installed and fits now, and a recipe for each | `models {view:"catalog"}`, `freellama://docs/cookbooks/<job>` | `catalog [--job JOB]`, [docs/cookbooks](cookbooks/README.md) | — |
-| Find and install models | ollama.com and Hugging Face GGUF search, every tag with its size and memory fit, pulls only on approval | `models {view:"library"}`, `ollama_pull`, `ollama_delete` | `fllama tool models\|ollama_pull\|ollama_delete` (same approvals) | — |
-| Job mode and prompts | Name a job and FreeLlama runs its first catalog pick that is installed and fits, with its documented prompt, options and embedding prefixes; your fields win. MCP prompts give each job's call, and `saveAs` hands an answer to the next task as a file | `run_task {job, saveAs}`, MCP prompts, [cookbook](cookbooks/jobs.md) | `fllama run -j JOB\|-w WORKFLOW --save-as NAME`, `fllama workflows` | — |
-| Chunked sweeps | A local model checks a code tree, log or docs site chunk by chunk in the background, saves every result, re-checks flags with a stronger model and, against a baseline, reports only what changed | `sweep`, [cookbook](cookbooks/sweep.md) | `fllama tool sweep` | — |
-| [Grounded research](#grounded-research) | Read-only repository answers with file and line citations | `delegate_research` | `fllama tool delegate_research` | — |
+| Find and install models | ollama.com and Hugging Face GGUF search, every tag with its size and memory fit, pulls only on approval | `models {view:"library"}`, `ollama_pull`, `ollama_delete` | `freellama tool models\|ollama_pull\|ollama_delete` (same approvals) | — |
+| Job mode and prompts | Name a job and FreeLlama runs its first catalog pick that is installed and fits, with its documented prompt, options and embedding prefixes; your fields win. MCP prompts give each job's call, and `saveAs` hands an answer to the next task as a file | `run_task {job, saveAs}`, MCP prompts, [cookbook](cookbooks/jobs.md) | `freellama run -j JOB\|-w WORKFLOW --save-as NAME`, `freellama workflows` | — |
+| Chunked sweeps | A local model checks a code tree, log or docs site chunk by chunk in the background, saves every result, re-checks flags with a stronger model and, against a baseline, reports only what changed | `sweep`, [cookbook](cookbooks/sweep.md) | `freellama tool sweep` | — |
+| [Grounded research](#grounded-research) | Read-only repository answers with file and line citations | `delegate_research` | `freellama tool delegate_research` | — |
 | [Small agent context](FEATURES.md#small-agent-context) | Compact results and paged details instead of raw dumps | every tool, `read_response` | JSON on stdout | JSON |
 | [Observe and evaluate](#observe-and-evaluate) | Live status, usage, metrics, benchmarks, routing policy from evaluations | `doctor {view:"usage"}` | `status`, `usage`, `config`, `bench-all`, `policy from-eval` | `/status`, `/usage`, `/metrics`, `/config`, `/_freellama/ui` |
-| Ollama passthrough | Any Ollama `/api/*` or `/v1/*` call, byte-preserving, with retries and a stream cap; `fllama gateway` also serves `freellama/<workflow\|job\|auto>` virtual models over Ollama, OpenAI `/v1/chat/completions` and `/v1/responses`, and Anthropic `/v1/messages` | — | `serve`, `proxy`, `fllama gateway` | Ollama's own paths |
+| Ollama passthrough | Any Ollama `/api/*` or `/v1/*` call, byte-preserving, with retries and a stream cap; `freellama gateway` also serves `freellama/<workflow\|job\|auto>` virtual models over Ollama, OpenAI `/v1/chat/completions` and `/v1/responses`, and Anthropic `/v1/messages` | — | `serve`, `proxy`, `freellama gateway` | Ollama's own paths |
 
 ### Model selection
 

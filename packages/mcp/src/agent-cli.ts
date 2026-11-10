@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// `fllama` entry: see agent-cli/main.ts. Exits once stdout and stderr are flushed (piped stderr is
+// `freellama` entry: see agent-cli/main.ts. Exits once stdout and stderr are flushed (piped stderr is
 // asynchronous on macOS, and check: lines must not be lost), so a lingering keep-alive socket or
 // the unref'd serve child never holds a one-shot command open.
 import { main } from "./agent-cli/main.js";

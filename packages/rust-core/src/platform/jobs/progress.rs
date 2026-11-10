@@ -69,6 +69,7 @@ impl JobProgress {
             job.status = status;
             job.reason = reason;
             job.detail = detail;
+            job.changed.notify_waiters();
         }
     }
 
@@ -79,6 +80,7 @@ impl JobProgress {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         job.selected_model = Some(model.into());
         job.backend = Some(backend.into());
+        job.changed.notify_waiters();
     }
 
     /// Linearize history commit against cancellation. After commit, cancellation waits for the
@@ -149,5 +151,6 @@ impl JobProgress {
                 });
             }
         }
+        job.changed.notify_waiters();
     }
 }

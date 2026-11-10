@@ -222,3 +222,33 @@ fn context_shift_off_sends_shift_false_and_ollama_default_omits_it_keeping_trunc
         assert_eq!(body["truncate"], false, "{shift:?} warm chat");
     }
 }
+
+#[test]
+fn embedding_dimensions_reach_ollama_and_chat_tasks_refuse_them() {
+    let embedder = model("embed", &["embedding"], Value::Null);
+    let mut task =
+        input(json!({"task":"embedding","input":["a","b"],"request_options":{"dimensions":256}}));
+    let mut decision = select_route(
+        &task.route,
+        std::slice::from_ref(&embedder),
+        &SessionAffinity::default(),
+    )
+    .unwrap();
+    apply_request_options(TaskKind::Embedding, &mut decision, &task.request_options).unwrap();
+    let (path, body) =
+        build_managed_request(&mut task, &decision, &json!("300s"), ContextShift::Off).unwrap();
+    assert_eq!(path, "/api/embed");
+    assert_eq!(body["dimensions"], 256);
+
+    let chat = input(json!({"prompt":"x","request_options":{"dimensions":256}}));
+    let mut chat_decision = decision.clone();
+    let refused = apply_request_options(
+        TaskKind::Completion,
+        &mut chat_decision,
+        &chat.request_options,
+    );
+    assert!(
+        refused.is_err(),
+        "dimensions on a chat task must be refused"
+    );
+}

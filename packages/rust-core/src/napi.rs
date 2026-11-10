@@ -461,14 +461,25 @@ pub async fn list_task_jobs(endpoint: Option<String>) -> Result<String> {
 /// # Errors
 /// Returns an error for an invalid ID, an expired job, or an unavailable server.
 #[napi]
-pub async fn get_task_job(endpoint: Option<String>, job_id: String) -> Result<String> {
+pub async fn get_task_job(
+    endpoint: Option<String>,
+    job_id: String,
+    wait_ms: Option<u32>,
+) -> Result<String> {
     let id =
         uuid::Uuid::parse_str(&job_id).map_err(|error| Error::from_reason(error.to_string()))?;
+    // With `wait_ms`, serve holds the read until the job changes (at most 5 s), so a poller sees
+    // a finished task at once instead of at its next timer tick.
+    let path = match wait_ms {
+        Some(ms) => format!("/_freellama/v1/jobs/{id}?wait_ms={ms}"),
+        None => format!("/_freellama/v1/jobs/{id}"),
+    };
+    let wait = std::time::Duration::from_millis(u64::from(wait_ms.unwrap_or(0)));
     pretty(
         &get_json(
             &endpoint_or_default(endpoint),
-            &format!("/_freellama/v1/jobs/{id}"),
-            crate::serve_client::control_timeout(),
+            &path,
+            crate::serve_client::control_timeout() + wait,
         )
         .await?,
     )

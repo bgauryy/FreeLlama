@@ -2,61 +2,82 @@
 
 ![A brown cartoon llama stands on a pastel cloud background.](assets/logo.jpg)
 
-**Run your agent's bulk work on local models without overloading your machine.**
+**Run local Ollama models the smart way: the right model for your machine right now, tuned
+prompts, and no swapping, for your coding agent and for you.**
 
-FreeLlama lets coding agents offload bounded work (embeddings, OCR and vision, bulk rewrites,
-classification, summaries) to local [Ollama](https://ollama.com) models instead of spending paid
-tokens and context. For each task it picks an installed model that fits, loads and switches models
-only when they fit in memory, and returns the result with a receipt of where and how it ran. Your
-agent still decides what to offload and verifies the answer.
+FreeLlama sits between you (or your agent) and [Ollama](https://ollama.com). Ollama runs the
+models; FreeLlama decides which model, how, and whether there is room for it.
+
+```mermaid
+flowchart LR
+    ask["A request:<br/>workflow, job or model"] --> pick["1. Pick<br/>a tested model that is<br/>installed and fits now"]
+    pick --> tune["2. Tune<br/>the model card's settings<br/>+ tested workflow prompt"]
+    tune --> gate{"3. Gate<br/>does the load fit<br/>in free memory?"}
+    gate -->|yes| run["Ollama runs it"]
+    gate -->|"no, after a wait"| refuse["Refused with the reason<br/>and what holds memory"]
+    run --> report["4. Report<br/>answer + check: lines<br/>+ receipt"]
+```
+
+| You are | Use | It feels like |
+|---|---|---|
+| A coding agent (Claude Code, Cursor, Codex, any MCP host) | The **MCP server** | Tools such as `run_task {workflow:"fix-bug", files:[…]}` |
+| A person, a script, or an agent with only a shell | **`freellama run`** and **`chat`** | `ollama run`, with workflows, files and memory safety |
+| Any Ollama, OpenAI or Anthropic client (the `ollama` CLI, Continue, opencode, Open WebUI, SDKs) | **`freellama gateway`** | A server that lists models such as `freellama/review-code` |
 
 ```mermaid
 flowchart LR
     agent["Coding agent<br/>Claude Code, Cursor, any MCP host"]
-    cli["freellama CLI"]
-    raw["Ollama-compatible client"]
+    you["You or a script"]
+    client["Ollama, OpenAI, Anthropic clients"]
     subgraph fl["FreeLlama, on your machine"]
-        mcp["MCP server<br/>Node.js + Rust addon"]
-        serve["freellama serve<br/>127.0.0.1:11435"]
-        research["Research adapter<br/>read-only, allowlisted files"]
+        mcp["MCP tools<br/>workflows, picks, checks"]
+        cli["freellama run / chat"]
+        gw["freellama gateway<br/>127.0.0.1:11437"]
+        serve["freellama serve<br/>127.0.0.1:11435<br/>routing, admission, memory gate"]
     end
-    gpu[("Ollama<br/>GPU: Metal, CUDA, ROCm")]
-    cpu[("Optional CPU-only Ollama")]
+    ollama[("Ollama<br/>Metal, CUDA, ROCm, CPU")]
 
-    agent -->|"MCP over stdio"| mcp
-    mcp -->|"control API"| serve
-    cli -->|"control API"| serve
-    raw -.->|"/api and /v1 stream through"| serve
-    mcp -.->|"delegate_research"| research
-    research -->|"each model turn is a managed task"| serve
-    serve -->|"route, admit, load, run"| gpu
-    serve -.->|"operator-assigned models"| cpu
+    agent -->|"MCP"| mcp
+    you --> cli
+    cli -->|"the same tool handlers, in-process"| mcp
+    client --> gw
+    mcp -->|"managed tasks"| serve
+    gw -->|"virtual models: pick, prompts, admitted load"| serve
+    serve --> ollama
 ```
 
-## Why FreeLlama
+## Why not call Ollama directly?
 
-Coding agents spend paid tokens and context on work a model on your own machine can do: embedding a
-repository, reading screenshots and scans, summarizing or classifying hundreds of files. Pointing
-the agent straight at Ollama does not fix that, because the agent cannot see:
+Ollama runs whatever tag you name, with the model's default settings. Three things go wrong that a
+caller cannot see. FreeLlama fixes each one.
 
-- **Which model fits the job.** A tag name does not show capabilities, context window or memory
-  footprint.
-- **Whether there is room.** One more load can push the machine into swap, several agents can pile
-  onto one GPU, and a hot or busy machine slows everything.
-- **Whether it worked.** A model can repeat itself until its token cap, and nothing says whether the
-  task ran on the GPU or fell back to the CPU.
+| What goes wrong with a direct call | What FreeLlama does | What we measured |
+|---|---|---|
+| **The wrong model for this machine.** A tag name says nothing about capability, context or memory. One load too many and the machine starts swapping. | Picks the tested model for the job that is installed *and fits now*. A load that does not fit waits, then is refused with the reason and the programs holding the memory. | With 6.5 GB free, a code review moved from a 10 GB model to one that fit. A yes/no question ran on a 1.2 GB decision model instead of a 14.5 GB one that would have been refused. |
+| **Default settings waste tokens.** Thinking models reason before every answer. Small models pad their output. | Applies each model card's documented sampling and think setting, plus step-by-step workflow prompts that were tested on the models. | A direct call spent 61 tokens (0.92 s) thinking before answering "OK"; FreeLlama answered in 2 tokens (0.47 s). On the workflow eval, the 1.7B model went from 7 of 12 to 11 of 12. |
+| **No way to tell a good answer from a bad one.** Answers loop, pad, invent facts, or come back empty. | Returns `check:` lines (filler, invented facts, edits that do not match the file) and a receipt with the model, timing, cache hits and GPU/CPU placement. | An empty "thinking-only" answer exits 1 with the fix (`--think=false`) instead of looking like success. |
 
-FreeLlama answers all three on every call, which makes offloading safe to do by default: the paid
-model keeps the judgment, the local model does the volume, and each answer comes back with a receipt
-you can check. The name means less metered inference, not only Meta's Llama models. More in
-[Features](docs/FEATURES.md#why-freellama).
+Over a session it also keeps the machine efficient:
+
+| Mechanism | Effect | Measured |
+|---|---|---|
+| **Prompt cache kept** | Reuses a loaded model's context window and settings, so Ollama's prompt cache survives between turns | 95% of a multi-turn prompt served from cache (attention models; Ollama does not cache hybrid models such as `lfm3` across turns) |
+| **Admitted loads only** | Every model load, streamed requests included, goes through the memory gate | — |
+| **Indexed code search** | A repeated search embeds only the chunks that changed | 89 chunks: 7.3 s first, 0.28 s next |
+| **Fast hand-off** | The service answers the moment a job is done | A short task on a loaded model in about 0.2 s |
+
+*Measured on one Apple M2 Pro (32 GB) with Ollama 0.40.15, on 2026-11-10. These are single-machine
+results, not general speed claims. Method and numbers: [Comparison](docs/COMPARISON.md) and
+[Testing](docs/TESTING.md).*
+
+The name means less metered inference, not only Meta's Llama models.
 
 ## Requirements
 
 | You need | Why |
 |---|---|
-| [Ollama](https://ollama.com/download) running (`ollama list` works) with at least one model | FreeLlama manages Ollama; it does not install, start or replace it, and never downloads a model without your approval |
-| Node.js 22 or newer | Runs the MCP server and the `freellama` npm launcher |
+| [Ollama](https://ollama.com/download) running (`ollama list` works) with at least one model | FreeLlama manages Ollama. It does not install, start or replace Ollama, and it never downloads a model without your approval |
+| Node.js 22 or newer | Runs the MCP server, the agent commands (`run`, `chat`, `gateway`…) and the npm launcher |
 | One of the platforms below | npm installs the matching prebuilt binary as an optional dependency; do not install with `--omit=optional` |
 
 | Platform | Prebuilt package |
@@ -67,214 +88,225 @@ you can check. The name means less metered inference, not only Meta's Llama mode
 | Windows x64 | `@octocodeai/freellama-native-win32-x64-msvc` |
 | Windows arm64 | `@octocodeai/freellama-native-win32-arm64-msvc` |
 
-Intel Macs and musl Linux (such as Alpine) have no prebuilt binary: build from source with Rust 1.89
-or newer ([Build from source](docs/BUILD_AND_NOTES.md#build-from-source)). Optional: a second,
-CPU-only Ollama process for small helper models ([CPU/GPU routing](docs/CPU_GPU_ROUTING.md)).
+Intel Macs and musl Linux (such as Alpine) have no prebuilt binary: [build from source](docs/BUILD_AND_NOTES.md#build-from-source)
+with Rust 1.89 or newer. A second, CPU-only Ollama for small helper models is optional
+([CPU/GPU routing](docs/CPU_GPU_ROUTING.md)).
+
+When Ollama is missing, every command that needs it stops at once and says what to do:
+
+```mermaid
+flowchart LR
+    cmd["freellama run, chat,<br/>gateway, status"] --> up{"Ollama answers?"}
+    up -->|yes| go["Runs"]
+    up -->|no| inst{"Ollama installed?"}
+    inst -->|no| m["Ollama is not installed. Please install Ollama:<br/>https://ollama.com/download<br/>(exit 1)"]
+    inst -->|yes| st["Ollama is installed but not running:<br/>open the Ollama app or run ollama serve<br/>(exit 75, retry)"]
+```
 
 ## Install
 
-### MCP server (for your agent)
+| For | Install | Then |
+|---|---|---|
+| Your agent (Claude Code) | `claude mcp add freellama -- npx -y @octocodeai/freellama-mcp-server` | Ask the agent in plain words |
+| Your agent (Claude Desktop, Cursor, other hosts) | `{ "mcpServers": { "freellama": { "command": "npx", "args": ["-y", "@octocodeai/freellama-mcp-server"] } } }` | Same |
+| You, scripts, shell-only agents, operators | `npm install -g @octocodeai/freellama` | `freellama run`, `chat`, `gateway`, `serve`, `doctor`… |
+| Operators without Node.js | `cargo install freellama-cli` (Rust 1.89+) | The operator commands only (`serve`, `doctor`, `catalog`…) |
 
-Claude Code:
+One `freellama` command covers both halves; the npm launcher sends each command to the right one:
 
-```bash
-claude mcp add freellama -- npx -y @octocodeai/freellama-mcp-server
+```mermaid
+flowchart LR
+    f["freellama COMMAND"] --> which{"COMMAND"}
+    which -->|"run, chat, gateway,<br/>workflows, job, tool(s)<br/>status on a terminal"| node["Agent commands, in Node<br/>(from @octocodeai/freellama-mcp-server,<br/>installed with it)"]
+    which -->|"serve, init, doctor, catalog,<br/>models, task, jobs, status --json…"| rust["Operator commands,<br/>the Rust binary"]
 ```
 
-Claude Desktop, Cursor and other hosts:
-
-```json
-{ "mcpServers": { "freellama": { "command": "npx", "args": ["-y", "@octocodeai/freellama-mcp-server"] } } }
-```
-
-At launch the server starts its own FreeLlama service on `127.0.0.1:11435` if none is running, so
-the CLI is optional. It does not install or start Ollama.
-
-Required for `delegate_research` in a published install: `FREELLAMA_MCP_ALLOWED_ROOTS` lists the
-directories that tool may read (`:`-separated on macOS and Linux, `;` on Windows). Unset, every local
-`delegate_research` call is refused (its `adapter:"github"` runs without a workspace); the other tools
-do not need it, and `run_task` `files` uses `FREELLAMA_FILE_ROOTS` instead. Add it with
-`claude mcp add freellama -e FREELLAMA_MCP_ALLOWED_ROOTS=/absolute/path/to/your-project -- npx -y @octocodeai/freellama-mcp-server`
-or an `"env": { ... }` entry in JSON. All settings: [MCP configuration](packages/mcp/CONFIGURATION.md).
-
-How `delegate_research` picks its model, grounds answers and resumes sweeps: [research model and sweeps](packages/mcp/CONFIGURATION.md#research-model-and-sweeps).
-
-### CLI (for the terminal)
-
-```bash
-npm install -g @octocodeai/freellama
-freellama --version
-```
-
-Without installing, prefix commands with `npx @octocodeai/freellama`. Without Node.js, use
-`cargo install freellama-cli` (Rust 1.89+; the command is still `freellama`).
-
-### Agent CLI and gateway (`fllama`)
-
-```bash
-npx -p @octocodeai/freellama-mcp-server fllama --help   # from 0.11.0; before that, from a checkout
-```
-
-`fllama` works like `ollama run`, but runs each request through FreeLlama: the job's tested
-model, its prompts, file reading and the memory gate. `fllama gateway` serves the same workflows as
-models (`freellama/fix-bug`) to any Ollama, OpenAI or Anthropic client. See
-[`fllama`](docs/AGENT_CLI.md).
+| Note | Detail |
+|---|---|
+| Agent commands on npm | Version 0.10.0 predates them; they ship from the next release. Today, from a checkout: `yarn install && yarn build && node packages/cli/bin/freellama.js run --help` |
+| Without installing | Prefix any command with `npx @octocodeai/freellama` |
+| The service | The MCP server and the agent commands start `freellama serve` on `127.0.0.1:11435` if none is running. Neither installs or starts Ollama |
+| `delegate_research` | Reads only the directories in `FREELLAMA_MCP_ALLOWED_ROOTS` (`:`-separated; `;` on Windows), for example `claude mcp add freellama -e FREELLAMA_MCP_ALLOWED_ROOTS=/absolute/path/to/your-project -- npx -y @octocodeai/freellama-mcp-server`. `run_task` `files` uses `FREELLAMA_FILE_ROOTS` instead |
+| Every setting | [MCP configuration](packages/mcp/CONFIGURATION.md) |
 
 ## Quick start
 
 ### From your agent
 
-Ask in plain words; the agent picks the tool ([MCP reference](packages/mcp/README.md)):
+Ask in plain words; the agent picks the tool:
 
-- "List my local models and tell me which one fits coding tasks."
-- "Use FreeLlama to summarize these 40 files with a local model, then check three summaries."
+- "Use FreeLlama to summarize these 40 log files with a local model, then check three summaries."
 - "Read this screenshot with a local OCR model."
+- "Find where CLI flags are parsed in src/, using a local embedding model."
 
-Or call the tools directly: take the tested pick for the job from the catalog, then run it with
-that `model` (without one, routing picks by capability alone and may choose a model that does
-not fit now).
+Or name a workflow. FreeLlama then picks the model and gives it step-by-step instructions:
 
 ```jsonc
+{ "tool": "run_task", "arguments": { "workflow": "fix-bug", "files": ["src/parser.ts"], "prompt": "drops the last token" } }
 { "tool": "models",   "arguments": { "view": "catalog", "job": "coding" } }
-{ "tool": "run_task", "arguments": { "task": "coding", "model": "<catalog pick>", "prompt": "Rename foo to bar in: ...", "options": { "num_predict": 512 } } }
 ```
 
-`run_task {preview:true}` shows the route without running or reserving anything.
+| Call | Returns |
+|---|---|
+| `models {view:"catalog", job}` | The tested picks for a job: installed or not, fits now or not |
+| `run_task {preview:true}` | The route, without running or reserving anything |
 
 ### From the terminal
 
-```bash
-freellama init          # check prerequisites; JSON with `status` and `next_steps`; changes nothing
-freellama doctor        # Ollama reachability, versions, hardware, effective settings
-freellama catalog       # tested model picks per job, what is installed, what fits now
-freellama serve         # keep running: the service on http://127.0.0.1:11435
-# in another terminal
-freellama ready         # can work be served now, or what is it waiting for
-freellama models
-freellama task --task completion --model MODEL_TAG "Reply with exactly OK."
-freellama status        # queues, memory holds, loaded models
-```
-
-Or let FreeLlama choose the model and prompts, as `ollama run` would run one:
+`freellama run` takes the same flags as `ollama run`. It streams tokens on a terminal and prints
+only the answer in a pipe.
 
 ```bash
-git diff | fllama run -w summarize-diff                       # the summarize pick that fits now
-fllama run -w fix-bug -f src/parser.ts "drops the last token"  # answer on stdout, check: lines on stderr
-fllama gateway   # then: OLLAMA_HOST=127.0.0.1:11437 ollama run freellama/explain-code
+freellama catalog                                          # tested picks per job: installed, fits now
+git diff | freellama run -w summarize-diff                 # review summary from the pick that fits
+freellama run -w fix-bug -f src/parser.ts "drops the last token"
+freellama run --ask "Is a refund requested?" < ticket.txt  # a yes/no answer with its probability
+freellama run -j find-code -f 'src/**/*.ts' "where are CLI flags parsed"
+freellama chat review-code                                 # the real ollama chat, on a workflow
+freellama status                                           # memory, queues, loaded models, jobs
 ```
 
-Replace `MODEL_TAG` with a tag from `models`. These commands print JSON receipts: the answer of
-`task` is `.response.message.content` (`freellama task … | jq -r .response.message.content`), and
-`fllama run` prints the answer alone. `init`, `doctor` and `catalog` work without `serve`.
-Every command has `--help`; the [CLI guide](docs/CLI.md) covers the rest. While `serve` runs, a
-status page is at `http://127.0.0.1:11435/_freellama/ui`.
-
-## Under the hood
-
-Every managed call, from the MCP server, `fllama`, the CLI or the HTTP API, runs through the same Rust core
-and the same gates: route, admit, load, run, observe. Nothing is decided from a model's name.
-
-| Owner | Does |
+| Stream | Carries |
 |---|---|
-| Your agent | Decides what to offload, writes the prompt, verifies the answer |
-| FreeLlama | Picks the model, queues fairly, checks memory and host signals, coordinates loads, writes the receipt |
-| Ollama | Stores models, loads runners, generates tokens |
+| stdout | The answer only |
+| stderr | `check:` lines (read them before you rely on the answer) and notes |
 
-### Life of one task
+| Exit code | Meaning |
+|---|---|
+| 0 | Answered |
+| 75 | Busy, short of memory, or Ollama stopped; retry later. stderr says when |
+| 1 | Refused, failed, empty, or Ollama not installed |
+| 2 | Usage error |
+| 130 | Interrupted |
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant A as Agent
-    participant M as MCP server
-    participant S as freellama serve
-    participant O as Ollama
-    A->>M: run_task (task kind, model, prompt)
-    M->>S: POST /_freellama/v1/tasks
-    Note over S: Route: filter installed models by capability<br/>and context window, rank by policy,<br/>local benchmarks and loop history
-    Note over S: Admit: fair queue per backend, weighted 3/2/1<br/>for interactive, normal and background work,<br/>then memory, swap, CPU-load and heat checks
-    alt queue full, no room, or wait budget spent
-        S-->>M: 429 or 503 with the reason
-    else admitted
-        opt model not resident
-            S->>O: load it under the backend's load lock
-        end
-        S->>O: chat, generate or embed
-        O-->>S: streamed tokens, checked for loops every 16 tokens<br/>when the repetition stop is on
-        S->>O: GET /api/ps
-        O-->>S: where the runner actually ran, GPU or CPU
-        S-->>M: result + receipt
-    end
-    M-->>A: answer + receipt: route, admission, timing, placement
+Model management stays with Ollama: `ollama list`, `ollama pull`, `ollama rm`.
+
+### From any Ollama, OpenAI or Anthropic client
+
+```bash
+freellama gateway                                          # 127.0.0.1:11437
+OLLAMA_HOST=127.0.0.1:11437 ollama run freellama/explain-code
 ```
 
-An explicit `model` always wins over routing; FreeLlama never swaps in another model. With
-`defer:true` the same path runs in the background and `task_jobs` returns the receipt.
+| Client | Point it at | Model |
+|---|---|---|
+| Ollama (CLI, Open WebUI, Continue…) | `OLLAMA_HOST=127.0.0.1:11437` | `freellama/review-code`, or any installed tag |
+| OpenAI Chat and Responses (Codex) | base URL `http://127.0.0.1:11437/v1` | `freellama/review-code` |
+| Anthropic Messages (Claude Code) | `ANTHROPIC_BASE_URL=http://127.0.0.1:11437` | `freellama/review-code` |
 
-Long answers are saved whole and returned as a short view with the file that holds them; see [where an answer goes](packages/mcp/CONFIGURATION.md#where-an-answer-goes).
+Each workflow is a model; responses stream token by token. Real tags pass through to Ollama with
+FreeLlama's admission and telemetry.
 
-### The memory gate
+## What you get
 
-A model load has to fit before it starts, so a new load cannot push the machine into swap:
-
-```mermaid
-flowchart TD
-    T(["Task admitted"]) --> R{"Model already<br/>resident?"}
-    R -->|"yes"| Run(["Run on the resident runner<br/>no new memory"])
-    R -->|"no"| P{"OS memory pressure,<br/>or swapping on a large load?"}
-    P -->|"yes"| Hold["Hold the load"]
-    P -->|"no"| F{"Fits in available memory<br/>and leaves the reserve free?"}
-    F -->|"yes"| Load(["Load, then run"])
-    F -->|"no"| U["Unload idle runners"]
-    U --> F2{"Fits now?"}
-    F2 -->|"yes"| Load
-    F2 -->|"no"| Hold
-    Hold --> W{"Room freed before<br/>the deadline?"}
-    W -->|"yes"| P
-    W -->|"no"| X(["503 naming the hold<br/>and the largest memory users"])
-```
-
-Resident models keep serving through a hold, except at critical OS memory pressure. Load estimates
-come from model metadata (including the K/V cache at the requested context), and Ollama stays the
-final authority on memory. `--low-memory advisory` admits a tight load with a warning instead of
-waiting. Details: [Architecture](docs/ARCHITECTURE.md#managed-task-execution).
+| Area | What it does | Where |
+|---|---|---|
+| **Model choice** | Tested picks per job (coding, summarizing, OCR, image questions, classification, code search, duplicates), each marked installed or not and fitting now or not. Strong-model workflows take the strongest pick that fits, light work the job's default; short memory falls back to a model that fits | `freellama catalog`, `models {view:"catalog"}` |
+| **Workflows** | 15 tested instructions for small models: `fix-bug`, `change-code`, `implement`, `write-tests`, `review-code`, `explain-code`, `summarize-log`, `summarize-text`, `summarize-diff`, `extract-json`, `read-text`, `read-table`, `read-fields`, `answer-image`, `describe-screen`. Sampling comes from each model's card; prompts are checked by an eval | `-w NAME`, `run_task {workflow}`, `scripts/local-test/workflows.mjs` |
+| **Structured output** | A field list (`'name, age int, tags list'`) or a JSON schema | `--schema` |
+| **Decisions** | Yes/no, one of a list, or a level, with a probability | `--ask`, `--choice`, `--level` |
+| **Embeddings and completion** | Shorter vectors; fill-in-the-middle on models that support it | `--dimensions`, `--suffix` |
+| **Checkable answers** | `check:` lines flag padding, numbers or names missing from the source, edits that do not match the file, and leaked `<think>` text. Receipts record the model and why, queue and load times, tokens (cached ones too) and GPU or CPU placement | stderr; `structuredContent` |
+| **Memory safety** | A model loads only if it fits with a reserve; idle models unload first, otherwise the load waits, then is refused with the reason | [The memory gate](docs/ARCHITECTURE.md#managed-task-execution) |
+| **Fair sharing** | One queue per backend weights interactive, normal and background work 3:2:1; holds apply when the machine is busy, hot or swapping. An optional CPU-only Ollama runs helper models beside the GPU | [Monitoring](docs/MONITORING.md) |
+| **Long answers** | Saved whole and returned as a short view | [Where an answer goes](packages/mcp/CONFIGURATION.md#where-an-answer-goes) |
+| **Batches and jobs** | Up to 64 independent items; background jobs; sweeps over a whole code tree or log set | `--each`, `run_task {tasks}`, `--defer` + `freellama job ID --wait`, `sweep` |
+| **Agent-safe shell** | Answer-only stdout, stable exit codes, no hang on an agent's open stdin; every MCP tool callable from a shell | `freellama tool NAME JSON` |
 
 ## What to offload
 
-Offload bounded work whose result your agent can check; keep judgment in the agent.
+Offload bounded work whose result can be checked. Keep judgment in the agent.
 
 | Offload | Keep in your agent |
 |---|---|
-| Embeddings, search and deduplication | Small lookups (describing the task costs more than doing it) |
+| Embeddings, code search and deduplication | Small lookups (describing the task costs more than doing it) |
 | OCR and image reading | High-stakes judgment: security review, design, merge decisions |
 | Bulk rewrites, summaries, classification of many files | Edits across files |
 | Questions about workspace files (`delegate_research`) | Final verification of any local answer |
 
-Many independent items: `run_task {tasks}`. Long work: `run_task {defer:true}` then `task_jobs`.
-Treat local answers as candidates and spot-check some before relying on the rest.
+Treat local answers as candidates: spot-check a few before you rely on the rest.
+
+## How it compares
+
+None of the other tools we compared picks a model by what fits in memory right now. That, plus the
+memory gate and the `check:` lines, is what FreeLlama adds.
+
+| | Picks by machine fit | Task presets | Protocols | Built for agents |
+|---|---|---|---|---|
+| **FreeLlama** | **Yes** | Tested workflows with checks | Ollama, OpenAI Chat and Responses, Anthropic | **Yes** |
+| Ollama alone | No | Modelfiles (fixed at creation) | Ollama, OpenAI, Anthropic | `ollama run` waits forever on an agent's open stdin |
+| fabric | No | Large pattern library | Ollama | Partly |
+| aichat, llm | No | Roles, templates | OpenAI (aichat) | Good (llm) |
+| LiteLLM | By task, not by machine | Aliases | OpenAI | — |
+| Open WebUI, LM Studio | No | Presets with a UI | OpenAI | No |
+
+FreeLlama has no chat UI of its own, a smaller preset library than fabric, and no routing across
+several machines. The full comparison, with sources and measurements, is in
+[Comparison](docs/COMPARISON.md).
+
+## Under the hood
+
+Every managed request, whether from MCP, the agent commands, the operator CLI or the HTTP API, goes through the same
+Rust core: route, admit, load, run, observe. Nothing is decided from a model's name.
+
+| Owner | Does |
+|---|---|
+| Your agent, or you | Decides what to run, writes the request, verifies the answer |
+| FreeLlama | Picks the model, queues fairly, checks memory and host signals, coordinates loads, writes the receipt |
+| Ollama | Stores models, loads runners, generates tokens |
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as Agent or you
+    participant F as MCP server or freellama run
+    participant S as freellama serve
+    participant O as Ollama
+    A->>F: a workflow, job or model, plus the request
+    F->>S: managed task (or a streamed request)
+    Note over S: Route: installed models by capability,<br/>context window and fit; the tested pick first
+    Note over S: Admit: fair queue, then memory, swap,<br/>CPU-load and heat checks
+    alt no room before the wait budget
+        S-->>F: 503 naming the hold and what holds memory
+    else admitted
+        opt model not loaded
+            S->>O: load it, unloading idle models if needed
+        end
+        S->>O: chat, generate or embed
+        O-->>S: tokens
+        S->>O: GET /api/ps (where it really ran)
+        S-->>F: answer + receipt
+    end
+    F-->>A: answer, check: lines, receipt
+```
+
+An explicit `model` always wins over routing; FreeLlama never swaps in another model. The memory
+gate, admission and routing are described in [Architecture](docs/ARCHITECTURE.md).
 
 ## Safety
 
-- Never pulls a model without approval for one exact tag and size; never deletes one unless you name
-  the exact installed tag.
-- Checks each load against live available memory; a load that does not fit waits, then is refused
-  with a reason, and resident models keep serving.
-- Unloads only models it warmed or that you name; idle models are unloaded under memory pressure.
+- Never pulls a model without approval for one exact tag and its size. Never deletes one unless you
+  name the exact installed tag.
+- Checks each load against live free memory. A load that does not fit waits, then is refused with
+  the reason; models already loaded keep serving.
+- Unloads only models it loaded, or models you name. Idle models are unloaded under memory pressure.
 - Holds CPU-bound work on a busy or hot machine and names the signal in the receipt.
-- Binds to loopback; for remote access see [Production](docs/PRODUCTION.md).
+- Binds to loopback. The gateway refuses browser requests from other origins and rebound DNS names.
+  Over HTTP it reads no files and fetches no URLs. For remote access, see
+  [Production](docs/PRODUCTION.md).
 
 ## Documentation
 
 | Topic | Page |
 |---|---|
 | All guides | [Documentation index](docs/README.md) |
-| Every API on one page: MCP tools, `fllama`, gateway, CLI, control API, passthrough | [Every API](docs/API.md) |
-| CLI commands and flags | [CLI](docs/CLI.md) |
-| `ollama run`-style CLI; workflows as models for Ollama, OpenAI and Anthropic clients | [`fllama`](docs/AGENT_CLI.md) |
-| MCP tools, schemas, agent workflow | [MCP reference](packages/mcp/README.md), [MCP configuration](packages/mcp/CONFIGURATION.md) |
+| Every API on one page: MCP tools, agent commands, gateway, CLI, control API | [Every API](docs/API.md) |
+| `freellama run`, `chat`, `gateway`: flags, virtual models, endpoints | [Agent commands](docs/AGENT_CLI.md) |
+| Operator commands (`serve`, `doctor`, `catalog`…) and flags | [CLI](docs/CLI.md) |
+| MCP tools, schemas, configuration | [MCP reference](packages/mcp/README.md), [MCP configuration](packages/mcp/CONFIGURATION.md) |
 | Operating procedure for agents | [FreeLlama skill](skills/freellama/SKILL.md) |
-| Features, routing and admission in depth, why FreeLlama | [Features](docs/FEATURES.md) |
-| How it compares with Ollama, llama.cpp, llama-swap, LocalAI, fabric, aichat, llm, LiteLLM | [Comparison](docs/COMPARISON.md) |
+| Features, routing and admission in depth | [Features](docs/FEATURES.md) |
+| How it compares, with sources and measurements | [Comparison](docs/COMPARISON.md) |
 | Choosing a model | [Model selection](docs/MODEL_SELECTION.md), [local model catalog](docs/LOCAL_MODELS.md) |
 | Model forms, measured results | [Model forms and results](docs/MODEL_FORMS_AND_RESULTS.md) |
 | Recipes per job | [Cookbooks](docs/cookbooks/README.md) |
@@ -284,7 +316,7 @@ Treat local answers as candidates and spot-check some before relying on the rest
 | Background jobs and recovery | [Deferred jobs](docs/DEFERRED_JOBS.md) |
 | History, affinity, warming | [Scopes and warming](docs/SCOPES_AND_WARMING.md) |
 | Deployment and releases | [Production](docs/PRODUCTION.md) |
-| Build from source, operating notes | [Build and notes](docs/BUILD_AND_NOTES.md), [Testing](docs/TESTING.md) |
+| Build from source, tests and evals | [Build and notes](docs/BUILD_AND_NOTES.md), [Testing](docs/TESTING.md) |
 | Architecture and ownership | [Architecture](docs/ARCHITECTURE.md) |
 | Embedding the Rust core | [Rust core](packages/rust-core/README.md) |
 

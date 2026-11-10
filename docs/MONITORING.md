@@ -24,7 +24,7 @@ token and keeps it only for the browser tab.
 | `GET /config` | `freellama config` | | Effective runtime settings and the source of each |
 | `POST /config/reload` | `freellama config --reload` | | Re-read the runtime file now; `422` keeps the last good values |
 | `GET /jobs` | `freellama jobs` | `task_jobs {action:"list"}` | Deferred job metadata without prompts or retained results |
-| `GET /jobs/:id` | `freellama jobs --id <uuid>` | `task_jobs {action:"get", jobId}` | One job receipt and its retained result or error |
+| `GET /jobs/:id` | `freellama jobs --id <uuid>` | `task_jobs {action:"get", jobId}` | One job receipt and its retained result or error. `?wait_ms=N` (at most 5000) holds the read until the job changes; the reply then carries `long_poll: true` |
 | `POST /jobs/:id/cancel` | `freellama jobs --id <uuid> --cancel` | `task_jobs {action:"cancel", jobId}` | Cancellation receipt after local permits are released |
 | `DELETE /jobs/:id` | `freellama jobs --id <uuid> --remove` | `task_jobs {action:"remove", jobId}` | Stops active work, releases local permits, and removes the retained record |
 

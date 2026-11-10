@@ -119,7 +119,7 @@ function ollamaTag(model: VirtualModel, now: string): Fields {
 function ollamaShow(model: VirtualModel): Fields {
   return {
     license: "",
-    modelfile: `# FreeLlama virtual model: ${model.title}\n# Runs on the tested pick that is installed and fits now; see \`fllama workflows\`.`,
+    modelfile: `# FreeLlama virtual model: ${model.title}\n# Runs on the tested pick that is installed and fits now; see \`freellama workflows\`.`,
     parameters: "",
     template: "{{ .Prompt }}",
     details: DETAILS,

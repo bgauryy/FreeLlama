@@ -25,7 +25,7 @@ yarn build
 ```
 
 The root build compiles the host Rust release binary, NAPI addon, and MCP JavaScript bundles
-(server, `fllama` agent CLI, and research adapters). The native `.node` addon remains external to the JavaScript bundle because it is selected
+(server, the agent CLI behind `freellama run`, `chat`, `gateway`…, and research adapters). The native `.node` addon remains external to the JavaScript bundle because it is selected
 by platform triple at runtime. Published packages resolve it from an OS/CPU/libc-specific optional
 dependency rather than compiling Rust during installation.
 
@@ -145,8 +145,8 @@ validation, replay, and flush behavior. `monitoring_contract` also checks that a
 does not hold task completion. Persistence remains best effort, not a zero-loss promise.
 
 MCP `serve.test.ts` checks startup permission failure, retry, child-lifecycle isolation, the
-background start at launch, and the detached serve `fllama` starts (log file, release once ready, log
-tail on an early exit). `agent-cli.test.ts` covers `fllama run` flag mapping and output, registry
+background start at launch, and the detached serve the agent commands start (log file, release once ready, log
+tail on an early exit). `agent-cli.test.ts` covers `freellama run` flag mapping and output, registry
 parity with the MCP server's tool list, virtual models, and the gateway's Ollama, OpenAI and Anthropic
 protocols, including a client that leaves mid-stream. The
 protocol integration contracts verify that spawn failure leaves the MCP connection usable and that
@@ -221,7 +221,7 @@ tier, and each writes a dated report to the git-ignored `.octocode/local-test/`.
 | `scripts/local-test/assist.mjs` | Issue to code, duplicates, triage and OCR on a real repository |
 | `scripts/local-test/media.mjs` | Speech round trip, multimodal image search, embedding comparison through MCP |
 | `scripts/local-test/octocode-agent.mjs` | A local model driving Octocode through `delegate_research` |
-| `scripts/local-test/workflows.mjs` | Each text workflow (summarize-text, summarize-log, summarize-diff, extract-json, explain-code, review-code, fix-bug) on each candidate model through `fllama run -w -m`. Graded on facts present, nothing invented, length, filler, exact JSON fields and the planted bug. Pass `--models a,b`, `--workflows x,y`, `--out file.json`. Re-run it after changing a workflow prompt or a catalog pick |
+| `scripts/local-test/workflows.mjs` | Each text workflow (summarize-text, summarize-log, summarize-diff, extract-json, explain-code, review-code, fix-bug) on each candidate model through `freellama run -w -m`. Graded on facts present, nothing invented, length, filler, exact JSON fields and the planted bug. Pass `--models a,b`, `--workflows x,y`, `--out file.json`. Re-run it after changing a workflow prompt or a catalog pick |
 
 Workflow eval of 2026-11-10 (Apple M2 Pro, 12 cases, so treat it as directional). The second
 run used the reworded prompts and the shipped sampling presets (the first forced temperature 0):
@@ -250,7 +250,7 @@ Publish the eight `@octocodeai/freellama-native-*` packages before `@octocodeai/
 at the exact same version, then the crates with `cargo publish --workspace` (`--dry-run` first packages
 and compiles both crates from their published sources). A successful local pack dry run proves package contents; it does not
 prove registry publication or another hardware class. Both release scripts require
-`packages/mcp/dist/agent-cli.js` (the `fllama` bin) in the MCP package.
+`packages/mcp/dist/agent-cli.js` (the agent commands the `freellama` launcher runs) in the MCP package, and the CLI package to depend on the MCP package of the same version.
 
 ## Test one layer while iterating
 

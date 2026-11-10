@@ -652,6 +652,41 @@ pub(crate) enum Command {
         #[command(subcommand)]
         action: PolicyAction,
     },
+    /// Run one task like `ollama run`, with workflows, files and the memory gate (npm install).
+    #[command(disable_help_flag = true)]
+    Run(AgentArgs),
+    /// The ollama chat on a workflow (freellama/review-code) or a tag (npm install).
+    #[command(disable_help_flag = true)]
+    Chat(AgentArgs),
+    #[command(
+        disable_help_flag = true,
+        about = "Serve workflows as models to Ollama, OpenAI and Anthropic clients (npm install)"
+    )]
+    Gateway(AgentArgs),
+    /// List workflows and jobs with what each expects (npm install).
+    #[command(disable_help_flag = true)]
+    Workflows(AgentArgs),
+    /// Get, wait for or cancel one deferred task by id (npm install).
+    #[command(disable_help_flag = true)]
+    Job(AgentArgs),
+    #[command(
+        disable_help_flag = true,
+        about = "Call one FreeLlama MCP tool with JSON arguments (npm install)"
+    )]
+    Tool(AgentArgs),
+    #[command(
+        disable_help_flag = true,
+        about = "List the FreeLlama MCP tools (npm install)"
+    )]
+    Tools(AgentArgs),
+}
+
+/// The arguments of a command the npm launcher runs in Node (the agent CLI in
+/// `@octocodeai/freellama-mcp-server`); this binary only names them in `--help`.
+#[derive(Debug, clap::Args)]
+pub(crate) struct AgentArgs {
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub(crate) args: Vec<String>,
 }
 
 #[derive(Debug, Subcommand)]

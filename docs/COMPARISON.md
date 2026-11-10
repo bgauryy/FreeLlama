@@ -23,13 +23,13 @@ on 2026-11-01 (the [task presets](#task-presets-shell-use-and-protocols) section
 
 ## Task presets, shell use and protocols
 
-`fllama` and its gateway ([reference](AGENT_CLI.md)) compete with tools that wrap a model in a
+The agent commands and gateway ([reference](AGENT_CLI.md)) compete with tools that wrap a model in a
 named preset and serve it to other clients. Their behavior below is taken from their docs, checked
 on 2026-11-10.
 
 | Question | Other tools | FreeLlama |
 |---|---|---|
-| Named task presets? | fabric has patterns, and user patterns override built-ins ([fabric](https://github.com/danielmiessler/fabric)). aichat has roles: Markdown files with model and sampling front matter ([roles](https://github.com/sigoden/aichat/wiki/Role-Guide)). llm has YAML templates with system, options, schema and tools ([templates](https://llm.datasette.io/en/stable/templates.html)). Open WebUI Workspace Models wrap a base model ([models](https://docs.openwebui.com/features/workspace/models/)). LM Studio has config presets ([presets](https://lmstudio.ai/docs/app/presets)). Ollama has Modelfiles ([Modelfile](https://docs.ollama.com/modelfile)). | Workflows and jobs (`fllama workflows`): a step-by-step system prompt per task, plus the sampling values, think setting and embedding prefixes that each model family documents, with citations in [`local-prompts.ts`](https://github.com/bgauryy/FreeLlama/blob/main/packages/mcp/src/local-prompts.ts). |
+| Named task presets? | fabric has patterns, and user patterns override built-ins ([fabric](https://github.com/danielmiessler/fabric)). aichat has roles: Markdown files with model and sampling front matter ([roles](https://github.com/sigoden/aichat/wiki/Role-Guide)). llm has YAML templates with system, options, schema and tools ([templates](https://llm.datasette.io/en/stable/templates.html)). Open WebUI Workspace Models wrap a base model ([models](https://docs.openwebui.com/features/workspace/models/)). LM Studio has config presets ([presets](https://lmstudio.ai/docs/app/presets)). Ollama has Modelfiles ([Modelfile](https://docs.ollama.com/modelfile)). | Workflows and jobs (`freellama workflows`): a step-by-step system prompt per task, plus the sampling values, think setting and embedding prefixes that each model family documents, with citations in [`local-prompts.ts`](https://github.com/bgauryy/FreeLlama/blob/main/packages/mcp/src/local-prompts.ts). |
 | Which model runs a preset? | Fixed in the preset: fabric `FABRIC_MODEL_PATTERN_NAME`, a role's or template's model, a Modelfile's `FROM`. LiteLLM routes by request complexity ([auto routing](https://docs.litellm.ai/docs/proxy/auto_routing)). LM Studio estimates memory only on request ([`lms load --estimate-only`](https://lmstudio.ai/docs/cli/load)). | The job's tested pick that is installed **and fits in memory now**, the strongest one first for `capable` workflows. Live, with 6.5 GB free: `review-code` moved from `bonsai-2:9b` (10.3 GB) to `lfm3`, and `--ask` ran on `strands-decider` (1.2 GB) instead of a 14.5 GB model. |
 | Presets served as models? | fabric `--serveOllama` lists patterns as Ollama models ([REST API](https://github.com/danielmiessler/fabric/blob/main/docs/rest-api.md)). Open WebUI serves custom models over its OpenAI-style API ([endpoints](https://docs.openwebui.com/reference/api-endpoints/)). A Modelfile becomes a real tag. | `freellama/<workflow>` on the Ollama, OpenAI Chat, OpenAI Responses and Anthropic Messages APIs from one listener, so the `ollama` CLI, Continue, opencode, Codex and Claude Code reach the same configuration. |
 | Which protocols? | aichat `--serve` speaks OpenAI ([CLI guide](https://github.com/sigoden/aichat/wiki/Command-Line-Guide)). llama-swap speaks OpenAI and Anthropic ([llama-swap](https://github.com/mostlygeek/llama-swap)). Ollama speaks its own API, OpenAI and Anthropic ([OpenAI](https://docs.ollama.com/api/openai-compatibility), [Anthropic](https://docs.ollama.com/api/anthropic-compatibility)). | All four. Streamed requests are rewritten and streamed by Ollama itself, so tokens and tool calls stream in every format. |
@@ -44,7 +44,7 @@ What FreeLlama lacks next to them:
 - a run log that can be continued (llm);
 - retry on a larger-context model when the input is too long (LiteLLM `context_window_fallbacks`).
 
-The cost of `fllama` over a direct `ollama` call on identical work is about 0.4 s per call:
+The cost of `freellama run` over a direct `ollama` call on identical work is about 0.4 s per call:
 0.07 s vs 0.45 s, with the same model, prompt and 2 output tokens, on 2026-11-10. Its defaults can
 win that back. Without flags, a direct call let `lfm3` think for 61 tokens to answer "OK" (0.92 s);
 the managed call answered in 2 tokens (0.47 s).

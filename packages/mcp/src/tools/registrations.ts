@@ -1,4 +1,4 @@
-// Every MCP tool's registration, in tools/list order. The MCP server (index.ts) and the fllama CLI
+// Every MCP tool's registration, in tools/list order. The MCP server (index.ts) and the agent CLI (`freellama run`, `tool`…)
 // (agent-cli/registry.ts) both register from this list, so the two surfaces cannot drift.
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { registerAudioTool } from "./audio.js";

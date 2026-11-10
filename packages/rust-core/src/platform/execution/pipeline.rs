@@ -645,6 +645,9 @@ async fn run_admitted_task(
     let mut footprint = footprint;
     super::memory::annotate_ollama_preflight(&mut footprint, &execution, admitted_available);
     execution_receipt["resource_revalidation"] = json!(resource_recheck.receipt);
+    for key in ["resource_admission", "resource_revalidation"] {
+        dedupe_sample(&mut execution_receipt, key);
+    }
     let previous = execution_receipt["memory_reservation"].clone();
     execution_receipt["memory_reservation"] = footprint;
     for key in ["evicted_idle_models", "eviction"] {
@@ -1047,6 +1050,53 @@ mod memory_refusal_tests {
         assert!(
             hint.starts_with("no installed `decision` model fits 4.0 GB free"),
             "{hint}"
+        );
+    }
+}
+
+/// A receipt's admission and revalidation usually read the very host sample the route already
+/// reported (only its age differs). Keep that sample once: a repeat names the one it equals and
+/// keeps its own age, while a fresh sample taken in between stays whole. About 3.4 KB per task.
+fn dedupe_sample(receipt: &mut Value, key: &str) {
+    let without_age = |sample: &Value| {
+        let mut sample = sample.clone();
+        if let Some(object) = sample.as_object_mut() {
+            object.remove("sample_age_ms");
+        }
+        sample
+    };
+    let base = &receipt["resource_snapshot"];
+    let repeated = &receipt[key]["snapshot"];
+    if base.is_object() && repeated.is_object() && without_age(base) == without_age(repeated) {
+        let age = repeated["sample_age_ms"].clone();
+        receipt[key]["snapshot"] =
+            json!({"same_sample_as": "resource_snapshot", "sample_age_ms": age});
+    }
+}
+
+#[cfg(test)]
+mod sample_tests {
+    use super::dedupe_sample;
+    use serde_json::json;
+
+    #[test]
+    fn a_repeated_host_sample_is_kept_once_and_a_fresh_one_stays_whole() {
+        let sample = json!({"available_memory_bytes": 10, "sample_age_ms": 0});
+        let mut receipt = json!({
+            "resource_snapshot": sample,
+            "resource_admission": {"status": "admitted", "snapshot": {"available_memory_bytes": 10, "sample_age_ms": 1}},
+            "resource_revalidation": {"status": "admitted", "snapshot": {"available_memory_bytes": 7, "sample_age_ms": 0}},
+        });
+        dedupe_sample(&mut receipt, "resource_admission");
+        dedupe_sample(&mut receipt, "resource_revalidation");
+        assert_eq!(
+            receipt["resource_admission"]["snapshot"],
+            json!({"same_sample_as": "resource_snapshot", "sample_age_ms": 1})
+        );
+        assert_eq!(receipt["resource_admission"]["status"], "admitted");
+        assert_eq!(
+            receipt["resource_revalidation"]["snapshot"]["available_memory_bytes"],
+            7
         );
     }
 }

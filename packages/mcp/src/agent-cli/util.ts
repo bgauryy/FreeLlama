@@ -1,4 +1,4 @@
-// Small shape helpers shared by the fllama modules.
+// Small shape helpers shared by the agent CLI modules.
 
 export type Fields = Record<string, unknown>;
 

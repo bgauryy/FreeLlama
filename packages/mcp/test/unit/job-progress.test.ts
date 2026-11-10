@@ -353,3 +353,26 @@ describe("progressSink", () => {
     ]);
   });
 });
+
+describe("long poll", () => {
+  it("stops sleeping between reads once serve says it long-polls, and passes the wait", async () => {
+    const reads: Array<number | undefined> = [];
+    const replies = [{ status: "running" }, { status: "running" }, { status: "completed", result: { ok: true } }];
+    let index = 0;
+    const calls = {
+      submit: async () => JSON.stringify({ deferred: true, job: { id: "00000000-0000-4000-8000-000000000001", status: "queued" } }),
+      get: async (_id: string, waitMs?: number) => {
+        reads.push(waitMs);
+        return JSON.stringify({ job: replies[Math.min(index++, replies.length - 1)], long_poll: true });
+      },
+      cancel: async () => "{}",
+      sync: () => { throw new Error("unused"); },
+    };
+    const sleeps: number[] = [];
+    const raw = await runWithJobProgress(calls as never, () => undefined, { wait: async (ms) => { sleeps.push(ms); } });
+    expect(JSON.parse(raw)).toEqual({ ok: true });
+    expect(reads.every((ms) => typeof ms === "number" && ms > 0)).toBe(true);
+    // Only the first read sleeps; after `long_poll` serve does the waiting.
+    expect(sleeps).toHaveLength(1);
+  });
+});

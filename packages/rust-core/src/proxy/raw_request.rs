@@ -290,6 +290,16 @@ impl RawModel {
         } else {
             self.not_installed = not_listed(state, &self.name).await;
         }
+        // No num_ctx in the request and no derivable default: use the window Ollama gave this
+        // model for such a request before.
+        if self.context.is_none() {
+            self.context = state
+                .learned_context
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(super::context_key(&self.name))
+                .copied();
+        }
     }
 
     /// Both initial sharing and an early transition release require known identity and exact

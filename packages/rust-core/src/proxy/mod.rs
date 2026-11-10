@@ -67,6 +67,17 @@ struct ProxyState {
     max_request_bytes: usize,
     /// Shared with every server in the process: bytes of buffered request bodies.
     body_budget: BodyBudget,
+    /// The context Ollama gave each model for a request that set no `num_ctx`, read from
+    /// `/api/ps` after such a request (keyed without `:latest`). Where `FreeLlama` cannot derive
+    /// Ollama's default (a unified-memory host, whose VRAM tier is unknown), this is what lets a
+    /// later request without `num_ctx` count as reusing the loaded runner instead of as a cold
+    /// load that plans evictions (measured: about 45 ms on every such request).
+    learned_context: Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>>,
+}
+
+/// The key a model's learned default context is kept under: Ollama reads `m` as `m:latest`.
+fn context_key(name: &str) -> &str {
+    name.strip_suffix(":latest").unwrap_or(name)
 }
 
 /// Resolve an incoming Ollama path against the configured upstream.
@@ -135,6 +146,7 @@ pub fn app(config: ProxyConfig) -> Result<Router> {
         load_lock: config.load_lock,
         telemetry: config.telemetry,
         hooks: config.hooks,
+        learned_context: Arc::default(),
         upstreams: (!config.upstreams.is_empty())
             .then(|| upstreams::Upstreams::new(config.upstreams)),
         max_request_bytes: config

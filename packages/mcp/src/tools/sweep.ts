@@ -22,7 +22,7 @@ function executorFor(endpoint: string | undefined): Executor {
     const { runTaskRequest, getTaskJob, cancelTaskJob } = await import("../serve-client.js");
     const raw = await runWithJobProgress({
       submit: () => runTaskRequest(target, { ...request, defer: true }),
-      get: (id) => getTaskJob(target, id),
+      get: (id, waitMs) => getTaskJob(target, id, waitMs),
       cancel: (id) => cancelTaskJob(target, id),
       sync: (refusal) => {
         throw new Error(JSON.stringify({ ...refusal, code: typeof refusal?.code === "string" ? refusal.code : "task_jobs_full", retry_safe: true }));

@@ -1,4 +1,4 @@
-// `fllama`: Ollama-style commands that run through FreeLlama. `run` is one managed task with job
+// `freellama`: Ollama-style commands that run through FreeLlama. `run` is one managed task with job
 // mode's picks and prompts; `chat` is the real `ollama run` REPL pointed at an in-process gateway
 // that serves the workflows as virtual models; `gateway` keeps that listener up for any Ollama or
 // OpenAI client; `tool` calls any MCP tool; Ollama's own commands pass through to `ollama`.
@@ -9,39 +9,39 @@ import { configureServeAutostart } from "../serve.js";
 import { SERVER_VERSION } from "../native.js";
 import { parseRunArgs, RUN_USAGE, UsageError, valueOrFile } from "./args.js";
 import { callTool, resultText, toolRegistry } from "./registry.js";
-import { renderResult } from "./output.js";
+import { EXIT_RETRY, renderResult } from "./output.js";
+import { OLLAMA_MISSING, OLLAMA_STOPPED, ollamaPresence } from "../ollama-presence.js";
 import { expandFileEntries } from "../task-files.js";
 import { installedInventory } from "../model-library.js";
 import type { InstalledModel } from "../model-catalog.js";
 import { streamRun, streamTarget } from "./stream.js";
 import { startGateway } from "./gateway.js";
+import { DEFAULT_SERVE_ENDPOINT } from "../config.js";
 import { CHAT_JOB, VIRTUAL_PREFIX, virtualModels } from "./virtual.js";
 import { pickLiveJobModel } from "../job-mode.js";
 
-/** Ollama's own commands: `fllama list` is `ollama list`, byte for byte. */
-const OLLAMA_COMMANDS = new Set(["serve", "create", "show", "stop", "pull", "push", "signin", "signout", "list", "ls", "ps", "cp", "rm", "launch"]);
+/** Ollama's own commands: `freellama list` is `ollama list`, byte for byte. */
+const USAGE = `freellama agent commands: run local models with FreeLlama's tested picks, prompts and memory gate.
 
-const USAGE = `fllama: run local Ollama models with FreeLlama's tested picks, prompts and admission.
-
-  fllama run [MODEL] [PROMPT...] [flags]   one task; ollama run flags plus -w/--workflow, -j/--job, -f/--file ...
-  fllama chat [NAME] [ollama run flags]    the ollama REPL on a FreeLlama virtual model (freellama/fix-bug) or a tag
-  fllama gateway [--port 11437]            serve virtual models over the Ollama, OpenAI and Anthropic APIs
-  fllama workflows                         workflows and jobs, with what each expects
-  fllama catalog [JOB]                     tested picks per job: installed, fits now
-  fllama job ID [--wait|--cancel] [--endpoint URL]   a deferred task's result (--wait: block until it ends)
-  fllama tool NAME [JSON|@FILE|-]          call one FreeLlama MCP tool; fllama tools lists them
-  fllama list|ps|show|pull|rm|cp|create|stop|push|serve ...   passed to ollama unchanged (serve = ollama serve)
+  freellama run [MODEL] [PROMPT...] [flags]   one task; ollama run flags plus -w/--workflow, -j/--job, -f/--file ...
+  freellama chat [NAME] [ollama run flags]    the ollama chat on a workflow (review-code) or a tag
+  freellama gateway [--port 11437]            serve workflows as models to Ollama, OpenAI and Anthropic clients
+  freellama workflows                         workflows and jobs, with what each expects
+  freellama status [--endpoint URL]           on a terminal: memory, queues, loaded models, active jobs
+  freellama job ID [--wait|--cancel] [--endpoint URL]   a deferred task's result (--wait: block until it ends)
+  freellama tool NAME [JSON|@FILE|-]          call one FreeLlama MCP tool; freellama tools lists them
 
 Examples:
-  git diff | fllama run -w summarize-diff
-  fllama run -w fix-bug -f src/parser.ts "The parser drops the last token"
-  fllama run -j find-code -f 'src/**/*.ts' "where are CLI flags parsed"
-  fllama run --ask "Is a refund requested?" < ticket.txt
-  fllama chat review-code
-  OLLAMA_HOST=127.0.0.1:11437 ollama run freellama/explain-code     (with fllama gateway running)
+  git diff | freellama run -w summarize-diff
+  freellama run -w fix-bug -f src/parser.ts "The parser drops the last token"
+  freellama run -j find-code -f 'src/**/*.ts' "where are CLI flags parsed"
+  freellama run --ask "Is a refund requested?" < ticket.txt
+  freellama chat review-code
+  OLLAMA_HOST=127.0.0.1:11437 ollama run freellama/explain-code     (with freellama gateway running)
 
-stdout is the answer; check: lines (verify these first) and notes go to stderr. Exit 0 ok, 1 refused
-or failed, 2 usage, 130 interrupted. A pull, rm or create still needs the user's approval.`;
+stdout is the answer; check: lines (verify these first) and notes go to stderr. Exit 0 ok, 75 busy or
+short of memory (retry later), 1 refused or failed, 2 usage, 130 interrupted. freellama --help lists the
+operator commands (serve, doctor, catalog, task...).`;
 
 type Io = { out: (text: string) => void; err: (text: string) => void; write?: (text: string) => void };
 const stdio: Io = {
@@ -51,7 +51,7 @@ const stdio: Io = {
 };
 
 /**
- * Piped (`a | fllama run`), redirected (`< file`) or programmatic input. A FIFO or a file is read
+ * Piped (`a | freellama run`), redirected (`< file`) or programmatic input. A FIFO or a file is read
  * to its end. A socket (how Node, and many agent harnesses, wire a child's stdin) is read only if
  * data or end-of-input arrives within STDIN_PROBE_MS: a program that passes input sends it at
  * once, while a harness's open socket that never ends is treated as no input instead of hanging
@@ -99,7 +99,7 @@ function progressPrinter(io: Io, verbose: boolean, quiet: boolean) {
   if (quiet) return undefined;
   const show = verbose || process.stderr.isTTY === true;
   return (level: "progress" | "info" | "warning", message: string) => {
-    if (level === "warning" || show) io.err(`fllama: ${message}`);
+    if (level === "warning" || show) io.err(`freellama: ${message}`);
   };
 }
 
@@ -110,6 +110,8 @@ async function run(argv: string[], io: Io): Promise<number> {
     io.out(RUN_USAGE);
     return 0;
   }
+  const stop = await ollamaReady(io, plan.args.endpoint);
+  if (stop !== undefined) return stop;
   // `ollama run MODEL` with no prompt on a terminal is a chat; so is this.
   if (plan.promptless && process.stdin.isTTY) {
     const name = (plan.args.workflow ?? plan.args.job ?? plan.args.model) as string | undefined;
@@ -117,14 +119,15 @@ async function run(argv: string[], io: Io): Promise<number> {
   }
   const signal = interruptSignal();
   const { args } = plan;
-  // `fllama run WORD …`: check the word against the installed tags, as `ollama run` would.
+  // `freellama run WORD …`: check the word against the installed tags, as `ollama run` would.
   if (plan.positionalModel && typeof args.model === "string") {
     const settled = await settleModelWord(args, args.model);
     if (settled) return settled(io);
   }
   if (plan.each) return runEach(args, plan, io, signal);
   // On a terminal, tokens stream as `ollama run` shows them; in a pipe one managed answer comes back.
-  const wantStream = plan.render.stream ?? (process.stdout.isTTY === true && !plan.render.json && !plan.render.extract);
+  // Fill in the middle always runs on the forwarded path (managed tasks are chats).
+  const wantStream = args.suffix !== undefined || (plan.render.stream ?? (process.stdout.isTTY === true && !plan.render.json && !plan.render.extract));
   const target = wantStream && !plan.render.json && !plan.render.extract ? streamTarget(args) : undefined;
   if (target) {
     return streamRun(target, args, plan.render, { ...io, write: io.write ?? ((text) => io.out(text)) }, signal, process.stderr.isTTY === true);
@@ -135,7 +138,7 @@ async function run(argv: string[], io: Io): Promise<number> {
   }
   const result = await callTool("run_task", args, { signal, onMessage: progressPrinter(io, plan.render.verbose, plan.render.quiet) });
   if (signal.aborted) {
-    io.err(resultText(result) || "fllama: cancelled");
+    io.err(resultText(result) || "freellama: cancelled");
     return 130;
   }
   const rendered = renderResult(result, plan.render, process.stderr.isTTY === true);
@@ -171,7 +174,7 @@ async function settleModelWord(args: Record<string, unknown>, word: string): Pro
     return undefined;
   }
   if (args.prompt === undefined && !word.includes(":") && !word.includes("/")) {
-    // `fllama run hello`: no tag of that name, nothing after it; it is the prompt.
+    // `freellama run hello`: no tag of that name, nothing after it; it is the prompt.
     delete args.model;
     args.prompt = word;
     return undefined;
@@ -182,14 +185,14 @@ async function settleModelWord(args: Record<string, unknown>, word: string): Pro
   const near = installed.map((model) => model.name)
     .filter((name) => name.toLowerCase().startsWith(family) || name.toLowerCase().includes(lower))
     .sort((a, b) => rank(a) - rank(b)).slice(0, 3);
-  throw new UsageError(`"${word}" is not an installed model${near.length ? `; did you mean ${near.join(", ")}?` : "; `fllama list` shows the installed tags"} (fllama never pulls; ask before \`ollama pull\`)`);
+  throw new UsageError(`"${word}" is not an installed model${near.length ? `; did you mean ${near.join(", ")}?` : "; `freellama list` shows the installed tags"} (freellama never pulls; ask before \`ollama pull\`)`);
 }
 
 /** --each: one task per file (globs expanded), the same request on each, as one batch. */
 async function runEach(args: Record<string, unknown>, plan: ReturnType<typeof parseRunArgs>, io: Io, signal: AbortSignal): Promise<number> {
   const paths = expandFileEntries(args.files as string[]);
   if (paths.length === 0) throw new UsageError("--each: no file matches the -f patterns.");
-  if (paths.length > 64) throw new UsageError(`--each: ${paths.length} files; a batch takes at most 64 (narrow the glob, or use fllama tool sweep for a tree).`);
+  if (paths.length > 64) throw new UsageError(`--each: ${paths.length} files; a batch takes at most 64 (narrow the glob, or use freellama tool sweep for a tree).`);
   const { files: _files, prompt, ...shared } = args;
   const tasks = paths.map((path) => ({ id: path, independent: true, task: { files: [path], ...(typeof prompt === "string" ? { prompt } : {}) } }));
   const result = await callTool("run_task", { ...shared, tasks }, { signal, onMessage: progressPrinter(io, plan.render.verbose, plan.render.quiet) });
@@ -197,6 +200,25 @@ async function runEach(args: Record<string, unknown>, plan: ReturnType<typeof pa
   for (const line of rendered.stderr) io.err(line);
   if (rendered.stdout !== "") io.out(rendered.stdout);
   return rendered.exitCode;
+}
+
+/**
+ * Commands that need Ollama say at once when it is missing (install it, with the link) or stopped
+ * (start it), instead of after serve's startup waits. Returns the exit code to stop with, or
+ * undefined to go on. A serve named with --endpoint may use an Ollama elsewhere, so it is not probed.
+ */
+async function ollamaReady(io: Io, endpoint: unknown): Promise<number | undefined> {
+  if (endpoint !== undefined) return undefined;
+  const presence = await ollamaPresence();
+  if (presence === "missing") {
+    io.err(`freellama: ${OLLAMA_MISSING}`);
+    return 1;
+  }
+  if (presence === "stopped") {
+    io.err(`freellama: ${OLLAMA_STOPPED}`);
+    return EXIT_RETRY;
+  }
+  return undefined;
 }
 
 /** `review-code` -> `freellama/review-code`; a tag stays a tag. */
@@ -208,11 +230,13 @@ export function chatModelName(name: string | undefined): string {
 
 /** The ollama REPL against a gateway on an ephemeral loopback port, for as long as the REPL runs. */
 async function chat(argv: string[], io: Io): Promise<number> {
+  const stop = await ollamaReady(io, undefined);
+  if (stop !== undefined) return stop;
   const name = argv[0] === undefined || argv[0].startsWith("-") ? undefined : argv[0];
   const flags = name === undefined ? argv : argv.slice(1);
   const gateway = await startGateway({ port: 0, checksInContent: true });
   const model = chatModelName(name);
-  io.err(`fllama: chatting with ${model} (FreeLlama gateway ${gateway.url}); /bye to leave`);
+  io.err(`freellama: chatting with ${model} (FreeLlama gateway ${gateway.url}); /bye to leave`);
   try {
     return await new Promise<number>((resolve) => {
       const child = spawn(process.env.FREELLAMA_OLLAMA_CLI ?? "ollama", ["run", model, ...flags], {
@@ -227,7 +251,7 @@ async function chat(argv: string[], io: Io): Promise<number> {
         resolve(signal ? 130 : code ?? 0);
       });
       child.on("error", (error) => {
-        io.err(`fllama: could not start the ollama CLI: ${error.message}. Install Ollama, or set FREELLAMA_OLLAMA_CLI.`);
+        io.err(`freellama: could not start the ollama CLI: ${error.message}. Install Ollama, or set FREELLAMA_OLLAMA_CLI.`);
         resolve(1);
       });
     });
@@ -244,14 +268,16 @@ async function gateway(argv: string[], io: Io): Promise<number> {
     if (flag === "--port") port = Number(argv[++index]);
     else if (flag === "--endpoint") serveEndpoint = argv[++index];
     else if (flag === "-h" || flag === "--help") {
-      io.out("usage: fllama gateway [--port 11437] [--endpoint SERVE_URL]\nServes freellama/<workflow> virtual models on loopback over the Ollama (/api), OpenAI (/v1/chat/completions, /v1/responses) and Anthropic (/v1/messages) APIs; every other request goes to serve.");
+      io.out("usage: freellama gateway [--port 11437] [--endpoint SERVE_URL]\nServes freellama/<workflow> virtual models on loopback over the Ollama (/api), OpenAI (/v1/chat/completions, /v1/responses) and Anthropic (/v1/messages) APIs; every other request goes to serve.");
       return 0;
     } else throw new UsageError(`unknown gateway flag "${flag}"`);
   }
   if (!Number.isInteger(port) || port < 0 || port > 65_535) throw new UsageError("--port needs a port number");
-  const started = await startGateway({ port, serveEndpoint, log: (line) => io.err(`fllama gateway: ${line}`) });
+  const stop = await ollamaReady(io, serveEndpoint);
+  if (stop !== undefined) return stop;
+  const started = await startGateway({ port, serveEndpoint, log: (line) => io.err(`freellama gateway: ${line}`) });
   const hostPort = started.url.replace(/^http:\/\//, "");
-  io.err(`fllama gateway on ${started.url}: ${virtualModels().length} virtual models; other requests go to serve.
+  io.err(`freellama gateway on ${started.url}: ${virtualModels().length} virtual models; other requests go to serve.
   ollama:  OLLAMA_HOST=${hostPort} ollama run freellama/fix-bug
   openai:  base URL ${started.url}/v1, model "freellama/review-code"
   claude:  ANTHROPIC_BASE_URL=${started.url}  (Codex: wire_api = "responses", base_url ${started.url}/v1)
@@ -282,7 +308,7 @@ async function tool(argv: string[], io: Io): Promise<number> {
   if (name === undefined) return tools(io);
   const registered = toolRegistry().get(name);
   if (raw === "--help" || raw === "-h") {
-    if (!registered) throw new UsageError(`unknown tool "${name}"; \`fllama tools\` lists them.`);
+    if (!registered) throw new UsageError(`unknown tool "${name}"; \`freellama tools\` lists them.`);
     io.out(`${name}: ${registered.description}\n\ninput schema:\n${JSON.stringify(registered.inputSchema.toJSONSchema?.() ?? {}, null, 2)}`);
     return 0;
   }
@@ -304,7 +330,57 @@ async function tool(argv: string[], io: Io): Promise<number> {
   return rendered.exitCode;
 }
 
-/** `fllama job ID --wait`: poll until the job ends, then print only its answer (checks on stderr). */
+const gb = (bytes: unknown) => (typeof bytes === "number" ? `${(bytes / 1e9).toFixed(1)} GB` : "?");
+
+/** Time left before a runner unloads, from `/api/ps` `expires_at` (a far-future date means pinned). */
+function until(expires: unknown, now = Date.now()): string {
+  const at = typeof expires === "string" ? Date.parse(expires) : NaN;
+  if (Number.isNaN(at)) return "?";
+  const seconds = Math.round((at - now) / 1000);
+  if (seconds > 365 * 86_400) return "pinned";
+  return seconds <= 0 ? "now" : seconds < 120 ? `${seconds} s` : `${Math.round(seconds / 60)} min`;
+}
+
+/** `freellama status`: serve, the host, queues and usage, then each loaded runner and the active jobs. */
+async function status(argv: string[], io: Io): Promise<number> {
+  const at = argv.indexOf("--endpoint");
+  const endpoint = at >= 0 ? argv[at + 1] : undefined;
+  const stop = await ollamaReady(io, endpoint);
+  if (stop !== undefined) return stop;
+  const result = await callTool("doctor", { view: "status", ...(endpoint ? { endpoint } : {}) });
+  if (argv.includes("--json")) {
+    io.out(JSON.stringify(result.structuredContent ?? {}, null, 2));
+    return result.isError ? 1 : 0;
+  }
+  const rendered = renderResult(result, { json: false, verbose: false, quiet: false, hideThinking: true }, false);
+  if (result.isError) {
+    for (const line of rendered.stderr) io.err(line);
+    return rendered.exitCode;
+  }
+  io.out(resultText(result).split("\n").filter((line) => !line.startsWith("Full object")).join("\n"));
+  // The runners Ollama holds now, as `ollama ps` shows them, through serve.
+  try {
+    const reply = await fetch(new URL("/api/ps", endpoint ?? DEFAULT_SERVE_ENDPOINT), { signal: AbortSignal.timeout(3_000) });
+    const models = ((await reply.json()) as { models?: Array<Record<string, unknown>> }).models ?? [];
+    if (models.length > 0) {
+      io.out("\nMODEL                                   SIZE      ON     WINDOW   UNLOADS");
+      for (const model of models) {
+        const onGpu = typeof model.size_vram === "number" && typeof model.size === "number" && model.size > 0 ? Math.round((model.size_vram / model.size) * 100) : undefined;
+        io.out(`${String(model.name).padEnd(40)}${gb(model.size).padEnd(10)}${(onGpu === undefined ? "?" : onGpu === 100 ? "GPU" : onGpu === 0 ? "CPU" : `${onGpu}% GPU`).padEnd(7)}${String(model.context_length ?? "?").padEnd(9)}${until(model.expires_at)}`);
+      }
+    }
+  } catch {
+    // Loaded runners are optional detail; the status above stands.
+  }
+  const jobs = (result.structuredContent?.task_jobs as { jobs?: Array<Record<string, unknown>> } | undefined)?.jobs ?? [];
+  if (jobs.length > 0) {
+    io.out("\nACTIVE JOBS");
+    for (const job of jobs) io.out(`${String(job.id).slice(0, 8)}  ${String(job.task ?? "?").padEnd(11)}${String(job.selected_model ?? job.requested_model ?? "-").padEnd(28)}${String(job.status)}${job.reason ? ` (${String(job.reason)})` : ""}`);
+  }
+  return 0;
+}
+
+/** `freellama job ID --wait`: poll until the job ends, then print only its answer (checks on stderr). */
 async function waitJob(id: string, io: Io, endpoint?: string): Promise<number> {
   const signal = interruptSignal();
   for (let delay = 100; !signal.aborted; delay = Math.min(2_000, delay * 2)) {
@@ -327,17 +403,17 @@ function tools(io: Io): number {
   for (const registered of toolRegistry().values()) {
     io.out(`${registered.name.padEnd(18)} ${registered.description.split(/(?<=\.) /)[0]}`);
   }
-  io.out("\nfllama tool NAME --help shows a tool's input schema.");
+  io.out("\nfreellama tool NAME --help shows a tool's input schema.");
   return 0;
 }
 
 function workflows(io: Io): number {
-  io.out("Workflows (fllama run -w NAME; chat and gateway: freellama/NAME):");
+  io.out("Workflows (freellama run -w NAME; chat and gateway: freellama/NAME):");
   for (const name of WORKFLOW_NAMES) {
     const flow = WORKFLOWS[name] as { job: JobName; title: string; input: string };
     io.out(`  ${name.padEnd(16)} ${flow.title} [job ${flow.job}; ${flow.input}]`);
   }
-  io.out("\nJobs (fllama run -j NAME):");
+  io.out("\nJobs (freellama run -j NAME):");
   for (const job of RUN_TASK_JOBS) {
     const spec = LOCAL_JOBS[job];
     io.out(`  ${job.padEnd(18)} ${spec.task.padEnd(9)} ${spec.notes.split(/(?<=\.) /)[0]}`);
@@ -353,14 +429,13 @@ export async function main(argv: string[], io: Io = stdio): Promise<number> {
       return 0;
     }
     if (command === "-v" || command === "--version") {
-      io.out(`fllama ${SERVER_VERSION}`);
+      io.out(`freellama ${SERVER_VERSION}`);
       return 0;
     }
-    if (OLLAMA_COMMANDS.has(command)) return passthrough(argv, io);
     // A one-shot command must not stop serve on exit: start it detached, logging to a file.
     configureServeAutostart({
       detach: true,
-      onStarted: (pid, logFile) => io.err(`fllama: started freellama serve in the background (pid ${pid}, log ${logFile}); stop it with \`kill ${pid}\``),
+      onStarted: (pid, logFile) => io.err(`freellama: started freellama serve in the background (pid ${pid}, log ${logFile}); stop it with \`kill ${pid}\``),
     });
     switch (command) {
       case "run": return await run(rest, io);
@@ -369,10 +444,9 @@ export async function main(argv: string[], io: Io = stdio): Promise<number> {
       case "tool": return await tool(rest, io);
       case "tools": return tools(io);
       case "workflows": return workflows(io);
-      // A run_task job (summarize) shows the catalog job whose picks it runs on (coding).
-      case "catalog": return await tool(["models", JSON.stringify({ view: "catalog", ...(rest[0] ? { job: (LOCAL_JOBS as Record<string, { catalogJob: string }>)[rest[0]]?.catalogJob ?? rest[0] } : {}) })], io);
+      case "status": return await status(rest, io);
       case "job": {
-        // A job lives on the serve that ran it: --endpoint names that serve, as on `fllama run`.
+        // A job lives on the serve that ran it: --endpoint names that serve, as on `freellama run`.
         const at = rest.indexOf("--endpoint");
         const endpoint = at >= 0 ? rest[at + 1] : undefined;
         const words = at >= 0 ? rest.filter((_, index) => index !== at && index !== at + 1) : rest;
@@ -383,25 +457,14 @@ export async function main(argv: string[], io: Io = stdio): Promise<number> {
         return await tool(["task_jobs", JSON.stringify({ action: flag === "--cancel" ? "cancel" : "get", jobId: id, ...where })], io);
       }
       default:
-        throw new UsageError(`unknown command "${command}"; fllama --help lists them.`);
+        throw new UsageError(`unknown command "${command}"; freellama --help lists them.`);
     }
   } catch (error) {
     if (error instanceof UsageError) {
-      io.err(`fllama: ${error.message}`);
+      io.err(`freellama: ${error.message}`);
       return 2;
     }
-    io.err(`fllama: ${(error as Error).message}`);
+    io.err(`freellama: ${(error as Error).message}`);
     return 1;
   }
-}
-
-function passthrough(argv: string[], io: Io): Promise<number> {
-  return new Promise((resolve) => {
-    const child = spawn(process.env.FREELLAMA_OLLAMA_CLI ?? "ollama", argv, { stdio: "inherit" });
-    child.on("exit", (code, signal) => resolve(signal ? 130 : code ?? 0));
-    child.on("error", (error) => {
-      io.err(`fllama: could not start the ollama CLI: ${error.message}. Install Ollama, or set FREELLAMA_OLLAMA_CLI.`);
-      resolve(1);
-    });
-  });
 }
