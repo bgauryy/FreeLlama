@@ -11,6 +11,7 @@ prompts, task dependencies, judgment, and verification. Ollama and the host exec
 | Install, run, and find a guide | [README](README.md), [documentation index](docs/README.md) |
 | Architecture and ownership | [Architecture](docs/ARCHITECTURE.md) |
 | MCP tool choice, request shapes, and agent workflow | [MCP reference](packages/mcp/README.md) |
+| Shell and OpenAI/Ollama-protocol access to jobs and workflows | [`fllama` agent CLI and gateway](docs/AGENT_CLI.md) |
 | Ollama/model operation procedure | [FreeLlama skill](skills/freellama/SKILL.md) |
 | CPU/GPU topology and observed placement | [CPU/GPU routing](docs/CPU_GPU_ROUTING.md) |
 | Runtime resource limits and status | [Monitoring](docs/MONITORING.md) |

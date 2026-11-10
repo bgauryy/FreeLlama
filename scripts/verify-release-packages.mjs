@@ -86,7 +86,7 @@ for (const [directory, expectedName] of publicPackages) {
     }
   } else {
     for (const file of [
-      "dist/index.js", "native/index.js", "native/index.d.ts", "native/package.json",
+      "dist/index.js", "dist/agent-cli.js", "native/index.js", "native/index.d.ts", "native/package.json",
       "dist/research/bash-agent.js", "dist/research/octocode-agent.js",
       "dist/research/github-agent.js", "dist/research/coder-agent.js",
     ]) {

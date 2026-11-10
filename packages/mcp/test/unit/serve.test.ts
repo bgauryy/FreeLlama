@@ -188,3 +188,32 @@ it.skipIf(process.platform === "win32")("ends a caller's wait on abort without s
   await expect(serve!.ensureServe(undefined)).resolves.toBeUndefined();
   expect((await fetch(`${endpoint}/_freellama/v1/health`)).status).toBe(200);
 }, 15_000);
+
+it.skipIf(process.platform === "win32")("detached mode: serve logs to a file, is let go once ready, and its log tail explains an early exit", async () => {
+  const { binary, endpoint } = await fixture();
+  await writeFile(binary, `#!${process.execPath}\nimport('node:http').then(({createServer}) => {
+    const args = process.argv.slice(2); const listen = args[args.indexOf('--listen') + 1];
+    process.stderr.write('detached serve starting\\n');
+    createServer((req,res) => { res.end('{}'); }).listen(Number(listen.split(':').at(-1)), '127.0.0.1');
+  });\n`);
+  await chmod(binary, 0o700);
+  fixtureLaunch.script = binary;
+  const logFile = join(folder!, "serve.log");
+  const started: number[] = [];
+  serve!.configureServeAutostart({ detach: true, logFile, onStarted: (pid) => started.push(pid) });
+  await serve!.ensureServe(undefined);
+  expect(started).toHaveLength(1);
+  // Let go: stopping the autostarted serve no longer reaches it, and it keeps answering.
+  serve!.stopAutostartedServe();
+  expect((await fetch(`${endpoint}/_freellama/v1/health`)).status).toBe(200);
+  const { readFile } = await import("node:fs/promises");
+  expect(await readFile(logFile, "utf8")).toContain("detached serve starting");
+  process.kill(started[0]!, "SIGTERM");
+
+  await writeFile(binary, `#!${process.execPath}\nprocess.stderr.write('Error: port policy refused\\n');\nprocess.exit(3);\n`);
+  vi.resetModules();
+  serve = await import("../../src/serve.js");
+  serve.configureServeAutostart({ detach: true, logFile });
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  await expect(serve.ensureServe(undefined)).rejects.toThrow(/exit 3[\s\S]*port policy refused/);
+}, 15_000);

@@ -32,7 +32,7 @@ function fixture() {
     for (const file of ["LICENSE-APACHE", "LICENSE-MIT"]) put(`packages/${pkg}/${file}`, readFileSync(path.join(repo, file)));
     put(`packages/${pkg}/assets/logo.jpg`, heroImage);
   }
-  for (const file of ["packages/cli/bin/freellama.js", "packages/mcp/dist/index.js", "packages/mcp/native/index.js", "packages/mcp/native/index.d.ts", "packages/mcp/native/package.json", ...adapters.map((name) => `packages/mcp/dist/research/${name}`)]) put(file);
+  for (const file of ["packages/cli/bin/freellama.js", "packages/mcp/dist/index.js", "packages/mcp/dist/agent-cli.js", "packages/mcp/native/index.js", "packages/mcp/native/index.d.ts", "packages/mcp/native/package.json", ...adapters.map((name) => `packages/mcp/dist/research/${name}`)]) put(file);
   for (const { id } of PLATFORM_PACKAGES) {
     put(`packages/native/${id}/${addonName(id)}`, `addon ${version}\n${marker}\n`);
     put(`packages/native/${id}/${executableName(id)}`, `binary ${version}\n${marker}\n`);
@@ -61,7 +61,7 @@ test("complete release package fixture passes", () => {
   try { const result = f.run(); assert.equal(result.status, 0, result.stderr); } finally { f.cleanup(); }
 });
 
-for (const file of ["packages/cli/bin/freellama.js", "packages/mcp/dist/index.js", ...adapters.map((name) => `packages/mcp/dist/research/${name}`)]) {
+for (const file of ["packages/cli/bin/freellama.js", "packages/mcp/dist/index.js", "packages/mcp/dist/agent-cli.js", ...adapters.map((name) => `packages/mcp/dist/research/${name}`)]) {
   test(`missing runtime file is refused: ${file}`, () => {
     const f = fixture();
     try {

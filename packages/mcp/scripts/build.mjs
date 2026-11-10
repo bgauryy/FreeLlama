@@ -1,4 +1,4 @@
-// MCP artifacts: dist/index.js (the server) and dist/research/{bash,octocode,github,coder}-agent.js (the
+// MCP artifacts: dist/index.js (the server), dist/agent-cli.js (`fllama`) and dist/research/{bash,octocode,github,coder}-agent.js (the
 // research adapters it spawns). Native .node stays next door (cannot go in a JS bundle).
 import { build } from "esbuild";
 import { chmodSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -27,6 +27,23 @@ await build({
 const js = readFileSync(outfile, "utf8").replace(/^(?:#!.*\n)+/, "");
 writeFileSync(outfile, `#!/usr/bin/env node\n${js}`);
 chmodSync(outfile, 0o755);
+
+// `fllama`, the agent CLI: same bundle rules as the server.
+const cliFile = path.join(distDir, "agent-cli.js");
+await build({
+  absWorkingDir: pkg,
+  entryPoints: [path.join(pkg, "src", "agent-cli.ts")],
+  outfile: cliFile,
+  bundle: true,
+  format: "esm",
+  platform: "node",
+  target: "node22",
+  sourcemap: false,
+  logLevel: "info",
+  external: ["../native/index.js"],
+});
+writeFileSync(cliFile, `#!/usr/bin/env node\n${readFileSync(cliFile, "utf8").replace(/^(?:#!.*\n)+/, "")}`);
+chmodSync(cliFile, 0o755);
 
 // Each research adapter is a standalone `node <file>` program with its own bundle.
 await build({

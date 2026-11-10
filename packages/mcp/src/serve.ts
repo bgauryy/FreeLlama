@@ -7,7 +7,7 @@
 // launch, so other local clients of the documented endpoint (skills, scripts, the CLI) find it
 // before the agent's first FreeLlama tool call.
 import { type ChildProcess, spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -23,6 +23,16 @@ const READY_PATH = "/_freellama/v1/ready";
 const STARTUP_CEILING_MS = 120_000;
 
 let child: ChildProcess | null = null;
+/**
+ * Detached mode (the `fllama` CLI): serve gets its own process group and logs to a file, and once
+ * ready the caller lets go of it, so it outlives a one-shot command and the next one reuses it.
+ * The MCP server keeps the attached default: serve stops with it.
+ */
+let detachTo: { logFile: string; onStarted?: (pid: number, logFile: string) => void } | null = null;
+
+export function configureServeAutostart(options: { detach: false } | { detach: true; logFile?: string; onStarted?: (pid: number, logFile: string) => void }): void {
+  detachTo = options.detach ? { logFile: options.logFile ?? path.join(FREELLAMA_HOME, "serve.log"), onStarted: options.onStarted } : null;
+}
 let starting: Promise<void> | null = null;
 /** Callers waiting on the current start, told each phase it passes. */
 const watchers = new Set<ProgressSink>();
@@ -163,6 +173,21 @@ export async function ensureServe(
 }
 
 const STDERR_TAIL_BYTES = 4096;
+
+/** A ready detached serve: this process stops tracking it so it can exit while serve keeps running. */
+function letGo(spawned: ChildProcess, detach: NonNullable<typeof detachTo>): void {
+  spawned.unref();
+  if (child === spawned) child = null;
+  if (spawned.pid !== undefined) detach.onStarted?.(spawned.pid, detach.logFile);
+}
+
+function logTail(file: string): string {
+  try {
+    return readFileSync(file, "utf8").slice(-STDERR_TAIL_BYTES);
+  } catch {
+    return "";
+  }
+}
 const STDERR_TAIL_LINES = 20;
 
 function startServe(target: string, listen: string): Promise<void> {
@@ -172,10 +197,19 @@ function startServe(target: string, listen: string): Promise<void> {
       const binary = serveBinaryCandidates().find((candidate) => existsSync(candidate));
       if (!binary) return;
       announce("starting freellama serve");
-      // stdout is the MCP transport: the child must never write to it.
-      const spawned = spawn(binary, ["serve", "--listen", listen, "--upstream", DEFAULT_OLLAMA_ENDPOINT, ...runtimeConfigArgs()], {
-        stdio: ["ignore", "ignore", "pipe"],
-      });
+      const args = ["serve", "--listen", listen, "--upstream", DEFAULT_OLLAMA_ENDPOINT, ...runtimeConfigArgs()];
+      const detach = detachTo;
+      let logFd: number | undefined;
+      if (detach) {
+        mkdirSync(path.dirname(detach.logFile), { recursive: true });
+        logFd = openSync(detach.logFile, "a");
+      }
+      // stdout is the MCP transport: the child must never write to it. A detached serve writes
+      // both streams to its log file instead.
+      const spawned = detach
+        ? spawn(binary, args, { detached: true, stdio: ["ignore", logFd!, logFd!] })
+        : spawn(binary, args, { stdio: ["ignore", "ignore", "pipe"] });
+      if (logFd !== undefined) closeSync(logFd);
       child = spawned;
       // The agent never sees the child's stderr, so keep its tail for the exit error.
       let stderrTail = "";
@@ -203,6 +237,7 @@ function startServe(target: string, listen: string): Promise<void> {
         const state = await readiness(target, 1_000);
         if (state.state === "ready") {
           announce("freellama serve ready");
+          if (detach) letGo(spawned, detach);
           return;
         }
         if (state.state === "waiting") {
@@ -211,7 +246,10 @@ function startServe(target: string, listen: string): Promise<void> {
           last = phase;
           // It answers. Only a catalog still loading resolves itself; an unreachable Ollama or
           // CPU backend will not appear by waiting here, and the tool's call reports it.
-          if (state.waitingFor !== "catalog" && state.waitingFor !== "startup") return;
+          if (state.waitingFor !== "catalog" && state.waitingFor !== "startup") {
+            if (detach) letGo(spawned, detach);
+            return;
+          }
         }
         await new Promise((resolve) => setTimeout(resolve, 200));
       }
@@ -221,7 +259,8 @@ function startServe(target: string, listen: string): Promise<void> {
       }
       // Let the pipe drain so the final lines (usually the cause) are included.
       await Promise.race([closed, new Promise((resolve) => setTimeout(resolve, 500))]);
-      const lines = stderrTail.trim().split("\n").slice(-STDERR_TAIL_LINES).join("\n");
+      const tail = detach ? logTail(detach.logFile) : stderrTail;
+      const lines = tail.trim().split("\n").slice(-STDERR_TAIL_LINES).join("\n");
       throw new Error(
         `freellama serve exited before becoming ready at ${target} (exit ${spawned.exitCode}, signal ${spawned.signalCode}).` +
           (lines ? ` Last stderr:\n${lines}` : ""),

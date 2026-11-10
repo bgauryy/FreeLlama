@@ -11,6 +11,7 @@ Start with the [repository README](https://github.com/bgauryy/FreeLlama/blob/mai
 | Connect an agent and choose a tool | [MCP server](https://github.com/bgauryy/FreeLlama/blob/main/packages/mcp/README.md) |
 | Follow the agent's operating workflow | [FreeLlama skill](https://github.com/bgauryy/FreeLlama/blob/main/skills/freellama/SKILL.md) |
 | Look up commands and task controls | [CLI reference](CLI.md) |
+| Run local models from a shell like `ollama run`, or serve FreeLlama workflows to Ollama and OpenAI clients | [`fllama` agent CLI and gateway](AGENT_CLI.md) |
 | Choose a model for a job | `models {view:"catalog"}`, `freellama catalog`, or the [local model catalog](LOCAL_MODELS.md) |
 | Follow a recipe for one job | [Cookbooks](cookbooks/README.md) |
 | Teach an agent the Octocode CLI in under 30 lines | [Local tools](octocode/LOCAL.md), [GitHub tools](octocode/GITHUB.md) |
