@@ -11,7 +11,7 @@ description: "Use when offloading bounded, token-heavy work to local Ollama mode
 flowchart TD
   A[Task] --> B{"≥10 similar items, or input over ~2k tokens,<br/>and the answer is cheap to check?"}
   B -- no --> Z[Do it yourself]
-  B -- yes --> C["catalog: tested pick per job, installed, fits now"]
+  B -- yes --> C["catalog: tested picks per job, installed, fits now<br/>(none installed: an installed model with the capability, untested)"]
   C --> D["run_task {workflow} or {job}<br/>CLI: freellama run -w NAME / -j NAME -f FILE"]
   D --> E{"Result"}
   E -- "exit 75 / memory refusal" --> F["Tell the user what holds memory; retry later<br/>or a smaller installed pick. Never stop their processes"]
@@ -31,7 +31,7 @@ Workflows (`freellama workflows`): `fix-bug`, `change-code`, `implement`, `write
 | Intent | Thinking mode | Action / check |
 |---|---|---|
 | Decide to offload | Second-order | Count what you send, read back and verify. One short item, cross-file edits, or judgment: do it yourself. |
-| Pick a model | Bayesian | Use current evidence: catalog `fits_now`, then the model the receipt names (`--verbose`, `job_profile.model`). Never infer fit or capability from a name. |
+| Pick a model | Bayesian | Machines differ: the catalog is tested recommendations, not a requirement. Trust the model the receipt names (`--verbose`, `job_profile.model`) and the `check:` that marks an untested pick. Never infer fit or capability from a name. |
 | Trust a result | Inversion, Goodhart | Exit 0 is not correctness. Any `check:` line, `[unsure: treat as unknown]`, or "ran on X because the stronger pick did not fit" means verify or rerun. Read `isError` first. |
 | Get structured output | Via Negativa | Give small models a schema (`format`, `--schema`), keep thinking off for bounded jobs, one model per batch. |
 | Install, unload, delete | Optionality | Irreversible or shared: pull only one exact tag at its approved size; unload only what you warmed; delete only a tag the user names. |
@@ -43,7 +43,7 @@ Workflows (`freellama workflows`): `fix-bug`, `change-code`, `implement`, `write
 | Connecting, flags, exit codes, tool ↔ command, gateway | [MCP and CLI](references/mcp-and-cli.md) | The same operation through either door |
 | Choosing a workflow, job or model; installing one | [Jobs and models](references/jobs-and-models.md) | Request shapes and field-tested model behavior |
 | Research over files, batches, long input, preview, scopes, warming, sweep | [Advanced flows](references/advanced-flows.md) | Bounded multi-step patterns |
-| A failure, memory, placement, disk, or grading a result | [Operations](references/operations.md) | Symptoms, safeguards and the accept / verify / escalate table |
+| A failure, memory, placement, disk, grading a result, or saving tokens | [Operations](references/operations.md) | Symptoms, safeguards, the escalation ladder and the accept / verify / escalate table |
 
 ## Done
 

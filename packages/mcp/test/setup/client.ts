@@ -43,7 +43,9 @@ export async function connectClient(env?: Record<string, string>): Promise<Clien
     // The SDK's implicit child environment is intentionally allowlisted and drops product-specific
     // variables. Always pass the test process environment explicitly so endpoint/config overrides
     // used by isolated live tests actually reach the MCP server child.
-    env: { FREELLAMA_HOME: TEST_HOME, ...process.env, ...env } as Record<string, string>,
+    // Receipt tests read run_task and task_jobs receipts inline; the default agent view is text
+    // (tool-results.ts agentView), covered by its own test with FREELLAMA_MCP_RECEIPT=text.
+    env: { FREELLAMA_HOME: TEST_HOME, FREELLAMA_MCP_RECEIPT: "structured", ...process.env, ...env } as Record<string, string>,
   });
   const client = new Client({ name: "vitest-client", version: "0.0.1" });
   await client.connect(transport);

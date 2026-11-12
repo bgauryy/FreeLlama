@@ -4,7 +4,7 @@
 // caller passes always wins; `job_profile.applied` names every field job mode filled in.
 import { catalogView, type InstalledModel } from "./model-catalog.js";
 import { catalogLiveState } from "./model-library.js";
-import { EMBEDDING_PREFIXES, LOCAL_JOBS, WORKFLOWS, type JobName, type LocalJob, type ModelProfile, type Prefixes, type Workflow, type WorkflowName } from "./local-prompts.js";
+import { EMBEDDING_PREFIXES, isOcrModel, LOCAL_JOBS, WORKFLOWS, type JobName, type LocalJob, type ModelProfile, type Prefixes, type Workflow, type WorkflowName } from "./local-prompts.js";
 
 export type JobProfile = { job: JobName; workflow?: WorkflowName; model: string | undefined; applied: string[] };
 
@@ -96,6 +96,12 @@ export function pickJobModelDetailed(
   // 2026-11-12: bonsai-2:9b previewed at 10.3 GB, the gate admitted it with 6.0 GB free.
   const installedPick = view.picks.find((entry) => entry.installed === true && lacking(entry).length === 0);
   if (installedPick) return { model: ("installed_as" in installedPick && installedPick.installed_as) || installedPick.tag };
+  // Machines differ: with no tested pick installed, an installed model that has the job's
+  // capability runs it, flagged as untested, instead of refusing every workflow.
+  const untested = untestedPick(spec, installed, availableBytes, needs);
+  if (untested) {
+    return { model: untested, note: `no tested pick for job "${job}" is installed, so it ran on ${untested}, chosen by capability and untested for this job: verify the answer (models {view:"catalog", job:"${spec.catalogJob}"} lists tested picks)` };
+  }
   const free = availableBytes === null ? "unknown" : `${(availableBytes / 1e9).toFixed(1)} GB`;
   const picks = view.picks.map((entry) => {
     const missing = entry.installed === true ? lacking(entry) : [];
@@ -105,9 +111,37 @@ export function pickJobModelDetailed(
   const wanted = needs.length > 0 ? ` with ${needs.join(" and ")} support` : "";
   throw new Error(JSON.stringify({
     code: "job_no_model_fits", job, picks, available_gb: availableBytes === null ? null : Number((availableBytes / 1e9).toFixed(1)),
-    error: `job "${job}": no catalog pick${wanted} is installed and fits now (free: ${free}). Picks: ${listed}. ` +
+    error: `job "${job}": no catalog pick${wanted} is installed and fits now (free: ${free}), and no installed model reports the ${[...JOB_CAPABILITIES[spec.task], ...needs].join(" + ")} capability to run it untested. Picks: ${listed}. ` +
       "Ask the user to free memory, pass `model` (an installed model with the same capability), or ask them to approve pulling one exact tag at its size.",
   }));
+}
+
+/** The Ollama capabilities a job's model must report, by the job's task. */
+const JOB_CAPABILITIES: Record<LocalJob["task"], string[]> = {
+  coding: ["completion"], completion: ["completion"], vision: ["completion", "vision"], embedding: ["embedding"], decision: ["decision"],
+};
+
+/**
+ * An installed model for a job none of whose tested picks is installed: one that reports every
+ * capability the job and the request need (models whose capabilities are unknown are skipped:
+ * a guess could send a chat to an embedding model). OCR-only families read text from images only,
+ * so they serve the ocr job and nothing else. Among the rest, the largest whose file leaves half of
+ * free memory for its context and the host is preferred (bigger answers better), else the smallest
+ * (serve's memory gate decides). Image search prefers an embedding model that also takes images.
+ */
+function untestedPick(spec: LocalJob, installed: readonly InstalledModel[], availableBytes: number | null, needs: readonly string[] = []): string | undefined {
+  const wanted = [...JOB_CAPABILITIES[spec.task], ...needs];
+  const ocrJob = spec.job === "ocr";
+  let candidates = installed.filter((model) => model.capabilities !== undefined
+    && wanted.every((capability) => model.capabilities!.includes(capability))
+    && (ocrJob || !isOcrModel(model.name)));
+  if (ocrJob && candidates.some((model) => isOcrModel(model.name))) candidates = candidates.filter((model) => isOcrModel(model.name));
+  if (spec.job === "image-search" && candidates.some((model) => model.capabilities!.includes("vision"))) candidates = candidates.filter((model) => model.capabilities!.includes("vision"));
+  if (candidates.length === 0) return undefined;
+  const size = (model: InstalledModel) => model.size ?? Number.MAX_SAFE_INTEGER;
+  const roomy = availableBytes === null ? [] : candidates.filter((model) => model.size !== undefined && model.size * 2 <= availableBytes);
+  const ordered = roomy.length > 0 ? [...roomy].sort((a, b) => size(b) - size(a)) : [...candidates].sort((a, b) => size(a) - size(b));
+  return ordered[0]!.name;
 }
 
 /** Read the live state and pick: only when the caller left `model` out. */
@@ -245,6 +279,13 @@ export function applyJob<T extends JobFields>(
   if (options && Object.keys(options).some((key) => next.options?.[key] === undefined)) {
     next.options = { ...options, ...next.options };
     applied.push("options");
+  }
+  // A ceiling on the answer, about 8x what the workflow's eval answers needed: a looping or
+  // rambling model stops in seconds instead of minutes. Only with thinking off, where reasoning
+  // cannot spend it; run_task turns stopOnRepetition on with it (a cap would turn it off).
+  if (flow?.maxOutput !== undefined && next.think === false && next.options?.num_predict === undefined) {
+    next.options = { ...next.options, num_predict: flow.maxOutput };
+    applied.push("num_predict");
   }
   return { fields: next as T, profile: profile() };
 }

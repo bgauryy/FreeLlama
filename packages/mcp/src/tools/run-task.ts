@@ -20,7 +20,7 @@ import { applyJob, mergeProfiles, neededCapabilities, pickLiveJobModel, pickLive
 import { LOCAL_JOBS, RUN_TASK_JOBS, WORKFLOW_NAMES, WORKFLOWS, type JobName, type WorkflowName } from "../local-prompts.js";
 import { checkOutputPath, HANDOFF_NAME, summaryOf, writeHandoff } from "../handoffs.js";
 import { outputInput } from "../tool-results.js";
-import { resultChecks, withChecks } from "../result-checks.js";
+import { injectionCheck, inputData, nullFieldCheck, resultChecks, withChecks } from "../result-checks.js";
 import { tablesToMarkdown } from "../table-markdown.js";
 import { EmbeddingIndex, embedIndexEnabled, rankByQuery } from "../embed-index.js";
 import { installedInventory } from "../model-library.js";
@@ -681,12 +681,25 @@ export function registerRunTaskTool(server: McpServer): void {
           ({ prompt, systemPrompt, options, think, input, model } = applied.fields);
           format = applied.fields.format as typeof format;
           task = applied.fields.task as typeof task;
+          // The workflow's output ceiling would turn serve's repetition stop off (a cap means "the
+          // caller bounded it"); free text keeps it on, structured output is legitimately periodic.
+          if (applied.profile.applied.includes("num_predict") && stopOnRepetition === undefined && format === undefined && !tools?.length) stopOnRepetition = true;
           nearestRequest = applied.fields.nearest as typeof nearestRequest;
           profile = applied.profile;
         }
         // Checks read the result itself (uncertain answers, close matches, unsupported facts, edits
         // that do not match the file) and are saved with a handoff too.
-        const finish = <R,>(result: R): R => withJob(withCheck(withChecks(asWorkflowOutput(result, workflow), job, task ?? "completion", tools, workflow), pickNote), profile, saveAs);
+        // The data the model read (files are inlined into prompt or state by then), never the request.
+        const inputText = () => inputData(typeof prompt === "string" ? prompt : undefined, typeof state === "string" ? state : undefined);
+        const answerOf = (result: unknown) => ((result as { content?: Array<{ type: string; text?: string }> }).content ?? []).find((part) => part.type === "text")?.text ?? "";
+        const extraChecks = (result: unknown) => {
+          const input = inputText();
+          return [
+            pickNote, injectionCheck(input),
+            workflow === "extract-json" ? nullFieldCheck(answerOf(result).split("\ncheck: ")[0]!, input || (typeof prompt === "string" ? prompt : "")) : undefined,
+          ];
+        };
+        const finish = <R,>(result: R): R => withJob(withCheck(withChecks(asWorkflowOutput(result, workflow), job, task ?? "completion", tools, workflow), ...extraChecks(result)), profile, saveAs);
         const canonicalTask = task ?? "completion";
         if (preview) {
           const executionOnlyFields = ([
@@ -1001,11 +1014,12 @@ function asWorkflowOutput<R>(result: R, workflow: WorkflowName | undefined): R {
   return { ...result, content: shown.content.map((part) => (part.type === "text" ? { ...part, text: table(part.text ?? "") } : part)) } as R;
 }
 
-/** One more `check:` line, after the result's own checks. */
-function withCheck<R>(result: R, check: string | undefined): R {
+/** More `check:` lines, after the result's own checks. */
+function withCheck<R>(result: R, ...extra: Array<string | undefined>): R {
   const shown = result as { content?: Array<{ type: string; text?: string }>; structuredContent?: Record<string, unknown>; isError?: boolean };
-  if (check === undefined || shown.isError || !shown.structuredContent) return result;
-  const checks = [...((shown.structuredContent.checks as string[] | undefined) ?? []), check];
-  const content = (shown.content ?? []).map((part, index) => (index === 0 && part.type === "text" ? { ...part, text: `${part.text ?? ""}\ncheck: ${check}` } : part));
+  const added = extra.filter((check): check is string => check !== undefined);
+  if (added.length === 0 || shown.isError || !shown.structuredContent) return result;
+  const checks = [...((shown.structuredContent.checks as string[] | undefined) ?? []), ...added];
+  const content = (shown.content ?? []).map((part, index) => (index === 0 && part.type === "text" ? { ...part, text: `${part.text ?? ""}${added.map((check) => `\ncheck: ${check}`).join("")}` } : part));
   return { ...result, structuredContent: { ...shown.structuredContent, checks }, content } as R;
 }

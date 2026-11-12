@@ -204,6 +204,68 @@ function toolCallChecks(calls: unknown[], tools: unknown[] | undefined): string[
     : [`${calls.length} tool call(s) match the tool schemas: run them, then send each result back as {role:"tool", tool_name, content} after the assistant message, with the same tools`];
 }
 
+/**
+ * Text in the input that addresses the model rather than describing anything: a summary, review or
+ * extraction over it may have followed it instead of the caller. Prompt-side defenses only halve
+ * such injections (arXiv 2403.14720), so this check runs outside the model, on the input itself.
+ */
+const ADDRESSED_TO_MODEL = [
+  /\b(?:ignore|disregard|forget)\s+(?:all\s+|any\s+|the\s+|your\s+)*(?:previous\s+|prior\s+|above\s+|earlier\s+|preceding\s+)?(?:instructions?|prompts?|rules|task|directions)\b/i,
+  /\b(?:reply|respond|answer|output)\s+(?:only\s+with|with\s+only)\b/i,
+  /\byou are now\b/i,
+  /^\s*(?:system|assistant)\s*:/im,
+  /\bnew instructions?\s*:/i,
+];
+
+/**
+ * The data part of a request, where an instruction is out of place: inlined files (after the first
+ * `--- file:` line), else what follows the request's first paragraph (the CLI appends piped input
+ * after a blank line). The caller's own request is never scanned.
+ */
+export function inputData(prompt: string | undefined, state?: string): string {
+  const text = prompt ?? "";
+  const file = text.indexOf("--- file: ");
+  const data = file >= 0 ? text.slice(file) : text.includes("\n\n") ? text.slice(text.indexOf("\n\n") + 2) : "";
+  return [data, state ?? ""].filter(Boolean).join("\n");
+}
+
+/** A check when the input data carries instructions addressed to a model; undefined otherwise. */
+export function injectionCheck(input: string): string | undefined {
+  for (const pattern of ADDRESSED_TO_MODEL) {
+    const match = pattern.exec(input);
+    if (match) {
+      const quoted = match[0].trim().replace(/\s+/g, " ").slice(0, 60);
+      return `the input contains text addressed to a model ("${quoted}"): check the answer followed your request, not that text`;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * extract-json fields left null although the input names them with a value ("Receipt R-19" for
+ * receipt_id): small models drop a value whose label differs from the field name (eval 2026-11-12,
+ * bonsai-2:9b 3 of 12). Checked here, outside the model.
+ */
+export function nullFieldCheck(answer: string, input: string): string | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(answer.replace(/^\[[^\]\n]*\]\s*/, "").replace(/^```(?:json)?\s*|\s*```\s*$/g, "").trim());
+  } catch {
+    return undefined;
+  }
+  const fields = object(parsed);
+  if (!fields) return undefined;
+  const found: string[] = [];
+  for (const [key, value] of Object.entries(fields)) {
+    if (value !== null) continue;
+    const label = key.toLowerCase().replace(/[_-]?(?:id|number|no|num|code)$/, "").replace(/[_-]+/g, " ").trim();
+    if (label.length < 3) continue;
+    const match = new RegExp(`\\b${label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*(?:#|no\\.?|number|id)?\\s*:?\\s*([A-Za-z]*-?\\d[\\w-]*)`, "i").exec(input);
+    if (match) found.push(`${key} (the input has "${match[0].trim()}")`);
+  }
+  return found.length > 0 ? `null although the input names a value: ${found.join(", ")}; check the extraction` : undefined;
+}
+
 /** The checks for one finished result; empty when there is nothing specific to say. */
 export function resultChecks(context: CheckContext): string[] {
   const calls = list(object(object(context.structured.response)?.message)?.tool_calls);

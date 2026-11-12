@@ -27,6 +27,7 @@ Start with the [repository README](https://github.com/bgauryy/FreeLlama/blob/mai
 | Compare FreeLlama with Ollama, llama.cpp, llama-swap, LocalAI, fabric, aichat, llm and LiteLLM | [Comparison](COMPARISON.md) |
 | See supported model forms and dated measured results | [Model forms and results](MODEL_FORMS_AND_RESULTS.md) |
 | Reduce reloads, prompt cost and memory; tune Ollama settings | [Tuning](TUNING.md) |
+| See how local-model prompts are written, checked and changed | [Local prompts](PROMPTS.md) |
 | Build from source; read operating notes (response store, port 11435, certificates) | [Build and notes](BUILD_AND_NOTES.md) |
 | Choose a model and interpret its metadata | [Model selection](MODEL_SELECTION.md), [model metadata](MODEL_SELECTION.md#model-metadata) |
 | Inspect quantization, placement, or neuron activations | [Model introspection](MODEL_INTROSPECTION.md) |

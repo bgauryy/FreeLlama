@@ -11,6 +11,7 @@ server-launch config (for example `.mcp.json`'s `env` block) or the launching sh
 |---|---|---|
 | `FREELLAMA_OLLAMA_ENDPOINT` | `http://127.0.0.1:11434` | Default Ollama endpoint for `doctor`, the `models` detail/raw/library views, all `ollama_*` tools, and the autostarted serve's `--upstream` |
 | `FREELLAMA_SERVE_ENDPOINT` | `http://127.0.0.1:11435` | Default `endpoint` for serve-backed tools and `delegate_research` |
+| `FREELLAMA_MCP_RECEIPT` | `text` | `structured` keeps `run_task` and `task_jobs` receipts inline as `structuredContent` (see [Where an answer goes](#where-an-answer-goes)) |
 | `FREELLAMA_MCP_DEFAULT_MODEL` | unset (routes to an installed coding model) | `delegate_research`'s default `model` |
 | `FREELLAMA_MCP_DEFAULT_ADAPTER` | `bash` | `delegate_research`'s adapter (`octocode` to switch) |
 | `FREELLAMA_MCP_MAX_TURNS` | `8` | Max agent turns for `delegate_research` |
@@ -129,6 +130,14 @@ reuses saved chunk results; sweeps never resume on their own.
 ## Where an answer goes
 
 Every result is saved whole (`response_file`; read one part with `read_response{file, section}`).
+
+`run_task` and `task_jobs` answer with **text alone**: the answer, its `check:` lines and a closing
+`response_file: <path>` line, with no `structuredContent`. Hosts such as Claude Code show
+`structuredContent` in place of the text when a result has it, which handed the agent the whole
+receipt (1–3k tokens) around a two-line answer. The receipt (route, model, timings, placement,
+tokens) stays in the response file, one `read_response` away; `receipt:"full"` on a call returns it
+inline, and `FREELLAMA_MCP_RECEIPT=structured` restores inline receipts for every call (those two
+tools then declare their output schema again). The other tools always return `structuredContent`.
 `run_task` and `delegate_research` take two more fields that choose what comes back inline:
 
 - `output`: `auto` (default) returns the answer inline up to 8,000 characters (about 2,000 tokens),

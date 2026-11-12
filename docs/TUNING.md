@@ -29,7 +29,11 @@ running out of memory. Best payoff first:
 3. **Spend output only where it helps.** Completion, tools, browser and vision tasks send
    `think:false` (Ollama otherwise enables thinking on capable models); coding, code-repair and
    long-context tasks send `think:"medium"` to thinking models. `stopOnRepetition` cut `glm-ocr` on 12
-   report strips from 12,948 to 6,452 output tokens with every label still read.
+   report strips from 12,948 to 6,452 output tokens with every label still read. Each text workflow
+   also caps its answer (`num_predict`, about 8 times the median its eval answers needed, 300–2,000
+   tokens) when thinking is off, and keeps `stopOnRepetition` on with it, so a model that loops stops
+   in seconds; a caller's own `num_predict` wins. End to end, workflows ran at 13–27 tokens/s on
+   `bonsai-2:9b` and Nemotron-3.5-Bolt here: the answer's length, not the prompt, sets the time.
 4. **Unload instead of swapping.** A load that does not fit waits instead of swapping, idle models are
    unloaded under memory pressure, and `unload` frees a big model before a switch without ever
    loading it.

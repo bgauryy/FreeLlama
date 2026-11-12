@@ -206,7 +206,7 @@ FreeLlama's admission and telemetry.
 | **Structured output** | A field list (`'name, age int, tags list'`) or a JSON schema | `--schema` |
 | **Decisions** | Yes/no, one of a list, or a level, with a probability | `--ask`, `--choice`, `--level` |
 | **Embeddings and completion** | Shorter vectors; fill-in-the-middle on models that support it | `--dimensions`, `--suffix` |
-| **Checkable answers** | `check:` lines flag padding, numbers or names missing from the source, edits that do not match the file, and leaked `<think>` text. Receipts record the model and why, queue and load times, tokens (cached ones too) and GPU or CPU placement | stderr; `structuredContent` |
+| **Checkable answers** | `check:` lines flag padding, numbers or names missing from the source, edits that do not match the file, leaked `<think>` text, instructions hidden in the input, and fields an extraction left empty. Receipts record the model and why, queue and load times, tokens (cached ones too) and GPU or CPU placement | stderr; MCP `response_file` ([local prompts](docs/PROMPTS.md)) |
 | **Memory safety** | A model loads only if it fits with a reserve; idle models unload first, otherwise the load waits, then is refused with the reason | [The memory gate](docs/ARCHITECTURE.md#managed-task-execution) |
 | **Fair sharing** | One queue per backend weights interactive, normal and background work 3:2:1; holds apply when the machine is busy, hot or swapping. An optional CPU-only Ollama runs helper models beside the GPU | [Monitoring](docs/MONITORING.md) |
 | **Long answers** | Saved whole and returned as a short view | [Where an answer goes](packages/mcp/CONFIGURATION.md#where-an-answer-goes) |

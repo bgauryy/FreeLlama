@@ -1,7 +1,7 @@
 {
   "snapshot": "2026-11-12",
   "measured_on": "Apple M2 Pro, 32 GB, Ollama 0.40.13, with other work running",
-  "how_to_read": "quality is measured (run here with known answers), published (the publisher's figure), or untested. memory_gb is what FreeLlama asks to have available, including its reserve; null means not previewed. Discovery never authorizes a pull: ask for one exact tag and its size first.",
+  "how_to_read": "quality is measured (run here with known answers), published (the publisher's figure), or untested. memory_gb is a conservative preview of what FreeLlama asks to have available, including its reserve (null means not previewed); serve's memory gate measures the real need, so an installed pick marked fits_now false may still run. These are tested recommendations, not requirements: with none installed, run_task {workflow} or {job} runs on an installed model with the job's capability and marks it untested. Discovery never authorizes a pull: ask for one exact tag and its size first.",
   "jobs": [
     { "job": "classify", "title": "Classify, triage, yes/no", "call": "run_task {task:\"decision\"}", "cookbook": "cookbooks/classify", "picks": [
       { "tag": "strands-decider:2b-nvfp4", "role": "default", "file_gb": 1.3, "memory_gb": 3.8, "quality": "measured", "evidence": "53/56 in all 3 rounds, 7 ms median; published 182/231 JevBench" },

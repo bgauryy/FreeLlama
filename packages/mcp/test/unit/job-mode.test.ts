@@ -112,6 +112,32 @@ describe("job model pick", () => {
     expect(refusal.picks.find((pick: any) => pick.tag === "bonsai-2:9b").lacks).toEqual(["tools"]);
   });
 
+  it("runs a job on another machine's models by capability, flagged untested, when no tested pick is installed", () => {
+    // Users install other models: none of these is a catalog pick.
+    const other = [
+      { name: "qwen3:8b", capabilities: ["completion", "tools", "thinking"], size: 5.2 * GB },
+      { name: "llama3.2:3b", capabilities: ["completion", "tools"], size: 2.0 * GB },
+      { name: "llava:7b", capabilities: ["completion", "vision"], size: 4.7 * GB },
+      { name: "glm-ocr:latest", capabilities: ["completion", "vision"], size: 2.2 * GB },
+      { name: "mxbai-embed-large:latest", capabilities: ["embedding"], size: 0.7 * GB },
+    ];
+    const coding = pickJobModelDetailed("coding", other, 16 * GB, "capable");
+    expect(coding.model).toBe("qwen3:8b");
+    expect(coding.note).toMatch(/no tested pick for job "coding" is installed, so it ran on qwen3:8b, chosen by capability and untested/);
+    // Less room: the largest that leaves half of free memory, else the smallest for the gate to judge.
+    expect(pickJobModel("summarize", other, 6 * GB)).toBe("llama3.2:3b");
+    expect(pickJobModel("coding", other, 2 * GB)).toBe("llama3.2:3b");
+    // An OCR-only model reads text, and only that; a general vision model answers about images.
+    expect(pickJobModel("ocr", other, 16 * GB)).toBe("glm-ocr:latest");
+    expect(pickJobModel("image-recognition", other, 16 * GB)).toBe("llava:7b");
+    expect(pickJobModel("find-code", other, 16 * GB)).toBe("mxbai-embed-large:latest");
+    // A request's own needs still apply: llava cannot call tools.
+    expect(() => pickJobModel("image-recognition", other, 16 * GB, "default", ["tools"])).toThrow(/job_no_model_fits/);
+    // No decision model installed, or capabilities Ollama did not report: refuse rather than guess.
+    expect(() => pickJobModel("classify", other, 16 * GB)).toThrow(/job_no_model_fits/);
+    expect(() => pickJobModel("coding", installed("qwen3:8b"), 16 * GB)).toThrow(/job_no_model_fits/);
+  });
+
   it("hands an installed pick that misses only the catalog's memory preview to serve's memory gate", () => {
     // The preview asks for a reserve; the gate measures the real load (bonsai-2:9b previewed at
     // 10.3 GB ran with 6.0 GB free) and refuses with what holds memory when it truly has no room.
@@ -152,6 +178,16 @@ describe("job defaults", () => {
     const vl = applyJob("image-recognition", { prompt: "Which bar?", options: { temperature: 0.5 } }, "lfm3-vl:2b-q4_K_M");
     expect(vl.fields.systemPrompt).toBe(LOCAL_JOBS["image-recognition"].systemPrompt);
     expect(vl.fields.options).toEqual({ temperature: 0.5, top_p: 1, top_k: 50, min_p: 0, repeat_penalty: 1.1 });
+  });
+
+  it("caps a workflow's answer with thinking off, never with thinking on, and the caller's cap wins", () => {
+    const capped = applyJob("summarize", {}, "bonsai-2:9b", false, "summarize-log");
+    expect(capped.fields.options).toMatchObject({ num_predict: WORKFLOWS["summarize-log"].maxOutput });
+    expect(capped.profile.applied).toContain("num_predict");
+    expect(applyJob("summarize", { think: true }, "bonsai-2:9b", false, "summarize-log").fields.options?.num_predict).toBeUndefined();
+    expect(applyJob("summarize", { options: { num_predict: 64 } }, "bonsai-2:9b", false, "summarize-log").fields.options?.num_predict).toBe(64);
+    // OCR readers keep their own length: a page of text has no fixed size.
+    expect(applyJob("ocr", {}, "hf.co/openbmb/MiniCPM-OCR-1.0-gguf:Q4_K_M", false, "read-text").fields.options?.num_predict).toBeUndefined();
   });
 
   it("turns bonsai-2:9b's thinking off with its non-thinking preset, unless the caller chose thinking", () => {

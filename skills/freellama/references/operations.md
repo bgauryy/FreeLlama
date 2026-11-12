@@ -20,6 +20,8 @@ The calling agent owns decomposition, prompts and verification. The operator own
 | 429 `admission_queue_full` or 503 `admission_timeout` | The backend pool is saturated: retry after `Retry-After` or lower fan-out. Raise only that pool, after reading Ollama's parallel and KV limits ([monitoring](https://github.com/bgauryy/FreeLlama/blob/main/docs/MONITORING.md#adaptive-concurrency)). Never retry a 503 while holding admission. |
 | Low-confidence refusal (`minConfidence`) | Add a policy plus functional evidence, lower the floor, or use `fastest` and say the evidence is low. |
 | Exit 1 "tool call although no tools were sent", or any `check:` warning | A failed or doubtful answer: rerun on a stronger installed pick ([jobs and models](jobs-and-models.md#field-tested-model-behavior)). |
+| `check:` "the input contains text addressed to a model" | The data carried instructions. Confirm the answer reports them rather than follows them before acting on it. |
+| `check:` "null although the input names a value" | An extraction dropped a value the input has. Re-run on a stronger pick or fill the field yourself. |
 | `check:` "ran on X because the stronger installed pick Y did not fit now" | Memory forced a weaker model. Verify, or rerun when memory frees or with `model`. |
 | `job_no_model_fits` | No pick is installed with room. Report free memory and what holds it; pass an installed model with the same capability, or ask approval to pull one exact tag. |
 | Empty answer after thinking | The model spent its budget thinking: `--think=false` or raise `num_predict`. |
@@ -35,6 +37,21 @@ The calling agent owns decomposition, prompts and verification. The operator own
 - `doctor` advises `LLAMA_ARG_CACHE_RAM` (for example 2048 on 32 GB hosts). Apply `OLLAMA_*` changes only with human intent, in the Ollama service's environment, then restart it ([production](https://github.com/bgauryy/FreeLlama/blob/main/docs/PRODUCTION.md#configure-ollama-explicitly)).
 - Unload only a model you warmed (when its burst ends) or one the user names. Delete only an exact installed tag the user names in this conversation (`ollama_delete` or `ollama rm`); never delete files under `~/.ollama/models`. Old models are candidates, not a retention policy.
 - `bench-all` talks to Ollama directly, past the memory gate: run it on a quiet machine with `--include` for the tags you mean, and `--output` outside the repo's evidence file unless you intend to replace it. It covers chat, tools, vision, embedding and decision models; speech-only models get no case. A model evicted by another client after its answer is graded normally with a note.
+
+## Spend the fewest tokens: the escalation ladder
+
+Send each piece of work to the cheapest worker that can do it reliably, and keep only its conclusion in your context.
+
+| Rung | Worker | Use it for | Move up when |
+|---|---|---|---|
+| 1 | Deterministic tools: `grep`, LSP, scripts, `jq` | Known names, exact counts, structure | The question needs reading or judgment |
+| 2 | A local model through FreeLlama (free, private) | Bulk, bounded, cheap-to-check work: summaries, extraction, classification, OCR, search by meaning | A `check:` line, an `[unsure]` mark, a tool call nobody asked for, or two failed spot-checks |
+| 3 | A small hosted model your host offers as a subagent (for example Claude Haiku) | Reading many results and triaging them, multi-step lookups, work that injected text or a format trips a local model on | The result needs judgment you must stand behind |
+| 4 | Your own model | Decomposition, final judgment, verification, edits across files | — |
+
+- Hand a worker a path, not pasted text, and ask for a short verdict plus a file for the detail.
+- Verify a sample of each worker's output yourself before relying on the rest; a confident summary is still a candidate.
+- Over MCP, `run_task` already answers with text and keeps the receipt in `response_file`; read a receipt section only when your next step needs it.
 
 ## Grade the result
 

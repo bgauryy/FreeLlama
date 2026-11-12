@@ -352,18 +352,48 @@ export async function finishResult<T extends ToolResult>(
 }
 
 /**
+ * Tools whose answer is text (no outputSchema): hosts that show structuredContent instead of the
+ * text (Claude Code does) would hand the agent the whole receipt, 1-3k tokens around a two-line
+ * answer, measured 2026-11-12. These answer with the text alone; the receipt stays in
+ * response_file. `receipt:"full"` or FREELLAMA_MCP_RECEIPT=structured keeps it inline.
+ */
+const TEXT_ANSWER_TOOLS = new Set(["run_task", "task_jobs"]);
+
+/** Whether answer tools answer with text (the default) or keep the receipt inline. */
+const textAnswers = (): boolean => process.env.FREELLAMA_MCP_RECEIPT !== "structured";
+
+/** The result an MCP host shows its agent: the answer text and where the receipt is, for answer tools. */
+export function agentView<T extends ToolResult>(tool: string, args: unknown, result: T): T {
+  const structured = object(result.structuredContent);
+  if (!TEXT_ANSWER_TOOLS.has(tool) || !structured || result.isError === true) return result;
+  if (object(args)?.receipt === "full" || !textAnswers()) return result;
+  const file = typeof structured.response_file === "string" ? structured.response_file : undefined;
+  const parts = (result as { content?: Array<{ type: string; text?: string }> }).content ?? [];
+  const index = parts.findIndex((part) => part.type === "text");
+  const pointer = file ? `response_file: ${file}` : undefined;
+  const content = index < 0
+    ? [...parts, ...(pointer ? [{ type: "text", text: pointer }] : [])]
+    : parts.map((part, at) => (at === index && pointer && !(part.text ?? "").includes(pointer) ? { ...part, text: `${part.text ?? ""}\n${pointer}` } : part));
+  const { structuredContent: _dropped, ...rest } = result as T & { structuredContent?: unknown };
+  const meta = { ...(result as { _meta?: Record<string, unknown> })._meta, ...(file ? { "freellama/response_file": file } : {}), ...(structured.timing ? { "freellama/timing": structured.timing } : {}) };
+  return { ...rest, content, _meta: meta } as unknown as T;
+}
+
+/**
  * Every tool reports how long it took and where its whole result is saved, so an agent sees what a
  * local model, a model switch or a queue cost and can read any receipt in full without carrying
  * it in context. Wraps registration once instead of editing each tool.
  */
 export function withToolResults(server: McpServer): McpServer {
   const register = server.registerTool.bind(server);
+  const text = textAnswers();
   server.registerTool = ((name: string, config: unknown, callback: (...args: unknown[]) => unknown) =>
-    register(name, config as never, (async (...args: unknown[]) => {
+    // An output schema obliges every result to carry structuredContent; a text answer tool drops it.
+    register(name, (text && TEXT_ANSWER_TOOLS.has(name) ? { ...(config as object), outputSchema: undefined } : config) as never, (async (...args: unknown[]) => {
       const started = performance.now();
       const startedAt = new Date().toISOString();
       const result = (await callback(...args)) as ToolResult;
-      return finishResult(name, args[0], result, Math.round(performance.now() - started), startedAt);
+      return agentView(name, args[0], await finishResult(name, args[0], result, Math.round(performance.now() - started), startedAt));
     }) as never)) as typeof server.registerTool;
   return server;
 }

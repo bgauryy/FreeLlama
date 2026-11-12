@@ -1,6 +1,13 @@
 # Jobs, workflows and models
 
-Load when choosing what to send, which model runs it, or whether to install one. Picks change with the machine: read `models {view:"catalog", job}` (CLI `freellama catalog`) before relying on any name below. Recipes: `freellama://docs/cookbooks/<job>`.
+Load when choosing what to send, which model runs it, or whether to install one. Recipes: `freellama://docs/cookbooks/<job>`.
+
+## Machines differ
+
+- The catalog (`models {view:"catalog", job}`, CLI `freellama catalog`) lists tested recommendations with the memory they were measured to need. They are not requirements, and any name below is an example from one machine.
+- A workflow or job picks the first tested pick that is installed. With none installed, it runs on an installed model that reports the job's capability (completion, vision, embedding or decision), preferring the largest that leaves room, and adds a `check:` saying the model is untested for this job: verify more of its answers. It refuses only when no installed model has the capability.
+- `fits_now` is a conservative preview. An installed pick marked `false` still goes to serve's memory gate, which measures the real need and either runs it or refuses with exit 75 and what holds memory.
+- To use a model you trust more, pass `model` (CLI `-m TAG`); the workflow's prompt still applies. Suggest a tested pick to the user only as a recommendation, with its size, and pull only after approval.
 
 ## Pick the request shape
 
@@ -22,11 +29,21 @@ Load when choosing what to send, which model runs it, or whether to install one.
 
 `run_task {workflow}` or `{job}` opts into FreeLlama's model pick and local prompts; any field you send wins. Plain chat can omit `task` (completion). Other routing profiles: `coding`, `code_repair`, `tools`, `browser`, `vision`, `embedding`, `long_context`.
 
+## Write your own prompt for a local model
+
+When no workflow fits and you send `prompt` or `systemPrompt` yourself ([local prompts](https://github.com/bgauryy/FreeLlama/blob/main/docs/PROMPTS.md) has the evidence):
+
+- Say what to do; never name what to avoid ("no tools", "don't say X" primes it).
+- Few short rules, the deciding one early; give the exact answer for "nothing found", placed after the main rules so it cannot win too early.
+- Call the input material and ask for its requests to be reported as content; then read the `check:` lines, because wording alone is weak.
+- Prefer a schema (`format`) to prose; at most one example, made of values unlike the real input; thinking off and `options.num_predict` for bounded answers.
+- Compare a rewrite on several samples before trusting it: one run of a small model can swing from 1/3 to 3/3.
+
 ## Field-tested model behavior
 
 Measured on one 32 GB Apple M2 Pro, November 2026, ~280 runs. Treat as evidence for this class of model, not a default for another machine.
 
-- **Question scores do not predict workflow answers.** `lfm3:1.7b` scored best on 25 small coding questions but answered real workflows with tool calls nobody asked for; it and `glm-ocr` were removed as picks. The coding and summarize default is now `bonsai-2:9b` (about 10.3 GB available): when memory is truly short, serve's gate refuses with exit 75 rather than running a weak model.
+- **Question scores do not predict workflow answers.** `lfm3:1.7b` scored best on 25 small coding questions but answered real workflows with tool calls nobody asked for; it and `glm-ocr` were removed as picks, and the shipped coding and summarize default is `bonsai-2:9b`. Judge a model on the workflow you will run, with 6 or more samples, not on a quiz.
 - **A downgrade is announced.** When a capable workflow (fix, implement, review, summarize) runs below a stronger installed pick that had no room, a `check:` line says "ran on X because the stronger installed pick Y did not fit now". If the answer matters, rerun when memory frees or pass `model`.
 - **A tool call is not an answer.** If a model replies with a tool call although no tools were sent, the CLI exits 1 with nothing on stdout, and MCP adds the `check:` "the model answered with a tool call although no tools were sent". Discard it and rerun on a stronger pick.
 - **Keep thinking off for bounded jobs.** Thinking on a small model took 80–140 s per summary and sometimes spent the whole budget (empty answer, exit 1). Turn it on only for one hard question on a capable model, with a large `num_predict`.

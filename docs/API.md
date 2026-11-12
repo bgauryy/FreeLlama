@@ -79,8 +79,8 @@ There are 13 tools, registered from [`tools/registrations.ts`](https://github.co
 | `session` | Keep related `run_task` calls on one model: create, kill, delete |
 | `models` | See catalog picks per job, installed and loaded models, one model's details, or search ollama.com and Hugging Face (`view:"library"`) |
 | `scope` | Keep chat history on the server, with revisions: create, get, fork, delete |
-| `run_task` | Run bounded work on a local model: `job` or `workflow`, `files`, decisions, embeddings with `nearest` (indexed, and `dimensions`), vision, tools, up to 64 batch items, `defer`, `preview` |
-| `task_jobs` | List, get, cancel or remove deferred work |
+| `run_task` | Run bounded work on a local model: `job` or `workflow`, `files`, decisions, embeddings with `nearest` (indexed, and `dimensions`), vision, tools, up to 64 batch items, `defer`, `preview`. Answers with text: the answer, `check:` lines and `response_file:` ([receipts](../packages/mcp/CONFIGURATION.md#where-an-answer-goes)) |
+| `task_jobs` | List, get, cancel or remove deferred work (text answers, like `run_task`) |
 | `ollama_pull` | Download one exact tag the user approved, at its reported size (`approvedSizeBytes`) |
 | `ollama_manage` | Load or free a model |
 | `ollama_delete` | Delete one exact tag the user names; it cannot be undone |
