@@ -60,7 +60,7 @@ freellama run -j find-code -f 'path/to/src/**/*.ts' --top 3 "where are CLI flags
 freellama run --ask "Is a refund requested?" < ticket.txt
 freellama run --ask "Which team?" --choice billing="Payments" --choice technical="Software" < ticket.txt
 freellama run "Why is the sky blue?"                       # the chat pick that fits now
-freellama run lfm3:1.7b-q4_K_M "Why?" --think=false        # a tag you choose
+freellama run bonsai-2:9b "Why?" --think=false             # a tag you choose
 echo "Invoice 2291, Acme, 1,240.50 EUR" | freellama run -w extract-json --schema "invoice_id, vendor, total float, currency"
 freellama run -w review-code --each -f 'src/*.ts'          # one answer per file
 ```
@@ -191,7 +191,8 @@ flowchart TD
 | What the caller sends wins | A system message, think or reasoning setting, sampling and format stay; job mode fills only what is missing |
 | Thinking off | `reasoning_effort: "none"` (OpenAI), `thinking: {type: "disabled"}` (Anthropic), `think: false` (Ollama, Responses) |
 | Small `max_tokens` | A thinking model may spend it all: `finish_reason: "length"`, empty content |
-| Receipts | Native streams end with a `freellama` field (`model`, `checks`, `job`, `num_ctx`, `context_source`) |
+| Model name | Every response for a virtual model, streamed or not, names the requested virtual model (`freellama/review-code`) in the protocol's `model` field; the real tag is `freellama.model`. Real tags pass through unchanged |
+| Receipts | A `freellama` object (`model`, `checks`, `job`) that standard clients ignore. Ollama streams: on the `done` line, plus `num_ctx` and `context_source`; with `checks` in the content too for a person in a chat. OpenAI Chat streams: a top-level field on the last chunk before `data: [DONE]`. Responses streams: on the `response.completed` (or `response.incomplete`) event, beside `response`. Anthropic streams: on the `message_stop` event. Non-streamed responses: a top-level field (managed Ollama and OpenAI chats carry `job_profile` and `cached_prompt_tokens` instead of `job`). Checks cover the whole answer and its tool calls; on the OpenAI and Anthropic layers they never enter the content |
 | Security | Loopback only; non-loopback Origin or Host refused; no files read and no URLs fetched over HTTP (images must be base64) |
 | Errors | 503 when waiting can fix it (capacity, memory, Ollama, no pick that fits), else 500 |
 

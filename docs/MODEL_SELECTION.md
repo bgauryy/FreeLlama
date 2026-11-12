@@ -46,14 +46,14 @@ calls shown are the current ones. Later and larger measurements, audio and memor
 | Text, tools, JSON, reasoning | `gpt-oss:20b` (13.8 GB) | 7/7: exact output, arithmetic, bat-and-ball, code reading, JSON extraction, tool call, 9/9 ticket routing | 1.4 s per routed ticket | `run_task {model:"gpt-oss:20b", prompt, think:"low"}`; add `tools` or `format:"json"` |
 | Embeddings | `nomic-embed-text:v1.5` (274 MB) | Retrieval 4/4 top-1; ticket routing 9/9 from two examples per team | 51 ms per item, batched | `run_task {task:"embedding", files:["src/**/*.rs"] or input:[...], nearest:{query:"..."}}`: ranked labels, not vectors |
 | Decisions (classify, route, score) | `strands-decider:2b-nvfp4` (1.3 GB) | Ticket routing 9/9, return-policy yes/no 3/3, damage rubric 2/3 | 0.17 s per question | `run_task {task:"decision", model, state or files:[path], questions}`; one line per answer |
-| OCR | `glm-ocr:latest` (2.2 GB) | 4/4 phrases from a dense report strip; 0/7 on text tasks | 11 s per strip at a 400-token cap | `run_task {task:"vision", model:"glm-ocr", prompt:"Text Recognition:", files:[path]}` |
+| OCR | `hf.co/openbmb/MiniCPM-OCR-1.0-gguf:Q4_K_M` (1.4 GB) | 30/30 rendered text images in all 3 rounds | 257 ms median | `run_task {workflow:"read-text", files:[path]}` (or `job:"ocr"`) |
 
 `gpt-oss:20b` reasons before answering, and its reasoning counts as output. FreeLlama sends no
 output cap of its own and sizes the context from what the model has needed before, so leave room
 for the reasoning if you set `num_predict` yourself. It needed about 17 GB available, so FreeLlama held
-it when other work left less. `glm-ocr` reads text from images only and keeps generating after the
-visible text ends. `stopOnRepetition` handles that and is on by default without `num_predict`; set it
-explicitly if you also cap the output. The `strands-decider` tags need Apple silicon, and decision
+it when other work left less. OCR models read text from images only; asked a chat question, one keeps generating to its output
+limit. Use them through the `ocr` job's trained prompts. `stopOnRepetition` stops one that loops and is
+on by default without `num_predict`; set it explicitly if you also cap the output. The `strands-decider` tags need Apple silicon, and decision
 models answer only through Ollama's decision API, which `run_task {task:"decision"}` reaches with
 FreeLlama's routing and memory checks. A busy CPU does not refuse them; low memory does.
 

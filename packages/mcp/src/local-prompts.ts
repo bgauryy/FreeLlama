@@ -135,11 +135,10 @@ export type Workflow = {
   think?: boolean;
 };
 
-/**
- * Every text workflow starts here: small models invent tool calls when they see file paths. Job
- * mode drops this line when the caller sends `tools`.
- */
-export const NO_TOOLS = "You have no tools and cannot open files: everything you need is in this message.";
+// No workflow mentions tools or opening files. A "you have no tools" line was tried (2026-11-09) and
+// measured on 2026-11-12: on lfm3:1.7b it caused the tool calls it meant to prevent (summarize-log
+// 6/6 tool calls with it, 0/6 without; summarize-diff 3/4 vs 0/4; change-code 5/10 vs 1/6).
+// Small models act on the noun, not the negation: say what to do, never what is missing.
 /** The closing line every text workflow shares: small models pad with what the input lacks, or with greetings. */
 const NO_PADDING = "Skip anything the input does not show. No introduction, closing or offer of help.";
 
@@ -176,8 +175,7 @@ Describe only what is visible. ${NO_PADDING}`,
   "change-code": {
     prefer: "capable",
     job: "coding", title: "Make one small code change", input: "files: the file to change; prompt: the change",
-    system: `${NO_TOOLS}
-You make one small code change.
+    system: `You make one small code change.
 1. Find where the change belongs in the code shown.
 2. Follow the file's existing names, style and error handling.
 3. Change as few lines as the task needs; touch nothing else.
@@ -187,8 +185,7 @@ Explain nothing unless asked.`,
   "fix-bug": {
     prefer: "capable",
     job: "coding", title: "Fix a bug with the smallest change", input: "files: the suspect code; prompt: the error message or symptom",
-    system: `${NO_TOOLS}
-You fix one bug with the smallest change.
+    system: `You fix one bug with the smallest change.
 1. Read the error or symptom, then the code shown.
 2. Name the cause in one sentence, quoting the line that causes it.
 3. Change only what the fix needs.
@@ -199,8 +196,7 @@ If the code shown cannot cause the symptom, say so and name the file or function
   implement: {
     prefer: "capable",
     job: "coding", title: "Add a small feature to existing code", input: "files: the code; prompt: the feature",
-    system: `${NO_TOOLS}
-You add one small feature to the code shown.
+    system: `You add one small feature to the code shown.
 1. Find the function or place it belongs; reuse helpers the file already has.
 2. Follow the file's names, style and error handling.
 3. Handle the empty and error cases the feature can meet.
@@ -210,8 +206,7 @@ End with one line: what to test.`,
   "write-tests": {
     prefer: "capable",
     job: "coding", title: "Write unit tests for the code shown", input: "files: the code (and an existing test, for style); prompt: what to cover (optional)",
-    system: `${NO_TOOLS}
-You write unit tests for the code shown; you never change that code.
+    system: `You write unit tests for the code shown; you never change that code.
 1. List the behaviours: the normal case, edge cases (empty, zero, missing, boundary) and one failure case.
 2. Use the test framework and import style the project already uses; copy them from the files shown.
 3. Write one small test per behaviour, named after it, with literal expected values.
@@ -220,15 +215,13 @@ Answer with the test file's path on one line, then the whole file in one fenced 
   "review-code": {
     prefer: "capable",
     job: "coding", title: "Find real defects in code (not style)", input: "files: the code; prompt: what to focus on (optional)",
-    system: `${NO_TOOLS}
-You review the code shown for real defects only: wrong logic, unhandled errors, off-by-one, null or undefined access, leaks, injection, races. Ignore style and naming.
+    system: `You review the code shown for real defects only: wrong logic, unhandled errors, off-by-one, null or undefined access, leaks, injection, races. Ignore style and naming.
 For each defect write one line: path - the faulty code quoted exactly (one line) - the problem - the fix.
 Report at most 5, the surest first. If you find none, answer "no defects found". Never invent code you did not see. No introduction or closing.`,
   },
   "explain-code": {
     job: "coding", title: "Explain code to someone about to change it", input: "files: the code; prompt: what to explain (optional)",
-    system: `${NO_TOOLS}
-Explain the code shown to a developer who is about to change it, in at most 6 bullets:
+    system: `Explain the code shown to a developer who is about to change it, in at most 6 bullets:
 what it does (one sentence); its inputs and outputs; side effects (files, network, shared state); its callers, when the code shown includes them; the one thing most likely to break when it changes.
 Name functions and variables exactly. ${NO_PADDING}`,
   },
@@ -236,8 +229,7 @@ Name functions and variables exactly. ${NO_PADDING}`,
     think: false,
     prefer: "capable",
     job: "summarize", title: "Summarize a log: errors grouped, counted, first failure", input: "files: the log; prompt: what you are investigating (optional)",
-    system: `${NO_TOOLS}
-Summarize the log for a developer debugging it. Write only these lines, in order, skipping any the log gives nothing for:
+    system: `Summarize the log for a developer debugging it. Write only these lines, in order, skipping any the log gives nothing for:
 - one bullet per distinct error or warning: the message quoted exactly, then (×count, first–last timestamp);
 - First error: the earliest error line, quoted exactly;
 - Cause: one sentence, only if a log line states it.
@@ -250,8 +242,7 @@ At most 8 bullets. Skip routine lines. ${NO_PADDING}`,
     // wording below took it to 2/3. bonsai-2:9b and Nemotron Bolt pass 3/3 either way, hence capable.
     prefer: "capable",
     job: "summarize", title: "Summarize text for someone who will act on it", input: "files: the text; prompt: what you need from it (optional)",
-    system: `${NO_TOOLS}
-Summarize the text for someone who will act on it: its decisions, numbers, deadlines and open questions, plus whatever the request asks for.
+    system: `Summarize the text for someone who will act on it: its decisions, numbers, deadlines and open questions, plus whatever the request asks for.
 Use as few short bullets as the text needs; one is right for one sentence, and the summary is never longer than the text.
 Never write a bullet about something the text does not say (no "not provided", "not specified" or "no details"); write "not stated" only for something the request explicitly asks for. Never guess.
 Quote numbers, names, versions and paths exactly. No introduction, closing or offer of help.`,
@@ -260,15 +251,13 @@ Quote numbers, names, versions and paths exactly. No introduction, closing or of
     think: false,
     prefer: "capable",
     job: "summarize", title: "Summarize a diff for a reviewer: changes and risks", input: "files: the diff or patch",
-    system: `${NO_TOOLS}
-Summarize the diff for a reviewer in at most 8 bullets: one per changed file (what changed, naming functions and settings exactly), then one per behaviour change or risk the diff itself shows (a removed check, a changed default, a new dependency, code changed with no test changed).
+    system: `Summarize the diff for a reviewer in at most 8 bullets: one per changed file (what changed, naming functions and settings exactly), then one per behaviour change or risk the diff itself shows (a removed check, a changed default, a new dependency, code changed with no test changed).
 If the diff shows no risk, write no risk bullet. ${NO_PADDING}`,
   },
   "extract-json": {
     think: false,
     job: "summarize", title: "Extract named fields from text into JSON", input: "files: the text; prompt: the field names (or a JSON schema)",
-    system: `${NO_TOOLS}
-Extract the fields the request names from the text into one JSON object.
+    system: `Extract the fields the request names from the text into one JSON object.
 Use the values exactly as written in the text; use null for a field the text does not give; never invent a value.
 Output only the JSON object.`,
     format: "json",

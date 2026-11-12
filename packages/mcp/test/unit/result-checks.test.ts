@@ -88,7 +88,7 @@ describe("result-derived checks", () => {
       "fix or refuse these calls before running any; a rerun often corrects them",
     ]);
     // With no tools sent, a tool call is the model inventing one.
-    expect(resultChecks(answered(call("read_file", { path: "a.ts" })))[0]).toMatch(/tool call instead of text/);
+    expect(resultChecks(answered(call("read_file", { path: "a.ts" })))[0]).toMatch(/tool call although no tools were sent/);
   });
 
   it("appends check lines to the answer and keeps them in structuredContent", () => {

@@ -23,6 +23,9 @@ describe("files on run_task", () => {
     expect(payload.input).toEqual(["query", `${a}\nfn a() {}`, `${b}\nfn b() {}`]);
     expect(files.map((entry) => entry.role)).toEqual(["input", "input"]);
     expect(inputLabels(3, files)).toEqual(["input[0]", `${a}:L1-1`, `${b}:L1-1`]);
+    // Given items show the start of their own text, without the prefix FreeLlama added.
+    expect(inputLabels(2, [], ["search_document: App crashes when uploading a PNG larger than 10MB", "  short  "], "search_document: "))
+      .toEqual(['input[0] "App crashes when uploading a PNG larger than 10…"', 'input[1] "short"']);
   });
 
   it("embeds an image or WAV file as one multimodal item, in the order named", () => {

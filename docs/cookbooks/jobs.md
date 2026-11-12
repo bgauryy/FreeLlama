@@ -12,8 +12,8 @@
 | `ocr` | vision | `hf.co/openbmb/MiniCPM-OCR-1.0-gguf:Q4_K_M` | prompt `Text Recognition:`; send `Table Recognition:` or `Formula Recognition:` as `prompt` for those |
 | `image-recognition` | vision | `lfm3-vl:2b-q4_K_M` | a brief-answer system prompt and the card's sampling; you send the question as `prompt` |
 | `image-search` | embedding | `embeddinggemma-2:740m-q8_0` | `task: search result \| query: ` before your query; images go in bare |
-| `coding` | coding | `lfm3:1.7b-q4_K_M` | a system prompt asking for SEARCH/REPLACE edits, and the card's sampling; you send the change as `prompt` |
-| `summarize` | completion | `lfm3:1.7b-q4_K_M` | a short-bullets system prompt that quotes numbers and names and says "not stated" rather than guess |
+| `coding` | coding | `bonsai-2:9b` | a system prompt asking for SEARCH/REPLACE edits, and the card's sampling; you send the change as `prompt` |
+| `summarize` | completion | `bonsai-2:9b` | a short-bullets system prompt that quotes numbers and names and says "not stated" rather than guess |
 
 The later picks of each job are the catalog's (`models {view:"catalog", job}`). Every value, with the model card it comes from, is in [local-prompts.ts](../../packages/mcp/src/local-prompts.ts); a sampling value is used only where the model's own card documents it.
 

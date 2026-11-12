@@ -50,6 +50,34 @@ fn benchmark_selects_cases_by_capability() {
     assert!(!cases.iter().any(|case| case.id == "embedding/similarity"));
 }
 
+/// An embedding model can advertise `vision` and `audio` (its encoder reads them) without
+/// `completion`; `/api/chat` refuses it with 400, so it must get no chat-shaped case.
+#[test]
+fn chat_cases_require_completion_even_when_vision_or_tools_are_advertised() {
+    let embedding = benchmark_plan(&model(
+        &[Capability::Vision, Capability::Audio, Capability::Embedding],
+        800_000_000,
+    ));
+    let ids = embedding.iter().map(|case| case.id).collect::<Vec<_>>();
+    assert_eq!(ids, ["embedding/integrity"]);
+
+    let tools_only = benchmark_plan(&model(&[Capability::Tools, Capability::Vision], 1_000));
+    assert!(tools_only.is_empty(), "{tools_only:?}");
+}
+
+#[test]
+fn decision_models_get_a_decision_case_and_no_chat_case() {
+    let plan = benchmark_plan(&model(&[Capability::Decision], 2_000_000_000));
+    let ids = plan.iter().map(|case| case.id).collect::<Vec<_>>();
+    assert_eq!(ids, ["decision/noul"]);
+    assert_eq!(plan[0].capability, Capability::Decision);
+}
+
+#[test]
+fn speech_only_models_remain_uncovered() {
+    assert!(benchmark_plan(&model(&[Capability::Speech], 1_000)).is_empty());
+}
+
 #[test]
 fn score_is_quality_guarded() {
     assert!((score_cases(3, 2_000) - 5_400.0).abs() < f64::EPSILON);

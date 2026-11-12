@@ -67,6 +67,19 @@ describe("decision answers", () => {
     ].join("\n"));
   });
 
+  it("marks a flat answer unsure, so its label is not acted on", () => {
+    // Recorded from strands-decider on an urgency question it could not judge (2026-11-12).
+    expect(decisionAnswerText({
+      urgent: { type: "score", score: 0.937, legend: { "0": "low", "1": "medium", "2": "high" }, probabilities: { "0": 0.353, "1": 0.357, "2": 0.29 }, confidence: 0.0039 },
+      refund: { type: "noul", noul: 0.55 },
+      team: { type: "choice", choice: "billing", probabilities: { billing: 0.51, technical: 0.49 }, confidence: 0.02 },
+    })).toBe([
+      'urgent: 0.94 of 0-2, likeliest "medium" (confidence 0.00) [unsure: treat as unknown]',
+      "refund: true (p(true) 0.55) [unsure: treat as unknown]",
+      "team: billing (p 0.51, confidence 0.02) [unsure: treat as unknown]",
+    ].join("\n"));
+  });
+
   it("is the answer text of a decision task", () => {
     expect(taskAnswerText({ route: { selected_model: "d:1" }, response: { answers: { a: { type: "noul", noul: 0.2 } } } }))
       .toBe("[d:1] a: false (p(true) 0.20)");

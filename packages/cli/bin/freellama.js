@@ -58,7 +58,9 @@ if (agent) {
     );
     process.exit(1);
   }
-  hand(binary, args);
+  // The binary's `status` always prints JSON and has no --json flag: the flag only keeps the
+  // human view away, so it is not passed on.
+  hand(binary, args[0] === "status" ? args.filter((arg) => arg !== "--json") : args);
 }
 
 /** The agent CLI: a checkout's build first, then the installed MCP package's. */

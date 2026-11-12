@@ -377,18 +377,25 @@ export function taskAnswerText(payload: Record<string, unknown>): string | undef
   return undefined;
 }
 
+/** Below this confidence (choice, score), or with p(true) between 0.3 and 0.7, an answer is a coin toss. */
+const UNSURE_CONFIDENCE = 0.25;
+const UNSURE = " [unsure: treat as unknown]";
+
 /** One line per decision answer: `kind: bug (p 0.97, confidence 0.94)`, `refund: true (p 0.99)`, `urgency: 1.20 of 0-2, likeliest "Soon" (confidence 0.40)`. */
 export function decisionAnswerText(answers: Record<string, unknown>): string {
   const fixed = (value: unknown) => (typeof value === "number" ? value.toFixed(2) : "?");
   return Object.entries(answers).map(([name, raw]) => {
     const answer = record(raw) ?? {};
     const confidence = typeof answer.confidence === "number" ? `, confidence ${fixed(answer.confidence)}` : "";
+    // A flat answer is the model saying it cannot tell: mark it, so nobody acts on its label.
+    const unsure = typeof answer.confidence === "number" && answer.confidence < UNSURE_CONFIDENCE ? UNSURE : "";
     if (answer.type === "choice") {
       const choice = String(answer.choice ?? "?");
-      return `${name}: ${choice} (p ${fixed(record(answer.probabilities)?.[choice])}${confidence})`;
+      return `${name}: ${choice} (p ${fixed(record(answer.probabilities)?.[choice])}${confidence})${unsure}`;
     }
     if (answer.type === "noul" && typeof answer.noul === "number") {
-      return `${name}: ${answer.noul >= 0.5 ? "true" : "false"} (p(true) ${fixed(answer.noul)})`;
+      const flat = answer.noul > 0.3 && answer.noul < 0.7 ? UNSURE : "";
+      return `${name}: ${answer.noul >= 0.5 ? "true" : "false"} (p(true) ${fixed(answer.noul)})${flat}`;
     }
     if (answer.type === "score") {
       const legend = record(answer.legend) ?? {};
@@ -397,7 +404,7 @@ export function decisionAnswerText(answers: Record<string, unknown>): string {
       const likeliest = probabilities.sort((left, right) => right[1] - left[1])[0]?.[0];
       const top = Math.max(0, Object.keys(legend).length - 1);
       const label = likeliest === undefined ? "" : `, likeliest ${JSON.stringify(legend[likeliest] ?? likeliest)}`;
-      return `${name}: ${fixed(answer.score)} of 0-${top}${label} (${confidence.slice(2) || "no confidence"})`;
+      return `${name}: ${fixed(answer.score)} of 0-${top}${label} (${confidence.slice(2) || "no confidence"})${unsure}`;
     }
     return `${name}: ${JSON.stringify(raw)}`;
   }).join("\n");

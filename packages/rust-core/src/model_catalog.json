@@ -1,5 +1,5 @@
 {
-  "snapshot": "2026-11-01",
+  "snapshot": "2026-11-12",
   "measured_on": "Apple M2 Pro, 32 GB, Ollama 0.40.13, with other work running",
   "how_to_read": "quality is measured (run here with known answers), published (the publisher's figure), or untested. memory_gb is what FreeLlama asks to have available, including its reserve; null means not previewed. Discovery never authorizes a pull: ask for one exact tag and its size first.",
   "jobs": [
@@ -15,8 +15,7 @@
       { "tag": "nomic-embed-text:v1.5", "role": "default", "file_gb": 0.3, "memory_gb": 1.4, "quality": "measured", "evidence": "8/12 real issue pairs" }
     ]},
     { "job": "ocr", "title": "Read text from an image", "call": "run_task {task:\"vision\", files:[path]}", "cookbook": "cookbooks/ocr", "picks": [
-      { "tag": "hf.co/openbmb/MiniCPM-OCR-1.0-gguf:Q4_K_M", "role": "default", "file_gb": 1.4, "memory_gb": 3.8, "quality": "measured", "evidence": "30/30 in all 3 rounds, 257 ms median, clean rendered text" },
-      { "tag": "glm-ocr:latest", "role": "alternative", "file_gb": 2.2, "memory_gb": 5.8, "quality": "measured", "evidence": "30/30 in all 3 rounds, 1,885 ms median" }
+      { "tag": "hf.co/openbmb/MiniCPM-OCR-1.0-gguf:Q4_K_M", "role": "default", "file_gb": 1.4, "memory_gb": 3.8, "quality": "measured", "evidence": "30/30 in all 3 rounds, 257 ms median, clean rendered text" }
     ]},
     { "job": "image-recognition", "title": "Understand what an image shows", "call": "run_task {task:\"vision\", files:[path], prompt}", "cookbook": "cookbooks/image-recognition", "picks": [
       { "tag": "lfm3-vl:2b-q4_K_M", "role": "default", "file_gb": 1.5, "memory_gb": 4.1, "quality": "measured", "evidence": "20/20 drawn images in all 3 rounds, 299 ms median" },
@@ -36,15 +35,13 @@
       { "tag": "lfm3-omni:2b-q4_K_M", "role": "alternative", "file_gb": 2.0, "memory_gb": 5.5, "quality": "measured", "evidence": "0% word error, 950 ms median; same judge caveat" }
     ]},
     { "job": "coding", "title": "Small coding tasks", "call": "run_task {task:\"coding\", files:[path]}", "cookbook": "cookbooks/coding", "picks": [
-      { "tag": "lfm3:1.7b-q4_K_M", "role": "default", "file_gb": 1.1, "memory_gb": 3.3, "quality": "measured", "evidence": "21, 20, 20 of 25 small questions, 579 ms median" },
+      { "tag": "bonsai-2:9b", "role": "default", "file_gb": 3.2, "memory_gb": 10.3, "quality": "measured", "evidence": "19, 19, 17 of 25, 475 ms median; every workflow case right in the 2026-11-12 field test, including SEARCH/REPLACE and tool calls" },
       { "tag": "hf.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-4GB:Q4_K_M", "role": "stronger", "file_gb": 6.2, "memory_gb": 13.5, "quality": "measured", "evidence": "23, 22, 23 of 25, 267 ms median" },
-      { "tag": "bonsai-2:9b", "role": "alternative", "file_gb": 3.2, "memory_gb": 10.3, "quality": "measured", "evidence": "19, 19, 17 of 25, 475 ms median" },
       { "tag": "bonsai-2:27b", "role": "stronger", "file_gb": 8.3, "memory_gb": 16.3, "quality": "published", "evidence": "publisher: SWE-bench Verified 60.8%, LiveCodeBench 90.1%; not measured here, never had 16.3 GB available" }
     ]},
     { "job": "research-agent", "title": "Research a repository", "call": "delegate_research {adapter:\"octocode\" or \"github\"}", "cookbook": "cookbooks/research-agent", "picks": [
       { "tag": "bonsai-2:9b", "role": "default", "file_gb": 3.2, "memory_gb": 10.3, "quality": "measured", "evidence": "4, 5, 5 of 8 local and 3, 5, 5 of 6 GitHub over 3 rounds, 82 s median per question" },
-      { "tag": "hf.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-4GB:Q4_K_M", "role": "stronger", "file_gb": 6.2, "memory_gb": 13.5, "quality": "measured", "evidence": "6/8 local and 5/6 GitHub in all 3 rounds, 96 s median per question" },
-      { "tag": "lfm3:1.7b-q4_K_M", "role": "small", "file_gb": 1.1, "memory_gb": 3.3, "quality": "measured", "evidence": "6, 5, 5 of 8 local but 1/6 GitHub, 20 s median per question" }
+      { "tag": "hf.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-4GB:Q4_K_M", "role": "stronger", "file_gb": 6.2, "memory_gb": 13.5, "quality": "measured", "evidence": "6/8 local and 5/6 GitHub in all 3 rounds, 96 s median per question" }
     ]}
   ]
 }

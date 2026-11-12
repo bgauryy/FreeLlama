@@ -12,7 +12,7 @@ const SERVE = (process.argv[2] ?? "http://127.0.0.1:11435").replace(/\/$/, "");
 const API = `${SERVE}/_freellama/v1`;
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../..");
 const BIN = path.join(ROOT, "target/release/freellama");
-const EMB = "nomic-embed-text:v1.5", DEC = "strands-decider:2b-nvfp4", OCR = "glm-ocr:latest";
+const EMB = "nomic-embed-text:v1.5", DEC = "strands-decider:2b-nvfp4", OCR = "hf.co/openbmb/MiniCPM-OCR-1.0-gguf:Q4_K_M";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const out = [];
 const section = (title) => { out.push({ title, rows: [], notes: [] }); console.error(`== ${title}`); };
@@ -105,7 +105,7 @@ section("Queue and priorities (8 managed embedding tasks at once)");
 }
 
 // 6. Prompt caching on a chat-capable model.
-section("Prompt prefix caching (glm-ocr as a text model, 4k context)");
+section("Prompt prefix caching (the OCR pick as a text model, 4k context)");
 if (await fits(OCR, "completion")) {
   const system = "You are a careful assistant. " + Array.from({ length: 60 }, (_, i) => `Rule ${i + 1}: answer in at most five words and never invent facts about item ${i}.`).join(" ");
   const ask = (sys, q) => http("POST", "/tasks", { task: "completion", model: OCR, context_tokens: 4096, max_wait_seconds: 120,
@@ -120,7 +120,7 @@ if (await fits(OCR, "completion")) {
   const models = (await http("GET", "/models")).json;
   const ocr = (Array.isArray(models) ? models : models.models ?? []).find((x) => x.name === OCR);
   row("learned token ratio", `${ocr?.bytes_per_token_milli ?? "none"} milli-bytes/token`, `${ocr?.bytes_per_token_samples ?? 0} samples`);
-} else row("skipped", "glm-ocr did not fit within 15 minutes");
+} else row("skipped", "the OCR pick did not fit within 15 minutes");
 
 // 7. Idle sweep under memory pressure.
 section("Idle models under memory pressure (sweep)");

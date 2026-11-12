@@ -4,7 +4,7 @@
 // caller passes always wins; `job_profile.applied` names every field job mode filled in.
 import { catalogView, type InstalledModel } from "./model-catalog.js";
 import { catalogLiveState } from "./model-library.js";
-import { EMBEDDING_PREFIXES, LOCAL_JOBS, NO_TOOLS, WORKFLOWS, type JobName, type LocalJob, type ModelProfile, type Prefixes, type Workflow, type WorkflowName } from "./local-prompts.js";
+import { EMBEDDING_PREFIXES, LOCAL_JOBS, WORKFLOWS, type JobName, type LocalJob, type ModelProfile, type Prefixes, type Workflow, type WorkflowName } from "./local-prompts.js";
 
 export type JobProfile = { job: JobName; workflow?: WorkflowName; model: string | undefined; applied: string[] };
 
@@ -39,12 +39,24 @@ export function neededCapabilities(fields: { tools?: unknown[]; think?: unknown 
 /**
  * The job's model for this machine now: the first catalog pick that is installed and not known to
  * be short of memory (unknown free memory is not "no room"), and that Ollama does not report
- * without a capability in `needs`; `capable` takes the strongest such pick. A pick installed under
- * another tag runs under that tag. Throws a JSON refusal naming each pick's need and what is free.
+ * without a capability in `needs`; `capable` takes the strongest such pick. When every installed
+ * pick misses only the memory preview, the first one goes to serve's memory gate. A pick installed
+ * under another tag runs under that tag. Throws a JSON refusal naming each pick's need and what is
+ * free when no suitable pick is installed.
  */
 export function pickJobModel(
   job: JobName, installed: readonly InstalledModel[] | null, availableBytes: number | null, prefer: "default" | "capable" = "default", needs: readonly string[] = [],
 ): string {
+  return pickJobModelDetailed(job, installed, availableBytes, prefer, needs).model;
+}
+
+/** A pick, plus a note when a capable workflow ran below a stronger pick that is installed but has no room now. */
+export type JobPick = { model: string; note?: string };
+
+/** pickJobModel, also saying which stronger installed pick was skipped for memory. */
+export function pickJobModelDetailed(
+  job: JobName, installed: readonly InstalledModel[] | null, availableBytes: number | null, prefer: "default" | "capable" = "default", needs: readonly string[] = [],
+): JobPick {
   const spec = LOCAL_JOBS[job];
   if (installed === null) {
     throw new Error(JSON.stringify({
@@ -67,7 +79,23 @@ export function pickJobModel(
     ? [...usable].sort((a, b) => CAPABLE_ORDER.indexOf(String((a as { role?: string }).role)) - CAPABLE_ORDER.indexOf(String((b as { role?: string }).role)))
     : usable;
   const pick = ranked[0];
-  if (pick) return ("installed_as" in pick && pick.installed_as) || pick.tag;
+  if (pick) {
+    const model = ("installed_as" in pick && pick.installed_as) || pick.tag;
+    if (prefer !== "capable") return { model };
+    // The answer gets worse silently when the strong pick waits for memory: say so.
+    const rank = (entry: (typeof view.picks)[number]) => CAPABLE_ORDER.indexOf(String((entry as { role?: string }).role));
+    const skipped = view.picks.filter((entry) => entry.installed === true && entry.fits_now === false && lacking(entry).length === 0 && rank(entry) < rank(pick));
+    if (skipped.length === 0) return { model };
+    const free = availableBytes === null ? "unknown" : `${(availableBytes / 1e9).toFixed(1)} GB`;
+    const names = skipped.map((entry) => `${("installed_as" in entry && entry.installed_as) || entry.tag} (needs ${entry.memory_gb ?? "?"} GB)`).join(", ");
+    return { model, note: `ran on ${model} because the stronger installed pick ${names} did not fit now (free: ${free}); if the answer matters, rerun when memory frees or pass that model` };
+  }
+  // The catalog's memory_gb is a conservative preview (it asks for a reserve); serve's memory gate
+  // measures the real load. An installed pick that only misses the preview goes to the gate, which
+  // runs it or refuses with what holds memory (exit 75), as delegate_research does. Measured
+  // 2026-11-12: bonsai-2:9b previewed at 10.3 GB, the gate admitted it with 6.0 GB free.
+  const installedPick = view.picks.find((entry) => entry.installed === true && lacking(entry).length === 0);
+  if (installedPick) return { model: ("installed_as" in installedPick && installedPick.installed_as) || installedPick.tag };
   const free = availableBytes === null ? "unknown" : `${(availableBytes / 1e9).toFixed(1)} GB`;
   const picks = view.picks.map((entry) => {
     const missing = entry.installed === true ? lacking(entry) : [];
@@ -84,8 +112,13 @@ export function pickJobModel(
 
 /** Read the live state and pick: only when the caller left `model` out. */
 export async function pickLiveJobModel(job: JobName, endpoint: string | undefined, prefer: "default" | "capable" = "default", needs: readonly string[] = []): Promise<string> {
+  return (await pickLiveJobModelDetailed(job, endpoint, prefer, needs)).model;
+}
+
+/** pickLiveJobModel with the note a capable workflow's caller should see. */
+export async function pickLiveJobModelDetailed(job: JobName, endpoint: string | undefined, prefer: "default" | "capable" = "default", needs: readonly string[] = []): Promise<JobPick> {
   const [installed, available] = await catalogLiveState(endpoint, undefined);
-  return pickJobModel(job, installed, available, prefer, needs);
+  return pickJobModelDetailed(job, installed, available, prefer, needs);
 }
 
 function familyPrefixes(spec: LocalJob, model: string | undefined): Prefixes | undefined {
@@ -191,8 +224,6 @@ export function applyJob<T extends JobFields>(
     // A workflow says what to do, so it wins over a model's own style prompt; a job without one
     // keeps the model's documented system prompt, else the job's default workflow.
     let systemPrompt = flow ? flow.system ?? own?.systemPrompt : own?.systemPrompt ?? spec.systemPrompt;
-    // Tools the caller sends are real: "you have no tools" would contradict them.
-    if (next.tools?.length && systemPrompt?.startsWith(`${NO_TOOLS}\n`)) systemPrompt = systemPrompt.slice(NO_TOOLS.length + 1);
     if (next.systemPrompt === undefined && systemPrompt !== undefined) {
       next.systemPrompt = systemPrompt;
       applied.push("systemPrompt");

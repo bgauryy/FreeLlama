@@ -478,7 +478,11 @@ export async function prepareForward(path: string, model: VirtualModel, body: Fi
   return { body: rewritten, resolution, runner, ...(numCtx !== undefined ? { numCtx } : {}) };
 }
 
-/** The `check:` lines job mode's result checks give for a finished streamed answer. */
-export function streamChecks(resolution: Resolution, answer: string, tools?: unknown[]): string[] {
-  return resultChecks({ job: resolution.job, task: resolution.task, workflow: resolution.workflow, answer, structured: { response: { message: { role: "assistant", content: answer } } }, tools });
+/**
+ * The `check:` lines job mode's result checks give for a finished streamed answer. `toolCalls` are
+ * the calls the stream carried, in Ollama's shape (`{function: {name, arguments}}`).
+ */
+export function streamChecks(resolution: Resolution, answer: string, tools?: unknown[], toolCalls: unknown[] = []): string[] {
+  const message = { role: "assistant", content: answer, ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}) };
+  return resultChecks({ job: resolution.job, task: resolution.task, workflow: resolution.workflow, answer, structured: { response: { message } }, tools });
 }

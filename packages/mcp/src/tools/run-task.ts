@@ -16,11 +16,12 @@ import {
 } from "../helpers.js";
 import { applyTaskFiles, inputLabels, type FileReceipt } from "../task-files.js";
 import { nearestText, validateEmbeddingVectors, type NearestRequest } from "../nearest.js";
-import { applyJob, mergeProfiles, neededCapabilities, pickLiveJobModel, type JobProfile } from "../job-mode.js";
+import { applyJob, mergeProfiles, neededCapabilities, pickLiveJobModel, pickLiveJobModelDetailed, type JobProfile } from "../job-mode.js";
 import { LOCAL_JOBS, RUN_TASK_JOBS, WORKFLOW_NAMES, WORKFLOWS, type JobName, type WorkflowName } from "../local-prompts.js";
 import { checkOutputPath, HANDOFF_NAME, summaryOf, writeHandoff } from "../handoffs.js";
 import { outputInput } from "../tool-results.js";
 import { resultChecks, withChecks } from "../result-checks.js";
+import { tablesToMarkdown } from "../table-markdown.js";
 import { EmbeddingIndex, embedIndexEnabled, rankByQuery } from "../embed-index.js";
 import { installedInventory } from "../model-library.js";
 
@@ -669,10 +670,13 @@ export function registerRunTaskTool(server: McpServer): void {
         if (maxParallelism !== undefined) return errorResult(new Error("`maxParallelism` is valid only with `tasks`."));
         if (saveAs !== undefined && (preview || defer)) return errorResult(new Error("`saveAs` saves a finished answer; it is not valid with `preview` or `defer`."));
         let profile: JobProfile | undefined;
+        let pickNote: string | undefined;
         if (job !== undefined) {
           if (scopeId !== undefined) return errorResult(new Error("`job` picks the model and prompt, and a scope has its own: remove `job` or `scopeId`."));
           const prefer = workflow !== undefined ? (WORKFLOWS[workflow] as { prefer?: "capable" }).prefer : undefined;
-          const picked = model === undefined ? await pickLiveJobModel(job, endpoint, prefer, neededCapabilities({ tools, think })) : undefined;
+          const pick = model === undefined ? await pickLiveJobModelDetailed(job, endpoint, prefer, neededCapabilities({ tools, think })) : undefined;
+          const picked = pick?.model;
+          pickNote = pick?.note;
           const applied = applyJob(job, { task, model, prompt, systemPrompt, messages, options, think, input, format, tools, nearest: nearestRequest }, picked, preview === true, workflow);
           ({ prompt, systemPrompt, options, think, input, model } = applied.fields);
           format = applied.fields.format as typeof format;
@@ -682,7 +686,7 @@ export function registerRunTaskTool(server: McpServer): void {
         }
         // Checks read the result itself (uncertain answers, close matches, unsupported facts, edits
         // that do not match the file) and are saved with a handoff too.
-        const finish = <R,>(result: R): R => withJob(withChecks(result, job, task ?? "completion", tools, workflow), profile, saveAs);
+        const finish = <R,>(result: R): R => withJob(withCheck(withChecks(asWorkflowOutput(result, workflow), job, task ?? "completion", tools, workflow), pickNote), profile, saveAs);
         const canonicalTask = task ?? "completion";
         if (preview) {
           const executionOnlyFields = ([
@@ -746,7 +750,7 @@ export function registerRunTaskTool(server: McpServer): void {
         });
         if (problem) return errorResult(new Error(problem));
         const items = input === undefined ? [] : Array.isArray(input) ? input : [input];
-        const labels = nearestRequest === undefined ? undefined : inputLabels(items.length, filled.files);
+        const labels = nearestRequest === undefined ? undefined : inputLabels(items.length, filled.files, items, nearestRequest.documentPrefix);
         // A repeated search over the same files embeds only the chunks that changed.
         if (canonicalTask === "embedding" && nearestRequest?.query !== undefined && labels && filled.files.length > 0
           && typeof model === "string" && !defer && !returnEmbeddings && embedIndexEnabled()
@@ -982,5 +986,26 @@ function withBatchChecks<R>(result: R, job: string | undefined, items: BatchItem
   const content = (shown.content ?? []).map((part, index) => (index === 0 && part.type === "text"
     ? { ...part, text: `${part.text ?? ""}\n\ncheck these items first:\n${flagged.slice(0, 20).map((line) => `- ${line}`).join("\n")}${flagged.length > 20 ? `\n- … ${flagged.length - 20} more in structuredContent.checks` : ""}` }
     : part));
+  return { ...result, structuredContent: { ...shown.structuredContent, checks }, content } as R;
+}
+
+/**
+ * A workflow's promised output shape, applied to the shown answer only (structuredContent keeps
+ * the model's raw text): read-table promises Markdown, and OCR models answer in OTSL or HTML.
+ */
+function asWorkflowOutput<R>(result: R, workflow: WorkflowName | undefined): R {
+  const shown = result as { content?: Array<{ type: string; text?: string }>; isError?: boolean };
+  if (workflow !== "read-table" || shown.isError || !shown.content) return result;
+  // A table starts on its own line, after the `[model] ` label.
+  const table = (text: string) => tablesToMarkdown(text).replace(/^(\[[^\]\n]*\] )\|/, "$1\n|");
+  return { ...result, content: shown.content.map((part) => (part.type === "text" ? { ...part, text: table(part.text ?? "") } : part)) } as R;
+}
+
+/** One more `check:` line, after the result's own checks. */
+function withCheck<R>(result: R, check: string | undefined): R {
+  const shown = result as { content?: Array<{ type: string; text?: string }>; structuredContent?: Record<string, unknown>; isError?: boolean };
+  if (check === undefined || shown.isError || !shown.structuredContent) return result;
+  const checks = [...((shown.structuredContent.checks as string[] | undefined) ?? []), check];
+  const content = (shown.content ?? []).map((part, index) => (index === 0 && part.type === "text" ? { ...part, text: `${part.text ?? ""}\ncheck: ${check}` } : part));
   return { ...result, structuredContent: { ...shown.structuredContent, checks }, content } as R;
 }

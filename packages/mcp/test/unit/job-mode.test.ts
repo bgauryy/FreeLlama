@@ -15,7 +15,7 @@ const fixture = vi.hoisted(() => {
 vi.mock("../../src/serve-client.js", () => ({ runTaskRequest: (...args: any[]) => fixture.run(...args), getTaskJob: vi.fn(), cancelTaskJob: vi.fn(), route: vi.fn() }));
 vi.mock("../../src/model-library.js", () => ({ catalogLiveState: (...args: any[]) => fixture.live(...args) }));
 
-import { applyJob, pickJobModel, familyMatch } from "../../src/job-mode.js";
+import { applyJob, pickJobModel, pickJobModelDetailed, familyMatch } from "../../src/job-mode.js";
 import { MODEL_CATALOG } from "../../src/model-catalog.js";
 import { LOCAL_JOBS, OCR_PROMPTS, RUN_TASK_JOBS, WORKFLOWS } from "../../src/local-prompts.js";
 import { registerRunTaskTool } from "../../src/tools/run-task.js";
@@ -50,22 +50,26 @@ describe("local-prompts job table", () => {
     const screen = applyJob("image-recognition", { prompt: "is there an error?" }, "lfm3-omni:2b-q4_K_M", false, "describe-screen");
     expect(screen.fields.systemPrompt).toBe(WORKFLOWS["describe-screen"].system);
     expect(screen.profile).toMatchObject({ job: "image-recognition", workflow: "describe-screen" });
-    const fields = applyJob("summarize", { prompt: "vendor, total" }, "lfm3:1.7b-q4_K_M", false, "extract-json");
+    const fields = applyJob("summarize", { prompt: "vendor, total" }, "bonsai-2:9b", false, "extract-json");
     expect(fields.fields).toMatchObject({ format: "json", systemPrompt: WORKFLOWS["extract-json"].system });
     // A JSON schema request becomes the structured-output format and stays in the prompt.
     const schema = { type: "object", properties: { vendor: { type: "string" }, total: { type: "number" } }, required: ["vendor"] };
-    const typed = applyJob("summarize", { prompt: JSON.stringify(schema) }, "lfm3:1.7b-q4_K_M", false, "extract-json");
+    const typed = applyJob("summarize", { prompt: JSON.stringify(schema) }, "bonsai-2:9b", false, "extract-json");
     expect(typed.fields).toMatchObject({ format: schema, prompt: JSON.stringify(schema) });
-    expect(applyJob("summarize", { prompt: "{not json" }, "lfm3:1.7b-q4_K_M", false, "extract-json").fields.format).toBe("json");
+    expect(applyJob("summarize", { prompt: "{not json" }, "bonsai-2:9b", false, "extract-json").fields.format).toBe("json");
     expect(applyJob("ocr", { prompt: "vendor, total" }, "glm-ocr:latest", false, "read-fields").fields.prompt).toMatch(/^Extract these fields from the image: vendor, total\./);
-    expect(applyJob("summarize", {}, "lfm3:1.7b-q4_K_M", false, "summarize-log").fields.prompt).toBe("Apply your instructions to the input below.");
-    expect(() => applyJob("coding", {}, "lfm3:1.7b-q4_K_M", false, "summarize-log")).toThrow(/runs job "summarize"/);
-    // A text workflow says it has no tools, unless the caller sends some.
-    expect(fields.fields.systemPrompt).toMatch(/^You have no tools/);
+    expect(applyJob("summarize", {}, "bonsai-2:9b", false, "summarize-log").fields.prompt).toBe("Apply your instructions to the input below.");
+    expect(() => applyJob("coding", {}, "bonsai-2:9b", false, "summarize-log")).toThrow(/runs job "summarize"/);
+    // No workflow mentions tools or opening files: on a 1.7B model a "you have no tools" line caused
+    // the tool calls it meant to prevent. Tools the caller sends leave the workflow prompt unchanged.
+    for (const [name, flow] of Object.entries(WORKFLOWS)) {
+      const system = (flow as { system?: string }).system ?? "";
+      expect(system, name).not.toMatch(/\btools?\b|open files/i);
+    }
+    expect(fields.fields.systemPrompt).toBe(WORKFLOWS["extract-json"].system);
     const tools = [{ type: "function", function: { name: "lookup", parameters: { type: "object", properties: {} } } }];
-    const withTools = applyJob("summarize", { prompt: "vendor", tools }, "lfm3:1.7b-q4_K_M", false, "extract-json");
-    expect(withTools.fields.systemPrompt).toBe(WORKFLOWS["extract-json"].system.split("\n").slice(1).join("\n"));
-    expect(applyJob("coding", { prompt: "x", tools }, "lfm3:1.7b-q4_K_M").fields.systemPrompt).not.toMatch(/no tools/);
+    const withTools = applyJob("summarize", { prompt: "vendor", tools }, "bonsai-2:9b", false, "extract-json");
+    expect(withTools.fields.systemPrompt).toBe(WORKFLOWS["extract-json"].system);
   });
 });
 
@@ -81,30 +85,48 @@ describe("job model pick", () => {
     expect(pickJobModel("summarize", installed("bonsai-2:9b"), 12 * GB)).toBe("bonsai-2:9b");
   });
 
-  it("skips a pick whose Ollama capabilities lack the tools or thinking a request needs", () => {
-    const inventory = [
-      { name: "lfm3:1.7b-q4_K_M", capabilities: ["completion"] },
-      { name: "bonsai-2:9b", capabilities: ["completion", "tools", "thinking"] },
-    ];
-    expect(pickJobModel("coding", inventory, 64 * GB)).toBe("lfm3:1.7b-q4_K_M");
-    expect(pickJobModel("coding", inventory, 64 * GB, "default", ["tools"])).toBe("bonsai-2:9b");
-    // Unknown capabilities are not "no".
-    expect(pickJobModel("coding", installed("lfm3:1.7b-q4_K_M"), 64 * GB, "default", ["tools"])).toBe("lfm3:1.7b-q4_K_M");
-    let refusal: any;
-    try { pickJobModel("coding", inventory.slice(0, 1), 64 * GB, "default", ["tools"]); } catch (error) { refusal = JSON.parse((error as Error).message); }
-    expect(refusal.error).toMatch(/no catalog pick with tools support is installed.*lfm3:1\.7b-q4_K_M \(needs [\d.]+ GB, installed, no tools support\)/);
-    expect(refusal.picks.find((pick: any) => pick.tag === "lfm3:1.7b-q4_K_M").lacks).toEqual(["tools"]);
+  it("says when a capable workflow runs below a stronger installed pick that has no room now", () => {
+    const nemotron = "hf.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-4GB:Q4_K_M";
+    const both = installed(nemotron, "bonsai-2:9b");
+    const tight = pickJobModelDetailed("coding", both, 12 * GB, "capable");
+    expect(tight.model).toBe("bonsai-2:9b");
+    expect(tight.note).toMatch(new RegExp(`ran on bonsai-2:9b because the stronger installed pick ${nemotron.replace(/[.]/g, "\\.")} \\(needs 13\\.5 GB\\) did not fit now \\(free: 12\\.0 GB\\)`));
+    expect(pickJobModelDetailed("coding", both, 64 * GB, "capable")).toEqual({ model: nemotron });
+    // Light work keeps the default pick and says nothing.
+    expect(pickJobModelDetailed("coding", both, 12 * GB)).toEqual({ model: "bonsai-2:9b" });
   });
 
-  it("refuses with each pick's memory need and what is free, or when the inventory is unreadable", () => {
+  it("skips a pick whose Ollama capabilities lack the tools or thinking a request needs", () => {
+    const nemotron = "hf.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-4GB:Q4_K_M";
+    const inventory = [
+      { name: "bonsai-2:9b", capabilities: ["completion"] },
+      { name: nemotron, capabilities: ["completion", "tools", "thinking"] },
+    ];
+    expect(pickJobModel("coding", inventory, 64 * GB)).toBe("bonsai-2:9b");
+    expect(pickJobModel("coding", inventory, 64 * GB, "default", ["tools"])).toBe(nemotron);
+    // Unknown capabilities are not "no".
+    expect(pickJobModel("coding", installed("bonsai-2:9b"), 64 * GB, "default", ["tools"])).toBe("bonsai-2:9b");
     let refusal: any;
-    try { pickJobModel("ocr", installed("glm-ocr:latest"), 2.1 * GB); } catch (error) { refusal = JSON.parse((error as Error).message); }
+    try { pickJobModel("coding", inventory.slice(0, 1), 64 * GB, "default", ["tools"]); } catch (error) { refusal = JSON.parse((error as Error).message); }
+    expect(refusal.error).toMatch(/no catalog pick with tools support is installed.*bonsai-2:9b \(needs [\d.]+ GB, installed, no tools support\)/);
+    expect(refusal.picks.find((pick: any) => pick.tag === "bonsai-2:9b").lacks).toEqual(["tools"]);
+  });
+
+  it("hands an installed pick that misses only the catalog's memory preview to serve's memory gate", () => {
+    // The preview asks for a reserve; the gate measures the real load (bonsai-2:9b previewed at
+    // 10.3 GB ran with 6.0 GB free) and refuses with what holds memory when it truly has no room.
+    expect(pickJobModel("ocr", installed("hf.co/openbmb/MiniCPM-OCR-1.0-gguf:Q4_K_M"), 2.1 * GB)).toBe("hf.co/openbmb/MiniCPM-OCR-1.0-gguf:Q4_K_M");
+    expect(pickJobModel("summarize", installed("bonsai-2:27b", "bonsai-2:9b"), 6 * GB, "capable")).toBe("bonsai-2:9b");
+  });
+
+  it("refuses with each pick's memory need and what is free when no pick is installed, or when the inventory is unreadable", () => {
+    let refusal: any;
+    try { pickJobModel("ocr", installed("lfm3-vl:2b-q4_K_M"), 2.1 * GB); } catch (error) { refusal = JSON.parse((error as Error).message); }
     expect(refusal).toMatchObject({ code: "job_no_model_fits", job: "ocr", available_gb: 2.1 });
     expect(refusal.picks).toEqual([
       { tag: "hf.co/openbmb/MiniCPM-OCR-1.0-gguf:Q4_K_M", memory_gb: 3.8, installed: false, fits_now: false },
-      { tag: "glm-ocr:latest", memory_gb: 5.8, installed: true, fits_now: false },
     ]);
-    expect(refusal.error).toMatch(/free: 2\.1 GB.*glm-ocr:latest \(needs 5\.8 GB, installed\)/);
+    expect(refusal.error).toMatch(/free: 2\.1 GB.*MiniCPM-OCR-1\.0-gguf:Q4_K_M \(needs 3\.8 GB, not installed\)/);
     expect(() => pickJobModel("ocr", null, 8 * GB)).toThrow(/could not be read.*pass `model`/);
   });
 });
@@ -143,13 +165,13 @@ describe("job defaults", () => {
   });
 
   it("needs the caller's prompt where the job has no default, and leaves a caller's messages whole", () => {
-    expect(() => applyJob("coding", {}, "lfm3:1.7b-q4_K_M")).toThrow(/needs prompt: the change to make/);
+    expect(() => applyJob("coding", {}, "bonsai-2:9b")).toThrow(/needs prompt: the change to make/);
     expect(() => applyJob("image-recognition", {}, "lfm3-vl:2b-q4_K_M")).toThrow(/needs prompt: your question/);
     const messages = [{ role: "user", content: "hi" }];
-    const own = applyJob("summarize", { messages }, "lfm3:1.7b-q4_K_M");
+    const own = applyJob("summarize", { messages }, "bonsai-2:9b");
     expect(own.fields.prompt).toBeUndefined();
     expect(own.fields.systemPrompt).toBeUndefined();
-    expect(applyJob("summarize", {}, "lfm3:1.7b-q4_K_M").fields.prompt).toBe("Summarize the text below.");
+    expect(applyJob("summarize", {}, "bonsai-2:9b").fields.prompt).toBe("Summarize the text below.");
   });
 
   it("refuses a task that contradicts the job, and sets only routing fields for a preview", () => {
@@ -187,7 +209,7 @@ describe("run_task with job", () => {
     } } as unknown as McpServer);
   });
   beforeEach(() => {
-    fixture.live = vi.fn(async () => [installed("lfm3:1.7b-q4_K_M", "glm-ocr:latest"), 8 * GB]);
+    fixture.live = vi.fn(async () => [installed("bonsai-2:9b", "hf.co/openbmb/MiniCPM-OCR-1.0-gguf:Q4_K_M"), 12 * GB]);
     fixture.run = vi.fn(async (_target: string, request: any) => receipt(request.model, "- step 2 failed: exit 1"));
   });
 
@@ -195,10 +217,10 @@ describe("run_task with job", () => {
     const result = await call({ job: "summarize", prompt: "Which steps failed?" });
     expect(result.isError).toBeFalsy();
     const sent = fixture.run.mock.calls[0][1];
-    expect(sent).toMatchObject({ task: "completion", model: "lfm3:1.7b-q4_K_M", request_options: { options: { temperature: 0.1, top_k: 50, repeat_penalty: 1.1 } } });
+    expect(sent).toMatchObject({ task: "completion", model: "bonsai-2:9b", request_options: { options: { temperature: 0.7, top_p: 0.8, top_k: 20, min_p: 0, presence_penalty: 1.5, repeat_penalty: 1 } } });
     expect(sent.messages[0]).toMatchObject({ role: "system", content: LOCAL_JOBS.summarize.systemPrompt });
     expect(sent.messages[1]).toMatchObject({ role: "user", content: "Which steps failed?" });
-    expect(result.structuredContent.job_profile).toEqual({ job: "summarize", model: "lfm3:1.7b-q4_K_M", applied: ["task", "model", "systemPrompt", "think", "options"] });
+    expect(result.structuredContent.job_profile).toEqual({ job: "summarize", model: "bonsai-2:9b", applied: ["task", "model", "systemPrompt", "think", "options"] });
     // Bounded output: the summarize job turns thinking off, as its workflows do.
     expect(sent.request_options.think).toBe(false);
   });
@@ -223,8 +245,9 @@ describe("run_task with job", () => {
     expect(result.isError).toBeFalsy();
     expect(fixture.live).toHaveBeenCalledTimes(1);
     const prompts = fixture.run.mock.calls.map(([, request]: any[]) => [request.model, request.prompt]);
-    expect(prompts).toEqual([["glm-ocr:latest", "Text Recognition:"], ["glm-ocr:latest", "Table Recognition:"]]);
-    expect(result.structuredContent.job_profile).toMatchObject({ job: "ocr", model: "glm-ocr:latest" });
+    const ocr = "hf.co/openbmb/MiniCPM-OCR-1.0-gguf:Q4_K_M";
+    expect(prompts).toEqual([[ocr, "Text Recognition:"], [ocr, "Table Recognition:"]]);
+    expect(result.structuredContent.job_profile).toMatchObject({ job: "ocr", model: ocr });
     const ranked = await call({ job: "duplicates", tasks: [{ id: "a", independent: true, task: { input: "x" } }] });
     expect(ranked.content[0].text).toMatch(/ranks every item in one call with `nearest`; send it without `tasks`/);
   });
@@ -235,7 +258,7 @@ describe("run_task with job", () => {
     expect(file).toBe(`${process.env.FREELLAMA_HOME}/handoffs/build-failures.md`);
     expect(result.content[0].text).toContain(`handoff_file: ${file}`);
     const body = readFileSync(file, "utf8");
-    expect(body).toMatch(/^# build-failures\n\nFrom run_task job summarize, model lfm3:1\.7b-q4_K_M, \d{4}-/);
+    expect(body).toMatch(/^# build-failures\n\nFrom run_task job summarize, model bonsai-2:9b, \d{4}-/);
     expect(body).toContain("## Summary\n\n- step 2 failed: exit 1\n\n## Result\n\n- step 2 failed: exit 1\n");
     expect((await call({ prompt: "x", saveAs: "x", defer: true })).content[0].text).toMatch(/not valid with `preview` or `defer`/);
     expect((await call({ saveAs: "x", tasks: [{ id: "a", independent: true, task: { prompt: "x" } }] })).content[0].text).toMatch(/not valid with `tasks`/);
@@ -245,6 +268,7 @@ describe("run_task with job", () => {
 describe("family profiles and model-aware prompts", () => {
   it("covers other tags, sizes and quantizations of a family, preferring the longest key", () => {
     const coding = LOCAL_JOBS.coding.models;
+    // Family profiles stay for any installed tag, picked or not.
     expect(familyMatch(coding, "lfm3:latest")).toBe(familyMatch(coding, "lfm3:1.7b-q4_K_M"));
     expect(familyMatch(coding, "LFM3:1.7B")).toBeDefined();
     expect(familyMatch(coding, "bonsai-2:27b-q8_0")).toMatchObject({ think: false, options: { temperature: 0.7, top_p: 0.8, presence_penalty: 1.5 } });

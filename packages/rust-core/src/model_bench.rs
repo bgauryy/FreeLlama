@@ -63,6 +63,7 @@ enum CaseKind {
     ToolRecovery,
     Vision,
     Embedding,
+    Decision,
 }
 
 /// Build a fixed, capability-specific case plan using conservative model-size tiers.
@@ -85,8 +86,11 @@ pub fn benchmark_plan(model: &ModelMetadata) -> Vec<BenchCase> {
         .unwrap_or(context);
     let num_ctx = context.min(supported_context);
     let has = |capability| model.capabilities.contains(&capability);
+    // Tools and vision are exercised through `/api/chat`, which only a completion model serves:
+    // an embedding model can advertise `vision` (its encoder reads images) yet refuses a chat.
+    let chats = has(Capability::Completion);
     let mut cases = Vec::new();
-    if has(Capability::Completion) {
+    if chats {
         cases.push(BenchCase {
             id: "text/exact",
             capability: Capability::Completion,
@@ -106,7 +110,7 @@ pub fn benchmark_plan(model: &ModelMetadata) -> Vec<BenchCase> {
             kind: CaseKind::Needle,
         });
     }
-    if has(Capability::Tools) {
+    if chats && has(Capability::Tools) {
         cases.push(BenchCase {
             id: "tools/multiply",
             capability: Capability::Tools,
@@ -120,7 +124,7 @@ pub fn benchmark_plan(model: &ModelMetadata) -> Vec<BenchCase> {
             kind: CaseKind::ToolRecovery,
         });
     }
-    if has(Capability::Vision) {
+    if chats && has(Capability::Vision) {
         cases.push(BenchCase {
             id: "vision/color",
             capability: Capability::Vision,
@@ -134,6 +138,14 @@ pub fn benchmark_plan(model: &ModelMetadata) -> Vec<BenchCase> {
             capability: Capability::Embedding,
             num_ctx,
             kind: CaseKind::Embedding,
+        });
+    }
+    if has(Capability::Decision) {
+        cases.push(BenchCase {
+            id: "decision/noul",
+            capability: Capability::Decision,
+            num_ctx,
+            kind: CaseKind::Decision,
         });
     }
     cases
@@ -222,6 +234,10 @@ pub struct ModelCaseResult {
     pub num_ctx: u32,
     pub output_excerpt: Option<String>,
     pub error: Option<String>,
+    /// How a graded trial's digest was confirmed when the usual residency evidence was missing,
+    /// e.g. another client evicted the model after the response completed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -327,6 +343,8 @@ pub async fn benchmark_all(config: &BenchConfig) -> Result<AllModelsReport> {
             format!("One cold-start request is reported but excluded from ranking; each case then runs {} warm trials.", config.trials),
             "Large artifacts use an 8K evaluation context; medium 16K; small 32K, capped by the advertised context.".to_owned(),
             "The deterministic screen uses temperature 0, seed 42, thinking disabled, and a 128-token response-envelope budget.".to_owned(),
+            "Decision models answer one fixed state on /v1/systemone (no options) with a clearly true and a clearly false noul question; both must be answered confidently and correctly.".to_owned(),
+            "Each trial's digest is checked in /api/tags before dispatch and in /api/ps after completion, falling back to /api/tags when another client evicted the model.".to_owned(),
             "Capability groups are ranked independently by quality-guarded useful cases/hour.".to_owned(),
             "This is a functional throughput screen, not a broad knowledge or reasoning leaderboard.".to_owned(),
         ],
@@ -411,13 +429,15 @@ async fn run_case(
     model: &ModelMetadata,
     case: &BenchCase,
 ) -> ModelCaseResult {
-    if let Err(error) = verify_benchmark_identity(client, endpoint, model, "/api/tags").await {
+    if let Err(error) = verify_dispatch_identity(client, endpoint, model).await {
         return failed(case, 0, error);
     }
     let started = Instant::now();
     let response = match case.kind {
         CaseKind::Embedding => client.post(crate::ollama_http::url(endpoint, "/api/embed"))
             .json(&json!({"model": model.name, "input": ["local model benchmark", "local model benchmark"], "keep_alive": "5m"})).send().await,
+        CaseKind::Decision => client.post(crate::ollama_http::url(endpoint, "/v1/systemone"))
+            .json(&decision_request(model)).send().await,
         _ => client.post(crate::ollama_http::url(endpoint, "/api/chat"))
             .json(&chat_request(model, case)).send().await,
     };
@@ -432,10 +452,13 @@ async fn run_case(
         },
         Err(error) => return failed(case, client_ms, format!("request: {error}")),
     };
-    if let Err(error) = verify_benchmark_identity(client, endpoint, model, "/api/ps").await {
-        return failed(case, client_ms, error);
-    }
-    grade_completed_case(case, client_ms, &value)
+    let note = match verify_completion_identity(client, endpoint, model).await {
+        Ok(note) => note,
+        Err(error) => return failed(case, client_ms, error),
+    };
+    let mut result = grade_completed_case(case, client_ms, &value);
+    result.note = note;
+    result
 }
 
 /// Grade only a completed operation. Correct-looking partial output or an upstream error must
@@ -447,6 +470,9 @@ fn grade_completed_case(case: &BenchCase, client_ms: u64, value: &Value) -> Mode
             client_ms,
             "benchmark response contains an upstream error".to_owned(),
         );
+    }
+    if matches!(case.kind, CaseKind::Decision) {
+        return grade_decision(case, client_ms, value);
     }
     if !matches!(case.kind, CaseKind::Embedding) {
         if value["done"] != true {
@@ -487,41 +513,174 @@ fn grade_completed_case(case: &BenchCase, client_ms: u64, value: &Value) -> Mode
         num_ctx: case.num_ctx,
         output_excerpt: (!output.is_empty()).then(|| output.chars().take(160).collect()),
         error: (!passed).then(|| "response did not satisfy the deterministic grader".to_owned()),
+        note: None,
+    }
+}
+
+/// `/v1/systemone` has no chat envelope or `done` flag: a completed answer is an `answers` object
+/// holding every asked question as a `noul` probability in [0, 1]. The state makes one question
+/// clearly true and the other clearly false, so a model answering every question the same way,
+/// or hedging near 0.5, fails.
+fn grade_decision(case: &BenchCase, client_ms: u64, value: &Value) -> ModelCaseResult {
+    let probability = |name: &str| {
+        let answer = value.get("answers")?.get(name)?;
+        (answer["type"] == "noul")
+            .then(|| answer["noul"].as_f64())
+            .flatten()
+            .filter(|p| (0.0..=1.0).contains(p))
+    };
+    let (Some(yes), Some(no)) = (
+        probability(DECISION_TRUE_QUESTION),
+        probability(DECISION_FALSE_QUESTION),
+    ) else {
+        return failed(
+            case,
+            client_ms,
+            "decision benchmark response lacks a noul probability for every question".to_owned(),
+        );
+    };
+    let passed = yes >= DECISION_CONFIDENT && no <= 1.0 - DECISION_CONFIDENT;
+    let usage = |field: &str| {
+        value
+            .pointer(&format!("/usage/{field}"))
+            .and_then(Value::as_u64)
+    };
+    ModelCaseResult {
+        id: case.id.to_owned(),
+        capability: case.capability,
+        passed,
+        client_ms,
+        load_ms: ns_ms(value.get("load_duration").and_then(Value::as_u64)),
+        prompt_tokens_per_second: None,
+        decode_tokens_per_second: None,
+        prompt_tokens: usage("input_tokens"),
+        output_tokens: usage("output_tokens"),
+        num_ctx: case.num_ctx,
+        output_excerpt: Some(format!(
+            "{DECISION_TRUE_QUESTION}={yes:.3} {DECISION_FALSE_QUESTION}={no:.3}"
+        )),
+        error: (!passed).then(|| {
+            format!(
+                "decision probabilities were not confident and correct (need p(true) >= {DECISION_CONFIDENT} and p(false question) <= {:.1})",
+                1.0 - DECISION_CONFIDENT
+            )
+        }),
+        note: None,
     }
 }
 
 /// Discovery establishes the expected artifact; every trial must still name that artifact
-/// immediately before dispatch and observe it after completion. A mutable tag alone is not
-/// sufficient evidence for a digest-bound benchmark score.
-async fn verify_benchmark_identity(
+/// immediately before dispatch and be confirmed as that artifact after completion. A mutable tag
+/// alone is not sufficient evidence for a digest-bound benchmark score.
+async fn verify_dispatch_identity(
     client: &Client,
     endpoint: &str,
     model: &ModelMetadata,
-    path: &str,
 ) -> Result<(), String> {
-    let expected = model
+    let expected = expected_digest(model)?;
+    let tags = get_json(client, &crate::ollama_http::url(endpoint, "/api/tags")).await;
+    match observe_digest(tags.as_ref().ok(), &model.name, expected) {
+        DigestObservation::Matches => Ok(()),
+        DigestObservation::Differs => Err(DIGEST_CHANGED.to_owned()),
+        DigestObservation::Absent => Err(DIGEST_UNOBSERVED.to_owned()),
+        DigestObservation::Unavailable => Err(identity_unavailable(&tags)),
+    }
+}
+
+/// After a completed response the loaded runner (`/api/ps`) is the strongest evidence of which
+/// artifact answered. Another Ollama client may evict the model between the response and this
+/// check; then `/api/tags` must still name the same digest, which binds the score to the artifact
+/// just as the pre-dispatch check does. Any observed different digest fails the trial.
+///
+/// Returns a note when the digest was confirmed only through `/api/tags`.
+async fn verify_completion_identity(
+    client: &Client,
+    endpoint: &str,
+    model: &ModelMetadata,
+) -> Result<Option<String>, String> {
+    let expected = expected_digest(model)?;
+    let ps = get_json(client, &crate::ollama_http::url(endpoint, "/api/ps")).await;
+    let resident = observe_digest(ps.as_ref().ok(), &model.name, expected);
+    let listed = if matches!(
+        resident,
+        DigestObservation::Absent | DigestObservation::Unavailable
+    ) {
+        let tags = get_json(client, &crate::ollama_http::url(endpoint, "/api/tags")).await;
+        observe_digest(tags.as_ref().ok(), &model.name, expected)
+    } else {
+        DigestObservation::Unavailable
+    };
+    completion_identity(resident, listed)
+}
+
+/// The post-completion verdict from the `/api/ps` observation and, when that could not confirm the
+/// model, the `/api/tags` fallback.
+fn completion_identity(
+    resident: DigestObservation,
+    listed: DigestObservation,
+) -> Result<Option<String>, String> {
+    match (resident, listed) {
+        (DigestObservation::Matches, _) => Ok(None),
+        (DigestObservation::Differs, _) | (_, DigestObservation::Differs) => {
+            Err(DIGEST_CHANGED.to_owned())
+        }
+        (_, DigestObservation::Matches) => Ok(Some(match resident {
+            DigestObservation::Absent => "model was evicted after the response completed; digest confirmed through /api/tags".to_owned(),
+            _ => "/api/ps was unavailable after the response completed; digest confirmed through /api/tags".to_owned(),
+        })),
+        _ => Err(DIGEST_UNOBSERVED.to_owned()),
+    }
+}
+
+const DIGEST_CHANGED: &str = "benchmark model digest changed; re-run against a stable artifact";
+const DIGEST_UNOBSERVED: &str = "benchmark model digest cannot be observed in /api/ps or /api/tags; re-run against a stable artifact";
+
+fn expected_digest(model: &ModelMetadata) -> Result<&str, String> {
+    model
         .digest
         .as_deref()
         .filter(|digest| !digest.is_empty())
         .ok_or_else(|| {
             "benchmark model digest unavailable; cannot qualify measured evidence".to_owned()
-        })?;
-    let observed = get_json(client, &crate::ollama_http::url(endpoint, path))
-        .await
-        .map_err(|error| format!("benchmark identity unavailable: {error}"))?;
-    let digest = observed["models"]
-        .as_array()
-        .and_then(|models| {
-            models.iter().find(|entry| {
-                entry["name"].as_str().or_else(|| entry["model"].as_str())
-                    == Some(model.name.as_str())
-            })
         })
-        .and_then(|entry| entry["digest"].as_str());
-    if digest != Some(expected) {
-        return Err("benchmark model digest changed or cannot be observed; re-run against a stable artifact".to_owned());
+}
+
+fn identity_unavailable(listing: &Result<Value>) -> String {
+    match listing {
+        Err(error) => format!("benchmark identity unavailable: {error:#}"),
+        Ok(_) => DIGEST_UNOBSERVED.to_owned(),
     }
-    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DigestObservation {
+    /// An entry for the model carries the expected digest.
+    Matches,
+    /// Entries for the model carry digests, none of them the expected one.
+    Differs,
+    /// The listing was read but holds no digest for the model.
+    Absent,
+    /// The listing could not be read or is not a model listing.
+    Unavailable,
+}
+
+/// What an `/api/ps` or `/api/tags` listing says about `name`. Ollama can list one name several
+/// times (contexts or digests), so every same-name entry is considered.
+fn observe_digest(listing: Option<&Value>, name: &str, expected: &str) -> DigestObservation {
+    let Some(listing) = listing.filter(|listing| listing["models"].is_array()) else {
+        return DigestObservation::Unavailable;
+    };
+    let mut digests = crate::ollama_http::ps_entries(listing, name)
+        .filter_map(|entry| entry["digest"].as_str())
+        .filter(|digest| !digest.is_empty())
+        .peekable();
+    if digests.peek().is_none() {
+        DigestObservation::Absent
+    } else if digests.any(|digest| digest == expected) {
+        DigestObservation::Matches
+    } else {
+        DigestObservation::Differs
+    }
 }
 
 fn chat_request(model: &ModelMetadata, case: &BenchCase) -> Value {
@@ -546,7 +705,7 @@ fn chat_request(model: &ModelMetadata, case: &BenchCase) -> Value {
         CaseKind::Vision => {
             json!([{"role": "user", "content": "What is the dominant color in this image? Reply with one color word.", "images": [STANDARD.encode(RED_PIXEL_PNG)]}])
         }
-        CaseKind::Embedding => unreachable!(),
+        CaseKind::Embedding | CaseKind::Decision => unreachable!(),
     };
     let mut request = json!({
         "model": model.name,
@@ -560,6 +719,27 @@ fn chat_request(model: &ModelMetadata, case: &BenchCase) -> Value {
         request["tools"] = json!([{"type":"function","function":{"name":"divide","description":"Divide one number by another","parameters":{"type":"object","required":["a","b"],"properties":{"a":{"type":"number"},"b":{"type":"number"}}}}}]);
     }
     request
+}
+
+const DECISION_TRUE_QUESTION: &str = "stopped";
+const DECISION_FALSE_QUESTION: &str = "moving";
+/// The probability a decision model must reach on the clearly true question, and stay below
+/// (as `1 - DECISION_CONFIDENT`) on the clearly false one.
+const DECISION_CONFIDENT: f64 = 0.7;
+
+/// One `/v1/systemone` request in the shape the platform's decision tasks send: a state and named
+/// `noul` questions, with `keep_alive` as the only residency control (the endpoint takes no
+/// options, so no seed or temperature is sent; a decision is one forward pass).
+fn decision_request(model: &ModelMetadata) -> Value {
+    json!({
+        "model": model.name,
+        "state": "The traffic light is red. Every car at the intersection has come to a complete stop and none is moving.",
+        "questions": {
+            DECISION_TRUE_QUESTION: {"type": "noul", "instructions": "Are the cars stopped?"},
+            DECISION_FALSE_QUESTION: {"type": "noul", "instructions": "Are the cars moving through the intersection?"}
+        },
+        "keep_alive": "5m",
+    })
 }
 
 fn grade(kind: CaseKind, value: &Value, output: &str) -> bool {
@@ -610,6 +790,8 @@ fn grade(kind: CaseKind, value: &Value, output: &str) -> bool {
                     })
                     && items[0].as_array().map(Vec::len) == items[1].as_array().map(Vec::len)
             }),
+        // Graded by `grade_decision`; a decision answer never satisfies a chat grader.
+        CaseKind::Decision => false,
     }
 }
 
@@ -627,6 +809,7 @@ fn failed(case: &BenchCase, client_ms: u64, error: String) -> ModelCaseResult {
         num_ctx: case.num_ctx,
         output_excerpt: None,
         error: Some(error),
+        note: None,
     }
 }
 
@@ -637,6 +820,7 @@ fn build_rankings(results: &[ModelBenchResult]) -> BTreeMap<Capability, Vec<Rank
         Capability::Tools,
         Capability::Vision,
         Capability::Embedding,
+        Capability::Decision,
     ] {
         let mut entries = results
             .iter()
@@ -781,6 +965,158 @@ mod cache_metric_tests {
         assert!(grade_completed_case(&case, 100, &response).passed);
         response["error"] = json!("embedding failed");
         assert!(!grade_completed_case(&case, 100, &response).passed);
+    }
+
+    fn decision_case() -> BenchCase {
+        BenchCase {
+            id: "decision/noul",
+            capability: Capability::Decision,
+            num_ctx: 2048,
+            kind: CaseKind::Decision,
+        }
+    }
+
+    fn decision_answer(stopped: &Value, moving: &Value) -> Value {
+        json!({
+            "model": "d",
+            "answers": {
+                "stopped": {"type": "noul", "noul": stopped},
+                "moving": {"type": "noul", "noul": moving}
+            },
+            "usage": {"input_tokens": 179, "output_tokens": 0}
+        })
+    }
+
+    #[test]
+    fn decision_case_passes_only_on_confident_correct_probabilities() {
+        let case = decision_case();
+        // Live shape from Ollama 0.40.15 `/v1/systemone` with strands-decider.
+        let correct = decision_answer(&json!(0.95), &json!(0.07));
+        let result = grade_completed_case(&case, 50, &correct);
+        assert!(result.passed, "{result:?}");
+        assert_eq!(result.prompt_tokens, Some(179));
+        assert_eq!(result.output_tokens, Some(0));
+        assert_eq!(
+            result.output_excerpt.as_deref(),
+            Some("stopped=0.950 moving=0.070")
+        );
+
+        for (stopped, moving) in [
+            (json!(0.07), json!(0.95)), // inverted
+            (json!(0.9), json!(0.9)),   // always yes
+            (json!(0.55), json!(0.45)), // hedging
+            (json!(1.5), json!(0.0)),   // not a probability
+            (json!("0.9"), json!(0.1)), // not a number
+            (Value::Null, json!(0.1)),
+        ] {
+            let result = grade_completed_case(&case, 50, &decision_answer(&stopped, &moving));
+            assert!(!result.passed, "{result:?}");
+            assert!(result.error.is_some());
+        }
+
+        let mut missing = correct.clone();
+        missing["answers"].as_object_mut().unwrap().remove("moving");
+        assert!(!grade_completed_case(&case, 50, &missing).passed);
+        let mut wrong_type = correct.clone();
+        wrong_type["answers"]["moving"]["type"] = json!("choice");
+        assert!(!grade_completed_case(&case, 50, &wrong_type).passed);
+        let mut upstream_error = correct;
+        upstream_error["error"] = json!("model is not a decision model");
+        assert!(!grade_completed_case(&case, 50, &upstream_error).passed);
+    }
+
+    /// The bench must send what the platform's decision tasks send to `/v1/systemone`: a state
+    /// and named questions, with no chat or option fields the endpoint does not read.
+    #[test]
+    fn decision_request_uses_the_systemone_task_shape() {
+        let model = ModelMetadata {
+            name: "strands-decider:2b-nvfp4".to_owned(),
+            digest: Some("sha".to_owned()),
+            size: 1,
+            format: String::new(),
+            family: String::new(),
+            parameter_size: String::new(),
+            quantization: String::new(),
+            capabilities: vec![Capability::Decision],
+            model_type: ModelType::Decision,
+            advertised_context: None,
+        };
+        let request = decision_request(&model);
+        let keys = request
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            keys,
+            BTreeSet::from(["keep_alive", "model", "questions", "state"])
+        );
+        for name in [DECISION_TRUE_QUESTION, DECISION_FALSE_QUESTION] {
+            assert_eq!(request["questions"][name]["type"], "noul");
+        }
+    }
+
+    #[test]
+    fn digest_observation_considers_every_same_name_entry() {
+        let listing = json!({"models": [
+            {"name": "m:1", "digest": "old"},
+            {"name": "m:1", "digest": "new"},
+            {"model": "n:1", "digest": "new"},
+            {"name": "o:1"}
+        ]});
+        let observe = |name| observe_digest(Some(&listing), name, "new");
+        assert_eq!(observe("m:1"), DigestObservation::Matches);
+        assert_eq!(observe("n:1"), DigestObservation::Matches);
+        assert_eq!(
+            observe_digest(Some(&listing), "m:1", "other"),
+            DigestObservation::Differs
+        );
+        assert_eq!(observe("o:1"), DigestObservation::Absent);
+        assert_eq!(observe("absent:1"), DigestObservation::Absent);
+        assert_eq!(
+            observe_digest(Some(&json!({"error": "x"})), "m:1", "new"),
+            DigestObservation::Unavailable
+        );
+        assert_eq!(
+            observe_digest(None, "m:1", "new"),
+            DigestObservation::Unavailable
+        );
+    }
+
+    /// A model evicted by another client after a complete response is still graded when
+    /// `/api/tags` names the same digest; any observed different digest fails, and a digest that
+    /// neither endpoint shows fails with its own message.
+    #[test]
+    fn completion_identity_falls_back_to_tags_only_for_an_unobserved_runner() {
+        use DigestObservation::{Absent, Differs, Matches, Unavailable};
+        assert_eq!(completion_identity(Matches, Unavailable), Ok(None));
+        let evicted = completion_identity(Absent, Matches).unwrap().unwrap();
+        assert!(evicted.contains("evicted after the response completed"));
+        let ps_down = completion_identity(Unavailable, Matches).unwrap().unwrap();
+        assert!(ps_down.contains("/api/ps was unavailable"));
+        for (resident, listed) in [
+            (Differs, Unavailable),
+            (Differs, Matches),
+            (Absent, Differs),
+        ] {
+            assert_eq!(
+                completion_identity(resident, listed),
+                Err(DIGEST_CHANGED.to_owned())
+            );
+        }
+        for (resident, listed) in [
+            (Absent, Absent),
+            (Absent, Unavailable),
+            (Unavailable, Unavailable),
+            (Unavailable, Absent),
+        ] {
+            assert_eq!(
+                completion_identity(resident, listed),
+                Err(DIGEST_UNOBSERVED.to_owned())
+            );
+        }
+        assert_ne!(DIGEST_CHANGED, DIGEST_UNOBSERVED);
     }
 
     #[test]

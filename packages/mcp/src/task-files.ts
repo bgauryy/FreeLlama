@@ -313,11 +313,22 @@ function jsonOrText(body: string): unknown {
   return body;
 }
 
-/** The label of embedding item `index`: `path:Lstart-Lend` for a file chunk, or `input[index]`. */
-export function inputLabels(inputCount: number, files: FileReceipt[]): string[] {
+/**
+ * The label of embedding item `index`: `path:Lstart-Lend` for a file chunk, or `input[index]`,
+ * followed by the start of the item's text when `texts` gives it, so a match is readable without
+ * looking the index up (`input[2] "Uploading big PNG images makes…"`). `prefix` (an embedding
+ * family's document prefix FreeLlama added) is left out of the snippet.
+ */
+export function inputLabels(inputCount: number, files: FileReceipt[], texts?: readonly unknown[], prefix?: string): string[] {
   // Project-relative where possible: a label is read once per match, so short paths save tokens.
   const fromFiles = files.filter((file) => file.role === "input")
     .map((file) => (file.lines ? `${shortPath(file.path)}:L${file.lines[0]}-${file.lines[1]}` : shortPath(file.path)));
   const given = inputCount - fromFiles.length;
-  return [...Array.from({ length: given }, (_, index) => `input[${index}]`), ...fromFiles];
+  const snippet = (index: number) => {
+    const raw = texts?.[index];
+    if (typeof raw !== "string") return "";
+    const text = (prefix && raw.startsWith(prefix) ? raw.slice(prefix.length) : raw).replace(/\s+/g, " ").trim();
+    return text === "" ? "" : ` ${JSON.stringify(text.length > 48 ? `${text.slice(0, 47)}…` : text)}`;
+  };
+  return [...Array.from({ length: given }, (_, index) => `input[${index}]${snippet(index)}`), ...fromFiles];
 }

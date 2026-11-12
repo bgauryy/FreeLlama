@@ -1,3 +1,6 @@
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 // The CLI and gateway run the real run_task handler; only serve and the live inventory are fakes.
@@ -19,6 +22,7 @@ vi.mock("../../src/model-library.js", async (importOriginal) => ({
 
 import { parseRunArgs, UsageError } from "../../src/agent-cli/args.js";
 import { renderResult, refusalOf, splitAnswer } from "../../src/agent-cli/output.js";
+import { TOOL_CALL_WITHOUT_TOOLS } from "../../src/result-checks.js";
 import { callTool } from "../../src/agent-cli/registry.js";
 import { hostAllowed, originAllowed, startGateway } from "../../src/agent-cli/gateway.js";
 import { chatTaskArgs, fromOpenAiRequest, openAiCompletion } from "../../src/agent-cli/managed.js";
@@ -30,7 +34,7 @@ import { chatModelName, main } from "../../src/agent-cli/main.js";
 
 const render = { json: false, verbose: false, quiet: false, hideThinking: false };
 const answer = (content: string, extra: Record<string, unknown> = {}) => JSON.stringify({
-  route: { selected_model: "lfm3:1.7b-q4_K_M" },
+  route: { selected_model: "bonsai-2:9b" },
   response: { message: { role: "assistant", content } },
   metrics: { prompt_tokens: 120, cached_prompt_tokens: 100, output_tokens: 8, total_duration_ns: 2e9 },
   ...extra,
@@ -49,14 +53,45 @@ beforeEach(() => {
   fixture.run.mockReset();
   fixture.run.mockImplementation(async () => answer("Fixed."));
   fixture.live.mockReset();
-  fixture.live.mockResolvedValue([[{ name: "lfm3:1.7b-q4_K_M", capabilities: ["completion"] }], 64e9]);
+  fixture.live.mockResolvedValue([[{ name: "bonsai-2:9b", capabilities: ["completion"] }], 64e9]);
   fixture.route.mockReset();
-  fixture.route.mockResolvedValue(JSON.stringify({ selected_model: "lfm3:1.7b-q4_K_M", options: { num_ctx: 4096 } }));
+  fixture.route.mockResolvedValue(JSON.stringify({ selected_model: "bonsai-2:9b", options: { num_ctx: 4096 } }));
   fixture.warm.mockReset();
-  fixture.warm.mockResolvedValue(JSON.stringify({ status: "warmed", model: "lfm3:1.7b-q4_K_M" }));
+  fixture.warm.mockResolvedValue(JSON.stringify({ status: "warmed", model: "bonsai-2:9b" }));
 });
 
 describe("freellama run flags", () => {
+  it("produces run_task arguments the real tool schema accepts, for every documented flag", () => {
+    const schema = toolRegistry().get("run_task")!.inputSchema;
+    const cases: string[][] = [
+      ["-m", "m:1", "hi", "--prefer", "cpu"],
+      ["-m", "m:1", "hi", "--prefer", "gpu"],
+      ["-w", "fix-bug", "-f", "a.ts", "bug", "--objective", "quality", "--min-confidence", "medium"],
+      ["-j", "coding", "-f", "a.ts", "x", "--priority", "background", "--timeout", "30", "--max-wait", "10", "--defer"],
+      ["-m", "m:1", "hi", "--think=false", "--keepalive", "5m", "-o", "temperature=0", "-o", "num_ctx=2048", "--schema", "name, age int"],
+      ["-m", "m:1", "hi", "-s", "be brief", "--format", "json", "--save-as", "note", "--session", "00000000-0000-4000-8000-000000000000"],
+      ["-m", "m:1", "hi", "--tools", '[{"type":"function","function":{"name":"f","parameters":{"type":"object","properties":{}}}}]'],
+      ["-j", "find-code", "-f", "src/a.ts", "--top", "3", "query", "--dimensions", "64"],
+      ["--ask", "Is it urgent?", "--choice", "yes=urgent", "--choice", "no", "state"],
+      ["-w", "fix-bug", "--preview"],
+    ];
+    for (const argv of cases) {
+      const parsed = schema.safeParse(parseRunArgs(argv).args);
+      expect(parsed.success, `${argv.join(" ")}: ${parsed.success ? "" : JSON.stringify(parsed.error.issues)}`).toBe(true);
+    }
+    expect(parseRunArgs(["-m", "m:1", "hi", "--prefer", "cpu"]).args.executionPreference).toBe("prefer_cpu");
+  });
+
+  it("attaches an image path written anywhere in the prompt, as ollama run does", () => {
+    const dir = mkdtempSync(join(tmpdir(), "fl-img-"));
+    const image = join(dir, "receipt.png");
+    writeFileSync(image, "png");
+    expect(parseRunArgs(["-m", "vl:1", `What is the total in ${image}?`]).args.files).toEqual([image]);
+    expect(parseRunArgs(["-m", "vl:1", `Read "${image}".`]).args.files).toEqual([image]);
+    expect(parseRunArgs(["-m", "vl:1", "describe", image, "--image", image]).args.files).toEqual([image]);
+    expect(parseRunArgs(["-m", "vl:1", `What is in ${join(dir, "missing.png")}?`]).args.files).toBeUndefined();
+  });
+
   it("reads the first word as a model only when it could be a tag and nothing else names one", () => {
     expect(parseRunArgs(["gemma4", "Why", "blue?"]).args).toMatchObject({ model: "gemma4", prompt: "Why blue?" });
     expect(parseRunArgs(["Why is the sky blue?"]).args).toEqual({ prompt: "Why is the sky blue?" });
@@ -179,6 +214,14 @@ describe("freellama output", () => {
     });
   });
 
+  it("fails a reply that is only a tool call nobody asked for, so a pipe never takes it as the answer", () => {
+    const text = `[m] tool_calls: [{"function":{"name":"app.log","arguments":{"file":"app.log"}}}]\ncheck: ${TOOL_CALL_WITHOUT_TOOLS}`;
+    const rendered = renderResult({ content: [{ type: "text", text }], structuredContent: {} }, render);
+    expect(rendered.stdout).toBe("");
+    expect(rendered.exitCode).toBe(1);
+    expect(rendered.stderr.at(-1)).toMatch(/no answer: the model replied with a tool call although no tools were sent/);
+  });
+
   it("prints a deferred job's id on stdout", () => {
     const rendered = renderResult({ structuredContent: { deferred: true, job: { id: "abc", status: "queued" } } }, render);
     expect(rendered).toEqual({ stdout: "abc", stderr: ["deferred; wait for it with: freellama job abc --wait"], exitCode: 0 });
@@ -190,10 +233,10 @@ describe("freellama tool registry", () => {
     const result = await callTool("run_task", parseRunArgs(["-w", "fix-bug", "parser drops a token"]).args);
     expect(result.isError).toBeFalsy();
     const request = fixture.run.mock.calls[0]![1];
-    expect(request.model).toBe("lfm3:1.7b-q4_K_M");
+    expect(request.model).toBe("bonsai-2:9b");
     expect(request.messages[0].role).toBe("system");
     expect(request.messages.at(-1).content).toContain("parser drops a token");
-    expect(result.structuredContent?.job_profile).toMatchObject({ job: "coding", workflow: "fix-bug", model: "lfm3:1.7b-q4_K_M" });
+    expect(result.structuredContent?.job_profile).toMatchObject({ job: "coding", workflow: "fix-bug", model: "bonsai-2:9b" });
   });
 
   it("refuses what MCP refuses, with the tool's own schema", async () => {
@@ -248,7 +291,7 @@ describe("virtual models", () => {
 
   it("runs freellama/auto on the chat pick that fits now, not on routing's first rank", async () => {
     expect(await chatTaskArgs(virtualModel("freellama/auto")!, { messages: [{ role: "user", content: "hi" }] }))
-      .toEqual({ task: "completion", objective: "balanced", model: "lfm3:1.7b-q4_K_M", prompt: "hi" });
+      .toEqual({ task: "completion", objective: "balanced", model: "bonsai-2:9b", prompt: "hi" });
   });
 
   it("sends one user turn as a workflow prompt, so job mode applies everything", async () => {
@@ -259,7 +302,7 @@ describe("virtual models", () => {
   it("prepends the workflow's system prompt to a longer conversation only when the caller sent none", async () => {
     const messages = [{ role: "user", content: "a" }, { role: "assistant", content: "b" }, { role: "user", content: "c" }];
     const without = await chatTaskArgs(virtualModel("freellama/explain-code")!, { messages });
-    expect(without.model).toBe("lfm3:1.7b-q4_K_M");
+    expect(without.model).toBe("bonsai-2:9b");
     expect((without.messages as Array<{ role: string }>)[0]!.role).toBe("system");
     expect((without.messages as unknown[]).length).toBe(4);
     const own = [{ role: "system", content: "mine" }, ...messages];
@@ -334,11 +377,11 @@ describe("gateway over HTTP", () => {
         upstream.push({ path: request.url ?? "", body: JSON.parse(raw || "{}"), headers: request.headers });
         if (request.url === "/api/chat") {
           response.writeHead(200, { "content-type": "application/x-ndjson" });
-          const second = JSON.stringify({ model: "lfm3:1.7b-q4_K_M", message: { role: "assistant", content: "xed." }, done: false });
-          response.write(`${JSON.stringify({ model: "lfm3:1.7b-q4_K_M", message: { role: "assistant", content: "Fi" }, done: false })}\n${second.slice(0, 20)}`);
+          const second = JSON.stringify({ model: "bonsai-2:9b", message: { role: "assistant", content: "xed." }, done: false });
+          response.write(`${JSON.stringify({ model: "bonsai-2:9b", message: { role: "assistant", content: "Fi" }, done: false })}\n${second.slice(0, 20)}`);
           // The second line arrives split across two chunks.
           setTimeout(() => {
-            response.write(`${second.slice(20)}\n${JSON.stringify({ model: "lfm3:1.7b-q4_K_M", message: { role: "assistant", content: "" }, done: true, done_reason: "stop", eval_count: 2 })}\n`);
+            response.write(`${second.slice(20)}\n${JSON.stringify({ model: "bonsai-2:9b", message: { role: "assistant", content: "" }, done: true, done_reason: "stop", eval_count: 2 })}\n`);
             response.end();
           }, 20);
         } else if (request.url === "/v1/chat/completions" || request.url === "/v1/responses") {
@@ -373,10 +416,10 @@ describe("gateway over HTTP", () => {
     const reply = await post("/api/chat", { model: "freellama/fix-bug:latest", messages: [{ role: "user", content: "crash" }], options: { temperature: 0 } });
     const lines = (await reply.text()).trim().split("\n").map((line) => JSON.parse(line));
     expect(lines.map((line) => line.message?.content)).toEqual(["Fi", "xed.", ""]);
-    expect(lines.at(-1)).toMatchObject({ done: true, freellama: { model: "lfm3:1.7b-q4_K_M", job: "coding", num_ctx: 4096 } });
+    expect(lines.at(-1)).toMatchObject({ done: true, freellama: { model: "bonsai-2:9b", job: "coding", num_ctx: 4096 } });
     const sent = upstream[0]!;
     expect(sent.path).toBe("/api/chat");
-    expect(sent.body.model).toBe("lfm3:1.7b-q4_K_M");
+    expect(sent.body.model).toBe("bonsai-2:9b");
     expect(sent.body.messages[0].role).toBe("system");
     expect(sent.body.messages.at(-1)).toEqual({ role: "user", content: "crash" });
     // The caller's temperature wins; the routed window (raised to hold the turn) and the job's other options fill in.
@@ -392,7 +435,7 @@ describe("gateway over HTTP", () => {
 
   it("checks the memory assessment before an OpenAI-layer stream loads a model, and refuses a held load", async () => {
     fixture.route.mockResolvedValue(JSON.stringify({
-      selected_model: "lfm3:1.7b-q4_K_M", options: { num_ctx: 4096 },
+      selected_model: "bonsai-2:9b", options: { num_ctx: 4096 },
       execution: { resource_assessment: { status: "held_insufficient_capacity", reason: "needs 9 GB, 4 GB free" } },
     }));
     const reply = await post("/v1/chat/completions", { model: "freellama/review-code", stream: true, messages: [{ role: "user", content: "x" }] });
@@ -405,11 +448,11 @@ describe("gateway over HTTP", () => {
   it("loads a model that is not resident through managed admission before streaming", async () => {
     await (await post("/api/chat", { model: "freellama/summarize", messages: [{ role: "user", content: "x" }] })).text();
     expect(fixture.warm).toHaveBeenCalledTimes(1);
-    expect(fixture.warm.mock.calls[0]![1]).toMatchObject({ model: "lfm3:1.7b-q4_K_M", context_tokens: upstream[0]!.body.options.num_ctx });
+    expect(fixture.warm.mock.calls[0]![1]).toMatchObject({ model: "bonsai-2:9b", context_tokens: upstream[0]!.body.options.num_ctx });
   });
 
   it("keeps a loaded runner's window, so nothing reloads and its prompt cache survives", async () => {
-    loaded = [{ name: "lfm3:1.7b-q4_K_M", context_length: 16384 }];
+    loaded = [{ name: "bonsai-2:9b", context_length: 16384 }];
     const lines = (await (await post("/api/chat", { model: "freellama/summarize", messages: [{ role: "user", content: "x" }] })).text()).trim().split("\n");
     expect(upstream[0]!.body.options.num_ctx).toBe(16384);
     expect(JSON.parse(lines.at(-1)!).freellama).toMatchObject({ num_ctx: 16384, context_source: "resident_runner" });
@@ -417,7 +460,7 @@ describe("gateway over HTTP", () => {
   });
 
   it("resizes a runner more than 4x bigger than the task, instead of holding its K/V memory", async () => {
-    loaded = [{ name: "lfm3:1.7b-q4_K_M", context_length: 131072 }];
+    loaded = [{ name: "bonsai-2:9b", context_length: 131072 }];
     await (await post("/api/chat", { model: "freellama/summarize", messages: [{ role: "user", content: "x" }] })).text();
     expect(upstream[0]!.body.options.num_ctx).toBeLessThan(131072);
     expect(fixture.warm).toHaveBeenCalledTimes(1);
@@ -450,7 +493,7 @@ describe("gateway over HTTP", () => {
   });
 
   it("leaves a caller's own system message and think setting alone", async () => {
-    fixture.live.mockResolvedValue([[{ name: "lfm3:1.7b-q4_K_M", capabilities: ["completion", "thinking"] }], 64e9]);
+    fixture.live.mockResolvedValue([[{ name: "bonsai-2:9b", capabilities: ["completion", "thinking"] }], 64e9]);
     await (await post("/api/chat", { model: "freellama/summarize", think: true, messages: [{ role: "system", content: "mine" }, { role: "user", content: "x" }] })).text();
     expect(upstream[0]!.body.messages).toEqual([{ role: "system", content: "mine" }, { role: "user", content: "x" }]);
     expect(upstream[0]!.body.think).toBe(true);
@@ -460,14 +503,14 @@ describe("gateway over HTTP", () => {
     const reply = await post("/v1/messages", { model: "freellama/review-code", max_tokens: 100, stream: true, messages: [{ role: "user", content: "def f(): pass" }] }, { "x-api-key": "ollama", "anthropic-version": "2023-06-01" });
     expect(await reply.text()).toContain("message_stop");
     const sent = upstream[0]!;
-    expect(sent.body).toMatchObject({ model: "lfm3:1.7b-q4_K_M", stream: true });
+    expect(sent.body).toMatchObject({ model: "bonsai-2:9b", stream: true });
     expect(typeof sent.body.system).toBe("string");
     expect(sent.headers["anthropic-version"]).toBe("2023-06-01");
   });
 
   it("runs a non-streaming Ollama chat as a managed task with its receipt's stats", async () => {
     const reply = await post("/api/chat", { model: "freellama/fix-bug:latest", stream: false, messages: [{ role: "user", content: "crash" }] });
-    expect(await reply.json()).toMatchObject({ message: { content: "Fixed." }, done: true, prompt_eval_count: 120, freellama: { model: "lfm3:1.7b-q4_K_M", cached_prompt_tokens: 100 } });
+    expect(await reply.json()).toMatchObject({ message: { content: "Fixed." }, done: true, prompt_eval_count: 120, freellama: { model: "bonsai-2:9b", cached_prompt_tokens: 100 } });
     expect(upstream).toHaveLength(0);
   });
 
@@ -544,10 +587,10 @@ describe("freellama run streaming", () => {
 
   it("streams a direct tag's tokens in order, with serve's shift setting and an admitted load", async () => {
     const { out, io } = capture();
-    const code = await streamRun(streamTarget({ model: "lfm3:1.7b-q4_K_M", prompt: "hi" })!, { model: "lfm3:1.7b-q4_K_M", prompt: "hi", endpoint }, render, io, new AbortController().signal, false);
+    const code = await streamRun(streamTarget({ model: "bonsai-2:9b", prompt: "hi" })!, { model: "bonsai-2:9b", prompt: "hi", endpoint }, render, io, new AbortController().signal, false);
     expect(code).toBe(0);
     expect(out.join("")).toBe("Hello\n");
-    expect(sent[0]).toMatchObject({ model: "lfm3:1.7b-q4_K_M", stream: true, shift: false, messages: [{ role: "user", content: "hi" }] });
+    expect(sent[0]).toMatchObject({ model: "bonsai-2:9b", stream: true, shift: false, messages: [{ role: "user", content: "hi" }] });
     expect(fixture.warm).toHaveBeenCalledTimes(1);
   });
 

@@ -27,15 +27,22 @@ type RunPlan = {
   positionalModel?: boolean;
 };
 
-/** Ollama attaches an image named in the prompt (`ollama run llava "what is in ./a.png"`); so does freellama. */
+/** Ollama attaches an image named in the prompt (`ollama run llava "what is in ./a.png?"`); so does freellama. */
 const IMAGE_FILE = /\.(?:png|jpe?g|webp|gif|bmp)$/i;
+/** A word as a path: without surrounding quotes or brackets, or the sentence punctuation after it. */
+const asPath = (word: string) => word.replace(/^["'(<\[]+/, "").replace(/["')>\]?!,;:.]+$/, "");
 function isImageFile(word: string): boolean {
-  const path = word.replace(/^["']|["']$/g, "");
+  const path = asPath(word);
   try {
     return IMAGE_FILE.test(path) && existsSync(path) && statSync(path).isFile();
   } catch {
     return false;
   }
+}
+/** Every existing image path among the words of the prompt, in order, each once. */
+function imagePathsIn(positionals: readonly string[]): string[] {
+  const words = positionals.flatMap((arg) => arg.split(/\s+/)).filter(Boolean);
+  return [...new Set(words.filter(isImageFile).map(asPath))];
 }
 
 /** Routing fields only: what `--preview` (route without running) accepts. */
@@ -291,7 +298,7 @@ export function parseRunArgs(argv: string[], stdin?: string): RunPlan & { help: 
     positionalModel = true;
   }
   // Image paths in the prompt become attached images, as in `ollama run`.
-  const promptImages = positionals.filter(isImageFile).map((word) => word.replace(/^["']|["']$/g, ""));
+  const promptImages = imagePathsIn(positionals);
   const prompt = positionals.length > 0 ? positionals.join(" ") : undefined;
   const input = stdin !== undefined && stdin.trim() !== "" ? stdin : undefined;
 
@@ -311,7 +318,7 @@ export function parseRunArgs(argv: string[], stdin?: string): RunPlan & { help: 
     else options[key] = value;
   }
 
-  const files = [...(values.file ?? []), ...(values.image ?? []), ...promptImages];
+  const files = [...new Set([...(values.file ?? []), ...(values.image ?? []), ...promptImages])];
   if (values.schema !== undefined && values.format !== undefined) throw new UsageError("--schema sets the output format; remove --format.");
   const format = values.schema !== undefined ? schemaValue(values.schema)
     : values.format === undefined ? undefined : values.format === "json" ? "json" : jsonValue(values.format, "--format");
@@ -335,7 +342,7 @@ export function parseRunArgs(argv: string[], stdin?: string): RunPlan & { help: 
     timeoutSeconds: positiveInt(values.timeout, "--timeout"),
     maxWaitSeconds: positiveInt(values["max-wait"], "--max-wait"),
     minConfidence: values["min-confidence"],
-    executionPreference: values.prefer === undefined ? undefined : values.prefer === "cpu" ? "prefer-cpu" : values.prefer === "gpu" ? "prefer-gpu" : values.prefer,
+    executionPreference: values.prefer === undefined ? undefined : values.prefer === "cpu" ? "prefer_cpu" : values.prefer === "gpu" ? "prefer_gpu" : values.prefer,
     defer: values.defer,
     preview: values.preview,
     saveAs: values["save-as"],

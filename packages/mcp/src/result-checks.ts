@@ -154,14 +154,18 @@ function hasType(value: unknown, type: unknown): boolean {
 }
 
 /**
+ * A reply that is a tool call although no tools were sent is not an answer. The CLI exits 1 on it,
+ * so keep this text stable.
+ */
+export const TOOL_CALL_WITHOUT_TOOLS = "the model answered with a tool call although no tools were sent: discard it and rerun on a stronger pick that fits (models {view:\"catalog\", job}) or pass `model`";
+
+/**
  * Tool calls checked against the tools that were sent: a known name, arguments that are an object
  * with every required parameter, no undeclared one, and declared types and enums. Small models
  * often call a tool that was not offered, drop a required argument or pass a number as a string.
  */
 function toolCallChecks(calls: unknown[], tools: unknown[] | undefined): string[] {
-  if (!tools || tools.length === 0) {
-    return ["the model answered with a tool call instead of text: rerun with a capable model or a workflow, or send no tools"];
-  }
+  if (!tools || tools.length === 0) return [TOOL_CALL_WITHOUT_TOOLS];
   const schemas = new Map(tools.map((tool) => object(object(tool)?.function)).filter((fn): fn is Fields => fn !== undefined)
     .map((fn) => [String(fn.name), object(fn.parameters) ?? {}]));
   const problems: string[] = [];

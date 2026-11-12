@@ -54,6 +54,13 @@ describe("freellama launcher", () => {
     expect(usage.stderr).toMatch(/^freellama: .*embedding/m);
   });
 
+  it.runIf(existsSync(RELEASE_BINARY))("accepts status --json, which the binary does not know, as its plain JSON status", () => {
+    // Nothing listens on port 9: the binary must fail on the connection, not on the --json flag.
+    const status = spawnSync(process.execPath, [LAUNCHER, "status", "--json", "--endpoint", "http://127.0.0.1:9"], { encoding: "utf8", timeout: 20_000 });
+    expect(status.error).toBeUndefined();
+    expect(status.stderr).not.toMatch(/unexpected argument '--json'/);
+  });
+
   it.runIf(existsSync(RELEASE_BINARY))("keeps operator commands on the binary, and lists the agent commands in --help", () => {
     const help = spawnSync(process.execPath, [LAUNCHER, "--help"], { encoding: "utf8", timeout: 10_000 });
     for (const command of ["serve", "doctor", "run", "chat", "gateway", "tool"]) expect(help.stdout).toMatch(new RegExp(`^  ${command}\\s`, "m"));

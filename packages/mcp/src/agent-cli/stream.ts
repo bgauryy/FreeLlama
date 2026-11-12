@@ -96,6 +96,7 @@ export async function streamRun(target: VirtualModel, args: Fields, render: Rend
   let pending = "";
   let answer = "";
   let thinking = false;
+  let toolCalled = false;
   let done: Fields | undefined;
   const handle = (line: string) => {
     const chunk = record(safeJson(line));
@@ -108,6 +109,7 @@ export async function streamRun(target: VirtualModel, args: Fields, render: Rend
       thinking = true;
       process.stderr.write(thought);
     }
+    if (Array.isArray(message?.tool_calls) && message.tool_calls.length > 0) toolCalled = true;
     const piece = message?.content;
     if (typeof piece === "string" && piece !== "") {
       if (thinking) process.stderr.write("\n");
@@ -135,6 +137,10 @@ export async function streamRun(target: VirtualModel, args: Fields, render: Rend
   }
   if (answer !== "" && !answer.endsWith("\n")) io.write("\n");
   if (answer.trim() === "") {
+    if (toolCalled) {
+      io.err("freellama: no answer: the model replied with a tool call although no tools were sent; rerun with -m on a stronger installed model (freellama catalog)");
+      return 1;
+    }
     const why = done?.done_reason === "length" ? "the output budget ran out (thinking?); rerun with --think=false or raise -o num_predict=N" : "the model returned nothing";
     io.err(`freellama: empty answer: ${why}`);
     return 1;

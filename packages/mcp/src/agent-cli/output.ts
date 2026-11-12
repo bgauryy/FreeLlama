@@ -1,6 +1,7 @@
 // A tool result as a shell sees it: the answer alone on stdout (pipeable), and on stderr what the
 // caller should act on (check: lines) or asked to see (--verbose: model, timings, cache, filled fields).
 import type { RenderOptions } from "./args.js";
+import { TOOL_CALL_WITHOUT_TOOLS } from "../result-checks.js";
 import { resultText, type ToolResult } from "./registry.js";
 import { record } from "./util.js";
 
@@ -10,7 +11,8 @@ type Rendered = { stdout: string; stderr: string[]; exitCode: number };
 /** `[model · lifecycle] answer\ncheck: …` -> label, answer lines, check lines. */
 export function splitAnswer(text: string): { label?: string; answer: string; checks: string[] } {
   const match = /^\[([^\]\n]*)\] /.exec(text);
-  const body = match ? text.slice(match[0].length) : text;
+  // A label may stand alone on its line, as before a table.
+  const body = match ? text.slice(match[0].length).replace(/^\n/, "") : text;
   const lines = body.split("\n");
   const checks = lines.filter((line) => line.startsWith("check: "));
   const answer = lines.filter((line) => !line.startsWith("check: ")).join("\n").trimEnd();
@@ -85,6 +87,10 @@ export function renderResult(result: ToolResult, options: RenderOptions, showThi
   const thinking = thinkingOf(structured);
   if (thinking && !options.hideThinking && (options.verbose || showThinking) && !options.quiet) stderr.push(`thinking: ${thinking}`);
   if (!options.quiet) stderr.push(...checks);
+  // A tool call nobody asked for is not an answer: a pipe must not take it as one.
+  if (checks.some((line) => line.includes(TOOL_CALL_WITHOUT_TOOLS))) {
+    return { stdout: "", stderr: [...stderr, "freellama: no answer: the model replied with a tool call although no tools were sent; rerun with -m on a stronger installed model (freellama catalog)"], exitCode: 1 };
+  }
   // A thinking model that spent the whole budget answers nothing: that is a failure for a script.
   if (/^\(empty (answer|response)/.test(answer)) {
     const hint = answer.includes("thinking") ? "the model spent its output thinking; rerun with --think=false or raise -o num_predict=N" : "the model returned nothing";
