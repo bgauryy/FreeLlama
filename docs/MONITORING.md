@@ -99,10 +99,12 @@ Use `host.sample_age_ms` to check freshness.
 
 NVIDIA activity comes from the same bounded `nvidia-smi` query as memory. Apple Silicon activity
 comes from the accelerator's `PerformanceStatistics` in a bounded IORegistry read. Those Apple
-properties are driver-specific and may disappear or change; the read can cover only the devices
-within its retained output. AMD, Windows, unsupported drivers, and unavailable reads report unknown activity. The counters include other processes, use a driver-defined observation
+properties are driver-specific and may disappear or change. A sample that may have reached the
+64 KiB output cap or omits a recognized device's busy counter is discarded rather than treated as
+complete. Malformed NVIDIA device rows likewise discard the activity sample. AMD, Windows, unsupported drivers, and unavailable reads report unknown activity. The counters include other processes, use a driver-defined observation
 window, and do not attribute activity to a FreeLlama task or establish bandwidth or energy
-efficiency. They are diagnostics and do not alter admission or pressure decisions.
+efficiency. They are diagnostic by default. The opt-in GPU headroom guard below also uses valid
+busy counters to hold new GPU work.
 
 Each backend's admission `queue_depth` includes both `slot_waiters` and `resource_waiters`.
 A resource waiter returns its execution slot after two seconds but remains in the bounded queue
@@ -178,6 +180,63 @@ is estimated from the queue depth, the lanes that can run at once (current limit
 task's cost), and the backend's recent average service time, which excludes queue wait (1 to 120
 seconds). A task can ask for a shorter wait with `max_wait_seconds` (`maxWaitSeconds`
 in MCP); the server caps it at the configured maximum.
+
+## Leave capacity for other applications
+
+Resource thresholds belong to the operator, not to a model name or a fixed machine size. Start
+`serve` with CPU and, optionally, GPU headroom targets:
+
+```bash
+freellama serve \
+  --resource-hold-load-per-cpu 0.75 \
+  --resource-resume-load-per-cpu 0.5 \
+  --resource-hold-gpu-busy-percent 80 \
+  --resource-resume-gpu-busy-percent 60
+```
+
+These are **admission targets, not utilization quotas**. They hold new work until observations
+recover; they do not pause, kill, or throttle work already executing. One admitted inference can
+still saturate a device. Use OS/container CPU quotas and upstream/device isolation when a hard
+resource partition is required. Direct calls to Ollama bypass FreeLlama's guard.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `--resource-hold-load-per-cpu` | `1.5` | Hold CPU-bound work when one-minute load / logical CPUs reaches this value |
+| `--resource-resume-load-per-cpu` | `1.0` | Recover the CPU hold at or below this value |
+| `--resource-hold-gpu-busy-percent` | Disabled | Hold GPU work when any observed device reaches this busy percentage |
+| `--resource-resume-gpu-busy-percent` | Disabled | Recover only when all observed devices are at or below this percentage |
+
+The four flags also accept environment variables named `FREELLAMA_RESOURCE_HOLD_LOAD_PER_CPU`,
+`FREELLAMA_RESOURCE_RESUME_LOAD_PER_CPU`, `FREELLAMA_RESOURCE_HOLD_GPU_BUSY_PERCENT`, and
+`FREELLAMA_RESOURCE_RESUME_GPU_BUSY_PERCENT`. They are startup settings, not runtime-TOML keys;
+changing them requires restarting your own FreeLlama service. Inspect the effective policy under
+`host.policy` in raw `status` (or the full saved `doctor` response).
+
+CPU load is **not CPU utilization**: `0.75` does not guarantee 25% idle CPU. It scales with logical
+CPU count and includes the OS's runnable/waiting load. Both CPU thresholds must be finite and
+positive, with resume less than hold; no fixed upper ceiling is imposed. Missing CPU telemetry
+follows `--resource-telemetry-policy`; use `require-all` if unavailable CPU-load observations must
+block work. CPU load holds CPU-assigned work and work on hosts without an observed accelerator;
+it does not hold an observed GPU runner merely because a compiler is busy. Raw Ollama requests
+with explicit integer `options.num_gpu: 0` use CPU admission without rewriting the body; this is
+request intent, not proof of physical placement. Unknown raw/OpenAI-compatible placement stays
+conservatively GPU-gated when the optional GPU guard is enabled.
+
+Both GPU settings must be supplied together and satisfy `0 <= resume < hold <= 100`. GPU activity
+is optional by default so unsupported machines continue to work. When explicitly enabled, missing,
+partial, or invalid GPU busy counters refuse GPU admission with `gpu_activity` in the assessment's
+`missing_telemetry`, even with `best-effort`; CPU-assigned work remains eligible. Enable this guard
+only on hosts exposing the counters described above. It conservatively considers the busiest of
+all observed GPUs, not a per-model device assignment. CPU-only or remote Ollama deployments should
+enforce resource controls on the machine actually executing work: remote upstreams bypass local
+resource admission. Holds recover after two fresh healthy samples by default, avoiding rapid
+stop/start at a single threshold.
+
+For memory headroom, the existing `--resource-hold-available-percent` and
+`--resource-resume-available-percent` settings default to 15 and 20. The per-load reserve is
+size-aware rather than a promise to keep that entire share unused for every small model. Use
+`model_memory_budget` in the runtime file to cap combined model residency on unified-memory/CPU
+backends. GPU busy percentage is not a VRAM reserve.
 
 ## Circuit breaker
 

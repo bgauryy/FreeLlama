@@ -602,11 +602,14 @@ const SERVE_ADDRESS_PATTERN = (() => {
 export function refusalLine(body: string, status?: number): string {
   let parsed: { error?: unknown; code?: unknown; resource_admission?: { assessment?: Record<string, unknown> } };
   try {
-    parsed = JSON.parse(body) as typeof parsed;
+    parsed = (record(JSON.parse(body)) ?? {}) as typeof parsed;
   } catch {
     return body.trim().slice(0, 400) || `HTTP ${status ?? "error"}`;
   }
-  const error = typeof parsed.error === "string" ? parsed.error : `HTTP ${status ?? "error"}`;
+  const nestedMessage = record(parsed.error)?.message;
+  const boundedMessage = typeof nestedMessage === "string" ? nestedMessage.slice(0, 400) : "";
+  const error = typeof parsed.error === "string" ? parsed.error
+    : boundedMessage.trim() ? boundedMessage : `HTTP ${status ?? "error"}`;
   const code = typeof parsed.code === "string" ? ` [${parsed.code}]` : "";
   const assessment = parsed.resource_admission?.assessment;
   // The core's managed-task refusals already state "needs X GB incl. Y GB reserve, Z GB free"

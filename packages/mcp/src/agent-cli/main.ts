@@ -306,6 +306,10 @@ async function tool(argv: string[], io: Io): Promise<number> {
   const json = argv.includes("--json");
   const [name, raw] = argv.filter((arg) => arg !== "--json");
   if (name === undefined) return tools(io);
+  if (name === "--help" || name === "-h") {
+    io.out("usage: freellama tool NAME [JSON|@FILE|-] [--json]\nCall any FreeLlama MCP tool. `freellama tools` lists them; `freellama tool NAME --help` shows its input schema.");
+    return 0;
+  }
   const registered = toolRegistry().get(name);
   if (raw === "--help" || raw === "-h") {
     if (!registered) throw new UsageError(`unknown tool "${name}"; \`freellama tools\` lists them.`);
@@ -446,6 +450,10 @@ export async function main(argv: string[], io: Io = stdio): Promise<number> {
       case "workflows": return workflows(io);
       case "status": return await status(rest, io);
       case "job": {
+        if (rest.includes("--help") || rest.includes("-h")) {
+          io.out("usage: freellama job [ID] [--wait|--cancel] [--endpoint SERVE_URL]\nList deferred tasks, read one result, wait for it, or cancel it.");
+          return 0;
+        }
         // A job lives on the serve that ran it: --endpoint names that serve, as on `freellama run`.
         const at = rest.indexOf("--endpoint");
         const endpoint = at >= 0 ? rest[at + 1] : undefined;

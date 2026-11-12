@@ -201,6 +201,27 @@ describe("freellama tool registry", () => {
     await expect(callTool("no_such_tool", {})).rejects.toThrow(/freellama tools/);
   });
 
+  it.each([
+    ["job", "--help"], ["job", "-h"],
+    ["tool", "--help"], ["tool", "-h"],
+  ])("prints %s %s usage without running a task", async (command, flag) => {
+    const out = vi.fn();
+    const err = vi.fn();
+    expect(await main([command, flag], { out, err })).toBe(0);
+    expect(out.mock.calls.map(([text]) => text).join("\n")).toContain(`usage: freellama ${command}`);
+    expect(err).not.toHaveBeenCalled();
+    expect(fixture.run).not.toHaveBeenCalled();
+    expect(fixture.live).not.toHaveBeenCalled();
+  });
+
+  it.each(["--help", "-h"])("keeps named-tool %s help as its input schema", async (flag) => {
+    const out = vi.fn();
+    const err = vi.fn();
+    expect(await main(["tool", "doctor", flag], { out, err })).toBe(0);
+    expect(out.mock.calls.map(([text]) => text).join("\n")).toContain("input schema:");
+    expect(err).not.toHaveBeenCalled();
+  });
+
   it("exits 2 on a usage error and 0 on help", async () => {
     const lines: string[] = [];
     const io = { out: (text: string) => lines.push(text), err: (text: string) => lines.push(text) };

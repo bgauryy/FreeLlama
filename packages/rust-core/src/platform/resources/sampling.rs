@@ -6,9 +6,9 @@ use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use super::HostResources;
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
 use super::MemoryPressure;
+use super::{HostResources, TELEMETRY_OUTPUT_CAP};
 
 /// Collect one bounded, unprivileged observation; unsupported fields stay `None`.
 #[must_use]
@@ -477,9 +477,6 @@ pub(crate) fn bounded_command_with(
     // A missing optional sysctl may cause nonzero status while the other fields remain valid.
     (!text.trim().is_empty()).then_some(text)
 }
-
-/// Default stdout cap for telemetry and discovery commands.
-const TELEMETRY_OUTPUT_CAP: u64 = 64 * 1024;
 
 /// Run a command with a deadline and return its exit success and up to 64 KiB of stdout. The
 /// child is killed and reaped at the deadline; `None` means it could not run or timed out.

@@ -25,6 +25,8 @@ pub use sampling::sample_host_resources;
 #[cfg(target_os = "macos")]
 pub(crate) use sampling::{apply_thermal_pressure, bounded_command_with};
 
+/// Shared cap so activity parsers cannot treat potentially truncated samples as complete.
+pub(crate) const TELEMETRY_OUTPUT_CAP: u64 = 64 * 1024;
 const GIB: u64 = 1024 * 1024 * 1024;
 /// A load smaller than this is not held by active swapping alone (it still needs its own reserve).
 const SMALL_LOAD_BYTES: u64 = GIB;
@@ -148,6 +150,14 @@ pub enum TelemetryMetric {
     CpuLoad,
     OsMemoryPressure,
     ThermalPressure,
+    GpuActivity,
+}
+
+/// Admission thresholds, not a throttle on an already running accelerator workload.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct GpuBusyPolicy {
+    pub hold_percent: f64,
+    pub resume_percent: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -162,6 +172,8 @@ pub struct ResourcePolicy {
     pub resume_available_min_bytes: u64,
     pub hold_load_per_cpu: f64,
     pub resume_load_per_cpu: f64,
+    /// Opt-in because not every host exposes trustworthy GPU busy counters.
+    pub gpu_busy: Option<GpuBusyPolicy>,
     pub recovery_samples: u32,
     /// Bounds the first host observation of a capacity wait independently of the caller's
     /// timeout, so a zero wait still assesses one sample (the sampler runs on the blocking pool,
@@ -181,6 +193,7 @@ impl Default for ResourcePolicy {
             resume_available_min_bytes: 2 * GIB,
             hold_load_per_cpu: 1.5,
             resume_load_per_cpu: 1.0,
+            gpu_busy: None,
             recovery_samples: 2,
             first_sample_grace: Duration::from_secs(2),
         }
@@ -200,6 +213,15 @@ impl ResourcePolicy {
             || self.recovery_samples == 0
         {
             return Err("resource policy requires positive sampling/recovery, increasing memory reserves and decreasing load thresholds".into());
+        }
+        if let Some(gpu) = self.gpu_busy
+            && (!gpu.hold_percent.is_finite()
+                || !gpu.resume_percent.is_finite()
+                || gpu.resume_percent < 0.0
+                || gpu.hold_percent > 100.0
+                || gpu.hold_percent <= gpu.resume_percent)
+        {
+            return Err("GPU busy thresholds require 0 <= resume < hold <= 100".into());
         }
         Ok(())
     }
@@ -238,6 +260,7 @@ pub enum PressureReason {
     LowAvailableMemory,
     OsMemoryPressure,
     HighCpuLoad,
+    HighGpuLoad,
     ThermalThrottling,
     ActiveSwapping,
 }
@@ -341,6 +364,8 @@ impl ResourceSnapshot {
         let resident_only = demand.resident_only();
         let advisory_mode = self.policy.low_memory == LowMemoryMode::Advisory;
         let os_critical = self.observation.memory_pressure == Some(MemoryPressure::Critical);
+        // An explicit GPU guard must not silently succeed when its counters disappear.
+        let require_gpu_activity = !demand.cpu_bound && self.policy.gpu_busy.is_some();
         // On a host with no observed accelerator, the "GPU" backend runs on the same cores.
         let demand = if self.observation.has_accelerator() {
             demand
@@ -359,9 +384,12 @@ impl ResourceSnapshot {
             required_available_bytes,
         );
         let required_with_reserve_bytes = required_available_bytes.checked_add(reserve_bytes);
-        let missing_telemetry = self
+        let mut missing_telemetry = self
             .observation
             .missing_required(self.policy.telemetry_policy);
+        if require_gpu_activity && self.observation.gpu_busy_percent().is_none() {
+            missing_telemetry.push(TelemetryMetric::GpuActivity);
+        }
         let below_reserve = !resident_only
             && self.effective_available_bytes.is_some_and(|available| {
                 required_with_reserve_bytes.is_some_and(|required| available < required)
@@ -489,6 +517,7 @@ impl ResourceDemand {
             // Saturated host cores slow work that decodes on them; they say nothing about a GPU
             // load or GPU inference, so a busy compiler never blocks a GPU model.
             PressureReason::HighCpuLoad => self.cpu_bound,
+            PressureReason::HighGpuLoad => !self.cpu_bound,
             PressureReason::ThermalThrottling => self.cpu_bound || !self.resident,
             PressureReason::OsMemoryPressure => os_critical || !self.resident_only(),
         }

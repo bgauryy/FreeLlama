@@ -117,7 +117,7 @@ pub(super) async fn forward(
     };
     let generation = kind == RawRequestKind::Generation;
     let mut model = matches!(kind, RawRequestKind::Generation | RawRequestKind::Unload)
-        .then(|| RawModel::parse(&body_bytes))
+        .then(|| RawModel::parse(parts.uri.path(), &body_bytes))
         .flatten();
     // Whether the caller chose the window; one that did not runs at Ollama's default, which is
     // learned from /api/ps once this request is served.

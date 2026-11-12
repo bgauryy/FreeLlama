@@ -223,6 +223,7 @@ pub(super) async fn status(State(state): State<PlatformState>) -> Json<Value> {
             "gpu_telemetry_source": observation.gpu_telemetry_source,
             "gpu_activity": observation.gpu_activity,
             "sample_age_ms": snapshot.sample_age_ms,
+            "policy": snapshot.policy,
         },
         "ollama": {
             "config": gpu_settings,

@@ -172,6 +172,10 @@ pub(crate) fn configure_resource_policy(
 ) -> Result<()> {
     if args.resource_hold_available_percent.is_some()
         || args.resource_resume_available_percent.is_some()
+        || args.resource_hold_load_per_cpu.is_some()
+        || args.resource_resume_load_per_cpu.is_some()
+        || args.resource_hold_gpu_busy_percent.is_some()
+        || args.resource_resume_gpu_busy_percent.is_some()
         || args.resource_telemetry_policy.is_some()
         || args.low_memory.is_some()
     {
@@ -185,6 +189,25 @@ pub(crate) fn configure_resource_policy(
         if let Some(value) = args.resource_resume_available_percent {
             policy.resume_available_percent = value;
         }
+        if let Some(value) = args.resource_hold_load_per_cpu {
+            policy.hold_load_per_cpu = value;
+        }
+        if let Some(value) = args.resource_resume_load_per_cpu {
+            policy.resume_load_per_cpu = value;
+        }
+        policy.gpu_busy = match (
+            args.resource_hold_gpu_busy_percent,
+            args.resource_resume_gpu_busy_percent,
+        ) {
+            (Some(hold_percent), Some(resume_percent)) => {
+                Some(freellama::platform::resources::GpuBusyPolicy {
+                    hold_percent,
+                    resume_percent,
+                })
+            }
+            (None, None) => None,
+            _ => anyhow::bail!("both GPU busy thresholds are required"),
+        };
         if let Some(value) = args.resource_telemetry_policy {
             policy.telemetry_policy = value.into();
         }

@@ -67,12 +67,13 @@ pub(super) async fn raw_resource_permit(
     resident: Option<bool>,
 ) -> Result<ResourcePermit, ResourceWaitError> {
     let governor = &state.resource_governor;
+    let cpu_only = model.as_deref().is_some_and(|model| model.cpu_only);
     if model.as_deref().is_some_and(|model| model.not_installed) {
         // Nothing can load, so this claims no memory; Ollama answers with its own "not found".
         return governor
             .wait_for_demand(
                 &state.upstream,
-                ResourceDemand::resident(),
+                ResourceDemand::resident().on_cpu(cpu_only),
                 RAW_PRESSURE_WAIT,
             )
             .await;
@@ -111,7 +112,7 @@ pub(super) async fn raw_resource_permit(
         _ => ResourceDemand::resident(),
     };
     governor
-        .wait_for_demand(&state.upstream, demand, RAW_PRESSURE_WAIT)
+        .wait_for_demand(&state.upstream, demand.on_cpu(cpu_only), RAW_PRESSURE_WAIT)
         .await
 }
 
@@ -165,6 +166,8 @@ pub(super) struct RawModel {
     pub(super) name: String,
     pub(super) context: Option<u64>,
     pub(super) options_unverified: bool,
+    /// Explicit CPU-only request intent; unknown placement retains conservative GPU gating.
+    pub(super) cpu_only: bool,
     pub(super) digest: Option<String>,
     pub(super) forecast_bytes: Option<u64>,
     /// Ollama's catalog was read and does not list this model: nothing can load, and Ollama's own
@@ -173,7 +176,7 @@ pub(super) struct RawModel {
 }
 
 impl RawModel {
-    pub(super) fn parse(body: &[u8]) -> Option<Self> {
+    pub(super) fn parse(path: &str, body: &[u8]) -> Option<Self> {
         let Ok(body) = serde_json::from_slice::<serde_json::Value>(body) else {
             return Self::from_multipart(body);
         };
@@ -184,11 +187,20 @@ impl RawModel {
         if !name.rsplit('/').next().unwrap_or(&name).contains(':') {
             name.push_str(":latest");
         }
+        // Compatibility adapters discard native runner options; an ignored field cannot prove
+        // CPU intent or the context that the upstream runner will use.
+        let native_options = matches!(
+            path,
+            "/api/generate" | "/api/chat" | "/api/embed" | "/api/embeddings"
+        );
         Some(Self {
             name,
-            context: body
-                .pointer("/options/num_ctx")
-                .and_then(serde_json::Value::as_u64),
+            context: native_options
+                .then(|| {
+                    body.pointer("/options/num_ctx")
+                        .and_then(serde_json::Value::as_u64)
+                })
+                .flatten(),
             options_unverified: [
                 "num_batch",
                 "num_thread",
@@ -205,6 +217,11 @@ impl RawModel {
             ]
             .iter()
             .any(|key| body["options"].get(*key).is_some()),
+            cpu_only: native_options
+                && body
+                    .pointer("/options/num_gpu")
+                    .and_then(serde_json::Value::as_i64)
+                    == Some(0),
             digest: None,
             forecast_bytes: None,
             not_installed: false,
@@ -232,6 +249,7 @@ impl RawModel {
             },
             context: None,
             options_unverified: true,
+            cpu_only: false,
             digest: None,
             forecast_bytes: None,
             not_installed: false,
@@ -327,7 +345,8 @@ mod tests {
 
     #[test]
     fn raw_initial_reuse_and_transition_release_require_exact_known_identity_and_context() {
-        let mut model = RawModel::parse(br#"{"model":"m","options":{"num_ctx":4096}}"#).unwrap();
+        let mut model =
+            RawModel::parse("/api/chat", br#"{"model":"m","options":{"num_ctx":4096}}"#).unwrap();
         let exact =
             serde_json::json!({"models":[{"name":"m:latest","digest":"a","context_length":4096}]});
         assert!(!model.transition_compatible(&exact));
@@ -350,13 +369,74 @@ mod tests {
     }
 
     #[test]
+    fn raw_cpu_only_intent_requires_an_explicit_integer_zero() {
+        for (value, cpu_only) in [
+            (serde_json::json!(0), true),
+            (serde_json::json!(2), false),
+            (serde_json::json!(-1), false),
+            (serde_json::json!("0"), false),
+            (serde_json::Value::Null, false),
+        ] {
+            let body = serde_json::json!({"model":"m","options":{"num_gpu":value}});
+            let model = RawModel::parse("/api/chat", body.to_string().as_bytes()).unwrap();
+            assert_eq!(model.cpu_only, cpu_only);
+            assert!(
+                model.options_unverified,
+                "request intent does not establish runner compatibility"
+            );
+        }
+        assert!(
+            !RawModel::parse("/api/chat", br#"{"model":"m"}"#)
+                .unwrap()
+                .cpu_only
+        );
+    }
+
+    #[test]
+    fn raw_runner_options_require_a_native_ollama_endpoint() {
+        let body = br#"{"model":"m","options":{"num_gpu":0,"num_ctx":4096}}"#;
+        for path in [
+            "/api/generate",
+            "/api/chat",
+            "/api/embed",
+            "/api/embeddings",
+        ] {
+            let model = RawModel::parse(path, body).unwrap();
+            assert!(model.cpu_only, "{path}");
+            assert_eq!(model.context, Some(4096), "{path}");
+            assert!(model.options_unverified);
+        }
+        for path in [
+            "/v1/chat/completions",
+            "/v1/completions",
+            "/v1/embeddings",
+            "/v1/responses",
+            "/v1/messages",
+            "/v1/audio/speech",
+            "/api/unknown",
+        ] {
+            let model = RawModel::parse(path, body).unwrap();
+            assert!(!model.cpu_only, "{path}");
+            assert_eq!(model.context, None, "{path}");
+            assert!(model.options_unverified);
+        }
+    }
+
+    #[test]
     fn a_multipart_audio_request_names_its_model() {
         let body = b"--b\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\n\r\nRIFF\r\n--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nlfm3-audio:2b\r\n--b--\r\n";
-        let model = RawModel::parse(body).expect("model field");
+        let model = RawModel::parse("/v1/audio/transcriptions", body).expect("model field");
         assert_eq!(model.name, "lfm3-audio:2b");
-        assert!(RawModel::parse(b"--b\r\nname=\"file\"\r\n\r\nRIFF\r\n--b--").is_none());
+        assert!(
+            RawModel::parse(
+                "/v1/audio/transcriptions",
+                b"--b\r\nname=\"file\"\r\n\r\nRIFF\r\n--b--"
+            )
+            .is_none()
+        );
         assert_eq!(
-            RawModel::parse(br#"{"model":"phonon:en","input":"hi"}"#).map(|model| model.name),
+            RawModel::parse("/v1/audio/speech", br#"{"model":"phonon:en","input":"hi"}"#)
+                .map(|model| model.name),
             Some("phonon:en".to_owned())
         );
     }

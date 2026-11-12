@@ -16,6 +16,23 @@ impl HostResources {
                 .is_some_and(|activity| !activity.devices.is_empty())
     }
 
+    /// Use the busiest observed device, not an average that could hide one saturated GPU.
+    /// Partial/invalid counters cannot establish the operator's requested headroom.
+    pub(super) fn gpu_busy_percent(&self) -> Option<f64> {
+        let devices = &self.gpu_activity.as_ref()?.devices;
+        if devices.is_empty() {
+            return None;
+        }
+        let mut busiest: f64 = 0.0;
+        for device in devices {
+            let busy = device
+                .busy_percent
+                .filter(|busy| busy.is_finite() && (0.0..=100.0).contains(busy))?;
+            busiest = busiest.max(busy);
+        }
+        Some(busiest)
+    }
+
     pub(super) fn missing_required(&self, policy: TelemetryPolicy) -> Vec<TelemetryMetric> {
         let mut missing = Vec::new();
         if policy == TelemetryPolicy::BestEffort {
@@ -89,6 +106,13 @@ pub(super) fn pressure_reasons(
     {
         reasons.push(PressureReason::HighCpuLoad);
     }
+    if policy.gpu_busy.is_some_and(|gpu| {
+        current
+            .gpu_busy_percent()
+            .is_some_and(|busy| busy >= gpu.hold_percent)
+    }) {
+        reasons.push(PressureReason::HighGpuLoad);
+    }
     if current.thermal_throttled == Some(true) {
         reasons.push(PressureReason::ThermalThrottling);
     }
@@ -118,6 +142,11 @@ pub(super) fn recovered_reason(
         PressureReason::HighCpuLoad => current
             .load_per_cpu()
             .is_some_and(|load| load <= policy.resume_load_per_cpu),
+        PressureReason::HighGpuLoad => policy.gpu_busy.is_some_and(|gpu| {
+            current
+                .gpu_busy_percent()
+                .is_some_and(|busy| busy <= gpu.resume_percent)
+        }),
         PressureReason::ThermalThrottling => current.thermal_throttled == Some(false),
         PressureReason::ActiveSwapping => {
             swap_grew(current, previous) == Some(false)
@@ -136,6 +165,7 @@ pub(super) fn reason_observed(reason: PressureReason, current: &HostResources) -
         }
         PressureReason::OsMemoryPressure => current.memory_pressure.is_some(),
         PressureReason::HighCpuLoad => current.load_per_cpu().is_some(),
+        PressureReason::HighGpuLoad => current.gpu_busy_percent().is_some(),
         PressureReason::ThermalThrottling => current.thermal_throttled.is_some(),
     }
 }

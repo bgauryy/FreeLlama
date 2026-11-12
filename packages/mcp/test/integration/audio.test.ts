@@ -1,6 +1,9 @@
-import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { registerAudioTool } from "../../src/tools/audio.js";
 import { createServer, type Server } from "node:http";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
@@ -76,6 +79,45 @@ describe("audio through serve's passthrough", () => {
       expect(JSON.stringify(result.content)).toMatch(message);
     }
     expect(requests).toHaveLength(0);
+  });
+});
+
+describe("audio public nested error regression", () => {
+  it.each([
+    [JSON.stringify({ error: { message: "voice unavailable; available voices: default", secret: "do not expose" } }), "voice unavailable; available voices: default"],
+    [JSON.stringify({ error: { message: "", secret: "do not expose" } }), "HTTP 400"],
+    [JSON.stringify({ error: { message: "  \t\n", secret: "do not expose" } }), "HTTP 400"],
+    ["null", "HTTP 400"],
+    ["[]", "HTTP 400"],
+    ["true", "HTTP 400"],
+  ])("returns an actionable diagnostic for upstream body %j without writing audio", async (body, expected) => {
+    const fixture = createServer((request, response) => {
+      response.setHeader("content-type", "application/json");
+      if (request.url === "/v1/audio/speech") {
+        response.statusCode = 400;
+        response.end(body);
+      } else response.end("{}");
+    });
+    await new Promise<void>((resolve) => fixture.listen(0, "127.0.0.1", resolve));
+    const address = fixture.address();
+    if (!address || typeof address === "string") throw new Error("missing fixture address");
+    const server = new McpServer({ name: "audio-test", version: "1" });
+    registerAudioTool(server);
+    const client = new Client({ name: "audio-test-client", version: "1" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    try {
+      await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+      const outputFile = path.join(mkdtempSync(path.join(tmpdir(), "freellama-audio-")), "rejected.wav");
+      const result = await client.callTool({ name: "audio", arguments: { action: "speak", model: "fixture", text: "test", voice: "missing", outputFile, endpoint: `http://127.0.0.1:${address.port}` } });
+      expect(result.isError).toBe(true);
+      expect((result.content as Array<{ text: string }>)[0]!.text).toBe(`speak with fixture failed: ${expected}`);
+      expect(JSON.stringify(result)).not.toContain("do not expose");
+      expect(existsSync(outputFile)).toBe(false);
+    } finally {
+      await client.close();
+      await server.close();
+      await new Promise<void>((resolve, reject) => fixture.close((error) => error ? reject(error) : resolve()));
+    }
   });
 });
 

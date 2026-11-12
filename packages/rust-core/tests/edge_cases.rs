@@ -68,6 +68,45 @@ fn fastest_tie_break_is_deterministic_regardless_of_catalog_order() {
 }
 
 #[test]
+fn arbitrary_installed_tags_need_no_measured_catalog_or_family_allowlist() {
+    for size in [250_000_000, 256_000_000_000] {
+        for context in [2_048, 131_072] {
+            let mut candidate = model(
+                "local-team/custom-architecture:v7",
+                size,
+                &[Capability::Completion],
+            );
+            candidate.advertised_context = Some(context);
+            for objective in [Objective::Fastest, Objective::Balanced] {
+                for explicit in [false, true] {
+                    let input = RouteInput {
+                        objective,
+                        context_tokens: Some(context),
+                        model: explicit.then(|| candidate.name.clone()),
+                        ..RouteInput::default()
+                    };
+                    let route =
+                        select_route(&input, &[candidate.clone()], &SessionAffinity::default())
+                            .unwrap();
+                    assert_eq!(route.selected_model, candidate.name);
+                    assert_eq!(route.options["num_ctx"], context);
+                }
+            }
+        }
+    }
+    // Unlisted tags are accepted, but required capabilities are still a real contract.
+    let candidate = model("local-team/custom-architecture:v7", 250_000_000, &[]);
+    assert!(
+        select_route(
+            &RouteInput::default(),
+            &[candidate],
+            &SessionAffinity::default()
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn fastest_prefers_the_smaller_model_when_benchmark_scores_tie() {
     let mut small = model("small:1b", 1_000_000_000, &[Capability::Completion]);
     small.benchmark.insert(Capability::Completion, 100.0);

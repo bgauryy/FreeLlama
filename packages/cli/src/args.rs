@@ -48,6 +48,26 @@ pub(crate) struct AdmissionArgs {
     /// Available-memory percentage required for recovery (default 20; greater than hold).
     #[arg(long)]
     pub(crate) resource_resume_available_percent: Option<u32>,
+    /// Hold CPU-bound work at this one-minute load per logical CPU (default 1.5; not utilization).
+    #[arg(long, env = "FREELLAMA_RESOURCE_HOLD_LOAD_PER_CPU")]
+    pub(crate) resource_hold_load_per_cpu: Option<f64>,
+    /// Resume CPU-bound work below this load per CPU (default 1.0; positive and less than hold).
+    #[arg(long, env = "FREELLAMA_RESOURCE_RESUME_LOAD_PER_CPU")]
+    pub(crate) resource_resume_load_per_cpu: Option<f64>,
+    /// Opt-in: hold GPU work at this observed busy percentage (0 < hold <= 100). Requires counters.
+    #[arg(
+        long,
+        env = "FREELLAMA_RESOURCE_HOLD_GPU_BUSY_PERCENT",
+        requires = "resource_resume_gpu_busy_percent"
+    )]
+    pub(crate) resource_hold_gpu_busy_percent: Option<f64>,
+    /// Resume GPU work at/below this busy percentage (0 <= resume < hold). Both GPU flags required.
+    #[arg(
+        long,
+        env = "FREELLAMA_RESOURCE_RESUME_GPU_BUSY_PERCENT",
+        requires = "resource_hold_gpu_busy_percent"
+    )]
+    pub(crate) resource_resume_gpu_busy_percent: Option<f64>,
     /// Primary/GPU admission budget in weighted units — embedding 1, chat 2, vision 4 (default 2
     /// per Ollama parallel slot, or the runtime file). This is not a literal task count.
     #[arg(long)]
@@ -255,6 +275,83 @@ mod telemetry_cli_tests {
         }
     }
 
+    #[test]
+    fn headroom_flags_reach_the_shared_resource_policy() {
+        for (hold, resume) in [("0.75", "0.5"), ("4", "3")] {
+            let parsed = Cli::try_parse_from([
+                "freellama",
+                "serve",
+                "--resource-hold-load-per-cpu",
+                hold,
+                "--resource-resume-load-per-cpu",
+                resume,
+                "--resource-hold-gpu-busy-percent",
+                "80",
+                "--resource-resume-gpu-busy-percent",
+                "60",
+            ])
+            .unwrap();
+            let Command::Serve { admission, .. } = parsed.command else {
+                panic!("expected serve")
+            };
+            let mut config = PlatformConfig::new(
+                "127.0.0.1:11435",
+                freellama::DEFAULT_OLLAMA_ENDPOINT,
+                None,
+                None,
+            );
+            configure_resource_policy(&mut config, &admission).unwrap();
+            let policy = config.resource_governor.policy();
+            assert_eq!(policy.hold_load_per_cpu, hold.parse::<f64>().unwrap());
+            assert_eq!(policy.resume_load_per_cpu, resume.parse::<f64>().unwrap());
+            let gpu = policy.gpu_busy.unwrap();
+            assert_eq!((gpu.hold_percent, gpu.resume_percent), (80.0, 60.0));
+        }
+    }
+
+    #[test]
+    fn gpu_headroom_requires_both_flags_and_invalid_thresholds_fail_before_serve() {
+        for flag in [
+            "--resource-hold-gpu-busy-percent",
+            "--resource-resume-gpu-busy-percent",
+        ] {
+            assert!(Cli::try_parse_from(["freellama", "serve", flag, "80"]).is_err());
+        }
+        for flags in [
+            [
+                "--resource-hold-gpu-busy-percent",
+                "80",
+                "--resource-resume-gpu-busy-percent",
+                "90",
+            ],
+            [
+                "--resource-hold-gpu-busy-percent",
+                "NaN",
+                "--resource-resume-gpu-busy-percent",
+                "60",
+            ],
+            [
+                "--resource-hold-load-per-cpu",
+                "0.5",
+                "--resource-resume-load-per-cpu",
+                "0.75",
+            ],
+        ] {
+            let parsed =
+                Cli::try_parse_from(["freellama", "serve"].into_iter().chain(flags)).unwrap();
+            let Command::Serve { admission, .. } = parsed.command else {
+                panic!("expected serve")
+            };
+            let mut config = PlatformConfig::new(
+                "127.0.0.1:11435",
+                freellama::DEFAULT_OLLAMA_ENDPOINT,
+                None,
+                None,
+            );
+            assert!(configure_resource_policy(&mut config, &admission).is_err());
+        }
+    }
+
     #[tokio::test]
     async fn explicit_policy_reaches_the_governor_and_default_requires_memory() {
         for (value, expected) in [
@@ -437,7 +534,7 @@ pub(crate) enum Command {
         #[arg(long, env = "FREELLAMA_POLICY_FILE")]
         policy_file: Option<PathBuf>,
         #[command(flatten)]
-        admission: AdmissionArgs,
+        admission: Box<AdmissionArgs>,
         #[command(flatten)]
         production: ProductionArgs,
     },

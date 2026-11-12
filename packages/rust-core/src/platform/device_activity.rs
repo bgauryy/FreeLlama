@@ -22,9 +22,13 @@ fn observation(source: &str, devices: Vec<GpuDeviceActivity>) -> Option<GpuActiv
 }
 
 /// Read only the quoted device-utilization counter in an accelerator's statistics dictionary.
-/// The bounded command retains at most 64 KiB, so later devices may be absent from this sample.
+/// Reject a potentially capped sample or missing recognized-device counters: neither proves idle.
 #[cfg(any(target_os = "macos", test))]
 pub(super) fn parse_apple_activity(text: &str) -> Option<GpuActivityObservation> {
+    if text.len() as u64 >= super::resources::TELEMETRY_OUTPUT_CAP {
+        return None;
+    }
+    let mut recognized = 0;
     let mut device = None;
     let mut devices = Vec::new();
     for line in text.lines() {
@@ -36,6 +40,7 @@ pub(super) fn parse_apple_activity(text: &str) -> Option<GpuActivityObservation>
                 if !class.starts_with("AGXAccelerator") {
                     return None;
                 }
+                recognized += 1;
                 let id = rest
                     .trim_start()
                     .strip_prefix("id ")?
@@ -76,6 +81,9 @@ pub(super) fn parse_apple_activity(text: &str) -> Option<GpuActivityObservation>
             });
         }
     }
+    if recognized != devices.len() {
+        return None;
+    }
     observation("apple_ioreg_performance_statistics", devices)
 }
 
@@ -83,9 +91,13 @@ pub(super) fn parse_apple_activity(text: &str) -> Option<GpuActivityObservation>
 /// follow them in the same query. N/A counters stay nullable without losing a known device.
 #[cfg(any(target_os = "linux", test))]
 pub(super) fn parse_nvidia_activity(text: &str) -> Option<GpuActivityObservation> {
+    if text.len() as u64 >= super::resources::TELEMETRY_OUTPUT_CAP {
+        return None;
+    }
     let devices = text
         .lines()
-        .filter_map(|line| {
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
             let fields: Vec<_> = line.split(',').map(str::trim).collect();
             if fields.len() != 5 {
                 return None;
@@ -101,7 +113,7 @@ pub(super) fn parse_nvidia_activity(text: &str) -> Option<GpuActivityObservation
                 allocated_memory_bytes: None,
             })
         })
-        .collect();
+        .collect::<Option<Vec<_>>>()?;
     observation("nvidia_smi", devices)
 }
 

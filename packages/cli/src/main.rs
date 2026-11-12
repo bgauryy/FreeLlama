@@ -97,7 +97,7 @@ async fn run() -> Result<()> {
                 backends,
                 benchmark_report,
                 policy_file,
-                admission,
+                admission: *admission,
                 production,
             })
             .await?;

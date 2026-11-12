@@ -65,6 +65,7 @@ async fn backend() -> (
         .route("/api/ps",get(|| async {Json(json!({"models":[]}))}))
         .route("/api/show",post(|| async {Json(json!({"capabilities":["completion"],"model_info":{"general.architecture":"llama","llama.context_length":32768}}))}))
         .route("/api/generate",post(|| async {Json(json!({"done":true}))}))
+        .route("/v1/chat/completions",post(|| async {Json(json!({"choices":[]}))}))
         .route("/api/chat",post(move |Json(body):Json<Value>| {let send=send.clone(); async move {
             let (release,released)=oneshot::channel();
             send.send((body,release)).unwrap();
@@ -163,6 +164,116 @@ async fn known_pressure_holds_managed_execution_until_its_deadline_without_infer
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(health["backends"]["cpu"]["admission"]["slots_available"], 1);
     for server in servers {
+        server.abort();
+    }
+}
+
+fn headroom_governor(busy: Option<f64>, load: f64) -> ResourceGovernor {
+    use freellama::platform::resources::{
+        GpuActivityObservation, GpuBusyPolicy, GpuDeviceActivity,
+    };
+    ResourceGovernor::with_sampler(
+        ResourcePolicy {
+            sample_interval: Duration::from_millis(5),
+            hold_load_per_cpu: 0.75,
+            resume_load_per_cpu: 0.5,
+            gpu_busy: Some(GpuBusyPolicy {
+                hold_percent: 80.0,
+                resume_percent: 60.0,
+            }),
+            ..ResourcePolicy::default()
+        },
+        move || HostResources {
+            source: "injected_headroom".into(),
+            total_memory_bytes: Some(32 * 1024 * 1024 * 1024),
+            available_memory_bytes: Some(16 * 1024 * 1024 * 1024),
+            gpu_memory_total_bytes: Some(8 * 1024 * 1024 * 1024),
+            logical_cpus: Some(8),
+            load_average_one_minute: Some(load * 8.0),
+            memory_pressure: Some(MemoryPressure::Normal),
+            thermal_throttled: Some(false),
+            gpu_activity: busy.map(|busy| GpuActivityObservation {
+                source: "fixture".into(),
+                scope: "observed_devices_all_processes",
+                window: "driver_defined",
+                devices: vec![GpuDeviceActivity {
+                    device: "GPU-a".into(),
+                    busy_percent: Some(busy),
+                    memory_busy_percent: None,
+                    allocated_memory_bytes: None,
+                }],
+            }),
+            ..HostResources::default()
+        },
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn raw_cpu_only_requests_bypass_gpu_busy_and_missing_counters_without_rewriting() {
+    for busy in [Some(95.0), None] {
+        let (upstream, mut receive, server) = backend().await;
+        let proxy = freellama::proxy::app(
+            freellama::proxy::ProxyConfig::new("127.0.0.1:0", upstream, false)
+                .with_resource_governor(headroom_governor(busy, 0.1)),
+        )
+        .unwrap();
+        let body = json!({"model":"test:latest","messages":[{"role":"user","content":"hi"}],"stream":false,"options":{"num_gpu":0}});
+        let expected = body.clone();
+        let response =
+            tokio::spawn(async move { proxy.oneshot(request("/api/chat", &body)).await.unwrap() });
+        let (executed, release) = next_execution(&mut receive).await;
+        assert_eq!(executed, expected);
+        release.send(()).unwrap();
+        let response = response.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn openai_ignored_native_options_cannot_bypass_gpu_headroom() {
+    for busy in [Some(95.0), None] {
+        let (upstream, _, server) = backend().await;
+        let proxy = freellama::proxy::app(
+            freellama::proxy::ProxyConfig::new("127.0.0.1:0", upstream, false)
+                .with_resource_governor(headroom_governor(busy, 0.1)),
+        )
+        .unwrap();
+        let response = proxy
+            .oneshot(request(
+                "/v1/chat/completions",
+                &json!({"model":"test:latest","messages":[{"role":"user","content":"hi"}],"stream":false,"options":{"num_gpu":0}}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn raw_cpu_only_requests_obey_cpu_headroom_while_unspecified_placement_obeys_gpu() {
+    for (busy, load, options) in [
+        (Some(0.0), 1.0, json!({"num_gpu":0})),
+        (Some(95.0), 0.1, json!({})),
+        (None, 0.1, json!({})),
+    ] {
+        let (upstream, _, server) = backend().await;
+        let proxy = freellama::proxy::app(
+            freellama::proxy::ProxyConfig::new("127.0.0.1:0", upstream, false)
+                .with_resource_governor(headroom_governor(busy, load)),
+        )
+        .unwrap();
+        let response = proxy
+            .oneshot(request(
+                "/api/generate",
+                &json!({"model":"test:latest","prompt":"hi","stream":false,"options":options}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         server.abort();
     }
 }

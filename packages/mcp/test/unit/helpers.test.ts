@@ -4,6 +4,7 @@ import {
   decisionAnswerText,
   costTelemetry,
   errorResult,
+  refusalLine,
   parsedResult,
   jobsText,
   lifecycleText,
@@ -17,6 +18,27 @@ import {
 import { REPO_ROOT } from "../../src/config.js";
 import { extractExistingWorkspacePath, parseAdapterResult } from "../../src/delegate.js";
 import { summarizeOllamaPullStream } from "../../src/tools/ollama-lifecycle.js";
+
+describe("refusalLine nested errors", () => {
+  it.each(["null", "[]", "42", "true", '"unstructured"'])("falls back for non-object JSON %s", (body) => {
+    expect(refusalLine(body, 400)).toBe("HTTP 400");
+  });
+  it.each(["", "  \t\n"])("falls back for blank nested message %j", (message) => {
+    expect(refusalLine(JSON.stringify({ error: { message, secret: "do not expose" } }), 400)).toBe("HTTP 400");
+  });
+  it("preserves only the nested message and existing fallback and formatting", () => {
+    expect(refusalLine(JSON.stringify({ error: { message: "voice unavailable; available voices: default", secret: "do not expose" }, code: "bad_voice" }), 400))
+      .toBe("voice unavailable; available voices: default [bad_voice]");
+    expect(refusalLine(JSON.stringify({ error: { message: 42, secret: "do not expose" } }), 400)).toBe("HTTP 400");
+    expect(refusalLine(JSON.stringify({ error: { secret: "do not expose" } }), 400)).toBe("HTTP 400");
+    expect(refusalLine(JSON.stringify({ error: "" }), 400)).toBe("");
+    expect(refusalLine(JSON.stringify({ error: "  " }), 400)).toBe("  ");
+    expect(refusalLine(JSON.stringify({ error: "existing failure", code: "bad" }), 400)).toBe("existing failure [bad]");
+    expect(refusalLine("x".repeat(500), 500)).toHaveLength(400);
+    expect(refusalLine(JSON.stringify({ error: { message: "x".repeat(500) } }), 400)).toHaveLength(400);
+    expect(refusalLine(JSON.stringify({ error: { message: " ".repeat(400) + "x" } }), 400)).toBe("HTTP 400");
+  });
+});
 
 describe("extractExistingWorkspacePath", () => {
   it("extracts an existing workspace-relative file from a Bash command", () => {

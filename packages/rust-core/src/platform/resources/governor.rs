@@ -258,6 +258,7 @@ impl ResourceGovernor {
             } else if !observation
                 .missing_required(self.policy.telemetry_policy)
                 .is_empty()
+                || (self.policy.gpu_busy.is_some() && observation.gpu_busy_percent().is_none())
             {
                 "telemetry_unavailable"
             } else if observation.has_signal() {
