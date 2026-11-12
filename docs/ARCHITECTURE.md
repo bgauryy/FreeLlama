@@ -188,6 +188,17 @@ throughput feedback. The receipt holds `route`, `admission` (`queue_wait_ms`,
 `resource_admission`, `context_sizing`, `memory_reservation`), `metrics`, `feedback` and
 `response`, which is Ollama's own answer (`message.content`, `eval_count`, durations).
 
+`fallback_models` (up to 4 tags) is an explicit fallback chain run in the core
+(`platform/execution/fallback.rs`): the next model replaces `model` only when the attempt before it
+was refused with a code that proves nothing executed (`resource_admission_unavailable`,
+`context_window_exceeded`, `embedding_item_exceeds_context`, `model_exceeds_host_budget`,
+`upstream_circuit_open`, `model_not_installed`, `model_not_eligible`), and only when no earlier
+embedding slice of the same task ran. Any other error ends the chain. During each attempt the later
+chain models are registered as busy, which keeps eviction from unloading them.
+A success adds `fallback: {used, attempts, selected}` to the receipt; a failure adds
+`fallback: {used, exhausted, attempts, note}` to the error body. A deferred job validates the chain
+at submission.
+
 A batch nests whole task bodies:
 
 ```json

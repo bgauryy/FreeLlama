@@ -19,7 +19,8 @@ use std::{
 use tokio::sync::{mpsc, oneshot};
 use tower::ServiceExt;
 
-/// Low available memory alone only warns, so the OS reports pressure together with it here;
+/// In advisory mode (set below) low available memory alone only warns, so the OS reports pressure
+/// together with it here;
 /// these contracts are about waiting for that pressure to clear.
 fn governor(available: Arc<AtomicU64>) -> ResourceGovernor {
     ResourceGovernor::with_sampler(

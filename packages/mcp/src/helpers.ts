@@ -174,6 +174,12 @@ export function taskMessages({ systemPrompt, messages, prompt, images }: {
   return [{ role: "system", content: systemPrompt }, ...conversation];
 }
 
+/**
+ * An explicit, ordered fallback chain the core runs (`fallback_models`): the next model only after
+ * the one before it was refused before it ran, never after it started. At most 4.
+ */
+export const fallbackModelsParam = z.array(z.string().min(1)).min(1).max(4).optional();
+
 // Full per-item shape, checked in run_task by `parseBatchTask` (strict: a misspelled or mistyped
 // field fails the call). It is never sent to the model; `batchItemParam` below is.
 const batchTaskParam = z.object({
@@ -207,6 +213,7 @@ const batchTaskParam = z.object({
   logprobs: z.boolean().optional(),
   topLogprobs: z.number().int().nonnegative().optional(),
   minConfidence: minConfidenceParam,
+  fallbackModels: fallbackModelsParam,
 }).strict();
 
 /** Field names a `tasks[].task` item accepts; derived from the schema so hints cannot drift. */

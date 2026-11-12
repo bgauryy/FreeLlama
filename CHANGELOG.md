@@ -4,6 +4,44 @@ All notable changes to FreeLlama are recorded here. Versions follow [Semantic Ve
 every npm package (`@octocodeai/freellama`, `@octocodeai/freellama-mcp-server`, the native platform
 packages) and the Rust crates share one version, set with `yarn release:version <semver>`.
 
+## [Unreleased]
+
+### Added
+
+- **Fallback chains.** `run_task {fallbackModels}` (HTTP `fallback_models`, `freellama task
+  --fallback-model`, `freellama run --fallback`) lists up to 4 models to try in order. The next one
+  runs only after the one before was refused before anything executed (no room by the wait deadline,
+  input over its context window, model file over the host budget, not installed, wrong capability,
+  circuit open); any other error ends the chain, so no work is replayed. Later models in the chain
+  are protected from eviction while an earlier one is tried. The receipt's `fallback` lists every
+  attempt, and the answer (batch items included) gets a `check:` line naming the model that answered.
+- **Your own workflows.** Markdown files in `~/.octocode/freellama/workflows/` (or
+  `FREELLAMA_WORKFLOWS_DIR`): front matter names the job (`summarize`, `coding`, `ocr` or
+  `image-recognition`), title and optional `think`, `max_output`,
+  `prefer`, `format`; the body is the instructions. They run through MCP, `freellama run -w` and the
+  gateway; one named like a built-in replaces it; invalid files are skipped and named by
+  `freellama workflows` and `doctor`; `job_profile.workflow_source` names the file and digest.
+- **Idempotency keys from MCP and the agent commands.** `run_task {defer:true, idempotencyKey}` and
+  `freellama run --defer --idempotency-key KEY` pass the durable-job key that the HTTP API already took.
+- **Stable refusal codes** `model_not_installed`, `model_not_eligible` and `model_exceeds_host_budget`.
+- **CI.** `.github/workflows/ci.yml` runs build, type check, Clippy, JavaScript and Rust tests and the
+  release package checks on Ubuntu and macOS.
+
+### Changed
+
+- A decider confidence under 0.9 cites the "right about 95% of the time" figure only for
+  strands-decider, which publishes it; for any other decider the `check:` line calls its confidence
+  uncalibrated.
+- The comparison and README credit what Ollama, llama.cpp, llama-swap, LocalAI, Lemonade, LM Studio,
+  oMLX and Docker Model Runner already do, and drop claims of uniqueness.
+
+### Fixed
+
+- Docs said deferred jobs are always lost on restart; with `FREELLAMA_DURABLE_JOBS=1` finished
+  receipts survive and unfinished ones read back as an unknown outcome. Monitoring said low available
+  RAM only warns on macOS; it refuses a new load by default on every OS (`--low-memory advisory`
+  restores the warning).
+
 ## [0.11.0] - 2026-11-10
 
 ### Added

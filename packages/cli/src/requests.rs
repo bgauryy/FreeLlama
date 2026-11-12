@@ -86,6 +86,9 @@ pub(crate) async fn request_task(args: TaskArgs) -> Result<()> {
     if let Some(stop) = execution.stop_on_repetition {
         body["stop_on_repetition"] = json!(stop);
     }
+    if !execution.fallback_models.is_empty() {
+        body["fallback_models"] = json!(execution.fallback_models);
+    }
 
     // Omitted flags must remain absent so scoped routing defaults can apply.
     body.as_object_mut()

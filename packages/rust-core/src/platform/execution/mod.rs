@@ -16,6 +16,7 @@ use super::{Backend, PlatformState, TaskInput};
 
 mod admit;
 mod completion;
+mod fallback;
 mod feedback;
 mod forward;
 mod identity;
@@ -29,6 +30,7 @@ mod select;
 mod upstream;
 
 pub(super) use admit::{admit, transition_timeout};
+pub(in crate::platform) use fallback::validate as validate_fallback;
 #[cfg(test)]
 pub(super) use feedback::feedback_work_unit_ns;
 pub use feedback::runtime_metrics;
@@ -333,7 +335,7 @@ pub(super) async fn execute_task(
         super::with_session_cancellation(
             &state,
             session_id.as_deref(),
-            Box::pin(nearest::run(state.clone(), input)),
+            Box::pin(fallback::run(state.clone(), input)),
         )
         .await
     };

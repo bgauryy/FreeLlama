@@ -24,10 +24,10 @@ Start with the [repository README](https://github.com/bgauryy/FreeLlama/blob/mai
 | Give `delegate_research` (octocode adapter) the Octocode CLI in under 30 lines | [Local tools](octocode/LOCAL.md), [GitHub tools](octocode/GITHUB.md) |
 | Understand task and resource ownership | [Architecture](ARCHITECTURE.md) |
 | See every feature, routing and admission in depth, and why FreeLlama exists | [Features](FEATURES.md) |
-| Compare FreeLlama with Ollama, llama.cpp, llama-swap, LocalAI, fabric, aichat, llm and LiteLLM | [Comparison](COMPARISON.md) |
+| Compare FreeLlama with Ollama, llama.cpp, llama-swap, LocalAI, Lemonade, LM Studio, oMLX, Docker Model Runner, LiteLLM and terminal preset tools | [Comparison](COMPARISON.md) |
 | See supported model forms and dated measured results | [Model forms and results](MODEL_FORMS_AND_RESULTS.md) |
 | Reduce reloads, prompt cost and memory; tune Ollama settings | [Tuning](TUNING.md) |
-| See how local-model prompts are written, checked and changed | [Local prompts](PROMPTS.md) |
+| See how local-model prompts are written, checked and changed; write your own workflows | [Local prompts](PROMPTS.md), [your own workflows](PROMPTS.md#your-own-workflows) |
 | Build from source; read operating notes (response store, port 11435, certificates) | [Build and notes](BUILD_AND_NOTES.md) |
 | Choose a model and interpret its metadata | [Model selection](MODEL_SELECTION.md), [model metadata](MODEL_SELECTION.md#model-metadata) |
 | Inspect quantization, placement, or neuron activations | [Model introspection](MODEL_INTROSPECTION.md) |
@@ -41,6 +41,7 @@ Start with the [repository README](https://github.com/bgauryy/FreeLlama/blob/mai
 | Embed the routing core | [Rust core](https://github.com/bgauryy/FreeLlama/blob/main/packages/rust-core/README.md) |
 | Use the read-only status page | `/_freellama/ui` on a running `serve` (see [Monitoring](MONITORING.md)) |
 | Configure durable receipts, idempotency and bounded job retention | [Deferred jobs and recovery](DEFERRED_JOBS.md) |
+| Try another model when the first is refused before it runs | [Fallback chains](FEATURES.md#fallback-chains) |
 
 Historical measurements describe one model, machine, and workload. Inspect current state and
 repeat the relevant checks before using them to select models or set resource limits.

@@ -65,6 +65,8 @@ const OPTIONS = {
   level: { type: "string", multiple: true },
   // FreeLlama
   model: { type: "string", short: "m" },
+  fallback: { type: "string", multiple: true },
+  "idempotency-key": { type: "string" },
   job: { type: "string", short: "j" },
   workflow: { type: "string", short: "w" },
   task: { type: "string", short: "t" },
@@ -244,6 +246,8 @@ FreeLlama flags:
   -w, --workflow NAME   fix-bug, write-tests, review-code, summarize-log, extract-json ... (freellama workflows)
   -j, --job NAME        classify, find-code, duplicates, ocr, image-recognition, coding, summarize ...
   -m, --model TAG       exact installed tag (wins over the job's pick)
+  --fallback TAG        try TAG when the model before it is refused before running: no room, input over its
+                        context, not installed (repeatable, up to 4; never after a model started)
   -t, --task KIND       completion, coding, code-repair, tools, vision, embedding, long-context, decision
   -f, --file PATH|GLOB  files to read into the task (repeatable); --image PATH for images
   -s, --system TEXT|@F  system prompt     -o, --option k=v  Ollama option (repeatable)
@@ -253,6 +257,7 @@ FreeLlama flags:
   --schema 'name, age int, tags list'|JSON|@F  structured output   -x, --extract  print only the first code block
   --suffix TEXT|@F  fill in the middle: PROMPT is the code before the gap (models with the insert capability)
   --each  one answer per -f file, run as one batch   --defer  return a job id (freellama job ID)
+  --idempotency-key KEY  with --defer on a serve with durable jobs: a resubmission returns the original job
   --preview  route only (payload flags are ignored)   --save-as NAME  write a handoff
   --json  full receipt on stdout   -q, --quiet  no stderr notes   --endpoint URL  serve endpoint
   --stream / --no-stream  tokens as they arrive (default on a terminal) / one managed answer (default in a pipe)
@@ -325,6 +330,7 @@ export function parseRunArgs(argv: string[], stdin?: string): RunPlan & { help: 
   const args: Record<string, unknown> = {
     endpoint: values.endpoint,
     model,
+    fallbackModels: values.fallback?.length ? values.fallback : undefined,
     job: values.workflow === undefined ? job ?? (questions !== undefined && model === undefined && values.task === undefined ? "classify" : undefined) : undefined,
     workflow: values.workflow as WorkflowName | undefined,
     task,
@@ -344,6 +350,7 @@ export function parseRunArgs(argv: string[], stdin?: string): RunPlan & { help: 
     minConfidence: values["min-confidence"],
     executionPreference: values.prefer === undefined ? undefined : values.prefer === "cpu" ? "prefer_cpu" : values.prefer === "gpu" ? "prefer_gpu" : values.prefer,
     defer: values.defer,
+    idempotencyKey: values["idempotency-key"],
     preview: values.preview,
     saveAs: values["save-as"],
     dimensions: positiveInt(values.dimensions, "--dimensions"),
@@ -373,6 +380,8 @@ export function parseRunArgs(argv: string[], stdin?: string): RunPlan & { help: 
   if (values.top !== undefined && kind !== "embedding") throw new UsageError("--top ranks embedding matches; use it with an embedding job (find-code, duplicates, image-search).");
   const promptless = prompt === undefined && input === undefined && files.length === 0 && questions === undefined;
   if (values.each && files.length === 0) throw new UsageError("--each runs one task per file; name the files with -f PATH|GLOB.");
+  if (values["idempotency-key"] !== undefined && !values.defer) throw new UsageError("--idempotency-key deduplicates deferred jobs; add --defer.");
+  if (values["idempotency-key"] !== undefined && values.each) throw new UsageError("--idempotency-key names one job; it does not apply to --each.");
   // A preview routes without running: payload fields (prompt, files, options…) do not apply to it.
   const routed = values.preview ? Object.fromEntries(Object.entries(args).filter(([name]) => PREVIEW_FIELDS.has(name))) : args;
   return { args: withoutUndefined(routed), render, promptless, help: false, ...(values.each ? { each: true } : {}), ...(positionalModel ? { positionalModel: true } : {}) };

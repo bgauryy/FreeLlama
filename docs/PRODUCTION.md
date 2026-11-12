@@ -202,7 +202,9 @@ lists it. `GET /v1/models` merges every list and names unreachable engines. A re
 sent once (no retries), streams through unchanged, carries the `x-freellama-upstream` header and is
 counted in usage. An engine on this machine waits out host holds as a loaded Ollama model would; a
 remote one does not. Managed tasks, residency and the memory budget cover Ollama only, and there is no
-automatic failover from one engine to another.
+automatic failover from one engine to another. A managed task can name an explicit
+[fallback chain](FEATURES.md#fallback-chains) of Ollama models, tried only after a refusal before
+execution.
 
 Everything the server learns lives in one `SQLite` database, `~/.octocode/freellama/freellama.sqlite`
 (`--home` or `FREELLAMA_HOME` moves the home): measured runner sizes, placement feedback, the usage
@@ -217,7 +219,11 @@ another schema version is refused with its path; move or delete it to start a ne
 
 ## Bound conversation history and residency
 
-Scope histories and deferred jobs are process-local and are discarded on restart. Configure
+Scope histories and sessions are process-local and are discarded on restart. Deferred jobs are
+process-local by default; with `FREELLAMA_DURABLE_JOBS=1` and the file-backed store, recorded
+terminal receipts survive a restart, an unfinished job reads back as an unknown outcome, and no work
+is replayed (see [Deferred jobs and recovery](DEFERRED_JOBS.md)). Receipt persistence is not
+executable recovery: nothing resumes an interrupted inference. Configure
 `[scopes]` and `[warming]` limits in the runtime file from measured workload needs; finite history
 bounds and automatic retention remain separate from host-memory reserves. Warm loads use the same
 admission and placement checks as tasks. See [Scope history and model warming](SCOPES_AND_WARMING.md)

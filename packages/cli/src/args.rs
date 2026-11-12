@@ -457,6 +457,11 @@ pub(crate) struct TaskExecutionArgs {
     /// server turns it on when nothing caps the output; `--stop-on-repetition false` turns it off.
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     pub(crate) stop_on_repetition: Option<bool>,
+    /// Model to try next when the one before it is refused before it runs (no room in memory,
+    /// input above its context window, not installed, cannot do the task). Repeat for an ordered
+    /// chain of up to 4; never used after a model started, and every attempt is in the receipt.
+    #[arg(long = "fallback-model")]
+    pub(crate) fallback_models: Vec<String>,
 }
 
 /// Production state and network boundary for `serve`.

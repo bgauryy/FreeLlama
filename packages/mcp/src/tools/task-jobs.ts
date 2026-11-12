@@ -13,7 +13,7 @@ export function registerTaskJobsTool(server: McpServer): void {
     {
       description:
         "Use when: following run_task {defer:true} work: list, get (result), cancel, or remove (cancels first) a job. " +
-        "Do not use when: submitting work or killing a session. Returns: the job's status, then its answer, ranking or error as text (full receipt in structuredContent).",
+        "Do not use when: submitting work or killing a session. Returns: the job's status, then its answer, ranking or error as text, then response_file (read_response opens the full receipt).",
       inputSchema: z.object({
         endpoint: endpointParam,
         action: z.enum(["list", "get", "cancel", "remove"]),

@@ -1,0 +1,51 @@
+# Deterministic checks on every push to main and every pull request: no Ollama, no models.
+# Live tiers (yarn test:integration, test:e2e) and hardware qualification stay manual: see
+# docs/TESTING.md. The Rust compiler comes from rust-toolchain.toml.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Enable Corepack (Yarn from packageManager)
+        run: corepack enable
+      - name: Install the pinned Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Install
+        run: yarn install --immutable
+      - name: Format and Clippy
+        if: matrix.os == 'ubuntu-latest'
+        run: yarn lint:rust
+      - name: Build (Rust binary, native addon, JS bundles)
+        run: yarn build
+      - name: Type check
+        run: yarn typecheck
+      - name: JavaScript unit tests
+        run: yarn test:js
+      - name: Rust contracts
+        run: yarn test:rust
+      - name: Release package checks
+        run: yarn test:release

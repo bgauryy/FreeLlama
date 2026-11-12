@@ -74,12 +74,16 @@ describe("freellama run flags", () => {
       ["-j", "find-code", "-f", "src/a.ts", "--top", "3", "query", "--dimensions", "64"],
       ["--ask", "Is it urgent?", "--choice", "yes=urgent", "--choice", "no", "state"],
       ["-w", "fix-bug", "--preview"],
+      ["-m", "small:1", "--fallback", "big:1", "--fallback", "huge:1", "hi"],
+      ["-j", "summarize", "-f", "a.log", "--defer", "--idempotency-key", "nightly-2026-11-12"],
     ];
     for (const argv of cases) {
       const parsed = schema.safeParse(parseRunArgs(argv).args);
       expect(parsed.success, `${argv.join(" ")}: ${parsed.success ? "" : JSON.stringify(parsed.error.issues)}`).toBe(true);
     }
     expect(parseRunArgs(["-m", "m:1", "hi", "--prefer", "cpu"]).args.executionPreference).toBe("prefer_cpu");
+    expect(parseRunArgs(["-m", "small:1", "--fallback", "big:1", "--fallback", "huge:1", "hi"]).args.fallbackModels).toEqual(["big:1", "huge:1"]);
+    expect(() => parseRunArgs(["-m", "m:1", "hi", "--idempotency-key", "k"])).toThrow(/add --defer/);
   });
 
   it("attaches an image path written anywhere in the prompt, as ollama run does", () => {

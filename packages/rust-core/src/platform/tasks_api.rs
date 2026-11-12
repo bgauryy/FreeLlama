@@ -77,6 +77,12 @@ pub(crate) struct TaskInput {
     /// Per-request admission wait in seconds, capped by the server's `max_queue_wait_seconds`.
     #[serde(default)]
     pub(crate) max_wait_seconds: Option<u64>,
+    /// An explicit, ordered fallback chain: each model runs only after the one before it was
+    /// refused before anything executed (no room in memory, input above its context window, not
+    /// installed, or unable to do the task). Never after a model started generating, so no work
+    /// is replayed. The receipt's `fallback` lists every attempt.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) fallback_models: Vec<String>,
     #[serde(default)]
     pub(crate) defer: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]

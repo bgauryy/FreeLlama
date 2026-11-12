@@ -14,8 +14,11 @@ const UNSURE = [0.35, 0.65] as const;
 /**
  * strands-decider's README: answers at a confidence of 0.9 or more are right about 95% of the time;
  * below that, confirm them. https://raw.githubusercontent.com/strands-labs/strands-decider/main/README.md
+ * That figure is the publisher's, for that model only: another decider's confidence is uncalibrated
+ * here, so its low answers are flagged without the accuracy claim.
  */
 const CONFIDENT = 0.9;
+const CALIBRATED_DECIDER = /(?:^|\/)strands-decider(?::|$)/i;
 /** Two nearest matches closer than this are too close to choose between. */
 const CLOSE = 0.02;
 /** A best nearest score under this is a weak match. */
@@ -24,10 +27,16 @@ const WEAK = 0.45;
 /** `tools`: the tool definitions sent with the task, if any. */
 export type CheckContext = { job?: string; task?: string; answer: string; structured: Fields; tools?: unknown[]; workflow?: string };
 
+/** The model that produced the result, from the receipt's route (absent when the receipt lacks one). */
+function answeringModel(structured: Fields): string | undefined {
+  const selected = object(structured.route)?.selected_model ?? object(structured.response)?.model ?? structured.model;
+  return typeof selected === "string" ? selected : undefined;
+}
+
 /** Coding workflows whose answer is edits; review-code and explain-code answer in prose. */
 const PROSE_CODING_WORKFLOWS = new Set(["review-code", "explain-code"]);
 
-function decisionChecks(answers: Fields): string[] {
+function decisionChecks(answers: Fields, model: string | undefined): string[] {
   const unsure: string[] = [];
   const low: string[] = [];
   for (const [name, raw] of Object.entries(answers)) {
@@ -39,7 +48,11 @@ function decisionChecks(answers: Fields): string[] {
   }
   const checks: string[] = [];
   if (unsure.length > 0) checks.push(`uncertain: ${unsure.join(", ")}; decide these yourself or rephrase the question`);
-  if (low.length > 0) checks.push(`confidence under ${CONFIDENT}: ${low.join(", ")}; the decider is right about 95% of the time only at ${CONFIDENT} or more, so confirm these`);
+  if (low.length > 0) {
+    checks.push(model !== undefined && CALIBRATED_DECIDER.test(model)
+      ? `confidence under ${CONFIDENT}: ${low.join(", ")}; the decider is right about 95% of the time only at ${CONFIDENT} or more, so confirm these`
+      : `confidence under ${CONFIDENT}: ${low.join(", ")}; ${model ?? "this decider"} has no published calibration, so treat its confidence as a ranking, not an accuracy, and confirm these`);
+  }
   return checks.length > 0 ? checks : ["every answer is outside 0.35-0.65; spot-check a few against the input"];
 }
 
@@ -72,13 +85,18 @@ function readText(file: string): string | undefined {
 /** Numbers, versions, paths and code-quoted names in `answer` that its sources never mention. */
 function unsupportedFacts(answer: string, sources: string[]): string[] {
   const haystack = sources.join("\n");
-  // File paths and FreeLlama's own bracketed notices are not facts from the source.
-  answer = answer.replace(/(?:\/|\.{1,2}\/)?[\w.@-]+(?:\/[\w.@-]+)+/g, " ").replace(/\((?:empty answer|empty response)[^)]*\)|\[freellama:[^\]]*\]/g, " ");
-  const facts = new Set([
-    ...answer.matchAll(/(?<![\w.])\d[\d,._:/-]*\d%?|(?<![\w.])\d%?(?![\w.])/g),
-    ...answer.matchAll(/`([^`\n]{2,60})`/g),
-  ].map((match) => (match[1] ?? match[0]).trim()).filter((fact) => fact.length > 0));
-  return [...facts].filter((fact) => !haystack.includes(fact) && !haystack.includes(fact.replace(/,/g, "")));
+  // FreeLlama's own bracketed notices are not facts from the source.
+  answer = answer.replace(/\((?:empty answer|empty response)[^)]*\)|\[freellama:[^\]]*\]/g, " ");
+  // Code quotes are read whole, paths included (`POST /api/orders 500` is one quoted log line);
+  // numbers are read outside them, with file paths blanked (a path's digits are not figures).
+  const quoted = [...answer.matchAll(/`([^`\n]{2,60})`/g)].map((match) => match[1]!.trim());
+  const prose = answer.replace(/`[^`\n]{2,60}`/g, " ").replace(/(?:\/|\.{1,2}\/)?[\w.@-]+(?:\/[\w.@-]+)+/g, " ");
+  const numbers = [...prose.matchAll(/(?<![\w.])\d[\d,._:/-]*\d%?|(?<![\w.])\d%?(?![\w.])/g)].map((match) => match[0]);
+  const found = (fact: string) => haystack.includes(fact) || haystack.includes(fact.replace(/,/g, ""));
+  // A range the model joined with a hyphen ("10:01:10-10:01:40") holds when both ends do.
+  const range = (fact: string) => /^(\d[\d:.]*:\d[\d:.]*)-(\d[\d:.]*:\d[\d:.]*)$/.exec(fact);
+  return [...new Set([...quoted, ...numbers].filter((fact) => fact.length > 0))]
+    .filter((fact) => !found(fact) && !(range(fact)?.slice(1).every(found) ?? false));
 }
 
 type EditBlock = { path: string; search: string };
@@ -211,11 +229,12 @@ function toolCallChecks(calls: unknown[], tools: unknown[] | undefined): string[
  */
 const ADDRESSED_TO_MODEL = [
   /\b(?:ignore|disregard|forget)\s+(?:all\s+|any\s+|the\s+|your\s+)*(?:previous\s+|prior\s+|above\s+|earlier\s+|preceding\s+)?(?:instructions?|prompts?|rules|task|directions)\b/i,
-  /\b(?:reply|respond|answer|output)\s+(?:only\s+with|with\s+only)\b/i,
   /\byou are now\b/i,
   /^\s*(?:system|assistant)\s*:/im,
   /\bnew instructions?\s*:/i,
 ];
+/** A caller may ask this of the model in their own request, so only clear data is checked for it. */
+const ASKS_FOR_ONLY = /\b(?:reply|respond|answer|output)\s+(?:only\s+with|with\s+only)\b/i;
 
 /**
  * The data part of a request, where an instruction is out of place: inlined files (after the first
@@ -229,16 +248,17 @@ export function inputData(prompt: string | undefined, state?: string): string {
   return [data, state ?? ""].filter(Boolean).join("\n");
 }
 
-/** A check when the input data carries instructions addressed to a model; undefined otherwise. */
-export function injectionCheck(input: string): string | undefined {
-  for (const pattern of ADDRESSED_TO_MODEL) {
-    const match = pattern.exec(input);
-    if (match) {
-      const quoted = match[0].trim().replace(/\s+/g, " ").slice(0, 60);
-      return `the input contains text addressed to a model ("${quoted}"): check the answer followed your request, not that text`;
-    }
-  }
-  return undefined;
+/**
+ * A check when the input carries instructions addressed to a model; undefined otherwise. `unsplit`
+ * is a prompt with no data part to separate (piped input alone, a gateway chat turn): it may be all
+ * data or all request, so it is scanned only for what no caller asks of their own model.
+ */
+export function injectionCheck(input: string, unsplit = ""): string | undefined {
+  const match = [...ADDRESSED_TO_MODEL, ASKS_FOR_ONLY].map((pattern) => pattern.exec(input)).find(Boolean)
+    ?? ADDRESSED_TO_MODEL.map((pattern) => pattern.exec(unsplit)).find(Boolean);
+  if (!match) return undefined;
+  const quoted = match[0].trim().replace(/\s+/g, " ").slice(0, 60);
+  return `the input contains text addressed to a model ("${quoted}"): check the answer followed your request, not that text`;
 }
 
 /**
@@ -258,9 +278,9 @@ export function nullFieldCheck(answer: string, input: string): string | undefine
   const found: string[] = [];
   for (const [key, value] of Object.entries(fields)) {
     if (value !== null) continue;
-    const label = key.toLowerCase().replace(/[_-]?(?:id|number|no|num|code)$/, "").replace(/[_-]+/g, " ").trim();
+    const label = key.toLowerCase().replace(/[_-]?(?:id|number|no|num|code|ref)$/, "").replace(/[_-]+/g, " ").trim();
     if (label.length < 3) continue;
-    const match = new RegExp(`\\b${label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*(?:#|no\\.?|number|id)?\\s*:?\\s*([A-Za-z]*-?\\d[\\w-]*)`, "i").exec(input);
+    const match = new RegExp(`\\b${label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*(?:#|no\\.?|number|id|ref(?:erence)?\\.?)?\\s*:?\\s*([A-Za-z]*-?\\d[\\w-]*)`, "i").exec(input);
     if (match) found.push(`${key} (the input has "${match[0].trim()}")`);
   }
   return found.length > 0 ? `null although the input names a value: ${found.join(", ")}; check the extraction` : undefined;
@@ -273,7 +293,7 @@ export function resultChecks(context: CheckContext): string[] {
   if (/^\s*\(empty answer/.test(context.answer)) return [];
   const response = object(context.structured.response);
   const answers = object(response?.answers);
-  if (answers) return decisionChecks(answers);
+  if (answers) return decisionChecks(answers, answeringModel(context.structured));
   const nearest = object(context.structured.nearest);
   if (nearest) return nearestChecks(nearest);
   const files = readPaths(context.structured);
@@ -313,12 +333,26 @@ export function paddingChecks(answer: string): string[] {
   return checks;
 }
 
+/**
+ * When an explicit fallback chain moved past the first model: which model answered and why the
+ * ones before it were refused, so the caller checks the answer against the model it really got.
+ */
+export function fallbackCheck(structured: Fields): string | undefined {
+  const fallback = object(structured.fallback);
+  if (fallback?.used !== true) return undefined;
+  const refused = list(fallback.attempts).map(object).filter((row): row is Fields => row !== undefined)
+    .map((row) => `${typeof row.model === "string" ? row.model : "the routed model"} (${typeof row.code === "string" ? row.code : "refused"})`);
+  const selected = typeof fallback.selected === "string" ? fallback.selected : "a fallback model";
+  return `answered by fallback ${selected} after ${refused.join(", ")} was refused before running; judge the answer by that model`;
+}
+
 /** The result with `checks` in structuredContent and as `check:` lines after the answer. */
 export function withChecks<R>(result: R, job: string | undefined, task: string | undefined, tools?: unknown[], workflow?: string): R {
   const shown = result as { content?: Array<{ type: string; text?: string }>; structuredContent?: Fields; isError?: boolean };
   if (shown.isError || !shown.structuredContent) return result;
   const answer = (shown.content ?? []).map((part) => part.text ?? "").join("\n").replace(/^\[[^\]\n]*\] /, "");
-  const checks = resultChecks({ job, task, answer, structured: shown.structuredContent, tools, workflow });
+  const fallback = fallbackCheck(shown.structuredContent);
+  const checks = [...(fallback ? [fallback] : []), ...resultChecks({ job, task, answer, structured: shown.structuredContent, tools, workflow })];
   if (checks.length === 0) return result;
   const content = (shown.content ?? []).map((part, index) => (index === 0 && part.type === "text"
     ? { ...part, text: `${part.text ?? ""}\n${checks.map((check) => `check: ${check}`).join("\n")}` }

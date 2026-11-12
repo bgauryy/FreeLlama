@@ -1,8 +1,9 @@
 # Local prompts
 
-How FreeLlama writes the instructions it gives local models, why, and how to change one without
-making it worse. Every prompt lives in one file:
-[`local-prompts.ts`](https://github.com/bgauryy/FreeLlama/blob/main/packages/mcp/src/local-prompts.ts).
+How FreeLlama writes the instructions it gives local models, why, how to add your own, and how to
+change one without making it worse. Every built-in prompt lives in one file:
+[`local-prompts.ts`](https://github.com/bgauryy/FreeLlama/blob/main/packages/mcp/src/local-prompts.ts);
+your own workflows are [Markdown files](#your-own-workflows) that it merges at start-up.
 
 ## Rules
 
@@ -25,12 +26,48 @@ Prompt wording halves an injection at best, so the answer is also checked by cod
 
 | Check | Fires when |
 |---|---|
-| Text addressed to a model | The input data (files, piped text, decision state; never the caller's own request) contains "ignore previous instructions", "reply only with", "assistant:" and the like |
+| Text addressed to a model | The input data (files, piped text, decision state) contains "ignore previous instructions", "reply only with", "assistant:" and the like. The caller's own request is never scanned; a workflow prompt with no data part to separate (piped text alone, a gateway chat turn) is scanned for everything except "reply only with", which a caller may ask themselves |
 | Tool call nobody asked for | The answer is a tool call although no tools were sent (the CLI exits 1) |
 | Null field with a value in the input | `extract-json` returns `null` for a field whose label and value appear in the input ("Receipt R-19" for `receipt_id`) |
-| Unsupported numbers and names | The answer has a number or quoted name the source lacks |
+| Unsupported numbers and names | The answer has a number or quoted name the source lacks (a quote is matched whole, paths included; a hyphenated time range holds when both ends do) |
 | Edits that do not apply | A SEARCH block does not match the file exactly once |
 | A weaker model ran | A capable workflow ran below a stronger installed pick that had no room |
+| A fallback model answered | A `fallbackModels` chain moved past the first model; the line names the model that answered and why each earlier one was refused |
+| Low decider confidence | A decision answer has a confidence under 0.9. The "right about 95% of the time at 0.9" figure is strands-decider's published calibration and is cited only for that model; for another decider the line says its confidence is uncalibrated |
+
+## Your own workflows
+
+A workflow of your own is one Markdown file in `~/.octocode/freellama/workflows/` (or
+`$FREELLAMA_HOME/workflows/`, or the directory `FREELLAMA_WORKFLOWS_DIR` names). The file name is
+the workflow name: `meeting-notes.md` becomes `run_task {workflow:"meeting-notes"}`,
+`freellama run -w meeting-notes` and the gateway model `freellama/meeting-notes`.
+
+```markdown
+---
+job: summarize                 # required: summarize, coding, ocr or image-recognition
+title: Summarize a meeting: decisions, owners, dates   # required: one line for the agent
+input: "files: the transcript; prompt: what to focus on (optional)"
+think: false                   # optional: true or false
+max_output: 400                # optional: num_predict ceiling (16-32768), applied with think: false
+prefer: capable                # optional: the strongest pick that fits now
+format: json                   # optional: structured output
+---
+List each decision with its owner and date, one bullet each, quoting names and dates exactly.
+Then list open questions. Start with the first bullet and stop after the last one.
+```
+
+| Rule | Behavior |
+|---|---|
+| Precedence | A file named like a built-in (`summarize-log.md`) replaces it everywhere, and the checks tied to that built-in's output (the `extract-json` null-field check, `read-table`'s Markdown conversion) no longer apply; the jobs' own defaults keep the built-in instructions |
+| Jobs | `summarize`, `coding`, `ocr` or `image-recognition`: the job's tested picks run the workflow. Decision and embedding jobs (`classify`, `find-code`, `duplicates`, `image-search`) take no instructions, so a file naming one is skipped |
+| Names | Lower-case letters, digits and hyphens, 2 to 48 characters; job names and `auto` are refused, since they share the `freellama/` namespace |
+| Validation | Unknown front-matter keys, an unknown job, an empty body or a file over 64 KiB skip that file (a UTF-8 byte-order mark is fine). `freellama workflows` and `doctor` name each skipped file and why; a bad file is never half-applied |
+| Caller fields | `systemPrompt`, `options`, `think`, `format` and `model` from the caller still win |
+| Version | The receipt's `job_profile.workflow_source` names the file and a SHA-256 prefix of its bytes |
+| When it applies | Files are read when the MCP server or an agent command starts; restart the MCP server after an edit |
+
+A user workflow has not been through FreeLlama's eval. Follow the rules above, and measure it the
+way the next section measures a built-in change before relying on it for batches.
 
 ## Change a prompt
 

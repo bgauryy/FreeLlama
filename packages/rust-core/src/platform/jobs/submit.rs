@@ -165,6 +165,8 @@ pub(in crate::platform) async fn submit(
     mut input: TaskInput,
 ) -> Result<Json<Value>, ApiError> {
     crate::platform::require_active_session(&state, input.route.session_id.as_deref()).await?;
+    // A malformed fallback chain is refused at submission, never accepted as a job.
+    execution::validate_fallback(&input)?;
     let journal = journal(&state);
     let PreparedSubmission {
         id,

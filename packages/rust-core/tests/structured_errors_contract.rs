@@ -181,7 +181,7 @@ async fn managed_and_batch_resource_errors_are_structured_without_executing() {
             source: "structured_error_fixture".into(),
             total_memory_bytes: Some(10_000),
             available_memory_bytes: Some(1),
-            // Low available memory alone only warns; the OS must report pressure to refuse.
+            // Advisory mode: low available memory alone only warns; the OS must report pressure to refuse.
             memory_pressure: Some(MemoryPressure::Warning),
             ..HostResources::default()
         },

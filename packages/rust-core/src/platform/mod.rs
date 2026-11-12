@@ -81,9 +81,9 @@ pub use discovery::machine_profile;
 pub(crate) use discovery::machine_profile_off_runtime;
 pub use preload::{PreloadModel, PreloadPolicy, PreloadSpec};
 pub use routing::{
-    Backend, CatalogModel, ExecutionPreference, LoopRecord, ModelRequestDefaults, Objective,
-    PlacementEvidence, RouteDecision, RouteInput, SessionAffinity, TaskKind, TaskPriority,
-    installed_model, select_route,
+    Backend, CatalogModel, ExecutionPreference, LoopRecord, ModelRefusal, ModelRequestDefaults,
+    Objective, PlacementEvidence, RouteDecision, RouteInput, SessionAffinity, TaskKind,
+    TaskPriority, installed_model, select_route,
 };
 pub use runtime::RuntimeFile;
 pub(crate) use runtime::{ContextMode, ContextShift};

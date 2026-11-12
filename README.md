@@ -3,7 +3,7 @@
 ![A brown cartoon llama stands on a pastel cloud background.](assets/logo.jpg)
 
 **Run local Ollama models the smart way: the right model for your machine right now, tuned
-prompts, and no swapping, for your coding agent and for you.**
+prompts, and new loads held until they fit in memory, for your coding agent and for you.**
 
 FreeLlama sits between you (or your agent) and [Ollama](https://ollama.com). Ollama runs the
 models; FreeLlama decides which model, how, and whether there is room for it.
@@ -49,7 +49,7 @@ flowchart LR
 ## Why not call Ollama directly?
 
 Ollama runs whatever tag you name, with the model's default settings. Three things go wrong that a
-caller cannot see. FreeLlama fixes each one.
+caller cannot see. FreeLlama addresses each one; the answer is still yours to check.
 
 | What goes wrong with a direct call | What FreeLlama does | What we measured |
 |---|---|---|
@@ -62,7 +62,7 @@ Over a session it also keeps the machine efficient:
 | Mechanism | Effect | Measured |
 |---|---|---|
 | **Prompt cache kept** | Reuses a loaded model's context window and settings, so Ollama's prompt cache survives between turns | 95% of a multi-turn prompt served from cache (attention models; Ollama does not cache hybrid models such as `lfm3` across turns) |
-| **Admitted loads only** | Every model load, streamed requests included, goes through the memory gate | — |
+| **Admitted loads only** | Every model load through FreeLlama, streamed requests included, goes through the memory gate (direct calls to Ollama bypass it) | — |
 | **Indexed code search** | A repeated search embeds only the chunks that changed | 89 chunks: 7.3 s first, 0.28 s next |
 | **Fast hand-off** | The service answers the moment a job is done | A short task on a loaded model in about 0.2 s |
 
@@ -203,6 +203,8 @@ FreeLlama's admission and telemetry.
 |---|---|---|
 | **Model choice** | Tested picks per job (coding, summarizing, OCR, image questions, classification, code search, duplicates), each marked installed or not and fitting now or not. Strong-model workflows take the strongest pick that fits, light work the job's default; short memory falls back to a model that fits | `freellama catalog`, `models {view:"catalog"}` |
 | **Workflows** | 15 tested instructions for small models: `fix-bug`, `change-code`, `implement`, `write-tests`, `review-code`, `explain-code`, `summarize-log`, `summarize-text`, `summarize-diff`, `extract-json`, `read-text`, `read-table`, `read-fields`, `answer-image`, `describe-screen`. Sampling comes from each model's card; prompts are checked by an eval | `-w NAME`, `run_task {workflow}`, `scripts/local-test/workflows.mjs` |
+| **Your own workflows** | A Markdown file per workflow (job, title, instructions) in `~/.octocode/freellama/workflows/`. It runs like a built-in, replaces one of the same name, and the receipt names the file and its digest; a bad file is skipped with the reason | [Your own workflows](docs/PROMPTS.md#your-own-workflows), `freellama workflows` |
+| **Fallback chains** | Up to 4 models to try in order, each only after the one before was refused before it ran (no room, input over its context, not installed). Never after a model started; every attempt is in the receipt | `run_task {fallbackModels}`, `--fallback TAG` |
 | **Structured output** | A field list (`'name, age int, tags list'`) or a JSON schema | `--schema` |
 | **Decisions** | Yes/no, one of a list, or a level, with a probability | `--ask`, `--choice`, `--level` |
 | **Embeddings and completion** | Shorter vectors; fill-in-the-middle on models that support it | `--dimensions`, `--suffix` |
@@ -210,7 +212,7 @@ FreeLlama's admission and telemetry.
 | **Memory safety** | A model loads only if it fits with a reserve; idle models unload first, otherwise the load waits, then is refused with the reason | [The memory gate](docs/ARCHITECTURE.md#managed-task-execution) |
 | **Fair sharing** | One queue per backend weights interactive, normal and background work 3:2:1; holds apply when the machine is busy, hot or swapping. An optional CPU-only Ollama runs helper models beside the GPU | [Monitoring](docs/MONITORING.md) |
 | **Long answers** | Saved whole and returned as a short view | [Where an answer goes](packages/mcp/CONFIGURATION.md#where-an-answer-goes) |
-| **Batches and jobs** | Up to 64 independent items; background jobs; sweeps over a whole code tree or log set | `--each`, `run_task {tasks}`, `--defer` + `freellama job ID --wait`, `sweep` |
+| **Batches and jobs** | Up to 64 independent items; background jobs, optionally with durable receipts and idempotency keys; sweeps over a whole code tree or log set | `--each`, `run_task {tasks}`, `--defer` + `freellama job ID --wait`, `idempotencyKey`, `sweep` |
 | **Agent-safe shell** | Answer-only stdout, stable exit codes, no hang on an agent's open stdin; every MCP tool callable from a shell | `freellama tool NAME JSON` |
 
 ## What to offload
@@ -228,21 +230,28 @@ Treat local answers as candidates: spot-check a few before you rely on the rest.
 
 ## How it compares
 
-None of the other tools we compared picks a model by what fits in memory right now. That, plus the
-memory gate and the `check:` lines, is what FreeLlama adds.
+Model loading, eviction, compatible APIs, MCP and presets are common. Ollama itself queues work and
+evicts idle models; the llama.cpp router, llama-swap, LocalAI, Lemonade, LM Studio and oMLX each
+manage model memory their own way. FreeLlama adds a specific combination for an agent offloading
+work on a machine that is also doing other work:
 
-| | Picks by machine fit | Task presets | Protocols | Built for agents |
-|---|---|---|---|---|
-| **FreeLlama** | **Yes** | Tested workflows with checks | Ollama, OpenAI Chat and Responses, Anthropic | **Yes** |
-| Ollama alone | No | Modelfiles (fixed at creation) | Ollama, OpenAI, Anthropic | `ollama run` waits forever on an agent's open stdin |
-| fabric | No | Large pattern library | Ollama | Partly |
-| aichat, llm | No | Roles, templates | OpenAI (aichat) | Good (llm) |
-| LiteLLM | By task, not by machine | Aliases | OpenAI | — |
-| Open WebUI, LM Studio | No | Presets with a UI | OpenAI | No |
+- admission against live host signals (free memory with a reserve, OS pressure, swap, CPU load,
+  heat) that holds a cold load but lets a loaded model keep serving;
+- a per-job pick that is installed and fits now, with tested workflow prompts;
+- compact answers with `check:` lines and a receipt of what ran, where and why.
 
-FreeLlama has no chat UI of its own, a smaller preset library than fabric, and no routing across
-several machines. The full comparison, with sources and measurements, is in
-[Comparison](docs/COMPARISON.md).
+| Choose | When |
+|---|---|
+| FreeLlama | An agent offloads bounded, checkable work to local Ollama models on a shared workstation |
+| Ollama alone | One application, one explicitly chosen model, little contention |
+| LocalAI, Lemonade | You want the server to supply agents, many backends or routing policies itself |
+| LM Studio, Open WebUI | You want a desktop or web app for people |
+| LiteLLM | An organization-wide gateway with retries, budgets and caching across providers |
+| llama.cpp, oMLX, vLLM | You want engine-level control: batching, KV caches, kernels |
+
+FreeLlama does not make Ollama decode faster, has no chat UI, no automatic failover between engines
+and no scheduling across machines. The full comparison, with sources, what is and is not specific
+to FreeLlama, and dated measurements, is in [Comparison](docs/COMPARISON.md).
 
 ## Under the hood
 
@@ -280,13 +289,16 @@ sequenceDiagram
     F-->>A: answer, check: lines, receipt
 ```
 
-An explicit `model` always wins over routing; FreeLlama never swaps in another model. The memory
+An explicit `model` always wins over routing; FreeLlama never swaps in another model unless you
+list one in `fallbackModels`. The memory
 gate, admission and routing are described in [Architecture](docs/ARCHITECTURE.md).
 
 ## Safety
 
 - Never pulls a model without approval for one exact tag and its size. Never deletes one unless you
   name the exact installed tag.
+- Never swaps in another model on its own: an explicit `model` always wins, and a `fallbackModels`
+  chain moves on only after a refusal before execution, so no work is replayed.
 - Checks each load against live free memory. A load that does not fit waits, then is refused with
   the reason; models already loaded keep serving.
 - Unloads only models it loaded, or models you name. Idle models are unloaded under memory pressure.
@@ -313,7 +325,8 @@ gate, admission and routing are described in [Architecture](docs/ARCHITECTURE.md
 | CPU/GPU setup and placement | [CPU/GPU routing](docs/CPU_GPU_ROUTING.md) |
 | Queues, memory, live tuning | [Monitoring](docs/MONITORING.md) |
 | Faster, lighter local models; Ollama settings | [Tuning](docs/TUNING.md) |
-| Background jobs and recovery | [Deferred jobs](docs/DEFERRED_JOBS.md) |
+| Background jobs, durable receipts and idempotency | [Deferred jobs](docs/DEFERRED_JOBS.md) |
+| Writing your own workflows | [Local prompts](docs/PROMPTS.md#your-own-workflows) |
 | History, affinity, warming | [Scopes and warming](docs/SCOPES_AND_WARMING.md) |
 | Deployment and releases | [Production](docs/PRODUCTION.md) |
 | Build from source, tests and evals | [Build and notes](docs/BUILD_AND_NOTES.md), [Testing](docs/TESTING.md) |

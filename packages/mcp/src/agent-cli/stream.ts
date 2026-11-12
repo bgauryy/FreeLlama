@@ -16,7 +16,7 @@ type Io = { out: (text: string) => void; err: (text: string) => void; write: (te
 export function streamTarget(args: Fields): VirtualModel | undefined {
   // Fill in the middle runs on the named model only.
   if (args.suffix !== undefined) return typeof args.model === "string" ? directModel(args.model) : undefined;
-  if (["tools", "defer", "preview", "saveAs", "questions", "state", "input", "nearest", "sessionId", "scopeId"].some((field) => args[field] !== undefined)) return undefined;
+  if (["tools", "defer", "preview", "saveAs", "questions", "state", "input", "nearest", "sessionId", "scopeId", "fallbackModels", "idempotencyKey"].some((field) => args[field] !== undefined)) return undefined;
   if (args.task === "decision" || args.task === "embedding") return undefined;
   if (typeof args.workflow === "string") return virtualModel(`freellama/${args.workflow}`);
   if (typeof args.job === "string") return virtualModel(`freellama/${args.job}`);

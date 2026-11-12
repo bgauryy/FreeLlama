@@ -101,11 +101,11 @@ flowchart TD
 | Group | Flags |
 |---|---|
 | Same as `ollama run` | `--format json\|SCHEMA`, `--think[=true\|false\|LEVEL]`, `--hidethinking`, `--keepalive`, `--verbose`, `--ask` / `--choice` / `--level`, `--dimensions N`, `--nowordwrap`, `--insecure` |
-| Choose the work | `-w/--workflow`, `-j/--job`, `-m/--model`, `-t/--task`, `--objective`, `--prefer cpu\|gpu`, `--min-confidence` |
+| Choose the work | `-w/--workflow`, `-j/--job`, `-m/--model`, `--fallback TAG` (repeatable: tried in order only after a refusal before running), `-t/--task`, `--objective`, `--prefer cpu\|gpu`, `--min-confidence` |
 | Inputs | `-f/--file PATH\|GLOB` (repeatable), `--image`, `-s/--system TEXT\|@FILE`, `--tools JSON\|@FILE`, `--suffix TEXT\|@FILE` (fill in the middle) |
 | Model controls | `-o/--option k=v`, `--ctx N`, `--top N` (embedding matches) |
 | Output | `--schema 'name, age int, tags list'\|JSON\|@FILE`, `-x/--extract` (first code block), `--json` (full receipt), `-q/--quiet`, `--stream` / `--no-stream` |
-| Scheduling | `--each`, `--defer`, `--preview`, `--save-as NAME`, `--session`, `--priority`, `--timeout`, `--max-wait`, `--endpoint URL` |
+| Scheduling | `--each`, `--defer`, `--idempotency-key KEY` (with `--defer`, on a serve with durable jobs), `--preview`, `--save-as NAME`, `--session`, `--priority`, `--timeout`, `--max-wait`, `--endpoint URL` |
 
 `freellama run --help` lists every flag. `--think=LEVEL` must be a level the model lists
 (`ollama show MODEL`). `--suffix` needs a model with Ollama's `insert` capability. `-x` extracts

@@ -73,7 +73,7 @@ describe("tool contract", () => {
     expect(instructions).toMatch(/before ollama_pull, ask the user for one exact tag \(name:tag\) and its reported size, and pass that size as approvedSizeBytes; search results are not permission/);
     expect(instructions).toMatch(/check isError first, then read the text/);
     expect(instructions).toMatch(/Unload only a model you warmed \(when its burst ends\) or one the user named; delete only a tag the user names/);
-    expect(instructions).toContain("A server restart loses scopes, sessions and jobs");
+    expect(instructions).toContain("A server restart loses scopes, sessions and jobs; with FREELLAMA_DURABLE_JOBS=1 finished job receipts survive");
     expect(instructions).toMatch(/executionPreference only chooses among eligible backends/);
     expect(instructions).toContain("Docs: freellama://docs/index");
     const runTask = byName.get("run_task")!;

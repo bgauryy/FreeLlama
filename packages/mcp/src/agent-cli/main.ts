@@ -4,7 +4,8 @@
 // OpenAI client; `tool` calls any MCP tool; Ollama's own commands pass through to `ollama`.
 import { spawn } from "node:child_process";
 import { fstatSync, readFileSync } from "node:fs";
-import { LOCAL_JOBS, RUN_TASK_JOBS, WORKFLOWS, WORKFLOW_NAMES, type JobName } from "../local-prompts.js";
+import { LOCAL_JOBS, RUN_TASK_JOBS, USER_WORKFLOW_ERRORS, WORKFLOWS, WORKFLOW_NAMES, workflowSource, type JobName } from "../local-prompts.js";
+import { workflowsDir } from "../workflow-files.js";
 import { configureServeAutostart } from "../serve.js";
 import { SERVER_VERSION } from "../native.js";
 import { parseRunArgs, RUN_USAGE, UsageError, valueOrFile } from "./args.js";
@@ -16,7 +17,7 @@ import { installedInventory } from "../model-library.js";
 import type { InstalledModel } from "../model-catalog.js";
 import { streamRun, streamTarget } from "./stream.js";
 import { startGateway } from "./gateway.js";
-import { DEFAULT_SERVE_ENDPOINT } from "../config.js";
+import { DEFAULT_SERVE_ENDPOINT, FREELLAMA_HOME } from "../config.js";
 import { CHAT_JOB, VIRTUAL_PREFIX, virtualModels } from "./virtual.js";
 import { pickLiveJobModel } from "../job-mode.js";
 
@@ -415,8 +416,12 @@ function workflows(io: Io): number {
   io.out("Workflows (freellama run -w NAME; chat and gateway: freellama/NAME):");
   for (const name of WORKFLOW_NAMES) {
     const flow = WORKFLOWS[name] as { job: JobName; title: string; input: string };
-    io.out(`  ${name.padEnd(16)} ${flow.title} [job ${flow.job}; ${flow.input}]`);
+    const source = workflowSource(name);
+    const origin = source.kind === "user" ? `; ${source.overrides ? "replaces the built-in, " : ""}from ${source.path}` : "";
+    io.out(`  ${name.padEnd(16)} ${flow.title} [job ${flow.job}; ${flow.input}${origin}]`);
   }
+  io.out(`\nYour own workflows: one NAME.md per workflow in ${workflowsDir(FREELLAMA_HOME)} (docs/PROMPTS.md#your-own-workflows).`);
+  for (const skipped of USER_WORKFLOW_ERRORS) io.err(`skipped ${skipped.path}: ${skipped.error}`);
   io.out("\nJobs (freellama run -j NAME):");
   for (const job of RUN_TASK_JOBS) {
     const spec = LOCAL_JOBS[job];

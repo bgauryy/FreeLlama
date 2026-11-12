@@ -2,6 +2,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as z from "zod";
 import { DEFAULT_SERVE_ENDPOINT } from "../config.js";
+import { USER_WORKFLOW_ERRORS } from "../local-prompts.js";
 import { doctor, health, machine, usage, status } from "../native.js";
 import { doctorFullText, statusText, usageText, withText } from "../result-text.js";
 import {
@@ -41,6 +42,8 @@ export function doctorStatus(report: Fields): { status: "ok" | "degraded"; probl
   if (ready?.ready === false) {
     problems.push(`freellama serve not ready: waiting for ${String(ready.waiting_for ?? "startup")}${typeof ready.detail === "string" ? ` (${ready.detail})` : ""}`);
   }
+  // A workflow file the user wrote but FreeLlama skipped would otherwise fail silently.
+  for (const skipped of USER_WORKFLOW_ERRORS) problems.push(`user workflow skipped: ${skipped.path}: ${skipped.error}`);
   return { status: problems.length > 0 ? "degraded" : "ok", problems };
 }
 

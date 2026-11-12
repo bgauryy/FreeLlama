@@ -172,7 +172,7 @@ FreeLlama waits for safe capacity within a deadline and bounds the retained back
 | Managed queue full | `429` | `admission_queue_full` |
 | Raw proxy over its cap after `raw_queue_wait_seconds` | `429` | |
 | Managed wait exceeded `max_queue_wait_seconds` (or the task's `max_wait_seconds`) | `503` | `admission_timeout` |
-| OS pressure, swapping, CPU, thermal, or required telemetry still holds when the waiting budget expires (low available RAM alone only warns on macOS; low RAM and swapping never hold an already-resident runner, and CPU load and thermal never hold one on the GPU) | `503` | `resource_admission_unavailable` |
+| A new load still does not fit available memory with its reserve, or OS pressure, swapping, CPU, thermal, or required telemetry still holds, when the waiting budget expires. Low available RAM refuses by default on every OS; `--low-memory advisory` (`FREELLAMA_LOW_MEMORY=advisory`) makes it a warning. Low RAM and swapping never hold an already-resident runner, and CPU load and thermal never hold one on the GPU | `503` | `resource_admission_unavailable` |
 | Backend circuit open | `503` | `upstream_circuit_open` |
 
 These capacity refusals carry a `Retry-After` header and `retry_after_seconds` in the body. For a queue it

@@ -294,6 +294,10 @@ Useful task options include:
 - `--stop-on-repetition` to stream the task and stop once the output repeats itself, keeping all
   generated text.
 - `--defer` to return a job ID immediately.
+- repeatable `--fallback-model TAG` for an ordered fallback chain (up to 4): each model runs only
+  after the one before it was refused before anything executed (no room by the wait deadline, input
+  over its context window, not installed or ineligible, circuit open), never after a model started.
+  The receipt's `fallback` lists every attempt ([fallback chains](FEATURES.md#fallback-chains)).
 
 Inspect deferred work with `jobs`, retrieve a result with `jobs --id <uuid>`, and cancel one task
 with `jobs --id <uuid> --cancel`. Remove one task with `jobs --id <uuid> --remove`: active work is

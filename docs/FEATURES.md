@@ -82,6 +82,7 @@ cell says otherwise. Every MCP tool is also reachable from a shell with `freella
 | Feature | What you get | MCP tool | CLI | HTTP |
 |---|---|---|---|---|
 | [Model selection](#model-selection) | The right installed model for the task, with a confidence level | `run_task {preview:true}`, `models` | `route`, `models` | `POST /routes`, `GET /models` |
+| [Fallback chains](#fallback-chains) | An ordered list of models to try when the one before is refused before it runs (no room, input too long, not installed); never after a model started | `run_task {fallbackModels}` | `task --fallback-model`, `freellama run --fallback` | `fallback_models` on `POST /tasks` |
 | [Resource admission](#resource-admission) | Tasks run, wait or are refused with a reason | every `run_task` receipt, `doctor {view:"status"}` | `status`, `ready` | `GET /health` (liveness), `GET /ready` (can serve now), `GET /status` |
 | [CPU and GPU backends](#cpu-and-gpu-backends) | Helper models on CPU next to GPU work, with proof of where each ran | `run_task {executionPreference}` | `serve --cpu-upstream --cpu-model` | `POST /tasks` |
 | Decisions | Label, triage or yes/no-check items with a decision model: one forward pass, one line per answer | `run_task {task:"decision", state, questions}` | `task --task decision --questions` | `POST /tasks` |
@@ -95,6 +96,7 @@ cell says otherwise. Every MCP tool is also reachable from a shell with `freella
 | Model catalog and cookbooks | Tested picks per job with their evidence, what is installed and fits now, and a recipe for each | `models {view:"catalog"}`, `freellama://docs/cookbooks/<job>` | `catalog [--job JOB]`, [docs/cookbooks](cookbooks/README.md) | — |
 | Find and install models | ollama.com and Hugging Face GGUF search, every tag with its size and memory fit, pulls only on approval | `models {view:"library"}`, `ollama_pull`, `ollama_delete` | `freellama tool models\|ollama_pull\|ollama_delete` (same approvals) | — |
 | Job mode and prompts | Name a job and FreeLlama runs its first catalog pick that is installed and fits, with its documented prompt, options and embedding prefixes; your fields win. MCP prompts give each job's call, and `saveAs` hands an answer to the next task as a file | `run_task {job, saveAs}`, MCP prompts, [cookbook](cookbooks/jobs.md) | `freellama run -j JOB\|-w WORKFLOW --save-as NAME`, `freellama workflows` | — |
+| [Your own workflows](PROMPTS.md#your-own-workflows) | A Markdown file per workflow in `~/.octocode/freellama/workflows/`: a job, a title and the instructions. It runs like a built-in, replaces a built-in of the same name, and the receipt names the file and its digest | `run_task {workflow}` | `freellama run -w NAME`, `freellama workflows` | gateway `freellama/NAME` |
 | Chunked sweeps | A local model checks a code tree, log or docs site chunk by chunk in the background, saves every result, re-checks flags with a stronger model and, against a baseline, reports only what changed | `sweep`, [cookbook](cookbooks/sweep.md) | `freellama tool sweep` | — |
 | [Grounded research](#grounded-research) | Read-only repository answers with file and line citations | `delegate_research` | `freellama tool delegate_research` | — |
 | [Small agent context](FEATURES.md#small-agent-context) | Compact results and paged details instead of raw dumps | every tool, `read_response` | JSON on stdout | JSON |
@@ -111,6 +113,36 @@ pins one. A bare name resolves as in Ollama: `name:latest`, or the only installe
 Routing never ranks by a model's name or architecture and adds no model-specific request options. A
 model that loops on a task kind (at least two loops in at most twice as many runs) ranks last for that
 kind; `models` lists the evidence as `observed_loops`. See [model selection](MODEL_SELECTION.md).
+
+### Fallback chains
+
+`fallbackModels` (HTTP `fallback_models`, CLI `--fallback-model`, agent CLI `--fallback`) is an
+explicit, ordered list of up to 4 models. The next one runs only when the one before it was refused
+before anything executed:
+
+| Refusal | Code |
+|---|---|
+| No room in memory by the wait deadline | `resource_admission_unavailable` |
+| The input exceeds the model's context window | `context_window_exceeded`, `embedding_item_exceeds_context` |
+| The model file alone exceeds the host budget | `model_exceeds_host_budget` |
+| Not installed, or lacks the task's capability | `model_not_installed`, `model_not_eligible` |
+| The backend's circuit is open | `upstream_circuit_open` |
+
+Anything else stops the chain: a timeout, a cancellation, a busy queue or an error after the model
+started never moves to another model, so no work is replayed after an uncertain outcome. The receipt's
+`fallback` lists every attempt with its code, and the answer gets a `check:` line naming the model
+that answered. Each attempt waits as a single task would, so set a short `maxWaitSeconds` to move on
+sooner; `timeoutSeconds` bounds the whole chain. While one model is tried, the models after it count
+as busy, so making room for an attempt that is then refused never unloads the model that would run
+next. An entry equal to the first model (which may be a scope default or a job's pick) is skipped; a
+model listed twice is refused. When an embedding task runs in slices and a later slice is refused,
+part of the work already ran, so the chain stops there. A chain cannot be combined with a pinned
+digest or backend, and MCP refuses one over separately sliced embeddings so one answer comes from one
+model. Batch items and `task_jobs` results carry the receipt's `fallback` too.
+
+```jsonc
+{ "tool": "run_task", "arguments": { "model": "lfm3:1.7b", "fallbackModels": ["bonsai-2:9b"], "files": ["big.log"], "prompt": "summarize", "maxWaitSeconds": 20 } }
+```
 
 ### Resource admission
 
@@ -278,7 +310,10 @@ privileges:
 | Keep related calls on one model | `session {action:"create"}`, then `run_task {sessionId}` |
 | Hot model before latency-sensitive work | `ollama_manage {action:"warm", model, contextTokens}` |
 
-Scopes, sessions and deferred jobs live in memory and are lost when the service restarts. See
+Scopes and sessions live in memory and are lost when the service restarts. Deferred jobs are
+process-local by default; with `FREELLAMA_DURABLE_JOBS=1` their finished receipts survive a restart,
+an unfinished one reads back as an unknown outcome (never replayed), and `idempotencyKey` makes a
+resubmission return the original job ([deferred jobs](DEFERRED_JOBS.md)). See
 [scopes and warming](SCOPES_AND_WARMING.md).
 
 ### Grounded research

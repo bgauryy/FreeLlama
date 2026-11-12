@@ -9,7 +9,7 @@ import { notice, progressSink, taskNotices, type ToolExtra } from "../progress.j
 import { ensureServe } from "../serve.js";
 import { deferText, routeText, withText } from "../result-text.js";
 import {
-  BATCH_TASK_FIELDS, type BatchItem, batchItemParam, embeddingInputParam, endpointParam, errorResult, executionPreferenceParam, filesParam,
+  BATCH_TASK_FIELDS, type BatchItem, batchItemParam, embeddingInputParam, endpointParam, errorResult, executionPreferenceParam, fallbackModelsParam, filesParam,
   isStructuredSuccess, localToolsParam, messagesParam, minConfidenceParam, minPlacementEvidenceParam, objectiveParam,
   parsedResult, questionsParam, requiredCapabilitiesParam, stateParam, summarizeEmbeddings, systemPromptParam,
   parseBatchTask, taskAnswerText, taskMessages, taskParam, withRequiredCapability,
@@ -17,10 +17,10 @@ import {
 import { applyTaskFiles, inputLabels, type FileReceipt } from "../task-files.js";
 import { nearestText, validateEmbeddingVectors, type NearestRequest } from "../nearest.js";
 import { applyJob, mergeProfiles, neededCapabilities, pickLiveJobModel, pickLiveJobModelDetailed, type JobProfile } from "../job-mode.js";
-import { LOCAL_JOBS, RUN_TASK_JOBS, WORKFLOW_NAMES, WORKFLOWS, type JobName, type WorkflowName } from "../local-prompts.js";
+import { LOCAL_JOBS, RUN_TASK_JOBS, WORKFLOW_NAMES, WORKFLOWS, workflowSource, type JobName, type WorkflowName } from "../local-prompts.js";
 import { checkOutputPath, HANDOFF_NAME, summaryOf, writeHandoff } from "../handoffs.js";
 import { outputInput } from "../tool-results.js";
-import { injectionCheck, inputData, nullFieldCheck, resultChecks, withChecks } from "../result-checks.js";
+import { fallbackCheck, injectionCheck, inputData, nullFieldCheck, resultChecks, withChecks } from "../result-checks.js";
 import { tablesToMarkdown } from "../table-markdown.js";
 import { EmbeddingIndex, embedIndexEnabled, rankByQuery } from "../embed-index.js";
 import { installedInventory } from "../model-library.js";
@@ -104,7 +104,7 @@ function withFiles<T extends TaskPayload & { files?: string[] }>(task: T, label?
 export const BATCH_SHARED_FIELDS: ReadonlySet<string> = new Set([
   "task", "model", "objective", "sessionId", "contextTokens", "executionPreference", "systemPrompt", "questions",
   "format", "think", "options", "keepAlive", "priority", "timeoutSeconds", "maxWaitSeconds", "stopOnRepetition", "tools",
-  "minConfidence", "requiredCapabilities", "minPlacementEvidence",
+  "minConfidence", "requiredCapabilities", "minPlacementEvidence", "fallbackModels",
 ]);
 
 function withoutUndefined<T extends object>(value: T): Partial<T> {
@@ -424,6 +424,7 @@ async function runBatch(
         max_wait_seconds: task.maxWaitSeconds,
         timeout_seconds: task.timeoutSeconds,
         stop_on_repetition: task.stopOnRepetition,
+        fallback_models: task.fallbackModels,
         prompt: task.prompt,
         images: task.images,
         messages: taskMessages(task),
@@ -491,7 +492,7 @@ export function registerRunTaskTool(server: McpServer): void {
         "Do not use when: you must stand behind the judgment or need edits across files. " +
         "`tasks` = up to 64 independent items; per-item fields override top-level defaults; one `model` per batch avoids a cold load per model; `maxParallelism` caps dispatch; `preview:true` routes only. " +
         "Hosts cut calls near 60 s: for long work pass `defer:true` (with `tasks`, one job per item) and poll task_jobs get. " +
-        "Returns: the answer text; receipts in structuredContent.",
+        "Returns: the answer text, its check: lines and response_file (read_response opens the receipt; receipt:\"full\" inlines it).",
       inputSchema: z.object({
         endpoint: endpointParam,
         task: taskParam.removeDefault().optional(),
@@ -499,6 +500,7 @@ export function registerRunTaskTool(server: McpServer): void {
         workflow: z.enum(WORKFLOW_NAMES as [WorkflowName, ...WorkflowName[]]).optional().describe("step-by-step instructions for the local model; implies its job"),
         objective: objectiveParam,
         model: z.string().min(1).optional().describe("exact tag; omitted, routing picks by capability only, so name the catalog's pick for the job"),
+        fallbackModels: fallbackModelsParam.describe("tried in order only when the model before was refused before it ran (no room, input over its context, not installed, wrong capability); never after it started. The receipt's fallback lists each attempt"),
         // Shown as plain strings (zod's UUID pattern alone is ~180 characters each); checked below.
         sessionId: z.string().length(36).optional(),
         scopeId: z.string().length(36).optional(),
@@ -547,6 +549,7 @@ export function registerRunTaskTool(server: McpServer): void {
           .optional()
           .describe("compact (default) or full"),
         defer: z.boolean().optional(),
+        idempotencyKey: z.string().min(1).max(128).optional().describe("defer:true on a serve with durable jobs (FREELLAMA_DURABLE_JOBS=1): resubmitting the same key and input returns the original job instead of running it again"),
         saveAs: z.string().regex(HANDOFF_NAME).optional().describe("save the answer as handoffs/<name>.md"),
         ...outputInput,
         returnEmbeddings: z.boolean().optional(),
@@ -577,6 +580,7 @@ export function registerRunTaskTool(server: McpServer): void {
       outputPath,
       objective,
       model,
+      fallbackModels,
       sessionId,
       scopeId,
       scopeRevision,
@@ -605,6 +609,7 @@ export function registerRunTaskTool(server: McpServer): void {
       timeoutSeconds,
       stopOnRepetition,
       defer,
+      idempotencyKey,
       returnEmbeddings,
       dimensions,
       nearest: nearestShown,
@@ -644,7 +649,8 @@ export function registerRunTaskTool(server: McpServer): void {
           task, objective, model, sessionId, scopeId, scopeRevision, contextTokens, executionPreference,
           minPlacementEvidence, requiredCapabilities, prompt, systemPrompt, images, messages, input, files, state, questions,
           tools, keepAlive, format, think, options, logprobs, topLogprobs, minConfidence, priority, maxWaitSeconds,
-          timeoutSeconds, stopOnRepetition, defer, returnEmbeddings, nearest: nearestRequest, preview,
+          timeoutSeconds, stopOnRepetition, defer, returnEmbeddings, nearest: nearestRequest, preview, fallbackModels,
+          idempotencyKey,
         };
         if (tasks !== undefined) {
           if (saveAs !== undefined) return errorResult(new Error("`saveAs` saves one answer; it is not valid with `tasks`."));
@@ -691,15 +697,21 @@ export function registerRunTaskTool(server: McpServer): void {
         // that do not match the file) and are saved with a handoff too.
         // The data the model read (files are inlined into prompt or state by then), never the request.
         const inputText = () => inputData(typeof prompt === "string" ? prompt : undefined, typeof state === "string" ? state : undefined);
+        // Checks keyed to a built-in's promised output apply only when that built-in ran, not a
+        // user file that replaced it under the same name.
+        const builtinFlow = workflow !== undefined && workflowSource(workflow).kind === "builtin" ? workflow : undefined;
         const answerOf = (result: unknown) => ((result as { content?: Array<{ type: string; text?: string }> }).content ?? []).find((part) => part.type === "text")?.text ?? "";
         const extraChecks = (result: unknown) => {
           const input = inputText();
+          const request = typeof prompt === "string" ? prompt : "";
           return [
-            pickNote, injectionCheck(input),
-            workflow === "extract-json" ? nullFieldCheck(answerOf(result).split("\ncheck: ")[0]!, input || (typeof prompt === "string" ? prompt : "")) : undefined,
+            // With a workflow FreeLlama owns the instructions, so a prompt with no data part is
+            // scanned too; a caller's own prompt ("You are now a translator") is theirs.
+            pickNote, injectionCheck(input, input === "" && workflow !== undefined ? request : ""),
+            builtinFlow === "extract-json" ? nullFieldCheck(answerOf(result).split("\ncheck: ")[0]!, input || request) : undefined,
           ];
         };
-        const finish = <R,>(result: R): R => withJob(withCheck(withChecks(asWorkflowOutput(result, workflow), job, task ?? "completion", tools, workflow), ...extraChecks(result)), profile, saveAs);
+        const finish = <R,>(result: R): R => withJob(withCheck(withChecks(asWorkflowOutput(result, builtinFlow), job, task ?? "completion", tools, builtinFlow), ...extraChecks(result)), profile, saveAs);
         const canonicalTask = task ?? "completion";
         if (preview) {
           const executionOnlyFields = ([
@@ -727,6 +739,8 @@ export function registerRunTaskTool(server: McpServer): void {
             ["timeoutSeconds", timeoutSeconds],
             ["stopOnRepetition", stopOnRepetition],
             ["defer", defer],
+            ["fallbackModels", fallbackModels],
+            ["idempotencyKey", idempotencyKey],
           ] satisfies Array<[string, unknown]>)
             .filter(([, value]) => value !== undefined)
             .map(([name]) => `\`${name}\``);
@@ -755,6 +769,7 @@ export function registerRunTaskTool(server: McpServer): void {
           ), routeText));
         }
         if (dimensions !== undefined && task !== "embedding") return errorResult(new Error("`dimensions` shortens embedding vectors; it is valid only for task \"embedding\"."));
+        if (idempotencyKey !== undefined && !defer) return errorResult(new Error("`idempotencyKey` deduplicates deferred jobs; pass it with `defer:true`."));
         const filled = withFiles({ task, files, prompt, images, input, state, documentPrefix: nearestRequest?.documentPrefix });
         ({ prompt, images, input, state } = filled.task);
         const problem = validateTaskPayload({
@@ -766,7 +781,7 @@ export function registerRunTaskTool(server: McpServer): void {
         const labels = nearestRequest === undefined ? undefined : inputLabels(items.length, filled.files, items, nearestRequest.documentPrefix);
         // A repeated search over the same files embeds only the chunks that changed.
         if (canonicalTask === "embedding" && nearestRequest?.query !== undefined && labels && filled.files.length > 0
-          && typeof model === "string" && !defer && !returnEmbeddings && embedIndexEnabled()
+          && typeof model === "string" && !defer && !returnEmbeddings && fallbackModels === undefined && embedIndexEnabled()
           && items.length > 0 && items.every((item) => typeof item === "string")) {
           const indexed = await indexedNearest(endpoint ?? DEFAULT_SERVE_ENDPOINT, {
             model, items: items as string[], labels, query: nearestRequest.query, top: nearestRequest.top, minScore: nearestRequest.minScore,
@@ -787,6 +802,7 @@ export function registerRunTaskTool(server: McpServer): void {
           task: scopeId !== undefined && task === undefined ? undefined : canonicalTask,
           objective: objective ?? (scopeId === undefined ? "balanced" : undefined),
           model,
+          fallback_models: fallbackModels,
           session_id: sessionId,
           scope_id: scopeId,
           scope_revision: scopeRevision,
@@ -811,6 +827,7 @@ export function registerRunTaskTool(server: McpServer): void {
           timeout_seconds: timeoutSeconds,
           stop_on_repetition: stopOnRepetition,
           defer: defer ?? false,
+          idempotency_key: idempotencyKey,
           execution_preference: executionPreference,
           min_placement_evidence: minPlacementEvidence,
           request_options: {
@@ -828,6 +845,10 @@ export function registerRunTaskTool(server: McpServer): void {
         const report = defer ? undefined : progressSink(extra);
         const slicedEmbedding = request.task === "embedding" && Array.isArray(input) && input.length > EMBEDDINGS_PER_JOB && !defer
           && nearestRequest === undefined;
+        // Each slice is its own request: a chain could embed slices on different models.
+        if (slicedEmbedding && fallbackModels !== undefined) {
+          return errorResult(new Error(`\`fallbackModels\` keeps one model per answer; with more than ${EMBEDDINGS_PER_JOB} embedding inputs, pass \`nearest\` (ranked in one job) or drop the chain.`));
+        }
         // A serve this server is still starting reports its phases too.
         if (report) await ensureServe(endpoint, { signal: extra.signal, report });
         // Slices bound retained job results. If the engine returns larger vectors than its job
@@ -990,8 +1011,11 @@ function withBatchChecks<R>(result: R, job: string | undefined, items: BatchItem
     if (!row || row.ok !== true) continue;
     const id = String(row.id);
     const receipt = object(row.response) ?? {};
-    const lines = resultChecks({ job, task: taskOf.get(id), answer: taskAnswerText(receipt) ?? "", structured: receipt, tools: toolsOf.get(id) });
-    if (lines.length === 0 || /^every answer is outside|^every number and quoted name|^all \d+ SEARCH|^\d+ tool call\(s\) match/.test(lines[0]!)) continue;
+    const ordinary = resultChecks({ job, task: taskOf.get(id), answer: taskAnswerText(receipt) ?? "", structured: receipt, tools: toolsOf.get(id) });
+    const quiet = ordinary.length === 0 || /^every answer is outside|^every number and quoted name|^all \d+ SEARCH|^\d+ tool call\(s\) match/.test(ordinary[0]!);
+    const fallback = fallbackCheck(receipt);
+    const lines = [...(fallback ? [fallback] : []), ...(quiet ? [] : ordinary)];
+    if (lines.length === 0) continue;
     checks[id] = lines;
     flagged.push(`${id}: ${lines.join("; ")}`);
   }

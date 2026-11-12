@@ -17,7 +17,7 @@ vi.mock("../../src/model-library.js", () => ({ catalogLiveState: (...args: any[]
 
 import { applyJob, pickJobModel, pickJobModelDetailed, familyMatch } from "../../src/job-mode.js";
 import { MODEL_CATALOG } from "../../src/model-catalog.js";
-import { LOCAL_JOBS, OCR_PROMPTS, RUN_TASK_JOBS, WORKFLOWS } from "../../src/local-prompts.js";
+import { BUILTIN_WORKFLOWS, LOCAL_JOBS, OCR_PROMPTS, RUN_TASK_JOBS, WORKFLOWS } from "../../src/local-prompts.js";
 import { registerRunTaskTool } from "../../src/tools/run-task.js";
 
 const installed = (...names: string[]) => names.map((name) => ({ name }));
@@ -320,9 +320,9 @@ describe("family profiles and model-aware prompts", () => {
   it("asks OCR-trained models with their trained prefix and other vision models in plain words", () => {
     const prompt = LOCAL_JOBS.ocr.prompt!;
     expect(prompt({ model: "hf.co/openbmb/MiniCPM-OCR-1.0-gguf:Q8_0" })).toBe("Text Recognition:");
-    expect(WORKFLOWS["read-table"].prompt(undefined, "glm-ocr:latest")).toBe("Table Recognition:");
+    expect(BUILTIN_WORKFLOWS["read-table"].prompt(undefined, "glm-ocr:latest")).toBe("Table Recognition:");
     expect(prompt({ model: "qwen3.8:27b" })).toMatch(/^Transcribe all text in the image exactly/);
-    expect(WORKFLOWS["read-table"].prompt(undefined, "lfm3-vl:2b")).toMatch(/Markdown table/);
+    expect(BUILTIN_WORKFLOWS["read-table"].prompt(undefined, "lfm3-vl:2b")).toMatch(/Markdown table/);
   });
 });
 

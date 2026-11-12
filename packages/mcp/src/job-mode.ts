@@ -4,9 +4,10 @@
 // caller passes always wins; `job_profile.applied` names every field job mode filled in.
 import { catalogView, type InstalledModel } from "./model-catalog.js";
 import { catalogLiveState } from "./model-library.js";
-import { EMBEDDING_PREFIXES, isOcrModel, LOCAL_JOBS, WORKFLOWS, type JobName, type LocalJob, type ModelProfile, type Prefixes, type Workflow, type WorkflowName } from "./local-prompts.js";
+import { EMBEDDING_PREFIXES, isOcrModel, LOCAL_JOBS, WORKFLOWS, workflowSource, type JobName, type LocalJob, type ModelProfile, type Prefixes, type Workflow, type WorkflowName } from "./local-prompts.js";
 
-export type JobProfile = { job: JobName; workflow?: WorkflowName; model: string | undefined; applied: string[] };
+/** `workflow_source`: the user file (path and digest) whose instructions ran, when not a built-in. */
+export type JobProfile = { job: JobName; workflow?: WorkflowName; workflow_source?: string; model: string | undefined; applied: string[] };
 
 /** The fields job mode reads and fills; every other field passes through untouched. */
 export type JobFields = {
@@ -212,7 +213,12 @@ export function applyJob<T extends JobFields>(
     next.model = model;
     applied.push("model");
   }
-  const profile = (): JobProfile => ({ job, ...(workflow ? { workflow } : {}), model: next.model, applied });
+  const source = workflow ? workflowSource(workflow) : undefined;
+  const profile = (): JobProfile => ({
+    job, ...(workflow ? { workflow } : {}),
+    ...(source?.kind === "user" ? { workflow_source: `${source.path} (sha256 ${source.digest})` } : {}),
+    model: next.model, applied,
+  });
   if (routingOnly || spec.task === "decision") return { fields: next as T, profile: profile() };
   if (spec.task === "embedding") {
     const prefixes = familyPrefixes(spec, next.model);

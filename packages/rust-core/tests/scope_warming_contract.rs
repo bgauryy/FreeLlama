@@ -441,7 +441,7 @@ async fn scope_and_warm_refused_for_capacity_never_infer_or_append() {
             source: "low_capacity_fixture".into(),
             total_memory_bytes: Some(10000),
             available_memory_bytes: Some(50),
-            // Low available memory alone only warns; the OS must report pressure to refuse.
+            // Advisory mode: low available memory alone only warns; the OS must report pressure to refuse.
             memory_pressure: Some(MemoryPressure::Warning),
             thermal_throttled: Some(false),
             ..HostResources::default()

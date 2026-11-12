@@ -266,7 +266,8 @@ pub(crate) async fn select_managed_route(
         preferred
     } else {
         (
-            select_route(input, models, sessions).map_err(ApiError::bad_request)?,
+            select_route(input, models, sessions)
+                .map_err(|error| ApiError::route_refusal(&error))?,
             if desired.is_some() {
                 "preferred_backend_unavailable_or_ineligible"
             } else {

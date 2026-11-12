@@ -45,6 +45,8 @@ freellama run -m TAG "prompt" --think=false                        # an exact in
 | `run_task {tasks:[{id, independent:true, task:{files:[p]}}]}` | `freellama run … --each -f GLOB` |
 | `run_task {preview:true, …routing only}` | `freellama run … --preview` or `freellama route --task T` |
 | `run_task {defer:true}`, `task_jobs {action:"get"\|"cancel", jobId}` | `--defer`, `freellama job ID --wait\|--cancel`, `freellama jobs` |
+| `run_task {defer:true, idempotencyKey}` (serve with `FREELLAMA_DURABLE_JOBS=1`) | `--defer --idempotency-key KEY`: a resubmission returns the original job |
+| `run_task {model, fallbackModels:[…]}` | `freellama run -m TAG --fallback TAG2` (repeatable): the next model only after a refusal before running |
 | `models {view:"catalog", job}` | `freellama catalog` |
 | `models {view:"installed"\|"resident"}` | `freellama models` (each entry has `resident`) |
 | `doctor`, `doctor {view:"status"\|"usage"}` | `freellama doctor`, `freellama status` (JSON when piped or with `--json`), `freellama usage --days N` |

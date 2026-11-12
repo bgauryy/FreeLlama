@@ -29,6 +29,31 @@ Load when choosing what to send, which model runs it, or whether to install one.
 
 `run_task {workflow}` or `{job}` opts into FreeLlama's model pick and local prompts; any field you send wins. Plain chat can omit `task` (completion). Other routing profiles: `coding`, `code_repair`, `tools`, `browser`, `vision`, `embedding`, `long_context`.
 
+The user may have their own workflows: `freellama workflows` lists them with the file each comes from, and one named like a built-in replaces it. They run like built-ins but are not eval-tested, so check more of their answers. `job_profile.workflow_source` names the file and digest that ran.
+
+## Ollama capabilities through FreeLlama
+
+Each Ollama capability below is reachable with FreeLlama's routing, memory gate and receipt added. Check the model has the capability (`models {view:"detail"}`, `ollama show`); a tag name proves nothing.
+
+| Ollama capability | FreeLlama door | What FreeLlama adds |
+|---|---|---|
+| Chat and generate | `run_task {prompt\|messages}`, `freellama run` | Admission, a pick that fits now, repetition stop, `check:` lines |
+| Thinking (`think` true, false or a level the model lists) | `think`, `--think=LEVEL` | Off by default for bounded workflows; refused when the model lacks the control |
+| Structured output (`format` JSON or schema) | `format`, `--schema 'name, age int'` | Field lists become a schema; `extract-json` null-field check |
+| Tool calling | `tools` (returns `tool_calls` you run) | A check when a tool call came back unasked |
+| Vision and OCR | `files` with images, workflows `read-*`, `answer-image`, `describe-screen` | OCR prefixes per model family; blank-image and loop checks |
+| Embeddings (and `dimensions`) | `task:"embedding"`, `nearest`, jobs `find-code`, `duplicates`, `image-search` | Ranking in the core instead of vectors, per-family prefixes, a reuse index for unchanged chunks |
+| Fill in the middle (`suffix`, models with `insert`) | `--suffix` | The same gate and receipt |
+| Log probabilities (`logprobs`, `top_logprobs`) | `logprobs`, `topLogprobs` | Returned in the receipt's `response`; refused for decision and embedding tasks |
+| Decision models (`/v1/systemone`) | `task:"decision"`, `--ask` | Probabilities, `[unsure]` marks, a check under 0.9 confidence |
+| Speech (`/v1/audio/*`) | `audio {transcribe\|translate\|speak}` | WAV handling and the same admission |
+| Residency (`keep_alive`, preload, unload) | `keepAlive`, `ollama_manage {warm\|unload}` | Warms pass the memory gate; idle models are evicted by reload cost under pressure |
+| Placement (`/api/ps`) | every receipt; `minPlacementEvidence:"observed"` | Configured backend vs where Ollama really ran it |
+| Pull, delete, show, library search | `ollama_pull`, `ollama_delete`, `models {view:"library"\|"detail"}` | Fit before download; pull only an approved exact tag and size |
+| OpenAI and Anthropic compatibility | `freellama gateway` | Workflows as `freellama/<name>` models; admission on streamed requests |
+
+Not added by FreeLlama: Ollama `create`, `copy` and `push` pass through `serve` unchanged (with client keys configured, only admin keys may call them), and cloud models and web search are outside its local admission.
+
 ## Write your own prompt for a local model
 
 When no workflow fits and you send `prompt` or `systemPrompt` yourself ([local prompts](https://github.com/bgauryy/FreeLlama/blob/main/docs/PROMPTS.md) has the evidence):

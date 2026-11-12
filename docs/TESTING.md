@@ -61,6 +61,14 @@ lifecycle test is disabled unless the operator explicitly sets `FREELLAMA_TEST_P
 `qwen2.5:0.5b` and `FREELLAMA_TEST_PULL_SIZE_BYTES` to the exact reported download size. The test
 rechecks that size and reads every installed-model page before allowing the round trip.
 
+## Continuous integration
+
+[`.github/workflows/ci.yml`](../.github/workflows/ci.yml) runs the deterministic tiers on every pull
+request and push to `main`, on Ubuntu and macOS: `yarn install --immutable`, `yarn lint:rust`
+(Ubuntu), `yarn build`, `yarn typecheck`, `yarn test:js`, `yarn test:rust` and `yarn test:release`.
+It uses no Ollama and no models, so it does not replace the live tiers, Windows qualification or the
+hardware procedures; run those before a release (`yarn verify:production`).
+
 ## Model metadata contracts
 
 Model metadata unit contracts cover README extraction, complete tag pages, family-versus-variant

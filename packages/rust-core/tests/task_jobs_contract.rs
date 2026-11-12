@@ -63,7 +63,7 @@ async fn fixture_with_delay(
                 source: "test".into(),
                 total_memory_bytes: Some(10000),
                 available_memory_bytes: Some(available),
-                // Low available memory alone only warns; the OS must report pressure to hold.
+                // Advisory mode: low available memory alone only warns; the OS must report pressure to hold.
                 memory_pressure: Some(if available < 100 {
                     MemoryPressure::Warning
                 } else {

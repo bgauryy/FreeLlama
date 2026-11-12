@@ -202,7 +202,8 @@ async fn run_admitted_task(
     if preflight["refuses"] == true {
         return Err(ApiError::bad_request(
             "model file size alone exceeds the 80% local CPU/unified host budget; select a smaller model or configure an Ollama backend on a separate host",
-        ));
+        )
+        .with_code("model_exceeds_host_budget"));
     }
 
     let mut execution_receipt = managed.execution_receipt(requested_cost, &state).await;
