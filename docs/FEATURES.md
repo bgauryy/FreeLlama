@@ -134,8 +134,9 @@ started never moves to another model, so no work is replayed after an uncertain 
 that answered. Each attempt waits as a single task would, so set a short `maxWaitSeconds` to move on
 sooner; `timeoutSeconds` bounds the whole chain. While one model is tried, the models after it count
 as busy, so making room for an attempt that is then refused never unloads the model that would run
-next. An entry equal to the first model (which may be a scope default or a job's pick) is skipped; a
-model listed twice is refused. When an embedding task runs in slices and a later slice is refused,
+next. An entry equal to the first model (which may be a scope default, a job's pick or the model
+routing chose) is skipped, and every attempt names the model it really used; a model listed twice
+is refused. A chain that fails is charged in usage to the model that failed last. When an embedding task runs in slices and a later slice is refused,
 part of the work already ran, so the chain stops there. A chain cannot be combined with a pinned
 digest or backend, and MCP refuses one over separately sliced embeddings so one answer comes from one
 model. Batch items and `task_jobs` results carry the receipt's `fallback` too.

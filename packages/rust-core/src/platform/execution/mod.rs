@@ -51,7 +51,7 @@ pub(super) use request::requests_immediate_unload;
 use request::{
     apply_request_options, build_managed_request, input_batch_items, task_cost_for, task_has_images,
 };
-pub(super) use select::{ManagedDecision, select_managed_route};
+pub(super) use select::{ManagedDecision, refuse_against_full_catalog, select_managed_route};
 
 /// How long a request may wait for host memory while holding its admission slot.
 const SLOT_HELD_RESOURCE_WAIT: Duration = Duration::from_secs(2);

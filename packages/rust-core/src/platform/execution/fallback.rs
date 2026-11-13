@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 
 use super::super::error::ApiError;
 use super::super::residency::ActiveModel;
+use super::super::tasks_api::RouteObserver;
 use super::super::{ManagedOperation, ModelRefusal, PlatformState, TaskInput};
 use super::nearest;
 
@@ -112,6 +113,12 @@ fn protect(state: &PlatformState, later: &[Option<String>]) -> Vec<ActiveModel> 
         .collect()
 }
 
+/// Whether `name` (or its `:latest` form) already had an attempt.
+fn already_tried(tried: &BTreeSet<String>, name: &str) -> bool {
+    let name = name.trim();
+    tried.contains(name) || (!name.contains(':') && tried.contains(&format!("{name}:latest")))
+}
+
 fn attempt(model: Option<&str>, error: &ApiError) -> Value {
     json!({
         "model": model,
@@ -128,13 +135,35 @@ pub(super) async fn run(state: PlatformState, input: TaskInput) -> Result<Json<V
     }
     let chain = attempts_in_order(&input);
     let mut attempts = Vec::new();
+    let mut tried = BTreeSet::new();
     for (index, model) in chain.iter().enumerate() {
+        // A routed first attempt may have picked a model the chain names again: never twice.
+        if let Some(name) = model
+            && already_tried(&tried, name)
+        {
+            continue;
+        }
         let mut next = input.clone();
         next.route.model.clone_from(model);
         next.fallback_models.clear();
+        let observer = RouteObserver::default();
+        next.route_observer = Some(observer.clone());
         let guards = protect(&state, &chain[index + 1..]);
         let outcome = nearest::run(state.clone(), next).await;
         drop(guards);
+        // The model this attempt really used: the one named, else the one routing picked.
+        let routed = observer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let model = &routed.or_else(|| model.clone());
+        if let Some(name) = model {
+            tried.insert(name.clone());
+        }
+        let more = chain[index + 1..]
+            .iter()
+            .flatten()
+            .any(|name| !already_tried(&tried, name));
         match outcome {
             Ok(Json(mut receipt)) => {
                 receipt["fallback"] = json!({
@@ -146,7 +175,7 @@ pub(super) async fn run(state: PlatformState, input: TaskInput) -> Result<Json<V
                 });
                 return Ok(Json(receipt));
             }
-            Err(error) if refused_before_execution(&error) && index + 1 < chain.len() => {
+            Err(error) if refused_before_execution(&error) && more => {
                 attempts.push(attempt(model.as_deref(), &error));
             }
             Err(error) => {
@@ -165,7 +194,7 @@ pub(super) async fn run(state: PlatformState, input: TaskInput) -> Result<Json<V
             }
         }
     }
-    unreachable!("the chain always holds the first attempt")
+    unreachable!("the first attempt always runs, and the last one tried always returns")
 }
 
 #[cfg(test)]
@@ -240,6 +269,34 @@ mod tests {
             "prompt":"hi","fallback_models":["b:1"],"expected_model_digest":"sha256:x",
         }));
         assert!(validate(&pinned).is_err());
+    }
+
+    #[test]
+    fn a_failed_chain_is_charged_to_the_model_that_failed_last() {
+        let error = ApiError::bad_request("no room")
+            .with_code("resource_admission_unavailable")
+            .with_fallback(json!({"attempts": [{"model": "a:1"}, {"model": "b:1"}]}));
+        assert_eq!(error.last_attempted_model(), Some("b:1"));
+        let record = super::super::feedback::task_record(
+            &Err(error),
+            std::time::Instant::now(),
+            "completion",
+            crate::platform::TaskPriority::Normal,
+            Some("a:1"),
+            None,
+        );
+        assert_eq!(record.model, "b:1");
+        assert_eq!(record.outcome, "error");
+        // Without a chain the requested model is recorded, as before.
+        let plain = super::super::feedback::task_record(
+            &Err(ApiError::bad_request("x")),
+            std::time::Instant::now(),
+            "completion",
+            crate::platform::TaskPriority::Normal,
+            Some("a:1"),
+            None,
+        );
+        assert_eq!(plain.model, "a:1");
     }
 
     #[test]

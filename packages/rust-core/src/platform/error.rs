@@ -162,6 +162,18 @@ impl ApiError {
         &self.body.error
     }
 
+    /// The last model a fallback chain tried before this error: the one that actually failed.
+    pub(super) fn last_attempted_model(&self) -> Option<&str> {
+        self.body
+            .fallback
+            .as_ref()?
+            .get("attempts")?
+            .as_array()?
+            .last()?
+            .get("model")?
+            .as_str()
+    }
+
     /// The models an explicit fallback chain tried before this error, in order.
     pub(super) fn with_fallback(mut self, fallback: Value) -> Self {
         self.body.fallback = Some(fallback);

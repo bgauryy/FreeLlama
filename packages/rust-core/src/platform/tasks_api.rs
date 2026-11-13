@@ -98,6 +98,10 @@ pub(crate) struct TaskInput {
     pub(crate) stop_on_repetition: Option<bool>,
     #[serde(skip)]
     pub(crate) job_progress: Option<jobs::JobProgress>,
+    /// Set by a fallback chain: receives the model routing selected, so an attempt that named no
+    /// model and was then refused can still be reported (and not retried) by its real name.
+    #[serde(skip)]
+    pub(crate) route_observer: Option<RouteObserver>,
     /// The client key that sent the task, for the usage ledger.
     #[serde(skip)]
     pub(crate) client: Option<String>,
@@ -121,6 +125,9 @@ impl<'de> Deserialize<'de> for TaskInput {
         Ok(input)
     }
 }
+
+/// Shared slot for the model a task was routed to; clones of one task share it.
+pub(crate) type RouteObserver = std::sync::Arc<std::sync::Mutex<Option<String>>>;
 
 /// Explicitly independent managed work. Dependencies are intentionally not accepted: a batch is
 /// a bounded dispatcher, not a workflow engine, so an agent cannot accidentally run a dependent

@@ -63,8 +63,8 @@ rechecks that size and reads every installed-model page before allowing the roun
 
 ## Continuous integration
 
-[`.github/workflows/ci.yml`](../.github/workflows/ci.yml) runs the deterministic tiers on every pull
-request and push to `main`, on Ubuntu and macOS: `yarn install --immutable`, `yarn lint:rust`
+[`.github/workflows/ci.yml`](../.github/workflows/ci.yml) runs the deterministic tiers on every push,
+every pull request and on demand (`gh workflow run CI`), on Ubuntu and macOS: `yarn install --immutable`, `yarn lint:rust`
 (Ubuntu), `yarn build`, `yarn typecheck`, `yarn test:js`, `yarn test:rust` and `yarn test:release`.
 It uses no Ollama and no models, so it does not replace the live tiers, Windows qualification or the
 hardware procedures; run those before a release (`yarn verify:production`).

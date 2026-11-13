@@ -1,4 +1,5 @@
 // Shared MCP result helpers, Zod parameter schemas, the confidence gate, and payload trimming.
+import { fallbackRefusalLine } from "./result-checks.js";
 import { OLLAMA_MISSING, ollamaInstalled } from "./ollama-presence.js";
 import * as z from "zod";
 import { DEFAULT_OLLAMA_ENDPOINT, DEFAULT_OLLAMA_FETCH_TIMEOUT_SECONDS, DEFAULT_SERVE_ENDPOINT } from "./config.js";
@@ -666,7 +667,9 @@ export function errorResult(error: unknown) {
         ? `${message}\n\nOllama is not running at that address. Ask the user to start Ollama (the app, or \`ollama serve\`); retrying before that cannot succeed.`
         : `${message}\n\n${OLLAMA_MISSING} Ask the user to install it; nothing can run until then.`
       : receipt && message.length > 600 ? refusalLine(message) : message;
-  return { content: [{ type: "text" as const, text: actionableMessage }], isError: true,
+  // A failed fallback chain names every model it tried, not only the last refusal.
+  const chain = receipt ? fallbackRefusalLine(receipt) : undefined;
+  return { content: [{ type: "text" as const, text: chain ? `${actionableMessage}\n${chain}` : actionableMessage }], isError: true,
     ...(receipt ? { structuredContent: receipt } : {}) };
 }
 

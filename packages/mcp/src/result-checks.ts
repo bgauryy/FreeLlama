@@ -346,6 +346,17 @@ export function fallbackCheck(structured: Fields): string | undefined {
   return `answered by fallback ${selected} after ${refused.join(", ")} was refused before running; judge the answer by that model`;
 }
 
+/** One line naming every model a failed fallback chain tried and why it stopped; undefined without a chain. */
+export function fallbackRefusalLine(body: Fields): string | undefined {
+  const fallback = object(body.fallback);
+  const tried = list(fallback?.attempts).map(object).filter((row): row is Fields => row !== undefined)
+    .map((row) => `${typeof row.model === "string" ? row.model : "the routed model"} (${typeof row.code === "string" ? row.code : "error"})`);
+  if (!fallback || tried.length === 0) return undefined;
+  return `fallback chain tried ${tried.join(", ")}: ${fallback.exhausted === true
+    ? "every model was refused before it ran, so nothing executed"
+    : "the last one failed after it started, so no further model was tried"}`;
+}
+
 /** The result with `checks` in structuredContent and as `check:` lines after the answer. */
 export function withChecks<R>(result: R, job: string | undefined, task: string | undefined, tools?: unknown[], workflow?: string): R {
   const shown = result as { content?: Array<{ type: string; text?: string }>; structuredContent?: Fields; isError?: boolean };

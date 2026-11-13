@@ -169,7 +169,7 @@ async fn run_admitted_task(
     // Snapshot the small affinity map: holding the read guard across routing's Ollama calls
     // queued every session write behind one `/api/ps`, and routing takes `feedback` next.
     let sessions = state.sessions.read().await.clone();
-    let mut managed = select_managed_route(
+    let mut managed = match select_managed_route(
         &state,
         &input.route,
         &models,
@@ -177,7 +177,26 @@ async fn run_admitted_task(
         requested_cost,
         Some(&input),
     )
-    .await?;
+    .await
+    {
+        Ok(managed) => managed,
+        Err(error) => {
+            return Err(super::select::refuse_against_full_catalog(
+                &state,
+                &input.route,
+                &models,
+                error,
+            )
+            .await);
+        }
+    };
+    // Report the pick before anything below can refuse it (context, host budget, memory).
+    if let Some(observer) = &input.route_observer {
+        *observer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(managed.route.selected_model.clone());
+    }
     // A `vision` capability tag is metadata, not evidence the build reads images (MLX conversions
     // have shipped without the vision head). Automatic image routing therefore needs an operator
     // policy naming the model for `vision`; otherwise the caller names a model it has trialled.

@@ -31,6 +31,18 @@ describe("result-derived checks", () => {
     expect(resultChecks({ answer: "", structured: { response: { answers } } })[0]).toMatch(/this decider has no published calibration/);
   });
 
+  it("names every model a failed chain tried in the error text", async () => {
+    const { errorResult } = await import("../../src/helpers.js");
+    const body = { error: "host resource admission deadline exceeded", code: "resource_admission_unavailable", fallback: {
+      used: true, exhausted: true, attempts: [
+        { model: "ghost:7b", code: "model_not_installed" }, { model: "bonsai-2:9b", code: "resource_admission_unavailable" }],
+    } };
+    const shown = errorResult(new Error(JSON.stringify(body)));
+    expect(shown.content[0]!.text).toMatch(/\nfallback chain tried ghost:7b \(model_not_installed\), bonsai-2:9b \(resource_admission_unavailable\): every model was refused before it ran/);
+    // An error without a chain is shown exactly as before.
+    expect(errorResult(new Error(JSON.stringify({ error: "plain" }))).content[0]!.text).toBe('{"error":"plain"}');
+  });
+
   it("names the fallback model that answered and why the ones before it were refused", () => {
     const result = { content: [{ type: "text", text: "ok" }], structuredContent: { fallback: {
       used: true, selected: "big:latest", attempts: [{ model: "tiny:latest", code: "context_window_exceeded" }],

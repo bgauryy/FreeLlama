@@ -1,12 +1,12 @@
-# Deterministic checks on every push to main and every pull request: no Ollama, no models.
+# Deterministic checks on every push (any branch) and every pull request: no Ollama, no models.
 # Live tiers (yarn test:integration, test:e2e) and hardware qualification stay manual: see
 # docs/TESTING.md. The Rust compiler comes from rust-toolchain.toml.
 name: CI
 
 on:
   push:
-    branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read

@@ -194,7 +194,9 @@ was refused with a code that proves nothing executed (`resource_admission_unavai
 `context_window_exceeded`, `embedding_item_exceeds_context`, `model_exceeds_host_budget`,
 `upstream_circuit_open`, `model_not_installed`, `model_not_eligible`), and only when no earlier
 embedding slice of the same task ran. Any other error ends the chain. During each attempt the later
-chain models are registered as busy, which keeps eviction from unloading them.
+chain models are registered as busy, which keeps eviction from unloading them. An attempt without a
+`model` records the model routing selected, so `attempts[].model` is never null for a routed pick and
+that model is not tried again; the usage record of a failed chain names the last model tried.
 A success adds `fallback: {used, attempts, selected}` to the receipt; a failure adds
 `fallback: {used, exhausted, attempts, note}` to the error body. A deferred job validates the chain
 at submission.

@@ -783,8 +783,23 @@ async fn route(
     // Snapshot the small affinity map so no lock is held across routing's Ollama calls.
     let sessions = state.sessions.read().await.clone();
     let requested_cost = state.tunables().task_cost(input.task);
-    let managed =
-        select_managed_route(&state, &input, &models, &sessions, requested_cost, None).await?;
+    let managed = match select_managed_route(
+        &state,
+        &input,
+        &models,
+        &sessions,
+        requested_cost,
+        None,
+    )
+    .await
+    {
+        Ok(managed) => managed,
+        Err(error) => {
+            return Err(
+                execution::refuse_against_full_catalog(&state, &input, &models, error).await,
+            );
+        }
+    };
     let mut value = serde_json::to_value(&managed.route).expect("RouteDecision serializes");
     value["execution"] = managed.execution_receipt(requested_cost, &state).await;
     Ok(Json(value))

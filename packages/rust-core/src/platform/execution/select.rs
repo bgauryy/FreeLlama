@@ -731,6 +731,28 @@ async fn context_left_to_ollama(
     Some(json!({"tokens": default, "source": source}))
 }
 
+/// A named model is discovered alone (the catalog fast path), so its "not eligible" refusal could
+/// list alternatives only from that one model and would claim none exist. Recompute that refusal
+/// against the whole installed catalog so its hint names the real alternatives; any other error,
+/// or a refusal already made against the full catalog, is returned unchanged.
+pub(in crate::platform) async fn refuse_against_full_catalog(
+    state: &PlatformState,
+    input: &RouteInput,
+    models: &[CatalogModel],
+    error: ApiError,
+) -> ApiError {
+    if error.code() != Some(super::super::ModelRefusal::NOT_ELIGIBLE) || models.len() > 1 {
+        return error;
+    }
+    let Ok(all) = super::super::catalog::discover_models(state).await else {
+        return error;
+    };
+    match select_route(input, &all, &SessionAffinity::default()) {
+        Err(refusal) => ApiError::route_refusal(&refusal),
+        Ok(_) => error,
+    }
+}
+
 #[cfg(test)]
 mod planning_tests {
     use super::*;

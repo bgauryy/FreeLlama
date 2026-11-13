@@ -4,7 +4,7 @@ All notable changes to FreeLlama are recorded here. Versions follow [Semantic Ve
 every npm package (`@octocodeai/freellama`, `@octocodeai/freellama-mcp-server`, the native platform
 packages) and the Rust crates share one version, set with `yarn release:version <semver>`.
 
-## [Unreleased]
+## [0.12.0] - 2026-11-13
 
 ### Added
 
@@ -13,7 +13,9 @@ packages) and the Rust crates share one version, set with `yarn release:version 
   runs only after the one before was refused before anything executed (no room by the wait deadline,
   input over its context window, model file over the host budget, not installed, wrong capability,
   circuit open); any other error ends the chain, so no work is replayed. Later models in the chain
-  are protected from eviction while an earlier one is tried. The receipt's `fallback` lists every
+  are protected from eviction while an earlier one is tried, each attempt names the model it really
+  used (a routed pick included, and never tried twice), and a failed chain's usage is charged to the
+  model that failed last. The receipt's `fallback` lists every
   attempt, and the answer (batch items included) gets a `check:` line naming the model that answered.
 - **Your own workflows.** Markdown files in `~/.octocode/freellama/workflows/` (or
   `FREELLAMA_WORKFLOWS_DIR`): front matter names the job (`summarize`, `coding`, `ocr` or

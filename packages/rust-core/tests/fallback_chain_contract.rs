@@ -113,6 +113,13 @@ async fn a_model_refused_before_it_ran_moves_down_the_chain() {
     assert_eq!(attempts[0]["code"], "model_not_installed");
     assert_eq!(attempts[1]["model"], "embed:latest");
     assert_eq!(attempts[1]["code"], "model_not_eligible");
+    // The named model was discovered alone, but the refusal names the real alternatives.
+    let refusal = attempts[1]["error"].as_str().unwrap();
+    assert!(
+        refusal.contains("eligible alternatives")
+            && !refusal.contains("no installed model is eligible"),
+        "{refusal}"
+    );
     // Only the model that was admitted generated anything.
     assert_eq!(*chats.lock().unwrap(), vec!["big:latest".to_owned()]);
 }
@@ -181,4 +188,71 @@ async fn an_exhausted_chain_reports_every_refusal_and_a_bad_chain_is_refused_up_
         "{body}"
     );
     assert_eq!(chats.lock().unwrap().len(), executed.load(Ordering::SeqCst));
+}
+
+/// Every new load is refused for memory, so each attempt is refused before it runs. A routed
+/// first attempt is reported by the model routing picked (never `null`), and a chain entry that
+/// repeats that pick is not tried a second time.
+#[tokio::test]
+async fn a_routed_first_attempt_is_named_and_never_tried_twice() {
+    use freellama::platform::{
+        PlatformConfig,
+        resources::{
+            HostResources, LowMemoryMode, MemoryPressure, ResourceGovernor, ResourcePolicy,
+        },
+    };
+    let (endpoint, chats) = backend(&[]).await;
+    let governor = ResourceGovernor::with_sampler(
+        ResourcePolicy {
+            low_memory: LowMemoryMode::Advisory,
+            ..ResourcePolicy::default()
+        },
+        || HostResources {
+            source: "fallback_fixture".into(),
+            total_memory_bytes: Some(10_000),
+            available_memory_bytes: Some(1),
+            memory_pressure: Some(MemoryPressure::Warning),
+            ..HostResources::default()
+        },
+    )
+    .unwrap();
+    let mut config = PlatformConfig::new("127.0.0.1:11435", endpoint, None, None)
+        .with_max_queue_wait(std::time::Duration::from_millis(30));
+    config.resource_governor = governor;
+    let platform = app(&config).unwrap();
+    let response = platform
+        .oneshot(
+            Request::post("/_freellama/v1/tasks")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"task": "completion", "fallback_models": ["big:latest", "tiny:latest"], "prompt": "hi"})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["code"], "resource_admission_unavailable", "{body}");
+    assert_eq!(body["fallback"]["exhausted"], true, "{body}");
+    let mut models = body["fallback"]["attempts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|attempt| {
+            attempt["model"]
+                .as_str()
+                .expect("named, not null")
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    models.sort();
+    // Routing picked one of the two; each model was tried exactly once.
+    assert_eq!(
+        models,
+        vec!["big:latest".to_owned(), "tiny:latest".to_owned()],
+        "{body}"
+    );
+    assert!(chats.lock().unwrap().is_empty());
 }
