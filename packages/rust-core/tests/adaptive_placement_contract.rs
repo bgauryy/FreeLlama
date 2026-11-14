@@ -195,7 +195,8 @@ async fn missing_digest_does_not_train_or_recover_the_limiter() {
     for _ in 0..5 {
         let (status, result) = task(&fixture).await;
         assert_eq!(status, StatusCode::OK, "{result}");
-        assert_eq!(result["execution"]["observation"]["status"], "verified");
+        assert_eq!(result["execution"]["observation"]["status"], "unavailable");
+        assert_eq!(result["execution"]["observation"]["processor"], "unknown");
     }
     assert_eq!(
         adaptive(&fixture).await["limit"],

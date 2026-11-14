@@ -307,7 +307,9 @@ Omitted managed `keep_alive` values use finite retention informed by measured re
 starting from `base_seconds` (300, Ollama's own default) and shortened by `pressure_factor` under a
 host hold. Explicit values take precedence. The background pressure sweep releases, under
 FreeLlama's own low-memory estimate, only runners idle longer than `base_seconds ×
-pressure_factor` (75 s by default); swapping or OS memory pressure releases any idle runner. For governed prewarming, profile compatibility, and retention
+pressure_factor` (75 s by default); swapping or OS memory pressure shortens that to `min_seconds`
+(15 s). A runner counts as used when a task ran on it here or when another client moved its Ollama
+`expires_at` since the sweep's last check; the audit then lists it as `used_elsewhere`. For governed prewarming, profile compatibility, and retention
 settings, see [Scope history and model warming](SCOPES_AND_WARMING.md).
 
 When a model about to load needs room, FreeLlama unloads idle runners itself (`keep_alive: 0`)

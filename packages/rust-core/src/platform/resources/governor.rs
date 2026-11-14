@@ -67,6 +67,10 @@ impl Drop for ResourcePermit {
     }
 }
 
+/// How many sampling intervals a cached observation may age before a reader waits for a fresh
+/// one; younger stale samples are refreshed in the background.
+const STALE_LIMIT_SAMPLES: u32 = 3;
+
 #[derive(Default)]
 struct SampleState {
     saved: Option<(Instant, HostResources)>,
@@ -184,17 +188,30 @@ impl ResourceGovernor {
         drop(accounting);
     }
 
-    /// Read the latest cached observation, sampling once when stale.
+    /// Read the latest cached observation. A sample older than `sample_interval` starts a fresh
+    /// one in the background and is still returned, so a task does not wait for host sampling
+    /// (the process list and GPU statistics took up to ~55 ms) once per interval. A caller waits
+    /// only with no sample yet, a sample older than [`STALE_LIMIT_SAMPLES`] intervals, or one
+    /// invalidated by a load (`sample_generation`); a finished background sample is absorbed by
+    /// the next reader.
     /// # Panics
     /// Panics only if the private sampler state violates its initialized-handle/cache invariant.
     pub async fn snapshot(&self) -> ResourceSnapshot {
         let mut state = self.state.lock().await;
-        let needs_sample = state.generation != self.sample_generation.load(Ordering::Acquire)
-            || state
-                .saved
-                .as_ref()
-                .is_none_or(|(at, _)| at.elapsed() >= self.policy.sample_interval);
-        if needs_sample {
+        let age = state.saved.as_ref().map(|(at, _)| at.elapsed());
+        let must_wait = state.generation != self.sample_generation.load(Ordering::Acquire)
+            || age.is_none_or(|age| age >= self.policy.sample_interval * STALE_LIMIT_SAMPLES);
+        let finished = state.pending.as_ref().is_some_and(JoinHandle::is_finished);
+        if !must_wait
+            && !finished
+            && state.pending.is_none()
+            && age.is_some_and(|age| age >= self.policy.sample_interval)
+        {
+            let sampler = self.sampler.clone();
+            state.pending_generation = self.sample_generation.load(Ordering::Acquire);
+            state.pending = Some(tokio::task::spawn_blocking(move || sampler()));
+        }
+        if must_wait || finished {
             if state.pending.is_none() {
                 let sampler = self.sampler.clone();
                 state.pending_generation = self.sample_generation.load(Ordering::Acquire);
@@ -212,42 +229,7 @@ impl ResourceGovernor {
                     unavailable: vec!["sampler_failed".into()],
                     ..HostResources::default()
                 });
-            state.pending = None;
-            state.generation = state.pending_generation;
-            let previous = state.saved.as_ref().map(|(_, sample)| sample);
-            let triggered = pressure_reasons(&observed, previous, &self.policy);
-            // Recover each signal independently. Low RAM must not preserve an obsolete CPU
-            // hold forever and prevent safe reuse of an unchanged resident runner.
-            let recovered: Vec<_> = state
-                .holds
-                .iter()
-                .filter_map(|hold| {
-                    let signal_expired = hold.since.elapsed() >= MAX_UNOBSERVED_HOLD;
-                    (!triggered.contains(&hold.reason)
-                        && (recovered_reason(hold.reason, &observed, previous, &self.policy)
-                            || (signal_expired && !reason_observed(hold.reason, &observed))))
-                    .then_some(hold.reason)
-                })
-                .collect();
-            for reason in triggered {
-                if !state.holds.iter().any(|hold| hold.reason == reason) {
-                    state.holds.push(PressureHold {
-                        reason,
-                        healthy_samples: 0,
-                        since: Instant::now(),
-                    });
-                }
-            }
-            state.holds.retain_mut(|hold| {
-                hold.healthy_samples = if recovered.contains(&hold.reason) {
-                    hold.healthy_samples.saturating_add(1)
-                } else {
-                    0
-                };
-                hold.healthy_samples < self.policy.recovery_samples
-            });
-            state.sample_count = state.sample_count.saturating_add(1);
-            state.saved = Some((Instant::now(), observed));
+            self.absorb(&mut state, observed);
         }
         let (saved_at, observation) = state.saved.as_ref().expect("sample is saved");
         let reserved_bytes = self.reservations.load(Ordering::Acquire);
@@ -286,6 +268,46 @@ impl ResourceGovernor {
             observation: observation.clone(),
             policy: self.policy.clone(),
         }
+    }
+
+    /// Take a finished sample into the cache: update pressure holds and their recovery.
+    fn absorb(&self, state: &mut SampleState, observed: HostResources) {
+        state.pending = None;
+        state.generation = state.pending_generation;
+        let previous = state.saved.as_ref().map(|(_, sample)| sample);
+        let triggered = pressure_reasons(&observed, previous, &self.policy);
+        // Recover each signal independently. Low RAM must not preserve an obsolete CPU
+        // hold forever and prevent safe reuse of an unchanged resident runner.
+        let recovered: Vec<_> = state
+            .holds
+            .iter()
+            .filter_map(|hold| {
+                let signal_expired = hold.since.elapsed() >= MAX_UNOBSERVED_HOLD;
+                (!triggered.contains(&hold.reason)
+                    && (recovered_reason(hold.reason, &observed, previous, &self.policy)
+                        || (signal_expired && !reason_observed(hold.reason, &observed))))
+                .then_some(hold.reason)
+            })
+            .collect();
+        for reason in triggered {
+            if !state.holds.iter().any(|hold| hold.reason == reason) {
+                state.holds.push(PressureHold {
+                    reason,
+                    healthy_samples: 0,
+                    since: Instant::now(),
+                });
+            }
+        }
+        state.holds.retain_mut(|hold| {
+            hold.healthy_samples = if recovered.contains(&hold.reason) {
+                hold.healthy_samples.saturating_add(1)
+            } else {
+                0
+            };
+            hold.healthy_samples < self.policy.recovery_samples
+        });
+        state.sample_count = state.sample_count.saturating_add(1);
+        state.saved = Some((Instant::now(), observed));
     }
 
     /// Wait within the caller's existing admission deadline. A remote endpoint bypasses local

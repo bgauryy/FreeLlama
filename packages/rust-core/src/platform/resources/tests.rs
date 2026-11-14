@@ -571,7 +571,8 @@ async fn unknown_memory_recovers_and_zero_wait_revalidates_current_snapshot() {
             .is_err()
     );
     known.store(true, Ordering::SeqCst);
-    tokio::time::sleep(Duration::from_millis(7)).await;
+    // Past the staleness limit (3 × 5 ms): the next read waits for a fresh sample.
+    tokio::time::sleep(Duration::from_millis(20)).await;
     governor.snapshot().await;
     let permit = governor
         .wait_for_capacity("http://localhost:11434", GIB, Duration::ZERO)
@@ -580,7 +581,8 @@ async fn unknown_memory_recovers_and_zero_wait_revalidates_current_snapshot() {
     assert_eq!(permit.receipt.status, "admitted");
     drop(permit);
     known.store(false, Ordering::SeqCst);
-    tokio::time::sleep(Duration::from_millis(7)).await;
+    // Past the staleness limit (3 × 5 ms): the next read waits for a fresh sample.
+    tokio::time::sleep(Duration::from_millis(20)).await;
     governor.snapshot().await;
     assert!(
         governor
@@ -635,7 +637,8 @@ async fn best_effort_cannot_clear_observed_pressure_with_unknown_telemetry() {
     )
     .unwrap();
     assert!(governor.snapshot().await.holding);
-    tokio::time::sleep(Duration::from_millis(7)).await;
+    // Past the staleness limit (3 × 5 ms): the next read waits for a fresh sample.
+    tokio::time::sleep(Duration::from_millis(20)).await;
     let snapshot = governor.snapshot().await;
     assert_eq!(
         snapshot.assess_capacity(0, false).denial_reason,
@@ -705,8 +708,45 @@ async fn pressure_requires_two_fresh_recovery_samples_and_unknown_does_not_clear
     .unwrap();
     for expected in [true, true, true, true, false] {
         assert_eq!(governor.snapshot().await.holding, expected);
-        tokio::time::sleep(Duration::from_millis(7)).await;
+        // Past the staleness limit (3 × 5 ms), so each read waits for its own fresh sample.
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+#[tokio::test]
+async fn a_stale_sample_is_refreshed_in_the_background_without_waiting() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = calls.clone();
+    let governor = ResourceGovernor::with_sampler(
+        ResourcePolicy {
+            sample_interval: Duration::from_millis(50),
+            ..quick_policy()
+        },
+        move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(30));
+            healthy()
+        },
+    )
+    .unwrap();
+    // No sample yet: the first reader waits for one.
+    let first = governor.snapshot().await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    // Stale but within 3 intervals: the cached sample comes back at once, a new one starts.
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    let started = Instant::now();
+    let stale = governor.snapshot().await;
+    assert!(started.elapsed() < Duration::from_millis(25), "a stale read must not wait for sampling");
+    assert_eq!(stale.sample_count, first.sample_count);
+    // The next reader after the background sample finished absorbs it.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let refreshed = governor.snapshot().await;
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(refreshed.sample_count, first.sample_count + 1);
+    // A load's invalidation still forces a waited, fresh sample.
+    governor.invalidate().await;
+    let forced = governor.snapshot().await;
+    assert_eq!(forced.sample_count, refreshed.sample_count + 1);
 }
 
 #[tokio::test]

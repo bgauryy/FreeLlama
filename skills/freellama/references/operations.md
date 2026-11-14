@@ -26,7 +26,7 @@ The calling agent owns decomposition, prompts and verification. The operator own
 | `job_no_model_fits` | No pick is installed with room. Report free memory and what holds it; pass an installed model with the same capability, or ask approval to pull one exact tag. |
 | Empty answer after thinking | The model spent its budget thinking: `--think=false` or raise `num_predict`. |
 | Slow but successful | Read `execution.observation`, not the assignment: partial GPU offload is silent. Free memory or lower context. |
-| Intermittent HTTP 500 | Check co-resident memory first; FreeLlama already retries 500/502 and connection errors. 504s, timeouts and post-send disconnects are final. |
+| Intermittent HTTP 500 | Check co-resident memory first. Inference is not replayed after 500/502, 504, timeout or post-send disconnect because execution may have started. Only proven connection-establishment failures are retried; read-only GET/HEAD requests have separate safe retries. |
 | Research root refusal | Keep `workspacePath` inside an allowlisted root. |
 
 ## Memory, placement and disk

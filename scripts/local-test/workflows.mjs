@@ -19,6 +19,7 @@ import { execFileSync } from "node:child_process";
 import { writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { gradeExactJson } from "./workflow-json-grade.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const CLI = path.join(root, "packages/mcp/dist/agent-cli.js");
@@ -161,13 +162,7 @@ function runCase(workflow, model, item) {
   const filler = FILLER.filter((pattern) => pattern.test(answer));
   if (filler.length > 0) failures.push(`filler: ${filler.map(String).join(", ")}`);
   if (item.json) {
-    let parsed;
-    try {
-      parsed = JSON.parse(answer.replace(/^```(?:json)?\s*|\s*```$/g, ""));
-    } catch {
-      failures.push("not JSON");
-    }
-    for (const [field, ok] of Object.entries(item.json)) if (parsed && !ok(parsed[field])) failures.push(`field ${field} = ${JSON.stringify(parsed?.[field])}`);
+    failures.push(...gradeExactJson(answer, item.json));
   }
   return { id: item.id, pass: failures.length === 0, failures, answer: answer.slice(0, 600), words: words(answer), outputTokens: receipt?.metrics?.output_tokens, seconds: (Date.now() - started) / 1000 };
 }

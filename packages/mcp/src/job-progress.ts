@@ -150,8 +150,15 @@ export function jobProgressMessage(job: Fields): string {
       const expected = number(detail?.expected_load_ms);
       return `loading ${model ?? "model"}${expected !== undefined ? ` (~${seconds(expected)})` : ""}${evictedSuffix(detail)}`;
     }
-    case "running":
+    case "running": {
+      // A streaming chat job counts its tokens: report liveness, never the text itself.
+      const tokens = number(detail?.generated_tokens);
+      if (reason === "generating" && tokens !== undefined) {
+        const rate = number(detail?.tokens_per_second);
+        return `generating on ${model ?? "model"}: ${tokens} tokens${rate !== undefined ? `, ${rate} tok/s` : ""}`;
+      }
       return model ? `running ${model}` : "running";
+    }
     default:
       return status.replace(/_/g, " ");
   }
@@ -357,9 +364,21 @@ export async function runWithJobProgress(
         }
         failures += 1;
         if (failures >= MAX_POLL_FAILURES) {
-          // Nobody will follow the job any more; do not leave it running.
+          // Nobody will follow the job any more; do not leave it running or lose its execution identity.
           cancel();
-          throw error;
+          const described = describe(error);
+          const failure = {
+            code: "task_job_poll_failed",
+            error: `Polling accepted job ${id} failed: ${error instanceof Error ? error.message : String(error)}. `
+              + "Cancellation was requested; execution outcome is unknown and the task must not be replayed.",
+            job_id: id,
+            last_observed_status: job.status,
+            execution_outcome: "unknown",
+            retry_safe: false,
+            cancellation_requested: true,
+            ...(described.body ? { cause: described.body } : {}),
+          };
+          throw options.failure?.(failure, described.status) ?? new Error(JSON.stringify(failure));
         }
       }
     }

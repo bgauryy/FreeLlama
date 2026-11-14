@@ -1,0 +1,9 @@
+# llama-swap config for the common GGUF cohort: the same llama-server flags as the direct
+# llama.cpp entry, started on demand by llama-swap. Replace MODEL_GGUF with the verified blob.
+healthCheckTimeout: 120
+models:
+  bench-model:
+    cmd: >
+      llama-server -m MODEL_GGUF
+      --host 127.0.0.1 --port ${PORT} -c 4096 -ngl 99 --jinja --seed 42
+      --reasoning-budget 0 --no-webui

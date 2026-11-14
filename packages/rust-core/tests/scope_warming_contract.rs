@@ -532,7 +532,7 @@ async fn warm_immediate_unload_reports_final_residency() {
         &platform,
         "POST",
         "warm",
-        json!({"model":"test:latest","keep_alive":"0"}),
+        json!({"model":"test:latest","context_tokens":4096,"keep_alive":"0"}),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{result}");

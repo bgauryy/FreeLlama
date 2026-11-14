@@ -244,7 +244,8 @@ async fn cpu_and_unknown_runner_evidence_preserve_observed_gates() {
     assert_eq!(entry["execution"]["observation"]["size"], 2000);
     assert_eq!(entry["execution"]["observation"]["processor"], "cpu");
     assert_eq!(entry["execution"]["observation"]["status"], "verified");
-    let route = json!({"model":"cpu:profile","min_placement_evidence":"observed"});
+    let route =
+        json!({"model":"cpu:profile","context_tokens":4096,"min_placement_evidence":"observed"});
     let (status, preview) = request(&platform, "POST", "routes", route.clone()).await;
     assert_eq!(status, StatusCode::OK, "{preview}");
     let mut task = route.clone();

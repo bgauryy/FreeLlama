@@ -8,6 +8,15 @@ prompts, and new loads held until they fit in memory, for your coding agent and 
 FreeLlama sits between you (or your agent) and [Ollama](https://ollama.com). Ollama runs the
 models; FreeLlama decides which model, how, and whether there is room for it.
 
+**In numbers** ([benchmark](docs/BENCHMARK.md), one Apple M2 Pro, 2026-11-14):
+
+| | Measured |
+|---|---|
+| Speed | 274 ms median per task against 272 ms for Ollama alone; first streamed token 95 vs 93 ms |
+| Cost of the layer | 3.7 ms per task (p95 9.8 ms), 9.7 ms of CPU, 26–31 MB of RAM |
+| Answers | Built-in workflow prompts passed 98% of graded cases where one-line prompts passed 52%, faster and with 36% fewer tokens |
+| Memory | A 7.2 GB load with 4.2 GB free was refused with the programs holding memory, instead of swapping |
+
 ```mermaid
 flowchart LR
     ask["A request:<br/>workflow, job or model"] --> pick["1. Pick<br/>a tested model that is<br/>installed and fits now"]
@@ -67,8 +76,8 @@ Over a session it also keeps the machine efficient:
 | **Fast hand-off** | The service answers the moment a job is done | A short task on a loaded model in about 0.2 s |
 
 *Measured on one Apple M2 Pro (32 GB) with Ollama 0.40.15, on 2026-11-10. These are single-machine
-results, not general speed claims. Method and numbers: [Comparison](docs/COMPARISON.md) and
-[Testing](docs/TESTING.md).*
+results, not general speed claims. The current benchmark, with every KPI and how it was measured:
+[Benchmark](docs/BENCHMARK.md); workflow checks: [Testing](docs/TESTING.md).*
 
 The name means less metered inference, not only Meta's Llama models.
 
@@ -76,7 +85,7 @@ The name means less metered inference, not only Meta's Llama models.
 
 | You need | Why |
 |---|---|
-| [Ollama](https://ollama.com/download) running (`ollama list` works) with at least one model | FreeLlama manages Ollama. It does not install, start or replace Ollama, and it never downloads a model without your approval |
+| [Ollama](https://ollama.com/download) running (`ollama list` works) with at least one model | FreeLlama manages Ollama and never downloads a model without your approval. Only the one-line installer below offers to install Ollama, and only after asking you |
 | Node.js 22 or newer | Runs the MCP server, the agent commands (`run`, `chat`, `gateway`…) and the npm launcher |
 | One of the platforms below | npm installs the matching prebuilt binary as an optional dependency; do not install with `--omit=optional` |
 
@@ -99,11 +108,25 @@ flowchart LR
     cmd["freellama run, chat,<br/>gateway, status"] --> up{"Ollama answers?"}
     up -->|yes| go["Runs"]
     up -->|no| inst{"Ollama installed?"}
-    inst -->|no| m["Ollama is not installed. Please install Ollama:<br/>https://ollama.com/download<br/>(exit 1)"]
+    inst -->|no| m["Ollama is not installed. Install it with<br/>curl -fsSL https://ollama.com/install.sh #124; sh<br/>or from https://ollama.com/download (exit 1)"]
     inst -->|yes| st["Ollama is installed but not running:<br/>open the Ollama app or run ollama serve<br/>(exit 75, retry)"]
 ```
 
 ## Install
+
+One line installs FreeLlama and, if you agree, Ollama:
+
+| System | Command |
+|---|---|
+| macOS, Linux | `curl -fsSL https://raw.githubusercontent.com/bgauryy/FreeLlama/main/scripts/install.sh \| sh` |
+| Windows (PowerShell) | `irm https://raw.githubusercontent.com/bgauryy/FreeLlama/main/scripts/install.ps1 \| iex` |
+
+It installs the npm package when npm is on PATH, otherwise the checksum-verified binary. When
+Ollama is missing it asks before running Ollama's official installer; add `sh -s -- --with-ollama`
+or `sh -s -- --no-ollama` to decide up front. It never downloads a model:
+run `freellama init` next to see what is installed and what fits.
+
+Or install one part yourself:
 
 | For | Install | Then |
 |---|---|---|
@@ -202,7 +225,9 @@ FreeLlama's admission and telemetry.
 | Area | What it does | Where |
 |---|---|---|
 | **Model choice** | Tested picks per job (coding, summarizing, OCR, image questions, classification, code search, duplicates), each marked installed or not and fitting now or not. Strong-model workflows take the strongest pick that fits, light work the job's default; short memory falls back to a model that fits | `freellama catalog`, `models {view:"catalog"}` |
-| **Workflows** | 15 tested instructions for small models: `fix-bug`, `change-code`, `implement`, `write-tests`, `review-code`, `explain-code`, `summarize-log`, `summarize-text`, `summarize-diff`, `extract-json`, `read-text`, `read-table`, `read-fields`, `answer-image`, `describe-screen`. Sampling comes from each model's card; prompts are checked by an eval | `-w NAME`, `run_task {workflow}`, `scripts/local-test/workflows.mjs` |
+| **Streaming with receipts** | Managed tasks stream their tokens as server-sent events (`route`, `admission`, `delta`, then `done` with the full receipt); first token as fast as Ollama's (95 vs 93 ms). MCP shows "generating on MODEL: N tokens, R tok/s" while a job runs | `POST /_freellama/v1/tasks {stream:true}`, [Every API](docs/API.md) |
+| **Where the time went** | Each receipt's `timing` splits a task by phase (discover, admission, Ollama's answer, placement, learning…) and gives FreeLlama's own `overhead_ms` | `--json`, `response_file`, [Architecture](docs/ARCHITECTURE.md#request-shapes) |
+| **Workflows** | 15 tested instructions for small models: `fix-bug`, `change-code`, `implement`, `write-tests`, `review-code`, `explain-code`, `summarize-log`, `summarize-text`, `summarize-diff`, `extract-json`, `read-text`, `read-table`, `read-fields`, `answer-image`, `describe-screen`. Sampling comes from each model's card; prompts are checked by an eval (98% of graded cases against 52% for one-line prompts, [measured](docs/BENCHMARK.md#built-in-prompts-measured)) | `-w NAME`, `run_task {workflow}`, `scripts/local-test/workflows.mjs` |
 | **Your own workflows** | A Markdown file per workflow (job, title, instructions) in `~/.octocode/freellama/workflows/`. It runs like a built-in, replaces one of the same name, and the receipt names the file and its digest; a bad file is skipped with the reason | [Your own workflows](docs/PROMPTS.md#your-own-workflows), `freellama workflows` |
 | **Fallback chains** | Up to 4 models to try in order, each only after the one before was refused before it ran (no room, input over its context, not installed). Never after a model started; every attempt is in the receipt | `run_task {fallbackModels}`, `--fallback TAG` |
 | **Structured output** | A field list (`'name, age int, tags list'`) or a JSON schema | `--schema` |
@@ -250,8 +275,34 @@ work on a machine that is also doing other work:
 | llama.cpp, oMLX, vLLM | You want engine-level control: batching, KV caches, kernels |
 
 FreeLlama does not make Ollama decode faster, has no chat UI, no automatic failover between engines
-and no scheduling across machines. The full comparison, with sources, what is and is not specific
-to FreeLlama, and dated measurements, is in [Comparison](docs/COMPARISON.md).
+and no scheduling across machines.
+
+### Benchmarks
+
+Ollama alone, FreeLlama on Ollama, and the most popular alternatives by GitHub stars, on the same
+task and the same hash-verified model file (Apple M2 Pro, 32 GB, 2026-11-14). Every one of the 300
+answers was correct.
+
+![Ollama, FreeLlama, llama.cpp, LocalAI and llama-swap on six measured KPIs: median task time 272, 274, 336, 802 and 332 ms; first token 93, 95, 128, 541 and 130 ms; throughput at 4 clients 225, 221, 291, 145 and 305 per minute; cold request 1.13, 1.21, n/a, 3.39 and 1.58 s; plus what FreeLlama adds: 3.7 ms overhead, 98% vs 52% with built-in prompts, 9.7 ms CPU and 30 MB RAM, loads that would not fit refused](docs/assets/benchmark-overview.png)
+
+| | Ollama | **FreeLlama** | llama.cpp | LocalAI | llama-swap |
+|---|---:|---:|---:|---:|---:|
+| GitHub stars | 187k | — (runs on Ollama) | 135k | 50k | 6k |
+| Median task time | 272 ms | **274 ms** | 336 ms | 802 ms | 332 ms |
+| p95 task time | 290 ms | **303 ms** | 375 ms | 911 ms | 372 ms |
+| First token | 93 ms | **95 ms** (streamed) | 128 ms | 541 ms | 130 ms |
+| Tasks/min, 1 client | 209 | **206** | 178 | 76 | 178 |
+| Tasks/min, 4 clients | 225 | **221** | 291 | 145 | 305 |
+| Cold request | 1.13 s | **1.21 s** | loads at start | 3.39 s | 1.58 s |
+| Refuses a load that won't fit in free memory | No (refuses only above total RAM) | **Yes**: refused 7.2 GB with 4.2 GB free | No (frees room, then loads anyway) | VRAM budget cap | No (declared pools) |
+| Picks an installed model that fits now, per job | No | **Yes** | No | Hardware recommendations | No |
+| Built-in tested prompts per job | — | **98%** of graded cases vs 52% with one-line prompts | — | — | — |
+| MCP server for coding agents | — | **Yes** | — | — | — |
+
+FreeLlama keeps Ollama's speed (its own work is 3.7 ms and 9.7 ms of CPU per task, 30 MB of RAM)
+and adds model choice, tested prompts, a memory gate and receipts. llama.cpp and llama-swap serve
+concurrent clients faster; LocalAI trades speed for breadth. What to use for what you are building,
+and how every number was measured: [Benchmark](docs/BENCHMARK.md).
 
 ## Under the hood
 
@@ -318,7 +369,7 @@ gate, admission and routing are described in [Architecture](docs/ARCHITECTURE.md
 | MCP tools, schemas, configuration | [MCP reference](packages/mcp/README.md), [MCP configuration](packages/mcp/CONFIGURATION.md) |
 | Operating procedure for agents | [FreeLlama skill](skills/freellama/SKILL.md) |
 | Features, routing and admission in depth | [Features](docs/FEATURES.md) |
-| How it compares, with sources and measurements | [Comparison](docs/COMPARISON.md) |
+| Actual vendor checks, numbers, limits and protocol | [Benchmark](docs/BENCHMARK.md) |
 | Choosing a model | [Model selection](docs/MODEL_SELECTION.md), [local model catalog](docs/LOCAL_MODELS.md) |
 | Model forms, measured results | [Model forms and results](docs/MODEL_FORMS_AND_RESULTS.md) |
 | Recipes per job | [Cookbooks](docs/cookbooks/README.md) |

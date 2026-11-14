@@ -8,15 +8,20 @@ import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const BLOB = "https://github.com/bgauryy/FreeLlama/blob/main/";
+const RAW = "https://raw.githubusercontent.com/bgauryy/FreeLlama/main/";
 const COPIES = ["packages/mcp/README.md", "packages/cli/README.md"];
 
 /**
- * Root-relative links as GitHub URLs. Absolute and in-page links stay, and so do images: each
- * package ships its own copy (`assets/logo.jpg` is in its `files`).
+ * Root-relative links as GitHub URLs. Absolute and in-page links stay, and so do images under
+ * `assets/`: each package ships its own copy (`assets/logo.jpg` is in its `files`). Other images,
+ * such as the benchmark charts in `docs/assets/`, are not in the tarball and load from GitHub.
  */
 export function packageReadme(markdown) {
-  return markdown.replace(/\]\((?!https?:|mailto:|#)([^)\s]+)\)/g, (match, target) =>
-    /\.(png|jpe?g|gif|svg|webp)$/i.test(target) ? match : `](${BLOB}${target.replace(/^\.\//, "")})`);
+  return markdown.replace(/\]\((?!https?:|mailto:|#)([^)\s]+)\)/g, (match, target) => {
+    const file = target.replace(/^\.\//, "");
+    if (!/\.(png|jpe?g|gif|svg|webp)$/i.test(file)) return `](${BLOB}${file})`;
+    return file.startsWith("assets/") ? match : `](${RAW}${file})`;
+  });
 }
 
 const expected = packageReadme(readFileSync(path.join(root, "README.md"), "utf8"));

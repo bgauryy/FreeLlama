@@ -241,7 +241,7 @@ export function registerOllamaLifecycleTools(server: McpServer, pullDependencies
     "ollama_manage",
     {
       description:
-        "Use when: loading or freeing a model. warm loads an installed model before a burst and evaluates an optional systemPrompt/messages into the prompt cache; " +
+        "Use when: loading or freeing a model. warm loads an installed model before a burst and evaluates an optional systemPrompt/messages into the prompt cache, which later run_task calls reuse only with the same model, contextTokens and an identical systemPrompt/messages prefix; " +
         "unload frees memory (a model you warmed or the user named). " +
         "Do not use when: downloading (ollama_pull; action pull is deprecated and refused), deleting (ollama_delete) or searching (models). Returns: a receipt with status.",
       inputSchema: z.object({

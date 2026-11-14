@@ -24,8 +24,8 @@ Start with the [repository README](https://github.com/bgauryy/FreeLlama/blob/mai
 | Give `delegate_research` (octocode adapter) the Octocode CLI in under 30 lines | [Local tools](octocode/LOCAL.md), [GitHub tools](octocode/GITHUB.md) |
 | Understand task and resource ownership | [Architecture](ARCHITECTURE.md) |
 | See every feature, routing and admission in depth, and why FreeLlama exists | [Features](FEATURES.md) |
-| Compare FreeLlama with Ollama, llama.cpp, llama-swap, LocalAI, Lemonade, LM Studio, oMLX, Docker Model Runner, LiteLLM and terminal preset tools | [Comparison](COMPARISON.md) |
 | See supported model forms and dated measured results | [Model forms and results](MODEL_FORMS_AND_RESULTS.md) |
+| Read the competitor review, measured vendor results, limits and protocol | [Benchmark](BENCHMARK.md) |
 | Reduce reloads, prompt cost and memory; tune Ollama settings | [Tuning](TUNING.md) |
 | See how local-model prompts are written, checked and changed; write your own workflows | [Local prompts](PROMPTS.md), [your own workflows](PROMPTS.md#your-own-workflows) |
 | Build from source; read operating notes (response store, port 11435, certificates) | [Build and notes](BUILD_AND_NOTES.md) |

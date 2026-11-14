@@ -94,13 +94,13 @@ export function registerSweepTool(server: McpServer): void {
       description:
         "Use when: a large divisible check (code tree, logs, docs site) should run chunk by chunk on a local model in the background; " +
         "each result is saved and you read only flagged chunks. start returns at once; wait (<=50 s) follows it; results pages " +
-        "flagged|unsure|failed|changed|all; resume continues after a restart; `baseline` reuses an earlier sweep for unchanged chunks. " +
-        "Do not use when: a few items (run_task tasks). Returns: status; results cite path:Lstart-Lend or url#n.",
+        "flagged|unsure (within 0.15 below a flag threshold)|failed|changed|all; resume continues after a restart; `baseline` reuses an earlier sweep for unchanged chunks. " +
+        "Clear chunks are screened, not proven clean: verify flagged ones and treat the rest as unaudited. Do not use when: a few items (run_task tasks), or finding related files (embedding + nearest). Returns: status; results cite path:Lstart-Lend or url#n.",
       inputSchema: z.object({
         action: z.enum(["start", "status", "wait", "results", "cancel", "resume", "list"]),
         sweepId: z.string().length(36).optional(),
         name: z.string().min(1).max(120).optional(),
-        files: z.array(z.string().min(1)).min(1).max(2_000).optional(),
+        files: z.array(z.string().min(1)).min(1).max(2_000).optional().describe("paths or globs, as run_task files"),
         urls: z.array(z.url({ protocol: /^https?$/ })).min(1).max(20).optional().describe("public pages; robots.txt honored"),
         crawl: z.object({ sameOrigin: z.boolean(), maxPages: z.number().int().max(200), maxDepth: z.number().int().max(5), include: z.string() })
           .partial().optional().describe("defaults: true, 20 pages, depth 1; include is a link regex"),

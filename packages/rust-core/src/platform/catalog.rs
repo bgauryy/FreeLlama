@@ -54,7 +54,7 @@ fn split_capabilities(show: &Value) -> (BTreeSet<Capability>, Vec<String>) {
 }
 
 pub(crate) async fn discover_models(state: &PlatformState) -> Result<Vec<CatalogModel>, ApiError> {
-    state.refresh_ollama_settings().await;
+    state.refresh_ollama_settings_soon();
     if let Some(mut models) = snapshot_catalog(&state.catalog_cache).await {
         refresh_residency(state, &mut models).await?;
         return Ok(models);
@@ -71,7 +71,7 @@ pub(crate) async fn discover_for_route(
     let Some(requested) = pinned_model else {
         return discover_models(state).await;
     };
-    state.refresh_ollama_settings().await;
+    state.refresh_ollama_settings_soon();
     let name = assigned_pin_name(&state.cpu_models, requested);
     // Family-only aliases can span both backends; keep the router's global ambiguity rules.
     if name == requested
@@ -118,12 +118,48 @@ fn assigned_pin_name(cpu_models: &BTreeSet<String>, requested: &str) -> String {
     requested.to_owned()
 }
 
+/// How long a filled catalog (installed tags and their metadata) is reused.
+const CATALOG_TTL: Duration = Duration::from_secs(30);
+/// How long one endpoint's `/api/tags` answers pinned requests. Ollama reads every manifest
+/// from disk for it (13-43 ms on a 12-model host), once per pinned request before.
+const ENDPOINT_TAGS_TTL: Duration = Duration::from_secs(10);
+
+/// One endpoint's `/api/tags`, from a read under [`ENDPOINT_TAGS_TTL`] old unless `fresh`; the
+/// flag says whether it came from that cache. Only successful reads are kept.
+async fn endpoint_tags(
+    state: &PlatformState,
+    upstream: &str,
+    fresh: bool,
+) -> Result<(Value, bool), ApiError> {
+    let cached = (!fresh)
+        .then(|| {
+            state
+                .endpoint_tags
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(upstream)
+                .filter(|(at, _)| at.elapsed() < ENDPOINT_TAGS_TTL)
+                .map(|(_, tags)| tags.clone())
+        })
+        .flatten();
+    if let Some(tags) = cached {
+        return Ok((tags, true));
+    }
+    let tags = get_json(&state.client, upstream, "/api/tags").await?;
+    state
+        .endpoint_tags
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(upstream.to_owned(), (Instant::now(), tags.clone()));
+    Ok((tags, false))
+}
+
 async fn snapshot_catalog(cache: &CatalogCache) -> Option<Vec<CatalogModel>> {
     cache
         .read()
         .await
         .as_ref()
-        .filter(|(saved, _)| saved.elapsed() < Duration::from_secs(30))
+        .filter(|(saved, _)| saved.elapsed() < CATALOG_TTL)
         .map(|(_, models)| models.clone())
 }
 
@@ -340,22 +376,31 @@ async fn model_from_endpoint(
         }
     }
     let (tags, ps) = tokio::join!(
-        get_json(&state.client, upstream, "/api/tags"),
+        endpoint_tags(state, upstream, false),
         get_json(&state.client, upstream, "/api/ps")
     );
-    let tags = tags?;
+    let (mut tags, mut cached) = tags?;
     let resident = running_models(ps?)?;
-    let entries = tags["models"]
-        .as_array()
-        .context("Ollama tags response has no models")
-        .map_err(ApiError::upstream)?;
-    let names: Vec<_> = entries
-        .iter()
-        .filter_map(crate::ollama_http::ps_entry_name)
-        .collect();
-    let Some(name) = endpoint_name(&names, requested, family_fallback)? else {
-        return Ok(None);
+    let name = loop {
+        let entries = tags["models"]
+            .as_array()
+            .context("Ollama tags response has no models")
+            .map_err(ApiError::upstream)?;
+        let names: Vec<_> = entries
+            .iter()
+            .filter_map(crate::ollama_http::ps_entry_name)
+            .collect();
+        if let Some(name) = endpoint_name(&names, requested, family_fallback)? {
+            break name.to_owned();
+        }
+        // A tag pulled since the cached read is not missing: read the endpoint again once.
+        if !cached {
+            return Ok(None);
+        }
+        (tags, cached) = endpoint_tags(state, upstream, true).await?;
     };
+    let name = name.as_str();
+    let entries = tags["models"].as_array().map_or(&[][..], Vec::as_slice);
     let Some(entry) = entries
         .iter()
         .find(|entry| crate::ollama_http::ps_entry_name(entry) == Some(name))
@@ -374,13 +419,21 @@ async fn model_from_endpoint(
             show.as_ref(),
             &resident,
         ))),
-        ShowOutcome::Changed => Err(ApiError::new(
-            StatusCode::CONFLICT,
-            format!(
-                "installed model {name} changed while its metadata was read; refusing to attach old metadata to a new revision"
-            ),
-        )
-        .with_code("model_identity_changed")),
+        ShowOutcome::Changed => {
+            // The cached tag list may name the old revision: the next request reads it again.
+            state
+                .endpoint_tags
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(upstream);
+            Err(ApiError::new(
+                StatusCode::CONFLICT,
+                format!(
+                    "installed model {name} changed while its metadata was read; refusing to attach old metadata to a new revision"
+                ),
+            )
+            .with_code("model_identity_changed"))
+        }
         ShowOutcome::Unavailable => Err(ApiError::upstream(format!(
             "metadata unavailable for installed model {name}"
         ))),

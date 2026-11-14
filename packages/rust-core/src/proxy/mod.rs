@@ -36,7 +36,7 @@ pub use hooks::{
     RawOutcome, RawUsage,
 };
 pub use retry::RestartAction;
-pub(crate) use retry::{MAX_ATTEMPTS, retry_delay, retryable_upstream_status};
+pub(crate) use retry::{MAX_ATTEMPTS, retry_delay};
 pub(crate) use upstreams::validate as validate_upstreams;
 pub use upstreams::{OpenAiUpstream, load_upstreams};
 
@@ -129,6 +129,8 @@ pub fn app(config: ProxyConfig) -> Result<Router> {
             builder
                 .connect_timeout(CONNECT_TIMEOUT.min(config.request_timeout))
                 .read_timeout(config.request_timeout)
+                // Preserve upstream 3xx responses instead of silently replaying a POST.
+                .redirect(reqwest::redirect::Policy::none())
         })
         .context("build upstream HTTP client")?,
         request_body_timeout: config.request_timeout,

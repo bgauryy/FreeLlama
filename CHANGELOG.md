@@ -4,6 +4,94 @@ All notable changes to FreeLlama are recorded here. Versions follow [Semantic Ve
 every npm package (`@octocodeai/freellama`, `@octocodeai/freellama-mcp-server`, the native platform
 packages) and the Rust crates share one version, set with `yarn release:version <semver>`.
 
+## [Unreleased]
+
+### Added
+
+- **Streamed managed tasks.** `POST /_freellama/v1/tasks` with `"stream": true` answers with
+  server-sent events: `route`, `admission` phases, a `delta` per generated piece, then `done` with
+  the same receipt a non-streaming call returns (or `error` with `retry_safe`). Fallback, admission
+  and the memory gate are unchanged; a client that disconnects stops generation upstream. Only
+  generating tasks stream; anything else is refused with 422 `stream_unsupported`.
+- **Token progress for MCP `run_task`.** A deferred chat job counts its tokens, and MCP progress
+  reads "generating on MODEL: N tokens, R tok/s" instead of a bare "running".
+- **Where the time went.** Every managed receipt has `timing`: milliseconds per phase inside
+  `serve` (`discover_ms`, `prepare_ms`, `admission_ms`, `upstream_ms`, `placement_ms`,
+  `learning_ms`, `persist_ms`…) and `overhead_ms`, everything except Ollama's own answer.
+- **Benchmark harness.** macOS available memory (the core's estimate), process RSS and `size_vram`
+  per block; the model unloaded between Ollama-backed blocks; a load gate
+  (`--max-load-per-cpu`); `--concurrency 2,4,8`; `--cold`; `--hog-gb` with `memory-hog.mjs`;
+  the `freellama-stream` protocol with client first-token time; pooled reports from repeated
+  `--report`; preflight reports owned-start vendors and checks the manifest's weight layer.
+
+- **One-line install.** `curl -fsSL https://raw.githubusercontent.com/bgauryy/FreeLlama/main/scripts/install.sh | sh`
+  on macOS and Linux, or `irm …/scripts/install.ps1 | iex` on Windows, installs FreeLlama: the npm
+  package when npm is on PATH, otherwise the checksum-verified binary of the latest release. When
+  Ollama is missing, the script asks before running Ollama's official installer
+  (`--with-ollama` / `--no-ollama` decide up front) and never downloads a model. A pinned
+  `--version` still installs the verified binary, as before. The "Ollama is not installed" message
+  from the CLI, the MCP server and `freellama init` now names the same one-line command. Ollama is
+  not bundled: its own download is 177 MB on macOS and about 1.5 GB on Linux and Windows, and a
+  second copy would compete with an existing install for port 11434.
+
+### Changed
+
+- **Managed-path overhead down about 6×.** Profiling with the new `timing` field found three costs
+  on every request: an `/api/tags` read for a pinned model (Ollama reads every manifest, 13–43 ms),
+  a host-sampling wait every 2 s (up to ~55 ms), and the feedback database write (5–11 ms). Pinned
+  requests now reuse an endpoint's tag list for 10 s (read again at once for a tag it does not
+  name), host samples older than 2 s are refreshed in the background (a reader still waits past
+  6 s or after a load), the Ollama settings probe runs in the background, and learned state is
+  written after the response, coalesced. Same host and load: median overhead 22.9 → 3.7 ms, p90
+  60.3 → 5.6 ms.
+- **The pressure sweep keeps runners other clients use.** Under swapping or OS memory pressure the
+  sweep released any runner with no FreeLlama task in flight, so it unloaded a model another client
+  used every 400 ms (seen in the 2026-11-14 benchmark). It now treats an Ollama `expires_at` that
+  moved since its last check as recent use (`used_elsewhere` in the audit), and keeps a 15 s idle
+  floor (`warming.min_seconds`) under pressure instead of none.
+
+- **Agent-facing MCP text, checked by interview.** The server instructions and tool descriptions
+  now answer gaps that two or more of three Claude Haiku interviews raised, each fact checked
+  against the code:
+  - send one of `workflow`, `job` or `task` (a conflict is refused), and `workflow` and `job` apply
+    to the whole batch;
+  - where `session_id`, `job_id` and the next `scopeRevision` come from, and that a fork returns a
+    new `scope_id` at revision 0;
+  - a warmed prompt cache is reused only with the same model, `contextTokens` and an identical
+    prefix;
+  - `doctor` views, `models` views and the library `model` field;
+  - the `delegate_research` timeout formula, with the coder's `diff` and `applyCommand` now in its
+    output schema;
+  - `audio` points to the speech-to-text catalog job;
+  - sweep: globs, the meaning of "unsure", and that clear chunks are not proven clean;
+  - a decision probability's coin-flip band;
+  - finding related files uses embedding + `nearest`, not sweep.
+
+  Over three interviews each, the 18-scenario score rose from 52/54 to 54/54, mean tool confidence
+  from 7.23 to 7.67, and unclear notes per run fell from 52 to 42. The model-facing surface grew
+  from 6,992 to 7,440 tokens (the budget is 7,450).
+- **Looser contract tests for agent text.** The protocol tests check the guardrails, limits and
+  identifiers agents act on (`approvedSizeBytes`, `job_id`, `scope.revision`, file caps), not whole
+  sentences, so the wording can improve without breaking them.
+- **Benchmark config names the model once.** In `scripts/bench/vendors.example.json`, Ollama and
+  FreeLlama inherit `model.ollama_tag`. The bench README says any GGUF chat model works, checked
+  with `preflight --hash-model`.
+- **One benchmark, with a bottom line.** [Benchmark](docs/BENCHMARK.md) now holds a single run
+  (2026-11-14, this build): what to use when, and a KPI table with real numbers for six setups.
+  Pooled medians: Ollama 272 ms, FreeLlama streamed 273, FreeLlama 274, llama-swap 332, llama.cpp
+  336, LocalAI 802; all 360 answers correct and identical. It adds throughput at 1 and 4 clients,
+  cold requests, decode speed, FreeLlama's overhead and its server's memory. The earlier runs and
+  their reports were removed. README charts: `docs/assets/benchmark-*.png`, drawn by
+  `scripts/bench/readme-charts.mjs`.
+- **A measured scorecard.** FreeLlama is rated on 11 measured KPIs (quality, time, first token,
+  load, switching, CPU, memory, GPU placement), each against parity with Ollama or a fixed bar:
+  9 met, 2 missed (cold request +7%, one unverified placement). The built-in workflow prompts were
+  measured against one-line prompts on `bonsai-2:9b`: 98% vs 52% of graded cases
+  (`scripts/local-test/baseline-prompts.mjs`).
+- **Feature comparison.** [Benchmark](docs/BENCHMARK.md#features-beyond-speed) compares ten runners
+  on memory checks, model suggestions, MCP, APIs, streaming and metrics, checked against their
+  docs on 2026-11-14. It notes that llama.cpp 1.0.0 and Ollama 0.40.16 shipped after the run.
+
 ## [0.12.0] - 2026-11-13
 
 ### Added
@@ -26,6 +114,12 @@ packages) and the Rust crates share one version, set with `yarn release:version 
 - **Idempotency keys from MCP and the agent commands.** `run_task {defer:true, idempotencyKey}` and
   `freellama run --defer --idempotency-key KEY` pass the durable-job key that the HTTP API already took.
 - **Stable refusal codes** `model_not_installed`, `model_not_eligible` and `model_exceeds_host_budget`.
+- **Sequential benchmark.** `docs/BENCHMARK.md` reviews the competing local runtimes and
+  lifecycle layers and records a measured run. Ollama, FreeLlama, llama.cpp, llama-swap and
+  LocalAI ran on the same hash-verified GGUF in two opposite orders. All five answered 60/60
+  correctly. FreeLlama's managed path was within 0–45 ms of Ollama; LocalAI was about 3× slower.
+  Each order has a standalone visual report. The runner now treats macOS `EPERM` from an owned
+  process group whose leader has exited as stopped, instead of halting.
 - **CI.** `.github/workflows/ci.yml` runs build, type check, Clippy, JavaScript and Rust tests and the
   release package checks on Ubuntu and macOS.
 
@@ -39,6 +133,11 @@ packages) and the Rust crates share one version, set with `yarn release:version 
 
 ### Fixed
 
+- **Inference replay safety.** Accepted inference and mutation requests no longer retry HTTP 500/502 or follow redirects. Connection-establishment retries and safe read retries remain; uncertain upstream outcomes explicitly report retry unsafe.
+- **Job and sweep recovery.** Failed polling retains accepted job identity and unknown execution; sweeps respect structured retry evidence instead of retry-looking error text.
+- **Embedding reuse and output bounds.** Indexed retrieval verifies execution identity, preserves explicit routing controls and rejects invalid cached vectors. Large nested response records use bounded previews with lossless record selection.
+- **Placement and stream evidence.** Post-run observations match digest/context, and malformed managed stream frames preserve partial output without claiming completion.
+- **Benchmark validity.** Added managed completion measurement and adversarial guards for model attribution, unknown execution, process cleanup, bounded capture and prerequisite evidence. No comparative performance win is claimed.
 - Docs said deferred jobs are always lost on restart; with `FREELLAMA_DURABLE_JOBS=1` finished
   receipts survive and unfinished ones read back as an unknown outcome. Monitoring said low available
   RAM only warns on macOS; it refuses a new load by default on every OS (`--low-memory advisory`

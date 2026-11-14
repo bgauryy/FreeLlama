@@ -52,62 +52,73 @@ describe("tool contract", () => {
     }
   });
 
+  // Pin the guardrails, limits and names agents act on, not the sentences around them, so the
+  // wording stays free to improve (re-check rewrites with an agent interview).
   it("teaches clients execution ownership and the model-installation approval gate", () => {
     const instructions = client.getInstructions() ?? "";
-    expect(instructions).toMatch(/so you spend fewer of your own tokens/);
-    expect(instructions).toMatch(/Offload when what you send plus what you read back costs less/);
-    expect(instructions).toMatch(/10 or more similar items, or an input over about 2,000 tokens/);
-    expect(instructions).toMatch(/Do it yourself: judgment you must stand behind/);
-    expect(instructions).toMatch(/Name inputs with files \(paths or globs under the server's working directory, the temp directory or FREELLAMA_FILE_ROOTS\); pasted text and base64 images are your own output tokens/);
-    expect(instructions).toMatch(/One task reads all its files together, so a glob gives one answer; for one answer per file send tasks:\[\{id, independent:true, task:\{files:\[path\]\}\}\]/);
-    expect(instructions).toMatch(/what the items share \(task, model, systemPrompt, questions, tools, format, options\) once at the top level/);
-    expect(instructions).toMatch(/Hosts cut calls near 60 s: for a cold load, a long input or a large batch pass defer:true/);
-    expect(instructions).toMatch(/For a large divisible check .* use sweep: it judges small chunks in the background, saves each result/);
-    expect(instructions).toMatch(/models\{view:"catalog", job\}.*pass that pick as model: routing without model picks by capability only and may choose one that does not fit now/);
-    expect(instructions).toMatch(/Keep one model per batch when you can; each extra model is a load and may evict another/);
-    expect(instructions).toMatch(/Warming a model saves local time, not your tokens/);
-    expect(instructions).toMatch(/You own prompts, output format and verification: local answers are candidates/);
-    expect(instructions).toMatch(/treat low decision probabilities as unknown/);
-    expect(instructions).toMatch(/models\{view:"catalog", job\}.*freellama:\/\/docs\/cookbooks\/<job>.*doctor\{view:"status"\} when a call fails.*Choose by capability, not by name/s);
-    expect(instructions).toMatch(/never stop their processes, then retry once they free memory, or use a smaller installed model with the same capability/);
-    expect(instructions).toMatch(/before ollama_pull, ask the user for one exact tag \(name:tag\) and its reported size, and pass that size as approvedSizeBytes; search results are not permission/);
-    expect(instructions).toMatch(/check isError first, then read the text/);
-    expect(instructions).toMatch(/Unload only a model you warmed \(when its burst ends\) or one the user named; delete only a tag the user names/);
-    expect(instructions).toContain("A server restart loses scopes, sessions and jobs; with FREELLAMA_DURABLE_JOBS=1 finished job receipts survive");
-    expect(instructions).toMatch(/executionPreference only chooses among eligible backends/);
-    expect(instructions).toContain("Docs: freellama://docs/index");
-    const runTask = byName.get("run_task")!;
-    expect(runTask.description).toMatch(/decision, embedding \+ `nearest`, vision, tools \(returns tool_calls you run\)/);
-    const runTaskFields = byName.get("run_task")!.inputSchema.properties;
-    expect(runTask.description).toMatch(/one `model` per batch avoids a cold load per model/);
-    expect(runTaskFields.model.description).toMatch(/routing picks by capability only.*name the catalog's pick/);
-    expect(runTaskFields.tools.description).toMatch(/check them, since small models call a tool when none is needed.*shared default/);
-    expect(runTaskFields.images.description).toMatch(/text in images: the catalog's ocr pick/);
-    expect(runTask.description).toMatch(/up to 64 independent items/);
-    expect(runTask.description).toMatch(/per-item fields override top-level defaults/);
-    expect(runTask.description).toMatch(/`preview:true` routes only/);
-    expect(runTask.description).toMatch(/near 60 s.*`defer:true` \(with `tasks`, one job per item\) and poll task_jobs get/);
-    expect(runTask.inputSchema.properties.preview.description).toMatch(/payload fields and runtime controls are refused; never executes/);
-    expect(runTask.inputSchema.properties.images.description).toMatch(/Needs an explicit vision `model`/);
-    expect(runTask.inputSchema.properties.files.description).toMatch(/4 MiB per text file, 8 MiB per image, 32 MiB total/);
-    expect(runTask.inputSchema.properties.questions.description).toMatch(/choice.*noul.*score/s);
-    expect(runTask.inputSchema.properties.nearest.description).toMatch(/default 5, max 100/);
-    expect(runTask.inputSchema.properties.maxWaitSeconds.description).toMatch(/max_queue_wait_seconds.*wait_limit/);
-    expect(byName.get("ollama_manage")!.inputSchema.properties.maxWaitSeconds.description).toMatch(/max_queue_wait_seconds.*wait_limit/);
-    expect(byName.get("ollama_manage")!.description).toMatch(/Do not use when: downloading \(ollama_pull; action pull is deprecated and refused\)/);
+    for (const contract of [
+      // When to offload, and what stays with the caller.
+      "10 or more similar items", "2,000 tokens", "Do it yourself", "You own prompts, output format and verification",
+      'models{view:"catalog", job}', "freellama://docs/cookbooks/<job>", 'doctor{view:"status"}', "Choose by the capabilities",
+      // Inputs, batches and long calls.
+      "FREELLAMA_FILE_ROOTS", "independent:true", "(up to 64)", "sweep", "defer:true", "Warming a model saves local time, not your tokens",
+      // Guardrails: memory, approval, unload and delete.
+      "never stop their processes", "one exact tag (name:tag) and its reported size", "approvedSizeBytes", "search results are not permission",
+      "Unload only a model you warmed", "delete only a tag the user names",
+      // Results and state.
+      "check isError first", "page.next_cursor", "next_offset", "FREELLAMA_DURABLE_JOBS=1", "executionPreference only chooses among eligible backends", "freellama://docs/index",
+    ]) expect(instructions, `instructions should keep: ${contract}`).toContain(contract);
+
+    const description = (name: string) => byName.get(name)!.description ?? "";
+    const field = (name: string, key: string) => byName.get(name)!.inputSchema.properties[key].description ?? "";
+    for (const [text, contract] of [
+      [description("run_task"), "up to 64 independent items"],
+      [description("run_task"), "`preview:true`"],
+      [description("run_task"), "`defer:true`"],
+      [description("run_task"), "per-item fields override top-level defaults"],
+      [field("run_task", "preview"), "never executes"],
+      [field("run_task", "images"), "vision `model`"],
+      [field("run_task", "files"), "4 MiB per text file, 8 MiB per image, 32 MiB total"],
+      [field("run_task", "nearest"), "default 5, max 100"],
+      [field("run_task", "maxWaitSeconds"), "max_queue_wait_seconds"],
+      [field("ollama_manage", "maxWaitSeconds"), "max_queue_wait_seconds"],
+      [description("ollama_manage"), "action pull is deprecated and refused"],
+      [description("ollama_manage"), "a model you warmed or the user named"],
+      [description("task_jobs"), "defer:true"],
+      [description("delegate_research"), "180 s"],
+      [description("delegate_research"), "verification.recommendation=escalate"],
+      [description("audio"), "audio input"],
+      [description("scope"), "run_task {scopeId, scopeRevision} (always together)"],
+    ] as const) expect(text).toContain(contract);
     expect(byName.get("ollama_pull")!.inputSchema.required).toContain("approvedSizeBytes");
-    expect(byName.get("ollama_manage")!.description).toMatch(/unload frees memory \(a model you warmed or the user named\)/);
-    expect(byName.get("task_jobs")!.description).toMatch(/run_task \{defer:true\}/);
-    expect(byName.get("delegate_research")!.description).toMatch(/killed after 180 s.*near 60 s/);
-    expect(byName.get("audio")!.description).toMatch(/needs audio input/);
-    expect(byName.get("scope")!.description).toContain("run_task {scopeId, scopeRevision} (always together)");
-    expect(byName.get("scope")!.description).toContain("run_task {scopeId, scopeRevision}");
     const requiredTaskFields = byName.get("run_task")!.inputSchema.required ?? [];
     expect(requiredTaskFields).not.toContain("scopeId");
     expect(requiredTaskFields).not.toContain("scopeRevision");
-    expect(instructions).toContain("check isError first, then read the text");
-    expect(instructions).toContain("Pass page.next_cursor (models) and next_offset (read_response) back unchanged");
-    expect(byName.get("delegate_research")!.description).toContain("discard verification.recommendation=escalate");
+  });
+
+  // Agents in the 2026-11-14 Haiku interviews could not act without these names. Pin the names,
+  // not the sentences, so the wording stays free to improve.
+  it("names the identifiers agents asked for in interviews", () => {
+    const required: Array<[string, string, string[]]> = [
+      ["_instructions", "", ["workflow, job or task", 'task:"embedding"', "nearest", "accepted_job_ids", "0.35", "approvedSizeBytes"]],
+      ["doctor", "", ["summary", "full", "status", "usage", "ollamaEndpoint"]],
+      ["session", "", ["session_id", "sessionId"]],
+      ["scope", "", ["scope_id", "scope.revision", "fork"]],
+      ["task_jobs", "", ["job_id", "accepted_job_ids"]],
+      ["ollama_manage", "", ["contextTokens", "systemPrompt"]],
+      ["delegate_research", "", ["applyCommand", "timeoutSeconds"]],
+      ["audio", "", ["speech-to-text"]],
+      ["sweep", "", ["unsure", "unaudited"]],
+      ["sweep", "files", ["glob"]],
+      ["models", "model", ["hf.co/"]],
+      ["models", "view", ["/api/tags"]],
+    ];
+    for (const [tool, key, names] of required) {
+      const text = tool === "_instructions" ? client.getInstructions() ?? ""
+        : key ? byName.get(tool)!.inputSchema.properties[key].description ?? ""
+        : byName.get(tool)!.description ?? "";
+      for (const name of names) expect(text, `${tool}${key ? `.${key}` : ""} should name ${name}`).toContain(name);
+    }
   });
 
   it("exposes a bounded placement preference instead of an unsafe backend override", () => {
@@ -585,6 +596,9 @@ describe("tool contract", () => {
     // +60 for delegate_research adapter "coder" and agent.commands (edits an isolated copy, returns a diff);
     // +~165 (7,404) for `output` and `outputPath` on run_task and delegate_research plus one instruction
     // clause: they keep long local answers out of the agent's context and under host output limits.
+    // 6,992 before and 7,440 after the 2026-11-14 interview fixes: one sentence per gap that two of three
+    // Haiku interviews raised (session/scope ids, job ids, cache reuse, sweep and audio links); they lifted
+    // the round-4 scenario score from 52/54 to 54/54. Trim elsewhere before raising the budget.
     const modelFacing = tools.map(({ name, description, inputSchema }) => ({ name, description, inputSchema }));
     const surfaceTokens = Math.round(
       (JSON.stringify(modelFacing).length + (client.getInstructions() ?? "").length) / 4,

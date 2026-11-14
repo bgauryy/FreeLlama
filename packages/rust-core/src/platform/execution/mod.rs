@@ -27,6 +27,7 @@ mod pipeline;
 mod request;
 pub(super) mod runner;
 mod select;
+mod timing;
 mod upstream;
 
 pub(super) use admit::{admit, transition_timeout};
@@ -271,6 +272,10 @@ pub(super) async fn run_task(
     use axum::response::IntoResponse;
     let Json(mut input) = input.map_err(|error| ApiError::invalid_task_request(&error))?;
     input.client = caller.map(|axum::Extension(caller)| caller.0.to_string());
+    if input.stream {
+        super::task_stream::validate(&input)?;
+        return Ok(super::task_stream::respond(state, input));
+    }
     if input.defer {
         return super::jobs::submit(state, input)
             .await

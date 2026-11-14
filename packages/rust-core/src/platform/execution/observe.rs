@@ -28,6 +28,8 @@ pub(crate) async fn observe_physical_placement(
     state: &PlatformState,
     execution: &ExecutionTarget,
     model: &str,
+    digest: Option<&str>,
+    context: Option<u64>,
 ) -> Value {
     let Ok(ps) = get_json(&state.client, &execution.upstream, "/api/ps").await else {
         return json!({
@@ -37,6 +39,18 @@ pub(crate) async fn observe_physical_placement(
             "source": "ollama_api_ps_after_execution"
         });
     };
+    placement_from_listing(&ps, execution.placement, model, digest, context)
+}
+
+/// A tag can have several resident revisions or contexts. Device counters from the first
+/// same-name runner are not evidence about this task; require one unambiguous identity match.
+fn placement_from_listing(
+    ps: &Value,
+    requested: Backend,
+    model: &str,
+    digest: Option<&str>,
+    context: Option<u64>,
+) -> Value {
     let Some(models) = ps.get("models").and_then(Value::as_array) else {
         return json!({
             "processor": "unknown",
@@ -45,19 +59,43 @@ pub(crate) async fn observe_physical_placement(
             "source": "ollama_api_ps_after_execution"
         });
     };
-    let running = models
+    let present = models
         .iter()
-        .find(|entry| crate::ollama_http::ps_entry_name(entry) == Some(model));
-    let Some(running) = running else {
+        .any(|entry| crate::ollama_http::ps_entry_name(entry) == Some(model));
+    if !present {
         return json!({
             "processor": "unknown",
             "status": "not_resident",
             "resident": false,
             "source": "ollama_api_ps_after_execution"
         });
+    }
+    let unknown = |reason| {
+        json!({
+            "processor":"unknown", "status":"unavailable", "resident":true,
+            "source":"ollama_api_ps_after_execution", "reason":reason,
+            "expected_digest":digest, "expected_context_length":context,
+        })
     };
+    let Some(digest) = digest.filter(|digest| !digest.is_empty()) else {
+        return unknown("expected_runner_digest_unavailable");
+    };
+    let Some(context) = context.filter(|tokens| *tokens > 0) else {
+        return unknown("expected_runner_context_unavailable");
+    };
+    let mut matching = models.iter().filter(|entry| {
+        crate::ollama_http::ps_entry_name(entry) == Some(model)
+            && entry["digest"].as_str() == Some(digest)
+            && entry["context_length"].as_u64() == Some(context)
+    });
+    let Some(running) = matching.next() else {
+        return unknown("matching_runner_identity_unavailable");
+    };
+    if matching.next().is_some() {
+        return unknown("matching_runner_identity_ambiguous");
+    }
     let mut observation = physical_placement_observation(
-        execution.placement,
+        requested,
         running.get("size").and_then(Value::as_u64),
         running.get("size_vram").and_then(Value::as_u64),
     );
@@ -107,4 +145,75 @@ pub(crate) fn physical_placement_observation(
         "size": size,
         "size_vram": size_vram,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::placement_from_listing;
+    use crate::platform::Backend;
+    use serde_json::{Value, json};
+
+    fn observe(entries: &Value, digest: Option<&str>, context: Option<u64>) -> Value {
+        placement_from_listing(
+            &json!({"models":entries}),
+            Backend::Gpu,
+            "model:tag",
+            digest,
+            context,
+        )
+    }
+
+    fn runner(digest: &str, context: u64, vram: u64) -> Value {
+        json!({"name":"model:tag","digest":digest,"context_length":context,"size":100,"size_vram":vram})
+    }
+
+    #[test]
+    fn post_run_placement_selects_the_requested_revision_and_context() {
+        let correct = runner("current", 4096, 0);
+        let result = observe(
+            &json!([
+                runner("old", 4096, 100),
+                runner("current", 2048, 100),
+                correct
+            ]),
+            Some("current"),
+            Some(4096),
+        );
+        assert_eq!(result["digest"], "current");
+        assert_eq!(result["context_length"], 4096);
+        assert_eq!(result["processor"], "cpu");
+        assert_eq!(result["status"], "mismatch");
+    }
+
+    #[test]
+    fn missing_or_ambiguous_runner_identity_never_verifies_placement() {
+        let correct = runner("current", 4096, 100);
+        for (entries, digest, context) in [
+            (json!([correct.clone()]), None, Some(4096)),
+            (json!([correct.clone()]), Some("current"), None),
+            (
+                json!([runner("old", 4096, 100)]),
+                Some("current"),
+                Some(4096),
+            ),
+            (
+                json!([runner("current", 2048, 100)]),
+                Some("current"),
+                Some(4096),
+            ),
+            (
+                json!([correct.clone(), correct]),
+                Some("current"),
+                Some(4096),
+            ),
+        ] {
+            let result = observe(&entries, digest, context);
+            assert_eq!(result["processor"], "unknown", "{result}");
+            assert_eq!(result["status"], "unavailable", "{result}");
+            assert_eq!(result["resident"], true, "{result}");
+        }
+        let missing = observe(&json!([]), Some("current"), Some(4096));
+        assert_eq!(missing["status"], "not_resident");
+        assert_eq!(missing["resident"], false);
+    }
 }

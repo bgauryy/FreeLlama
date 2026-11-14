@@ -1,0 +1,20 @@
+# LocalAI model config for the common GGUF cohort. Put it in the --models-path directory next
+# to bench-model.gguf (a symlink to the verified Ollama blob). Install the backend first:
+#   local-ai backends install llama-cpp-development --backends-path BACKENDS_DIR
+# The stable llama-cpp backend (LocalAI 4.12.1) rejects the lfm3 architecture.
+name: bench-model
+backend: llama-cpp-development
+context_size: 4096
+gpu_layers: 99
+f16: true
+mmap: true
+parameters:
+  model: bench-model.gguf
+  temperature: 0
+  seed: 42
+template:
+  use_tokenizer_template: true
+# Matches think:false (Ollama) and --reasoning-budget 0 (llama.cpp); otherwise the 64-token
+# cap is spent on reasoning and the answer is empty.
+reasoning:
+  disable: true

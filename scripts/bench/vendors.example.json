@@ -1,0 +1,64 @@
+{
+  "model": {
+    "ollama_tag": "lfm3-vl:2b-q4_K_M",
+    "artifact_sha256": "56dac2e192ff0d9ab8507f4f1aeb4aed0463449bbbefaac79497f041c95f21eb",
+    "quantization": "Q4_K_M",
+    "context_tokens": 4096,
+    "output_tokens": 64
+  },
+  "vendors": [
+    {
+      "id": "ollama",
+      "protocol": "ollama",
+      "base_url": "http://127.0.0.1:11434",
+      "enabled": true,
+      "cohort": "gguf"
+    },
+    {
+      "id": "freellama",
+      "protocol": "freellama-managed",
+      "base_url": "http://127.0.0.1:11435",
+      "enabled": true,
+      "cohort": "gguf"
+    },
+    {
+      "id": "freellama-stream",
+      "protocol": "freellama-stream",
+      "base_url": "http://127.0.0.1:11435",
+      "enabled": false,
+      "cohort": "gguf"
+    },
+    {
+      "id": "llama-cpp",
+      "protocol": "openai",
+      "base_url": "http://127.0.0.1:18080",
+      "model": "bench-model",
+      "enabled": true,
+      "cohort": "gguf"
+    },
+    {
+      "id": "llama-swap",
+      "protocol": "openai",
+      "base_url": "http://127.0.0.1:18084",
+      "model": "bench-model",
+      "enabled": true,
+      "cohort": "gguf"
+    },
+    {
+      "id": "localai",
+      "protocol": "openai",
+      "base_url": "http://127.0.0.1:18082",
+      "model": "bench-model",
+      "enabled": true,
+      "cohort": "gguf"
+    },
+    {
+      "id": "omlx",
+      "protocol": "openai",
+      "base_url": "http://127.0.0.1:18083",
+      "model": "SET_MATCHING_MLX_MODEL_ID",
+      "enabled": true,
+      "cohort": "mlx"
+    }
+  ]
+}

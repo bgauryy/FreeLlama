@@ -185,8 +185,33 @@ closes, which cancels generation upstream, and everything generated is kept with
 (`done_reason: "repeat_limit"`). A stopped stream has no Ollama timing fields, so it trains no
 throughput feedback. The receipt holds `route`, `admission` (`queue_wait_ms`,
 `resource_wait_ms`, `transition_wait_ms`, `total_wait_ms`), `execution` (placement, observation,
-`resource_admission`, `context_sizing`, `memory_reservation`), `metrics`, `feedback` and
-`response`, which is Ollama's own answer (`message.content`, `eval_count`, durations).
+`resource_admission`, `context_sizing`, `memory_reservation`), `metrics`, `feedback`, `timing` and
+`response`, which is Ollama's own answer (`message.content`, `eval_count`, durations). `timing` says
+where the task's time went inside `serve`, in milliseconds: `discover_ms`, `route_ms`,
+`prepare_ms`, `admission_ms`, `dispatch_ms`, `upstream_ms` (Ollama's whole answer),
+`placement_ms`, `learning_ms`, `persist_ms`, `receipt_ms`, `total_ms`, and `overhead_ms`
+(everything except `upstream_ms`). Learned feedback is written to disk after the response
+(`feedback.persistence.persisted: "queued"`); a failed write shows in health.
+
+`stream: true` answers with server-sent events (`text/event-stream`) instead of one JSON body. The
+task runs exactly as without it: same route, fallback chain, admission, memory gate and receipt.
+
+| Event | When | `data` |
+|---|---|---|
+| `route` | the model is chosen, before dispatch (once per fallback attempt) | `{selected_model, backend}` |
+| `admission` | queued, waiting for memory, loading, running | `{status, reason, detail?}`, the deferred-job phases |
+| `delta` | each generated piece | `{content}` or `{thinking}` |
+| `done` | finished | the receipt a non-streaming call returns |
+| `error` | refused or failed | the error body, `status` and `retry_safe` (false once a `delta` was sent) |
+
+Only generating tasks stream (`completion`, `coding`, `code_repair`, `vision`, `long_context`),
+without `defer`, `tools`, `questions`, `input` or `nearest`; anything else is refused before
+admission with 422 `stream_unsupported`. Fallback models advance only before generation starts. A
+client that disconnects aborts the task, which closes the upstream request so Ollama stops
+generating; nothing is replayed. `stop_on_repetition` keeps its meaning: streaming does not turn the
+loop stop on. A deferred chat job without tools reads Ollama's output the same way and shows
+`{generated_tokens, tokens_per_second}` in its status detail (reason `generating`), which MCP
+`run_task` reports as progress.
 
 `fallback_models` (up to 4 tags) is an explicit fallback chain run in the core
 (`platform/execution/fallback.rs`): the next model replaces `model` only when the attempt before it
@@ -215,8 +240,9 @@ architecture, and disk. `memory_bytes` is portable host RAM. `memory_kind` is `u
 when host and accelerator memory are known to share a pool; host RAM must not be treated as
 discrete GPU VRAM. Ollama's `/api/ps` remains the placement authority.
 
-All other paths use the compatibility proxy. It buffers request bodies up to 64 MB so a retry can
-resend identical bytes, then streams the upstream response. It removes hop-by-hop headers, adds
+All other paths use the compatibility proxy. It buffers request bodies up to 64 MB for admission
+and forwarding, then streams the upstream response. Requests are replayed only when execution
+is proven not to have started; buffering bytes does not make an inference retry safe. It removes hop-by-hop headers, adds
 `x-freellama-proxy: 1`, always targets the primary upstream, and does not apply CPU model
 assignment. Existing Ollama clients keep predictable compatibility; clients that opt into the
 managed API receive routing and policy behavior.
@@ -358,11 +384,11 @@ flowchart TD
     CR --> OQ
     CX --> OQ
     OQ --> SEND["Ollama schedules bounded request"]
-    SEND --> RETRY{"500, 502,<br/>or connection-establishment failure?"}
+    SEND --> RETRY{"Connection establishment failed<br/>before execution?"}
     RETRY -->|"Retryable"| OQ
     RETRY -->|"Success"| OBS["Query selected Ollama /api/ps"]
     OBS --> OUT["Route, assignment, physical observation,<br/>admission, metrics, and response"]
-    RETRY -->|"503, timeout, or final failure"| ERR["Return upstream error"]
+    RETRY -->|"HTTP error, timeout, or uncertain failure"| ERR["Return upstream error"]
 ```
 
 Admission is independent per backend and uses weighted fair round robin: interactive gets three
@@ -532,8 +558,10 @@ waits up to the raw queue wait (control API: the managed queue wait), then gets 
 `queue_wait_ms`, `resource_wait_ms`, `transition_wait_ms`, and
 their sum as `total_wait_ms`. Health and route receipts expose sampled pressure and reservations.
 
-HTTP `500` and `502` status codes and connection-establishment failures use bounded retry with backoff.
-HTTP `504`, transport timeouts and post-send disconnects are not replayed.
+Connection-establishment failures use bounded retry with backoff because they precede execution.
+Managed inference and raw mutation/inference requests are not replayed after HTTP `500` or `502`: an
+Ollama error may arrive after the runner has already performed work. Raw read-only GET/HEAD status
+failures may still be retried. HTTP `504`, transport timeouts and post-send disconnects are not replayed.
 FreeLlama does not retry `503 Service Unavailable` because retrying while holding admission can
 amplify overload. It does not retry a generation timeout because the first request might still run.
 

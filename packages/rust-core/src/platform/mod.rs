@@ -55,6 +55,7 @@ mod runtime;
 mod scopes;
 mod sessions;
 mod sweep;
+mod task_stream;
 mod tasks_api;
 mod telemetry;
 mod warming;
@@ -139,6 +140,8 @@ struct PlatformState {
     catalog_cache: CatalogCache,
     catalog_metadata: catalog::MetadataCache,
     catalog_refresh: Arc<Mutex<()>>,
+    /// Each endpoint's last `/api/tags` read, for pinned requests (`catalog::endpoint_tags`).
+    endpoint_tags: Arc<std::sync::Mutex<std::collections::HashMap<String, (Instant, Value)>>>,
     /// Per-backend load locks (primary and CPU): they serialize loads and unloads only.
     load_lock: Arc<Mutex<()>>,
     cpu_load_lock: Arc<Mutex<()>>,
@@ -148,6 +151,8 @@ struct PlatformState {
     /// The shared database, when this server persists what it learns.
     store: Option<crate::store::Store>,
     feedback_persistence_error: Arc<RwLock<Option<String>>>,
+    /// A background feedback write is queued and has not read the feedback yet.
+    feedback_write_queued: Arc<std::sync::atomic::AtomicBool>,
     auth_required: bool,
     /// Client keys, for the usage view of their budgets.
     clients: Arc<[clients::ClientKey]>,
@@ -172,6 +177,20 @@ struct PlatformState {
 }
 
 impl PlatformState {
+    /// [`Self::refresh_ollama_settings`] without making the caller wait: a task's route reads the
+    /// settings seen at most a few seconds ago, and a stale probe is started for the next one.
+    /// The process inspection took tens of milliseconds every five seconds on the request path.
+    fn refresh_ollama_settings_soon(&self) {
+        let due = self
+            .ollama_refresh
+            .try_lock()
+            .is_ok_and(|refreshed| refreshed.elapsed() >= Duration::from_secs(5));
+        if due {
+            let state = self.clone();
+            tokio::spawn(async move { state.refresh_ollama_settings().await });
+        }
+    }
+
     async fn refresh_ollama_settings(&self) {
         let mut refreshed = self.ollama_refresh.lock().await;
         if refreshed.elapsed() < Duration::from_secs(5) {
@@ -322,8 +341,13 @@ fn build(config: &PlatformConfig) -> Result<(Router, PlatformState)> {
         // plane's cold path. Generous enough
         // for a real generation (Ollama's own OLLAMA_LOAD_TIMEOUT is 5m for the load alone);
         // cheap discovery calls take a much shorter per-request timeout below.
-        client: crate::net::build_http_client(|builder| builder.timeout(platform_task_timeout()))
-            .context("build platform HTTP client")?,
+        client: crate::net::build_http_client(|builder| {
+            builder
+                .timeout(platform_task_timeout())
+                // Redirects can replay an accepted POST or change the configured backend.
+                .redirect(reqwest::redirect::Policy::none())
+        })
+        .context("build platform HTTP client")?,
         upstream: config.upstream.clone(),
         cpu_upstream: config.cpu_upstream.clone(),
         cpu_models: Arc::new(config.cpu_models.clone()),
@@ -334,6 +358,7 @@ fn build(config: &PlatformConfig) -> Result<(Router, PlatformState)> {
         catalog_cache: Arc::new(RwLock::new(None)),
         catalog_metadata: catalog::MetadataCache::default(),
         catalog_refresh: Arc::new(Mutex::new(())),
+        endpoint_tags: Arc::default(),
         load_lock: Arc::new(Mutex::new(())),
         cpu_load_lock: Arc::new(Mutex::new(())),
         gpu_admission: AdmissionPool::new(tunables.max_concurrent_tasks, tunables.max_queued_tasks),
@@ -344,6 +369,7 @@ fn build(config: &PlatformConfig) -> Result<(Router, PlatformState)> {
         feedback: Arc::new(RwLock::new(feedback)),
         store: config.store.clone(),
         feedback_persistence_error: Arc::new(RwLock::new(feedback_load_warning)),
+        feedback_write_queued: Arc::default(),
         auth_required: config.authenticates(),
         clients: Arc::from(config.client_keys.clone()),
         remote_access: config.allow_remote,

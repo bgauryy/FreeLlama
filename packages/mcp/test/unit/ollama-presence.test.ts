@@ -7,7 +7,7 @@ vi.mock("../../src/ollama-presence.js", async (importOriginal) => ({
 }));
 vi.mock("../../src/serve.js", async (importOriginal) => ({ ...(await importOriginal<Record<string, unknown>>()), configureServeAutostart: vi.fn() }));
 
-import { OLLAMA_DOWNLOAD_URL, OLLAMA_MISSING, ollamaInstalled } from "../../src/ollama-presence.js";
+import { OLLAMA_DOWNLOAD_URL, OLLAMA_MISSING, ollamaInstallCommand, ollamaInstalled } from "../../src/ollama-presence.js";
 const { ollamaPresence: realPresence } = await vi.importActual<typeof import("../../src/ollama-presence.js")>("../../src/ollama-presence.js");
 import { main } from "../../src/agent-cli/main.js";
 
@@ -23,6 +23,15 @@ describe("ollamaInstalled", () => {
     expect(ollamaInstalled({ PATH: "/a:/b" }, "linux", at("/b/ollama"))).toBe(true);
     expect(ollamaInstalled({ PATH: "/a" }, "darwin", at("/Applications/Ollama.app"))).toBe(true);
     expect(ollamaInstalled({ PATH: "/a" }, "linux", at())).toBe(false);
+  });
+});
+
+describe("ollamaInstallCommand", () => {
+  it("names Ollama's official one-line installer for the platform", () => {
+    expect(ollamaInstallCommand("darwin")).toBe("curl -fsSL https://ollama.com/install.sh | sh");
+    expect(ollamaInstallCommand("linux")).toBe("curl -fsSL https://ollama.com/install.sh | sh");
+    expect(ollamaInstallCommand("win32")).toBe("irm https://ollama.com/install.ps1 | iex");
+    expect(OLLAMA_MISSING).toContain(ollamaInstallCommand());
   });
 });
 

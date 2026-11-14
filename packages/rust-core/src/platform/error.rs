@@ -28,6 +28,11 @@ pub(super) struct ErrorBody {
     upstream_response: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     lifecycle: Option<Value>,
+    /// An accepted upstream response may follow partial execution; status alone cannot prove retry safety.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    execution_outcome: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retry_safe: Option<bool>,
     /// Seconds a caller should wait before retrying; also sent as the `Retry-After` header.
     #[serde(skip_serializing_if = "Option::is_none")]
     retry_after_seconds: Option<u64>,
@@ -75,6 +80,8 @@ impl ApiError {
                 resource_admission: None,
                 upstream_response: None,
                 lifecycle: None,
+                execution_outcome: None,
+                retry_safe: None,
                 retry_after_seconds: None,
                 memory_holders: None,
                 wait_limit: None,
@@ -206,6 +213,8 @@ impl ApiError {
         self.body.code = Some(code);
         self.body.upstream_response = Some(response);
         self.body.lifecycle = lifecycle;
+        self.body.execution_outcome = Some("unknown");
+        self.body.retry_safe = Some(false);
         self
     }
 
@@ -447,6 +456,8 @@ pub(super) fn resource_error(error: resources::ResourceWaitError) -> ApiError {
             resource_admission: Some(ResourceFailureReceipt::Assessed(Box::new(receipt))),
             upstream_response: None,
             lifecycle: None,
+            execution_outcome: None,
+            retry_safe: None,
             // Host memory rarely recovers in under a few seconds.
             retry_after_seconds: Some(5),
             memory_holders,

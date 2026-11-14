@@ -99,7 +99,8 @@ async fn warm(fixture: &Fixture, keep_alive: &str) -> (StatusCode, Value) {
             Request::post("/_freellama/v1/warm")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    json!({"model":"warm:receipt","keep_alive":keep_alive}).to_string(),
+                    json!({"model":"warm:receipt","context_tokens":8192,"keep_alive":keep_alive})
+                        .to_string(),
                 ))
                 .unwrap(),
         )

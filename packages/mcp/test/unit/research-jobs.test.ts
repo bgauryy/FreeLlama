@@ -226,10 +226,19 @@ describe("managed research turns as jobs", () => {
     expect(serve.calls.filter((call) => call.method === "GET").every((call) => call.signal !== undefined)).toBe(true);
   });
 
-  it("cancels the job when polling keeps failing", async () => {
-    const serve = fakeServe({ polls: [new Error("socket hang up")] });
-    await expect(run(serve).result).rejects.toThrow("socket hang up");
-    expect([serve.cancels(), serve.syncs()]).toEqual([1, 0]);
+  it.each([
+    new Error("socket hang up"),
+    new HTTPError(503, "Service Unavailable", Buffer.from(JSON.stringify({ code: "admission_timeout", error: "queue timeout", execution_outcome: "not_started", retry_safe: true }))),
+  ])("cancels after persistent poll failure without making the accepted execution retryable: $name", async (failure) => {
+    const serve = fakeServe({ polls: [failure] });
+    const error = await run(serve).result.catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(HTTPError);
+    expect(retryableChatError(error)).toBe(false);
+    expect(JSON.parse((error as HTTPError).body.toString("utf8"))).toMatchObject({
+      code: "task_job_poll_failed", job_id: ID, execution_outcome: "unknown", retry_safe: false, cancellation_requested: true,
+    });
+    expect(chatErrorDetails(error)[0]).toContain(failure.message);
+    expect([serve.submits(), serve.cancels(), serve.syncs()]).toEqual([1, 1, 0]);
   });
 });
 

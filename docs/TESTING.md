@@ -69,6 +69,18 @@ every pull request and on demand (`gh workflow run CI`), on Ubuntu and macOS: `y
 It uses no Ollama and no models, so it does not replace the live tiers, Windows qualification or the
 hardware procedures; run those before a release (`yarn verify:production`).
 
+## Comparative benchmark
+
+Comparing FreeLlama with Ollama alone and other local stacks is a separate, manual programme:
+protocol, measured results and limits are in [Benchmark](BENCHMARK.md). One warm extraction case
+has been run; contention, cold-load and agent-token scenarios have not.
+
+`yarn test:bench` checks the sequential vendor runner, streamed timing, exact JSON grading and
+host-counter parsing using deterministic fixtures. It is included in `yarn test:js`. These checks
+require no model downloads or inference and do not qualify live performance. Use
+`node scripts/bench/preflight.mjs --hash-model` for the separate live prerequisite report and
+follow [`scripts/bench/README.md`](../scripts/bench/README.md) for vendor installation and execution.
+
 ## Model metadata contracts
 
 Model metadata unit contracts cover README extraction, complete tag pages, family-versus-variant

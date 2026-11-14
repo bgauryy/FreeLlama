@@ -6,7 +6,12 @@ import { DEFAULT_OLLAMA_ENDPOINT } from "./config.js";
 
 export const OLLAMA_DOWNLOAD_URL = "https://ollama.com/download";
 
-export const OLLAMA_MISSING = `Ollama is not installed. Please install Ollama: ${OLLAMA_DOWNLOAD_URL}`;
+/** Ollama's official one-line installer for this platform. */
+export function ollamaInstallCommand(platform: NodeJS.Platform = process.platform): string {
+  return platform === "win32" ? "irm https://ollama.com/install.ps1 | iex" : "curl -fsSL https://ollama.com/install.sh | sh";
+}
+
+export const OLLAMA_MISSING = `Ollama is not installed. Install it with \`${ollamaInstallCommand()}\` or from ${OLLAMA_DOWNLOAD_URL}`;
 export const OLLAMA_STOPPED = "Ollama is installed but not running: open the Ollama app or run `ollama serve`, then retry.";
 
 export type OllamaPresence = "running" | "stopped" | "missing";

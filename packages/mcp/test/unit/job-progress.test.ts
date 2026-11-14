@@ -38,6 +38,11 @@ describe("job progress messages", () => {
       status: "loading", selected_model: "gpt-oss:20b", detail: { expected_load_ms: 8_700, evicted: ["glm-ocr:latest"] },
     })).toBe("loading gpt-oss:20b (~8.7 s), evicted glm-ocr:latest");
     expect(jobProgressMessage({ status: "loading", selected_model: "m" })).toBe("loading m");
+    expect(jobProgressMessage({
+      status: "running", reason: "generating", selected_model: "bonsai-2:9b", detail: { generated_tokens: 120, tokens_per_second: 44.5 },
+    })).toBe("generating on bonsai-2:9b: 120 tokens, 44.5 tok/s");
+    expect(jobProgressMessage({ status: "running", reason: "generating", detail: { generated_tokens: 1, tokens_per_second: null } }))
+      .toBe("generating on model: 1 tokens");
     expect(jobProgressMessage({ status: "running", selected_model: "m" })).toBe("running m");
   });
 });
@@ -336,6 +341,21 @@ describe("runWithJobProgress", () => {
     down.get.mockRejectedValue(new Error("connection refused"));
     await expect(runWithJobProgress(down, () => undefined, { wait: noWait })).rejects.toThrow("connection refused");
     // Nobody follows the job any more, so it is cancelled rather than left running.
+    expect(down.cancel).toHaveBeenCalledWith(ID);
+  });
+});
+
+describe("accepted-job polling safety", () => {
+  it("does not turn a retryable poll error into permission to replay the accepted task", async () => {
+    const down = scripted([]);
+    down.get.mockRejectedValue(new Error(JSON.stringify({ code: "admission_timeout", error: "503 timeout", retry_safe: true, execution_outcome: "not_started" })));
+    let caught: Error | undefined;
+    try { await runWithJobProgress(down, () => undefined, { wait: noWait }); } catch (error) { caught = error as Error; }
+    expect(caught).toBeDefined();
+    expect(JSON.parse(caught!.message)).toMatchObject({ code: "task_job_poll_failed", job_id: ID,
+      execution_outcome: "unknown", retry_safe: false, cancellation_requested: true });
+    expect(down.submit).toHaveBeenCalledTimes(1);
+    expect(down.sync).not.toHaveBeenCalled();
     expect(down.cancel).toHaveBeenCalledWith(ID);
   });
 });

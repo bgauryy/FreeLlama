@@ -127,7 +127,13 @@ Every route needs the bearer token when one is configured, except `GET /_freella
 | Monitoring | `GET metrics`, `GET status`, `GET usage`, `GET config`, `POST config/reload`, and the `GET /_freellama/ui` page |
 
 Request shapes are in [Architecture](ARCHITECTURE.md#request-shapes); monitoring fields are in
-[Monitoring](MONITORING.md).
+[Monitoring](MONITORING.md). `POST tasks` with `"stream": true` answers with server-sent events
+(`route`, `admission`, `delta`, then `done` with the usual receipt):
+
+```sh
+curl -N http://127.0.0.1:11435/_freellama/v1/tasks -H 'content-type: application/json' \
+  -d '{"task":"completion","model":"TAG","prompt":"Two sentences about llamas.","stream":true}'
+```
 
 ## Ollama-compatible passthrough
 

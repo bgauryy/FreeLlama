@@ -155,7 +155,13 @@ async fn run_admitted_task(
     State(state): State<PlatformState>,
     Json(mut input): Json<TaskInput>,
 ) -> Result<Json<Value>, ApiError> {
-    let progress = input.job_progress.clone();
+    let mut clock = super::timing::PhaseClock::start();
+    let progress = super::super::task_stream::Progress::new(
+        input.job_progress.clone(),
+        input.stream_events.clone(),
+    );
+    let stream_events = input.stream_events.clone();
+    let job_progress = input.job_progress.clone();
     let opportunistic = input.opportunistic_warm;
     // Refuse a task with nothing to do before routing loads a model for it.
     super::request::require_payload(&input)?;
@@ -166,6 +172,7 @@ async fn run_admitted_task(
     let requested_cost = task_cost_for(input.route.task, batch_items, &state.tunables());
     let models =
         super::super::catalog::discover_for_route(&state, input.route.model.as_deref()).await?;
+    clock.lap("discover_ms");
     // Snapshot the small affinity map: holding the read guard across routing's Ollama calls
     // queued every session write behind one `/api/ps`, and routing takes `feedback` next.
     let sessions = state.sessions.read().await.clone();
@@ -190,6 +197,7 @@ async fn run_admitted_task(
             .await);
         }
     };
+    clock.lap("route_ms");
     // Report the pick before anything below can refuse it (context, host budget, memory).
     if let Some(observer) = &input.route_observer {
         *observer
@@ -235,6 +243,7 @@ async fn run_admitted_task(
             managed.execution.placement.as_str(),
         );
     }
+    clock.lap("prepare_ms");
     let resource_model = managed.model;
     let decision = managed.route;
     let execution = managed.execution;
@@ -312,6 +321,22 @@ async fn run_admitted_task(
         execution_receipt["context_sizing"]["ollama_default_context"] = default_context;
     }
     execution_receipt["runtime_options"] = body["options"].clone();
+    // A streamed task reads Ollama's chunks as they arrive. Whether a repetition loop stops the
+    // answer stays what the request asked (`stop_on_repetition`), not a side effect of streaming.
+    // A deferred chat job without tools counts its tokens the same way, for job progress.
+    let stream_events = stream_events.or_else(|| {
+        job_progress
+            .filter(|_| body["tools"].is_null())
+            .map(super::super::task_stream::job_token_counter)
+    });
+    let stream = stream_events.filter(|_| path == "/api/chat").map(|events| {
+        let stop_on_loop = body["stream"] == true;
+        body["stream"] = json!(true);
+        super::forward::StreamOut {
+            events,
+            stop_on_loop,
+        }
+    });
     // Slot first, THEN the transition lock — in both branches. The order matters: if the
     // non-resident path took the write lock before its slot while resident tasks held slots and
     // waited on the read lock, the two would deadlock. One consistent order removes that entirely.
@@ -713,6 +738,7 @@ async fn run_admitted_task(
             "foreground demand arrived before dispatch",
         ));
     }
+    clock.lap("admission_ms");
     let forward = forward_managed_task(
         &state,
         ForwardRequest {
@@ -730,6 +756,8 @@ async fn run_admitted_task(
             },
             slot,
             breaker_probe,
+            clock,
+            stream,
         },
     );
     // On unified memory a loaded runner's weights are wired and visible in OS telemetry, so the

@@ -1,0 +1,72 @@
+{
+  "title": "Ollama, FreeLlama and the most popular local runners, measured",
+  "subtitle": "One task, one hash-verified model file (lfm3-vl:2b Q4_K_M) · 60 warm requests each over two run orders · all 300 answers correct · Apple M2 Pro 32 GB · 2026-11-14",
+  "systems": [
+    {
+      "id": "ollama",
+      "name": "Ollama",
+      "stars": "187k",
+      "kind": "ollama"
+    },
+    {
+      "id": "freellama",
+      "name": "FreeLlama",
+      "note": "runs on Ollama",
+      "kind": "freellama",
+      "from": {
+        "ttft": "freellama-stream"
+      }
+    },
+    {
+      "id": "llama-cpp",
+      "name": "llama.cpp",
+      "stars": "135k",
+      "kind": "other",
+      "notComparable": [
+        "cold"
+      ],
+      "notes": {
+        "cold": "loads the model at process start"
+      }
+    },
+    {
+      "id": "localai",
+      "name": "LocalAI",
+      "stars": "50k",
+      "kind": "other"
+    },
+    {
+      "id": "llama-swap",
+      "name": "llama-swap",
+      "stars": "6k",
+      "kind": "other"
+    }
+  ],
+  "adds": {
+    "title": "What FreeLlama adds on top of Ollama, measured",
+    "tiles": [
+      {
+        "value": "3.7 ms",
+        "label": "Overhead per task",
+        "detail": "p95 9.8 ms over Ollama's engine time"
+      },
+      {
+        "value": "98% vs 52%",
+        "label": "Built-in workflow prompts",
+        "detail": "graded cases passed vs one-line prompts"
+      },
+      {
+        "value": "9.7 ms · 30 MB",
+        "label": "CPU per task · server RAM",
+        "detail": "1.6% of one core while serving"
+      },
+      {
+        "value": "Refused",
+        "label": "A load that would not fit",
+        "detail": "7.2 GB needed, 4.2 GB free; nothing loaded"
+      }
+    ]
+  },
+  "footnote": "FreeLlama's first token is from its streamed mode (stream:true). Throughput at 4 clients from the forward pass. Stars: GitHub, 2026-11-13.",
+  "source": "Method, raw numbers and limits: docs/BENCHMARK.md · regenerate with node scripts/bench/readme-charts.mjs"
+}

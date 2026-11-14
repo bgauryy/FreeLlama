@@ -75,7 +75,7 @@ export function registerDoctorTool(server: McpServer): void {
   server.registerTool(
     "doctor",
     {
-      description: "Use when: checking Ollama/FreeLlama health, live queues and limits (view:status) or token usage (view:usage). Do not use when: choosing a model (models). Returns: a short summary; a view gives detail.",
+      description: "Use when: checking Ollama/FreeLlama health, live queues and limits (view:status) or token usage (view:usage). Do not use when: choosing a model (models). Returns: summary (default): versions, resident models, problems; full adds every check; status: live memory, queues, holds and limits; usage: tokens over `days`. endpoint is serve, ollamaEndpoint is Ollama.",
       inputSchema: z.object({
         ollamaEndpoint: ollamaEndpointParam,
         endpoint: endpointParam,

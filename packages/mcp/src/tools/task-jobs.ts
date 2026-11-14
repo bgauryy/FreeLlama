@@ -12,7 +12,7 @@ export function registerTaskJobsTool(server: McpServer): void {
     "task_jobs",
     {
       description:
-        "Use when: following run_task {defer:true} work: list, get (result), cancel, or remove (cancels first) a job. " +
+        "Use when: following run_task {defer:true} work (jobId is its job_id, or one of accepted_job_ids): list, get (result), cancel, or remove (cancels first) a job. " +
         "Do not use when: submitting work or killing a session. Returns: the job's status, then its answer, ranking or error as text, then response_file (read_response opens the full receipt).",
       inputSchema: z.object({
         endpoint: endpointParam,

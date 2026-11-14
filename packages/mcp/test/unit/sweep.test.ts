@@ -167,6 +167,32 @@ describe("sweep runner", () => {
     expect(retrying.view(sweep.id).counts).toMatchObject({ failed: 0, done: 1, flagged: 1 });
   });
 
+  it.each([
+    { code: "upstream_timeout", error: "timeout 503 while waiting for capacity", execution_outcome: "unknown", retry_safe: false },
+    { code: "resource_admission_unavailable", error: "needs 9.0 GB", execution_outcome: "unknown", retry_safe: true },
+    { code: "admission_timeout", error: "queue timeout", execution_outcome: "started", retry_safe: true },
+    { code: "resource_admission_unavailable", error: "needs 9.0 GB", retry_safe: false },
+  ])("does not replay unsafe execution despite retry-looking text: $code", async (failure) => {
+    const root = workspace();
+    let calls = 0;
+    const executor: Executor = async () => { calls += 1; throw new Error(JSON.stringify(failure)); };
+    const runner = new SweepRunner(new SweepStore(path.join(root, ".sweeps")), executor, async () => undefined);
+    const sweep = await runner.start(base([path.join(root, "src", "a.ts")]));
+    await runner.waitFor(sweep.id, 5_000);
+    expect(calls).toBe(1);
+    expect(runner.view(sweep.id).counts).toMatchObject({ failed: 1, done: 0 });
+  });
+
+  it("does not infer a pre-execution refusal from an unclassified transport timeout", async () => {
+    const root = workspace();
+    let calls = 0;
+    const executor: Executor = async () => { calls += 1; throw new Error("error sending request: timeout 503"); };
+    const runner = new SweepRunner(new SweepStore(path.join(root, ".sweeps")), executor, async () => undefined);
+    const sweep = await runner.start(base([path.join(root, "src", "a.ts")]));
+    await runner.waitFor(sweep.id, 5_000);
+    expect(calls).toBe(1);
+  });
+
   it("reports a sweep this process is not running as interrupted", async () => {
     const root = workspace();
     const store = new SweepStore(path.join(root, ".sweeps"));

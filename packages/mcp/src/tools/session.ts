@@ -14,7 +14,7 @@ export function registerSessionTool(server: McpServer): void {
     "session",
     {
       description:
-        "Use when: related run_task calls should stay on one model with a warm runner: create, then pass sessionId; kill stops its running tasks, delete forgets it. " +
+        "Use when: related run_task calls should stay on one model with a warm runner: create returns session_id, pass it as run_task sessionId; kill stops its running tasks, delete forgets it. " +
         "Do not use when: cancelling one deferred job (task_jobs), keeping history (scope) or freeing memory (ollama_manage unload). Returns: a receipt.",
       inputSchema: z.object({
         action: z.enum(["create", "delete", "kill"]),

@@ -11,7 +11,7 @@ import { deferText, routeText, withText } from "../result-text.js";
 import {
   BATCH_TASK_FIELDS, type BatchItem, batchItemParam, embeddingInputParam, endpointParam, errorResult, executionPreferenceParam, fallbackModelsParam, filesParam,
   isStructuredSuccess, localToolsParam, messagesParam, minConfidenceParam, minPlacementEvidenceParam, objectiveParam,
-  parsedResult, questionsParam, requiredCapabilitiesParam, stateParam, summarizeEmbeddings, systemPromptParam,
+  parsedResult, questionsParam, requiredCapabilitiesParam, stateParam, structuredResult, summarizeEmbeddings, systemPromptParam,
   parseBatchTask, taskAnswerText, taskMessages, taskParam, withRequiredCapability,
 } from "../helpers.js";
 import { applyTaskFiles, inputLabels, type FileReceipt } from "../task-files.js";
@@ -23,7 +23,6 @@ import { outputInput } from "../tool-results.js";
 import { fallbackCheck, injectionCheck, inputData, nullFieldCheck, resultChecks, withChecks } from "../result-checks.js";
 import { tablesToMarkdown } from "../table-markdown.js";
 import { EmbeddingIndex, embedIndexEnabled, rankByQuery } from "../embed-index.js";
-import { installedInventory } from "../model-library.js";
 
 // Typed where the agent acts on a field (model, fit, the deferred job, saved files); every other
 // receipt field stays open, so the schema an agent pays for in tools/list stays small.
@@ -490,7 +489,7 @@ export function registerRunTaskTool(server: McpServer): void {
       description:
         "Use when: bounded work for a local model: a workflow or job, decision, embedding + `nearest`, vision, tools (returns tool_calls you run). " +
         "Do not use when: you must stand behind the judgment or need edits across files. " +
-        "`tasks` = up to 64 independent items; per-item fields override top-level defaults; one `model` per batch avoids a cold load per model; `maxParallelism` caps dispatch; `preview:true` routes only. " +
+        "`tasks` = up to 64 independent items; per-item fields override top-level defaults (workflow and job apply to the whole batch); one `model` per batch avoids a cold load per model; `maxParallelism` caps dispatch; `preview:true` routes only. " +
         "Hosts cut calls near 60 s: for long work pass `defer:true` (with `tasks`, one job per item) and poll task_jobs get. " +
         "Returns: the answer text, its check: lines and response_file (read_response opens the receipt; receipt:\"full\" inlines it).",
       inputSchema: z.object({
@@ -782,10 +781,12 @@ export function registerRunTaskTool(server: McpServer): void {
         // A repeated search over the same files embeds only the chunks that changed.
         if (canonicalTask === "embedding" && nearestRequest?.query !== undefined && labels && filled.files.length > 0
           && typeof model === "string" && !defer && !returnEmbeddings && fallbackModels === undefined && embedIndexEnabled()
+          && sessionId === undefined && scopeId === undefined && contextTokens === undefined
+          && minConfidence === undefined && minPlacementEvidence === undefined
           && items.length > 0 && items.every((item) => typeof item === "string")) {
           const indexed = await indexedNearest(endpoint ?? DEFAULT_SERVE_ENDPOINT, {
             model, items: items as string[], labels, query: nearestRequest.query, top: nearestRequest.top, minScore: nearestRequest.minScore,
-            dimensions, options, keepAlive, priority: priority ?? "normal", maxWaitSeconds, timeoutSeconds, executionPreference,
+            dimensions, options, keepAlive, priority: priority ?? "normal", maxWaitSeconds, timeoutSeconds, executionPreference, requiredCapabilities: effectiveRequiredCapabilities,
           }, progressSink(extra), extra.signal);
           if (isStructuredSuccess(indexed)) indexed.structuredContent.files_read = filled.files;
           return finish(isStructuredSuccess(indexed) ? rankedResult(indexed, true, items.length) : indexed);
@@ -939,47 +940,84 @@ export function withJob<R>(result: R, profile: JobProfile | undefined, saveAs?: 
 type IndexedSearch = {
   model: string; items: string[]; labels: string[]; query: string; top?: number; minScore?: number;
   dimensions?: number; options?: Record<string, unknown>; keepAlive?: string; priority: string;
-  maxWaitSeconds?: number; timeoutSeconds?: number; executionPreference?: string;
+  maxWaitSeconds?: number; timeoutSeconds?: number; executionPreference?: string; requiredCapabilities?: string[];
 };
 
 /**
- * `nearest` over file chunks with the persistent index: only chunks the index lacks are embedded
- * (the core returns the query's vector first, then the items'), and the ranking happens here with
- * the same cosine the core uses. The receipt is the managed run's,
- * with the ranking and `embedding_index` counts in place of vectors.
+ * Rank file chunks in the query's verified embedding space. The query runs once per search;
+ * missing documents are embedded separately with the same observed identity. Cache misses can
+ * therefore add a local request; cache hits never reuse vectors from uncertain or changed runtimes.
+ * Every execution receipt is retained, with combined counters and no raw vectors inline.
  */
 async function indexedNearest(target: string, search: IndexedSearch, report: ((message: string) => void) | undefined, signal: AbortSignal) {
-  const digest = await installedInventory(undefined)
-    .then((models) => models.find((entry) => entry.name === search.model)?.digest ?? undefined)
-    .catch(() => undefined);
-  const index = EmbeddingIndex.open(search.model, digest ?? undefined, search.dimensions);
-  const missing = [...new Set(search.items.filter((text) => index.get(text) === undefined))];
-  // The core embeds the query first and returns its vector ahead of the items'; when every chunk
-  // is indexed, the query alone is sent as the one item.
-  const input = missing.length > 0 ? missing : [search.query];
-  const result = parsedResult(await runManagedTask(target, {
-    task: "embedding", model: search.model, input,
-    nearest: { query: search.query, top: 1 }, return_embeddings: true,
-    keep_alive: search.keepAlive, priority: search.priority, max_wait_seconds: search.maxWaitSeconds,
-    timeout_seconds: search.timeoutSeconds, execution_preference: search.executionPreference, defer: false,
-    request_options: { options: search.options, dimensions: search.dimensions },
-  }, report, signal));
-  if (!isStructuredSuccess(result)) return result;
-  const response = object(result.structuredContent.response) ?? {};
-  const vectors = validateEmbeddingVectors(response.embeddings, input.length + 1);
-  const [query, ...itemVectors] = vectors;
-  index.add(missing.map((text, i) => ({ text, vector: itemVectors[i]! })));
-  const matches = rankByQuery(query!, search.items.map((text, i) => ({ label: search.labels[i]!, vector: index.get(text)! })), search.top ?? 5, search.minScore);
-  const { embeddings: _vectors, ...rest } = response;
-  return withTaskTelemetry({
-    ...result,
-    structuredContent: {
-      ...result.structuredContent,
-      response: { ...rest, embeddings_omitted: { count: vectors.length } },
-      nearest: { mode: "query", matches },
-      embedding_index: { cached: search.items.length - missing.length, embedded: missing.length, file: index.file },
-    },
-  });
+  const receipts: Fields[] = [];
+  const acceptedJobs: string[] = [];
+  const deadline = search.timeoutSeconds === undefined ? undefined : performance.now() + search.timeoutSeconds * 1000;
+  const deadlineSignal = deadline === undefined ? undefined : AbortSignal.timeout(Math.max(1, Math.ceil(deadline - performance.now())));
+  const combinedSignal = deadlineSignal ? AbortSignal.any([signal, deadlineSignal]) : signal;
+  const request = { task: "embedding", model: search.model, keep_alive: search.keepAlive, priority: search.priority,
+    max_wait_seconds: search.maxWaitSeconds, execution_preference: search.executionPreference, required_capabilities: search.requiredCapabilities, defer: false,
+    request_options: { options: search.options, dimensions: search.dimensions } };
+  const execute = async (input: string[], extra: Fields = {}) => {
+    const next = { ...request, ...extra, input,
+      ...(deadline === undefined ? {} : { timeout_seconds: Math.max(1, Math.ceil((deadline - performance.now()) / 1000)) }) };
+    if (combinedSignal.aborted) throw cancellationError();
+    const result = parsedResult(await (input.length > EMBEDDINGS_PER_JOB && extra.nearest === undefined
+      ? embedInSlices(target, next, input, report, combinedSignal)
+      : runManagedTask(target, next, report, combinedSignal, (id) => acceptedJobs.push(id))));
+    if (!isStructuredSuccess(result)) throw new Error(JSON.stringify(result.structuredContent ?? { error: "embedding request failed" }));
+    const content = result.structuredContent;
+    const response = object(content.response) ?? {};
+    receipts.push({ ...content, response: { ...response, embeddings: undefined,
+      embeddings_omitted: { count: Array.isArray(response.embeddings) ? response.embeddings.length : null } } });
+    if (Array.isArray(content.accepted_job_ids)) acceptedJobs.push(...content.accepted_job_ids.filter((id): id is string => typeof id === "string"));
+    return { result, content, response };
+  };
+  const finish = (content: Fields, response: Fields, matches: unknown[], index: Fields) => withTaskTelemetry(structuredResult({
+    ...content, response: { ...response, embeddings: undefined }, nearest: { mode: "query", matches },
+      metrics: sumFields(receipts, "metrics", ["total_duration_ns", "load_duration_ns", "prompt_tokens", "cached_prompt_tokens",
+        "uncached_prompt_tokens", "prompt_duration_ns", "output_tokens", "output_duration_ns"]),
+      admission: { mode: "identity_scoped_embedding_index", ...sumFields(receipts, "admission", ["queue_wait_ms", "resource_wait_ms", "transition_wait_ms", "total_wait_ms"]) },
+      embedding_requests: receipts.reduce((total, receipt) => total + (typeof receipt.embedding_requests === "number" ? receipt.embedding_requests : 1), 0),
+      embedding_slices: receipts, accepted_job_ids: [...new Set(acceptedJobs)], embedding_index: index,
+  }));
+  try {
+    // The query has to run on every search. Its actual receipt, not a default-endpoint inventory
+    // or a mutable tag, determines which cached document vectors can join its embedding space.
+    const probe = await execute([search.query]);
+    const [query] = validateEmbeddingVectors(probe.response.embeddings, 1);
+    let identity: Fields;
+    try { identity = sliceIdentity(probe.content, query!.length); }
+    catch {
+      // Older/uncertain receipts still answer using one fresh embedding space, with reuse disabled.
+      const fresh = await execute(search.items, { nearest: { query: search.query, top: 1 }, return_embeddings: true });
+      const [freshQuery, ...vectors] = validateEmbeddingVectors(fresh.response.embeddings, search.items.length + 1);
+      const matches = rankByQuery(freshQuery!, vectors.map((vector, i) => ({ label: search.labels[i]!, vector })), search.top ?? 5, search.minScore);
+      return finish(fresh.content, fresh.response, matches, { status: "disabled_unverified_identity", cached: 0, embedded: search.items.length });
+    }
+    const index = EmbeddingIndex.open(search.model, String(identity.model_digest), query!.length, undefined,
+      canonical({ target, identity }));
+    const missing = [...new Set(search.items.filter((text) => index.get(text) === undefined))];
+    let last = probe;
+    if (missing.length > 0) {
+      last = await execute(missing, { expected_model_digest: identity.model_digest,
+        expected_execution_backend: identity.backend, expected_upstream: identity.upstream });
+      const vectors = validateEmbeddingVectors(last.response.embeddings, missing.length, query!.length);
+      if (canonical(sliceIdentity(last.content, query!.length)) !== canonical(identity)) {
+        throw new Error("embedding identity changed between query and documents; no cached vectors were combined");
+      }
+      index.add(missing.map((text, i) => ({ text, vector: vectors[i]! })));
+    }
+    const matches = rankByQuery(query!, search.items.map((text, i) => ({ label: search.labels[i]!, vector: index.get(text)! })), search.top ?? 5, search.minScore);
+    return finish(last.content, last.response, matches, { status: "verified", cached: search.items.length - missing.length, embedded: missing.length, file: index.file });
+  } catch (error) {
+    let cause: Fields | undefined;
+    try { cause = object(JSON.parse(error instanceof Error ? error.message : String(error))); } catch { /* retain validation detail */ }
+    throw new Error(JSON.stringify({ code: cause?.code ?? "embedding_index_invalid",
+      error: cause?.error ?? (error instanceof Error ? error.message : String(error)),
+      embedding_slices: receipts, accepted_job_ids: [...new Set(acceptedJobs)],
+      execution_outcome: receipts.length > 0 ? "unknown" : cause?.execution_outcome ?? "unknown", retry_safe: false, cause }));
+  }
 }
 
 function rankedResult(

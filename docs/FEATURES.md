@@ -179,7 +179,7 @@ its deadline, on every OS. On macOS the available figure already includes reclai
 `serve --low-memory advisory` (or `FREELLAMA_LOW_MEMORY=advisory`) restores admit-with-warning.
 While any model is loaded, `serve` also samples the host itself: under low memory, OS pressure or
 swapping it unloads the cheapest idle models (audit trigger `pressure_sweep`), never pinned,
-`keep_alive: -1` or busy ones. Because of the reserve, a load can wait while the OS still shows free
+`keep_alive: -1` or busy ones, nor one another client used in the last 15 s. Because of the reserve, a load can wait while the OS still shows free
 memory ([admission controls](CLI.md#bound-admission)). Total deadlines (`timeoutSeconds`) and
 per-backend circuit breakers complete admission; see [monitoring and tuning](MONITORING.md).
 

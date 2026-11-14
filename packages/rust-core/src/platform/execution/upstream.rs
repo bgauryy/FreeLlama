@@ -1,27 +1,18 @@
-//! Upstream transport for managed tasks: one POST to Ollama with the passthrough proxy's retry
-//! schedule, as a single JSON body or as a streamed `/api/chat` that can stop a repetition loop.
+//! Upstream transport for managed tasks: one accepted POST to Ollama, as a single JSON body or
+//! as a streamed `/api/chat` that can stop a repetition loop. Only connection failures retry.
 
 use axum::http::StatusCode;
 use serde_json::{Value, json};
 use std::time::Instant;
 
 use super::super::error::ApiError;
+use super::super::task_stream::{EventSink, TaskEvent};
 use super::super::{PlatformState, repetition};
 use crate::proxy;
 
-/// Retry 500/502 (load-model blips), but not 503 busy or 504 timeout. Same as passthrough.
-/// Retrying 503 while holding an admission slot — and on a cold load, the exclusive write lock —
-/// amplifies the saturation the semaphore exists to shed.
-fn retryable_managed_status(status: StatusCode) -> bool {
-    proxy::retryable_upstream_status(status)
-}
-
-/// Send `body` to `url`, retrying transient failures on the passthrough proxy's backoff
-/// schedule (`proxy::retry_delay`), and return the first response that is final.
-///
-/// The caller holds its admission slot across this call: an Ollama 500 —
-/// which it returns under load-model contention, the exact condition managed routing creates —
-/// must not fail the task and throw away a slot it already queued for.
+/// Send `body` to `url`, retrying only failures establishing a connection on the shared backoff.
+/// An HTTP error does not prove that execution never began: Ollama can return a nonstreaming
+/// 500 after its runner generated content. Never replay an accepted managed POST from status alone.
 async fn send_with_retries(
     state: &PlatformState,
     url: &str,
@@ -33,13 +24,6 @@ async fn send_with_retries(
         attempt += 1;
         let more_attempts = attempt < proxy::MAX_ATTEMPTS;
         match state.client.post(url).json(body).send().await {
-            Ok(response) if retryable_managed_status(response.status()) && more_attempts => {
-                eprintln!(
-                    "managed task retry attempt={attempt} status={} path={path}",
-                    response.status()
-                );
-                tokio::time::sleep(proxy::retry_delay(attempt)).await;
-            }
             Ok(response) => return Ok(response),
             // A timeout is NOT a transient hiccup here. This client's per-attempt budget is
             // `platform_task_timeout()` (900s by default), and the caller holds both an admission
@@ -165,6 +149,34 @@ impl StreamedMessage {
     }
 }
 
+/// Corrupt frames cannot be skipped: accepting a later done:true would claim a complete answer
+/// while silently discarding generated output. Keep the valid prefix and stop the upstream.
+fn parse_stream_frame(line: &[u8], partial: &StreamedMessage) -> Result<Value, Value> {
+    match serde_json::from_slice::<Value>(line) {
+        Ok(frame) if frame.is_object() => Ok(frame),
+        _ => Err(json!({
+            "error":"Ollama returned a malformed NDJSON frame after accepting the request",
+            "done":false,
+            "message":partial.message(),
+        })),
+    }
+}
+
+/// Forward a chunk's generated text to a streamed task's caller. A caller that went away is not
+/// an error here: its task is being aborted.
+fn send_pieces(events: &EventSink, chunk: &Value) {
+    for (pointer, event) in [
+        ("/message/thinking", TaskEvent::Thinking as fn(String) -> TaskEvent),
+        ("/message/content", TaskEvent::Content as fn(String) -> TaskEvent),
+    ] {
+        if let Some(piece) = chunk.pointer(pointer).and_then(Value::as_str)
+            && !piece.is_empty()
+        {
+            let _ = events.send(event(piece.to_owned()));
+        }
+    }
+}
+
 /// How often, in streamed tokens, a growing output is checked for a loop.
 const LOOP_CHECK_TOKENS: u64 = 16;
 
@@ -174,11 +186,16 @@ const LOOP_CHECK_TOKENS: u64 = 16;
 /// the response is dropped, which closes the connection and cancels the generation upstream, and
 /// everything generated so far is returned with `done_reason: "repetition"`. Ollama's own
 /// "token repeat limit" abort keeps the generated text too (`done_reason: "repeat_limit"`).
+///
+/// With `events` (a streamed task), each content and thinking piece is also sent there as it
+/// arrives; `stop_on_loop: false` keeps generating through a repetition, as the caller asked.
 pub(crate) async fn post_streaming_chat_with_retries(
     state: &PlatformState,
     upstream: &str,
     path: &str,
     body: &Value,
+    events: Option<&EventSink>,
+    stop_on_loop: bool,
 ) -> Result<(StatusCode, Value), ApiError> {
     let started = Instant::now();
     let url = crate::ollama_http::url(upstream, path);
@@ -195,8 +212,12 @@ pub(crate) async fn post_streaming_chat_with_retries(
         pending.extend_from_slice(&bytes);
         while let Some(end) = pending.iter().position(|byte| *byte == b'\n') {
             let line = pending.drain(..=end).collect::<Vec<_>>();
-            let Ok(chunk) = serde_json::from_slice::<Value>(&line) else {
+            if line.iter().all(u8::is_ascii_whitespace) {
                 continue;
+            }
+            let chunk = match parse_stream_frame(&line, &streamed) {
+                Ok(chunk) => chunk,
+                Err(error) => return Ok((status, error)),
             };
             if let Some(error) = chunk.get("error").filter(|error| !error.is_null()) {
                 if error
@@ -219,12 +240,15 @@ pub(crate) async fn post_streaming_chat_with_retries(
                 return Ok((status, value));
             }
             streamed.absorb(&chunk);
+            if let Some(events) = events {
+                send_pieces(events, &chunk);
+            }
             if chunk["done"] == true {
                 return Ok((status, streamed.finish(chunk)));
             }
             last = chunk;
             let generated = streamed.tokens + streamed.thinking_tokens;
-            if generated >= checked_at + LOOP_CHECK_TOKENS {
+            if stop_on_loop && generated >= checked_at + LOOP_CHECK_TOKENS {
                 checked_at = generated;
                 if streamed.looping() {
                     // Returning drops `response`: the connection closes and Ollama cancels.
@@ -246,6 +270,9 @@ pub(crate) async fn post_streaming_chat_with_retries(
         && chunk["done"] == true
     {
         streamed.absorb(&chunk);
+        if let Some(events) = events {
+            send_pieces(events, &chunk);
+        }
         return Ok((status, streamed.finish(chunk)));
     }
     // The stream ended without a final chunk: report it as incomplete, keeping the text.
@@ -257,7 +284,7 @@ pub(crate) async fn post_streaming_chat_with_retries(
 
 #[cfg(test)]
 mod streamed_tests {
-    use super::StreamedMessage;
+    use super::{StreamedMessage, parse_stream_frame};
     use serde_json::json;
 
     #[test]
@@ -284,5 +311,22 @@ mod streamed_tests {
         }
         assert_eq!(streamed.content, "");
         assert!(streamed.looping());
+    }
+
+    #[test]
+    fn a_corrupt_frame_fails_with_the_valid_prefix_instead_of_becoming_a_complete_answer() {
+        let mut streamed = StreamedMessage::default();
+        streamed.absorb(&json!({"message":{"content":"partial answer"},"done":false}));
+        for line in [b"broken frame\n".as_slice(), b"[]\n", b"null\n"] {
+            let error = parse_stream_frame(line, &streamed).unwrap_err();
+            assert_eq!(error["done"], false);
+            assert_eq!(error["message"]["content"], "partial answer");
+            assert!(
+                error["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("malformed NDJSON")
+            );
+        }
     }
 }

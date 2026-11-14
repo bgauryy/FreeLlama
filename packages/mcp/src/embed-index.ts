@@ -1,6 +1,6 @@
 // A persistent index of embedding vectors, so a repeated `nearest` search over a code tree (the
 // find-code job) embeds only the chunks that changed instead of every chunk again. One JSONL
-// file per model identity (tag, digest, dimensions) under FREELLAMA_HOME/embedding-index/, keyed
+// file per model identity and verified execution scope under FREELLAMA_HOME/embedding-index/, keyed
 // by a hash of the exact text embedded (document prefix included); vectors are stored as base64
 // float32. A changed file changes its chunks' text and so their keys: stale entries are simply
 // never read again. FREELLAMA_EMBED_INDEX=0 turns it off.
@@ -30,13 +30,13 @@ function decode(text: string): number[] {
 export class EmbeddingIndex {
   private readonly vectors = new Map<string, number[]>();
 
-  private constructor(readonly file: string) {}
+  private constructor(readonly file: string, private readonly dimensions: number | undefined) {}
 
-  /** The index of one model identity; vectors from another tag, digest or size never mix. */
-  static open(model: string, digest: string | undefined, dimensions: number | undefined, root = path.join(FREELLAMA_HOME, "embedding-index")): EmbeddingIndex {
-    const identity = sha(`${model}\n${digest ?? ""}\n${dimensions ?? ""}`).slice(0, 24);
-    const index = new EmbeddingIndex(path.join(root, `${identity}.jsonl`));
-    index.load();
+  /** The index of one model and execution identity; different digests, sizes or scopes never mix. */
+  static open(model: string, digest: string | undefined, dimensions: number | undefined, root = path.join(FREELLAMA_HOME, "embedding-index"), scope = ""): EmbeddingIndex {
+    const identity = sha(`${model}\n${digest ?? ""}\n${dimensions ?? ""}\n${scope}`).slice(0, 24);
+    const index = new EmbeddingIndex(path.join(root, `${identity}.jsonl`), dimensions);
+    try { index.load(); } catch { /* Optional cache: unreadable or concurrently removed files re-embed. */ }
     return index;
   }
 
@@ -50,7 +50,9 @@ export class EmbeddingIndex {
       if (!line) continue;
       try {
         const { k, v } = JSON.parse(line) as { k: string; v: string };
-        this.vectors.set(k, decode(v));
+        if (typeof k !== "string" || !/^[a-f0-9]{64}$/.test(k) || typeof v !== "string") continue;
+        const vector = decode(v);
+        if (this.valid(vector)) this.vectors.set(k, vector);
       } catch {
         // A torn last line from an interrupted write: skip it.
       }
@@ -61,18 +63,25 @@ export class EmbeddingIndex {
     return sha(text);
   }
 
+  private valid(vector: number[]): boolean {
+    return vector.length > 0 && (this.dimensions === undefined || vector.length === this.dimensions)
+      && vector.every((value) => Number.isFinite(value) && Number.isFinite(Math.fround(value)));
+  }
+
   get(text: string): number[] | undefined {
     return this.vectors.get(EmbeddingIndex.key(text));
   }
 
   /** Remember vectors for texts, appending them to the file (a write failure keeps them in memory only). */
   add(entries: Array<{ text: string; vector: number[] }>): void {
+    if (entries.some(({ vector }) => !this.valid(vector))) throw new Error("embedding index requires finite vectors of the verified dimensions");
     const lines: string[] = [];
     for (const { text, vector } of entries) {
       const key = EmbeddingIndex.key(text);
       if (this.vectors.has(key)) continue;
-      this.vectors.set(key, vector);
-      lines.push(JSON.stringify({ k: key, v: encode(vector) }));
+      const stored = vector.map(Math.fround);
+      this.vectors.set(key, stored);
+      lines.push(JSON.stringify({ k: key, v: encode(stored) }));
     }
     if (lines.length === 0) return;
     try {
@@ -89,6 +98,9 @@ export class EmbeddingIndex {
 }
 
 export function cosine(a: number[], b: number[]): number {
+  if (a.length !== b.length || a.some((v) => !Number.isFinite(v)) || b.some((v) => !Number.isFinite(v))) {
+    throw new Error("cosine requires finite vectors with matching dimensions");
+  }
   let dot = 0;
   let na = 0;
   let nb = 0;

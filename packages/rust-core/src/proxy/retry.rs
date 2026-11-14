@@ -114,22 +114,19 @@ pub(crate) fn retry_delay(attempt: u32) -> Duration {
     RETRY_BASE_DELAY * 2u32.pow(attempt.saturating_sub(1)) + jitter()
 }
 
-/// Retry 500/502 (load-model blips) and connection-establishment failures, but not 503 busy,
-/// 504/client timeouts, or ambiguous failures after the upstream accepted a request.
-/// A timed-out generation may still be consuming the upstream runner, so replaying it can multiply
-/// load precisely when the host is under pressure. Shared with managed `/tasks` so a
-/// request through the proxy cannot amplify saturation the admission semaphore is shedding.
-pub(crate) fn retryable_upstream_status(status: StatusCode) -> bool {
-    matches!(
-        status,
-        StatusCode::INTERNAL_SERVER_ERROR | StatusCode::BAD_GATEWAY
-    )
+/// Status-based retries are limited to safe HTTP reads. A generation or mutation can execute
+/// before an upstream reports 500/502; those statuses never authorize replay of an accepted POST.
+fn retryable_upstream_status(method: &reqwest::Method, status: StatusCode) -> bool {
+    matches!(*method, reqwest::Method::GET | reqwest::Method::HEAD)
+        && matches!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR | StatusCode::BAD_GATEWAY
+        )
 }
 
-/// Send the request, retrying transient 500/502 responses and connection-establishment errors
-/// with exponential backoff. Ollama occasionally returns a 500 under load-model contention; a
-/// same-request retry is enough to ride that out without surfacing an error to the caller. HTTP
-/// 503, 504, client timeouts, and post-send transport failures are returned as-is.
+/// Send the request with bounded connection-establishment retries. Safe reads may also retry
+/// 500/502; all HTTP responses to generation/mutation requests are final. HTTP 503, 504, client
+/// timeouts and post-send transport failures are returned as-is for every method.
 pub(crate) async fn send_with_retries(
     state: &ProxyState,
     method: &reqwest::Method,
@@ -150,7 +147,8 @@ pub(crate) async fn send_with_retries(
         let retryable_more_attempts = attempt < MAX_ATTEMPTS;
         match outcome {
             Ok(response)
-                if retryable_upstream_status(response.status()) && retryable_more_attempts =>
+                if retryable_upstream_status(method, response.status())
+                    && retryable_more_attempts =>
             {
                 eprintln!(
                     "proxy retry attempt={attempt} status={} path={}",
@@ -206,4 +204,33 @@ pub(crate) async fn try_restart_ollama(state: &ProxyState) -> bool {
     eprintln!("proxy: Ollama connection refused — attempting one automatic restart");
     (state.restart_action)().await;
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::retryable_upstream_status;
+    use reqwest::{Method, StatusCode};
+
+    #[test]
+    fn status_retries_are_limited_to_safe_reads() {
+        for status in [StatusCode::INTERNAL_SERVER_ERROR, StatusCode::BAD_GATEWAY] {
+            for method in [Method::GET, Method::HEAD] {
+                assert!(retryable_upstream_status(&method, status));
+            }
+            for method in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE] {
+                assert!(
+                    !retryable_upstream_status(&method, status),
+                    "an accepted {method} must not replay after {status}"
+                );
+            }
+        }
+        for status in [
+            StatusCode::OK,
+            StatusCode::NOT_IMPLEMENTED,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::GATEWAY_TIMEOUT,
+        ] {
+            assert!(!retryable_upstream_status(&Method::GET, status));
+        }
+    }
 }

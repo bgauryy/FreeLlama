@@ -19,20 +19,23 @@ not provide tenant isolation or billing.
   `SSL_CERT_FILE` if any upstream uses `https://`. Without one, FreeLlama starts with an empty trust
   store and warns: plain-HTTP upstreams work, HTTPS upstreams fail their certificate check.
 
-After a tag has been published, install that exact checksummed release on macOS or Linux:
+To pin a server to one checksummed release, pass its tag. A pinned version installs the
+operator binary and verifies it against the release's `SHA256SUMS`; `--no-ollama` keeps the
+installer from offering Ollama on a host where you manage it yourself:
 
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/bgauryy/FreeLlama/main/scripts/install.sh
-sh install.sh --version vX.Y.Z
+sh install.sh --version vX.Y.Z --no-ollama
 ```
 
-The installer downloads the exact-version binary and verifies it against the release's
-`SHA256SUMS`. From a Windows checkout, run the following command after replacing `VERSION` with the
-published tag:
+On Windows, replace `VERSION` with the published tag:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Version VERSION
+powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Version VERSION -NoOllama
 ```
+
+Without a version, both scripts install the latest release: the npm package when npm is on PATH,
+otherwise the binary.
 
 The repository has no CI or release workflows; they were removed (see git history). Release from a
 clean checkout: `yarn release:version <version>`, `yarn release:build` (builds each target's

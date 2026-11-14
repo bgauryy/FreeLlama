@@ -60,6 +60,42 @@ describe("read_response", () => {
     expect(page({ small: true })).toEqual({ type: "json", value: { small: true } });
   });
 
+  it("bounds nested array pages by serialized characters without skipping complete records", () => {
+    const value = Array.from({ length: 20 }, (_, index) => ({ index, text: "x".repeat(7_000) }));
+    let offset = 0;
+    const returned: unknown[] = [];
+    while (offset < value.length) {
+      const view = page(value, offset);
+      expect(view.type).toBe("array");
+      expect(JSON.stringify(view.value).length).toBeLessThanOrEqual(20_000);
+      expect(view.returned_items).toBe((view.value as unknown[]).length);
+      returned.push(...view.value as unknown[]);
+      if (view.next_offset === null) break;
+      expect(view.next_offset).toBe(offset + (view.value as unknown[]).length);
+      offset = view.next_offset as number;
+    }
+    expect(returned).toEqual(value);
+  });
+
+  it("labels an oversized array record and exposes its escaped selectable path", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "large-read-response-"));
+    const store = new ResponseStore(root, 16 * 1024 * 1024);
+    const record = { text: "x".repeat(35_000) };
+    const file = await store.save("run_task", { tool: "run_task", result: { structuredContent: { "rows/~": [record, { small: true }] } } });
+    const preview = await readResponse({ file: file!, section: "rows/~" }, root) as View;
+    expect(preview.structuredContent).toMatchObject({ type: "array_record_preview", record_complete: false,
+      returned_items: 0, previewed_items: 1, record_index: 0, next_offset: 1,
+      record_section: "/result/structuredContent/rows~1~0/0" });
+    expect(String(preview.structuredContent!.value).length).toBeLessThanOrEqual(20_000);
+    expect(preview.content[0]!.text).toContain("bounded preview only");
+    const first = await readResponse({ file: file!, section: preview.structuredContent!.record_section }, root) as View;
+    const last = await readResponse({ file: file!, section: preview.structuredContent!.record_section,
+      offset: first.structuredContent!.next_offset }, root) as View;
+    expect(JSON.parse(first.structuredContent!.value + last.structuredContent!.value)).toEqual(record);
+    const following = await readResponse({ file: file!, section: "rows/~", offset: 1 }, root) as View;
+    expect(following.structuredContent).toMatchObject({ type: "array", value: [{ small: true }], returned_items: 1, next_offset: null });
+  });
+
   it("outlines the file without a section and names the sections on a miss", async () => {
     const { root, file } = await savedResponse();
     const outline = await readResponse({ file }, root) as View;

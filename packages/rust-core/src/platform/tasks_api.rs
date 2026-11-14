@@ -25,6 +25,10 @@ pub(crate) enum ManagedOperation {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(remote = "Self", deny_unknown_fields)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag is one independent wire field of the task request"
+)]
 pub(crate) struct TaskInput {
     #[serde(flatten)]
     pub(crate) route: RouteInput,
@@ -96,8 +100,15 @@ pub(crate) struct TaskInput {
     /// stop then bounds a runaway answer short of the model's context; `false` turns it off.
     #[serde(default)]
     pub(crate) stop_on_repetition: Option<bool>,
+    /// Answer with server-sent events: phases, each generated piece, then the receipt
+    /// (`task_stream`). Only for tasks that generate text, never deferred.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) stream: bool,
     #[serde(skip)]
     pub(crate) job_progress: Option<jobs::JobProgress>,
+    /// Set for `stream`: where the pipeline sends phases and generated pieces.
+    #[serde(skip)]
+    pub(crate) stream_events: Option<super::task_stream::EventSink>,
     /// Set by a fallback chain: receives the model routing selected, so an attempt that named no
     /// model and was then refused can still be reported (and not retried) by its real name.
     #[serde(skip)]
