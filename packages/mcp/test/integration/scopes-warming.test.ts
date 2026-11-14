@@ -145,7 +145,7 @@ describe("scope and warming client contracts", () => {
     expect(result.structuredContent).toMatchObject({ deferred: true });
     expect(requests[0]!.body).toMatchObject({
       task: "embedding", defer: true, input: ["x", "y"], return_embeddings: true,
-      nearest: { query: "q", top: 3, min_score: 0.2, labels: ["input[0]", "input[1]"] },
+      nearest: { query: "q", top: 3, min_score: 0.2, labels: ['input[0] "x"', 'input[1] "y"'] },
     });
   });
   it("sends shared batch fields once as defaults that each item may override", async () => {

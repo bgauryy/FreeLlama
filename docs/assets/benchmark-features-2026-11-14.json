@@ -1,0 +1,198 @@
+{
+  "title": "FreeLlama's management features, measured",
+  "subtitle": "Each feature against the same work without it · Apple M2 Pro 32 GB · Ollama 0.40.15 · 2026-11-14",
+  "workflowTitle": "Answer quality and time per workflow",
+  "workflowNote": "bonsai-2:9b, graded cases, 2 samples each: FreeLlama's built-in prompt vs the one-line prompt an agent would write",
+  "workflows": [
+    {
+      "workflow": "summarize-text",
+      "cases": 4,
+      "shipped_pass": 7,
+      "shipped_runs": 7,
+      "shipped_median_s": 1.07,
+      "oneline_pass": 6,
+      "oneline_runs": 8,
+      "oneline_median_s": 1.5
+    },
+    {
+      "workflow": "summarize-log",
+      "cases": 5,
+      "shipped_pass": 9,
+      "shipped_runs": 9,
+      "shipped_median_s": 3.99,
+      "oneline_pass": 2,
+      "oneline_runs": 10,
+      "oneline_median_s": 6.63
+    },
+    {
+      "workflow": "summarize-diff",
+      "cases": 2,
+      "shipped_pass": 4,
+      "shipped_runs": 4,
+      "shipped_median_s": 3.13,
+      "oneline_pass": 4,
+      "oneline_runs": 4,
+      "oneline_median_s": 5.2
+    },
+    {
+      "workflow": "extract-json",
+      "cases": 5,
+      "shipped_pass": 9,
+      "shipped_runs": 10,
+      "shipped_median_s": 2.13,
+      "oneline_pass": 9,
+      "oneline_runs": 10,
+      "oneline_median_s": 1.67
+    },
+    {
+      "workflow": "explain-code",
+      "cases": 1,
+      "shipped_pass": 2,
+      "shipped_runs": 2,
+      "shipped_median_s": 6.87,
+      "oneline_pass": 0,
+      "oneline_runs": 2,
+      "oneline_median_s": 27.69
+    },
+    {
+      "workflow": "review-code",
+      "cases": 3,
+      "shipped_pass": 6,
+      "shipped_runs": 6,
+      "shipped_median_s": 1.62,
+      "oneline_pass": 2,
+      "oneline_runs": 6,
+      "oneline_median_s": 13.19
+    },
+    {
+      "workflow": "fix-bug",
+      "cases": 2,
+      "shipped_pass": 4,
+      "shipped_runs": 4,
+      "shipped_median_s": 2.97,
+      "oneline_pass": 0,
+      "oneline_runs": 4,
+      "oneline_median_s": 2.74
+    },
+    {
+      "workflow": "change-code",
+      "cases": 1,
+      "shipped_pass": 2,
+      "shipped_runs": 2,
+      "shipped_median_s": 2.72,
+      "oneline_pass": 1,
+      "oneline_runs": 2,
+      "oneline_median_s": 2.82
+    },
+    {
+      "workflow": "write-tests",
+      "cases": 1,
+      "shipped_pass": 2,
+      "shipped_runs": 2,
+      "shipped_median_s": 13.55,
+      "oneline_pass": 1,
+      "oneline_runs": 2,
+      "oneline_median_s": 28.65
+    }
+  ],
+  "panels": [
+    {
+      "title": "Interactive task behind 8 queued",
+      "better": "lower",
+      "note": "8 background tasks in flight, then 1 interactive (median of 7 rounds)",
+      "rows": [
+        {
+          "label": "Urgent, alone",
+          "value": 3516,
+          "kind": "ollama",
+          "text": "3.52 s urgent"
+        },
+        {
+          "label": "Urgent, FreeLlama",
+          "value": 1403,
+          "kind": "freellama",
+          "text": "1.40 s urgent"
+        },
+        {
+          "label": "Batch, alone",
+          "value": 3618,
+          "kind": "ollama",
+          "text": "3.62 s all 9"
+        },
+        {
+          "label": "Batch, FreeLlama",
+          "value": 3674,
+          "kind": "freellama",
+          "text": "3.67 s all 9"
+        }
+      ],
+      "footer": "The urgent task jumps the queue; the whole batch costs 1% more",
+      "labelW": 150
+    },
+    {
+      "title": "Search a code tree by meaning",
+      "better": "lower",
+      "note": "packages/mcp/src, job find-code, the same query twice",
+      "rows": [
+        {
+          "label": "1st search",
+          "value": 55891,
+          "kind": "other",
+          "text": "55.9 s"
+        },
+        {
+          "label": "Repeat",
+          "value": 127,
+          "kind": "freellama",
+          "text": "0.13 s"
+        }
+      ],
+      "footer": "Unchanged chunks are not embedded again; same top result"
+    },
+    {
+      "title": "Sweep a code tree again",
+      "better": "lower",
+      "note": "83 chunks judged one by one, then a sweep with that one as baseline",
+      "rows": [
+        {
+          "label": "1st sweep",
+          "value": 49794,
+          "kind": "other",
+          "text": "49.8 s"
+        },
+        {
+          "label": "Again",
+          "value": 18,
+          "kind": "freellama",
+          "text": "18 ms"
+        }
+      ],
+      "footer": "83 of 83 unchanged chunks reused"
+    }
+  ],
+  "tilesTitle": "Long work, memory and placement",
+  "tiles": [
+    {
+      "value": "29 ms",
+      "label": "Job id for a long task",
+      "detail": "CHANGELOG.md summarized in 19.2 s, caller free"
+    },
+    {
+      "value": "Refused",
+      "label": "A load that would not fit",
+      "detail": "7.2 GB needed, 4.2 GB free; nothing loaded"
+    },
+    {
+      "value": "119/120",
+      "label": "Tasks verified on the GPU",
+      "detail": "Ollama /api/ps after each answer"
+    },
+    {
+      "value": "9.7 ms · 30 MB",
+      "label": "CPU per task · server RAM",
+      "detail": "1.6% of one core while serving"
+    }
+  ],
+  "footnote": "Code search and sweep save their work: a first run embeds or judges every chunk, a repeat reuses every unchanged one.",
+  "source": "Method and raw numbers: docs/BENCHMARK.md#features · rerun with node scripts/bench/features.mjs"
+}

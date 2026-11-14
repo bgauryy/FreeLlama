@@ -2,6 +2,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as z from "zod";
 import { DEFAULT_SERVE_ENDPOINT } from "../config.js";
+import { USER_WORKFLOW_ERRORS } from "../local-prompts.js";
 import { doctor, health, machine, usage, status } from "../native.js";
 import { doctorFullText, statusText, usageText, withText } from "../result-text.js";
 import {
@@ -41,10 +42,25 @@ export function doctorStatus(report: Fields): { status: "ok" | "degraded"; probl
   if (ready?.ready === false) {
     problems.push(`freellama serve not ready: waiting for ${String(ready.waiting_for ?? "startup")}${typeof ready.detail === "string" ? ` (${ready.detail})` : ""}`);
   }
+  // A workflow file the user wrote but FreeLlama skipped would otherwise fail silently.
+  for (const skipped of USER_WORKFLOW_ERRORS) problems.push(`user workflow skipped: ${skipped.path}: ${skipped.error}`);
   return { status: problems.length > 0 ? "degraded" : "ok", problems };
 }
 
 /** "Ollama unreachable on backend gpu (…)" for each backend whose residency query failed. */
+/**
+ * The status view's jobs as counts by state plus the jobs still active: the full list (often half
+ * of the status payload) is task_jobs{action:"list"}'s to give, not every status call's.
+ */
+export function jobsSummary(value: unknown): Fields | unknown {
+  const jobs = value && typeof value === "object" && Array.isArray((value as Fields).jobs) ? (value as Fields).jobs as Fields[] : undefined;
+  if (!jobs) return value;
+  const terminal = new Set(["completed", "failed", "cancelled", "expired"]);
+  const counts: Record<string, number> = {};
+  for (const job of jobs) counts[String(job.status ?? "unknown")] = (counts[String(job.status ?? "unknown")] ?? 0) + 1;
+  return { ...(value as Fields), jobs: jobs.filter((job) => !terminal.has(String(job.status))), counts, note: 'finished jobs are counted only; task_jobs{action:"list"} lists them' };
+}
+
 export function ollamaProblems(status: Fields): string[] {
   const loaded = Array.isArray(status.loaded_models) ? status.loaded_models : [];
   return loaded.flatMap((entry) => {
@@ -59,7 +75,7 @@ export function registerDoctorTool(server: McpServer): void {
   server.registerTool(
     "doctor",
     {
-      description: "Use when: checking Ollama/FreeLlama health, live queues and limits (view:status) or token usage (view:usage). Do not use when: choosing a model (models). Returns: a short summary; a view gives detail.",
+      description: "Use when: checking Ollama/FreeLlama health, live queues and limits (view:status) or token usage (view:usage). Do not use when: choosing a model (models). Returns: summary (default): versions, resident models, problems; full adds every check; status: live memory, queues, holds and limits; usage: tokens over `days`. endpoint is serve, ollamaEndpoint is Ollama.",
       inputSchema: z.object({
         ollamaEndpoint: ollamaEndpointParam,
         endpoint: endpointParam,
@@ -89,6 +105,7 @@ export function registerDoctorTool(server: McpServer): void {
               live.structuredContent.status = "degraded";
               live.structuredContent.problems = problems;
             }
+            live.structuredContent.task_jobs = jobsSummary(live.structuredContent.task_jobs);
           }
           return withText(live, statusText);
         }

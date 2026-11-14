@@ -1,6 +1,5 @@
 # Make local models faster and lighter
 
-Moved from the root README.
 
 ## Make local models faster and lighter
 
@@ -30,7 +29,11 @@ running out of memory. Best payoff first:
 3. **Spend output only where it helps.** Completion, tools, browser and vision tasks send
    `think:false` (Ollama otherwise enables thinking on capable models); coding, code-repair and
    long-context tasks send `think:"medium"` to thinking models. `stopOnRepetition` cut `glm-ocr` on 12
-   report strips from 12,948 to 6,452 output tokens with every label still read.
+   report strips from 12,948 to 6,452 output tokens with every label still read. Each text workflow
+   also caps its answer (`num_predict`, about 8 times the median its eval answers needed, 300–2,000
+   tokens) when thinking is off, and keeps `stopOnRepetition` on with it, so a model that loops stops
+   in seconds; a caller's own `num_predict` wins. End to end, workflows ran at 13–27 tokens/s on
+   `bonsai-2:9b` and Nemotron-3.5-Bolt here: the answer's length, not the prompt, sets the time.
 4. **Unload instead of swapping.** A load that does not fit waits instead of swapping, idle models are
    unloaded under memory pressure, and `unload` frees a big model before a switch without ever
    loading it.
@@ -51,7 +54,7 @@ FreeLlama never changes Ollama's settings. These matter most, per Ollama's docs 
 | Setting | What it does | Suggested start |
 |---|---|---|
 | `OLLAMA_NUM_PARALLEL` | Decoding slots per model, each with its own prompt cache; RAM grows with slots times context ([Ollama FAQ](https://github.com/ollama/ollama/blob/main/docs/faq.mdx)). Small gain on Apple silicon; some engines run one request at a time ([MLX engine](https://github.com/ollama/ollama/issues/17280)) | `1`, raised only after measuring. FreeLlama's budget follows it |
-| `OLLAMA_FLASH_ATTENTION` + `OLLAMA_KV_CACHE_TYPE=q8_0` | A quantized KV cache roughly halves its memory and needs flash attention ([Ollama FAQ](https://github.com/ollama/ollama/blob/main/docs/faq.mdx)); with `OLLAMA_FLASH_ATTENTION` unset, Ollama enables it automatically on supported backends. See [KV cache and flash attention](#kv-cache-and-flash-attention) | On, when the model's quality holds |
+| `OLLAMA_FLASH_ATTENTION` + `OLLAMA_KV_CACHE_TYPE=q8_0` | A quantized KV cache roughly halves its memory and needs flash attention ([Ollama FAQ](https://github.com/ollama/ollama/blob/main/docs/faq.mdx)); with `OLLAMA_FLASH_ATTENTION` unset, Ollama enables it automatically on supported backends. See [KV cache and flash attention](#kv-cache-and-flash-attention) | `freellama doctor`'s conservative starter profile reports `f16`; switch to `q8_0` after checking quality on your workload (`scripts/local-test/workflows.mjs`) |
 | Context length | Ollama defaults to 4k below 24 GiB of VRAM and recommends at least 64k for agent and coding work ([context length](https://github.com/ollama/ollama/blob/main/docs/context-length.mdx)) | Size per task. FreeLlama keeps Ollama's default when it covers the prompt, otherwise sizes text tasks to the prompt; `contextTokens` overrides |
 | `OLLAMA_MAX_LOADED_MODELS` | How many runners stay resident. Unset and `0` mean 3 per GPU, then Ollama unloads by count | More than the model memory budget can hold, so the budget decides by size and reload cost. `1` reloads on every switch |
 | `keep_alive` | How long a runner stays loaded after use | Leave it out. FreeLlama picks a finite time from measured reuse |

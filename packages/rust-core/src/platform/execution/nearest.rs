@@ -124,7 +124,17 @@ pub(super) async fn run(
             next.expected_execution_backend = pinned["backend"].as_str().map(str::to_owned);
             next.expected_upstream = pinned["upstream"].as_str().map(str::to_owned);
         }
-        let Json(mut receipt) = run_session_task(State(state.clone()), Json(next)).await?;
+        let first = receipts.is_empty();
+        // After the first slice ran, a refusal no longer means nothing executed.
+        let Json(mut receipt) = run_session_task(State(state.clone()), Json(next))
+            .await
+            .map_err(|error| {
+                if first {
+                    error
+                } else {
+                    error.after_partial_execution()
+                }
+            })?;
         let embeddings = take_vectors(&mut receipt, slice.len(), vectors.first().map(Vec::len))?;
         if sliced {
             let actual = slice_identity(&receipt, embeddings[0].len())?;

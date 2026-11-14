@@ -358,15 +358,45 @@ pub fn installed_model<'a>(
         .iter()
         .map(|model| model.name.as_str())
         .collect::<Vec<_>>();
-    bail!(
-        "model is not installed: {requested} (installed: {})",
-        if installed.is_empty() {
-            "none".to_owned()
-        } else {
-            installed.join(", ")
-        }
+    Err(ModelRefusal::new(
+        ModelRefusal::NOT_INSTALLED,
+        format!(
+            "model is not installed: {requested} (installed: {})",
+            if installed.is_empty() {
+                "none".to_owned()
+            } else {
+                installed.join(", ")
+            }
+        ),
     )
+    .into())
 }
+
+/// A pinned model the router refused before anything ran, with a stable code: the caller (and an
+/// explicit fallback chain) can tell "not installed" or "cannot do this task" from other errors
+/// without parsing the message.
+#[derive(Debug)]
+pub struct ModelRefusal {
+    pub code: &'static str,
+    message: String,
+}
+
+impl ModelRefusal {
+    pub const NOT_INSTALLED: &'static str = "model_not_installed";
+    pub const NOT_ELIGIBLE: &'static str = "model_not_eligible";
+
+    fn new(code: &'static str, message: String) -> Self {
+        Self { code, message }
+    }
+}
+
+impl std::fmt::Display for ModelRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ModelRefusal {}
 
 /// Which gate of [`eligible_models`] rejected `model`: the failed requirement, named, so a caller
 /// can fix the request or pick another model instead of guessing.
@@ -455,15 +485,21 @@ pub fn select_route(
 
     let chosen = if let Some(requested) = input.model.as_deref() {
         let model = installed_model(models, requested)?;
-        ensure!(
-            eligible
-                .iter()
-                .any(|candidate| candidate.name == model.name),
-            "model is not eligible for the request: {} ({}{})",
-            model.name,
-            ineligibility_reason(input, model, &required),
-            alternatives_hint(&eligible)
-        );
+        if !eligible
+            .iter()
+            .any(|candidate| candidate.name == model.name)
+        {
+            return Err(ModelRefusal::new(
+                ModelRefusal::NOT_ELIGIBLE,
+                format!(
+                    "model is not eligible for the request: {} ({}{})",
+                    model.name,
+                    ineligibility_reason(input, model, &required),
+                    alternatives_hint(&eligible)
+                ),
+            )
+            .into());
+        }
         model
     } else if let Some(affine) = input
         .session_id

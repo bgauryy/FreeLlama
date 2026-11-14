@@ -37,6 +37,26 @@ describe("caller-owned task prompts", () => {
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
   });
 
+  it("answers with text alone by default, so a host that shows structuredContent does not hand its agent the receipt", async () => {
+    const textClient = await connectClient({ FREELLAMA_MCP_RECEIPT: "text" });
+    try {
+      const result = await textClient.callTool({ name: "run_task", arguments: { endpoint, prompt: "Hello" } });
+      expect(result.isError, JSON.stringify(result)).not.toBe(true);
+      expect(result.structuredContent).toBeUndefined();
+      const text = (result.content as Array<{ type: string; text: string }>)[0]!.text;
+      expect(text).toContain("Caller-defined prose.");
+      const file = (result._meta as Record<string, unknown>)["freellama/response_file"] as string;
+      expect(text.endsWith(`response_file: ${file}`)).toBe(true);
+      // The receipt is one read away, and inline on request.
+      const receipt = await textClient.callTool({ name: "read_response", arguments: { file } });
+      expect(receipt.isError).not.toBe(true);
+      const full = await textClient.callTool({ name: "run_task", arguments: { endpoint, prompt: "Hello", receipt: "full" } });
+      expect(full.structuredContent).toBeDefined();
+    } finally {
+      await textClient.close();
+    }
+  });
+
   it("runs ordinary chat without a task label or workflow setup", async () => {
     const result = await client.callTool({ name: "run_task", arguments: { endpoint, prompt: "Hello" } });
     expect(result.isError, JSON.stringify(result)).not.toBe(true);

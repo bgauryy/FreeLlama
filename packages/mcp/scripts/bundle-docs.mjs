@@ -1,6 +1,6 @@
 // Package the repository's operator documentation for installed MCP clients.
 // The repository docs/ directory remains the source of truth. This build step copies the Markdown
-// guides, their subfolders included; docs/README.md is served as the index (freellama://docs/index), so an
+// guides and self-contained HTML assets, their subfolders included; docs/README.md is served as the index (freellama://docs/index), so an
 // MCP client can fetch one relevant resource rather than receiving every guide at initialization.
 import { copyFileSync, existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import path from "node:path";
@@ -19,7 +19,7 @@ rmSync(destination, { recursive: true, force: true });
 mkdirSync(destination, { recursive: true });
 
 const names = readdirSync(source, { recursive: true, encoding: "utf8" })
-  .filter((name) => name.endsWith(".md"))
+  .filter((name) => name.endsWith(".md") || (name.startsWith(`assets${path.sep}`) && name.endsWith(".html")))
   .sort();
 for (const name of names) {
   mkdirSync(path.dirname(path.join(destination, name)), { recursive: true });

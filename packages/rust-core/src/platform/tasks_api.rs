@@ -25,6 +25,10 @@ pub(crate) enum ManagedOperation {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(remote = "Self", deny_unknown_fields)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag is one independent wire field of the task request"
+)]
 pub(crate) struct TaskInput {
     #[serde(flatten)]
     pub(crate) route: RouteInput,
@@ -77,6 +81,12 @@ pub(crate) struct TaskInput {
     /// Per-request admission wait in seconds, capped by the server's `max_queue_wait_seconds`.
     #[serde(default)]
     pub(crate) max_wait_seconds: Option<u64>,
+    /// An explicit, ordered fallback chain: each model runs only after the one before it was
+    /// refused before anything executed (no room in memory, input above its context window, not
+    /// installed, or unable to do the task). Never after a model started generating, so no work
+    /// is replayed. The receipt's `fallback` lists every attempt.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) fallback_models: Vec<String>,
     #[serde(default)]
     pub(crate) defer: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -90,8 +100,19 @@ pub(crate) struct TaskInput {
     /// stop then bounds a runaway answer short of the model's context; `false` turns it off.
     #[serde(default)]
     pub(crate) stop_on_repetition: Option<bool>,
+    /// Answer with server-sent events: phases, each generated piece, then the receipt
+    /// (`task_stream`). Only for tasks that generate text, never deferred.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) stream: bool,
     #[serde(skip)]
     pub(crate) job_progress: Option<jobs::JobProgress>,
+    /// Set for `stream`: where the pipeline sends phases and generated pieces.
+    #[serde(skip)]
+    pub(crate) stream_events: Option<super::task_stream::EventSink>,
+    /// Set by a fallback chain: receives the model routing selected, so an attempt that named no
+    /// model and was then refused can still be reported (and not retried) by its real name.
+    #[serde(skip)]
+    pub(crate) route_observer: Option<RouteObserver>,
     /// The client key that sent the task, for the usage ledger.
     #[serde(skip)]
     pub(crate) client: Option<String>,
@@ -115,6 +136,9 @@ impl<'de> Deserialize<'de> for TaskInput {
         Ok(input)
     }
 }
+
+/// Shared slot for the model a task was routed to; clones of one task share it.
+pub(crate) type RouteObserver = std::sync::Arc<std::sync::Mutex<Option<String>>>;
 
 /// Explicitly independent managed work. Dependencies are intentionally not accepted: a batch is
 /// a bounded dispatcher, not a workflow engine, so an agent cannot accidentally run a dependent
@@ -273,4 +297,7 @@ pub(crate) struct OllamaRequestOptions {
     pub(crate) options: Option<Map<String, Value>>,
     pub(crate) logprobs: Option<bool>,
     pub(crate) top_logprobs: Option<u32>,
+    /// Embedding tasks: shorten each vector to this many dimensions (`/api/embed` `dimensions`),
+    /// for models trained to allow it (Matryoshka embeddings such as embeddinggemma or nomic).
+    pub(crate) dimensions: Option<u32>,
 }

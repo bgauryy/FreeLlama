@@ -131,14 +131,14 @@ async fn spawn_flaky_upstream(fail_count: usize) -> (String, Arc<AtomicUsize>) {
 }
 
 #[tokio::test]
-async fn proxy_retries_transient_upstream_errors_and_eventually_succeeds() {
+async fn proxy_retries_transient_read_errors_and_eventually_succeeds() {
     let (upstream, calls) = spawn_flaky_upstream(2).await;
     let config = crate::support::proxy_config("127.0.0.1:0", upstream, false);
     let router = app(config).unwrap();
 
     let request = Request::builder()
-        .method("POST")
-        .uri("/api/chat")
+        .method("GET")
+        .uri("/api/version")
         .body(Body::from("{}"))
         .unwrap();
     let response = router.oneshot(request).await.unwrap();
@@ -149,6 +149,99 @@ async fn proxy_retries_transient_upstream_errors_and_eventually_succeeds() {
         3,
         "expected 2 failed attempts + 1 successful attempt"
     );
+}
+
+/// A later successful response does not justify re-running an accepted generation. Both a
+/// streamed request and a nonstreaming one can reach an upstream that returns an HTTP error.
+#[tokio::test]
+async fn proxy_does_not_replay_generation_server_errors() {
+    for status in [StatusCode::INTERNAL_SERVER_ERROR, StatusCode::BAD_GATEWAY] {
+        for stream in [false, true] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let counter = calls.clone();
+            let upstream = Router::new().route(
+                "/api/chat",
+                axum::routing::post(move || {
+                    let counter = counter.clone();
+                    async move {
+                        if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                            (status, "runner failed after accepting work").into_response()
+                        } else {
+                            (StatusCode::OK, "replayed").into_response()
+                        }
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let task = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+            let proxy = app(crate::support::proxy_config(
+                "127.0.0.1:0",
+                format!("http://{addr}"),
+                false,
+            ))
+            .unwrap();
+            let response = proxy
+                .oneshot(
+                    Request::post("/api/chat")
+                        .body(Body::from(format!(r#"{{"stream":{stream}}}"#)))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            let body = to_bytes(response.into_body(), 1024).await.unwrap();
+            assert_eq!(&body[..], b"runner failed after accepting work");
+            task.abort();
+        }
+    }
+}
+
+#[tokio::test]
+async fn proxy_preserves_post_redirect_without_replaying_it() {
+    let redirected = Arc::new(AtomicUsize::new(0));
+    let counter = redirected.clone();
+    let upstream = Router::new()
+        .route(
+            "/api/chat",
+            axum::routing::post(|| async {
+                (
+                    StatusCode::TEMPORARY_REDIRECT,
+                    [("location", "/redirected")],
+                    "redirect after accepting work",
+                )
+            }),
+        )
+        .route(
+            "/redirected",
+            axum::routing::post(move || {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    "replayed"
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+    let proxy = app(crate::support::proxy_config(
+        "127.0.0.1:0",
+        format!("http://{addr}"),
+        false,
+    ))
+    .unwrap();
+    let response = proxy
+        .oneshot(Request::post("/api/chat").body(Body::from("{}")).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(response.headers()["location"], "/redirected");
+    let body = to_bytes(response.into_body(), 1024).await.unwrap();
+    assert_eq!(&body[..], b"redirect after accepting work");
+    assert_eq!(redirected.load(Ordering::SeqCst), 0);
+    task.abort();
 }
 
 /// 503 is "busy, shed load" — retrying it through the passthrough would amplify the same
@@ -522,14 +615,14 @@ async fn an_unresolvable_generation_is_refused_with_a_typed_forecast_error() {
 }
 
 #[tokio::test]
-async fn proxy_gives_up_after_max_attempts_on_persistent_failure() {
+async fn proxy_gives_up_after_max_attempts_on_persistent_read_failure() {
     let (upstream, calls) = spawn_flaky_upstream(usize::MAX).await;
     let config = crate::support::proxy_config("127.0.0.1:0", upstream, false);
     let router = app(config).unwrap();
 
     let request = Request::builder()
-        .method("POST")
-        .uri("/api/chat")
+        .method("GET")
+        .uri("/api/version")
         .body(Body::from("{}"))
         .unwrap();
     let response = router.oneshot(request).await.unwrap();

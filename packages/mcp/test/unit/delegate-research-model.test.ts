@@ -72,11 +72,12 @@ describe("delegate_research default model", () => {
     expect(text).toContain("catalog default pick, installed, fits now");
   });
 
-  it("uses the small pick for local research when it is the only one that fits", async () => {
+  it("never researches on a model the catalog dropped, even when only it fits: the installed default goes to the memory gate", async () => {
+    // lfm3:1.7b left the research picks on 2026-11-12 (1/6 GitHub questions); installed, it is not a pick.
     fixture.liveState.mockResolvedValue([[{ name: STRONGER }, { name: DEFAULT }, { name: SMALL }], 4 * GB]);
     const { model, text } = await run();
-    expect(model).toBe(SMALL);
-    expect(text).toContain("catalog small pick, installed, fits now");
+    expect(model).toBe(DEFAULT);
+    expect(text).toContain("catalog default pick, installed; not fitting now, so serve's memory gate decides");
   });
 
   it("never defaults GitHub research to the small pick: the installed default goes to the memory gate", async () => {

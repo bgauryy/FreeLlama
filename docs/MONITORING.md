@@ -16,13 +16,15 @@ token and keeps it only for the browser tab.
 
 | Endpoint | CLI | MCP | What it returns |
 |---|---|---|---|
+| `GET /health` | | `doctor` (`platform_health`) | Liveness, admission capacity, and configured backends; answers as soon as serve listens |
+| `GET /ready` | `freellama ready` | `doctor` (`readiness`) | 200 once the primary Ollama (and CPU backend, when configured) answers and its catalog reads; otherwise 503 with `waiting_for` |
 | `GET /status` | `freellama status` | `doctor {view:"status"}` | Live view of every backend, the raw proxy, loaded models, host, Ollama settings, and today's usage |
 | `GET /usage?days=N` | `freellama usage --days N` | `doctor {view:"usage", days:N}` | Totals per day and per model (default 7 days) |
 | `GET /metrics` | | | Prometheus text exposition |
 | `GET /config` | `freellama config` | | Effective runtime settings and the source of each |
 | `POST /config/reload` | `freellama config --reload` | | Re-read the runtime file now; `422` keeps the last good values |
 | `GET /jobs` | `freellama jobs` | `task_jobs {action:"list"}` | Deferred job metadata without prompts or retained results |
-| `GET /jobs/:id` | `freellama jobs --id <uuid>` | `task_jobs {action:"get", jobId}` | One job receipt and its retained result or error |
+| `GET /jobs/:id` | `freellama jobs --id <uuid>` | `task_jobs {action:"get", jobId}` | One job receipt and its retained result or error. `?wait_ms=N` (at most 5000) holds the read until the job changes; the reply then carries `long_poll: true` |
 | `POST /jobs/:id/cancel` | `freellama jobs --id <uuid> --cancel` | `task_jobs {action:"cancel", jobId}` | Cancellation receipt after local permits are released |
 | `DELETE /jobs/:id` | `freellama jobs --id <uuid> --remove` | `task_jobs {action:"remove", jobId}` | Stops active work, releases local permits, and removes the retained record |
 
@@ -49,7 +51,8 @@ token and keeps it only for the browser tab.
   A remote endpoint is never probed and is reported as unknown.
 - **`usage_today`**: tasks, errors, tokens, and busy time since midnight UTC.
 - **`task_jobs`**: deferred task IDs, selected models, configured backends, priorities, total
-  deadlines, states, and waiting reasons. States cover discovery, admission, resources, runner
+  deadlines, states, and waiting reasons. MCP `doctor {view:"status"}` keeps only the active jobs
+  plus counts by state; `task_jobs {action:"list"}` lists them all. States cover discovery, admission, resources, runner
   transitions, loading, execution, and completion. Metadata excludes the original payload.
 
 A task receipt explains its own wait. `admission.mode` is `resident_shared` (the runner was
@@ -96,10 +99,12 @@ Use `host.sample_age_ms` to check freshness.
 
 NVIDIA activity comes from the same bounded `nvidia-smi` query as memory. Apple Silicon activity
 comes from the accelerator's `PerformanceStatistics` in a bounded IORegistry read. Those Apple
-properties are driver-specific and may disappear or change; the read can cover only the devices
-within its retained output. AMD, Windows, unsupported drivers, and unavailable reads report unknown activity. The counters include other processes, use a driver-defined observation
+properties are driver-specific and may disappear or change. A sample that may have reached the
+64 KiB output cap or omits a recognized device's busy counter is discarded rather than treated as
+complete. Malformed NVIDIA device rows likewise discard the activity sample. AMD, Windows, unsupported drivers, and unavailable reads report unknown activity. The counters include other processes, use a driver-defined observation
 window, and do not attribute activity to a FreeLlama task or establish bandwidth or energy
-efficiency. They are diagnostics and do not alter admission or pressure decisions.
+efficiency. They are diagnostic by default. The opt-in GPU headroom guard below also uses valid
+busy counters to hold new GPU work.
 
 Each backend's admission `queue_depth` includes both `slot_waiters` and `resource_waiters`.
 A resource waiter returns its execution slot after two seconds but remains in the bounded queue
@@ -167,7 +172,7 @@ FreeLlama waits for safe capacity within a deadline and bounds the retained back
 | Managed queue full | `429` | `admission_queue_full` |
 | Raw proxy over its cap after `raw_queue_wait_seconds` | `429` | |
 | Managed wait exceeded `max_queue_wait_seconds` (or the task's `max_wait_seconds`) | `503` | `admission_timeout` |
-| OS pressure, swapping, CPU, thermal, or required telemetry still holds when the waiting budget expires (low available RAM alone only warns on macOS; low RAM and swapping never hold an already-resident runner, and CPU load and thermal never hold one on the GPU) | `503` | `resource_admission_unavailable` |
+| A new load still does not fit available memory with its reserve, or OS pressure, swapping, CPU, thermal, or required telemetry still holds, when the waiting budget expires. Low available RAM refuses by default on every OS; `--low-memory advisory` (`FREELLAMA_LOW_MEMORY=advisory`) makes it a warning. Low RAM and swapping never hold an already-resident runner, and CPU load and thermal never hold one on the GPU | `503` | `resource_admission_unavailable` |
 | Backend circuit open | `503` | `upstream_circuit_open` |
 
 These capacity refusals carry a `Retry-After` header and `retry_after_seconds` in the body. For a queue it
@@ -175,6 +180,63 @@ is estimated from the queue depth, the lanes that can run at once (current limit
 task's cost), and the backend's recent average service time, which excludes queue wait (1 to 120
 seconds). A task can ask for a shorter wait with `max_wait_seconds` (`maxWaitSeconds`
 in MCP); the server caps it at the configured maximum.
+
+## Leave capacity for other applications
+
+Resource thresholds belong to the operator, not to a model name or a fixed machine size. Start
+`serve` with CPU and, optionally, GPU headroom targets:
+
+```bash
+freellama serve \
+  --resource-hold-load-per-cpu 0.75 \
+  --resource-resume-load-per-cpu 0.5 \
+  --resource-hold-gpu-busy-percent 80 \
+  --resource-resume-gpu-busy-percent 60
+```
+
+These are **admission targets, not utilization quotas**. They hold new work until observations
+recover; they do not pause, kill, or throttle work already executing. One admitted inference can
+still saturate a device. Use OS/container CPU quotas and upstream/device isolation when a hard
+resource partition is required. Direct calls to Ollama bypass FreeLlama's guard.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `--resource-hold-load-per-cpu` | `1.5` | Hold CPU-bound work when one-minute load / logical CPUs reaches this value |
+| `--resource-resume-load-per-cpu` | `1.0` | Recover the CPU hold at or below this value |
+| `--resource-hold-gpu-busy-percent` | Disabled | Hold GPU work when any observed device reaches this busy percentage |
+| `--resource-resume-gpu-busy-percent` | Disabled | Recover only when all observed devices are at or below this percentage |
+
+The four flags also accept environment variables named `FREELLAMA_RESOURCE_HOLD_LOAD_PER_CPU`,
+`FREELLAMA_RESOURCE_RESUME_LOAD_PER_CPU`, `FREELLAMA_RESOURCE_HOLD_GPU_BUSY_PERCENT`, and
+`FREELLAMA_RESOURCE_RESUME_GPU_BUSY_PERCENT`. They are startup settings, not runtime-TOML keys;
+changing them requires restarting your own FreeLlama service. Inspect the effective policy under
+`host.policy` in raw `status` (or the full saved `doctor` response).
+
+CPU load is **not CPU utilization**: `0.75` does not guarantee 25% idle CPU. It scales with logical
+CPU count and includes the OS's runnable/waiting load. Both CPU thresholds must be finite and
+positive, with resume less than hold; no fixed upper ceiling is imposed. Missing CPU telemetry
+follows `--resource-telemetry-policy`; use `require-all` if unavailable CPU-load observations must
+block work. CPU load holds CPU-assigned work and work on hosts without an observed accelerator;
+it does not hold an observed GPU runner merely because a compiler is busy. Raw Ollama requests
+with explicit integer `options.num_gpu: 0` use CPU admission without rewriting the body; this is
+request intent, not proof of physical placement. Unknown raw/OpenAI-compatible placement stays
+conservatively GPU-gated when the optional GPU guard is enabled.
+
+Both GPU settings must be supplied together and satisfy `0 <= resume < hold <= 100`. GPU activity
+is optional by default so unsupported machines continue to work. When explicitly enabled, missing,
+partial, or invalid GPU busy counters refuse GPU admission with `gpu_activity` in the assessment's
+`missing_telemetry`, even with `best-effort`; CPU-assigned work remains eligible. Enable this guard
+only on hosts exposing the counters described above. It conservatively considers the busiest of
+all observed GPUs, not a per-model device assignment. CPU-only or remote Ollama deployments should
+enforce resource controls on the machine actually executing work: remote upstreams bypass local
+resource admission. Holds recover after two fresh healthy samples by default, avoiding rapid
+stop/start at a single threshold.
+
+For memory headroom, the existing `--resource-hold-available-percent` and
+`--resource-resume-available-percent` settings default to 15 and 20. The per-load reserve is
+size-aware rather than a promise to keep that entire share unused for every small model. Use
+`model_memory_budget` in the runtime file to cap combined model residency on unified-memory/CPU
+backends. GPU busy percentage is not a VRAM reserve.
 
 ## Circuit breaker
 
@@ -245,7 +307,9 @@ Omitted managed `keep_alive` values use finite retention informed by measured re
 starting from `base_seconds` (300, Ollama's own default) and shortened by `pressure_factor` under a
 host hold. Explicit values take precedence. The background pressure sweep releases, under
 FreeLlama's own low-memory estimate, only runners idle longer than `base_seconds ×
-pressure_factor` (75 s by default); swapping or OS memory pressure releases any idle runner. For governed prewarming, profile compatibility, and retention
+pressure_factor` (75 s by default); swapping or OS memory pressure shortens that to `min_seconds`
+(15 s). A runner counts as used when a task ran on it here or when another client moved its Ollama
+`expires_at` since the sweep's last check; the audit then lists it as `used_elsewhere`. For governed prewarming, profile compatibility, and retention
 settings, see [Scope history and model warming](SCOPES_AND_WARMING.md).
 
 When a model about to load needs room, FreeLlama unloads idle runners itself (`keep_alive: 0`)

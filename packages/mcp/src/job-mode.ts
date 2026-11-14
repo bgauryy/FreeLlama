@@ -4,9 +4,10 @@
 // caller passes always wins; `job_profile.applied` names every field job mode filled in.
 import { catalogView, type InstalledModel } from "./model-catalog.js";
 import { catalogLiveState } from "./model-library.js";
-import { EMBEDDING_PREFIXES, LOCAL_JOBS, NO_TOOLS, WORKFLOWS, type JobName, type LocalJob, type ModelProfile, type Prefixes, type Workflow, type WorkflowName } from "./local-prompts.js";
+import { EMBEDDING_PREFIXES, isOcrModel, LOCAL_JOBS, WORKFLOWS, workflowSource, type JobName, type LocalJob, type ModelProfile, type Prefixes, type Workflow, type WorkflowName } from "./local-prompts.js";
 
-export type JobProfile = { job: JobName; workflow?: WorkflowName; model: string | undefined; applied: string[] };
+/** `workflow_source`: the user file (path and digest) whose instructions ran, when not a built-in. */
+export type JobProfile = { job: JobName; workflow?: WorkflowName; workflow_source?: string; model: string | undefined; applied: string[] };
 
 /** The fields job mode reads and fills; every other field passes through untouched. */
 export type JobFields = {
@@ -39,12 +40,24 @@ export function neededCapabilities(fields: { tools?: unknown[]; think?: unknown 
 /**
  * The job's model for this machine now: the first catalog pick that is installed and not known to
  * be short of memory (unknown free memory is not "no room"), and that Ollama does not report
- * without a capability in `needs`; `capable` takes the strongest such pick. A pick installed under
- * another tag runs under that tag. Throws a JSON refusal naming each pick's need and what is free.
+ * without a capability in `needs`; `capable` takes the strongest such pick. When every installed
+ * pick misses only the memory preview, the first one goes to serve's memory gate. A pick installed
+ * under another tag runs under that tag. Throws a JSON refusal naming each pick's need and what is
+ * free when no suitable pick is installed.
  */
 export function pickJobModel(
   job: JobName, installed: readonly InstalledModel[] | null, availableBytes: number | null, prefer: "default" | "capable" = "default", needs: readonly string[] = [],
 ): string {
+  return pickJobModelDetailed(job, installed, availableBytes, prefer, needs).model;
+}
+
+/** A pick, plus a note when a capable workflow ran below a stronger pick that is installed but has no room now. */
+export type JobPick = { model: string; note?: string };
+
+/** pickJobModel, also saying which stronger installed pick was skipped for memory. */
+export function pickJobModelDetailed(
+  job: JobName, installed: readonly InstalledModel[] | null, availableBytes: number | null, prefer: "default" | "capable" = "default", needs: readonly string[] = [],
+): JobPick {
   const spec = LOCAL_JOBS[job];
   if (installed === null) {
     throw new Error(JSON.stringify({
@@ -67,7 +80,29 @@ export function pickJobModel(
     ? [...usable].sort((a, b) => CAPABLE_ORDER.indexOf(String((a as { role?: string }).role)) - CAPABLE_ORDER.indexOf(String((b as { role?: string }).role)))
     : usable;
   const pick = ranked[0];
-  if (pick) return ("installed_as" in pick && pick.installed_as) || pick.tag;
+  if (pick) {
+    const model = ("installed_as" in pick && pick.installed_as) || pick.tag;
+    if (prefer !== "capable") return { model };
+    // The answer gets worse silently when the strong pick waits for memory: say so.
+    const rank = (entry: (typeof view.picks)[number]) => CAPABLE_ORDER.indexOf(String((entry as { role?: string }).role));
+    const skipped = view.picks.filter((entry) => entry.installed === true && entry.fits_now === false && lacking(entry).length === 0 && rank(entry) < rank(pick));
+    if (skipped.length === 0) return { model };
+    const free = availableBytes === null ? "unknown" : `${(availableBytes / 1e9).toFixed(1)} GB`;
+    const names = skipped.map((entry) => `${("installed_as" in entry && entry.installed_as) || entry.tag} (needs ${entry.memory_gb ?? "?"} GB)`).join(", ");
+    return { model, note: `ran on ${model} because the stronger installed pick ${names} did not fit now (free: ${free}); if the answer matters, rerun when memory frees or pass that model` };
+  }
+  // The catalog's memory_gb is a conservative preview (it asks for a reserve); serve's memory gate
+  // measures the real load. An installed pick that only misses the preview goes to the gate, which
+  // runs it or refuses with what holds memory (exit 75), as delegate_research does. Measured
+  // 2026-11-12: bonsai-2:9b previewed at 10.3 GB, the gate admitted it with 6.0 GB free.
+  const installedPick = view.picks.find((entry) => entry.installed === true && lacking(entry).length === 0);
+  if (installedPick) return { model: ("installed_as" in installedPick && installedPick.installed_as) || installedPick.tag };
+  // Machines differ: with no tested pick installed, an installed model that has the job's
+  // capability runs it, flagged as untested, instead of refusing every workflow.
+  const untested = untestedPick(spec, installed, availableBytes, needs);
+  if (untested) {
+    return { model: untested, note: `no tested pick for job "${job}" is installed, so it ran on ${untested}, chosen by capability and untested for this job: verify the answer (models {view:"catalog", job:"${spec.catalogJob}"} lists tested picks)` };
+  }
   const free = availableBytes === null ? "unknown" : `${(availableBytes / 1e9).toFixed(1)} GB`;
   const picks = view.picks.map((entry) => {
     const missing = entry.installed === true ? lacking(entry) : [];
@@ -77,15 +112,48 @@ export function pickJobModel(
   const wanted = needs.length > 0 ? ` with ${needs.join(" and ")} support` : "";
   throw new Error(JSON.stringify({
     code: "job_no_model_fits", job, picks, available_gb: availableBytes === null ? null : Number((availableBytes / 1e9).toFixed(1)),
-    error: `job "${job}": no catalog pick${wanted} is installed and fits now (free: ${free}). Picks: ${listed}. ` +
+    error: `job "${job}": no catalog pick${wanted} is installed and fits now (free: ${free}), and no installed model reports the ${[...JOB_CAPABILITIES[spec.task], ...needs].join(" + ")} capability to run it untested. Picks: ${listed}. ` +
       "Ask the user to free memory, pass `model` (an installed model with the same capability), or ask them to approve pulling one exact tag at its size.",
   }));
 }
 
+/** The Ollama capabilities a job's model must report, by the job's task. */
+const JOB_CAPABILITIES: Record<LocalJob["task"], string[]> = {
+  coding: ["completion"], completion: ["completion"], vision: ["completion", "vision"], embedding: ["embedding"], decision: ["decision"],
+};
+
+/**
+ * An installed model for a job none of whose tested picks is installed: one that reports every
+ * capability the job and the request need (models whose capabilities are unknown are skipped:
+ * a guess could send a chat to an embedding model). OCR-only families read text from images only,
+ * so they serve the ocr job and nothing else. Among the rest, the largest whose file leaves half of
+ * free memory for its context and the host is preferred (bigger answers better), else the smallest
+ * (serve's memory gate decides). Image search prefers an embedding model that also takes images.
+ */
+function untestedPick(spec: LocalJob, installed: readonly InstalledModel[], availableBytes: number | null, needs: readonly string[] = []): string | undefined {
+  const wanted = [...JOB_CAPABILITIES[spec.task], ...needs];
+  const ocrJob = spec.job === "ocr";
+  let candidates = installed.filter((model) => model.capabilities !== undefined
+    && wanted.every((capability) => model.capabilities!.includes(capability))
+    && (ocrJob || !isOcrModel(model.name)));
+  if (ocrJob && candidates.some((model) => isOcrModel(model.name))) candidates = candidates.filter((model) => isOcrModel(model.name));
+  if (spec.job === "image-search" && candidates.some((model) => model.capabilities!.includes("vision"))) candidates = candidates.filter((model) => model.capabilities!.includes("vision"));
+  if (candidates.length === 0) return undefined;
+  const size = (model: InstalledModel) => model.size ?? Number.MAX_SAFE_INTEGER;
+  const roomy = availableBytes === null ? [] : candidates.filter((model) => model.size !== undefined && model.size * 2 <= availableBytes);
+  const ordered = roomy.length > 0 ? [...roomy].sort((a, b) => size(b) - size(a)) : [...candidates].sort((a, b) => size(a) - size(b));
+  return ordered[0]!.name;
+}
+
 /** Read the live state and pick: only when the caller left `model` out. */
 export async function pickLiveJobModel(job: JobName, endpoint: string | undefined, prefer: "default" | "capable" = "default", needs: readonly string[] = []): Promise<string> {
+  return (await pickLiveJobModelDetailed(job, endpoint, prefer, needs)).model;
+}
+
+/** pickLiveJobModel with the note a capable workflow's caller should see. */
+export async function pickLiveJobModelDetailed(job: JobName, endpoint: string | undefined, prefer: "default" | "capable" = "default", needs: readonly string[] = []): Promise<JobPick> {
   const [installed, available] = await catalogLiveState(endpoint, undefined);
-  return pickJobModel(job, installed, available, prefer, needs);
+  return pickJobModelDetailed(job, installed, available, prefer, needs);
 }
 
 function familyPrefixes(spec: LocalJob, model: string | undefined): Prefixes | undefined {
@@ -145,7 +213,12 @@ export function applyJob<T extends JobFields>(
     next.model = model;
     applied.push("model");
   }
-  const profile = (): JobProfile => ({ job, ...(workflow ? { workflow } : {}), model: next.model, applied });
+  const source = workflow ? workflowSource(workflow) : undefined;
+  const profile = (): JobProfile => ({
+    job, ...(workflow ? { workflow } : {}),
+    ...(source?.kind === "user" ? { workflow_source: `${source.path} (sha256 ${source.digest})` } : {}),
+    model: next.model, applied,
+  });
   if (routingOnly || spec.task === "decision") return { fields: next as T, profile: profile() };
   if (spec.task === "embedding") {
     const prefixes = familyPrefixes(spec, next.model);
@@ -191,8 +264,6 @@ export function applyJob<T extends JobFields>(
     // A workflow says what to do, so it wins over a model's own style prompt; a job without one
     // keeps the model's documented system prompt, else the job's default workflow.
     let systemPrompt = flow ? flow.system ?? own?.systemPrompt : own?.systemPrompt ?? spec.systemPrompt;
-    // Tools the caller sends are real: "you have no tools" would contradict them.
-    if (next.tools?.length && systemPrompt?.startsWith(`${NO_TOOLS}\n`)) systemPrompt = systemPrompt.slice(NO_TOOLS.length + 1);
     if (next.systemPrompt === undefined && systemPrompt !== undefined) {
       next.systemPrompt = systemPrompt;
       applied.push("systemPrompt");
@@ -214,6 +285,13 @@ export function applyJob<T extends JobFields>(
   if (options && Object.keys(options).some((key) => next.options?.[key] === undefined)) {
     next.options = { ...options, ...next.options };
     applied.push("options");
+  }
+  // A ceiling on the answer, about 8x what the workflow's eval answers needed: a looping or
+  // rambling model stops in seconds instead of minutes. Only with thinking off, where reasoning
+  // cannot spend it; run_task turns stopOnRepetition on with it (a cap would turn it off).
+  if (flow?.maxOutput !== undefined && next.think === false && next.options?.num_predict === undefined) {
+    next.options = { ...next.options, num_predict: flow.maxOutput };
+    applied.push("num_predict");
   }
   return { fields: next as T, profile: profile() };
 }

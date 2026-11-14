@@ -571,7 +571,8 @@ async fn unknown_memory_recovers_and_zero_wait_revalidates_current_snapshot() {
             .is_err()
     );
     known.store(true, Ordering::SeqCst);
-    tokio::time::sleep(Duration::from_millis(7)).await;
+    // Past the staleness limit (3 × 5 ms): the next read waits for a fresh sample.
+    tokio::time::sleep(Duration::from_millis(20)).await;
     governor.snapshot().await;
     let permit = governor
         .wait_for_capacity("http://localhost:11434", GIB, Duration::ZERO)
@@ -580,7 +581,8 @@ async fn unknown_memory_recovers_and_zero_wait_revalidates_current_snapshot() {
     assert_eq!(permit.receipt.status, "admitted");
     drop(permit);
     known.store(false, Ordering::SeqCst);
-    tokio::time::sleep(Duration::from_millis(7)).await;
+    // Past the staleness limit (3 × 5 ms): the next read waits for a fresh sample.
+    tokio::time::sleep(Duration::from_millis(20)).await;
     governor.snapshot().await;
     assert!(
         governor
@@ -635,7 +637,8 @@ async fn best_effort_cannot_clear_observed_pressure_with_unknown_telemetry() {
     )
     .unwrap();
     assert!(governor.snapshot().await.holding);
-    tokio::time::sleep(Duration::from_millis(7)).await;
+    // Past the staleness limit (3 × 5 ms): the next read waits for a fresh sample.
+    tokio::time::sleep(Duration::from_millis(20)).await;
     let snapshot = governor.snapshot().await;
     assert_eq!(
         snapshot.assess_capacity(0, false).denial_reason,
@@ -705,8 +708,45 @@ async fn pressure_requires_two_fresh_recovery_samples_and_unknown_does_not_clear
     .unwrap();
     for expected in [true, true, true, true, false] {
         assert_eq!(governor.snapshot().await.holding, expected);
-        tokio::time::sleep(Duration::from_millis(7)).await;
+        // Past the staleness limit (3 × 5 ms), so each read waits for its own fresh sample.
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+#[tokio::test]
+async fn a_stale_sample_is_refreshed_in_the_background_without_waiting() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = calls.clone();
+    let governor = ResourceGovernor::with_sampler(
+        ResourcePolicy {
+            sample_interval: Duration::from_millis(50),
+            ..quick_policy()
+        },
+        move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(30));
+            healthy()
+        },
+    )
+    .unwrap();
+    // No sample yet: the first reader waits for one.
+    let first = governor.snapshot().await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    // Stale but within 3 intervals: the cached sample comes back at once, a new one starts.
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    let started = Instant::now();
+    let stale = governor.snapshot().await;
+    assert!(started.elapsed() < Duration::from_millis(25), "a stale read must not wait for sampling");
+    assert_eq!(stale.sample_count, first.sample_count);
+    // The next reader after the background sample finished absorbs it.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let refreshed = governor.snapshot().await;
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(refreshed.sample_count, first.sample_count + 1);
+    // A load's invalidation still forces a waited, fresh sample.
+    governor.invalidate().await;
+    let forced = governor.snapshot().await;
+    assert_eq!(forced.sample_count, refreshed.sample_count + 1);
 }
 
 #[tokio::test]
@@ -1191,6 +1231,245 @@ fn macos_thermal_pressure_fills_the_thermal_signal() {
     assert_eq!(
         (unknown.thermal_pressure, unknown.thermal_throttled),
         (None, None)
+    );
+}
+
+#[test]
+fn configurable_busy_thresholds_validate_hysteresis_and_finite_values() {
+    for (hold, resume) in [(80.0, 60.0), (100.0, 0.0), (0.5, 0.25)] {
+        let policy = ResourcePolicy {
+            gpu_busy: Some(GpuBusyPolicy {
+                hold_percent: hold,
+                resume_percent: resume,
+            }),
+            ..quick_policy()
+        };
+        assert!(ResourceGovernor::with_sampler(policy, healthy).is_ok());
+    }
+    for (hold, resume) in [
+        (0.0, 0.0),
+        (101.0, 60.0),
+        (80.0, -1.0),
+        (60.0, 80.0),
+        (80.0, 80.0),
+        (f64::NAN, 60.0),
+        (80.0, f64::INFINITY),
+    ] {
+        let policy = ResourcePolicy {
+            gpu_busy: Some(GpuBusyPolicy {
+                hold_percent: hold,
+                resume_percent: resume,
+            }),
+            ..quick_policy()
+        };
+        assert!(ResourceGovernor::with_sampler(policy, healthy).is_err());
+    }
+    for (hold, resume) in [
+        (0.8, 0.8),
+        (0.8, 0.0),
+        (f64::NAN, 0.5),
+        (1.0, f64::INFINITY),
+    ] {
+        let policy = ResourcePolicy {
+            hold_load_per_cpu: hold,
+            resume_load_per_cpu: resume,
+            ..quick_policy()
+        };
+        assert!(ResourceGovernor::with_sampler(policy, healthy).is_err());
+    }
+}
+
+#[test]
+fn cpu_headroom_thresholds_scale_with_the_machine_not_a_fixed_core_count() {
+    let policy = ResourcePolicy {
+        hold_load_per_cpu: 0.75,
+        resume_load_per_cpu: 0.5,
+        ..quick_policy()
+    };
+    for cpus in [2, 8, 64, 256] {
+        let mut observed = healthy();
+        observed.logical_cpus = Some(cpus);
+        observed.load_average_one_minute = Some(f64::from(cpus) * 0.75);
+        assert!(pressure_reasons(&observed, None, &policy).contains(&PressureReason::HighCpuLoad));
+        observed.load_average_one_minute = Some(f64::from(cpus) * 0.5);
+        assert!(super::pressure::recovered_reason(
+            PressureReason::HighCpuLoad,
+            &observed,
+            None,
+            &policy
+        ));
+    }
+}
+
+fn gpu_policy() -> ResourcePolicy {
+    ResourcePolicy {
+        gpu_busy: Some(GpuBusyPolicy {
+            hold_percent: 80.0,
+            resume_percent: 60.0,
+        }),
+        ..quick_policy()
+    }
+}
+
+fn with_gpu_busy(busy: u64) -> HostResources {
+    let mut observed = healthy();
+    observed.gpu_activity = super::super::device_activity::parse_nvidia_activity(&format!(
+        "24576, 1024, {busy}, 0, GPU-a\n"
+    ));
+    observed
+}
+
+#[tokio::test]
+async fn gpu_headroom_holds_gpu_work_not_cpu_and_recovers_with_hysteresis() {
+    let busy = Arc::new(AtomicU64::new(90));
+    let source = busy.clone();
+    let governor = ResourceGovernor::with_sampler(gpu_policy(), move || {
+        with_gpu_busy(source.load(Ordering::SeqCst))
+    })
+    .unwrap();
+    let held = governor.snapshot().await;
+    assert_eq!(held.reasons, vec![PressureReason::HighGpuLoad]);
+    for demand in [ResourceDemand::load(GIB), ResourceDemand::resident()] {
+        assert_eq!(
+            held.assess_demand(demand, false).denial_reason,
+            Some(CapacityDenialReason::HostPressure)
+        );
+        assert!(held.assess_demand(demand.on_cpu(true), false).admissible);
+    }
+    busy.store(70, Ordering::SeqCst);
+    governor.invalidate().await;
+    assert!(
+        governor.snapshot().await.holding,
+        "middle of hysteresis must not resume"
+    );
+    busy.store(60, Ordering::SeqCst);
+    governor.invalidate().await;
+    assert!(
+        governor.snapshot().await.holding,
+        "one healthy sample is not recovery"
+    );
+    governor.invalidate().await;
+    assert!(!governor.snapshot().await.holding);
+    let permit = governor
+        .wait_for_demand(
+            "http://127.0.0.1:11434",
+            ResourceDemand::resident(),
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+    assert_eq!(permit.reserved_bytes(), 0);
+}
+
+#[tokio::test]
+async fn opted_in_gpu_headroom_fails_closed_on_missing_partial_or_invalid_counters() {
+    let mut missing_device_counter = with_gpu_busy(20);
+    let mut second = missing_device_counter
+        .gpu_activity
+        .as_ref()
+        .unwrap()
+        .devices[0]
+        .clone();
+    second.busy_percent = None;
+    missing_device_counter
+        .gpu_activity
+        .as_mut()
+        .unwrap()
+        .devices
+        .push(second);
+    let mut invalid = with_gpu_busy(20);
+    invalid.gpu_activity.as_mut().unwrap().devices[0].busy_percent = Some(f64::NAN);
+    for observed in [healthy(), missing_device_counter, invalid] {
+        let governor =
+            ResourceGovernor::with_sampler(gpu_policy(), move || observed.clone()).unwrap();
+        let snapshot = governor.snapshot().await;
+        assert_eq!(snapshot.status, "telemetry_unavailable");
+        let assessment = snapshot.assess_demand(ResourceDemand::resident(), false);
+        assert_eq!(
+            assessment.denial_reason,
+            Some(CapacityDenialReason::TelemetryUnavailable)
+        );
+        assert!(
+            assessment
+                .missing_telemetry
+                .contains(&TelemetryMetric::GpuActivity)
+        );
+        assert!(
+            snapshot
+                .assess_demand(ResourceDemand::resident().on_cpu(true), false)
+                .admissible
+        );
+        assert!(
+            governor
+                .wait_for_demand(
+                    "http://127.0.0.1:11434",
+                    ResourceDemand::resident(),
+                    Duration::ZERO
+                )
+                .await
+                .is_err()
+        );
+    }
+}
+
+#[tokio::test]
+async fn incomplete_gpu_collector_samples_cannot_establish_headroom() {
+    let apple = |value: &str| {
+        format!(
+            "+-o AGX <class AGXAcceleratorG14X, id 0x401, registered>\n | \"PerformanceStatistics\" = {{\"Device Utilization %\"={value}}}\n"
+        )
+    };
+    let valid_nvidia = "24576, 1024, 20, 0, GPU-a\n";
+    let valid_apple = apple("20");
+    let observations = [
+        super::super::device_activity::parse_nvidia_activity(&format!(
+            "{valid_nvidia}malformed GPU row\n"
+        )),
+        super::super::device_activity::parse_apple_activity(&format!(
+            "{valid_apple}{}",
+            apple("N/A").replace("0x401", "0x402")
+        )),
+        super::super::device_activity::parse_apple_activity(&format!(
+            "{valid_apple}+-o AGX <class AGXAcceleratorG14X, id 0x402, registered>\n"
+        )),
+        super::super::device_activity::parse_nvidia_activity(&format!(
+            "{valid_nvidia}{}",
+            " ".repeat(64 * 1024)
+        )),
+        super::super::device_activity::parse_apple_activity(&format!(
+            "{valid_apple}{}",
+            " ".repeat(64 * 1024)
+        )),
+    ];
+    for activity in observations {
+        let governor = ResourceGovernor::with_sampler(gpu_policy(), move || HostResources {
+            gpu_activity: activity.clone(),
+            ..healthy()
+        })
+        .unwrap();
+        let snapshot = governor.snapshot().await;
+        assert_eq!(
+            snapshot
+                .assess_demand(ResourceDemand::resident(), false)
+                .denial_reason,
+            Some(CapacityDenialReason::TelemetryUnavailable),
+            "partial counters cannot prove headroom: {snapshot:?}"
+        );
+    }
+}
+
+#[test]
+fn gpu_headroom_uses_busiest_device_not_an_average() {
+    let mut observed = with_gpu_busy(10);
+    observed
+        .gpu_activity
+        .as_mut()
+        .unwrap()
+        .devices
+        .push(with_gpu_busy(90).gpu_activity.unwrap().devices.remove(0));
+    assert_eq!(observed.gpu_busy_percent(), Some(90.0));
+    assert!(
+        pressure_reasons(&observed, None, &gpu_policy()).contains(&PressureReason::HighGpuLoad)
     );
 }
 

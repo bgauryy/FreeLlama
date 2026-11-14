@@ -115,6 +115,10 @@ pub(crate) fn task_record(
         Err(error) => {
             record.outcome = "error".into();
             record.status = error.status().as_u16();
+            // A failed fallback chain is charged to the model that failed last, not the first.
+            if let Some(model) = error.last_attempted_model() {
+                model.clone_into(&mut record.model);
+            }
         }
     }
     record

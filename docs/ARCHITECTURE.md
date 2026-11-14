@@ -72,6 +72,7 @@ flowchart TB
     subgraph clients["Clients"]
         CLI["freellama CLI"]
         MCP["MCP client"]
+        FLL["freellama CLI / gateway"]
         RUST["Embedded Rust application"]
         RAW["Ollama-compatible client"]
     end
@@ -89,6 +90,8 @@ flowchart TB
 
     CLI --> CORE
     MCP --> CORE
+    FLL -->|"in-process MCP handlers"| API
+    FLL -->|"streamed rewrites"| PX
     RUST --> CORE
     CORE --> API
     RAW --> PX
@@ -100,10 +103,14 @@ flowchart TB
     ADAPTER --> GPU
 ```
 
-The CLI and MCP server do not reimplement routing. CLI commands other than `serve`, `doctor`,
-`init`, and benchmarking are HTTP clients of a running `freellama serve`. The MCP server reaches the
-same control API through the feature-gated NAPI boundary, and unless `FREELLAMA_MCP_AUTOSTART_SERVE=0`
+The CLI and MCP server do not reimplement routing. `freellama` commands other than `serve`, `proxy`,
+`doctor`, `init`, `catalog` (it falls back to the shipped catalog), `auth-token`, `bench-all`, and
+`policy from-eval` are HTTP clients of a running `freellama serve`. The MCP server reaches the same control API through the feature-gated NAPI boundary, and unless `FREELLAMA_MCP_AUTOSTART_SERVE=0`
 it starts the bundled `serve` in the background at launch when nothing answers on the default endpoint.
+The agent commands (`freellama run`, `chat`, `gateway`…) call the same MCP tool handlers in-process. Its gateway runs a non-streamed Ollama or OpenAI
+chat on a `freellama/<workflow|job|auto>` virtual model as managed `run_task`, rewrites streamed and
+Anthropic or OpenAI Responses requests for serve's Ollama passthrough, and proxies everything else to
+serve ([agent CLI](AGENT_CLI.md)).
 
 ## Request classification
 
@@ -128,6 +135,7 @@ The control API exposes these endpoints:
 | Method and path | Purpose | Inference |
 |---|---|---|
 | `GET /_freellama/v1/health` | Health, admission capacity, and configured backends | No |
+| `GET /_freellama/v1/ready` | 200 once the primary Ollama (and CPU backend, when configured) answers and its catalog reads; otherwise 503 naming what is missing | No |
 | `GET /_freellama/v1/machine` | Machine profile | No |
 | `GET /_freellama/v1/models` | Normalized installed catalog, evidence, residency, and execution backend | No |
 | `POST /_freellama/v1/routes` | Deterministic route decision | No |
@@ -139,6 +147,7 @@ The control API exposes these endpoints:
 | `POST /_freellama/v1/scopes/:id/fork` | Fork history at an expected revision | No |
 | `DELETE /_freellama/v1/scopes/:id` | Delete retained history | No |
 | `POST /_freellama/v1/warm` | Admitted load of an exact installed runner profile | Load only |
+| `POST /_freellama/v1/unload` | Unload a resident model once its running tasks finish; a model that is not loaded reports `not_resident` | No |
 | `POST /_freellama/v1/tasks` | Managed chat, vision, tools, or embedding task (body shape under [Request shapes](#request-shapes)) | Yes |
 | `POST /_freellama/v1/task-batches` | Caller-declared independent tasks with ordered per-item receipts | Yes |
 | `GET /_freellama/v1/jobs` | Deferred job metadata without prompts or results | No |
@@ -146,7 +155,8 @@ The control API exposes these endpoints:
 | `POST /_freellama/v1/jobs/:id/cancel` | Cancel one deferred task and release its local permits | No new inference |
 | `DELETE /_freellama/v1/jobs/:id` | Cancel active work, release local permits, and remove its retained record | No new inference |
 
-Status, usage, metrics, and runtime-config endpoints are listed in [monitoring](MONITORING.md).
+Status, usage, metrics, and runtime-config (`config`, `config/reload`) endpoints are listed in
+[monitoring](MONITORING.md); [API](API.md) lists every surface.
 
 ### Request shapes
 
@@ -175,8 +185,46 @@ closes, which cancels generation upstream, and everything generated is kept with
 (`done_reason: "repeat_limit"`). A stopped stream has no Ollama timing fields, so it trains no
 throughput feedback. The receipt holds `route`, `admission` (`queue_wait_ms`,
 `resource_wait_ms`, `transition_wait_ms`, `total_wait_ms`), `execution` (placement, observation,
-`resource_admission`, `context_sizing`, `memory_reservation`), `metrics`, `feedback` and
-`response`, which is Ollama's own answer (`message.content`, `eval_count`, durations).
+`resource_admission`, `context_sizing`, `memory_reservation`), `metrics`, `feedback`, `timing` and
+`response`, which is Ollama's own answer (`message.content`, `eval_count`, durations). `timing` says
+where the task's time went inside `serve`, in milliseconds: `discover_ms`, `route_ms`,
+`prepare_ms`, `admission_ms`, `dispatch_ms`, `upstream_ms` (Ollama's whole answer),
+`placement_ms`, `learning_ms`, `persist_ms`, `receipt_ms`, `total_ms`, and `overhead_ms`
+(everything except `upstream_ms`). Learned feedback is written to disk after the response
+(`feedback.persistence.persisted: "queued"`); a failed write shows in health.
+
+`stream: true` answers with server-sent events (`text/event-stream`) instead of one JSON body. The
+task runs exactly as without it: same route, fallback chain, admission, memory gate and receipt.
+
+| Event | When | `data` |
+|---|---|---|
+| `route` | the model is chosen, before dispatch (once per fallback attempt) | `{selected_model, backend}` |
+| `admission` | queued, waiting for memory, loading, running | `{status, reason, detail?}`, the deferred-job phases |
+| `delta` | each generated piece | `{content}` or `{thinking}` |
+| `done` | finished | the receipt a non-streaming call returns |
+| `error` | refused or failed | the error body, `status` and `retry_safe` (false once a `delta` was sent) |
+
+Only generating tasks stream (`completion`, `coding`, `code_repair`, `vision`, `long_context`),
+without `defer`, `tools`, `questions`, `input` or `nearest`; anything else is refused before
+admission with 422 `stream_unsupported`. Fallback models advance only before generation starts. A
+client that disconnects aborts the task, which closes the upstream request so Ollama stops
+generating; nothing is replayed. `stop_on_repetition` keeps its meaning: streaming does not turn the
+loop stop on. A deferred chat job without tools reads Ollama's output the same way and shows
+`{generated_tokens, tokens_per_second}` in its status detail (reason `generating`), which MCP
+`run_task` reports as progress.
+
+`fallback_models` (up to 4 tags) is an explicit fallback chain run in the core
+(`platform/execution/fallback.rs`): the next model replaces `model` only when the attempt before it
+was refused with a code that proves nothing executed (`resource_admission_unavailable`,
+`context_window_exceeded`, `embedding_item_exceeds_context`, `model_exceeds_host_budget`,
+`upstream_circuit_open`, `model_not_installed`, `model_not_eligible`), and only when no earlier
+embedding slice of the same task ran. Any other error ends the chain. During each attempt the later
+chain models are registered as busy, which keeps eviction from unloading them. An attempt without a
+`model` records the model routing selected, so `attempts[].model` is never null for a routed pick and
+that model is not tried again; the usage record of a failed chain names the last model tried.
+A success adds `fallback: {used, attempts, selected}` to the receipt; a failure adds
+`fallback: {used, exhausted, attempts, note}` to the error body. A deferred job validates the chain
+at submission.
 
 A batch nests whole task bodies:
 
@@ -192,8 +240,9 @@ architecture, and disk. `memory_bytes` is portable host RAM. `memory_kind` is `u
 when host and accelerator memory are known to share a pool; host RAM must not be treated as
 discrete GPU VRAM. Ollama's `/api/ps` remains the placement authority.
 
-All other paths use the compatibility proxy. It buffers request bodies up to 64 MB so a retry can
-resend identical bytes, then streams the upstream response. It removes hop-by-hop headers, adds
+All other paths use the compatibility proxy. It buffers request bodies up to 64 MB for admission
+and forwarding, then streams the upstream response. Requests are replayed only when execution
+is proven not to have started; buffering bytes does not make an inference retry safe. It removes hop-by-hop headers, adds
 `x-freellama-proxy: 1`, always targets the primary upstream, and does not apply CPU model
 assignment. Existing Ollama clients keep predictable compatibility; clients that opt into the
 managed API receive routing and policy behavior.
@@ -335,11 +384,11 @@ flowchart TD
     CR --> OQ
     CX --> OQ
     OQ --> SEND["Ollama schedules bounded request"]
-    SEND --> RETRY{"500, 502,<br/>or connection-establishment failure?"}
+    SEND --> RETRY{"Connection establishment failed<br/>before execution?"}
     RETRY -->|"Retryable"| OQ
     RETRY -->|"Success"| OBS["Query selected Ollama /api/ps"]
     OBS --> OUT["Route, assignment, physical observation,<br/>admission, metrics, and response"]
-    RETRY -->|"503, timeout, or final failure"| ERR["Return upstream error"]
+    RETRY -->|"HTTP error, timeout, or uncertain failure"| ERR["Return upstream error"]
 ```
 
 Admission is independent per backend and uses weighted fair round robin: interactive gets three
@@ -509,8 +558,10 @@ waits up to the raw queue wait (control API: the managed queue wait), then gets 
 `queue_wait_ms`, `resource_wait_ms`, `transition_wait_ms`, and
 their sum as `total_wait_ms`. Health and route receipts expose sampled pressure and reservations.
 
-HTTP `500` and `502` status codes and connection-establishment failures use bounded retry with backoff.
-HTTP `504`, transport timeouts and post-send disconnects are not replayed.
+Connection-establishment failures use bounded retry with backoff because they precede execution.
+Managed inference and raw mutation/inference requests are not replayed after HTTP `500` or `502`: an
+Ollama error may arrive after the runner has already performed work. Raw read-only GET/HEAD status
+failures may still be retried. HTTP `504`, transport timeouts and post-send disconnects are not replayed.
 FreeLlama does not retry `503 Service Unavailable` because retrying while holding admission can
 amplify overload. It does not retry a generation timeout because the first request might still run.
 
@@ -569,8 +620,9 @@ Raw proxy traffic always uses the primary upstream. For setup and runtime verifi
 The MCP server keeps general model work (`run_task`), file-backed research (`delegate_research`, a
 confined adapter subprocess), and destructive lifecycle operations (`ollama_manage`,
 `ollama_delete`) in separate tools, so `run_task` never acquires file access and lifecycle
-operations are not hidden inside a generic action. The canonical tool table, schemas, and security
-annotations are in the [MCP server reference](https://github.com/bgauryy/FreeLlama/blob/main/packages/mcp/README.md#tools).
+operations are not hidden inside a generic action. Tool schemas and security annotations
+are registered in `packages/mcp/src/tools/registrations.ts`; the tool list is in
+[API](API.md#mcp-tools). `freellama tool NAME JSON` calls the same handlers from a shell.
 
 ## Grounded research flow
 
@@ -643,7 +695,8 @@ flowchart LR
 
 Raw source, images, and embedding vectors do not need to enter the frontier model's context.
 Embedding vectors are withheld by default because they are large and not human-readable. For the
-measured accounting, see [Token economics](https://github.com/bgauryy/FreeLlama/blob/main/packages/mcp/README.md#token-economics).
+compact receipts, saved response files, and the avoided-cost estimate, see
+[Small agent context](FEATURES.md#small-agent-context).
 
 ## State and failure behavior
 

@@ -33,6 +33,10 @@ enum Script {
     FenceLoop,
     /// An answer, then Ollama's own repeat-guard error line.
     RepeatLimit,
+    /// A corrupt middle frame followed by a valid terminal frame must still fail.
+    MalformedThenDone,
+    /// The answer, then Ollama's final frame with its timing.
+    Done,
 }
 
 const LOOP_LINES: usize = 600;
@@ -123,6 +127,16 @@ async fn stream_chat(stream: &mut TcpStream, fake: &FakeOllama) {
             "{}\n",
             json!({"error": "prediction aborted, token repeat limit reached"})
         )),
+        Script::MalformedThenDone => {
+            lines.push("not valid JSON\n".to_owned());
+            lines.push(format!("{}\n", json!({"done":true})));
+        }
+        Script::Done => lines.push(format!(
+            "{}\n",
+            json!({"model": "loop:latest", "message": {"role": "assistant", "content": ""},
+                "done": true, "done_reason": "stop", "eval_count": 2, "eval_duration": 20_000_000_u64,
+                "prompt_eval_count": 5, "total_duration": 30_000_000_u64})
+        )),
     }
     let mut probe = [0u8; 1];
     for line in lines {
@@ -195,6 +209,134 @@ async fn serve(fake: FakeOllama) -> (String, tokio::task::JoinHandle<()>) {
         }
     });
     (url, server)
+}
+
+/// Send a task and return the live response, for reading a stream as it arrives.
+async fn send(
+    fake: &FakeOllama,
+    extra: Value,
+) -> (axum::response::Response, tokio::task::JoinHandle<()>) {
+    let (upstream, server) = serve(fake.clone()).await;
+    let mut config = PlatformConfig::new("127.0.0.1:11435", upstream, None, None)
+        .with_max_queue_wait(Duration::from_millis(1500));
+    config.resource_governor =
+        ResourceGovernor::with_sampler(ResourcePolicy::default(), healthy).unwrap();
+    let mut task = json!({"task": "completion", "objective": "fastest", "model": "loop:latest",
+        "prompt": "read the invoice", "request_options": {"options": {"num_predict": 2048}}});
+    for (key, value) in extra.as_object().unwrap() {
+        task[key] = value.clone();
+    }
+    let response = app(&config)
+        .unwrap()
+        .oneshot(
+            Request::post("/_freellama/v1/tasks")
+                .header("content-type", "application/json")
+                .body(Body::from(task.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    (response, server)
+}
+
+/// Server-sent events as (event, data) pairs.
+fn events(text: &str) -> Vec<(String, Value)> {
+    text.split("\n\n")
+        .filter(|block| !block.trim().is_empty())
+        .map(|block| {
+            let field = |name: &str| {
+                block
+                    .lines()
+                    .find_map(|line| line.strip_prefix(name))
+                    .unwrap_or_default()
+                    .to_owned()
+            };
+            (field("event: "), serde_json::from_str(&field("data: ")).unwrap())
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_streamed_task_sends_its_route_each_piece_and_then_the_same_receipt() {
+    let fake = fake(Script::Done);
+    let (response, server) = send(&fake, json!({"stream": true})).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-type"], "text/event-stream");
+    let text = String::from_utf8(to_bytes(response.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+    server.abort();
+    let events = events(&text);
+    let names: Vec<_> = events.iter().map(|(name, _)| name.as_str()).collect();
+    let route = names.iter().position(|name| *name == "route").expect("a route event");
+    let first_delta = names.iter().position(|name| *name == "delta").expect("deltas");
+    assert!(route < first_delta, "{names:?}");
+    assert!(names.contains(&"admission"), "{names:?}");
+    assert_eq!(names.last(), Some(&"done"), "{names:?}");
+    assert_eq!(events[route].1["selected_model"], "loop:latest");
+    let streamed: String = events
+        .iter()
+        .filter(|(name, _)| name == "delta")
+        .filter_map(|(_, data)| data["content"].as_str())
+        .collect();
+    assert_eq!(streamed, "Invoice #48213\nTotal: $1,337.42\n");
+    let receipt = &events.last().unwrap().1;
+    assert_eq!(receipt["response"]["message"]["content"], streamed);
+    assert_eq!(receipt["route"]["selected_model"], "loop:latest");
+    assert!(receipt["timing"]["upstream_ms"].is_number(), "{receipt}");
+    // Streaming alone does not turn on the loop stop: num_predict caps this answer.
+    assert_eq!(receipt["response"]["done_reason"], "stop");
+}
+
+#[tokio::test]
+async fn a_stream_that_cannot_carry_tokens_is_refused_before_admission() {
+    for extra in [
+        json!({"stream": true, "defer": true}),
+        json!({"stream": true, "tools": [{"type": "function", "function": {"name": "f"}}]}),
+        json!({"stream": true, "task": "embedding", "input": "x", "prompt": null}),
+    ] {
+        let fake = fake(Script::Done);
+        let (response, server) = send(&fake, extra.clone()).await;
+        let status = response.status();
+        let body: Value = serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+        server.abort();
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{extra} {body}");
+        assert_eq!(body["code"], "stream_unsupported", "{body}");
+        assert!(fake.chats.lock().await.is_empty(), "nothing ran for {extra}");
+    }
+}
+
+#[tokio::test]
+async fn a_streamed_loop_still_stops_when_asked() {
+    let fake = fake(Script::FenceLoop);
+    let (response, server) = send(&fake, json!({"stream": true, "stop_on_repetition": true})).await;
+    let text = String::from_utf8(to_bytes(response.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+    server.abort();
+    let events = events(&text);
+    let (name, receipt) = events.last().unwrap();
+    assert_eq!(name, "done", "{text}");
+    assert_eq!(receipt["response"]["done_reason"], "repetition", "{receipt}");
+}
+
+#[tokio::test]
+async fn a_client_that_disconnects_stops_generation_upstream() {
+    use http_body_util::BodyExt as _;
+    let fake = fake(Script::FenceLoop);
+    let (response, server) = send(&fake, json!({"stream": true})).await;
+    let mut body = response.into_body();
+    // Read until the first generated piece, then hang up.
+    let mut seen = String::new();
+    while !seen.contains("event: delta") {
+        let frame = body.frame().await.expect("frames until the first delta").unwrap();
+        if let Ok(data) = frame.into_data() {
+            seen.push_str(std::str::from_utf8(&data).unwrap());
+        }
+    }
+    drop(body);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let sent = fake.lines_sent.load(Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    server.abort();
+    assert_eq!(fake.lines_sent.load(Ordering::SeqCst), sent, "generation kept going after the client left");
+    assert!(sent < LOOP_LINES, "only {sent} of {LOOP_LINES} lines were generated");
 }
 
 async fn run(fake: &FakeOllama, extra: Value) -> (StatusCode, Value) {
@@ -294,6 +436,26 @@ async fn ollama_repeat_limit_keeps_the_text_generated_before_it() {
         "Invoice #48213\nTotal: $1,337.42\n"
     );
     assert_eq!(body["output_check"]["stopped_early"], true, "{body}");
+}
+
+#[tokio::test]
+async fn malformed_middle_frame_cannot_be_hidden_by_a_later_terminal_frame() {
+    let fake = fake(Script::MalformedThenDone);
+    let (status, body) = run(&fake, json!({"stop_on_repetition":true})).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert_eq!(body["code"], "upstream_error", "{body}");
+    assert_eq!(body["execution_outcome"], "unknown");
+    assert_eq!(body["retry_safe"], false);
+    assert_eq!(body["upstream_response"]["done"], false);
+    assert_eq!(
+        body["upstream_response"]["message"]["content"],
+        "Invoice #48213\nTotal: $1,337.42\n"
+    );
+    assert_eq!(
+        fake.chats.lock().await.len(),
+        1,
+        "accepted work must not replay"
+    );
 }
 
 #[tokio::test]

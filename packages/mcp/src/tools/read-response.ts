@@ -10,7 +10,7 @@ type Fields = Record<string, unknown>;
 
 const STRING_PAGE_CHARS = 20_000;
 const ARRAY_PAGE_ITEMS = 20;
-/** Objects up to this many JSON characters come back whole; larger ones are paged as JSON text. */
+/** Serialized JSON budget for whole objects and array pages; larger objects use JSON text. */
 const WHOLE_OBJECT_CHARS = 20_000;
 
 const object = (value: unknown): Fields | undefined =>
@@ -49,21 +49,23 @@ function pointer(record: unknown, section: string): { found: boolean; value: unk
 }
 
 /** Named views of the saved record; any other name is a top-level field of the structured result. */
-function sectionValue(record: Fields, section: string): { found: boolean; value: unknown } {
-  if (section.startsWith("/")) return pointer(record, section);
+function sectionValue(record: Fields, section: string): { found: boolean; value: unknown; pointer?: string } {
+  if (section.startsWith("/")) return { ...pointer(record, section), pointer: section };
   const result = object(record.result);
   const content = object(result?.structuredContent);
   const response = object(content?.response);
-  const named: Record<string, unknown> = {
-    receipt: content,
-    arguments: record.arguments,
-    content: result?.content,
-    thinking: object(response?.message)?.thinking ?? response?.thinking,
-    embeddings: response?.embeddings,
+  const named: Record<string, { value: unknown; pointer: string }> = {
+    receipt: { value: content, pointer: "/result/structuredContent" },
+    arguments: { value: record.arguments, pointer: "/arguments" },
+    content: { value: result?.content, pointer: "/result/content" },
+    thinking: { value: object(response?.message)?.thinking ?? response?.thinking,
+      pointer: object(response?.message)?.thinking != null ? "/result/structuredContent/response/message/thinking" : "/result/structuredContent/response/thinking" },
+    embeddings: { value: response?.embeddings, pointer: "/result/structuredContent/response/embeddings" },
   };
-  if (Object.hasOwn(named, section)) return { found: named[section] !== undefined, value: named[section] };
-  if (content && Object.hasOwn(content, section)) return { found: true, value: content[section] };
-  if (Object.hasOwn(record, section)) return { found: true, value: record[section] };
+  if (Object.hasOwn(named, section)) return { found: named[section]!.value !== undefined, ...named[section]! };
+  const key = section.replace(/~/g, "~0").replace(/\//g, "~1");
+  if (content && Object.hasOwn(content, section)) return { found: true, value: content[section], pointer: `/result/structuredContent/${key}` };
+  if (Object.hasOwn(record, section)) return { found: true, value: record[section], pointer: `/${key}` };
   return { found: false, value: undefined };
 }
 
@@ -85,18 +87,35 @@ function outline(file: string, record: Fields): Fields {
   return { file, tool: record.tool, sections };
 }
 
-/** One page of `value`: characters of a string, items of an array, or the JSON text of a large object. */
+/** One bounded page: string/JSON characters or complete array records; oversized records are explicit previews. */
 export function page(value: unknown, offset = 0, limit?: number): Fields {
-  if (typeof value === "string" || Array.isArray(value)) {
-    const chosen = limit ?? (typeof value === "string" ? STRING_PAGE_CHARS : ARRAY_PAGE_ITEMS);
+  if (Array.isArray(value)) {
+    const chosen = limit ?? ARRAY_PAGE_ITEMS;
+    const total = value.length;
+    const wantedEnd = Math.min(total, offset + chosen);
+    let end = offset;
+    let chars = 2;
+    for (; end < wantedEnd; end += 1) {
+      const record = JSON.stringify(value[end], null, 2) ?? "null";
+      const size = record.length + (end > offset ? 1 : 0);
+      if (chars + size > WHOLE_OBJECT_CHARS) {
+        if (end > offset) break;
+        const preview = typeof value[end] === "string" ? value[end] as string : record;
+        return { type: "array_record_preview", total, offset, limit: chosen,
+          next_offset: end + 1 < total ? end + 1 : null, returned_items: 0, previewed_items: 1,
+          record_index: end, record_chars: preview.length, record_complete: false,
+          value: preview.slice(0, STRING_PAGE_CHARS) };
+      }
+      chars += size;
+    }
+    return { type: "array", total, offset, limit: chosen, returned_items: Math.max(0, end - offset),
+      next_offset: end < total ? end : null, value: value.slice(offset, end) };
+  }
+  if (typeof value === "string") {
+    const chosen = limit ?? STRING_PAGE_CHARS;
     const total = value.length;
     const end = Math.min(total, offset + chosen);
-    return {
-      type: typeof value === "string" ? "string" : "array",
-      total, offset, limit: chosen,
-      next_offset: end < total ? end : null,
-      value: value.slice(offset, end),
-    };
+    return { type: "string", total, offset, limit: chosen, next_offset: end < total ? end : null, value: value.slice(offset, end) };
   }
   const json = JSON.stringify(value, null, 2) ?? "null";
   if (json.length <= WHOLE_OBJECT_CHARS && offset === 0 && limit === undefined) return { type: "json", value };
@@ -117,7 +136,7 @@ export async function readResponse(
       const view = outline(resolved, record);
       return structuredResult(view, { text: JSON.stringify(view) });
     }
-    const { found, value } = sectionValue(record, section);
+    const { found, value, pointer: selectedPointer } = sectionValue(record, section);
     if (!found) {
       const names = (outline(resolved, record).sections as Fields[]).map((entry) => entry.name).join(", ");
       return errorResult(new Error(`No section ${section} in ${file}. Sections: ${names}.`));
@@ -125,6 +144,15 @@ export async function readResponse(
     const view: Fields = { file: resolved, section, ...page(value, offset, limit) };
     const text = typeof view.value === "string" ? view.value : JSON.stringify(view.value);
     const more = typeof view.next_offset === "number" ? `\n[more: offset ${view.next_offset} of ${String(view.total)}]` : "";
+    if (view.type === "array_record_preview") {
+      const recordSection = `${selectedPointer}/${String(view.record_index)}`;
+      view.record_section = recordSection;
+      const instructions = `Large array record ${String(view.record_index)}: bounded preview only; original record is unchanged. `
+        + `Read it in pages with read_response{file:${JSON.stringify(resolved)}, section:${JSON.stringify(recordSection)}}. `
+        + "Array next_offset continues with the following record.";
+      view.instructions = instructions;
+      return structuredResult(view, { text: `[${instructions}]\n${text}${more}` });
+    }
     return structuredResult(view, { text: text + more });
   } catch (error) {
     return errorResult(error);
@@ -138,7 +166,7 @@ export function registerReadResponseTool(server: McpServer): void {
       description:
         "Use when: a result's response_file holds what the inline view lacks. Do not use when: the inline result answers. " +
         "Returns: one section (a `sections` name, a structuredContent field or a JSON pointer such as /result/structuredContent/route), paged by offset/limit " +
-        "(characters, array items or JSON text; next_offset continues); omit section for an outline.",
+        "(characters, array items or JSON text; next_offset continues). Array pages also cap serialized text; an oversized record returns an explicit preview and its record_section to page. Omit section for an outline.",
       inputSchema: z.object({
         file: z.string().min(1),
         section: z.string().min(1).optional(),

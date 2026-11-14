@@ -11,6 +11,7 @@ server-launch config (for example `.mcp.json`'s `env` block) or the launching sh
 |---|---|---|
 | `FREELLAMA_OLLAMA_ENDPOINT` | `http://127.0.0.1:11434` | Default Ollama endpoint for `doctor`, the `models` detail/raw/library views, all `ollama_*` tools, and the autostarted serve's `--upstream` |
 | `FREELLAMA_SERVE_ENDPOINT` | `http://127.0.0.1:11435` | Default `endpoint` for serve-backed tools and `delegate_research` |
+| `FREELLAMA_MCP_RECEIPT` | `text` | `structured` keeps `run_task` and `task_jobs` receipts inline as `structuredContent` (see [Where an answer goes](#where-an-answer-goes)) |
 | `FREELLAMA_MCP_DEFAULT_MODEL` | unset (routes to an installed coding model) | `delegate_research`'s default `model` |
 | `FREELLAMA_MCP_DEFAULT_ADAPTER` | `bash` | `delegate_research`'s adapter (`octocode` to switch) |
 | `FREELLAMA_MCP_MAX_TURNS` | `8` | Max agent turns for `delegate_research` |
@@ -27,11 +28,14 @@ server-launch config (for example `.mcp.json`'s `env` block) or the launching sh
 | `FREELLAMA_TASK_TIMEOUT_SECONDS` | `900` | Generation calls; read by the native client (`packages/rust-core/src/serve_client.rs`) |
 | `FREELLAMA_AUTH_TOKEN_FILE` | unset | Bearer-token file used by the native client and research adapters for all serve routes |
 | `FREELLAMA_AGENT_TOKEN_CALIBRATION_DIR` | platform data directory | Prompt-free, model-specific token-estimator calibration shared across adapter processes |
-| `FREELLAMA_MCP_AUTOSTART_SERVE` | `1` | When the default loopback serve endpoint does not answer, start `freellama serve` as a child of the MCP server (stopped with it): once in the background at launch, so other local clients find it, and again on a tool call if it is still down. `0` disables |
+| `FREELLAMA_MCP_AUTOSTART_SERVE` | `1` | When the default loopback serve endpoint does not answer, start `freellama serve` as a child of the MCP server (stopped with it): once in the background at launch, so other local clients find it, and again on a tool call if it is still down. Under the agent commands (`freellama run`, `chat`…) it starts detached instead, logging to `$FREELLAMA_HOME/serve.log` (default `~/.octocode/freellama/serve.log`), and keeps running for later calls. `0` disables |
+| `FREELLAMA_WORKFLOWS_DIR` | `$FREELLAMA_HOME/workflows` | Directory of your own workflow files (`NAME.md`), read when the MCP server or an agent command starts. A file named like a built-in replaces it; an invalid one is skipped and named by `freellama workflows` and `doctor`. Format: [your own workflows](../../docs/PROMPTS.md#your-own-workflows) |
+| `FREELLAMA_EMBED_INDEX` | `1` | `0` turns off the persistent embedding index that lets a repeated `nearest` search over files (find-code, duplicates) embed only new or changed chunks. Vectors live in `$FREELLAMA_HOME/embedding-index/`, one file per model, digest and dimensions. |
+| `FREELLAMA_OLLAMA_CLI` | `ollama` | Path of the `ollama` binary that `freellama chat` runs |
 | `FREELLAMA_SERVE_BINARY` | checkout `target/release`/`debug`, then the platform package | Binary used for serve autostart |
 | `FREELLAMA_AGENT_OS_SANDBOX` | `auto` | Bash adapter OS confinement: `bwrap` on Linux, `sandbox-exec` on macOS, when present. `off` keeps only the restricted shell |
 | `FREELLAMA_AGENT_OCTOCODE_PACKAGE` | `octocode@19.1.0` | Pinned npm spec the Octocode adapter runs through `npx` |
-| `FREELLAMA_MCP_ALLOW_CODER` | unset (off) | `1` enables `delegate_research` `adapter:"coder"`, which edits files and runs the caller's `agent.commands` in an isolated copy of the workspace (see [the coder adapter](README.md#the-coder-adapter)) |
+| `FREELLAMA_MCP_ALLOW_CODER` | unset (off) | `1` enables `delegate_research` `adapter:"coder"`, which edits files and runs the caller's `agent.commands` in an isolated copy of the workspace and returns a patch for the caller to review and `git apply` (see [`src/research/coder-agent.ts`](https://github.com/bgauryy/FreeLlama/blob/main/packages/mcp/src/research/coder-agent.ts)) |
 | `FREELLAMA_CODER_RUN_TIMEOUT_SECONDS` | `300` (at most `1800`) | Timeout of one coder `run`; the whole call is still bounded by `agent.timeoutSeconds` (coder default at least 600 s) |
 | `FREELLAMA_CODER_MAX_COPY_BYTES` | `209715200` (200 MB) | Size cap of a coder copy of a workspace that is not a git repository (`node_modules`, `target`, `dist` and `.git` excluded) |
 | `FREELLAMA_CODER_WRITABLE` | unset | Platform-separated extra directories the coder's allowed commands may write, such as `~/.cargo` for `cargo test`; an entry that holds or lies inside the workspace is refused |
@@ -112,3 +116,55 @@ slots or relax memory guards. Existing queued work keeps its captured cost. See
 file, so its evidence table is empty unless you set `FREELLAMA_MCP_MODEL_EVIDENCE`. An unmeasured
 model yields a `verify` verdict, and an unreadable evidence file is reported on stderr and treated
 as empty. Tool descriptions state the rules.
+
+## Research model and sweeps
+
+Without `model` (and without `FREELLAMA_MCP_DEFAULT_MODEL`), `delegate_research` uses the first
+research-agent catalog pick (stronger, default, small) that is installed and fits in memory now;
+GitHub research skips the small pick, which scored 1 of 6 there. When none fits, it takes the
+installed default (then stronger) pick and lets serve's memory gate admit, wait or refuse the load;
+with no pick installed it falls back to routing. The receipt's `researchModel` says which and why.
+GitHub answers are grounded against the adapter's own `gh` results; local adapters check the workspace on disk. A sweep whose
+server process exited reports `interrupted` with the `sweep{action:"resume", sweepId}` call, which
+reuses saved chunk results; sweeps never resume on their own.
+
+## Where an answer goes
+
+Every result is saved whole (`response_file`; read one part with `read_response{file, section}`).
+
+`run_task` and `task_jobs` answer with **text alone**: the answer, its `check:` lines and a closing
+`response_file: <path>` line, with no `structuredContent`. Hosts such as Claude Code show
+`structuredContent` in place of the text when a result has it, which handed the agent the whole
+receipt (1–3k tokens) around a two-line answer. The receipt (route, model, timings, placement,
+tokens) stays in the response file, one `read_response` away; `receipt:"full"` on a call returns it
+inline, and `FREELLAMA_MCP_RECEIPT=structured` restores inline receipts for every call (those two
+tools then declare their output schema again). The other tools always return `structuredContent`.
+`run_task` and `delegate_research` take two more fields that choose what comes back inline:
+
+- `output`: `auto` (default) returns the answer inline up to 8,000 characters (about 2,000 tokens),
+  and above that a short view: the label line, the first lines of the answer, every `check:`,
+  `handoff_file:`, `verification:` and `cited:` line unchanged, and the file holding the whole
+  answer. `inline` always returns the whole text; `file` always returns the short view. The
+  default exists because hosts limit tool output (Claude Code warns above 10,000 tokens and caps
+  it at 25,000 by default) and every inline character costs the calling agent tokens.
+  A shortened view also replaces the answer's text inside `structuredContent` with
+  `answer moved: <output_file or read_response location>` and adds `output: {mode, chars, file}`.
+- `outputPath`: also write the answer there as Markdown (the `saveAs` handoff format), returned as
+  `output_file`. The caller owns the path: a new file is created and an existing one replaced. It
+  must resolve inside the readable roots (the project, the temp directory, `FREELLAMA_FILE_ROOTS`),
+  outside any `.git` directory, and not be a directory. It is checked before the model runs, so it
+  is refused with `preview` or `defer`; with `tasks` one file holds the combined text. A failed
+  write keeps the whole answer inline and names the error.
+
+A shortened view without an `outputPath` writes the answer to a new
+`${FREELLAMA_HOME}/tmp/<timestamp>-<pid>-<n>.md` (default `~/.octocode/freellama`) and ends with
+`output_file: <path> (the full answer, N chars)`; a later `run_task{files:[output_file]}` can read
+it. Those files are deleted after `FREELLAMA_RESPONSE_TTL_DAYS` (default 7; `0` keeps them). If
+that write fails, the view points at the saved response
+(`read_response{file, section:"/result/content/0/text"}`); with neither, the whole answer is
+returned with a note.
+
+`task_jobs{action:"get"}` shapes a finished deferred job the same way (its own `output`, default
+`auto`). Receipts keep the routing, timing and token counts inline; telemetry and nested metrics move
+to the saved `response_file`. `models{view:"installed"}` and `resident` return a slim per-model set;
+`includeVerbose:true` returns the full records.

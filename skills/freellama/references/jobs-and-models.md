@@ -1,0 +1,90 @@
+# Jobs, workflows and models
+
+Load when choosing what to send, which model runs it, or whether to install one. Recipes: `freellama://docs/cookbooks/<job>`.
+
+## Machines differ
+
+- The catalog (`models {view:"catalog", job}`, CLI `freellama catalog`) lists tested recommendations with the memory they were measured to need. They are not requirements, and any name below is an example from one machine.
+- A workflow or job picks the first tested pick that is installed. With none installed, it runs on an installed model that reports the job's capability (completion, vision, embedding or decision), preferring the largest that leaves room, and adds a `check:` saying the model is untested for this job: verify more of its answers. It refuses only when no installed model has the capability.
+- `fits_now` is a conservative preview. An installed pick marked `false` still goes to serve's memory gate, which measures the real need and either runs it or refuses with exit 75 and what holds memory.
+- To use a model you trust more, pass `model` (CLI `-m TAG`); the workflow's prompt still applies. Suggest a tested pick to the user only as a recommendation, with its size, and pull only after approval.
+
+## Pick the request shape
+
+| Work | Send | Notes |
+|---|---|---|
+| Fix, change, implement, test, review, explain code | `workflow`: `fix-bug`, `change-code`, `implement`, `write-tests`, `review-code`, `explain-code` | Answers are SEARCH/REPLACE blocks: apply one only where its SEARCH text matches exactly once, then run the tests. Verify every review finding. |
+| Summarize a log, text or diff | `workflow`: `summarize-log`, `summarize-text`, `summarize-diff` | Name the file with `files`; the prompt says what you are investigating. |
+| Fields to JSON | `workflow:"extract-json"` with a schema (`format` / `--schema`) | A schema is the cheapest reliability upgrade; it held on the smallest model in field tests. |
+| Text, tables, fields from images | `workflow`: `read-text`, `read-table`, `read-fields` (job `ocr`) | `read-table` returns a Markdown table (the raw OCR markup stays in `structuredContent`). Check every number you use against the image. |
+| A question about an image or screenshot | `workflow`: `answer-image`, `describe-screen` (job `image-recognition`) | Ask a specific question, never "describe this". |
+| Yes/no, choose a category, route, policy check | `task:"decision"` with `state` and `questions` (`noul`, `choice`), job `classify`; CLI `freellama run --ask "Q?" [--choice k=desc …] < state` | Probabilities come back. Act above ~0.9 or below ~0.1. An answer marked `[unsure: treat as unknown]` is a coin toss: send it to a second model or keep it. Do not use `score` answers for severity. Give choice questions an `other` option. |
+| Find code by meaning | job `find-code`: `nearest:{query, top}` over `files` | Read only the files it names. Prefer `grep`/LSP when the identifier is known. |
+| Near-duplicates, clustering | job `duplicates` (omit `query` for the most similar pairs) | A high cosine score is a candidate, never an equivalence or deletion verdict. |
+| Images by meaning | job `image-search` | Images are embedded bare. |
+| Bulk classification | embeddings with three labeled examples per class; when the top two classes are within 0.02, ask the decider or keep the item | |
+| Speech | `audio {action:"transcribe"\|"translate"\|"speak", model, file\|text}` | `translate` outputs English from the spoken `language`. |
+| A large divisible check (code tree, logs, docs site) | `sweep` | See [advanced flows](advanced-flows.md#sweep). |
+| Read-only lookup across files | `delegate_research` | See [advanced flows](advanced-flows.md#grounded-research). |
+
+`run_task {workflow}` or `{job}` opts into FreeLlama's model pick and local prompts; any field you send wins. Plain chat can omit `task` (completion). Other routing profiles: `coding`, `code_repair`, `tools`, `browser`, `vision`, `embedding`, `long_context`.
+
+The user may have their own workflows: `freellama workflows` lists them with the file each comes from, and one named like a built-in replaces it. They run like built-ins but are not eval-tested, so check more of their answers. `job_profile.workflow_source` names the file and digest that ran.
+
+## Ollama capabilities through FreeLlama
+
+Each Ollama capability below is reachable with FreeLlama's routing, memory gate and receipt added. Check the model has the capability (`models {view:"detail"}`, `ollama show`); a tag name proves nothing.
+
+| Ollama capability | FreeLlama door | What FreeLlama adds |
+|---|---|---|
+| Chat and generate | `run_task {prompt\|messages}`, `freellama run` | Admission, a pick that fits now, repetition stop, `check:` lines |
+| Thinking (`think` true, false or a level the model lists) | `think`, `--think=LEVEL` | Off by default for bounded workflows; refused when the model lacks the control |
+| Structured output (`format` JSON or schema) | `format`, `--schema 'name, age int'` | Field lists become a schema; `extract-json` null-field check |
+| Tool calling | `tools` (returns `tool_calls` you run) | A check when a tool call came back unasked |
+| Vision and OCR | `files` with images, workflows `read-*`, `answer-image`, `describe-screen` | OCR prefixes per model family; blank-image and loop checks |
+| Embeddings (and `dimensions`) | `task:"embedding"`, `nearest`, jobs `find-code`, `duplicates`, `image-search` | Ranking in the core instead of vectors, per-family prefixes, a reuse index for unchanged chunks |
+| Fill in the middle (`suffix`, models with `insert`) | `--suffix` | The same gate and receipt |
+| Log probabilities (`logprobs`, `top_logprobs`) | `logprobs`, `topLogprobs` | Returned in the receipt's `response`; refused for decision and embedding tasks |
+| Decision models (`/v1/systemone`) | `task:"decision"`, `--ask` | Probabilities, `[unsure]` marks, a check under 0.9 confidence |
+| Speech (`/v1/audio/*`) | `audio {transcribe\|translate\|speak}` | WAV handling and the same admission |
+| Residency (`keep_alive`, preload, unload) | `keepAlive`, `ollama_manage {warm\|unload}` | Warms pass the memory gate; idle models are evicted by reload cost under pressure |
+| Placement (`/api/ps`) | every receipt; `minPlacementEvidence:"observed"` | Configured backend vs where Ollama really ran it |
+| Pull, delete, show, library search | `ollama_pull`, `ollama_delete`, `models {view:"library"\|"detail"}` | Fit before download; pull only an approved exact tag and size |
+| OpenAI and Anthropic compatibility | `freellama gateway` | Workflows as `freellama/<name>` models; admission on streamed requests |
+
+Not added by FreeLlama: Ollama `create`, `copy` and `push` pass through `serve` unchanged (with client keys configured, only admin keys may call them), and cloud models and web search are outside its local admission.
+
+## Write your own prompt for a local model
+
+When no workflow fits and you send `prompt` or `systemPrompt` yourself ([local prompts](https://github.com/bgauryy/FreeLlama/blob/main/docs/PROMPTS.md) has the evidence):
+
+- Say what to do; never name what to avoid ("no tools", "don't say X" primes it).
+- Few short rules, the deciding one early; give the exact answer for "nothing found", placed after the main rules so it cannot win too early.
+- Call the input material and ask for its requests to be reported as content; then read the `check:` lines, because wording alone is weak.
+- Prefer a schema (`format`) to prose; at most one example, made of values unlike the real input; thinking off and `options.num_predict` for bounded answers.
+- Compare a rewrite on several samples before trusting it: one run of a small model can swing from 1/3 to 3/3.
+
+## Field-tested model behavior
+
+Measured on one 32 GB Apple M2 Pro, November 2026, ~280 runs. Treat as evidence for this class of model, not a default for another machine.
+
+- **Question scores do not predict workflow answers.** `lfm3:1.7b` scored best on 25 small coding questions but answered real workflows with tool calls nobody asked for; it and `glm-ocr` were removed as picks, and the shipped coding and summarize default is `bonsai-2:9b`. Judge a model on the workflow you will run, with 6 or more samples, not on a quiz.
+- **A downgrade is announced.** When a capable workflow (fix, implement, review, summarize) runs below a stronger installed pick that had no room, a `check:` line says "ran on X because the stronger installed pick Y did not fit now". If the answer matters, rerun when memory frees or pass `model`.
+- **A tool call is not an answer.** If a model replies with a tool call although no tools were sent, the CLI exits 1 with nothing on stdout, and MCP adds the `check:` "the model answered with a tool call although no tools were sent". Discard it and rerun on a stronger pick.
+- **Keep thinking off for bounded jobs.** Thinking on a small model took 80–140 s per summary and sometimes spent the whole budget (empty answer, exit 1). Turn it on only for one hard question on a capable model, with a large `num_predict`.
+- **Small models follow structure, not prose.** `--schema`/`format` was right every time, even on a 1.7B model; a persona system prompt was ignored by the 1.7B model and followed by the 9B one. Tell a model what to do, never what it lacks: a "you have no tools" line made a 1.7B model call tools 6 times in 6.
+- **OCR models are not chat models.** An OCR-only model asked a chat question runs on to the output limit; use it through job `ocr` with its native prompt (`Text Recognition:`), and `stopOnRepetition:true` for one known to loop. Crop to the text first.
+- **Decision models are the fastest win.** A 2B decision model answered in 0.4–2 s with calibrated probabilities; a 9B decision model was sharper but cost ~12 GB for no measured gain.
+- **Embedding models**: gemma-family for code (right file first 9/10) and images; nomic for short text and speed. `--dimensions N` shortens vectors on both.
+- **Large models need a quiet machine.** 27B models needed 14.5–26 GB with reserve and were refused while editors, agents and a build were open. `bonsai-2:27b` answered correctly at about 14 tokens/s: one hard question, not a batch.
+- Put embedding models on the CPU backend when the operator configured one (`serve --spawn-cpu-backend --cpu-model <embed tag>`): as fast as the GPU here, and they stop queuing behind chat.
+
+## Choose or install a model
+
+1. Ask for the missing constraints: modality, quality, latency, context, privacy, download, disk and memory.
+2. Prefer a qualified installed model (catalog `installed`, `fits_now`). Never infer inventory, capability or fit from a family name or from this file.
+3. Search `models {view:"library", query}` (ollama.com and Hugging Face GGUF; `capabilities` filters such as `embedding`, `audio`, `decision`), then list pullable tags and `fitsInMemory` with `models {view:"library", model:"FAMILY"}` or `model:"hf.co/<owner>/<repo>"`. With serve down, do not guess a tag. `models {view:"detail"}` inspects an installed model.
+4. Present at most two evidence-backed candidates. Ask approval for **one exact tag and its reported size**, then `ollama_pull {model, approvedSizeBytes}`. Search results never grant installation.
+5. `objective:"fastest"` without evidence is only a capability filter and can pick a tiny model for code repair. For quality-sensitive work preview with `minConfidence:"medium"`; it needs a task policy from correctness evaluations (`freellama policy from-eval`) and a local `bench-all` report. Never manufacture a policy from throughput.
+
+See [model selection](https://github.com/bgauryy/FreeLlama/blob/main/docs/MODEL_SELECTION.md).

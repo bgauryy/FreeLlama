@@ -1,5 +1,6 @@
 //! Bounded empirical runner footprints. No extrapolation across model revisions or contexts.
 use super::CatalogModel;
+use crate::capability::Capability;
 use crate::store::{FootprintRow, Store};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, VecDeque};
@@ -394,15 +395,24 @@ impl FootprintHistory {
             .filter(|sample| sample.context >= context)
             .map(|sample| sample.bytes)
             .max();
+        // Ollama runs a model that cannot complete (an embedding model) with one parallel slot
+        // whatever OLLAMA_NUM_PARALLEL says (server/sched.go), so its K/V is not multiplied.
+        // Unknown capabilities are not evidence of an embedding model.
+        let embedding_only = model.capabilities.contains(&Capability::Embedding)
+            && !model.capabilities.contains(&Capability::Completion);
+        let parallel = if embedding_only {
+            1
+        } else {
+            hints.num_parallel
+        };
         // Context 0 means the context is unknown, not empty: fall back to the assumed KV share.
         let kv_f16 = model
             .kv_cache_bytes_per_token_f16
             .filter(|_| context > 0)
             .and_then(|bytes| bytes.checked_mul(context))
-            .and_then(|bytes| bytes.checked_mul(hints.num_parallel));
+            .and_then(|bytes| bytes.checked_mul(parallel));
         let kv = kv_f16.map(|bytes| bytes / 100 * hints.kv_cache_percent);
-        let kv_or_fallback =
-            kv.unwrap_or_else(|| unknown_kv_bytes(model.size, context, hints.num_parallel));
+        let kv_or_fallback = kv.unwrap_or_else(|| unknown_kv_bytes(model.size, context, parallel));
         let graph = model.size / 100 * GRAPH_MARGIN_PERCENT;
         // What Ollama's own fit check predicts: the same file and graph with an F16 cache. It
         // differs from the estimate only for a quantized cache, and never replaces it (or a
@@ -558,6 +568,26 @@ mod tests {
         });
         assert_eq!(auto_q4.flash_attention, FlashAttention::Auto);
         assert_eq!(auto_q4.kv_cache_percent, 25);
+    }
+
+    #[test]
+    fn an_embedding_model_is_not_multiplied_by_parallel_slots() {
+        let mut embedding = model();
+        embedding.kv_cache_bytes_per_token_f16 = Some(10);
+        embedding.capabilities = [Capability::Embedding].into();
+        let hints =
+            RuntimeHints::from_lookup(|name| (name == "OLLAMA_NUM_PARALLEL").then(|| "4".into()));
+        let history = FootprintHistory::with_hints(hints);
+        // Ollama runs it with one slot: 1000 file + 10 * 100 KV + 100 graph, not 4x the KV.
+        assert_eq!(
+            history.requirement("cpu", &embedding, 100, None, true)["required_available_bytes"],
+            2100
+        );
+        embedding.capabilities = [Capability::Embedding, Capability::Completion].into();
+        assert_eq!(
+            history.requirement("cpu", &embedding, 100, None, true)["required_available_bytes"],
+            5100
+        );
     }
 
     fn hints(flash_attention: Option<&str>, kv_cache_type: &str) -> RuntimeHints {

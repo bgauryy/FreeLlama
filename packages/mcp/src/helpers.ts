@@ -1,4 +1,6 @@
 // Shared MCP result helpers, Zod parameter schemas, the confidence gate, and payload trimming.
+import { fallbackRefusalLine } from "./result-checks.js";
+import { OLLAMA_MISSING, ollamaInstalled } from "./ollama-presence.js";
 import * as z from "zod";
 import { DEFAULT_OLLAMA_ENDPOINT, DEFAULT_OLLAMA_FETCH_TIMEOUT_SECONDS, DEFAULT_SERVE_ENDPOINT } from "./config.js";
 import { modelNames, seconds } from "./job-progress.js";
@@ -173,6 +175,12 @@ export function taskMessages({ systemPrompt, messages, prompt, images }: {
   return [{ role: "system", content: systemPrompt }, ...conversation];
 }
 
+/**
+ * An explicit, ordered fallback chain the core runs (`fallback_models`): the next model only after
+ * the one before it was refused before it ran, never after it started. At most 4.
+ */
+export const fallbackModelsParam = z.array(z.string().min(1)).min(1).max(4).optional();
+
 // Full per-item shape, checked in run_task by `parseBatchTask` (strict: a misspelled or mistyped
 // field fails the call). It is never sent to the model; `batchItemParam` below is.
 const batchTaskParam = z.object({
@@ -206,6 +214,7 @@ const batchTaskParam = z.object({
   logprobs: z.boolean().optional(),
   topLogprobs: z.number().int().nonnegative().optional(),
   minConfidence: minConfidenceParam,
+  fallbackModels: fallbackModelsParam,
 }).strict();
 
 /** Field names a `tasks[].task` item accepts; derived from the schema so hints cannot drift. */
@@ -214,26 +223,19 @@ export const BATCH_TASK_FIELDS: ReadonlySet<string> = new Set(Object.keys(batchT
 export type BatchTask = z.infer<typeof batchTaskParam>;
 export type BatchItem = { id: string; independent: true; task: BatchTask };
 
-// What the model sees: only the fields that usually differ between items, loosely typed. Every
-// other batch field is still accepted (`catchall`) and `parseBatchTask` validates the whole item.
+// What the model sees: one loose task object per item, described in a line. Every field is
+// validated against the full strict shape by `parseBatchTask`, so the item schema need not repeat
+// the run_task fields an agent already sees at the top level (it cost about 1.5 KB per session).
 export const batchItemParam = z.object({
   id: z.string().min(1),
   independent: z.literal(true),
+  // The fields that usually differ between items, named so an agent sees them; any other run_task
+  // field is accepted too, and parseBatchTask checks every one strictly.
   task: z.object({
-    prompt: z.string().optional(),
+    ...Object.fromEntries(["prompt", "messages", "state", "input", "files", "images", "model", "task", "questions", "options", "keepAlive", "format", "think"]
+      .map((name) => [name, z.unknown().optional()])),
+    // Typed where an agent writes structure the local model reads: instructions and tool descriptors.
     systemPrompt: systemPromptParam,
-    messages: z.array(z.unknown()).optional(),
-    state: z.unknown().optional(),
-    input: z.unknown().optional(),
-    files: z.array(z.string()).optional(),
-    images: z.array(z.string()).optional(),
-    model: z.string().optional(),
-    task: taskParam.removeDefault().optional(),
-    questions: z.record(z.string(), z.unknown()).optional(),
-    options: z.record(z.string(), z.unknown()).optional(),
-    keepAlive: z.string().optional(),
-    format: z.unknown().optional(),
-    think: z.unknown().optional(),
     tools: localToolsParam,
   }).catchall(z.unknown()),
 }).strict();
@@ -383,18 +385,25 @@ export function taskAnswerText(payload: Record<string, unknown>): string | undef
   return undefined;
 }
 
+/** Below this confidence (choice, score), or with p(true) between 0.3 and 0.7, an answer is a coin toss. */
+const UNSURE_CONFIDENCE = 0.25;
+const UNSURE = " [unsure: treat as unknown]";
+
 /** One line per decision answer: `kind: bug (p 0.97, confidence 0.94)`, `refund: true (p 0.99)`, `urgency: 1.20 of 0-2, likeliest "Soon" (confidence 0.40)`. */
 export function decisionAnswerText(answers: Record<string, unknown>): string {
   const fixed = (value: unknown) => (typeof value === "number" ? value.toFixed(2) : "?");
   return Object.entries(answers).map(([name, raw]) => {
     const answer = record(raw) ?? {};
     const confidence = typeof answer.confidence === "number" ? `, confidence ${fixed(answer.confidence)}` : "";
+    // A flat answer is the model saying it cannot tell: mark it, so nobody acts on its label.
+    const unsure = typeof answer.confidence === "number" && answer.confidence < UNSURE_CONFIDENCE ? UNSURE : "";
     if (answer.type === "choice") {
       const choice = String(answer.choice ?? "?");
-      return `${name}: ${choice} (p ${fixed(record(answer.probabilities)?.[choice])}${confidence})`;
+      return `${name}: ${choice} (p ${fixed(record(answer.probabilities)?.[choice])}${confidence})${unsure}`;
     }
     if (answer.type === "noul" && typeof answer.noul === "number") {
-      return `${name}: ${answer.noul >= 0.5 ? "true" : "false"} (p(true) ${fixed(answer.noul)})`;
+      const flat = answer.noul > 0.3 && answer.noul < 0.7 ? UNSURE : "";
+      return `${name}: ${answer.noul >= 0.5 ? "true" : "false"} (p(true) ${fixed(answer.noul)})${flat}`;
     }
     if (answer.type === "score") {
       const legend = record(answer.legend) ?? {};
@@ -403,7 +412,7 @@ export function decisionAnswerText(answers: Record<string, unknown>): string {
       const likeliest = probabilities.sort((left, right) => right[1] - left[1])[0]?.[0];
       const top = Math.max(0, Object.keys(legend).length - 1);
       const label = likeliest === undefined ? "" : `, likeliest ${JSON.stringify(legend[likeliest] ?? likeliest)}`;
-      return `${name}: ${fixed(answer.score)} of 0-${top}${label} (${confidence.slice(2) || "no confidence"})`;
+      return `${name}: ${fixed(answer.score)} of 0-${top}${label} (${confidence.slice(2) || "no confidence"})${unsure}`;
     }
     return `${name}: ${JSON.stringify(raw)}`;
   }).join("\n");
@@ -608,11 +617,14 @@ const SERVE_ADDRESS_PATTERN = (() => {
 export function refusalLine(body: string, status?: number): string {
   let parsed: { error?: unknown; code?: unknown; resource_admission?: { assessment?: Record<string, unknown> } };
   try {
-    parsed = JSON.parse(body) as typeof parsed;
+    parsed = (record(JSON.parse(body)) ?? {}) as typeof parsed;
   } catch {
     return body.trim().slice(0, 400) || `HTTP ${status ?? "error"}`;
   }
-  const error = typeof parsed.error === "string" ? parsed.error : `HTTP ${status ?? "error"}`;
+  const nestedMessage = record(parsed.error)?.message;
+  const boundedMessage = typeof nestedMessage === "string" ? nestedMessage.slice(0, 400) : "";
+  const error = typeof parsed.error === "string" ? parsed.error
+    : boundedMessage.trim() ? boundedMessage : `HTTP ${status ?? "error"}`;
   const code = typeof parsed.code === "string" ? ` [${parsed.code}]` : "";
   const assessment = parsed.resource_admission?.assessment;
   // The core's managed-task refusals already state "needs X GB incl. Y GB reserve, Z GB free"
@@ -651,9 +663,13 @@ export function errorResult(error: unknown) {
   const actionableMessage = managedServeUnavailable
     ? `${message}\n\nFreeLlama managed serve is unreachable. Start it with \`freellama serve\`, or set \`FREELLAMA_SERVE_ENDPOINT\` to a running managed endpoint; then retry. Run \`doctor\` to inspect the configured endpoint.`
     : ollamaUnavailable
-      ? `${message}\n\nOllama is not running at that address. Ask the user to start Ollama (the app, or \`ollama serve\`); retrying before that cannot succeed.`
+      ? ollamaInstalled()
+        ? `${message}\n\nOllama is not running at that address. Ask the user to start Ollama (the app, or \`ollama serve\`); retrying before that cannot succeed.`
+        : `${message}\n\n${OLLAMA_MISSING} Ask the user to install it; nothing can run until then.`
       : receipt && message.length > 600 ? refusalLine(message) : message;
-  return { content: [{ type: "text" as const, text: actionableMessage }], isError: true,
+  // A failed fallback chain names every model it tried, not only the last refusal.
+  const chain = receipt ? fallbackRefusalLine(receipt) : undefined;
+  return { content: [{ type: "text" as const, text: chain ? `${actionableMessage}\n${chain}` : actionableMessage }], isError: true,
     ...(receipt ? { structuredContent: receipt } : {}) };
 }
 

@@ -38,6 +38,11 @@ describe("job progress messages", () => {
       status: "loading", selected_model: "gpt-oss:20b", detail: { expected_load_ms: 8_700, evicted: ["glm-ocr:latest"] },
     })).toBe("loading gpt-oss:20b (~8.7 s), evicted glm-ocr:latest");
     expect(jobProgressMessage({ status: "loading", selected_model: "m" })).toBe("loading m");
+    expect(jobProgressMessage({
+      status: "running", reason: "generating", selected_model: "bonsai-2:9b", detail: { generated_tokens: 120, tokens_per_second: 44.5 },
+    })).toBe("generating on bonsai-2:9b: 120 tokens, 44.5 tok/s");
+    expect(jobProgressMessage({ status: "running", reason: "generating", detail: { generated_tokens: 1, tokens_per_second: null } }))
+      .toBe("generating on model: 1 tokens");
     expect(jobProgressMessage({ status: "running", selected_model: "m" })).toBe("running m");
   });
 });
@@ -63,10 +68,11 @@ describe("runWithJobProgress", () => {
     const calls = scripted([same, same, same, same, same, same, same, same, { status: "running" }, { status: "completed", result: {} }]);
     const delays: number[] = [];
     await runWithJobProgress(calls, () => undefined, { wait: async (ms) => { delays.push(ms); } });
-    expect(delays[0]).toBe(250);
+    // The first poll is quick so a short task is reported soon after it finishes.
+    expect(delays[0]).toBe(25);
     expect(Math.max(...delays)).toBeLessThanOrEqual(2_000);
     expect(delays.slice(1, 8).every((delay, index) => delay >= delays[index]!)).toBe(true);
-    expect(delays.at(-1)).toBe(250);
+    expect(delays.at(-1)).toBe(25);
   });
 
   it("repeats a long phase with its elapsed time so a waiting client still sees progress", async () => {
@@ -239,7 +245,8 @@ describe("runWithJobProgress", () => {
       await expect(runWithJobProgress(calls, () => undefined, { signal: controller.signal, wait, onJob }))
         .rejects.toThrow(/cancellation was requested for deferred job .* and acknowledged by serve/);
       expect(calls.cancel).toHaveBeenCalledTimes(3);
-      expect(waits).toEqual([250, 250, 500]);
+      // One quick first poll, then the cancel request's own backoff.
+      expect(waits).toEqual([25, 250, 500]);
       expect(onJob.mock.calls).toEqual([[ID, true], [ID, false]]);
     });
 
@@ -338,6 +345,21 @@ describe("runWithJobProgress", () => {
   });
 });
 
+describe("accepted-job polling safety", () => {
+  it("does not turn a retryable poll error into permission to replay the accepted task", async () => {
+    const down = scripted([]);
+    down.get.mockRejectedValue(new Error(JSON.stringify({ code: "admission_timeout", error: "503 timeout", retry_safe: true, execution_outcome: "not_started" })));
+    let caught: Error | undefined;
+    try { await runWithJobProgress(down, () => undefined, { wait: noWait }); } catch (error) { caught = error as Error; }
+    expect(caught).toBeDefined();
+    expect(JSON.parse(caught!.message)).toMatchObject({ code: "task_job_poll_failed", job_id: ID,
+      execution_outcome: "unknown", retry_safe: false, cancellation_requested: true });
+    expect(down.submit).toHaveBeenCalledTimes(1);
+    expect(down.sync).not.toHaveBeenCalled();
+    expect(down.cancel).toHaveBeenCalledWith(ID);
+  });
+});
+
 describe("progressSink", () => {
   it("is absent without a progressToken and counts up with one", async () => {
     expect(progressSink({ _meta: {}, sendNotification: async () => undefined })).toBeUndefined();
@@ -349,5 +371,28 @@ describe("progressSink", () => {
       { method: "notifications/progress", params: { progressToken: "t", progress: 1, message: "queued" } },
       { method: "notifications/progress", params: { progressToken: "t", progress: 2, message: "running" } },
     ]);
+  });
+});
+
+describe("long poll", () => {
+  it("stops sleeping between reads once serve says it long-polls, and passes the wait", async () => {
+    const reads: Array<number | undefined> = [];
+    const replies = [{ status: "running" }, { status: "running" }, { status: "completed", result: { ok: true } }];
+    let index = 0;
+    const calls = {
+      submit: async () => JSON.stringify({ deferred: true, job: { id: "00000000-0000-4000-8000-000000000001", status: "queued" } }),
+      get: async (_id: string, waitMs?: number) => {
+        reads.push(waitMs);
+        return JSON.stringify({ job: replies[Math.min(index++, replies.length - 1)], long_poll: true });
+      },
+      cancel: async () => "{}",
+      sync: () => { throw new Error("unused"); },
+    };
+    const sleeps: number[] = [];
+    const raw = await runWithJobProgress(calls as never, () => undefined, { wait: async (ms) => { sleeps.push(ms); } });
+    expect(JSON.parse(raw)).toEqual({ ok: true });
+    expect(reads.every((ms) => typeof ms === "number" && ms > 0)).toBe(true);
+    // Only the first read sleeps; after `long_poll` serve does the waiting.
+    expect(sleeps).toHaveLength(1);
   });
 });

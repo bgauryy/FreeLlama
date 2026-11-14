@@ -121,6 +121,15 @@ export function installedModelsText(data: Fields): string {
   return lines.join("\n");
 }
 
+/** Where a runner sits. `processor` is Ollama's own label ("100% GPU", "48%/52% CPU/GPU"), which
+ * already carries the split; the percentage is added only when the label lacks one. */
+function placementLabel(placement: Fields): string {
+  const processor = str(placement.processor) ? String(placement.processor) : undefined;
+  if (processor && /%/.test(processor)) return processor;
+  const percent = num(placement.gpu_percent);
+  return [processor, percent !== undefined ? `${percent}% GPU` : undefined].filter(Boolean).join(" ") || "?";
+}
+
 /** `models view:resident`: what is loaded, where, and how much. */
 export function residentModelsText(data: Fields): string {
   const models = list(data.models).map((m) => obj(m) ?? {});
@@ -131,7 +140,7 @@ export function residentModelsText(data: Fields): string {
     lines.push(
       [
         String(m.name ?? "?"), `size ${gib(m.resident_size ?? m.size)}`,
-        placement ? `${String(placement.processor ?? "?")} ${String(placement.gpu_percent ?? "?")}% GPU` : "",
+        placement ? placementLabel(placement) : "",
         num(m.resident_context) !== undefined ? `ctx ${String(m.resident_context)}` : "",
         str(placement?.warning) ? `warning: ${String(placement?.warning)}` : "",
       ].filter(Boolean).join("  "),

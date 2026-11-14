@@ -29,6 +29,9 @@ struct Activity {
     /// An unload owns the lifecycle until its request/confirmation finishes or is cancelled.
     evicting: bool,
     last_used: Option<Instant>,
+    /// Whether `last_used` came from another client (an advancing Ollama `expires_at`), not a
+    /// task routed here.
+    used_elsewhere: bool,
     /// Exponentially decayed use count (half-life `USE_HALF_LIFE`) as of `decayed_at`.
     uses: f64,
     decayed_at: Option<Instant>,
@@ -123,11 +126,30 @@ pub(super) struct Usage {
     pub(super) active: usize,
     pub(super) evicting: bool,
     pub(super) idle_seconds: Option<f64>,
+    /// The last use seen came from another client, not a task routed here.
+    pub(super) used_elsewhere: bool,
     pub(super) recent_uses: f64,
     pub(super) load_ms: Option<f64>,
 }
 
 impl ModelActivity {
+    /// Another client used this runner since `since` (its Ollama `expires_at` moved forward).
+    /// A task routed here after `since` already counts; otherwise the use is dated now, which
+    /// errs toward keeping a runner someone is using rather than unloading it under them.
+    pub(super) fn note_used_elsewhere(&self, backend: &str, model: &str, since: Instant) {
+        let now = Instant::now();
+        let mut inner = self.lock();
+        let entry = inner
+            .entry((backend.to_owned(), model.to_owned()))
+            .or_default();
+        if entry.last_used.is_some_and(|used| used >= since) {
+            return;
+        }
+        entry.last_used = Some(now);
+        entry.used_elsewhere = true;
+        trim_idle_history(&mut inner);
+    }
+
     /// The caller must retain its registered `ActiveModel` while waiting, and already own a
     /// bounded admission slot. This method never registers an additional queue or demand.
     pub(super) async fn ready(&self, backend: &str, model: &str) {
@@ -207,6 +229,7 @@ impl ModelActivity {
         entry.decay(now);
         entry.active += 1;
         entry.last_used = Some(now);
+        entry.used_elsewhere = false;
         trim_idle_history(&mut inner);
         drop(inner);
         Some(ActiveModel {
@@ -253,6 +276,7 @@ impl ModelActivity {
         entry.decay(now);
         entry.uses += 1.0;
         entry.last_used = Some(now);
+        entry.used_elsewhere = false;
         if load_ms > 0 {
             let sample = super::float(load_ms);
             entry.load_ms = Some(
@@ -296,6 +320,7 @@ impl ModelActivity {
             idle_seconds: entry
                 .last_used
                 .map(|then| now.saturating_duration_since(then).as_secs_f64()),
+            used_elsewhere: entry.used_elsewhere,
             recent_uses: entry.uses,
             load_ms: entry.load_ms,
         }
@@ -423,7 +448,11 @@ pub(super) fn plan(ps: &Value, activity: &ModelActivity, inputs: &PlanInputs<'_>
             .zip(usage.idle_seconds)
             .is_some_and(|(minimum, idle)| idle < minimum)
         {
-            Some("recently_used")
+            Some(if usage.used_elsewhere {
+                "used_elsewhere"
+            } else {
+                "recently_used"
+            })
         } else {
             None
         };
@@ -724,6 +753,40 @@ mod tests {
         // Two small runners (4 GiB) are not enough; big-cold alone costs less than small-a +
         // small-b + anything, and far less than the hot model.
         assert_eq!(names(&plan), ["big-cold"]);
+    }
+
+    #[test]
+    fn a_runner_another_client_uses_is_spared_as_used_elsewhere() {
+        let activity = ModelActivity::default();
+        // Nothing here ever ran on "shared"; the sweep saw its expiry move.
+        activity.note_used_elsewhere("gpu", "shared", Instant::now());
+        let loaded = ps(&[
+            ("shared", 2 * GIB, 2 * GIB, "2026-09-29T12:05:00Z"),
+            ("old", GIB, GIB, "2026-09-29T12:01:00Z"),
+        ]);
+        let (pinned, weights) = (BTreeSet::new(), BTreeMap::new());
+        let spared = plan(
+            &loaded,
+            &activity,
+            &PlanInputs {
+                min_idle_seconds: Some(15.0),
+                ..inputs(&pinned, &weights, Freed::Total, 3 * GIB)
+            },
+        );
+        assert_eq!(names(&spared), ["old"]);
+        assert!(
+            spared
+                .skipped
+                .iter()
+                .any(|(name, reason)| name == "shared" && *reason == "used_elsewhere")
+        );
+        // A task routed here afterwards is its own use, not another client's.
+        activity.completed("gpu", "shared", 0);
+        assert!(!activity.usage("gpu", "shared").used_elsewhere);
+        // A use noted before a task that already ran since then changes nothing.
+        let before = Instant::now().checked_sub(Duration::from_secs(5)).unwrap();
+        activity.note_used_elsewhere("gpu", "shared", before);
+        assert!(!activity.usage("gpu", "shared").used_elsewhere);
     }
 
     #[test]

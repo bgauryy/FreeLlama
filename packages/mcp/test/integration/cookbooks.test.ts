@@ -5,6 +5,8 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { REPO_ROOT } from "../../src/config.js";
 import { CATALOG_JOBS, MODEL_CATALOG, catalogText, catalogView } from "../../src/model-catalog.js";
 import { connectClient } from "../setup/client.js";
+import * as z from "zod";
+import { embeddingInputParam, localToolsParam, messagesParam, parseBatchTask, questionsParam, stateParam } from "../../src/helpers.js";
 
 const DIR = path.join(REPO_ROOT, "docs/cookbooks");
 const recipes = readdirSync(DIR).filter((name) => name.endsWith(".md") && name !== "README.md");
@@ -17,9 +19,44 @@ function problems(value: unknown, schema: Schema | undefined, at: string): strin
   if (schema.enum && !schema.enum.includes(value)) return [`${at}: ${String(value)} is not one of ${schema.enum.join(", ")}`];
   if (Array.isArray(value)) return value.flatMap((item, index) => problems(item, schema.items, `${at}[${index}]`));
   if (value !== null && typeof value === "object" && schema.properties) {
-    return Object.entries(value).flatMap(([key, item]) => (key in schema.properties! ? problems(item, schema.properties![key], `${at}.${key}`) : [`${at}.${key}: unknown field`]));
+    // An object the schema leaves open (additionalProperties not false) accepts other keys; the
+    // tool checks those strictly itself (strictProblems below).
+    const open = schema.additionalProperties !== undefined && schema.additionalProperties !== false;
+    return Object.entries(value).flatMap(([key, item]) => (key in schema.properties!
+      ? problems(item, schema.properties![key], `${at}.${key}`)
+      : open ? [] : [`${at}.${key}: unknown field`]));
   }
   return [];
+}
+
+/**
+ * run_task advertises some fields loosely (to keep tools/list small) and validates them strictly
+ * in its handler: check a recipe's call against those strict shapes too, so a misspelled field
+ * inside a loose object still fails here.
+ */
+function strictProblems(tool: string, args: unknown): string[] {
+  if (tool !== "run_task" || args === null || typeof args !== "object") return [];
+  const fields = args as Record<string, unknown>;
+  const issues: string[] = [];
+  const check = (name: string, schema: { safeParse: (value: unknown) => { success: boolean; error?: { issues: Array<{ path: PropertyKey[]; message: string }> } } }, value: unknown) => {
+    if (value === undefined) return;
+    const parsed = schema.safeParse(value);
+    if (!parsed.success) issues.push(...parsed.error!.issues.map((issue) => `${name}.${issue.path.map(String).join(".")}: ${issue.message}`));
+  };
+  check("questions", questionsParam, fields.questions);
+  check("tools", localToolsParam, fields.tools);
+  check("messages", messagesParam, fields.messages);
+  check("state", stateParam, fields.state);
+  check("input", embeddingInputParam, fields.input);
+  check("nearest", z.object({ query: z.string().min(1).optional(), top: z.number().int().positive().max(100).optional(), minScore: z.number().optional(), documentPrefix: z.string().optional() }).strict(), fields.nearest);
+  for (const item of Array.isArray(fields.tasks) ? fields.tasks as Array<{ id: string; task: Record<string, unknown> }> : []) {
+    try {
+      parseBatchTask({ ...item, task: { ...item.task } });
+    } catch (error) {
+      issues.push((error as Error).message);
+    }
+  }
+  return issues;
 }
 
 describe("cookbooks and catalog", () => {
@@ -37,6 +74,7 @@ describe("cookbooks and catalog", () => {
     for (const call of calls) {
       expect(schemas.has(call.tool), `${name}: unknown tool ${call.tool}`).toBe(true);
       expect(problems(call.arguments, schemas.get(call.tool), call.tool)).toEqual([]);
+      expect(strictProblems(call.tool, call.arguments)).toEqual([]);
     }
   });
 

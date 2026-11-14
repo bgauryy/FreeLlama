@@ -155,7 +155,13 @@ async fn run_admitted_task(
     State(state): State<PlatformState>,
     Json(mut input): Json<TaskInput>,
 ) -> Result<Json<Value>, ApiError> {
-    let progress = input.job_progress.clone();
+    let mut clock = super::timing::PhaseClock::start();
+    let progress = super::super::task_stream::Progress::new(
+        input.job_progress.clone(),
+        input.stream_events.clone(),
+    );
+    let stream_events = input.stream_events.clone();
+    let job_progress = input.job_progress.clone();
     let opportunistic = input.opportunistic_warm;
     // Refuse a task with nothing to do before routing loads a model for it.
     super::request::require_payload(&input)?;
@@ -166,10 +172,11 @@ async fn run_admitted_task(
     let requested_cost = task_cost_for(input.route.task, batch_items, &state.tunables());
     let models =
         super::super::catalog::discover_for_route(&state, input.route.model.as_deref()).await?;
+    clock.lap("discover_ms");
     // Snapshot the small affinity map: holding the read guard across routing's Ollama calls
     // queued every session write behind one `/api/ps`, and routing takes `feedback` next.
     let sessions = state.sessions.read().await.clone();
-    let mut managed = select_managed_route(
+    let mut managed = match select_managed_route(
         &state,
         &input.route,
         &models,
@@ -177,7 +184,27 @@ async fn run_admitted_task(
         requested_cost,
         Some(&input),
     )
-    .await?;
+    .await
+    {
+        Ok(managed) => managed,
+        Err(error) => {
+            return Err(super::select::refuse_against_full_catalog(
+                &state,
+                &input.route,
+                &models,
+                error,
+            )
+            .await);
+        }
+    };
+    clock.lap("route_ms");
+    // Report the pick before anything below can refuse it (context, host budget, memory).
+    if let Some(observer) = &input.route_observer {
+        *observer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(managed.route.selected_model.clone());
+    }
     // A `vision` capability tag is metadata, not evidence the build reads images (MLX conversions
     // have shipped without the vision head). Automatic image routing therefore needs an operator
     // policy naming the model for `vision`; otherwise the caller names a model it has trialled.
@@ -202,7 +229,8 @@ async fn run_admitted_task(
     if preflight["refuses"] == true {
         return Err(ApiError::bad_request(
             "model file size alone exceeds the 80% local CPU/unified host budget; select a smaller model or configure an Ollama backend on a separate host",
-        ));
+        )
+        .with_code("model_exceeds_host_budget"));
     }
 
     let mut execution_receipt = managed.execution_receipt(requested_cost, &state).await;
@@ -215,6 +243,7 @@ async fn run_admitted_task(
             managed.execution.placement.as_str(),
         );
     }
+    clock.lap("prepare_ms");
     let resource_model = managed.model;
     let decision = managed.route;
     let execution = managed.execution;
@@ -292,6 +321,22 @@ async fn run_admitted_task(
         execution_receipt["context_sizing"]["ollama_default_context"] = default_context;
     }
     execution_receipt["runtime_options"] = body["options"].clone();
+    // A streamed task reads Ollama's chunks as they arrive. Whether a repetition loop stops the
+    // answer stays what the request asked (`stop_on_repetition`), not a side effect of streaming.
+    // A deferred chat job without tools counts its tokens the same way, for job progress.
+    let stream_events = stream_events.or_else(|| {
+        job_progress
+            .filter(|_| body["tools"].is_null())
+            .map(super::super::task_stream::job_token_counter)
+    });
+    let stream = stream_events.filter(|_| path == "/api/chat").map(|events| {
+        let stop_on_loop = body["stream"] == true;
+        body["stream"] = json!(true);
+        super::forward::StreamOut {
+            events,
+            stop_on_loop,
+        }
+    });
     // Slot first, THEN the transition lock — in both branches. The order matters: if the
     // non-resident path took the write lock before its slot while resident tasks held slots and
     // waited on the read lock, the two would deadlock. One consistent order removes that entirely.
@@ -316,7 +361,10 @@ async fn run_admitted_task(
             requested_cost,
             input.priority,
             &decision.selected_model,
-            queue_deadline,
+            super::admit::QueueDeadline {
+                at: queue_deadline,
+                wait: queue_wait,
+            },
             None,
         )
         .await?
@@ -440,7 +488,14 @@ async fn run_admitted_task(
                         .admission
                         .register_resource_waiter()
                         .map_err(|failure| {
-                            admission_error(&state, &execution, input.priority, cost, failure)
+                            admission_error(
+                                &state,
+                                &execution,
+                                input.priority,
+                                cost,
+                                failure,
+                                queue_wait,
+                            )
                         })?;
                 drop(slot);
                 let reserved = reserve_while_models_drain(
@@ -485,7 +540,10 @@ async fn run_admitted_task(
                     requested_cost,
                     input.priority,
                     &decision.selected_model,
-                    queue_deadline,
+                    super::admit::QueueDeadline {
+                        at: queue_deadline,
+                        wait: queue_wait,
+                    },
                     Some(resource_waiter),
                 )
                 .await?;
@@ -632,6 +690,9 @@ async fn run_admitted_task(
     let mut footprint = footprint;
     super::memory::annotate_ollama_preflight(&mut footprint, &execution, admitted_available);
     execution_receipt["resource_revalidation"] = json!(resource_recheck.receipt);
+    for key in ["resource_admission", "resource_revalidation"] {
+        dedupe_sample(&mut execution_receipt, key);
+    }
     let previous = execution_receipt["memory_reservation"].clone();
     execution_receipt["memory_reservation"] = footprint;
     for key in ["evicted_idle_models", "eviction"] {
@@ -677,6 +738,7 @@ async fn run_admitted_task(
             "foreground demand arrived before dispatch",
         ));
     }
+    clock.lap("admission_ms");
     let forward = forward_managed_task(
         &state,
         ForwardRequest {
@@ -694,6 +756,8 @@ async fn run_admitted_task(
             },
             slot,
             breaker_probe,
+            clock,
+            stream,
         },
     );
     // On unified memory a loaded runner's weights are wired and visible in OS telemetry, so the
@@ -1034,6 +1098,53 @@ mod memory_refusal_tests {
         assert!(
             hint.starts_with("no installed `decision` model fits 4.0 GB free"),
             "{hint}"
+        );
+    }
+}
+
+/// A receipt's admission and revalidation usually read the very host sample the route already
+/// reported (only its age differs). Keep that sample once: a repeat names the one it equals and
+/// keeps its own age, while a fresh sample taken in between stays whole. About 3.4 KB per task.
+fn dedupe_sample(receipt: &mut Value, key: &str) {
+    let without_age = |sample: &Value| {
+        let mut sample = sample.clone();
+        if let Some(object) = sample.as_object_mut() {
+            object.remove("sample_age_ms");
+        }
+        sample
+    };
+    let base = &receipt["resource_snapshot"];
+    let repeated = &receipt[key]["snapshot"];
+    if base.is_object() && repeated.is_object() && without_age(base) == without_age(repeated) {
+        let age = repeated["sample_age_ms"].clone();
+        receipt[key]["snapshot"] =
+            json!({"same_sample_as": "resource_snapshot", "sample_age_ms": age});
+    }
+}
+
+#[cfg(test)]
+mod sample_tests {
+    use super::dedupe_sample;
+    use serde_json::json;
+
+    #[test]
+    fn a_repeated_host_sample_is_kept_once_and_a_fresh_one_stays_whole() {
+        let sample = json!({"available_memory_bytes": 10, "sample_age_ms": 0});
+        let mut receipt = json!({
+            "resource_snapshot": sample,
+            "resource_admission": {"status": "admitted", "snapshot": {"available_memory_bytes": 10, "sample_age_ms": 1}},
+            "resource_revalidation": {"status": "admitted", "snapshot": {"available_memory_bytes": 7, "sample_age_ms": 0}},
+        });
+        dedupe_sample(&mut receipt, "resource_admission");
+        dedupe_sample(&mut receipt, "resource_revalidation");
+        assert_eq!(
+            receipt["resource_admission"]["snapshot"],
+            json!({"same_sample_as": "resource_snapshot", "sample_age_ms": 1})
+        );
+        assert_eq!(receipt["resource_admission"]["status"], "admitted");
+        assert_eq!(
+            receipt["resource_revalidation"]["snapshot"]["available_memory_bytes"],
+            7
         );
     }
 }

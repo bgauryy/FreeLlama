@@ -13,7 +13,7 @@ const API = `${SERVE}/_freellama/v1`;
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../..");
 const OCTO = path.resolve(ROOT, "../octocode/packages/octocode-native/crates");
 const ISSUES = JSON.parse(readFileSync(path.join(ROOT, ".octocode/tmp/octocode-issues.json"), "utf8"));
-const EMB = "nomic-embed-text:v1.5", DEC = "strands-decider:2b-nvfp4", OCR = "glm-ocr:latest";
+const EMB = "nomic-embed-text:v1.5", DEC = "strands-decider:2b-nvfp4", OCR = "hf.co/openbmb/MiniCPM-OCR-1.0-gguf:Q4_K_M";
 const lines = [];
 const log = (text = "") => { lines.push(text); console.error(text); };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

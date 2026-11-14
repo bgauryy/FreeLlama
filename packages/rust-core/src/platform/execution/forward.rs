@@ -19,6 +19,30 @@ use super::select::{
 };
 use super::upstream::{post_json_with_retries, post_streaming_chat_with_retries};
 
+/// Write the learned feedback in the background. Writes coalesce: while one is queued, later
+/// samples ride on it, because the writer reads the latest feedback when it runs, not a copy
+/// taken when it was queued.
+fn queue_feedback_write(state: &PlatformState, store: crate::store::Store) {
+    if state
+        .feedback_write_queued
+        .swap(true, std::sync::atomic::Ordering::AcqRel)
+    {
+        return;
+    }
+    let state = state.clone();
+    tokio::spawn(async move {
+        state
+            .feedback_write_queued
+            .store(false, std::sync::atomic::Ordering::Release);
+        let snapshot = state.feedback.read().await.clone();
+        // A synchronous database write on a runtime worker stalls every task sharing it.
+        let written = tokio::task::spawn_blocking(move || persist_feedback(&store, &snapshot))
+            .await
+            .unwrap_or_else(|error| Err(anyhow::anyhow!("feedback writer panicked: {error}")));
+        *state.feedback_persistence_error.write().await = written.err().map(|error| error.to_string());
+    });
+}
+
 /// Feed the circuit breaker with one upstream call's outcome.
 fn record_upstream_outcome(
     state: &PlatformState,
@@ -101,6 +125,16 @@ pub(crate) struct ForwardRequest<'a> {
     /// Remains owned until completion and validation. The pipeline owns any later unload.
     pub(crate) slot: AdmissionPermit,
     pub(crate) breaker_probe: Option<super::super::runtime::BreakerProbe>,
+    /// Phase timing since the task entered the pipeline; the receipt's `timing`.
+    pub(crate) clock: super::timing::PhaseClock,
+    /// Set for a streamed task: where each generated piece goes.
+    pub(crate) stream: Option<StreamOut>,
+}
+
+/// A streamed task's output: the event sink, and whether a repetition loop stops the answer.
+pub(crate) struct StreamOut {
+    pub(crate) events: super::super::task_stream::EventSink,
+    pub(crate) stop_on_loop: bool,
 }
 
 #[expect(
@@ -127,6 +161,8 @@ pub(crate) async fn forward_managed_task(
             },
         slot,
         breaker_probe,
+        mut clock,
+        stream,
     } = request;
     super::identity::verify_before_forward(
         state,
@@ -145,8 +181,13 @@ pub(crate) async fn forward_managed_task(
             None
         };
     let dispatch_admission = execution.admission.receipt();
+    clock.lap("dispatch_ms");
     let posted = if body["stream"] == true {
-        post_streaming_chat_with_retries(state, &execution.upstream, path, &body).await
+        let (events, stop_on_loop) = stream
+            .as_ref()
+            .map_or((None, true), |out| (Some(&out.events), out.stop_on_loop));
+        post_streaming_chat_with_retries(state, &execution.upstream, path, &body, events, stop_on_loop)
+            .await
     } else {
         post_json_with_retries(state, &execution.upstream, path, &body).await
     };
@@ -162,10 +203,25 @@ pub(crate) async fn forward_managed_task(
     if upstream_failed {
         observe_completion(state, execution, true, None, None).await;
     }
+    clock.lap("upstream_ms");
     let (status, value) = posted?;
     let value = validate_upstream_completion(path, status, value)?;
     let metrics = runtime_metrics(&value);
-    let placement = observe_physical_placement(state, execution, &decision.selected_model).await;
+    let expected_context = body["options"]["num_ctx"]
+        .as_u64()
+        .or_else(|| {
+            execution_receipt["context_sizing"]["ollama_default_context"]["tokens"].as_u64()
+        })
+        .or_else(|| decision.options["num_ctx"].as_u64());
+    let placement = observe_physical_placement(
+        state,
+        execution,
+        &decision.selected_model,
+        execution_receipt["model_digest"].as_str(),
+        expected_context,
+    )
+    .await;
+    clock.lap("placement_ms");
     super::identity::verify_completed(&execution_receipt, &placement)?;
     super::identity::finalize_route_evidence(&mut decision, &mut execution_receipt, &placement);
     let feedback_accepted = placement["status"] == "verified";
@@ -238,6 +294,7 @@ pub(crate) async fn forward_managed_task(
     if let Some(guard) = &mut completion_guard {
         guard.complete();
     }
+    clock.lap("learning_ms");
     // Measurements are taken while the slot is held; the disk writes happen after it is
     // released, so a slow database never delays the next queued task. Both writes converge in
     // any order (footprints keep the larger size, feedback merges sample ids), so a later task
@@ -252,7 +309,7 @@ pub(crate) async fn forward_managed_task(
     // Report throttling rather than hiding it. A caller that fans out embeddings needs to know it
     // is queueing here — otherwise the only symptom is latency it cannot attribute.
     let slots_available = execution.admission.available();
-    let (mut feedback_receipt, feedback_snapshot) = {
+    let (mut feedback_receipt, feedback_store) = {
         let mut feedback = state.feedback.write().await;
         let by_task = if execution.placement == Backend::Cpu {
             &mut feedback.cpu
@@ -283,38 +340,25 @@ pub(crate) async fn forward_managed_task(
             "physical_placement_unverified_or_mismatched"
         });
         // Only an accepted sample changes what is worth writing.
-        let snapshot = state
-            .store
-            .clone()
-            .filter(|_| feedback_accepted)
-            .map(|store| (store, feedback.clone()));
-        (receipt, snapshot)
+        let store = state.store.clone().filter(|_| feedback_accepted);
+        (receipt, store)
     };
     drop(slot);
+    // The caller does not wait for disk: footprint and feedback writes run after the response
+    // (5 ms median, 11 ms p90 on the response path before). A failed write shows in health's
+    // `feedback.persistence.last_error`; a crash before it lands loses one learning sample.
     if let Some(save) = footprint_save {
-        save.persist().await;
+        tokio::spawn(save.persist());
     }
-    feedback_receipt["persistence"] = if let Some((store, snapshot)) = feedback_snapshot {
-        // A synchronous database write on a runtime worker stalls every task sharing it.
-        let written = tokio::task::spawn_blocking(move || persist_feedback(&store, &snapshot))
-            .await
-            .unwrap_or_else(|error| Err(anyhow::anyhow!("feedback writer panicked: {error}")));
-        match written {
-            Ok(()) => {
-                *state.feedback_persistence_error.write().await = None;
-                json!({"enabled": true, "persisted": true, "schema_version": FEEDBACK_SCHEMA_VERSION})
-            }
-            Err(error) => {
-                let message = error.to_string();
-                *state.feedback_persistence_error.write().await = Some(message.clone());
-                json!({"enabled": true, "persisted": false, "error": message})
-            }
-        }
+    feedback_receipt["persistence"] = if let Some(store) = feedback_store {
+        queue_feedback_write(state, store);
+        json!({"enabled": true, "persisted": "queued", "schema_version": FEEDBACK_SCHEMA_VERSION})
     } else if feedback_accepted {
         json!({"enabled": false, "persisted": false})
     } else {
         json!({"enabled": state.store.is_some(), "persisted": false, "reason": "sample_not_accepted"})
     };
+    clock.lap("persist_ms");
     let output_check = super::super::repetition::output_check(&value);
     let artifact_verified = execution_receipt["observation"]["resident"] == true
         && execution_receipt["model_digest"]
@@ -390,8 +434,11 @@ pub(crate) async fn forward_managed_task(
     if let Some(identity) = embedding_identity {
         receipt["embedding_identity"] = identity;
     }
+    clock.lap("receipt_ms");
+    receipt["timing"] = clock.receipt();
     Ok(Json(receipt))
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -454,7 +501,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn the_admission_slot_is_released_before_learned_state_is_written() {
+    async fn neither_the_slot_nor_the_response_waits_for_learned_state_to_be_written() {
         let (upstream, server) = resident_ollama().await;
         let store = crate::store::Store::in_memory().unwrap();
         let mut config = PlatformConfig::new("127.0.0.1:0", upstream, None, None)
@@ -495,15 +542,11 @@ mod tests {
         })
         .await
         .expect("the slot is returned while the database write is still blocked");
-        assert!(
-            !task.is_finished(),
-            "the response waits for its persistence receipt"
-        );
         assert_eq!(state.gpu_admission.receipt()["in_flight"], 0);
-        release.send(()).unwrap();
+        // The response does not wait for the blocked write either.
         let response = tokio::time::timeout(Duration::from_secs(5), task)
             .await
-            .unwrap()
+            .expect("the response returns while the database write is still blocked")
             .unwrap()
             .unwrap();
         let status = response.status();
@@ -512,7 +555,16 @@ mod tests {
                 .unwrap();
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["feedback"]["accepted"], true, "{body}");
-        assert_eq!(body["feedback"]["persistence"]["persisted"], true, "{body}");
+        assert_eq!(body["feedback"]["persistence"]["persisted"], "queued", "{body}");
+        // (Reading the store here would wait on the stalled connection itself.)
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while store.snapshot("placement_feedback").unwrap().is_none() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the queued write lands once the database is free");
         server.abort();
     }
 }

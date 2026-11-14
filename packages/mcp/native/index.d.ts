@@ -71,7 +71,7 @@ export declare function getScope(endpoint: string | undefined | null, scopeId: s
  * # Errors
  * Returns an error for an invalid ID, an expired job, or an unavailable server.
  */
-export declare function getTaskJob(endpoint: string | undefined | null, jobId: string): Promise<string>
+export declare function getTaskJob(endpoint: string | undefined | null, jobId: string, waitMs?: number | undefined | null): Promise<string>
 
 /**
  * Current managed-platform health, including admission and session bounds.

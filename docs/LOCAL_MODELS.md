@@ -42,11 +42,11 @@ Group a model by the job it does, using the capability Ollama reports. FreeLlama
 | Find code for an issue | `embeddinggemma-2:740m-q8_0` | 1.3 GB | 1.4 GB | Measured: right file first 9/10, top 3 9/10; `nomic-embed-text` 6/10 and 8/10, but indexes in 42 s against 67 s |
 | Find duplicates | `nomic-embed-text:v1.5` | 0.3 GB | 1.4 GB | Measured: 8/12 real issue pairs |
 | Find an image by describing it | `embeddinggemma-2:740m-q8_0` | 1.3 GB | 1.4 GB | Measured: 5/5 screenshots, about 1 s per query |
-| OCR, reading text in images | `hf.co/openbmb/MiniCPM-OCR-1.0-gguf:Q4_K_M` | 1.4 GB | 3.8 GB | Measured: 30/30 in all 3 rounds, 257 ms median; `glm-ocr` also 30/30 at 1,885 ms |
+| OCR, reading text in images | `hf.co/openbmb/MiniCPM-OCR-1.0-gguf:Q4_K_M` | 1.4 GB | 3.8 GB | Measured: 30/30 in all 3 rounds, 257 ms median. Its tables come back as OTSL; `read-table` turns them into Markdown |
 | Image understanding | `lfm3-vl:2b-q4_K_M` | 1.5 GB | 4.1 GB | Measured: 20/20 drawn images in all 3 rounds, 299 ms; `lfm3-omni` 18/20, `bonsai-2:9b` 17/20 |
 | Speech to text | `lfm3-audio:2b-q4_K_M` | 1.7 GB | 5.5 GB | Measured: 1.7% word error on 12 generated sentences, 276 ms median, French and Spanish translation worked; `lfm3-omni` the same |
 | Text to speech | `phonon:en` | 0.1 GB | not previewed | Measured: 0.8–1.7% word error when transcribed back, 102 ms median; both LFM3 models 0% at 950 ms, but the judge is an LFM3 model |
-| Small coding tasks | `lfm3:1.7b-q4_K_M` | 1.1 GB | 3.3 GB | Measured: 21, 20, 20 of 25, 579 ms median; `bonsai-2:9b` 19, 19, 17 |
+| Small coding tasks | `bonsai-2:9b` | 3.2 GB | 10.3 GB | Measured: 19, 19, 17 of 25, 475 ms median, and every workflow case right in the 2026-11-12 field test. `lfm3:1.7b` scored 21, 20, 20 on the questions but answered workflows with tool calls nobody asked for, so it is no longer a pick |
 
 ### Use when memory is free: installed
 
@@ -152,7 +152,7 @@ through the real CLI.
 | Model | Local questions | GitHub questions | Notes |
 |---|---:|---:|---|
 | `lfm3-audio:2b-q4_K_M` | 3, 3, 3 of 8 | 3, 3, 3 of 6 | Guessed names and repeated calls; 3.2 calls per question |
-| `lfm3:1.7b-q4_K_M` | 6, 5, 5 of 8 | 1, 1, 1 of 6 | Good on local lookups, weak on GitHub; 2 calls per question, 20 s median |
+| `lfm3:1.7b-q4_K_M` | 6, 5, 5 of 8 | 1, 1, 1 of 6 | Good on local lookups, weak on GitHub; 2 calls per question, 20 s median. No longer a pick |
 | `bonsai-2:9b` | 4, 5, 5 of 8 | 3, 5, 5 of 6 | 2.2 calls per question; 82 s median per question |
 | Nemotron-3.5-Bolt-E4B | 6, 6, 6 of 8 | 5, 5, 5 of 6 | 2.2 calls per question; 96 s median per question; needs 13.5 GB |
 

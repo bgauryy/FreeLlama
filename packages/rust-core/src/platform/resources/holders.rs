@@ -2,6 +2,7 @@
 //! can tell its user what to close ("node: tsserver.js ×4 holds 5.3 GB") instead of only that the
 //! machine is short. Two bounded `ps` samples, taken only on that path and reused for a few
 //! seconds; never an admission input.
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -9,10 +10,12 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 
 /// How many programs a hold names.
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 const LIMIT: usize = 5;
 /// How long one sample is reused.
 const FRESH: Duration = Duration::from_secs(10);
 /// Runtimes whose own name says nothing; the script they run names the program instead.
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 const INTERPRETERS: [&str; 9] = [
     "node", "python", "python3", "ruby", "java", "bun", "deno", "perl", "php",
 ];
@@ -160,11 +163,13 @@ fn sample() -> Vec<MemoryHolder> {
     Vec::new()
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn basename(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
 /// "node: tsserver.js" for an interpreter running a script; the executable's name otherwise.
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn program_name(executable: &str, args: Option<&str>) -> String {
     let name = basename(executable);
     if !INTERPRETERS.contains(&name) {
@@ -182,6 +187,7 @@ fn program_name(executable: &str, args: Option<&str>) -> String {
 }
 
 /// Join `ps -o rss=,pid=,comm=` (RSS in KiB) with `ps -o pid=,args=` and sum by program.
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn parse(executables: &str, command_lines: &str) -> Vec<MemoryHolder> {
     let args: BTreeMap<u32, &str> = command_lines
         .lines()

@@ -25,7 +25,7 @@ yarn build
 ```
 
 The root build compiles the host Rust release binary, NAPI addon, and MCP JavaScript bundles
-(server and research adapters). The native `.node` addon remains external to the JavaScript bundle because it is selected
+(server, the agent CLI behind `freellama run`, `chat`, `gateway`…, and research adapters). The native `.node` addon remains external to the JavaScript bundle because it is selected
 by platform triple at runtime. Published packages resolve it from an OS/CPU/libc-specific optional
 dependency rather than compiling Rust during installation.
 
@@ -60,6 +60,26 @@ the model. These skips do not qualify inference throughput or physical placement
 lifecycle test is disabled unless the operator explicitly sets `FREELLAMA_TEST_PULL_TAG` to
 `qwen2.5:0.5b` and `FREELLAMA_TEST_PULL_SIZE_BYTES` to the exact reported download size. The test
 rechecks that size and reads every installed-model page before allowing the round trip.
+
+## Continuous integration
+
+[`.github/workflows/ci.yml`](../.github/workflows/ci.yml) runs the deterministic tiers on every push,
+every pull request and on demand (`gh workflow run CI`), on Ubuntu and macOS: `yarn install --immutable`, `yarn lint:rust`
+(Ubuntu), `yarn build`, `yarn typecheck`, `yarn test:js`, `yarn test:rust` and `yarn test:release`.
+It uses no Ollama and no models, so it does not replace the live tiers, Windows qualification or the
+hardware procedures; run those before a release (`yarn verify:production`).
+
+## Comparative benchmark
+
+Comparing FreeLlama with Ollama alone and other local stacks is a separate, manual programme:
+protocol, measured results and limits are in [Benchmark](BENCHMARK.md). One warm extraction case
+has been run; contention, cold-load and agent-token scenarios have not.
+
+`yarn test:bench` checks the sequential vendor runner, streamed timing, exact JSON grading and
+host-counter parsing using deterministic fixtures. It is included in `yarn test:js`. These checks
+require no model downloads or inference and do not qualify live performance. Use
+`node scripts/bench/preflight.mjs --hash-model` for the separate live prerequisite report and
+follow [`scripts/bench/README.md`](../scripts/bench/README.md) for vendor installation and execution.
 
 ## Model metadata contracts
 
@@ -144,8 +164,11 @@ Usage-ledger unit contracts cover ordered writes, bounded queue overflow, failed
 validation, replay, and flush behavior. `monitoring_contract` also checks that a blocked ledger path
 does not hold task completion. Persistence remains best effort, not a zero-loss promise.
 
-MCP `serve.test.ts` checks startup permission failure, retry, child-lifecycle isolation, and the
-background start at launch. The
+MCP `serve.test.ts` checks startup permission failure, retry, child-lifecycle isolation, the
+background start at launch, and the detached serve the agent commands start (log file, release once ready, log
+tail on an early exit). `agent-cli.test.ts` covers `freellama run` flag mapping and output, registry
+parity with the MCP server's tool list, virtual models, and the gateway's Ollama, OpenAI and Anthropic
+protocols, including a client that leaves mid-stream. The
 protocol integration contracts verify that spawn failure leaves the MCP connection usable and that
 fixture-backed library requests fail on unexpected product errors. External catalog availability
 is separate from these deterministic checks.
@@ -218,6 +241,18 @@ tier, and each writes a dated report to the git-ignored `.octocode/local-test/`.
 | `scripts/local-test/assist.mjs` | Issue to code, duplicates, triage and OCR on a real repository |
 | `scripts/local-test/media.mjs` | Speech round trip, multimodal image search, embedding comparison through MCP |
 | `scripts/local-test/octocode-agent.mjs` | A local model driving Octocode through `delegate_research` |
+| `scripts/local-test/workflows.mjs` | Each text workflow (summarize-text, summarize-log, summarize-diff, extract-json, explain-code, review-code, fix-bug) on each candidate model through `freellama run -w -m`. Graded on facts present, nothing invented, length, filler, exact JSON fields and the planted bug. Pass `--models a,b`, `--workflows x,y`, `--out file.json`. Re-run it after changing a workflow prompt or a catalog pick |
+
+Workflow eval of 2026-11-10 (Apple M2 Pro, 12 cases, so treat it as directional). The second
+run used the reworded prompts and the shipped sampling presets (the first forced temperature 0):
+
+| Workflow | `lfm3:1.7b` first → second | `bonsai-2:9b` first → second | Change made |
+|---|---|---|---|
+| summarize-text | 0/3 → 3/3 | 3/3 → 3/3 | No-padding prompt; `prefer: "capable"` |
+| summarize-log | 0/2 → 1/2 (one run looped to 1,688 words) | 2/2 → 2/2 | Line-by-line format, no-padding closing; already `prefer: "capable"` |
+| explain-code, review-code | 3/3 → 3/3 | 1/3 → 3/3 | Callers only when shown; quote the faulty code instead of line numbers the input lacks |
+| summarize-diff, extract-json, fix-bug | all pass | all pass | Diff risks only when the diff shows them |
+| **All** | **7/12 → 11/12** | **10/12 → 12/12** | |
 
 ## Verify release packages
 
@@ -234,7 +269,8 @@ deterministic suite, and inspect every platform package dry run before publishin
 Publish the eight `@octocodeai/freellama-native-*` packages before `@octocodeai/freellama` and `@octocodeai/freellama-mcp-server`, all
 at the exact same version, then the crates with `cargo publish --workspace` (`--dry-run` first packages
 and compiles both crates from their published sources). A successful local pack dry run proves package contents; it does not
-prove registry publication or another hardware class.
+prove registry publication or another hardware class. Both release scripts require
+`packages/mcp/dist/agent-cli.js` (the agent commands the `freellama` launcher runs) in the MCP package, and the CLI package to depend on the MCP package of the same version.
 
 ## Test one layer while iterating
 

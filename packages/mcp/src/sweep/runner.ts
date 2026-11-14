@@ -65,14 +65,17 @@ function errorBody(error: unknown): Fields | undefined {
   }
 }
 
-/** A refusal that waiting can fix: memory, queue or capacity, or a lost connection to serve. */
+/** A refusal that waiting can fix. Unknown execution must never be inferred safe from error text. */
 function retryable(error: unknown): "memory" | "transient" | undefined {
   const body = errorBody(error);
   const text = errorText(error);
-  if (body?.code === "task_cancelled") return undefined;
+  if (body?.code === "task_cancelled" || body?.retry_safe === false
+    || (body?.execution_outcome !== undefined && body.execution_outcome !== "not_started")) return undefined;
+  const refusal = ["resource_admission_unavailable", "admission_queue_full", "admission_timeout", "upstream_circuit_open",
+    "model_lifecycle_busy", "task_jobs_full", "task_jobs_input_budget"].includes(String(body?.code));
+  if (body?.retry_safe !== true && !refusal) return undefined;
   if (/memory|resource_admission|resources/i.test(String(body?.code ?? "")) || /needs [\d.]+ GB/.test(text)) return "memory";
-  if (body?.retry_safe === true || /queue|capacity|timeout|ECONNREFUSED|error sending request|503|429/i.test(text)) return "transient";
-  return undefined;
+  return "transient";
 }
 
 type Counters = { total: number; done: number; failed: number; flagged: number; unsure: number; clear: number; reused: number; changed: number; added: number };

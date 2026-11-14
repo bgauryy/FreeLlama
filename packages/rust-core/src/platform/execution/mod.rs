@@ -16,6 +16,7 @@ use super::{Backend, PlatformState, TaskInput};
 
 mod admit;
 mod completion;
+mod fallback;
 mod feedback;
 mod forward;
 mod identity;
@@ -26,9 +27,11 @@ mod pipeline;
 mod request;
 pub(super) mod runner;
 mod select;
+mod timing;
 mod upstream;
 
 pub(super) use admit::{admit, transition_timeout};
+pub(in crate::platform) use fallback::validate as validate_fallback;
 #[cfg(test)]
 pub(super) use feedback::feedback_work_unit_ns;
 pub use feedback::runtime_metrics;
@@ -49,7 +52,7 @@ pub(super) use request::requests_immediate_unload;
 use request::{
     apply_request_options, build_managed_request, input_batch_items, task_cost_for, task_has_images,
 };
-pub(super) use select::{ManagedDecision, select_managed_route};
+pub(super) use select::{ManagedDecision, refuse_against_full_catalog, select_managed_route};
 
 /// How long a request may wait for host memory while holding its admission slot.
 const SLOT_HELD_RESOURCE_WAIT: Duration = Duration::from_secs(2);
@@ -269,6 +272,10 @@ pub(super) async fn run_task(
     use axum::response::IntoResponse;
     let Json(mut input) = input.map_err(|error| ApiError::invalid_task_request(&error))?;
     input.client = caller.map(|axum::Extension(caller)| caller.0.to_string());
+    if input.stream {
+        super::task_stream::validate(&input)?;
+        return Ok(super::task_stream::respond(state, input));
+    }
     if input.defer {
         return super::jobs::submit(state, input)
             .await
@@ -333,7 +340,7 @@ pub(super) async fn execute_task(
         super::with_session_cancellation(
             &state,
             session_id.as_deref(),
-            Box::pin(nearest::run(state.clone(), input)),
+            Box::pin(fallback::run(state.clone(), input)),
         )
         .await
     };

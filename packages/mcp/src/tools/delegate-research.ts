@@ -36,6 +36,8 @@ import {
 
 const researchResultSchema = z.object({
   answer: z.string(), summary: z.string(), citations: z.unknown().optional(), verification: z.unknown(), usage: z.unknown().optional(), telemetry: z.unknown().optional(),
+  // adapter coder only: the patch to review and the command that applies it to the caller's tree.
+  diff: z.string().optional(), applyCommand: z.string().nullable().optional(),
 }).loose();
 
 
@@ -87,8 +89,8 @@ export function registerDelegateResearchTool(server: McpServer): void {
       description:
         "Use when: a read-only question about files under workspacePath (where is X, what calls Y) would take several searches; without `model` it uses the catalog's research-agent pick that is installed and fits now. " +
         "Do not use when: editing (adapter:\"coder\" edits an isolated copy, if the operator enabled it), facts outside the workspace (GitHub excepted: adapter:\"github\", which needs no `workspacePath`), final judgment, or a question one search answers; run_task embedding with `nearest` finds files faster. " +
-        "Up to 8 turns, killed after 180 s by default (longer for bigger models, or agent.timeoutSeconds); no defer (a host that cuts calls near 60 s may drop it). " +
-        "Returns: citations/answer; discard verification.recommendation=escalate, otherwise verify citations. coder: review diff, then run its applyCommand.",
+        "Up to 8 turns, killed after 180 s by default plus 20 s per GB of model above 4 GB (at most 1,200 s; agent.timeoutSeconds sets it, up to 1,800); no defer (a host that cuts calls near 60 s may drop it). " +
+        "Returns: citations/answer; discard verification.recommendation=escalate, otherwise verify citations. coder: review structuredContent.diff, then run structuredContent.applyCommand.",
       inputSchema: z.object({
         question: z.string().min(1),
         workspacePath: z.string().min(1).optional().describe(
@@ -103,7 +105,7 @@ export function registerDelegateResearchTool(server: McpServer): void {
             contextTokens: z.number().int().positive().optional(),
             outputTokens: z.number().int().positive().optional(),
             timeoutSeconds: z.number().int().positive().max(MAX_DELEGATE_TIMEOUT_SECONDS).optional()
-              .describe("default scales with the model's size"),
+              .describe("overrides the default above"),
             commands: coderCommandsSchema,
           })
           .strict()

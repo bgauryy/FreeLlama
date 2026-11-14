@@ -548,7 +548,7 @@ async fn immediate_unload_is_observed_before_it_is_verified_unloaded() {
         .route(
             "/api/tags",
             get(|| async {
-                Json(json!({"models": [{"name": "embed-model", "size": 274_000_000}]}))
+                Json(json!({"models": [{"name": "embed-model", "digest":"embed-digest", "size": 274_000_000}]}))
             }),
         )
         .route(
@@ -561,6 +561,8 @@ async fn immediate_unload_is_observed_before_it_is_verified_unloaded() {
                         if lifecycle.load(Ordering::SeqCst) == 1 {
                             Json(json!({"models": [{
                                 "name": "embed-model",
+                                "digest":"embed-digest",
+                                "context_length":2048,
                                 "size": 274_000_000,
                                 "size_vram": 274_000_000
                             }]}))
@@ -626,7 +628,7 @@ async fn immediate_unload_is_observed_before_it_is_verified_unloaded() {
             Request::post("/_freellama/v1/tasks")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    r#"{"task":"embedding","objective":"fastest","model":"embed-model","input":"hello","keep_alive":"0"}"#,
+                    r#"{"task":"embedding","objective":"fastest","model":"embed-model","context_tokens":2048,"input":"hello","keep_alive":"0"}"#,
                 ))
                 .unwrap(),
         )
@@ -1140,7 +1142,7 @@ async fn physical_gpu_observation_overrides_cpu_assignment_and_withholds_feedbac
         .route(
             "/api/tags",
             get(|| async {
-                Json(json!({"models": [{"name": "mlx-model", "size": 1_000_000_000}]}))
+                Json(json!({"models": [{"name": "mlx-model", "digest":"mlx-digest", "size": 1_000_000_000}]}))
             }),
         )
         .route(
@@ -1148,6 +1150,8 @@ async fn physical_gpu_observation_overrides_cpu_assignment_and_withholds_feedbac
             get(|| async {
                 Json(json!({"models": [{
                     "name": "mlx-model",
+                    "digest":"mlx-digest",
+                    "context_length":4096,
                     "size": 1_000_000_000,
                     "size_vram": 1_000_000_000
                 }]}))
@@ -1201,7 +1205,7 @@ async fn physical_gpu_observation_overrides_cpu_assignment_and_withholds_feedbac
             Request::post("/_freellama/v1/tasks")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    r#"{"task":"completion","objective":"fastest","model":"mlx-model","prompt":"hello"}"#,
+                    r#"{"task":"completion","objective":"fastest","model":"mlx-model","context_tokens":4096,"prompt":"hello"}"#,
                 ))
                 .unwrap(),
         )
@@ -2576,23 +2580,17 @@ async fn batch_refuses_dependent_items_before_any_upstream_call() {
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }
 
-/// Ollama returns 500 under load-model contention — the exact condition managed routing creates
-/// when it transitions models. The passthrough proxy has always ridden that out; the managed path
-/// used to fail the whole task on the first one, *and* throw away the admission permit it was
-/// holding. One retry must be enough to succeed.
-#[tokio::test]
-async fn managed_task_retries_a_transient_upstream_500() {
+/// A server error may follow work already performed. Even a later attempt that would succeed
+/// cannot justify replaying the accepted inference, regardless of a suggestive error message.
+async fn assert_managed_server_error_is_not_replayed(status: StatusCode) {
     let calls = Arc::new(AtomicUsize::new(0));
     let mock = discovery_routes()
         .route(
             "/api/embed",
-            post(|State(calls): State<Arc<AtomicUsize>>| async move {
+            post(move |State(calls): State<Arc<AtomicUsize>>| async move {
                 let seen = calls.fetch_add(1, Ordering::SeqCst) + 1;
                 if seen == 1 {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error": "model is loading"})),
-                    )
+                    (status, Json(json!({"error": "model is loading"})))
                 } else {
                     (StatusCode::OK, Json(json!({"embeddings": [[0.1, 0.2]]})))
                 }
@@ -2612,13 +2610,58 @@ async fn managed_task_retries_a_transient_upstream_500() {
 
     let response = platform.oneshot(embedding_task_request()).await.unwrap();
 
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), status);
     assert_eq!(
         calls.load(Ordering::SeqCst),
-        2,
-        "the managed task should have retried the transient 500 exactly once"
+        1,
+        "an HTTP server error does not prove execution never began"
     );
     mock_task.abort();
+}
+
+#[tokio::test]
+async fn managed_task_does_not_replay_upstream_server_errors() {
+    for status in [StatusCode::INTERNAL_SERVER_ERROR, StatusCode::BAD_GATEWAY] {
+        assert_managed_server_error_is_not_replayed(status).await;
+    }
+}
+
+#[tokio::test]
+async fn managed_task_does_not_follow_a_post_redirect() {
+    let redirected = Arc::new(AtomicUsize::new(0));
+    let mock = discovery_routes()
+        .route(
+            "/api/embed",
+            post(|| async {
+                (
+                    StatusCode::TEMPORARY_REDIRECT,
+                    [("location", "/redirected")],
+                    "redirect after accepting work",
+                )
+            }),
+        )
+        .route(
+            "/redirected",
+            post(|State(calls): State<Arc<AtomicUsize>>| async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Json(json!({"embeddings": [[0.1, 0.2]]}))
+            }),
+        )
+        .with_state(redirected.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    let platform = app(&crate::support::platform_config(
+        "127.0.0.1:11435",
+        upstream,
+        None,
+        None,
+    ))
+    .unwrap();
+    let response = platform.oneshot(embedding_task_request()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(redirected.load(Ordering::SeqCst), 0);
+    task.abort();
 }
 
 /// 503 is Ollama's honest "server busy" — retrying it under the exclusive non-resident lock
@@ -3757,7 +3800,16 @@ async fn verified_feedback_survives_a_platform_restart() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert!(store.snapshot("placement_feedback").unwrap().is_some());
+    // The write runs after the response; it lands within moments.
+    let mut saved = false;
+    for _ in 0..100 {
+        if store.snapshot("placement_feedback").unwrap().is_some() {
+            saved = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(saved, "the queued feedback write must land");
 
     // A second process opening the same database sees what the first one learned.
     let restarted =

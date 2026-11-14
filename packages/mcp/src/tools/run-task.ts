@@ -9,52 +9,27 @@ import { notice, progressSink, taskNotices, type ToolExtra } from "../progress.j
 import { ensureServe } from "../serve.js";
 import { deferText, routeText, withText } from "../result-text.js";
 import {
-  BATCH_TASK_FIELDS, type BatchItem, batchItemParam, embeddingInputParam, endpointParam, errorResult, executionPreferenceParam, filesParam,
+  BATCH_TASK_FIELDS, type BatchItem, batchItemParam, embeddingInputParam, endpointParam, errorResult, executionPreferenceParam, fallbackModelsParam, filesParam,
   isStructuredSuccess, localToolsParam, messagesParam, minConfidenceParam, minPlacementEvidenceParam, objectiveParam,
-  parsedResult, questionsParam, requiredCapabilitiesParam, stateParam, summarizeEmbeddings, systemPromptParam,
+  parsedResult, questionsParam, requiredCapabilitiesParam, stateParam, structuredResult, summarizeEmbeddings, systemPromptParam,
   parseBatchTask, taskAnswerText, taskMessages, taskParam, withRequiredCapability,
 } from "../helpers.js";
 import { applyTaskFiles, inputLabels, type FileReceipt } from "../task-files.js";
 import { nearestText, validateEmbeddingVectors, type NearestRequest } from "../nearest.js";
-import { applyJob, mergeProfiles, neededCapabilities, pickLiveJobModel, type JobProfile } from "../job-mode.js";
-import { LOCAL_JOBS, RUN_TASK_JOBS, WORKFLOW_NAMES, WORKFLOWS, type JobName, type WorkflowName } from "../local-prompts.js";
+import { applyJob, mergeProfiles, neededCapabilities, pickLiveJobModel, pickLiveJobModelDetailed, type JobProfile } from "../job-mode.js";
+import { LOCAL_JOBS, RUN_TASK_JOBS, WORKFLOW_NAMES, WORKFLOWS, workflowSource, type JobName, type WorkflowName } from "../local-prompts.js";
 import { checkOutputPath, HANDOFF_NAME, summaryOf, writeHandoff } from "../handoffs.js";
 import { outputInput } from "../tool-results.js";
-import { resultChecks, withChecks } from "../result-checks.js";
+import { fallbackCheck, injectionCheck, inputData, nullFieldCheck, resultChecks, withChecks } from "../result-checks.js";
+import { tablesToMarkdown } from "../table-markdown.js";
+import { EmbeddingIndex, embedIndexEnabled, rankByQuery } from "../embed-index.js";
 
-// Typed where the agent acts on a field; Ollama-owned payloads (`response`) stay open.
+// Typed where the agent acts on a field (model, fit, the deferred job, saved files); every other
+// receipt field stays open, so the schema an agent pays for in tools/list stays small.
 const taskResultSchema = z.object({
   selected_model: z.string().optional(),
   context_window_fit: z.string().optional(),
-  execution: z.unknown().optional(),
-  response: z.unknown().optional(),
-  nearest: z.object({
-    mode: z.enum(["query", "pairs"]),
-    matches: z.array(z.object({ label: z.string(), score: z.number() }).loose()).optional(),
-    pairs: z.array(z.object({ score: z.number() }).loose()).optional(),
-  }).optional(),
-  files_read: z.array(z.object({ path: z.string(), role: z.string() }).loose()).optional(),
-  deferred: z.boolean().optional(),
   job: z.object({ id: z.string(), status: z.string() }).loose().optional(),
-  response_file: z.string().optional(),
-  sections: z.array(z.string()).optional(),
-  telemetry: z.unknown().optional(),
-  handoff_file: z.string().optional(),
-}).loose();
-const batchResultSchema = z.object({
-  results: z.array(z.object({
-    id: z.string(),
-    ok: z.boolean(),
-    response: z.unknown().optional(),
-    error: z.unknown().optional(),
-  }).loose()).optional(),
-  deferred: z.boolean().optional(),
-  jobs: z.array(z.object({
-    id: z.string(),
-    job: z.object({ id: z.string(), status: z.string() }).loose().optional(),
-    error: z.unknown().optional(),
-  }).loose()).optional(),
-  telemetry: z.unknown().optional(),
 }).loose();
 
 type TaskPayload = Pick<BatchItem["task"],
@@ -128,7 +103,7 @@ function withFiles<T extends TaskPayload & { files?: string[] }>(task: T, label?
 export const BATCH_SHARED_FIELDS: ReadonlySet<string> = new Set([
   "task", "model", "objective", "sessionId", "contextTokens", "executionPreference", "systemPrompt", "questions",
   "format", "think", "options", "keepAlive", "priority", "timeoutSeconds", "maxWaitSeconds", "stopOnRepetition", "tools",
-  "minConfidence", "requiredCapabilities", "minPlacementEvidence",
+  "minConfidence", "requiredCapabilities", "minPlacementEvidence", "fallbackModels",
 ]);
 
 function withoutUndefined<T extends object>(value: T): Partial<T> {
@@ -169,7 +144,7 @@ async function runManagedTask(
   try {
     const raw = await runWithJobProgress({
       submit: () => runTaskRequest(target, { ...request, defer: true }),
-      get: (id) => getTaskJob(target, id),
+      get: (id, waitMs) => getTaskJob(target, id, waitMs),
       cancel: (id) => cancelTaskJob(target, id),
       sync: (refusal) => {
         // This callback is reached only for a definitive pre-execution job refusal. The request
@@ -448,6 +423,7 @@ async function runBatch(
         max_wait_seconds: task.maxWaitSeconds,
         timeout_seconds: task.timeoutSeconds,
         stop_on_repetition: task.stopOnRepetition,
+        fallback_models: task.fallbackModels,
         prompt: task.prompt,
         images: task.images,
         messages: taskMessages(task),
@@ -511,24 +487,24 @@ export function registerRunTaskTool(server: McpServer): void {
     "run_task",
     {
       description:
-        "Use when: bounded work for a local model: decision, embedding + `nearest`, vision, tools (returns tool_calls you run), completion batches. " +
-        "Do not use when: you must stand behind the judgment, need edits across files, or the work is shorter than describing it. " +
-        "`tasks` = up to 64 independent items; per-item fields override top-level defaults; one `model` per batch avoids a cold load per model; `maxParallelism` caps dispatch; `preview:true` routes only. " +
-        "MCP clients time out near 60 s: for long work pass `defer:true` (with `tasks`, one job per item) and poll task_jobs get. " +
-        "Returns: the answer text (decision: one line per question; nearest: ranked labels); receipts in structuredContent.",
+        "Use when: bounded work for a local model: a workflow or job, decision, embedding + `nearest`, vision, tools (returns tool_calls you run). " +
+        "Do not use when: you must stand behind the judgment or need edits across files. " +
+        "`tasks` = up to 64 independent items; per-item fields override top-level defaults (workflow and job apply to the whole batch); one `model` per batch avoids a cold load per model; `maxParallelism` caps dispatch; `preview:true` routes only. " +
+        "Hosts cut calls near 60 s: for long work pass `defer:true` (with `tasks`, one job per item) and poll task_jobs get. " +
+        "Returns: the answer text, its check: lines and response_file (read_response opens the receipt; receipt:\"full\" inlines it).",
       inputSchema: z.object({
         endpoint: endpointParam,
         task: taskParam.removeDefault().optional(),
-        job: z.enum(RUN_TASK_JOBS).optional().describe("picks a model that fits now and fills prompt, systemPrompt, options, think, prefixes; your fields win"),
-        workflow: z.enum(WORKFLOW_NAMES as [WorkflowName, ...WorkflowName[]]).optional().describe("step-by-step instructions for the local model (fix-bug, write-tests, review-code, summarize-log, extract-json, read-fields...); implies its job"),
+        job: z.enum(RUN_TASK_JOBS).optional().describe("picks the model that fits now and fills prompts and options; your fields win"),
+        workflow: z.enum(WORKFLOW_NAMES as [WorkflowName, ...WorkflowName[]]).optional().describe("step-by-step instructions for the local model; implies its job"),
         objective: objectiveParam,
-        model: z.string().min(1).optional().describe(
-          "exact tag; omitted: routing picks by capability only and may choose one that does not fit now, so name the catalog's pick for the job",
-        ),
-        sessionId: z.string().uuid().optional(),
-        scopeId: z.string().uuid().optional(),
+        model: z.string().min(1).optional().describe("exact tag; omitted, routing picks by capability only, so name the catalog's pick for the job"),
+        fallbackModels: fallbackModelsParam.describe("tried in order only when the model before was refused before it ran (no room, input over its context, not installed, wrong capability); never after it started. The receipt's fallback lists each attempt"),
+        // Shown as plain strings (zod's UUID pattern alone is ~180 characters each); checked below.
+        sessionId: z.string().length(36).optional(),
+        scopeId: z.string().length(36).optional(),
         scopeRevision: z.number().int().nonnegative().optional(),
-        contextTokens: z.number().int().positive().optional().describe("Input + output window (num_ctx)."),
+        contextTokens: z.number().int().positive().optional().describe("num_ctx"),
         executionPreference: executionPreferenceParam,
         minPlacementEvidence: minPlacementEvidenceParam,
         requiredCapabilities: requiredCapabilitiesParam,
@@ -538,22 +514,15 @@ export function registerRunTaskTool(server: McpServer): void {
           .array(z.string().min(1))
           .min(1)
           .optional()
-          .describe("base64 without data-URI prefix, with `prompt` or a decision `state` (prefer `files`). Needs an explicit vision `model`; text in images: the catalog's ocr pick"),
-        files: filesParam.describe(
-          "Paths or globs the server reads (a refused path lists the allowed roots); 4 MiB per text file, 8 MiB per image, 32 MiB total. " +
-            "embedding: ~1.5 KB chunks, an image or .wav is one item. decision: one text file is the state; images and .wav join images. Other tasks: images join images, text goes under `prompt`.",
-        ),
-        state: stateParam.describe("decision: what the questions ask about; they may name JSON fields in backticks"),
-        questions: questionsParam.describe(
-          'decision: choice picks one criteria option; noul is yes/no, answered as the probability of yes (criteria {"false","true"} optional); ' +
-            "score gives a level from 2-10 criteria descriptions, lowest first (unreliable for severity).",
-        ),
-        messages: messagesParam.describe("Caller system prompts; no injected task instructions. Overrides prompt."),
-        input: embeddingInputParam,
-        tools: localToolsParam.describe(
-          "Returns tool_calls for you to run; check them, since small models call a tool when none is needed. With `tasks`: a shared default, an item's own `tools` replaces it",
-        ),
-        keepAlive: z.string().min(1).optional().describe('"0" unloads now, "-1" pins; omitted: adaptive TTL'),
+          .describe("base64 (prefer `files`). Needs an explicit vision `model`; text in images: the catalog's ocr pick"),
+        files: filesParam.describe("paths or globs the server reads (4 MiB per text file, 8 MiB per image, 32 MiB total): text under prompt, images as images; embedding: ~1.5 KB chunks; decision: the state"),
+        state: z.unknown().optional().describe("decision: the text or JSON the questions are about"),
+        questions: z.record(z.string(), z.object({ type: z.enum(["noul", "choice", "score"]) }).loose()).optional()
+          .describe("decision: {name:{type, instructions, criteria}}; choice picks one criteria label, noul is the probability of yes, score a level from 2-10 descriptions"),
+        messages: z.array(z.object({ role: z.string() }).loose()).optional().describe("Caller system prompts; no injected task instructions. Overrides prompt."),
+        input: z.unknown().optional().describe("embedding: text, or {text|image|audio} items"),
+        tools: localToolsParam.describe("Returns tool_calls for you to run; check them, since small models call a tool when none is needed. With `tasks`: a shared default"),
+        keepAlive: z.string().min(1).optional().describe('"0" unloads, "-1" pins'),
         format: z
           .union([z.literal("json"), z.record(z.string(), z.unknown())])
           .optional(),
@@ -563,38 +532,29 @@ export function registerRunTaskTool(server: McpServer): void {
         options: z
           .record(z.string(), z.unknown())
           .optional()
-          .describe("num_ctx/num_gpu are routing-owned; num_predict caps output."),
+          .describe("num_ctx/num_gpu are routing-owned; num_predict caps output"),
         logprobs: z.boolean().optional(),
         topLogprobs: z.number().int().nonnegative().optional(),
         minConfidence: minConfidenceParam,
         priority: z.enum(["interactive", "normal", "background"]).optional(),
-        maxWaitSeconds: z.number().int().positive().optional().describe("capped by the operator's max_queue_wait_seconds (default 120); lowered waits show as wait_limit"),
+        maxWaitSeconds: z.number().int().positive().optional().describe("capped by the operator's max_queue_wait_seconds; lowered waits show as wait_limit"),
         timeoutSeconds: z.number().int().positive().optional(),
         stopOnRepetition: z
           .boolean()
           .optional()
-          .describe("Stop a repeating loop, keeping its text; default on without num_predict"),
+          .describe("stop a repeating answer, keeping its text"),
         receipt: z
           .enum(["compact", "full"])
           .optional()
-          .describe("compact (default): full receipt at response_file; full: inline"),
+          .describe("compact (default) or full"),
         defer: z.boolean().optional(),
-        saveAs: z.string().regex(HANDOFF_NAME).optional().describe("answer to handoffs/<name>.md, returned as handoff_file"),
+        idempotencyKey: z.string().min(1).max(128).optional().describe("defer:true on a serve with durable jobs (FREELLAMA_DURABLE_JOBS=1): resubmitting the same key and input returns the original job instead of running it again"),
+        saveAs: z.string().regex(HANDOFF_NAME).optional().describe("save the answer as handoffs/<name>.md"),
         ...outputInput,
         returnEmbeddings: z.boolean().optional(),
-        nearest: z
-          .object({
-            query: z.string().min(1).optional(),
-            top: z.number().int().positive().max(100).optional(),
-            minScore: z.number().min(-1).max(1).optional(),
-            documentPrefix: z.string().optional(),
-          })
-          .strict()
-          .optional()
-          .describe(
-            "embedding: rank instead of returning vectors (works with `defer`). With `query`: the `top` (default 5, max 100) closest items; " +
-              "without: the `top` most similar pairs. Chunks are labelled path:Lstart-Lend: read only that range. documentPrefix is the model's own (see its cookbook).",
-          ),
+        dimensions: z.number().int().positive().optional().describe("embedding: shorten vectors (models trained for it)"),
+        nearest: z.object({}).loose().optional()
+          .describe("embedding: {query?, top? (default 5, max 100), minScore?, documentPrefix?}: the items closest to `query`, or the most similar pairs"),
         preview: z
           .boolean()
           .optional()
@@ -604,21 +564,22 @@ export function registerRunTaskTool(server: McpServer): void {
           .min(1)
           .max(64)
           .optional()
-          .describe("Result text: one `## <id>` section per item."),
-        maxParallelism: z.number().int().positive().max(64).optional().describe("Batch mode only"),
+          .describe("independent items; per-item fields override top-level ones; one ## <id> section each"),
+        maxParallelism: z.number().int().positive().max(64).optional(),
       }).strict(),
-      outputSchema: taskResultSchema.extend(batchResultSchema.shape),
+      outputSchema: taskResultSchema,
       annotations: { destructiveHint: false },
     },
     async ({
       endpoint,
       task,
       job,
-      workflow,
+      workflow: workflowShown,
       saveAs,
       outputPath,
       objective,
       model,
+      fallbackModels,
       sessionId,
       scopeId,
       scopeRevision,
@@ -629,12 +590,12 @@ export function registerRunTaskTool(server: McpServer): void {
       prompt,
       systemPrompt,
       images,
-      messages,
-      input,
+      messages: messagesShown,
+      input: inputShown,
       files,
-      state,
-      questions,
-      tools,
+      state: stateShown,
+      questions: questionsShown,
+      tools: toolsShown,
       keepAlive,
       format,
       think,
@@ -647,13 +608,31 @@ export function registerRunTaskTool(server: McpServer): void {
       timeoutSeconds,
       stopOnRepetition,
       defer,
+      idempotencyKey,
       returnEmbeddings,
-      nearest: nearestRequest,
+      dimensions,
+      nearest: nearestShown,
       preview,
       tasks,
       maxParallelism,
     }, extra: ToolExtra) => {
       try {
+        // The schema shown to agents is loose for these fields; the accepted shapes are exactly
+        // the strict ones.
+        const strict = z.object({
+          sessionId: z.string().uuid().optional(), scopeId: z.string().uuid().optional(),
+          state: stateParam, questions: questionsParam, input: embeddingInputParam, tools: localToolsParam, messages: messagesParam,
+          workflow: z.enum(WORKFLOW_NAMES as [WorkflowName, ...WorkflowName[]]).optional(),
+          nearest: z.object({
+            query: z.string().min(1).optional(), top: z.number().int().positive().max(100).optional(),
+            minScore: z.number().min(-1).max(1).optional(), documentPrefix: z.string().optional(),
+          }).strict().optional(),
+        }).safeParse({ workflow: workflowShown, sessionId, scopeId, state: stateShown, questions: questionsShown, input: inputShown, tools: toolsShown, messages: messagesShown, nearest: nearestShown });
+        if (!strict.success) {
+          return errorResult(new Error(strict.error.issues.map((issue) => `${issue.path.join(".")}: ${issue.message}`).join("; ")));
+        }
+        let { state, questions, input, tools, messages, nearest: nearestRequest } = strict.data;
+        let workflow = strict.data.workflow;
         // Refuse a bad outputPath before any model work; the write itself happens with the result (tool-results.ts).
         if (outputPath !== undefined) {
           if (preview || defer) return errorResult(new Error("`outputPath` saves a finished answer; it is not valid with `preview` or `defer`."));
@@ -669,7 +648,8 @@ export function registerRunTaskTool(server: McpServer): void {
           task, objective, model, sessionId, scopeId, scopeRevision, contextTokens, executionPreference,
           minPlacementEvidence, requiredCapabilities, prompt, systemPrompt, images, messages, input, files, state, questions,
           tools, keepAlive, format, think, options, logprobs, topLogprobs, minConfidence, priority, maxWaitSeconds,
-          timeoutSeconds, stopOnRepetition, defer, returnEmbeddings, nearest: nearestRequest, preview,
+          timeoutSeconds, stopOnRepetition, defer, returnEmbeddings, nearest: nearestRequest, preview, fallbackModels,
+          idempotencyKey,
         };
         if (tasks !== undefined) {
           if (saveAs !== undefined) return errorResult(new Error("`saveAs` saves one answer; it is not valid with `tasks`."));
@@ -695,20 +675,42 @@ export function registerRunTaskTool(server: McpServer): void {
         if (maxParallelism !== undefined) return errorResult(new Error("`maxParallelism` is valid only with `tasks`."));
         if (saveAs !== undefined && (preview || defer)) return errorResult(new Error("`saveAs` saves a finished answer; it is not valid with `preview` or `defer`."));
         let profile: JobProfile | undefined;
+        let pickNote: string | undefined;
         if (job !== undefined) {
           if (scopeId !== undefined) return errorResult(new Error("`job` picks the model and prompt, and a scope has its own: remove `job` or `scopeId`."));
           const prefer = workflow !== undefined ? (WORKFLOWS[workflow] as { prefer?: "capable" }).prefer : undefined;
-          const picked = model === undefined ? await pickLiveJobModel(job, endpoint, prefer, neededCapabilities({ tools, think })) : undefined;
+          const pick = model === undefined ? await pickLiveJobModelDetailed(job, endpoint, prefer, neededCapabilities({ tools, think })) : undefined;
+          const picked = pick?.model;
+          pickNote = pick?.note;
           const applied = applyJob(job, { task, model, prompt, systemPrompt, messages, options, think, input, format, tools, nearest: nearestRequest }, picked, preview === true, workflow);
           ({ prompt, systemPrompt, options, think, input, model } = applied.fields);
           format = applied.fields.format as typeof format;
           task = applied.fields.task as typeof task;
+          // The workflow's output ceiling would turn serve's repetition stop off (a cap means "the
+          // caller bounded it"); free text keeps it on, structured output is legitimately periodic.
+          if (applied.profile.applied.includes("num_predict") && stopOnRepetition === undefined && format === undefined && !tools?.length) stopOnRepetition = true;
           nearestRequest = applied.fields.nearest as typeof nearestRequest;
           profile = applied.profile;
         }
         // Checks read the result itself (uncertain answers, close matches, unsupported facts, edits
         // that do not match the file) and are saved with a handoff too.
-        const finish = <R,>(result: R): R => withJob(withChecks(result, job, task ?? "completion", tools), profile, saveAs);
+        // The data the model read (files are inlined into prompt or state by then), never the request.
+        const inputText = () => inputData(typeof prompt === "string" ? prompt : undefined, typeof state === "string" ? state : undefined);
+        // Checks keyed to a built-in's promised output apply only when that built-in ran, not a
+        // user file that replaced it under the same name.
+        const builtinFlow = workflow !== undefined && workflowSource(workflow).kind === "builtin" ? workflow : undefined;
+        const answerOf = (result: unknown) => ((result as { content?: Array<{ type: string; text?: string }> }).content ?? []).find((part) => part.type === "text")?.text ?? "";
+        const extraChecks = (result: unknown) => {
+          const input = inputText();
+          const request = typeof prompt === "string" ? prompt : "";
+          return [
+            // With a workflow FreeLlama owns the instructions, so a prompt with no data part is
+            // scanned too; a caller's own prompt ("You are now a translator") is theirs.
+            pickNote, injectionCheck(input, input === "" && workflow !== undefined ? request : ""),
+            builtinFlow === "extract-json" ? nullFieldCheck(answerOf(result).split("\ncheck: ")[0]!, input || request) : undefined,
+          ];
+        };
+        const finish = <R,>(result: R): R => withJob(withCheck(withChecks(asWorkflowOutput(result, builtinFlow), job, task ?? "completion", tools, builtinFlow), ...extraChecks(result)), profile, saveAs);
         const canonicalTask = task ?? "completion";
         if (preview) {
           const executionOnlyFields = ([
@@ -736,6 +738,8 @@ export function registerRunTaskTool(server: McpServer): void {
             ["timeoutSeconds", timeoutSeconds],
             ["stopOnRepetition", stopOnRepetition],
             ["defer", defer],
+            ["fallbackModels", fallbackModels],
+            ["idempotencyKey", idempotencyKey],
           ] satisfies Array<[string, unknown]>)
             .filter(([, value]) => value !== undefined)
             .map(([name]) => `\`${name}\``);
@@ -763,6 +767,8 @@ export function registerRunTaskTool(server: McpServer): void {
             await route(endpoint, canonicalTask, objective, model, sessionId, contextTokens, effectiveRequiredCapabilities, minConfidence, executionPreference, minPlacementEvidence),
           ), routeText));
         }
+        if (dimensions !== undefined && task !== "embedding") return errorResult(new Error("`dimensions` shortens embedding vectors; it is valid only for task \"embedding\"."));
+        if (idempotencyKey !== undefined && !defer) return errorResult(new Error("`idempotencyKey` deduplicates deferred jobs; pass it with `defer:true`."));
         const filled = withFiles({ task, files, prompt, images, input, state, documentPrefix: nearestRequest?.documentPrefix });
         ({ prompt, images, input, state } = filled.task);
         const problem = validateTaskPayload({
@@ -771,7 +777,20 @@ export function registerRunTaskTool(server: McpServer): void {
         });
         if (problem) return errorResult(new Error(problem));
         const items = input === undefined ? [] : Array.isArray(input) ? input : [input];
-        const labels = nearestRequest === undefined ? undefined : inputLabels(items.length, filled.files);
+        const labels = nearestRequest === undefined ? undefined : inputLabels(items.length, filled.files, items, nearestRequest.documentPrefix);
+        // A repeated search over the same files embeds only the chunks that changed.
+        if (canonicalTask === "embedding" && nearestRequest?.query !== undefined && labels && filled.files.length > 0
+          && typeof model === "string" && !defer && !returnEmbeddings && fallbackModels === undefined && embedIndexEnabled()
+          && sessionId === undefined && scopeId === undefined && contextTokens === undefined
+          && minConfidence === undefined && minPlacementEvidence === undefined
+          && items.length > 0 && items.every((item) => typeof item === "string")) {
+          const indexed = await indexedNearest(endpoint ?? DEFAULT_SERVE_ENDPOINT, {
+            model, items: items as string[], labels, query: nearestRequest.query, top: nearestRequest.top, minScore: nearestRequest.minScore,
+            dimensions, options, keepAlive, priority: priority ?? "normal", maxWaitSeconds, timeoutSeconds, executionPreference, requiredCapabilities: effectiveRequiredCapabilities,
+          }, progressSink(extra), extra.signal);
+          if (isStructuredSuccess(indexed)) indexed.structuredContent.files_read = filled.files;
+          return finish(isStructuredSuccess(indexed) ? rankedResult(indexed, true, items.length) : indexed);
+        }
         // A deferred job is accepted before it routes, so a floor would otherwise surface only as a
         // failed job. Route first (no generation) so the refusal returns synchronously.
         if (minConfidence && defer && scopeId === undefined) {
@@ -784,6 +803,7 @@ export function registerRunTaskTool(server: McpServer): void {
           task: scopeId !== undefined && task === undefined ? undefined : canonicalTask,
           objective: objective ?? (scopeId === undefined ? "balanced" : undefined),
           model,
+          fallback_models: fallbackModels,
           session_id: sessionId,
           scope_id: scopeId,
           scope_revision: scopeRevision,
@@ -808,6 +828,7 @@ export function registerRunTaskTool(server: McpServer): void {
           timeout_seconds: timeoutSeconds,
           stop_on_repetition: stopOnRepetition,
           defer: defer ?? false,
+          idempotency_key: idempotencyKey,
           execution_preference: executionPreference,
           min_placement_evidence: minPlacementEvidence,
           request_options: {
@@ -816,6 +837,7 @@ export function registerRunTaskTool(server: McpServer): void {
             options,
             logprobs,
             top_logprobs: topLogprobs,
+            dimensions,
           },
         };
         const target = endpoint ?? DEFAULT_SERVE_ENDPOINT;
@@ -824,6 +846,10 @@ export function registerRunTaskTool(server: McpServer): void {
         const report = defer ? undefined : progressSink(extra);
         const slicedEmbedding = request.task === "embedding" && Array.isArray(input) && input.length > EMBEDDINGS_PER_JOB && !defer
           && nearestRequest === undefined;
+        // Each slice is its own request: a chain could embed slices on different models.
+        if (slicedEmbedding && fallbackModels !== undefined) {
+          return errorResult(new Error(`\`fallbackModels\` keeps one model per answer; with more than ${EMBEDDINGS_PER_JOB} embedding inputs, pass \`nearest\` (ranked in one job) or drop the chain.`));
+        }
         // A serve this server is still starting reports its phases too.
         if (report) await ensureServe(endpoint, { signal: extra.signal, report });
         // Slices bound retained job results. If the engine returns larger vectors than its job
@@ -911,6 +937,89 @@ export function withJob<R>(result: R, profile: JobProfile | undefined, saveAs?: 
 }
 
 /** An embedding result the core ranked by `nearest`: labelled matches inline, vectors only on request. */
+type IndexedSearch = {
+  model: string; items: string[]; labels: string[]; query: string; top?: number; minScore?: number;
+  dimensions?: number; options?: Record<string, unknown>; keepAlive?: string; priority: string;
+  maxWaitSeconds?: number; timeoutSeconds?: number; executionPreference?: string; requiredCapabilities?: string[];
+};
+
+/**
+ * Rank file chunks in the query's verified embedding space. The query runs once per search;
+ * missing documents are embedded separately with the same observed identity. Cache misses can
+ * therefore add a local request; cache hits never reuse vectors from uncertain or changed runtimes.
+ * Every execution receipt is retained, with combined counters and no raw vectors inline.
+ */
+async function indexedNearest(target: string, search: IndexedSearch, report: ((message: string) => void) | undefined, signal: AbortSignal) {
+  const receipts: Fields[] = [];
+  const acceptedJobs: string[] = [];
+  const deadline = search.timeoutSeconds === undefined ? undefined : performance.now() + search.timeoutSeconds * 1000;
+  const deadlineSignal = deadline === undefined ? undefined : AbortSignal.timeout(Math.max(1, Math.ceil(deadline - performance.now())));
+  const combinedSignal = deadlineSignal ? AbortSignal.any([signal, deadlineSignal]) : signal;
+  const request = { task: "embedding", model: search.model, keep_alive: search.keepAlive, priority: search.priority,
+    max_wait_seconds: search.maxWaitSeconds, execution_preference: search.executionPreference, required_capabilities: search.requiredCapabilities, defer: false,
+    request_options: { options: search.options, dimensions: search.dimensions } };
+  const execute = async (input: string[], extra: Fields = {}) => {
+    const next = { ...request, ...extra, input,
+      ...(deadline === undefined ? {} : { timeout_seconds: Math.max(1, Math.ceil((deadline - performance.now()) / 1000)) }) };
+    if (combinedSignal.aborted) throw cancellationError();
+    const result = parsedResult(await (input.length > EMBEDDINGS_PER_JOB && extra.nearest === undefined
+      ? embedInSlices(target, next, input, report, combinedSignal)
+      : runManagedTask(target, next, report, combinedSignal, (id) => acceptedJobs.push(id))));
+    if (!isStructuredSuccess(result)) throw new Error(JSON.stringify(result.structuredContent ?? { error: "embedding request failed" }));
+    const content = result.structuredContent;
+    const response = object(content.response) ?? {};
+    receipts.push({ ...content, response: { ...response, embeddings: undefined,
+      embeddings_omitted: { count: Array.isArray(response.embeddings) ? response.embeddings.length : null } } });
+    if (Array.isArray(content.accepted_job_ids)) acceptedJobs.push(...content.accepted_job_ids.filter((id): id is string => typeof id === "string"));
+    return { result, content, response };
+  };
+  const finish = (content: Fields, response: Fields, matches: unknown[], index: Fields) => withTaskTelemetry(structuredResult({
+    ...content, response: { ...response, embeddings: undefined }, nearest: { mode: "query", matches },
+      metrics: sumFields(receipts, "metrics", ["total_duration_ns", "load_duration_ns", "prompt_tokens", "cached_prompt_tokens",
+        "uncached_prompt_tokens", "prompt_duration_ns", "output_tokens", "output_duration_ns"]),
+      admission: { mode: "identity_scoped_embedding_index", ...sumFields(receipts, "admission", ["queue_wait_ms", "resource_wait_ms", "transition_wait_ms", "total_wait_ms"]) },
+      embedding_requests: receipts.reduce((total, receipt) => total + (typeof receipt.embedding_requests === "number" ? receipt.embedding_requests : 1), 0),
+      embedding_slices: receipts, accepted_job_ids: [...new Set(acceptedJobs)], embedding_index: index,
+  }));
+  try {
+    // The query has to run on every search. Its actual receipt, not a default-endpoint inventory
+    // or a mutable tag, determines which cached document vectors can join its embedding space.
+    const probe = await execute([search.query]);
+    const [query] = validateEmbeddingVectors(probe.response.embeddings, 1);
+    let identity: Fields;
+    try { identity = sliceIdentity(probe.content, query!.length); }
+    catch {
+      // Older/uncertain receipts still answer using one fresh embedding space, with reuse disabled.
+      const fresh = await execute(search.items, { nearest: { query: search.query, top: 1 }, return_embeddings: true });
+      const [freshQuery, ...vectors] = validateEmbeddingVectors(fresh.response.embeddings, search.items.length + 1);
+      const matches = rankByQuery(freshQuery!, vectors.map((vector, i) => ({ label: search.labels[i]!, vector })), search.top ?? 5, search.minScore);
+      return finish(fresh.content, fresh.response, matches, { status: "disabled_unverified_identity", cached: 0, embedded: search.items.length });
+    }
+    const index = EmbeddingIndex.open(search.model, String(identity.model_digest), query!.length, undefined,
+      canonical({ target, identity }));
+    const missing = [...new Set(search.items.filter((text) => index.get(text) === undefined))];
+    let last = probe;
+    if (missing.length > 0) {
+      last = await execute(missing, { expected_model_digest: identity.model_digest,
+        expected_execution_backend: identity.backend, expected_upstream: identity.upstream });
+      const vectors = validateEmbeddingVectors(last.response.embeddings, missing.length, query!.length);
+      if (canonical(sliceIdentity(last.content, query!.length)) !== canonical(identity)) {
+        throw new Error("embedding identity changed between query and documents; no cached vectors were combined");
+      }
+      index.add(missing.map((text, i) => ({ text, vector: vectors[i]! })));
+    }
+    const matches = rankByQuery(query!, search.items.map((text, i) => ({ label: search.labels[i]!, vector: index.get(text)! })), search.top ?? 5, search.minScore);
+    return finish(last.content, last.response, matches, { status: "verified", cached: search.items.length - missing.length, embedded: missing.length, file: index.file });
+  } catch (error) {
+    let cause: Fields | undefined;
+    try { cause = object(JSON.parse(error instanceof Error ? error.message : String(error))); } catch { /* retain validation detail */ }
+    throw new Error(JSON.stringify({ code: cause?.code ?? "embedding_index_invalid",
+      error: cause?.error ?? (error instanceof Error ? error.message : String(error)),
+      embedding_slices: receipts, accepted_job_ids: [...new Set(acceptedJobs)],
+      execution_outcome: receipts.length > 0 ? "unknown" : cause?.execution_outcome ?? "unknown", retry_safe: false, cause }));
+  }
+}
+
 function rankedResult(
   finished: { structuredContent: Record<string, unknown>; content?: unknown },
   withQuery: boolean,
@@ -940,8 +1049,11 @@ function withBatchChecks<R>(result: R, job: string | undefined, items: BatchItem
     if (!row || row.ok !== true) continue;
     const id = String(row.id);
     const receipt = object(row.response) ?? {};
-    const lines = resultChecks({ job, task: taskOf.get(id), answer: taskAnswerText(receipt) ?? "", structured: receipt, tools: toolsOf.get(id) });
-    if (lines.length === 0 || /^every answer is outside|^every number and quoted name|^all \d+ SEARCH|^\d+ tool call\(s\) match/.test(lines[0]!)) continue;
+    const ordinary = resultChecks({ job, task: taskOf.get(id), answer: taskAnswerText(receipt) ?? "", structured: receipt, tools: toolsOf.get(id) });
+    const quiet = ordinary.length === 0 || /^every answer is outside|^every number and quoted name|^all \d+ SEARCH|^\d+ tool call\(s\) match/.test(ordinary[0]!);
+    const fallback = fallbackCheck(receipt);
+    const lines = [...(fallback ? [fallback] : []), ...(quiet ? [] : ordinary)];
+    if (lines.length === 0) continue;
     checks[id] = lines;
     flagged.push(`${id}: ${lines.join("; ")}`);
   }
@@ -949,5 +1061,27 @@ function withBatchChecks<R>(result: R, job: string | undefined, items: BatchItem
   const content = (shown.content ?? []).map((part, index) => (index === 0 && part.type === "text"
     ? { ...part, text: `${part.text ?? ""}\n\ncheck these items first:\n${flagged.slice(0, 20).map((line) => `- ${line}`).join("\n")}${flagged.length > 20 ? `\n- … ${flagged.length - 20} more in structuredContent.checks` : ""}` }
     : part));
+  return { ...result, structuredContent: { ...shown.structuredContent, checks }, content } as R;
+}
+
+/**
+ * A workflow's promised output shape, applied to the shown answer only (structuredContent keeps
+ * the model's raw text): read-table promises Markdown, and OCR models answer in OTSL or HTML.
+ */
+function asWorkflowOutput<R>(result: R, workflow: WorkflowName | undefined): R {
+  const shown = result as { content?: Array<{ type: string; text?: string }>; isError?: boolean };
+  if (workflow !== "read-table" || shown.isError || !shown.content) return result;
+  // A table starts on its own line, after the `[model] ` label.
+  const table = (text: string) => tablesToMarkdown(text).replace(/^(\[[^\]\n]*\] )\|/, "$1\n|");
+  return { ...result, content: shown.content.map((part) => (part.type === "text" ? { ...part, text: table(part.text ?? "") } : part)) } as R;
+}
+
+/** More `check:` lines, after the result's own checks. */
+function withCheck<R>(result: R, ...extra: Array<string | undefined>): R {
+  const shown = result as { content?: Array<{ type: string; text?: string }>; structuredContent?: Record<string, unknown>; isError?: boolean };
+  const added = extra.filter((check): check is string => check !== undefined);
+  if (added.length === 0 || shown.isError || !shown.structuredContent) return result;
+  const checks = [...((shown.structuredContent.checks as string[] | undefined) ?? []), ...added];
+  const content = (shown.content ?? []).map((part, index) => (index === 0 && part.type === "text" ? { ...part, text: `${part.text ?? ""}${added.map((check) => `\ncheck: ${check}`).join("")}` } : part));
   return { ...result, structuredContent: { ...shown.structuredContent, checks }, content } as R;
 }

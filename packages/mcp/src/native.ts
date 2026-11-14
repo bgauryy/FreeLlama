@@ -36,7 +36,7 @@ export const { createScope, getScope, forkScope, deleteScope, warmModelRequest, 
   ) => Promise<string>;
   runTaskRequest: (endpoint: string | null | undefined, request: unknown) => Promise<string>;
   listTaskJobs: (endpoint?: string | null) => Promise<string>;
-  getTaskJob: (endpoint: string | null | undefined, jobId: string) => Promise<string>;
+  getTaskJob: (endpoint: string | null | undefined, jobId: string, waitMs?: number) => Promise<string>;
   cancelTaskJob: (endpoint: string | null | undefined, jobId: string) => Promise<string>;
   removeTaskJob: (endpoint: string | null | undefined, jobId: string) => Promise<string>;
 };

@@ -19,20 +19,23 @@ not provide tenant isolation or billing.
   `SSL_CERT_FILE` if any upstream uses `https://`. Without one, FreeLlama starts with an empty trust
   store and warns: plain-HTTP upstreams work, HTTPS upstreams fail their certificate check.
 
-After a tag has been published, install that exact checksummed release on macOS or Linux:
+To pin a server to one checksummed release, pass its tag. A pinned version installs the
+operator binary and verifies it against the release's `SHA256SUMS`; `--no-ollama` keeps the
+installer from offering Ollama on a host where you manage it yourself:
 
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/bgauryy/FreeLlama/main/scripts/install.sh
-sh install.sh --version vX.Y.Z
+sh install.sh --version vX.Y.Z --no-ollama
 ```
 
-The installer downloads the exact-version binary and verifies it against the release's
-`SHA256SUMS`. From a Windows checkout, run the following command after replacing `VERSION` with the
-published tag:
+On Windows, replace `VERSION` with the published tag:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Version VERSION
+powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Version VERSION -NoOllama
 ```
+
+Without a version, both scripts install the latest release: the npm package when npm is on PATH,
+otherwise the binary.
 
 The repository has no CI or release workflows; they were removed (see git history). Release from a
 clean checkout: `yarn release:version <version>`, `yarn release:build` (builds each target's
@@ -202,7 +205,9 @@ lists it. `GET /v1/models` merges every list and names unreachable engines. A re
 sent once (no retries), streams through unchanged, carries the `x-freellama-upstream` header and is
 counted in usage. An engine on this machine waits out host holds as a loaded Ollama model would; a
 remote one does not. Managed tasks, residency and the memory budget cover Ollama only, and there is no
-automatic failover from one engine to another.
+automatic failover from one engine to another. A managed task can name an explicit
+[fallback chain](FEATURES.md#fallback-chains) of Ollama models, tried only after a refusal before
+execution.
 
 Everything the server learns lives in one `SQLite` database, `~/.octocode/freellama/freellama.sqlite`
 (`--home` or `FREELLAMA_HOME` moves the home): measured runner sizes, placement feedback, the usage
@@ -217,7 +222,11 @@ another schema version is refused with its path; move or delete it to start a ne
 
 ## Bound conversation history and residency
 
-Scope histories and deferred jobs are process-local and are discarded on restart. Configure
+Scope histories and sessions are process-local and are discarded on restart. Deferred jobs are
+process-local by default; with `FREELLAMA_DURABLE_JOBS=1` and the file-backed store, recorded
+terminal receipts survive a restart, an unfinished job reads back as an unknown outcome, and no work
+is replayed (see [Deferred jobs and recovery](DEFERRED_JOBS.md)). Receipt persistence is not
+executable recovery: nothing resumes an interrupted inference. Configure
 `[scopes]` and `[warming]` limits in the runtime file from measured workload needs; finite history
 bounds and automatic retention remain separate from host-memory reserves. Warm loads use the same
 admission and placement checks as tasks. See [Scope history and model warming](SCOPES_AND_WARMING.md)
@@ -235,6 +244,10 @@ Set these values in the MCP host environment:
 - `FREELLAMA_AGENT_TOKEN_CALIBRATION_DIR`: persistent, per-model token-estimate records.
 - `FREELLAMA_MCP_ALLOWED_ROOTS`: exact directories available to `delegate_research`.
 - `FREELLAMA_SERVE_ENDPOINT`: authenticated FreeLlama endpoint.
+
+`freellama gateway` listens on loopback only and has no authentication of its own: it refuses
+non-loopback `Origin` and `Host` headers and forwards the client's `authorization` and `x-api-key`
+headers to serve.
 
 Persistent token calibration eliminates the repeated “uncalibrated first call” after a model has
 been observed on that host. A genuinely new model/template still starts from the conservative

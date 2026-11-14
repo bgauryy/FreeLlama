@@ -7,7 +7,8 @@ type Fields = Record<string, unknown>;
 export type JobCalls = {
   /** The task request with `defer:true`. */
   submit: () => Promise<string>;
-  get: (id: string) => Promise<string>;
+  /** `waitMs`: ask serve to hold the read until the job changes (a long poll); older serves ignore it. */
+  get: (id: string, waitMs?: number) => Promise<string>;
   cancel: (id: string) => Promise<string>;
   /**
    * The unchanged synchronous call, used only when submission was refused before execution;
@@ -54,7 +55,13 @@ const TERMINAL = new Set(["completed", "failed", "cancelled", "expired"]);
 const SUBMIT_FALLBACK_CODES = new Set(["task_job_input_too_large", "task_jobs_full", "task_jobs_input_budget"]);
 /** The worker already ran, but the registry could not retain its result or error. */
 const RETENTION_FAILURE_CODES = new Set(["task_job_result_too_large", "task_job_error_too_large"]);
-const FIRST_POLL_MS = 250;
+/**
+ * The first poll comes soon and the interval doubles up to MAX_POLL_MS: a short task (most local
+ * tasks finish in 100-300 ms on a warm runner) is reported within a few tens of milliseconds of
+ * finishing, not at the first 250 ms tick or the next one at 625 ms (measured), while a long
+ * task still settles to one cheap local poll every two seconds.
+ */
+const FIRST_POLL_MS = 25;
 /**
  * A phase that lasts this long is reported again with its elapsed time, so a cold load or a long
  * memory wait still sends progress: clients that reset their request timeout on progress keep
@@ -62,6 +69,11 @@ const FIRST_POLL_MS = 250;
  */
 const HEARTBEAT_MS = 10_000;
 const MAX_POLL_MS = 2_000;
+/**
+ * How long one read may wait for the job to change on a serve that long-polls. A change answers
+ * at once; the cap keeps a cancellation (checked between reads) responsive.
+ */
+const LONG_POLL_MS = 1_000;
 /** Consecutive failed polls before the transport error is reported; any success resets it. */
 const MAX_POLL_FAILURES = 5;
 /** Cancel requests sent before the cancellation is reported as unknown. */
@@ -138,8 +150,15 @@ export function jobProgressMessage(job: Fields): string {
       const expected = number(detail?.expected_load_ms);
       return `loading ${model ?? "model"}${expected !== undefined ? ` (~${seconds(expected)})` : ""}${evictedSuffix(detail)}`;
     }
-    case "running":
+    case "running": {
+      // A streaming chat job counts its tokens: report liveness, never the text itself.
+      const tokens = number(detail?.generated_tokens);
+      if (reason === "generating" && tokens !== undefined) {
+        const rate = number(detail?.tokens_per_second);
+        return `generating on ${model ?? "model"}: ${tokens} tokens${rate !== undefined ? `, ${rate} tok/s` : ""}`;
+      }
       return model ? `running ${model}` : "running";
+    }
     default:
       return status.replace(/_/g, " ");
   }
@@ -288,6 +307,7 @@ export async function runWithJobProgress(
     let lastReportAt = Date.now();
     let phaseStartedAt = lastReportAt;
     let delay = FIRST_POLL_MS;
+    let longPoll = false;
     let failures = 0;
     for (;;) {
       if (signal?.aborted) {
@@ -311,14 +331,17 @@ export async function runWithJobProgress(
         lastReportAt = now;
       }
       if (TERMINAL.has(String(job.status))) break;
-      await wait(delay, signal);
+      // A long-polling serve answers when the job changes, so there is nothing to sleep for.
+      if (!longPoll) await wait(delay, signal);
       if (signal?.aborted) {
         cancel();
         throw aborted(id, await cancellationState());
       }
-      delay = Math.min(MAX_POLL_MS, Math.round(delay * 1.5));
+      delay = Math.min(MAX_POLL_MS, delay * 2);
       try {
-        const polled = object(object(JSON.parse(await calls.get(id)))?.job);
+        const reply = object(JSON.parse(await calls.get(id, LONG_POLL_MS)));
+        if (reply?.long_poll === true) longPoll = true;
+        const polled = object(reply?.job);
         if (polled) job = polled;
         failures = 0;
       } catch (error) {
@@ -341,9 +364,21 @@ export async function runWithJobProgress(
         }
         failures += 1;
         if (failures >= MAX_POLL_FAILURES) {
-          // Nobody will follow the job any more; do not leave it running.
+          // Nobody will follow the job any more; do not leave it running or lose its execution identity.
           cancel();
-          throw error;
+          const described = describe(error);
+          const failure = {
+            code: "task_job_poll_failed",
+            error: `Polling accepted job ${id} failed: ${error instanceof Error ? error.message : String(error)}. `
+              + "Cancellation was requested; execution outcome is unknown and the task must not be replayed.",
+            job_id: id,
+            last_observed_status: job.status,
+            execution_outcome: "unknown",
+            retry_safe: false,
+            cancellation_requested: true,
+            ...(described.body ? { cause: described.body } : {}),
+          };
+          throw options.failure?.(failure, described.status) ?? new Error(JSON.stringify(failure));
         }
       }
     }

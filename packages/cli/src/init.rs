@@ -38,6 +38,13 @@ pub(crate) fn generate_auth_token(path: &std::path::Path) -> Result<()> {
     ))
 }
 
+/// Ollama's official one-line installer for this platform.
+const OLLAMA_INSTALL_COMMAND: &str = if cfg!(windows) {
+    "irm https://ollama.com/install.ps1 | iex"
+} else {
+    "curl -fsSL https://ollama.com/install.sh | sh"
+};
+
 pub(crate) fn initialization_status(
     ollama_ready: bool,
     serve_ready: bool,
@@ -106,7 +113,7 @@ pub(crate) async fn initialize(ollama_endpoint: String, serve_endpoint: String) 
     if !ollama_ready {
         next_steps.push(json!({
             "action": "install_or_start_ollama",
-            "instruction": "Install Ollama from https://ollama.com/download, or start `ollama serve`, then rerun `freellama init`."
+            "instruction": format!("Install Ollama with `{OLLAMA_INSTALL_COMMAND}` (or from https://ollama.com/download), or start `ollama serve`, then rerun `freellama init`.")
         }));
     } else if installed_models.is_empty() {
         next_steps.push(json!({

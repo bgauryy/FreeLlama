@@ -12,7 +12,7 @@ export const CATALOG_JOBS = MODEL_CATALOG.jobs.map((job) => job.job);
 
 /** One `/api/tags` entry: Ollama reports each installed tag with its manifest digest. */
 /** `capabilities`: what Ollama's /api/tags reports for the tag (tools, thinking, vision, ...), when it does. */
-export type InstalledModel = { name: string; digest?: string | null; capabilities?: string[] };
+export type InstalledModel = { name: string; digest?: string | null; capabilities?: string[]; /** file bytes, from /api/tags */ size?: number };
 
 /** `glm-ocr`, `library/glm-ocr:latest` and `GLM-OCR:latest` name one tag. */
 function canonicalTag(name: string): string {
@@ -82,6 +82,8 @@ export function catalogText(view: ReturnType<typeof catalogView>): string {
     pick.installed === null ? "" : pick.installed ? ("installed_as" in pick && pick.installed_as ? `installed as ${pick.installed_as}` : "installed") : "not installed",
     pick.fits_now === null ? "" : pick.fits_now ? "fits now" : "no room now",
   ].filter(Boolean).join(", ");
-  const lines = view.jobs.map((job) => `${job.job}: ${job.picks.map((pick) => `${pick.tag} (${state(pick)})`).join("; ")}. Recipe: ${job.cookbook}`);
-  return `${lines.join("\n")}\nAvailable memory: ${view.available_gb ?? "unknown"} GB. Measured on ${view.measured_on}.`;
+  const lines = view.jobs.map((job) => `${job.job}: ${job.picks.map((pick) => `${pick.tag} (${state(pick)})`).join("; ")}.`);
+  // One recipe pointer for every job, not one per line: the URIs share a pattern.
+  const recipes = view.jobs.length === 1 ? `Recipe: ${view.jobs[0]!.cookbook}` : "Recipes: freellama://docs/cookbooks/<job>";
+  return `${lines.join("\n")}\n${recipes}. Available memory: ${view.available_gb ?? "unknown"} GB. Measured on ${view.measured_on}.`;
 }

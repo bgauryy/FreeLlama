@@ -278,9 +278,10 @@ export function registerModelsTool(server: McpServer): void {
       inputSchema: z.object({
         view: z
           .enum(["catalog", "installed", "resident", "detail", "raw", "library"])
-          .optional(),
+          .optional()
+          .describe("installed: tags, capabilities, fit; resident: loaded now, GPU/CPU split; detail: one tag; raw: Ollama /api/tags, paged; library: search (query) or one family's tags"),
         job: z.enum(CATALOG_JOBS as [string, ...string[]]).optional().describe("catalog: one job's measured picks that fit now"),
-        model: z.string().min(1).optional(),
+        model: z.string().min(1).optional().describe("detail: the tag; library: a family or hf.co/owner/repo, to list its tags with sizeBytes"),
         includeVerbose: z
           .boolean()
           .optional(),

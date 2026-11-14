@@ -26,7 +26,7 @@ MCP task cancellation and managed research use addressable jobs regardless of wh
 
 ## Idempotency
 
-With persistence enabled, the HTTP task request may include `idempotency_key`, containing 1–128 UTF-8 bytes. It requires `defer:true`; synchronous requests and servers without durable jobs reject the field. The current MCP tool schema does not add an idempotency-key argument.
+With persistence enabled, the HTTP task request may include `idempotency_key`, containing 1–128 UTF-8 bytes. It requires `defer:true`; synchronous requests and servers without durable jobs reject the field. MCP passes it as `run_task {defer:true, idempotencyKey}` and the agent commands as `freellama run --defer --idempotency-key KEY`; both refuse a key without `defer`. A batch (`tasks`, `--each`) takes no key: each item is its own job.
 
 Keys are hashed (HMAC-SHA256, see [request hashes](#request-hashes)) with authenticated caller identity and scoped to a server topology: listen address, primary endpoint, CPU endpoint and configured CPU model list. Keep that configuration and caller identity stable when recovering jobs. Task input is serialized and hashed after removing the key, together with the set of explicitly supplied fields. Retries must preserve both values and field presence: omission can inherit scope defaults while an explicit default overrides them. Reusing a key with changed input returns `task_job_idempotency_conflict`.
 

@@ -12,6 +12,9 @@ use serde_json::{Value, json};
 pub(super) struct ApiError {
     status: StatusCode,
     pub(super) body: Box<ErrorBody>,
+    /// Part of the task already ran (an earlier embedding slice) before this error, so a
+    /// fallback chain must not treat it as a refusal before execution.
+    after_execution: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -25,6 +28,11 @@ pub(super) struct ErrorBody {
     upstream_response: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     lifecycle: Option<Value>,
+    /// An accepted upstream response may follow partial execution; status alone cannot prove retry safety.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    execution_outcome: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retry_safe: Option<bool>,
     /// Seconds a caller should wait before retrying; also sent as the `Retry-After` header.
     #[serde(skip_serializing_if = "Option::is_none")]
     retry_after_seconds: Option<u64>,
@@ -35,6 +43,9 @@ pub(super) struct ErrorBody {
     /// The caller's `max_wait_seconds` when the operator's queue-wait cap lowered it.
     #[serde(skip_serializing_if = "Option::is_none")]
     wait_limit: Option<Value>,
+    /// With `fallback_models`: every model tried before this refusal and why each was refused.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fallback: Option<Value>,
 }
 
 /// A deadline can expire before footprint discovery establishes a byte requirement. Keep that
@@ -69,11 +80,26 @@ impl ApiError {
                 resource_admission: None,
                 upstream_response: None,
                 lifecycle: None,
+                execution_outcome: None,
+                retry_safe: None,
                 retry_after_seconds: None,
                 memory_holders: None,
                 wait_limit: None,
+                fallback: None,
             }),
+            after_execution: false,
         }
+    }
+
+    /// Mark an error that followed work already done for this task (see `after_execution`).
+    pub(super) fn after_partial_execution(mut self) -> Self {
+        self.after_execution = true;
+        self
+    }
+
+    /// Whether part of the task ran before this error.
+    pub(super) fn followed_execution(&self) -> bool {
+        self.after_execution
     }
 
     /// A host-memory admission wait that ran out of time (as opposed to a queue or input error).
@@ -122,6 +148,45 @@ impl ApiError {
         Self::new(StatusCode::UNPROCESSABLE_ENTITY, error)
     }
 
+    /// A routing refusal, keeping the stable code of a refused pinned model (not installed, or
+    /// unable to do the task) so callers and fallback chains need not parse the message.
+    pub(super) fn route_refusal(error: &anyhow::Error) -> Self {
+        let refusal = error.downcast_ref::<super::ModelRefusal>();
+        let api = Self::bad_request(error);
+        match refusal {
+            Some(refusal) => api.with_code(refusal.code),
+            None => api,
+        }
+    }
+
+    /// The machine-readable code, when one was attached.
+    pub(super) fn code(&self) -> Option<&'static str> {
+        self.body.code
+    }
+
+    /// The refusal message.
+    pub(super) fn message(&self) -> &str {
+        &self.body.error
+    }
+
+    /// The last model a fallback chain tried before this error: the one that actually failed.
+    pub(super) fn last_attempted_model(&self) -> Option<&str> {
+        self.body
+            .fallback
+            .as_ref()?
+            .get("attempts")?
+            .as_array()?
+            .last()?
+            .get("model")?
+            .as_str()
+    }
+
+    /// The models an explicit fallback chain tried before this error, in order.
+    pub(super) fn with_fallback(mut self, fallback: Value) -> Self {
+        self.body.fallback = Some(fallback);
+        self
+    }
+
     pub(super) fn task_cancelled() -> Self {
         Self::new(StatusCode::CONFLICT, "task cancelled").with_code("task_cancelled")
     }
@@ -148,6 +213,8 @@ impl ApiError {
         self.body.code = Some(code);
         self.body.upstream_response = Some(response);
         self.body.lifecycle = lifecycle;
+        self.body.execution_outcome = Some("unknown");
+        self.body.retry_safe = Some(false);
         self
     }
 
@@ -389,11 +456,15 @@ pub(super) fn resource_error(error: resources::ResourceWaitError) -> ApiError {
             resource_admission: Some(ResourceFailureReceipt::Assessed(Box::new(receipt))),
             upstream_response: None,
             lifecycle: None,
+            execution_outcome: None,
+            retry_safe: None,
             // Host memory rarely recovers in under a few seconds.
             retry_after_seconds: Some(5),
             memory_holders,
             wait_limit: None,
+            fallback: None,
         }),
+        after_execution: false,
     }
 }
 

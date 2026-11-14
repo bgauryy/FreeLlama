@@ -24,6 +24,8 @@ for (const relative of manifests) {
   for (const { id } of PLATFORM_PACKAGES) {
     if (manifest.optionalDependencies?.[nativePackageName(id)]) manifest.optionalDependencies[nativePackageName(id)] = version;
   }
+  // The CLI runs `freellama run`, `chat`, `gateway`… from the MCP package: the two ship together.
+  if (manifest.dependencies?.["@octocodeai/freellama-mcp-server"]) manifest.dependencies["@octocodeai/freellama-mcp-server"] = version;
   writeFileSync(file, `${JSON.stringify(manifest, null, 2)}\n`);
 }
 

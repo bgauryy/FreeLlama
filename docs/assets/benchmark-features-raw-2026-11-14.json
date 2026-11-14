@@ -1,0 +1,179 @@
+{
+  "features": {
+    "priority": {
+      "ollama": {
+        "interactive_median_ms": 3516,
+        "batch_median_ms": 3618,
+        "rounds": 7
+      },
+      "freellama": {
+        "interactive_median_ms": 1403,
+        "batch_median_ms": 3674,
+        "rounds": 7
+      }
+    },
+    "cache": {
+      "document_chars": 12000,
+      "first_question": {
+        "ms": 11872,
+        "prompt_tokens": 3144,
+        "prompt_eval_ms": 10097,
+        "cached_tokens": 0
+      },
+      "second_question": {
+        "ms": 5141,
+        "prompt_tokens": 3151,
+        "prompt_eval_ms": 3434,
+        "cached_tokens": 2120
+      }
+    },
+    "index": {
+      "first_ms": 55891,
+      "second_ms": 127,
+      "speedup": 441,
+      "top_first": [
+        "packages/mcp/src/job-progress.ts",
+        "packages/mcp/src/job-progress.ts",
+        "packages/mcp/src/job-progress.ts"
+      ],
+      "top_second": [
+        "packages/mcp/src/job-progress.ts",
+        "packages/mcp/src/job-progress.ts",
+        "packages/mcp/src/job-progress.ts"
+      ]
+    },
+    "sweep": {
+      "error": "sweep: start needs `model`: a decision model such as models{view:\"catalog\", job:\"classify\"} lists."
+    },
+    "long": {
+      "submit_ms": 29,
+      "job_total_ms": 19159,
+      "polls": 19,
+      "status": "completed"
+    }
+  },
+  "sweep": {
+    "files": "packages/mcp/src/tools/*.ts",
+    "first_ms": 49794,
+    "first_counts": {
+      "total": 83,
+      "done": 83,
+      "failed": 0,
+      "flagged": 0,
+      "unsure": 0,
+      "clear": 83,
+      "reused": 0,
+      "changed": 0,
+      "added": 0,
+      "pending": 0,
+      "removed": 0
+    },
+    "baseline_ms": 18,
+    "baseline_counts": {
+      "total": 83,
+      "done": 83,
+      "failed": 0,
+      "flagged": 0,
+      "unsure": 0,
+      "clear": 83,
+      "reused": 83,
+      "changed": 0,
+      "added": 0,
+      "pending": 0,
+      "removed": 0
+    },
+    "speedup": 2705.2
+  },
+  "per_workflow": [
+    {
+      "workflow": "summarize-text",
+      "cases": 4,
+      "shipped_pass": 7,
+      "shipped_runs": 7,
+      "shipped_median_s": 1.07,
+      "oneline_pass": 6,
+      "oneline_runs": 8,
+      "oneline_median_s": 1.5
+    },
+    {
+      "workflow": "summarize-log",
+      "cases": 5,
+      "shipped_pass": 9,
+      "shipped_runs": 9,
+      "shipped_median_s": 3.99,
+      "oneline_pass": 2,
+      "oneline_runs": 10,
+      "oneline_median_s": 6.63
+    },
+    {
+      "workflow": "summarize-diff",
+      "cases": 2,
+      "shipped_pass": 4,
+      "shipped_runs": 4,
+      "shipped_median_s": 3.13,
+      "oneline_pass": 4,
+      "oneline_runs": 4,
+      "oneline_median_s": 5.2
+    },
+    {
+      "workflow": "extract-json",
+      "cases": 5,
+      "shipped_pass": 9,
+      "shipped_runs": 10,
+      "shipped_median_s": 2.13,
+      "oneline_pass": 9,
+      "oneline_runs": 10,
+      "oneline_median_s": 1.67
+    },
+    {
+      "workflow": "explain-code",
+      "cases": 1,
+      "shipped_pass": 2,
+      "shipped_runs": 2,
+      "shipped_median_s": 6.87,
+      "oneline_pass": 0,
+      "oneline_runs": 2,
+      "oneline_median_s": 27.69
+    },
+    {
+      "workflow": "review-code",
+      "cases": 3,
+      "shipped_pass": 6,
+      "shipped_runs": 6,
+      "shipped_median_s": 1.62,
+      "oneline_pass": 2,
+      "oneline_runs": 6,
+      "oneline_median_s": 13.19
+    },
+    {
+      "workflow": "fix-bug",
+      "cases": 2,
+      "shipped_pass": 4,
+      "shipped_runs": 4,
+      "shipped_median_s": 2.97,
+      "oneline_pass": 0,
+      "oneline_runs": 4,
+      "oneline_median_s": 2.74
+    },
+    {
+      "workflow": "change-code",
+      "cases": 1,
+      "shipped_pass": 2,
+      "shipped_runs": 2,
+      "shipped_median_s": 2.72,
+      "oneline_pass": 1,
+      "oneline_runs": 2,
+      "oneline_median_s": 2.82
+    },
+    {
+      "workflow": "write-tests",
+      "cases": 1,
+      "shipped_pass": 2,
+      "shipped_runs": 2,
+      "shipped_median_s": 13.55,
+      "oneline_pass": 1,
+      "oneline_runs": 2,
+      "oneline_median_s": 28.65
+    }
+  ]
+}

@@ -16,6 +16,7 @@ mod control_timing_contract;
 mod decision_task_contract;
 mod doctor_contract;
 mod edge_cases;
+mod fallback_chain_contract;
 mod lease_split_contract;
 mod model_bench_contract;
 mod model_identity_contract;

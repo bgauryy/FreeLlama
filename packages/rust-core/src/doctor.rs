@@ -16,8 +16,10 @@ use crate::ollama_http::{server_version, url};
 use crate::platform::resources::run_bounded;
 use crate::{DEFAULT_CONTROL_TIMEOUT_SECS, timeout_from_env};
 
-const OLLAMA_CONFIG_SETTING_NAMES: [&str; 21] = [
+const OLLAMA_CONFIG_SETTING_NAMES: [&str; 25] = [
     "OLLAMA_DEBUG",
+    // Writes inference request bodies (prompts) to a temporary directory: a privacy leak.
+    "OLLAMA_DEBUG_LOG_REQUESTS",
     "OLLAMA_HOST",
     "OLLAMA_CONTEXT_LENGTH",
     "OLLAMA_KEEP_ALIVE",
@@ -35,8 +37,11 @@ const OLLAMA_CONFIG_SETTING_NAMES: [&str; 21] = [
     "OLLAMA_GPU_OVERHEAD",
     "OLLAMA_IGPU_ENABLE",
     "OLLAMA_LOAD_TIMEOUT",
+    "OLLAMA_NOHISTORY",
+    "OLLAMA_REMOTES",
     "LLAMA_ARG_FIT",
     "LLAMA_ARG_FIT_TARGET",
+    "LLAMA_ARG_CACHE_RAM",
     // `OLLAMA_NUM_PARALLEL` is deliberately last only to keep the list grouped by the help text.
     "OLLAMA_NUM_PARALLEL",
 ];
@@ -366,7 +371,7 @@ where
             "value": getenv("OLLAMA_GPU_OVERHEAD"),
             "effective_default": "0",
         },
-        // Not OLLAMA_-prefixed, but these two govern memory as directly as anything above.
+        // Not OLLAMA_-prefixed, but these govern memory as directly as anything above.
         "LLAMA_ARG_FIT": {
             "value": getenv("LLAMA_ARG_FIT"),
             "effective_default": "on",
@@ -377,12 +382,17 @@ where
             "effective_default": "unset — llama.cpp picks its own margin",
             "note": "Target free VRAM margin per device, in MiB, that the automatic fit above aims to leave. On unified memory this is headroom taken from the same pool the OS and everything else uses, which is why Ollama's own loader also refuses a model predicted past 80% of free memory (server/sched.go).",
         },
+        "LLAMA_ARG_CACHE_RAM": {
+            "value": getenv("LLAMA_ARG_CACHE_RAM"),
+            "effective_default": "8192 MiB of host RAM per runner",
+            "note": "Displaced prompt caches each llama-server keeps in host RAM, which no memory estimate sees. 2048 bounds it on hosts with 32 GB or less; 0 disables it.",
+        },
     })
 }
 
 /// Build the version-labelled, categorized Ollama configuration diagnostic.
 ///
-/// `categories.memory_scheduler` is `ollama_env_advisories`, the eleven memory controls. This
+/// `categories.memory_scheduler` is `ollama_env_advisories`, the twelve memory controls. This
 /// report adds the other production-relevant variables advertised by the detected Ollama 0.33
 /// generation, grouped by operational purpose. The detected server version is
 /// included because Ollama's environment surface changes over time; this is a known-setting audit,
@@ -411,6 +421,11 @@ where
                     "effective_default": "127.0.0.1:11434 (loopback only)",
                     "note": "Binding to a non-loopback address expands the trust boundary. Put authentication and transport security in front of Ollama before exposing it beyond the host.",
                 },
+                "OLLAMA_REMOTES": {
+                    "value": getenv("OLLAMA_REMOTES"),
+                    "effective_default": "Ollama's default remote hosts",
+                    "note": "Hosts Ollama may reach for remote models. Leave unset with OLLAMA_NO_CLOUD=1 on a local-only box.",
+                },
                 "OLLAMA_ORIGINS": {
                     "value": getenv("OLLAMA_ORIGINS"),
                     "effective_default": "Ollama's built-in local application origins",
@@ -422,6 +437,16 @@ where
                     "value": getenv("OLLAMA_NO_CLOUD"),
                     "effective_default": "false — Ollama cloud features are available",
                     "note": "Set to 1 when the deployment contract requires local-only inference and no Ollama web-search or remote-inference features.",
+                },
+                "OLLAMA_DEBUG_LOG_REQUESTS": {
+                    "value": getenv("OLLAMA_DEBUG_LOG_REQUESTS"),
+                    "effective_default": "false",
+                    "note": "When set, Ollama writes every inference request body to a temporary directory: the prompts and files agents offload. Keep it unset outside a short, supervised diagnosis.",
+                },
+                "OLLAMA_NOHISTORY": {
+                    "value": getenv("OLLAMA_NOHISTORY"),
+                    "effective_default": "false — the ollama CLI keeps readline history",
+                    "note": "Set to 1 so interactive `ollama run` prompts are not kept in ~/.ollama/history.",
                 },
             },
             "storage_lifecycle": {
@@ -522,6 +547,7 @@ pub fn local_conservative_config_posture(config: &Value, observed_process: &Valu
     let (flash, _) = posture_value(config, observed_process, "OLLAMA_FLASH_ATTENTION");
     let (kv_cache, _) = posture_value(config, observed_process, "OLLAMA_KV_CACHE_TYPE");
     let (cache_ram, _) = posture_value(config, observed_process, "LLAMA_ARG_CACHE_RAM");
+    let (log_requests, _) = posture_value(config, observed_process, "OLLAMA_DEBUG_LOG_REQUESTS");
 
     let no_cloud_status = if matches!(no_cloud.as_deref(), Some("1" | "true" | "TRUE")) {
         "ready"
@@ -562,23 +588,29 @@ pub fn local_conservative_config_posture(config: &Value, observed_process: &Valu
     } else {
         "recommended"
     };
-    let overall = if no_cloud_status == "action_required" {
-        "action_required"
-    } else if [
-        max_loaded_status,
-        parallel_status,
-        queue_status,
-        context_status,
-        flash_status,
-        kv_status,
-    ]
-    .iter()
-    .any(|status| *status != "ready")
-    {
-        "review_required"
-    } else {
-        "ready"
+    // Ollama writes every inference request body to disk while this is set.
+    let log_requests_status = match log_requests.as_deref() {
+        None | Some("" | "0" | "false" | "FALSE") => "ready",
+        Some(_) => "action_required",
     };
+    let overall =
+        if no_cloud_status == "action_required" || log_requests_status == "action_required" {
+            "action_required"
+        } else if [
+            max_loaded_status,
+            parallel_status,
+            queue_status,
+            context_status,
+            flash_status,
+            kv_status,
+        ]
+        .iter()
+        .any(|status| *status != "ready")
+        {
+            "review_required"
+        } else {
+            "ready"
+        };
 
     json!({
         "profile": "local-conservative-v1",
@@ -592,6 +624,7 @@ pub fn local_conservative_config_posture(config: &Value, observed_process: &Valu
             "OLLAMA_CONTEXT_LENGTH": rule("OLLAMA_CONTEXT_LENGTH", "unset; observe the VRAM-tiered runtime default with /api/ps", context_status, "Use per-request num_ctx for managed work; a request at another num_ctx reloads the runner and loses its prompt cache, so keep callers of one model on one context. Qualify any global override and inspect the loaded runner."),
             "OLLAMA_FLASH_ATTENTION": rule("OLLAMA_FLASH_ATTENTION", "auto", flash_status, "Ollama enables it automatically on supported backends; forcing it is not a performance claim."),
             "LLAMA_ARG_CACHE_RAM": rule("LLAMA_ARG_CACHE_RAM", "2048 on hosts with 32 GB or less", cache_ram_status, "llama.cpp keeps prompt caches that a new prompt displaced in host RAM, up to 8192 MiB per runner by default, and FreeLlama's memory estimates do not see it. Ollama passes its environment to each llama-server, so setting this on the Ollama server bounds it; 0 disables the cache (later prompts then re-evaluate their prefix)."),
+            "OLLAMA_DEBUG_LOG_REQUESTS": rule("OLLAMA_DEBUG_LOG_REQUESTS", "unset", log_requests_status, "Set, Ollama writes every inference request body (the prompts and files agents offload) to a temporary directory."),
             "OLLAMA_KV_CACHE_TYPE": rule("OLLAMA_KV_CACHE_TYPE", "f16", kv_status, "q8_0 halves and q4_0 quarters K/V memory (more models fit the memory budget, longer contexts fit a runner) at a quality cost; they are process-wide and need workload qualification."),
         },
         "apply": {
@@ -797,4 +830,30 @@ pub async fn doctor(endpoint: &str) -> Result<Value> {
         // while diagnosing a broken setup.
         "machine": machine,
     }))
+}
+
+#[cfg(test)]
+mod posture_tests {
+    use super::local_conservative_config_posture;
+    use serde_json::json;
+
+    #[test]
+    fn request_body_logging_is_an_action_item() {
+        let config = json!({});
+        let observed = json!({"status": "observed", "settings": {"OLLAMA_DEBUG_LOG_REQUESTS": "1", "OLLAMA_NO_CLOUD": "1"}});
+        let posture = local_conservative_config_posture(&config, &observed);
+        assert_eq!(
+            posture["settings"]["OLLAMA_DEBUG_LOG_REQUESTS"]["status"],
+            "action_required"
+        );
+        assert_eq!(posture["overall"], "action_required");
+        let quiet = local_conservative_config_posture(
+            &config,
+            &json!({"status": "observed", "settings": {"OLLAMA_NO_CLOUD": "1"}}),
+        );
+        assert_eq!(
+            quiet["settings"]["OLLAMA_DEBUG_LOG_REQUESTS"]["status"],
+            "ready"
+        );
+    }
 }
