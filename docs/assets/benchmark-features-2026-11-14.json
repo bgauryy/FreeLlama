@@ -130,26 +130,6 @@
       "labelW": 150
     },
     {
-      "title": "Second question, same document",
-      "better": "lower",
-      "note": "Prompt cache kept: 3,144-token document, bonsai-2:9b",
-      "rows": [
-        {
-          "label": "1st question",
-          "value": 11872,
-          "kind": "other",
-          "text": "11.9 s"
-        },
-        {
-          "label": "2nd question",
-          "value": 5141,
-          "kind": "freellama",
-          "text": "5.1 s"
-        }
-      ],
-      "footer": "2,120 of 3,151 prompt tokens came from the cache"
-    },
-    {
       "title": "Search a code tree by meaning",
       "better": "lower",
       "note": "packages/mcp/src, job find-code, the same query twice",
@@ -213,6 +193,6 @@
       "detail": "1.6% of one core while serving"
     }
   ],
-  "footnote": "The index and sweep first runs include embedding or judging every chunk; repeats are served from saved results.",
+  "footnote": "Code search and sweep save their work: a first run embeds or judges every chunk, a repeat reuses every unchanged one.",
   "source": "Method and raw numbers: docs/BENCHMARK.md#features · rerun with node scripts/bench/features.mjs"
 }

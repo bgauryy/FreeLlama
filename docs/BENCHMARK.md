@@ -112,7 +112,6 @@ numbers: [`benchmark-features-raw-2026-11-14.json`](assets/benchmark-features-ra
 |---|---|---:|---:|---|
 | Priority under load | One interactive task sent after 8 background tasks | 3.52 s (Ollama alone, arrival order) | **1.40 s** | Median of 7 rounds; `priority: "interactive"` vs `"background"`. The whole batch of 9 took 3.62 s and 3.67 s (+1%) |
 | Built-in workflow prompts | The one-line prompt an agent would write | 52% of graded cases | **98%** | 24 cases × 2 samples on `bonsai-2:9b`; [per workflow](#built-in-prompts-measured) |
-| Prompt cache kept | The first question about a 3,144-token document | 11.9 s | **5.1 s** (second question) | 2,120 of 3,151 prompt tokens came from Ollama's cache; prompt evaluation 10.1 s → 3.4 s |
 | Code search index | The first search of `packages/mcp/src` by meaning | 55.9 s | **0.13 s** (repeat) | Job `find-code` with `nearest`; the repeat embeds no unchanged chunk and returns the same top file |
 | Sweep with a baseline | A first sweep: 83 chunks judged one by one by `strands-decider:2b` | 49.8 s | **18 ms** | `sweep {baseline}` reused all 83 unchanged chunks |
 | Long task as a job | Waiting on one call | — | **29 ms** to a job id | `run_task {defer:true}` for `summarize-log` over `CHANGELOG.md`; done in 19.2 s while the caller polled `task_jobs` |
@@ -121,9 +120,13 @@ numbers: [`benchmark-features-raw-2026-11-14.json`](assets/benchmark-features-ra
 | Layer cost | — | — | **9.7 ms CPU, 26–31 MB** per task and server | `ps` CPU time over 100 tasks; peak server RSS |
 
 The first index and sweep runs include embedding or judging every chunk; their repeats read saved
-results, so the size of the gain depends on how much changed. The prompt cache gain depends on a
-model whose cache Ollama reuses across turns (attention models such as `bonsai-2:9b`; Ollama does
-not reuse it for hybrid models such as `lfm3`).
+results, so the size of the gain depends on how much changed.
+
+Not a FreeLlama-only gain, so not in the table: a second question about the same 3,144-token
+document took 5.1 s instead of 11.9 s (2,120 of 3,151 prompt tokens from cache). That is Ollama's
+prompt cache; FreeLlama keeps the context size and settings stable between calls so the cache
+stays usable, and Ollama alone gives the same when a client does the same. Ollama reuses it across
+turns only for attention models such as `bonsai-2:9b`, not hybrid ones such as `lfm3`.
 
 ### Built-in prompts, measured
 
@@ -210,12 +213,6 @@ choose which tools to look at. They do not measure quality or speed.
 | [SGLang](https://github.com/sgl-project/sglang) | 38.8k | Not run: GPU-server engine |
 | [llamafile](https://github.com/mozilla-ai/llamafile) | 26.6k | Not run: same engine family as llama.cpp |
 | [oMLX](https://github.com/jundot/omlx) | 23.6k | Not run: needs a separate MLX artifact and a third-party tap |
-| [KoboldCpp](https://github.com/LostRuins/koboldcpp) | 12.3k | Not run: same engine family as llama.cpp |
-| [mlx-lm](https://github.com/ml-explore/mlx-lm) | 7.7k | Not run: different artifact format (MLX) |
-| [Lemonade](https://github.com/lemonade-sdk/lemonade) | 6.2k | Not run: not installed |
-| [LM Studio CLI](https://github.com/lmstudio-ai/lms) | 5.4k | Not run: CLI for a closed-source app |
-| [RamaLama](https://github.com/containers/ramalama) | 3.1k | Not run: container-based |
-| [Docker Model Runner](https://github.com/docker/model-runner) | 0.7k | Not run: Docker not installed |
 
 **Lifecycle, routing and agent layers.** These are FreeLlama's closest peers. They sit in front
 of an engine.
@@ -225,11 +222,16 @@ of an engine.
 | [LiteLLM](https://github.com/BerriAI/litellm) | 63.2k | Gateway for many providers: budgets, retries | Not run: a different layer |
 | [llama-swap](https://github.com/mostlygeek/llama-swap) | 6.2k | Starts engines on demand and swaps models | Benchmarked |
 | [GPUStack](https://github.com/gpustack/gpustack) | 6.0k | Schedules models across GPU clusters | Not run: needs several machines |
-| [ollama-mcp-bridge](https://github.com/patruff/ollama-mcp-bridge) | 1.0k | Lets Ollama models call MCP tools (the reverse direction) | Not run: last push 2025-04 |
-| [Olla](https://github.com/thushan/olla) | 0.3k | Proxy that balances load across endpoints | Not run: needs several endpoints |
-| [ollama-mcp](https://github.com/rawveg/ollama-mcp) | 0.2k | MCP server that passes calls straight to Ollama | Not run: same HTTP path as Ollama alone |
-| [herd](https://github.com/tom-swift-tech/herd) | <0.1k | GPU-aware Ollama router | Not run: too few users to select |
-| [ollama-queue-proxy](https://github.com/TadMSTR/ollama-queue-proxy) | <0.1k | Priority queue in front of Ollama | Not run: too few users to select |
+
+Smaller runtimes, not run: [KoboldCpp](https://github.com/LostRuins/koboldcpp) (12.3k) and
+[mlx-lm](https://github.com/ml-explore/mlx-lm) (7.7k) share an engine family or artifact format with
+those above; [Lemonade](https://github.com/lemonade-sdk/lemonade) (6.2k),
+[LM Studio's CLI](https://github.com/lmstudio-ai/lms) (5.4k), [RamaLama](https://github.com/containers/ramalama)
+(3.1k) and [Docker Model Runner](https://github.com/docker/model-runner) (0.7k) were not installed.
+Ollama-specific layers under 1k stars ([ollama-mcp-bridge](https://github.com/patruff/ollama-mcp-bridge),
+[Olla](https://github.com/thushan/olla), [ollama-mcp](https://github.com/rawveg/ollama-mcp),
+[herd](https://github.com/tom-swift-tech/herd), [ollama-queue-proxy](https://github.com/TadMSTR/ollama-queue-proxy))
+cover one piece each: MCP pass-through, load balancing, GPU routing or a priority queue.
 
 Tools at other layers (Open WebUI 158.6k, Fabric 44.6k, llm 12.8k, aichat 10.6k) are clients that
 sit above FreeLlama, not peers. [TensorZero](https://github.com/tensorzero/tensorzero) is now archived,

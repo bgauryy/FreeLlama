@@ -63,21 +63,21 @@ caller cannot see. FreeLlama addresses each one; the answer is still yours to ch
 | What goes wrong with a direct call | What FreeLlama does | What we measured |
 |---|---|---|
 | **The wrong model for this machine.** A tag name says nothing about capability, context or memory. One load too many and the machine starts swapping. | Picks the tested model for the job that is installed *and fits now*. A load that does not fit waits, then is refused with the reason and the programs holding the memory. | With 6.5 GB free, a code review moved from a 10 GB model to one that fit. A yes/no question ran on a 1.2 GB decision model instead of a 14.5 GB one that would have been refused. |
-| **Default settings waste tokens.** Thinking models reason before every answer. Small models pad their output. | Applies each model card's documented sampling and think setting, plus step-by-step workflow prompts that were tested on the models. | A direct call spent 61 tokens (0.92 s) thinking before answering "OK"; FreeLlama answered in 2 tokens (0.47 s). On the workflow eval, the 1.7B model went from 7 of 12 to 11 of 12. |
+| **Default settings waste tokens.** Thinking models reason before every answer. Small models pad their output. | Applies each model card's documented sampling and think setting, plus step-by-step workflow prompts that were tested on the models. | A direct call spent 61 tokens (0.92 s) thinking before answering "OK"; FreeLlama answered in 2 tokens (0.47 s). Built-in workflow prompts passed 98% of graded cases where one-line prompts passed 52%. |
 | **No way to tell a good answer from a bad one.** Answers loop, pad, invent facts, or come back empty. | Returns `check:` lines (filler, invented facts, edits that do not match the file) and a receipt with the model, timing, cache hits and GPU/CPU placement. | An empty "thinking-only" answer exits 1 with the fix (`--think=false`) instead of looking like success. |
 
 Over a session it also keeps the machine efficient:
 
 | Mechanism | Effect | Measured |
 |---|---|---|
-| **Prompt cache kept** | Reuses a loaded model's context window and settings, so Ollama's prompt cache survives between turns | 95% of a multi-turn prompt served from cache (attention models; Ollama does not cache hybrid models such as `lfm3` across turns) |
+| **Prompt cache kept** | Reuses a loaded model's context window and settings, so Ollama's prompt cache survives between turns | A second question about a 3,144-token document took 5.1 s instead of 11.9 s (attention models; Ollama does not cache hybrid models such as `lfm3` across turns) |
 | **Admitted loads only** | Every model load through FreeLlama, streamed requests included, goes through the memory gate (direct calls to Ollama bypass it) | — |
-| **Indexed code search** | A repeated search embeds only the chunks that changed | 89 chunks: 7.3 s first, 0.28 s next |
-| **Fast hand-off** | The service answers the moment a job is done | A short task on a loaded model in about 0.2 s |
+| **Indexed code search** | A repeated search embeds only the chunks that changed | `packages/mcp/src`: 55.9 s first, 0.13 s next |
+| **Long tasks as jobs** | A long task returns a job id at once; the agent polls and stays free | Job id in 29 ms; an interactive task behind 8 queued ones answered in 1.40 s instead of 3.52 s |
 
-*Measured on one Apple M2 Pro (32 GB) with Ollama 0.40.15, on 2026-11-10. These are single-machine
-results, not general speed claims. The current benchmark, with every KPI and how it was measured:
-[Benchmark](docs/BENCHMARK.md); workflow checks: [Testing](docs/TESTING.md).*
+*Measured on one Apple M2 Pro (32 GB) with Ollama 0.40.15 on 2026-11-14 (the thinking example on
+2026-11-10). These are single-machine results, not general speed claims; method and limits:
+[Benchmark](docs/BENCHMARK.md).*
 
 The name means less metered inference, not only Meta's Llama models.
 
@@ -279,30 +279,24 @@ and no scheduling across machines.
 
 ### Benchmarks
 
-Ollama alone, FreeLlama on Ollama, and the most popular alternatives by GitHub stars, on the same
-task and the same hash-verified model file (Apple M2 Pro, 32 GB, 2026-11-14). Every one of the 300
-answers was correct.
+Ollama alone, FreeLlama on Ollama, and the most popular alternatives by GitHub stars, on one task
+and one hash-verified model file (Apple M2 Pro, 32 GB, 2026-11-14). All 300 answers were correct.
 
 ![Ollama, FreeLlama, llama.cpp, LocalAI and llama-swap on six measured KPIs: median task time 272, 274, 336, 802 and 332 ms; first token 93, 95, 128, 541 and 130 ms; throughput at 4 clients 225, 221, 291, 145 and 305 per minute; cold request 1.13, 1.21, n/a, 3.39 and 1.58 s; plus what FreeLlama adds: 3.7 ms overhead, 98% vs 52% with built-in prompts, 9.7 ms CPU and 30 MB RAM, loads that would not fit refused](docs/assets/benchmark-overview.png)
 
 | | Ollama | **FreeLlama** | llama.cpp | LocalAI | llama-swap |
 |---|---:|---:|---:|---:|---:|
-| GitHub stars | 187k | — (runs on Ollama) | 135k | 50k | 6k |
 | Median task time | 272 ms | **274 ms** | 336 ms | 802 ms | 332 ms |
-| p95 task time | 290 ms | **303 ms** | 375 ms | 911 ms | 372 ms |
-| First token | 93 ms | **95 ms** (streamed) | 128 ms | 541 ms | 130 ms |
-| Tasks/min, 1 client | 209 | **206** | 178 | 76 | 178 |
+| First token | 93 ms | **95 ms** | 128 ms | 541 ms | 130 ms |
 | Tasks/min, 4 clients | 225 | **221** | 291 | 145 | 305 |
-| Cold request | 1.13 s | **1.21 s** | loads at start | 3.39 s | 1.58 s |
-| Refuses a load that won't fit in free memory | No (refuses only above total RAM) | **Yes**: refused 7.2 GB with 4.2 GB free | No (frees room, then loads anyway) | VRAM budget cap | No (declared pools) |
-| Picks an installed model that fits now, per job | No | **Yes** | No | Hardware recommendations | No |
-| Built-in tested prompts per job | — | **98%** of graded cases vs 52% with one-line prompts | — | — | — |
-| MCP server for coding agents | — | **Yes** | — | — | — |
 
-FreeLlama keeps Ollama's speed (its own work is 3.7 ms and 9.7 ms of CPU per task, 30 MB of RAM)
-and adds model choice, tested prompts, a memory gate and receipts. llama.cpp and llama-swap serve
-concurrent clients faster; LocalAI trades speed for breadth. What to use for what you are building,
-and how every number was measured: [Benchmark](docs/BENCHMARK.md).
+FreeLlama keeps Ollama's speed and adds what an agent needs on a shared machine:
+
+![FreeLlama's features measured: built-in prompts pass 98% of graded cases against 52% for one-line prompts; an interactive task behind 8 queued answers in 1.40 s instead of 3.52 s; a repeated code search takes 0.13 s instead of 55.9 s; a repeated sweep 18 ms instead of 49.8 s; a long task returns a job id in 29 ms](docs/assets/benchmark-features.png)
+
+llama.cpp and llama-swap serve concurrent clients faster with Ollama's default settings, and
+LocalAI trades speed for breadth. What to use for what you are building, and how every number was
+measured: [Benchmark](docs/BENCHMARK.md).
 
 ## Under the hood
 

@@ -12,6 +12,11 @@
 // index     search a code tree by meaning twice: the second embeds only what changed (nothing)
 // sweep     judge every chunk of a code tree; then again with `baseline`, reusing unchanged chunks
 // long      a long input as a deferred job: time to a job id, progress messages, total time
+// continuous  3 clients send tasks without pause for 90 s: throughput, p50/p95/p99, errors, drift
+// multimodel  2 clients cycle requests over several models from cold: total time, loads, latency
+// idle      how long a model stays loaded after a direct call vs a FreeLlama task, and after reuse
+// batch     16 independent tasks as one run_task call vs 16 separate calls
+// parallel  4 clients against a test-only Ollama with 4 parallel slots, direct and through FreeLlama
 import { spawn } from "node:child_process";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -28,7 +33,9 @@ const out = option("--out", "features.json");
 const port = option("--port", "11451");
 const chatModel = option("--chat-model", "bonsai-2:9b");
 const decideModel = option("--decide-model", "strands-decider:2b-nvfp4");
-const scenarios = option("--scenarios", "priority,cache,index,sweep,long").split(",");
+const scenarios = option("--scenarios", "priority,cache,index,sweep,long,continuous,multimodel,idle,batch,parallel").split(",");
+const ollamaBinary = option("--ollama-binary", "/Applications/Ollama.app/Contents/Resources/ollama");
+const multiModels = option("--models", "lfm3-vl:2b-q4_K_M,bonsai-2:9b,hf.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-4GB:Q4_K_M").split(",");
 const OLLAMA = "http://127.0.0.1:11434";
 const SERVE = `http://127.0.0.1:${port}`;
 const home = mkdtempSync(path.join(tmpdir(), "freellama-features-"));
@@ -165,6 +172,134 @@ try {
       polls += 1;
     }
     return { submit_ms: round(submitted.ms), job_total_ms: round(submitted.ms + performance.now() - started), polls, status: job.status ?? job.job?.status };
+  });
+  // Ollama alone and FreeLlama receive the same requests; only the endpoint and body shape differ.
+  const caseBody = JSON.parse(readFileSync(path.join(root, "scripts/bench/features-case.json"), "utf8"));
+  const send = async (side, model) => {
+    const started = performance.now();
+    const ollama = side === "ollama";
+    const response = await fetch(ollama ? `${OLLAMA}/api/chat` : `${SERVE}/_freellama/v1/tasks`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify(ollama
+        ? { model, messages: caseBody.messages, stream: false, think: false, options: { ...caseBody.request_options.options, num_ctx: caseBody.context_tokens } }
+        : { ...caseBody, model }),
+    });
+    const json = await response.json().catch(() => ({}));
+    const loadMs = ollama ? (json.load_duration ?? 0) / 1e6 : (json.metrics?.load_duration_ns ?? 0) / 1e6;
+    return { ok: response.ok, ms: performance.now() - started, loadMs, at: started };
+  };
+  const unload = async (models) => {
+    for (const model of models) await fetch(`${OLLAMA}/api/generate`, { method: "POST", body: JSON.stringify({ model, keep_alive: 0 }) }).catch(() => undefined);
+    await sleep(1500);
+  };
+  const quantiles = (xs) => ({ p50: round(quantile(xs, 0.5)), p95: round(quantile(xs, 0.95)), p99: round(quantile(xs, 0.99)) });
+  function quantile(xs, p) { const s = [...xs].sort((a, b) => a - b); const k = (s.length - 1) * p, f = Math.floor(k), c = Math.min(f + 1, s.length - 1); return s[f] + (s[c] - s[f]) * (k - f); }
+
+  await run("continuous", async () => {
+    const model = caseBody.model;
+    const side = async (name) => {
+      for (let i = 0; i < 3; i++) await send(name, model);
+      const results = [];
+      const stop = performance.now() + 90_000;
+      await Promise.all(Array.from({ length: 3 }, async () => { while (performance.now() < stop) results.push(await send(name, model)); }));
+      const ok = results.filter((r) => r.ok);
+      const firstHalf = ok.filter((r) => r.at < stop - 45_000).map((r) => r.ms), secondHalf = ok.filter((r) => r.at >= stop - 45_000).map((r) => r.ms);
+      return { tasks: results.length, errors: results.length - ok.length, per_minute: round(ok.length / 1.5, 1), ...quantiles(ok.map((r) => r.ms)),
+        p50_first_45s: round(quantile(firstHalf, 0.5)), p50_last_45s: round(quantile(secondHalf, 0.5)) };
+    };
+    return { clients: 3, seconds: 90, ollama: await side("ollama"), freellama: await side("freellama") };
+  });
+
+  await run("multimodel", async () => {
+    const side = async (name) => {
+      await unload(multiModels);
+      const started = performance.now();
+      const queue = Array.from({ length: 36 }, (_, index) => multiModels[index % multiModels.length]);
+      const results = [];
+      await Promise.all(Array.from({ length: 2 }, async () => { for (let model = queue.shift(); model; model = queue.shift()) results.push({ model, ...(await send(name, model)) }); }));
+      const ok = results.filter((r) => r.ok);
+      return { tasks: results.length, errors: results.length - ok.length, total_ms: round(performance.now() - started),
+        loads: ok.filter((r) => r.loadMs > 500).length, load_ms_total: round(ok.reduce((sum, r) => sum + r.loadMs, 0)), ...quantiles(ok.map((r) => r.ms)) };
+    };
+    const result = { models: multiModels, clients: 2, ollama: await side("ollama"), freellama: await side("freellama") };
+    await unload(multiModels);
+    return result;
+  });
+  /** Seconds until Ollama unloads `model`, from /api/ps `expires_at` on `upstream`. */
+  const expiresIn = async (model, upstream = OLLAMA) => {
+    const ps = await (await fetch(`${upstream}/api/ps`)).json();
+    const entry = ps.models?.find((m) => m.name === model || m.model === model);
+    return entry ? round((Date.parse(entry.expires_at) - Date.now()) / 1000) : null;
+  };
+
+  await run("idle", async () => {
+    const model = caseBody.model;
+    await send("ollama", model);
+    const ollamaSeconds = await expiresIn(model);
+    const managed = async () => {
+      const response = await fetch(`${SERVE}/_freellama/v1/tasks`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(caseBody) });
+      return (await response.json()).execution?.keep_alive ?? {};
+    };
+    const once = await managed();
+    const onceSeconds = await expiresIn(model);
+    for (let i = 0; i < 9; i++) await managed();
+    const reused = await managed();
+    return {
+      ollama_alone_keep_alive_s: ollamaSeconds,
+      freellama_first_task: { keep_alive_s: onceSeconds, reason: once.reason ?? null, pressure: once.pressure_observed ?? null },
+      freellama_after_10_tasks: { keep_alive_s: await expiresIn(model), reason: reused.reason ?? null, recent_uses: reused.recent_uses ?? null },
+      bounds_s: once.bounds ?? null,
+    };
+  });
+
+  await run("batch", async () => {
+    const items = Array.from({ length: 16 }, (_, index) => ({
+      id: `t${index}`, independent: true,
+      task: { prompt: `Ticket id: FL-${200 + index}. Team: billing. Priority: high. Extract id, team and priority as JSON.` },
+    }));
+    const shared = { task: "completion", model: caseBody.model, options: { num_predict: 64, temperature: 0 }, think: false };
+    await tool("run_task", { ...shared, prompt: "warm up" });
+    const separate = performance.now();
+    for (const item of items) await tool("run_task", { ...shared, prompt: item.task.prompt });
+    const separateMs = performance.now() - separate;
+    const batch = await tool("run_task", { ...shared, tasks: items });
+    return { items: items.length, separate_calls: items.length, separate_ms: round(separateMs), batch_calls: 1, batch_ms: round(batch.ms) };
+  });
+
+  await run("parallel", async () => {
+    // A test-only Ollama with 4 parallel slots on its own port, owned and stopped here; the
+    // user's Ollama is not touched. FreeLlama reads OLLAMA_NUM_PARALLEL from that process.
+    const parallelPort = 11460, freellamaPort = 11461;
+    const upstream = `http://127.0.0.1:${parallelPort}`, managedBase = `http://127.0.0.1:${freellamaPort}`;
+    const ollama = spawn(ollamaBinary, ["serve"], { stdio: "ignore", env: { ...process.env, OLLAMA_HOST: `127.0.0.1:${parallelPort}`, OLLAMA_NUM_PARALLEL: "4" } });
+    const managedServe = spawn(binary, ["serve", "--listen", `127.0.0.1:${freellamaPort}`, "--upstream", upstream], { stdio: "ignore", env: { ...process.env, FREELLAMA_HOME: home } });
+    try {
+      for (let i = 0; i < 120; i++) { try { if ((await fetch(`${upstream}/api/version`)).ok && (await fetch(`${managedBase}/_freellama/v1/health`)).ok) break; } catch { /* starting */ } await sleep(250); }
+      const model = caseBody.model;
+      const call = async (url, body) => { const started = performance.now(); const response = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }); await response.json(); return { ok: response.ok, ms: performance.now() - started }; };
+      const direct = () => call(`${upstream}/api/chat`, { model, messages: caseBody.messages, stream: false, think: false, options: { ...caseBody.request_options.options, num_ctx: caseBody.context_tokens } });
+      const viaFreellama = () => call(`${managedBase}/_freellama/v1/tasks`, caseBody);
+      const level = async (send, clients) => {
+        for (let i = 0; i < 4; i++) await send();
+        const results = [];
+        const started = performance.now();
+        let left = 40;
+        await Promise.all(Array.from({ length: clients }, async () => { while (left-- > 0) results.push(await send()); }));
+        const ok = results.filter((r) => r.ok);
+        return { tasks: results.length, errors: results.length - ok.length, per_minute: round(ok.length / ((performance.now() - started) / 60_000), 1), p50: round(quantile(ok.map((r) => r.ms), 0.5)) };
+      };
+      const admission = (await (await fetch(`${managedBase}/_freellama/v1/status`)).json()).backends?.gpu?.admission ?? {};
+      return {
+        ollama_num_parallel: 4,
+        freellama_slots_total: admission.slots_total ?? null,
+        direct_1_client: await level(direct, 1), direct_4_clients: await level(direct, 4),
+        freellama_1_client: await level(viaFreellama, 1), freellama_4_clients: await level(viaFreellama, 4),
+      };
+    } finally {
+      managedServe.kill("SIGTERM");
+      ollama.kill("SIGTERM");
+      await sleep(1000);
+    }
   });
 } finally {
   await client?.close().catch(() => undefined);

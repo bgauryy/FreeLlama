@@ -177,9 +177,10 @@ function features(data) {
   });
   body += barPanel(margin + leftW + gap, rowTop, rightW, leftH, data.panels[0]);
 
-  // Row 2: three before/after panels.
-  const row2 = rowTop + leftH + gap, panelW = (width - 2 * margin - 2 * gap) / 3, panelH = 200;
-  data.panels.slice(1, 4).forEach((panel, index) => {
+  // Row 2: the before/after panels, as many columns as there are panels.
+  const second = data.panels.slice(1), count = Math.max(1, second.length);
+  const row2 = rowTop + leftH + gap, panelW = (width - 2 * margin - (count - 1) * gap) / count, panelH = 200;
+  second.forEach((panel, index) => {
     body += barPanel(margin + index * (panelW + gap), row2, panelW, panelH, { labelW: 110, ...panel });
   });
 
