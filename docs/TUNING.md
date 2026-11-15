@@ -1,9 +1,10 @@
 # Make local models faster and lighter
 
+Start with an installed model selected using [machine-local calibration](MODEL_SELECTION.md#turn-measurements-into-routing-evidence)
+and held-out quality checks. Tuning cannot turn throughput evidence into correctness evidence.
+The Ollama settings below do not configure the separate [managed llama.cpp adapter](LLAMACPP.md).
 
-## Make local models faster and lighter
-
-Decode speed is fixed by the model and hardware. A task's real cost is mostly around decoding: cold
+Steady-state decode speed depends on the model, hardware and competing work. A task's real cost is mostly around decoding: cold
 loads, reloads, re-evaluating a prompt the runner already saw, unneeded thinking and output, and
 running out of memory. Best payoff first:
 
@@ -29,14 +30,14 @@ running out of memory. Best payoff first:
 3. **Spend output only where it helps.** Completion, tools, browser and vision tasks send
    `think:false` (Ollama otherwise enables thinking on capable models); coding, code-repair and
    long-context tasks send `think:"medium"` to thinking models. `stopOnRepetition` cut `glm-ocr` on 12
-   report strips from 12,948 to 6,452 output tokens with every label still read. Each text workflow
+   report strips from 12,948 to 6,452 output tokens with every label still read in that dated sample. Each text workflow
    also caps its answer (`num_predict`, about 8 times the median its eval answers needed, 300–2,000
    tokens) when thinking is off, and keeps `stopOnRepetition` on with it, so a model that loops stops
    in seconds; a caller's own `num_predict` wins. End to end, workflows ran at 13–27 tokens/s on
    `bonsai-2:9b` and Nemotron-3.5-Bolt here: the answer's length, not the prompt, sets the time.
 4. **Unload instead of swapping.** A load that does not fit waits instead of swapping, idle models are
-   unloaded under memory pressure, and `unload` frees a big model before a switch without ever
-   loading it.
+   unloaded under memory pressure according to operator policy. An agent may use `unload` for a
+   model it warmed or one the user named; it frees that model without loading it.
 5. **Shrink memory per runner.** Quantize the KV cache, keep `OLLAMA_NUM_PARALLEL=1` on a laptop
    (every slot multiplies KV memory by the context), and bound llama-server's hidden prompt cache
    with `LLAMA_ARG_CACHE_RAM`; see [Tune Ollama](#tune-ollama-for-local-models).

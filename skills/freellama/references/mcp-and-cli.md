@@ -9,6 +9,9 @@ Load when connecting FreeLlama, choosing between the MCP server and the shell, o
 | MCP (preferred in an MCP host) | `claude mcp add freellama -- npx -y @octocodeai/freellama-mcp-server`; other hosts: `{"mcpServers":{"freellama":{"command":"npx","args":["-y","@octocodeai/freellama-mcp-server"]}}}` | Starts `freellama serve` on `127.0.0.1:11435` at launch. `delegate_research` needs `-e FREELLAMA_MCP_ALLOWED_ROOTS=/abs/project`; `run_task` `files` uses `FREELLAMA_FILE_ROOTS` (plus server cwd and temp dir). |
 | CLI | `npm install -g @octocodeai/freellama` (or prefix `npx -y @octocodeai/freellama`) | One `freellama` command. Agent commands (`run`, `chat`, `gateway`, `workflows`, `job`, `tool`, `tools`) need Node 22+ and run the MCP handlers in-process. |
 
+Supported npm platforms ship prebuilt Rust binaries; installing them needs Node 22+, not Rust.
+Rust is needed for source builds. The standalone operator binary runs without Node.
+
 - Operator commands run in the Rust binary: `doctor`, `init`, `catalog`, `auth-token`, `serve`, `proxy`, `bench-all`, `policy` need no running serve; `models`, `route`, `task`, `jobs`, `warm`, `unload`, `status`, `usage`, `session`, `scope`, `ready`, `config`, `machine` need one. `--endpoint` or `FREELLAMA_SERVE_ENDPOINT` selects it.
 - `freellama run` starts serve in the background if nothing answers (log `~/.octocode/freellama/serve.log`); `FREELLAMA_MCP_AUTOSTART_SERVE=0` turns that off.
 - `freellama task` has no decoding options; use `freellama run -o k=v`, `--think`, `--format`/`--schema`, or MCP.
@@ -50,13 +53,18 @@ freellama run -m TAG "prompt" --think=false                        # an exact in
 | `models {view:"catalog", job}` | `freellama catalog` |
 | `models {view:"installed"\|"resident"}` | `freellama models` (each entry has `resident`) |
 | `doctor`, `doctor {view:"status"\|"usage"}` | `freellama doctor`, `freellama status` (JSON when piped or with `--json`), `freellama usage --days N` |
-| `doctor` readiness | `freellama ready` (exit 0 only when serve can run work) |
+| `doctor` readiness | `freellama ready` (checks the default Ollama service, catalog and configured CPU backend) |
 | `ollama_manage {action:"warm"\|"unload", model, contextTokens}` | `freellama warm --model TAG --context-tokens N`, `freellama unload --model TAG` |
 | `session {action:"create"}`, `scope {…}` | `freellama session`, `freellama scope create\|get\|fork\|delete` |
 | `read_response {file, section}` | read the `response_file` JSON directly |
 | `audio`, `sweep`, `delegate_research`, `ollama_pull`, `ollama_delete`, `models {view:"library"\|"detail"}` | `freellama tool NAME 'JSON'` (or `@file.json`, or `-` for stdin); `freellama tool NAME --help` shows its schema |
 
 `freellama tool` adds a door, not authority: pull and delete approvals and allowed roots still apply.
+
+For an operator-configured llama.cpp server, use an explicit `name/model` through `freellama route`
+and `freellama task`, or the control API. This bounded text path can work without Ollama; agent
+commands and global readiness still depend on Ollama. Streaming, tools, embeddings, vision and
+Ollama runtime controls are unsupported there. Follow the [managed llama.cpp guide](https://github.com/bgauryy/FreeLlama/blob/main/docs/LLAMACPP.md).
 
 ## Gateway: workflows as models for other clients
 
@@ -65,6 +73,7 @@ freellama run -m TAG "prompt" --think=false                        # an exact in
 - Non-loopback Origin or Host gets 403; no files are read and no URLs fetched over HTTP (images as base64).
 - Turn thinking off per protocol: `think:false` (Ollama, Responses), `reasoning_effort:"none"` (OpenAI), `thinking:{type:"disabled"}` (Anthropic). A small `max_tokens` with thinking on can return empty content.
 - Every virtual-model response reports the virtual name in `model` and carries a `freellama` receipt (real `model`, `checks`, `job`) on its final event: the NDJSON done line, the last OpenAI chunk, Responses `response.completed`, Anthropic `message_stop`. Read the checks there.
-- Local models are 2–9B: good for bounded requests, poor for long agent loops.
+- The shipped recommendations emphasize small local models. Model size does not establish tool
+  reliability; keep requests bounded and verify answers before extending an agent loop.
 
 Full reference: [agent CLI and gateway](https://github.com/bgauryy/FreeLlama/blob/main/docs/AGENT_CLI.md), [every API](https://github.com/bgauryy/FreeLlama/blob/main/docs/API.md).

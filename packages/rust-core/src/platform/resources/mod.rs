@@ -11,6 +11,8 @@ mod pressure;
 mod sampling;
 #[cfg(test)]
 mod tests;
+#[cfg(any(target_os = "windows", test))]
+mod windows;
 
 pub use governor::{ResourceGovernor, ResourcePermit};
 pub use holders::{
@@ -112,11 +114,14 @@ pub enum TelemetryPolicy {
 }
 
 impl Default for TelemetryPolicy {
-    /// Require RAM telemetry where a collector exists. Elsewhere (Windows) a memory requirement
-    /// could never be met and every local request was refused, so admission there is best-effort
-    /// and says so in each receipt (`admitted_telemetry_unknown`).
+    /// Require RAM telemetry where a collector exists. Unsupported platforms use best-effort
+    /// and report unknown telemetry in each receipt (`admitted_telemetry_unknown`).
     fn default() -> Self {
-        if cfg!(any(target_os = "linux", target_os = "macos")) {
+        if cfg!(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "windows"
+        )) {
             Self::RequireMemory
         } else {
             Self::BestEffort

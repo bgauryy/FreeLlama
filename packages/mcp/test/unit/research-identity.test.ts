@@ -46,6 +46,8 @@ describe("model identity", () => {
 
 // Vectors computed by the reference implementation (`json.dumps(..., sort_keys=True)` with the
 // default ", " and ": " separators, then sha256) and frozen before it was removed.
+// 2026-11-15: independently recomputed the Octocode vector with Python hashlib/json after
+// canonical LOCAL.md replaced the stale embedded instructions. Other vectors are unchanged.
 interface Vectors {
   identity: Array<{ endpoint: string; model: string; prompt_kind: string; catalog: unknown; url: string; result: Record<string, unknown> }>;
   model_key: Array<{ env: Record<string, string>; model: string; identity: string; contract: string; key: string }>;
@@ -79,6 +81,7 @@ describe("frozen identity vectors", () => {
     const sha = (text: string) => createHash("sha256").update(text, "utf8").digest("hex");
     // 2026-11-08: rewritten for small models (structured actions first, rg/grep shell, answer + Source contract); older research grades no longer apply.
     expect(sha(BASH_SYSTEM_PROMPT)).toBe("031e6561563022cefc1af59c97c9d2e6189b319e51f392a45e9d21512e11e82b");
-    expect(sha(octocodeSystemPrompt("/w"))).toBe("4568dbb071c8196dcb8f638c0999144613b52dda9f94ecb14b710507b9895bd2");
+    // 2026-11-15: canonical Markdown instruction repair deliberately invalidates Octocode calibration.
+    expect(sha(octocodeSystemPrompt("/w"))).toBe("c78d37a99e3ba201a51ef8fc6ecb6cfeb5d7a531c545341d69b465c381ac0dcd");
   });
 });

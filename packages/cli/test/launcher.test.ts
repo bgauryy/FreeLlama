@@ -10,7 +10,7 @@ import { describe, expect, it } from "vitest";
 
 const PKG = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const LAUNCHER = path.join(PKG, "bin", "freellama.js");
-const RELEASE_BINARY = path.join(PKG, "..", "..", "target", "release", "freellama");
+const RELEASE_BINARY = path.join(PKG, "..", "..", "target", "release", process.platform === "win32" ? "freellama.exe" : "freellama");
 const AGENT_CLI = path.join(PKG, "..", "mcp", "dist", "agent-cli.js");
 
 describe("freellama launcher", () => {

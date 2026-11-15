@@ -185,6 +185,11 @@ describe("gateway receipts over HTTP", () => {
         if (request.url === "/api/ps") return void response.writeHead(200, { "content-type": "application/json" }).end('{"models":[]}');
         const body = JSON.parse(raw || "{}");
         sent.push({ path: request.url ?? "", body });
+        if (request.url === "/_freellama/v1/routes") {
+          // This fixture has no machine calibration; job mode must fall back to live inventory.
+          return void response.writeHead(200, { "content-type": "application/json" })
+            .end(JSON.stringify({ selected_model: REAL, task_evidence: "unknown" }));
+        }
         if (request.url === "/v1/messages" && body.stream !== true) {
           response.writeHead(200, { "content-type": "application/json" });
           return void response.end(JSON.stringify({ id: "m", type: "message", role: "assistant", model: REAL, content: [{ type: "text", text: "Fine." }], stop_reason: "end_turn" }));
@@ -219,7 +224,11 @@ describe("gateway receipts over HTTP", () => {
     const reply = await post("/v1/chat/completions", { model: "freellama/auto", stream: true, messages: [{ role: "user", content: "x" }] });
     expect(reply.headers.get("content-type")).toContain("text/event-stream");
     const out = events(await reply.text());
-    expect(sent[0]!.body.model).toBe(REAL);
+    expect(sent.map((request) => request.path)).toEqual(["/_freellama/v1/routes", "/v1/chat/completions"]);
+    // Routing is decision-only: no user content, tools or runtime controls reach its request.
+    expect(sent[0]!.body).toEqual({ task: "completion", objective: "fastest", required_capabilities: [] });
+    expect(sent[1]!.body).toMatchObject({ model: REAL, stream: true, messages: [{ role: "user", content: "x" }] });
+    expect(fixture.live).toHaveBeenCalledOnce();
     expect(out.slice(0, -1).map((item) => item.data.model)).toEqual(["freellama/auto", "freellama/auto"]);
     expect(out.at(-2)!.data.freellama).toMatchObject({ model: REAL, checks: [] });
   });

@@ -331,6 +331,13 @@ impl PlatformConfig {
         }
         super::clients::validate(&self.client_keys, self.auth_token.as_deref())?;
         crate::proxy::validate_upstreams(&self.upstreams)?;
+        for upstream in self
+            .upstreams
+            .iter()
+            .filter(|upstream| upstream.llamacpp.is_some())
+        {
+            ProxyConfig::new(&self.listen, &upstream.base_url, self.allow_remote).validate()?;
+        }
         ensure!(
             !self.allow_remote || self.authenticates(),
             "remote access requires bearer authentication"

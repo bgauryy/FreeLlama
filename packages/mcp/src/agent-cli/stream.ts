@@ -5,8 +5,10 @@
 // (decisions, embeddings, tools, batches, deferred or saved results) stay on the managed path.
 import { DEFAULT_SERVE_ENDPOINT } from "../config.js";
 import { applyTaskFiles } from "../task-files.js";
+import { serveAuthHeaders } from "../serve-http.js";
 import type { RenderOptions } from "./args.js";
 import { EXIT_RETRY } from "./output.js";
+import { boundedResponseBytes, boundedResponseText } from "./response-limit.js";
 import { record, type Fields } from "./util.js";
 import { directModel, GatewayError, prepareForward, streamChecks, virtualModel, type VirtualModel } from "./virtual.js";
 
@@ -14,10 +16,11 @@ type Io = { out: (text: string) => void; err: (text: string) => void; write: (te
 
 /** The model a streamed run resolves, or undefined when the task needs the managed path. */
 export function streamTarget(args: Fields): VirtualModel | undefined {
+  if (["tools", "defer", "preview", "saveAs", "questions", "state", "input", "nearest", "sessionId", "scopeId", "fallbackModels", "idempotencyKey",
+    "priority", "timeoutSeconds", "maxWaitSeconds", "minConfidence", "executionPreference", "objective"].some((field) => args[field] !== undefined)) return undefined;
   // Fill in the middle runs on the named model only.
   if (args.suffix !== undefined) return typeof args.model === "string" ? directModel(args.model) : undefined;
-  if (["tools", "defer", "preview", "saveAs", "questions", "state", "input", "nearest", "sessionId", "scopeId", "fallbackModels", "idempotencyKey"].some((field) => args[field] !== undefined)) return undefined;
-  if (args.task === "decision" || args.task === "embedding") return undefined;
+  if (typeof args.task === "string" && !["completion", "coding", "vision", "long_context"].includes(args.task)) return undefined;
   if (typeof args.workflow === "string") return virtualModel(`freellama/${args.workflow}`);
   if (typeof args.job === "string") return virtualModel(`freellama/${args.job}`);
   if (typeof args.model === "string") return directModel(args.model, args.task === "vision" ? "vision" : typeof args.task === "string" ? args.task : "completion");
@@ -51,7 +54,7 @@ export async function streamRun(target: VirtualModel, args: Fields, render: Rend
   const body: Fields = {
     model: target.name,
     stream: true,
-    ...(fill ? { prompt: payload.prompt ?? "", suffix: args.suffix } : {
+    ...(fill ? { prompt: payload.prompt ?? "", suffix: args.suffix, ...(typeof args.systemPrompt === "string" ? { system: args.systemPrompt } : {}) } : {
       messages: [
         ...(typeof args.systemPrompt === "string" ? [{ role: "system", content: args.systemPrompt }] : []),
         { role: "user", content: payload.prompt ?? "", ...(images?.length ? { images } : {}) },
@@ -80,7 +83,8 @@ export async function streamRun(target: VirtualModel, args: Fields, render: Rend
   let reply: Response;
   try {
     reply = await fetch(new URL(path, endpoint ?? DEFAULT_SERVE_ENDPOINT), {
-      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(prepared.body), signal,
+      method: "POST", headers: { "content-type": "application/json", ...(await serveAuthHeaders()) },
+      body: JSON.stringify(prepared.body), signal, redirect: "error",
     });
   } catch (error) {
     if (signal.aborted) return 130;
@@ -88,7 +92,13 @@ export async function streamRun(target: VirtualModel, args: Fields, render: Rend
     return 1;
   }
   if (!reply.ok || !reply.body) {
-    const text = await reply.text().catch(() => "");
+    let text: string;
+    try { text = await boundedResponseText(reply); }
+    catch (error) {
+      if (signal.aborted) return 130;
+      io.err(`freellama: ${(error as Error).message}`);
+      return 1;
+    }
     io.err(`freellama: ${String(record(safeJson(text))?.error ?? (text || `HTTP ${reply.status}`))}`);
     return 1;
   }
@@ -120,7 +130,7 @@ export async function streamRun(target: VirtualModel, args: Fields, render: Rend
     if (chunk.done === true) done = chunk;
   };
   try {
-    for await (const bytes of reply.body as unknown as AsyncIterable<Uint8Array>) {
+    for await (const bytes of boundedResponseBytes(reply.body as unknown as AsyncIterable<Uint8Array>)) {
       pending += decoder.decode(bytes, { stream: true });
       const lines = pending.split("\n");
       pending = lines.pop() ?? "";
@@ -136,6 +146,10 @@ export async function streamRun(target: VirtualModel, args: Fields, render: Rend
     return 1;
   }
   if (answer !== "" && !answer.endsWith("\n")) io.write("\n");
+  if (!done) {
+    io.err("freellama: incomplete stream: no done:true completion was received; partial output is not a completed answer");
+    return 1;
+  }
   if (answer.trim() === "") {
     if (toolCalled) {
       io.err("freellama: no answer: the model replied with a tool call although no tools were sent; rerun with -m on a stronger installed model (freellama catalog)");

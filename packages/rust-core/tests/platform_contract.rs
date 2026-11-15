@@ -972,9 +972,8 @@ async fn preview_honors_cpu_preference_and_exposes_the_execution_receipt() {
     cpu_task.abort();
 }
 
-/// Auto placement may learn from runtime receipts, but only after three successful samples for
-/// both backends on the same task. This keeps a single cold load or noisy request from rewriting a
-/// route while still closing the observe -> compare -> decide loop.
+/// Repeated successful requests without artifact/profile identity cannot qualify placement
+/// feedback. Even three responses on each backend must leave automatic placement unchanged.
 #[tokio::test]
 #[expect(
     clippy::too_many_lines,
@@ -1060,6 +1059,14 @@ async fn auto_placement_does_not_use_samples_without_observed_profile_identity()
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
+            let receipt: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            assert_eq!(receipt["feedback"]["accepted"], false, "{receipt}");
+            assert_eq!(
+                receipt["execution"]["throughput_learning"]["profile_eligible"], false,
+                "{receipt}"
+            );
         }
     }
 
@@ -1126,8 +1133,8 @@ async fn auto_placement_does_not_use_samples_without_observed_profile_identity()
         .unwrap();
     let health: Value =
         serde_json::from_slice(&to_bytes(health.into_body(), usize::MAX).await.unwrap()).unwrap();
-    assert_eq!(health["feedback"]["gpu"]["completed"], 3);
-    assert_eq!(health["feedback"]["cpu"]["completed"], 3);
+    assert_eq!(health["feedback"]["gpu"]["completed"], 0);
+    assert_eq!(health["feedback"]["cpu"]["completed"], 0);
 
     gpu_task.abort();
     cpu_task.abort();
@@ -3747,7 +3754,7 @@ async fn verified_feedback_survives_a_platform_restart() {
         .route(
             "/api/tags",
             get(|| async {
-                Json(json!({"models": [{"name": "embed-model", "size": 274_000_000}]}))
+                Json(json!({"models": [{"name": "embed-model", "digest": "sha256:verified-embed", "size": 274_000_000}]}))
             }),
         )
         .route(
@@ -3755,6 +3762,8 @@ async fn verified_feedback_survives_a_platform_restart() {
             get(|| async {
                 Json(json!({"models": [{
                     "name": "embed-model",
+                    "digest": "sha256:verified-embed",
+                    "context_length": 2048,
                     "size": 274_000_000,
                     "size_vram": 274_000_000
                 }]}))
@@ -3800,6 +3809,9 @@ async fn verified_feedback_survives_a_platform_restart() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+    let receipt: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(receipt["feedback"]["accepted"], true, "{receipt}");
     // The write runs after the response; it lands within moments.
     let mut saved = false;
     for _ in 0..100 {

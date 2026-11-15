@@ -95,10 +95,23 @@ describe("result-derived checks", () => {
     writeFileSync(log, "10:01:10 ERROR POST /api/orders 500 db timeout after 5000ms\n10:01:40 ERROR POST /api/orders 500 db timeout after 5000ms\n10:02:00 WARN pool exhausted: 20/20 connections in use\n");
     const logRead = { files_read: [{ path: log, bytes: 10, role: "prompt" }] };
     const answer = "* `POST /api/orders 500 db timeout after 5000ms` (×2, 10:01:10-10:01:40)\n* `pool exhausted: 20/20 connections in use` (×1, 10:02:00)";
-    expect(resultChecks({ answer, structured: logRead })).toEqual(["every number and quoted name in the answer appears in the source"]);
+    // Quotes and range endpoints occur verbatim. Derived counts are absent as literal tokens:
+    // this remains a known false positive; the checker does not verify arithmetic or counts.
+    expect(resultChecks({ answer, structured: logRead })).toEqual(["not in the source: 2, 1; verify these before reusing them"]);
     // An invented quote or end of a range is still reported.
     expect(resultChecks({ answer: "* `POST /api/pay 502` (10:01:10-10:09:59)", structured: logRead })[0])
       .toBe("not in the source: POST /api/pay 502, 10:01:10-10:09:59; verify these before reusing them");
+  });
+
+  it("compares complete numeric tokens and normalizes comma grouping in either direction", () => {
+    const file = path.join(dir, "numeric-tokens.txt");
+    writeFileSync(file, "Port 18080; total 1,240.50 EUR; timeout 30ms; ratio 20/20.");
+    const structured = { files_read: [{ path: file }] };
+    expect(resultChecks({ answer: "Port 8080; total 1240.50 EUR; timeout 30 ms.", structured }))
+      .toEqual(["not in the source: 8080; verify these before reusing them"]);
+    expect(resultChecks({ answer: "Port `8080`.", structured })[0]).toMatch(/not in the source: 8080/);
+    writeFileSync(file, "Total 1240.50 EUR.");
+    expect(resultChecks({ answer: "Total 1,240.50 EUR.", structured })[0]).toMatch(/^every number/);
   });
 
   it("explains an empty or looping read", () => {
@@ -112,19 +125,19 @@ describe("result-derived checks", () => {
 
   it("checks tool calls against the tools that were sent", () => {
     const tools = [{ type: "function", function: { name: "get_temperature", parameters: {
-      type: "object", required: ["city"], properties: { city: { type: "string" }, unit: { type: "string", enum: ["C", "F"] }, days: { type: "integer" } },
+      type: "object", additionalProperties: false, required: ["city"], properties: { city: { type: "string" }, unit: { type: "string", enum: ["C", "F"] }, days: { type: "integer" } },
     } } }];
     const answered = (...calls: unknown[]) => ({ answer: `tool_calls: ${JSON.stringify(calls)}`, structured: { response: { message: { role: "assistant", content: "", tool_calls: calls } } } });
     const call = (name: string, args: unknown) => ({ function: { name, arguments: args } });
-    expect(resultChecks({ ...answered(call("get_temperature", { city: "Paris", unit: "C" })), tools })[0]).toMatch(/^1 tool call\(s\) match the tool schemas: run them, then send each result back as \{role:"tool", tool_name, content\}/);
+    expect(resultChecks({ ...answered(call("get_temperature", { city: "Paris", unit: "C" })), tools })[0]).toMatch(/^1 tool call\(s\) match the tool schemas' supported structural checks; verify tool choice and authorization, then send each result back as \{role:"tool", tool_name, content\}/);
     // Ollama returns arguments as an object; a JSON string is read too.
     expect(resultChecks({ ...answered(call("get_temperature", JSON.stringify({ city: "Paris" }))), tools })[0]).toMatch(/^1 tool call\(s\) match/);
     expect(resultChecks({ ...answered(call("get_weather", { city: "Paris" }), call("get_temperature", { unit: "K", days: "3", country: "FR" })), tools })).toEqual([
       "call 1 (get_weather) is not one of the tools sent (get_temperature)",
       "call 2 (get_temperature) lacks required city",
       "call 2 (get_temperature) passes country, which the tool does not declare",
-      'call 2 (get_temperature): unit is "K", not one of ["C","F"]',
-      'call 2 (get_temperature): days is "3", not "integer"',
+      'call 2 (get_temperature).unit is "K", not one of ["C","F"]',
+      'call 2 (get_temperature).days is "3", not "integer"',
       "fix or refuse these calls before running any; a rerun often corrects them",
     ]);
     // With no tools sent, a tool call is the model inventing one.

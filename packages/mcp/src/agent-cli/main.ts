@@ -20,6 +20,8 @@ import { startGateway } from "./gateway.js";
 import { DEFAULT_SERVE_ENDPOINT, FREELLAMA_HOME } from "../config.js";
 import { CHAT_JOB, VIRTUAL_PREFIX, virtualModels } from "./virtual.js";
 import { pickLiveJobModel } from "../job-mode.js";
+import { serveAuthHeaders } from "../serve-http.js";
+import { boundedResponseText } from "./response-limit.js";
 
 /** Ollama's own commands: `freellama list` is `ollama list`, byte for byte. */
 const USAGE = `freellama agent commands: run local models with FreeLlama's tested picks, prompts and memory gate.
@@ -365,8 +367,8 @@ async function status(argv: string[], io: Io): Promise<number> {
   io.out(resultText(result).split("\n").filter((line) => !line.startsWith("Full object")).join("\n"));
   // The runners Ollama holds now, as `ollama ps` shows them, through serve.
   try {
-    const reply = await fetch(new URL("/api/ps", endpoint ?? DEFAULT_SERVE_ENDPOINT), { signal: AbortSignal.timeout(3_000) });
-    const models = ((await reply.json()) as { models?: Array<Record<string, unknown>> }).models ?? [];
+    const reply = await fetch(new URL("/api/ps", endpoint ?? DEFAULT_SERVE_ENDPOINT), { headers: await serveAuthHeaders(), signal: AbortSignal.timeout(3_000), redirect: "error" });
+    const models = (JSON.parse(await boundedResponseText(reply)) as { models?: Array<Record<string, unknown>> }).models ?? [];
     if (models.length > 0) {
       io.out("\nMODEL                                   SIZE      ON     WINDOW   UNLOADS");
       for (const model of models) {
@@ -392,12 +394,13 @@ async function waitJob(id: string, io: Io, endpoint?: string): Promise<number> {
     const result = await callTool("task_jobs", { action: "get", jobId: id, ...(endpoint ? { endpoint } : {}) }, { signal });
     const job = result.structuredContent?.job as Record<string, unknown> | undefined;
     if (result.isError || ["completed", "failed", "cancelled", "expired"].includes(String(job?.status))) {
-      // The job's line comes first in the text; the answer follows it.
-      const text = (result.content ?? []).map((part) => part.text ?? "").join("\n").split("\n").slice(1).join("\n");
+      // Only a successful lookup has a job-status header. A refusal's first line is its error.
+      const fullText = resultText(result);
+      const text = result.isError ? fullText : fullText.split("\n").slice(1).join("\n");
       const rendered = renderResult({ ...result, content: [{ type: "text", text }] }, { json: false, verbose: false, quiet: false, hideThinking: true }, false);
       for (const line of rendered.stderr) io.err(line);
       if (rendered.stdout !== "") io.out(rendered.stdout);
-      return job?.status === "completed" ? rendered.exitCode : 1;
+      return result.isError || job?.status === "completed" ? rendered.exitCode : 1;
     }
     await new Promise((resolve) => setTimeout(resolve, delay));
   }

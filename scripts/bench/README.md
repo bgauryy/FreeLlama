@@ -1,10 +1,13 @@
 # Benchmark commands
 
 The benchmark definition, results and limits live in [BENCHMARK.md](../../docs/BENCHMARK.md).
-Six systems are configured and run one at a time: Ollama alone, FreeLlama managed tasks, llama.cpp,
-llama-swap, LocalAI and oMLX. oMLX is disabled unless a matching MLX artifact is configured. A
-seventh entry, `freellama-stream` (managed tasks with `stream: true`, shown as "FreeLlama
-(streamed)"), is disabled until serve supports streamed tasks.
+The example has seven entries run one at a time: Ollama alone, FreeLlama managed tasks, FreeLlama
+streamed managed tasks, llama.cpp, llama-swap, LocalAI and oMLX. `freellama-stream` is disabled in
+the example; managed streaming is implemented, so enable that entry when including it in the
+comparison. oMLX is enabled with a placeholder model ID: supply a separately qualified matching
+MLX artifact or disable it explicitly before running. The FreeLlama benchmark entries target
+Ollama-backed managed tasks; the [explicit managed llama.cpp adapter](../../docs/LLAMACPP.md)
+is a separate integration path.
 
 ```sh
 # Optional native-Mac software setup; selected competitors only, no models/daemons:
@@ -66,11 +69,12 @@ against the hashed blob; the `/api/tags` tag digest is printed as information on
 (p50/p95 from every verified measured trial in each run's `VENDOR/trials.jsonl`) and one table per
 run order. A single `--report` renders as before.
 
-Any GGUF chat model works. The example names the one the 2026-11-13 run used; pick one that fits
-your machine, then run preflight with `--hash-model` to check every vendor loads the same bytes.
+Choose a GGUF chat model supported by every selected engine and its chat template. The example
+names the one the dated run used; pick one that fits your machine, then run preflight with
+`--hash-model` to check every vendor loads the same bytes.
 
-Cohort is a declaration, not verification. The first five entries use the same GGUF; oMLX needs a
-separately qualified matching MLX artifact. A declared MLX cohort never inherits the GGUF hash.
+Cohort is a declaration, not verification. All entries in the GGUF cohort use the same artifact;
+oMLX needs a separately qualified matching MLX artifact. A declared MLX cohort never inherits the GGUF hash.
 Replace `SET_MATCHING_MLX_MODEL_ID` and check all effective templates, contexts and cache policies.
 No model download is automatic; new pulls require the exact artifact/tag and reported size approved.
 
@@ -86,3 +90,6 @@ Run a second pass with the enabled vendors in reverse order before comparing: on
 drift between passes can exceed the gaps between systems.
 
 `yarn test:bench` checks deterministic fixtures with no model downloads or live inference.
+Per-machine model calibration uses [bench-all](../../docs/MODEL_SELECTION.md#turn-measurements-into-routing-evidence);
+model tool-calling and check-line evaluation use the separate [reliability harnesses](../../docs/RELIABILITY.md).
+Vendor latency, local throughput and model correctness answer different questions.

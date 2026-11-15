@@ -1,9 +1,10 @@
 # Local model catalog
 
-Which local model to use for each job on one machine, what was measured, and what is only
-published. The method for choosing a model on other hardware is in
-[Choose local models](MODEL_SELECTION.md). For live answers about your machine, use `models {view:"catalog"}`
-or `freellama catalog`; for the exact calls, see the [cookbooks](cookbooks/README.md).
+A dated comparison of local models for each job on one machine, separating measured results
+from published claims. The method for choosing a model on other hardware is in
+[Choose local models](MODEL_SELECTION.md). For current installed candidates, use `models {view:"catalog"}`
+or `freellama catalog`; job execution first consults [machine-local calibration](MODEL_SELECTION.md#turn-measurements-into-routing-evidence),
+then catalog fallback. The tables below do not pin that live choice. For exact calls, see the [cookbooks](cookbooks/README.md).
 
 **Snapshot:** 2026-11-01. Apple M2 Pro, 32 GB unified memory, Ollama 0.40.13, FreeLlama 0.8.0. Other
 work was running throughout, leaving about 4–14 GB available. Each model answered the same questions
@@ -30,11 +31,11 @@ Group a model by the job it does, using the capability Ollama reports. FreeLlama
 | Speech | `speech` | `speech` | Text to speech | `audio {action:"speak", text}` |
 | Embedding | `embedding` | `embedding_only` | Code search, duplicates, image search | `run_task {task:"embedding", files, nearest}` |
 | Decision | `decision` | `decision` | Classify, triage, route, yes/no | `run_task {task:"decision", state, questions}` |
-| Not runnable in Ollama | none | none | Rerankers, tiny classifiers, most dedicated speech models | Needs another runtime; FreeLlama cannot serve them |
+| Not runnable in Ollama | none | none | Rerankers, tiny classifiers, most dedicated speech models | Ollama cannot run these; the [managed llama.cpp adapter](LLAMACPP.md) supports only its documented text-task subset |
 
-## Tested picks for each job
+## Historical tested picks for each job
 
-### Use now: installed, and fit alongside normal work
+### Installed at the snapshot: fit alongside normal work
 
 | Job | Model | File | Memory needed | Evidence |
 |---|---|---:|---:|---|
@@ -48,7 +49,7 @@ Group a model by the job it does, using the capability Ollama reports. FreeLlama
 | Text to speech | `phonon:en` | 0.1 GB | not previewed | Measured: 0.8–1.7% word error when transcribed back, 102 ms median; both LFM3 models 0% at 950 ms, but the judge is an LFM3 model |
 | Small coding tasks | `bonsai-2:9b` | 3.2 GB | 10.3 GB | Measured: 19, 19, 17 of 25, 475 ms median, and every workflow case right in the 2026-11-12 field test. `lfm3:1.7b` scored 21, 20, 20 on the questions but answered workflows with tool calls nobody asked for, so it is no longer a pick |
 
-### Use when memory is free: installed
+### Installed at the snapshot: need more free memory
 
 | Job | Model | File | Memory needed | Evidence |
 |---|---|---:|---:|---|
@@ -66,7 +67,7 @@ Group a model by the job it does, using the capability Ollama reports. FreeLlama
 | `bonsai-2:27b` | 8.3 GB | Installed. FreeLlama asks for 16.3 GB available; this machine never had more than 14.4 GB, so it is not measured here. Published: SWE-bench Verified 60.8%, LiveCodeBench 90.1% |
 | `qwen3.6:27b-q4_K_M` | 17.4 GB | Needs 28.7 GB available, so only on a nearly empty 32 GB machine. Removed from this machine untested |
 
-### Worth adding: not installed, untested here
+### Candidates at the snapshot: not installed, untested here
 
 Pull a tag only with approval for that exact tag and size.
 
@@ -97,9 +98,11 @@ score) in one forward pass, with no generated text. Local decision models follow
 The original Nimble 9B (not v3) scored 75.7% against Jev 1.13's 76.0% on the same 3,880 human-labeled
 decisions; its publisher ran that test.
 
-**Recommendation:** keep `strands-decider` for everyday decisions, and trial `nimble-v3:9b-q4_K_M`
-for harder ones. Compare them on your own labeled data before switching, since `strands-decider`
-already scores 35/36 on real issues here.
+**Historical interpretation:** `strands-decider` was the smaller starting point and
+`nimble-v3:9b-q4_K_M` a candidate for harder decisions in this sample. The 35/36 issue result
+is one dataset, not a calibrated accuracy guarantee. Compare exact installed tags on your own
+labeled data and use [machine-local evidence](MODEL_SELECTION.md#turn-measurements-into-routing-evidence)
+before changing the live choice.
 
 **Limits of this comparison:**
 
@@ -111,9 +114,9 @@ Other families:
 
 - `d1`, `d1-omni` and `d3` publish other benchmarks, so they are not ranked here. `d1-omni` matters when decisions need images or audio.
 - `jevos-v4` claims 28–130 ms on a laptop CPU with its own binary and also ships GGUF files. No JevBench score was found, and loading in Ollama was not checked.
-- `openjev` is 27B and licensed CC-BY-NC, which bars commercial use.
+- `openjev` was listed as 27B under CC-BY-NC in this snapshot; inspect the current repository license before use.
 
-## New models on Hugging Face and Ollama
+## Candidates found on Hugging Face and Ollama, 2026-10-31
 
 Trending on 2026-10-31 and filtered to what could fit. Quality is the publishers' claim. **Path**:
 Ollama is an official tag, HF GGUF pulls as `hf.co/<repo>:<quant>`, and "not via Ollama" needs another
@@ -157,20 +160,23 @@ through the real CLI.
 | Nemotron-3.5-Bolt-E4B | 6, 6, 6 of 8 | 5, 5, 5 of 6 | 2.2 calls per question; 96 s median per question; needs 13.5 GB |
 
 Three rounds each. An answer counts as right only if it contains every expected fact and rests on at
-least one tool call.
+least one tool call. These historical research outcomes are separate from the newer
+[tool-calling smoke suite](RELIABILITY.md#measured-on-2026-11-14), which has two exact models and
+one trial per public case and does not establish general agent reliability.
 
 ## What runs in FreeLlama
 
 - **Managed, with routing, memory checks and receipts:** chat, coding, vision, embeddings, decisions.
 - **Through serve's passthrough, with memory checks:** speech and transcription (`audio`).
-- **Not supported:** a second, non-Ollama runtime; separate images per question in one decision, because Ollama shares images across all questions.
+- **Managed llama.cpp text tasks:** one operator-run loopback `llama-server`, selected explicitly as `name/model`; see the [supported task subset and lifecycle limits](LLAMACPP.md).
+- **Not supported:** separate images per question in one decision, because Ollama shares images across all questions.
 - **Hugging Face:** GGUF repositories work in discovery and pull through Ollama as `hf.co/<repo>:<quant>`. Multimodal GGUF needs an Ollama-supported architecture.
 
 ## Still open
 
 - Measure `bonsai-2:27b` when 16.3 GB is available.
 - Measure audio embeddings through `files`; image embeddings are measured, audio ones are not.
-- Run the candidates under "Worth adding".
+- Evaluate the dated candidates above only after checking current availability and approving any exact-tag download.
 - Test `embeddinggemma-2` on duplicates; only `nomic-embed-text` is measured there.
 
 ## Detailed results

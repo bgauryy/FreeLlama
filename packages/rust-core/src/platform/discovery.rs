@@ -68,7 +68,7 @@ impl BenchmarkEvidence {
     }
 }
 
-pub(super) fn load_benchmark(path: Option<&PathBuf>) -> Result<BenchmarkEvidence> {
+pub(super) fn load_benchmark(path: Option<&PathBuf>, upstream: &str) -> Result<BenchmarkEvidence> {
     let Some(path) = path else {
         return Ok(BenchmarkEvidence::default());
     };
@@ -76,6 +76,33 @@ pub(super) fn load_benchmark(path: Option<&PathBuf>) -> Result<BenchmarkEvidence
         std::fs::read(path).with_context(|| format!("read benchmark report {}", path.display()))?;
     let report: AllModelsReport = serde_json::from_slice(&bytes)
         .with_context(|| format!("parse benchmark report {}", path.display()))?;
+    let current = crate::model_bench::BenchmarkMachine::current();
+    if !benchmark_matches(&report, upstream, current.as_ref()) {
+        eprintln!(
+            "benchmark report {} has no matching local host/backend calibration; run `freellama bench-all` on this host and endpoint",
+            path.display()
+        );
+        return Ok(BenchmarkEvidence::default());
+    }
+    Ok(benchmark_evidence(report))
+}
+
+fn benchmark_matches(
+    report: &AllModelsReport,
+    upstream: &str,
+    current: Option<&crate::model_bench::BenchmarkMachine>,
+) -> bool {
+    report.schema_version == 2
+        && crate::net::is_loopback_url(upstream)
+        && report.endpoint.trim_end_matches('/') == upstream.trim_end_matches('/')
+        && report
+            .machine
+            .as_ref()
+            .zip(current)
+            .is_some_and(|(measured, current)| measured.matches(current))
+}
+
+fn benchmark_evidence(report: AllModelsReport) -> BenchmarkEvidence {
     let mut output = BenchmarkEvidence::default();
     // Old reports remain readable, but cannot establish which artifact was measured. Duplicate
     // metadata for a tag is ambiguous even when a ranking happens to name that tag only once.
@@ -105,7 +132,7 @@ pub(super) fn load_benchmark(path: Option<&PathBuf>) -> Result<BenchmarkEvidence
             }
         }
     }
-    Ok(output)
+    output
 }
 
 #[derive(Debug, Deserialize)]
@@ -561,15 +588,12 @@ num_predict = 64
     #[test]
     fn benchmark_replacement_and_duplicate_metadata_never_reuse_scores() {
         use serde_json::json;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("benchmark.json");
         let mut report = json!({
             "schema_version":1,"endpoint":"http://local:11434","server_version":"test","profile":"test","methodology":[],
             "models":[{"metadata":{"name":"model:latest","digest":"sha256:measured","size":1,"format":"gguf","family":"test","parameter_size":"1B","quantization":"Q4","capabilities":["completion"],"advertised_context":2048},"cold_start":null,"cases":[],"resident_size":null,"resident_vram":null}],
             "rankings":{"completion":[{"model":"model:latest","passed":3,"attempted":3,"quality_rate":1.0,"useful_cases_per_hour":42.0,"mean_decode_tokens_per_second":null}]}
         });
-        std::fs::write(&path, serde_json::to_vec(&report).unwrap()).unwrap();
-        let bound = super::load_benchmark(Some(&path)).unwrap();
+        let bound = super::benchmark_evidence(serde_json::from_value(report.clone()).unwrap());
         assert_eq!(
             bound.for_model("model:latest", Some("sha256:measured"))
                 [&super::Capability::Completion],
@@ -585,23 +609,55 @@ num_predict = 64
             .as_object_mut()
             .unwrap()
             .remove("digest");
-        std::fs::write(&path, serde_json::to_vec(&report).unwrap()).unwrap();
         assert!(
-            super::load_benchmark(Some(&path))
-                .unwrap()
+            super::benchmark_evidence(serde_json::from_value(report.clone()).unwrap())
                 .for_model("model:latest", Some("sha256:measured"))
                 .is_empty()
         );
         report["models"][0]["metadata"]["digest"] = json!("sha256:measured");
         let duplicate = report["models"][0].clone();
         report["models"].as_array_mut().unwrap().push(duplicate);
-        std::fs::write(&path, serde_json::to_vec(&report).unwrap()).unwrap();
         assert!(
-            super::load_benchmark(Some(&path))
-                .unwrap()
+            super::benchmark_evidence(serde_json::from_value(report.clone()).unwrap())
                 .for_model("model:latest", Some("sha256:measured"))
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn throughput_requires_matching_host_hardware_and_endpoint() {
+        use crate::model_bench::{AllModelsReport, BenchmarkMachine};
+        use serde_json::json;
+        let machine = BenchmarkMachine {
+            host_id_sha256: "a".repeat(64),
+            os: "test".into(),
+            architecture: "arm".into(),
+            chip: Some("chip".into()),
+            logical_cpus: 8,
+            memory_bytes: 32_000_000_000,
+            gpu: None,
+        };
+        let endpoint = "http://127.0.0.1:11434";
+        let mut report: AllModelsReport = serde_json::from_value(json!({
+            "schema_version":2, "machine":machine, "endpoint":endpoint,
+            "server_version":"test", "profile":"test", "methodology":[], "models":[], "rankings":{}
+        }))
+        .unwrap();
+        assert!(super::benchmark_matches(&report, endpoint, Some(&machine)));
+        assert!(!super::benchmark_matches(
+            &report,
+            "http://127.0.0.1:11436",
+            Some(&machine)
+        ));
+        assert!(!super::benchmark_matches(&report, endpoint, None));
+        let mut other = machine.clone();
+        other.host_id_sha256 = "b".repeat(64);
+        assert!(!super::benchmark_matches(&report, endpoint, Some(&other)));
+        report.schema_version = 1;
+        assert!(!super::benchmark_matches(&report, endpoint, Some(&machine)));
+        report.schema_version = 2;
+        report.machine = None;
+        assert!(!super::benchmark_matches(&report, endpoint, Some(&machine)));
     }
 
     #[test]

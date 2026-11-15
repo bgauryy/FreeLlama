@@ -2,7 +2,7 @@
 
 **Use when** you do not know which file to read and have no exact word to search for. The server embeds the files and returns ranked `path:Lstart-Lend` labels, so you read a few ranges instead of a repository.
 
-**Skip it when** you know an identifier: `localSearch` or `grep` is faster and exact.
+**Skip it when** you know an identifier: `localSearch` or `rg` is faster and exact.
 
 **Model:** `embeddinggemma-2:740m-q8_0` (1.3 GB). `nomic-embed-text:v1.5` (0.3 GB) indexes faster but found the right file less often.
 
@@ -14,8 +14,13 @@ The prefixes belong to the model: `task: search result | query: ` and `title: no
 
 CLI, for items one per line: `freellama task --task embedding --model embeddinggemma-2:740m-q8_0 --input-file items.txt --nearest "task: search result | query: saving crashes" --top 5`
 
-**Read the result:** one line per file, best chunk first, with a cosine score.
+**Read the result:** one line per ranked chunk; several chunks may name the same file, with a cosine score.
 
 **Check it:** read the top ranges before you rely on them. Measured here on 10 questions about this repository: embeddinggemma put the right file first for 9 and in the top 3 for 9; nomic, 6 and 8. A miss is still normal; widen `top` or rephrase before you conclude anything.
 
-Each call embeds the files again, so narrow the glob. A glob over about 900 chunks took about 67 s with embeddinggemma and 42 s with nomic.
+Eligible file-backed query searches reuse unchanged chunks from the persistent embedding index;
+the query is embedded each time. Reuse requires verified model digest, dimensions, backend and
+execution identity; an unverified identity falls back to fresh embeddings. Deferred calls, raw
+vector requests and certain explicit controls bypass this cache. Narrow the glob for a cold
+search: the historical roughly 900-chunk run took about 67 s with embeddinggemma and 42 s with nomic.
+See the [current index contract](../FEATURES.md#small-agent-context).

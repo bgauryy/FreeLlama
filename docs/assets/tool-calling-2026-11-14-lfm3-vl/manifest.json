@@ -1,0 +1,582 @@
+{
+  "schema_version": 1,
+  "suite_version": "tool-calling-v1",
+  "started_at": "2026-11-14T18:55:21.847Z",
+  "endpoint": "http://127.0.0.1:11434",
+  "options": {
+    "endpoint": "http://127.0.0.1:11434",
+    "models": [
+      "lfm3-vl:2b-q4_K_M"
+    ],
+    "repeats": 1,
+    "timeoutMs": 45000,
+    "maxTokens": 256,
+    "inventory": false,
+    "out": "docs/assets/tool-calling-2026-11-14-lfm3-vl"
+  },
+  "provenance": {
+    "git_commit": "9933d95315b46b2e8d0b584ee3b55b55fbecc751",
+    "dirty_files": "M docs/ARCHITECTURE.md\n M docs/FEATURES.md\n M docs/MONITORING.md\n M docs/PRODUCTION.md\n M docs/README.md\n M package.json\n M packages/cli/src/args.rs\n M packages/cli/src/bench_cmd.rs\n M packages/mcp/src/job-mode.ts\n M packages/mcp/src/result-checks.ts\n M packages/mcp/test/unit/job-mode.test.ts\n M packages/mcp/test/unit/result-checks.test.ts\n M packages/rust-core/src/model_bench.rs\n M packages/rust-core/src/platform/catalog.rs\n M packages/rust-core/src/platform/config.rs\n M packages/rust-core/src/platform/discovery.rs\n M packages/rust-core/src/platform/execution/forward.rs\n M packages/rust-core/src/platform/execution/mod.rs\n M packages/rust-core/src/platform/execution/pipeline.rs\n M packages/rust-core/src/platform/execution/upstream.rs\n M packages/rust-core/src/platform/mod.rs\n M packages/rust-core/src/platform/resources/governor.rs\n M packages/rust-core/src/platform/resources/mod.rs\n M packages/rust-core/src/platform/resources/sampling.rs\n M packages/rust-core/src/platform/resources/tests.rs\n M packages/rust-core/src/platform/warming.rs\n M packages/rust-core/src/proxy/mod.rs\n M packages/rust-core/src/proxy/upstreams.rs\n M packages/rust-core/tests/main.rs\n M packages/rust-core/tests/preload_keys_upstreams_contract.rs\n M packages/rust-core/tests/repetition_stop_contract.rs\n?? .github/\n?? docs/LLAMACPP.md\n?? docs/RUST_RESOURCE_AUDIT.md\n?? docs/assets/result-check-accuracy.json\n?? packages/mcp/src/job-calibration.ts\n?? packages/mcp/src/tool-call-checks.ts\n?? packages/mcp/test/unit/job-calibration.test.ts\n?? packages/mcp/test/unit/tool-call-checks.test.ts\n?? packages/rust-core/src/model_bench/\n?? packages/rust-core/src/platform/execution/llamacpp.rs\n?? packages/rust-core/src/platform/resources/governor/\n?? packages/rust-core/src/platform/resources/tests/\n?? packages/rust-core/src/platform/resources/windows.rs\n?? packages/rust-core/tests/llamacpp_contract.rs\n?? scripts/reliability/",
+    "harness_sha256": "e33a0b83ebc5dfbce29b11c2a8eb3100fe48f2c2ed3948e6eb102e5c90609e44",
+    "cases_sha256": "9f3fa2c279a3bf25497e1a72a168537e9ef7e74ba655f32aca8919004035233b",
+    "node": "v26.4.0",
+    "platform": "darwin",
+    "arch": "arm64",
+    "os_release": "25.5.0",
+    "total_memory_bytes": 34359738368,
+    "free_memory_bytes": 6328205312,
+    "load_average": [
+      5.71630859375,
+      18.5,
+      28.26318359375
+    ]
+  },
+  "show": {
+    "lfm3-vl:2b-q4_K_M": {
+      "thinking": {
+        "values": [
+          true,
+          false
+        ],
+        "default": true
+      },
+      "license": "LFM Open License v1.0\n\nTERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION\n\n1. Definitions.\n\n\"License\" shall mean the terms and conditions for use, reproduction, and distribution as defined by this document.\n\n\"Licensor\" shall mean Liquid AI, Inc.\n\n\"Legal Entity\" shall mean the union of the acting entity and all other entities that control, are controlled by, or are under common control with that entity. For the purposes of this definition, \"control\" means (i) the power, direct or indirect, to cause the direction or management of such entity, whether by contract or otherwise, or (ii) ownership of fifty percent (50%) or more of the outstanding shares, or (iii) beneficial ownership of such entity.\n\n\"You\" (or \"Your\") shall mean an individual or Legal Entity exercising permissions granted by this License.\n\n\"Source\" form shall mean the preferred form for making modifications, including but not limited to software source code, documentation source, and configuration files.\n\n\"Object\" form shall mean any form resulting from mechanical transformation or translation of a Source form, including but not limited to compiled object code, generated documentation, and conversions to other media types.\n\n\"Work\" shall mean the work of authorship, whether in Source or Object form, made available under the License, as indicated by a copyright notice that is included in or attached to the work.\n\n\"Derivative Works\" shall mean any work, whether in Source or Object form, that is based on (or derived from) the Work and for which the editorial revisions, annotations, elaborations, or other modifications represent, as a whole, an original work of authorship. For the purposes of this License, Derivative Works shall not include works that remain separable from, or merely link (or bind by name) to the interfaces of, the Work and Derivative Works thereof.\n\n\"Contribution\" shall mean any work of authorship, including the original version of the Work and any modifications or additions to that Work or Derivative Works thereof, that is intentionally submitted to Licensor for inclusion in the Work by the copyright owner or by an individual or Legal Entity authorized to submit on behalf of the copyright owner. For the purposes of this definition, \"submitted\" means any form of electronic, verbal, or written communication sent to the Licensor or its representatives, including but not limited to communication on electronic mailing lists, source code control systems, and issue tracking systems that are managed by, or on behalf of, the Licensor for the purpose of discussing and improving the Work, but excluding communication that is conspicuously marked or otherwise designated in writing by the copyright owner as \"Not a Contribution.\"\n\n\"Contributor\" shall mean Licensor and any individual or Legal Entity on behalf of whom a Contribution has been received by Licensor and subsequently incorporated within the Work.\n\n\"Commercial Use\" shall mean any use of the Work for direct or indirect commercial advantage or monetary compensation.\n\n\"Qualified Non-Profit Organization\" shall mean a Legal Entity that is organized and operated exclusively for religious, charitable, scientific, testing for public safety, literary, or educational purposes, and which is exempt from federal income tax under Section 501(c)(3) of the United States Internal Revenue Code of 1986, as amended, or any equivalent non-profit or charitable organization in a foreign jurisdiction.\n\n\"Non-Commercial or Research Purposes\" shall mean purposes that do not involve any use of the Work or a Derivative Work for Commercial Use.\n\n\"Threshold\" shall mean annual revenue of 10 million United States dollars ($10,000,000) or more.\n\n2. Grant of Copyright License. Subject to the terms and conditions of this License, including the Commercial Use limitation set forth in Section 5, each Contributor hereby grants to You a perpetual, worldwide, non-exclusive, no-charge, royalty-free, irrevocable copyright license to reproduce, prepare Derivative Works of, publicly display, publicly perform, sublicense, and distribute the Work and such Derivative Works in Source or Object form.\n\n3. Grant of Patent License. Subject to the terms and conditions of this License, including the Commercial Use limitation set forth in Section 5, each Contributor hereby grants to You a perpetual, worldwide, non-exclusive, no-charge, royalty-free, irrevocable (except as stated in this section) patent license to make, have made, use, offer to sell, sell, import, and otherwise transfer the Work, where such license applies only to those patent claims licensable by such Contributor that are necessarily infringed by their Contribution(s) alone or by combination of their Contribution(s) with the Work to which such Contribution(s) was submitted. If You institute patent litigation against any entity (including a cross-claim or counterclaim in a lawsuit) alleging that the Work or a Contribution incorporated within the Work constitutes direct or contributory patent infringement, then any patent licenses granted to You under this License for that Work shall terminate as of the date such litigation is filed.\n\n4. Redistribution. You may reproduce and distribute copies of the Work or Derivative Works thereof in any medium, with or without modifications, and in Source or Object form, provided that You meet the following conditions:\n\n(a) You must give any other recipients of the Work or Derivative Works a copy of this License; and\n\n(b) You must cause any modified files to carry prominent notices stating that You changed the files; and\n\n(c) You must retain, in the Source form of any Derivative Works that You distribute, all copyright, patent, trademark, and attribution notices from the Source form of the Work, excluding those notices that do not pertain to any part of the Derivative Works; and\n\n(d) If the Work includes a \"NOTICE\" text file as part of its distribution, then any Derivative Works that You distribute must include a readable copy of the attribution notices contained within such NOTICE file, excluding those notices that do not pertain to any part of the Derivative Works, in at least one of the following places: within a NOTICE text file distributed as part of the Derivative Works; within the Source form or documentation, if provided along with the Derivative Works; or, within a display generated by the Derivative Works, if and wherever such third-party notices normally appear. The contents of the NOTICE file are for informational purposes only and do not modify the License. You may add Your own attribution notices within Derivative Works that You distribute, alongside or as an addendum to the NOTICE text from the Work, provided that such additional attribution notices cannot be construed as modifying the License.\n\nYou may add Your own copyright statement to Your modifications and may provide additional or different license terms and conditions for use, reproduction, or distribution of Your modifications, or for any such Derivative Works as a whole, provided Your use, reproduction, and distribution of the Work otherwise complies with the conditions stated in this License.\n\n5. Commercial Use Limitation.\n\n(a) The rights granted under this License for Commercial Use are conditioned upon You or Your Legal Entity not exceeding the Threshold.\n\n(b) Any Commercial Use of the Work or a Derivative Work by a Legal Entity that exceeds the Threshold is not licensed under this Agreement.\n\n(c) The Threshold shall not apply to a Qualified Non-Profit Organization's use of the Work or a Derivative Work for Non-Commercial or Research Purposes.\n\n6. Submission of Contributions. Unless You explicitly state otherwise, any Contribution intentionally submitted for inclusion in the Work by You to the Licensor shall be under the terms and conditions of this License, without any additional terms or conditions. Notwithstanding the above, nothing herein shall supersede or modify the terms of any separate license agreement you may have executed with Licensor regarding such Contributions.\n\n7. Trademarks. This License does not grant permission to use the trade names, trademarks, service marks, or product names of the Licensor, except for the reasonable and customary use in describing the origin of the Work and reproducing the content of the NOTICE file.\n\n8. Disclaimer of Warranty. Unless required by applicable law or agreed to in writing, Licensor provides the Work (and each Contributor provides its Contributions) on an \"AS IS\" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied, including, without limitation, any warranties or conditions of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A PARTICULAR PURPOSE. You are solely responsible for determining the appropriateness of using or redistributing the Work and assume any risks associated with Your exercise of permissions under this License.\n\n9. Limitation of Liability. In no event and under no legal theory, whether in tort (including negligence), contract, or otherwise, unless required by applicable law (such as deliberate and grossly negligent acts) or agreed to in writing, shall any Contributor be liable to You for damages, including any direct, indirect, special, incidental, or consequential damages of any character arising as a result of this License or out of the use or inability to use the Work (including but not limited to damages for loss of goodwill, work stoppage, computer failure or malfunction, or any and all other commercial damages or losses), even if such Contributor has been advised of the possibility of such damages.\n\n10. Accepting Warranty or Additional Liability. While redistributing the Work or Derivative Works thereof, You may choose to offer, and charge a fee for, acceptance of support, warranty, indemnity, or other liability obligations and/or rights consistent with this License. However, in accepting such obligations, You may act only on Your own behalf and on Your sole responsibility, not on behalf of any other Contributor, and only if You agree to indemnify, defend, and hold each Contributor harmless for any liability incurred by, or claims asserted against, such Contributor by reason of your accepting any such warranty or additional liability.\n\n11. Termination. This License will terminate automatically and immediately if You fail to comply with any of its terms and conditions. Upon termination, You must cease all use of the Work and any Derivative Works and delete all copies in Your possession.\n\nEND OF TERMS AND CONDITIONS\n",
+      "modelfile": "# Modelfile generated by \"ollama show\"\n# To build a new Modelfile based on this, replace FROM with:\n# FROM lfm3-vl:2b-q4_K_M\n\nFROM /Users/bgaryy/.ollama/models/blobs/sha256-56dac2e192ff0d9ab8507f4f1aeb4aed0463449bbbefaac79497f041c95f21eb\nFROM /Users/bgaryy/.ollama/models/blobs/sha256-8e75a88afc0e6a3bcd637becbe720447ea0794934b7b417a1f42d5cfe0d9c288\nTEMPLATE {{ .Prompt }}\nRENDERER lfm3\nPARSER lfm3\nCAPABILITY completion\nCAPABILITY vision\nCAPABILITY tools\nCAPABILITY thinking\nPARAMETER repeat_last_n -1\nPARAMETER repeat_penalty 1.1\nPARAMETER temperature 0.1\nPARAMETER top_k 50\nPARAMETER top_p 1\nLICENSE \"\"\"LFM Open License v1.0\n\nTERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION\n\n1. Definitions.\n\n\"License\" shall mean the terms and conditions for use, reproduction, and distribution as defined by this document.\n\n\"Licensor\" shall mean Liquid AI, Inc.\n\n\"Legal Entity\" shall mean the union of the acting entity and all other entities that control, are controlled by, or are under common control with that entity. For the purposes of this definition, \"control\" means (i) the power, direct or indirect, to cause the direction or management of such entity, whether by contract or otherwise, or (ii) ownership of fifty percent (50%) or more of the outstanding shares, or (iii) beneficial ownership of such entity.\n\n\"You\" (or \"Your\") shall mean an individual or Legal Entity exercising permissions granted by this License.\n\n\"Source\" form shall mean the preferred form for making modifications, including but not limited to software source code, documentation source, and configuration files.\n\n\"Object\" form shall mean any form resulting from mechanical transformation or translation of a Source form, including but not limited to compiled object code, generated documentation, and conversions to other media types.\n\n\"Work\" shall mean the work of authorship, whether in Source or Object form, made available under the License, as indicated by a copyright notice that is included in or attached to the work.\n\n\"Derivative Works\" shall mean any work, whether in Source or Object form, that is based on (or derived from) the Work and for which the editorial revisions, annotations, elaborations, or other modifications represent, as a whole, an original work of authorship. For the purposes of this License, Derivative Works shall not include works that remain separable from, or merely link (or bind by name) to the interfaces of, the Work and Derivative Works thereof.\n\n\"Contribution\" shall mean any work of authorship, including the original version of the Work and any modifications or additions to that Work or Derivative Works thereof, that is intentionally submitted to Licensor for inclusion in the Work by the copyright owner or by an individual or Legal Entity authorized to submit on behalf of the copyright owner. For the purposes of this definition, \"submitted\" means any form of electronic, verbal, or written communication sent to the Licensor or its representatives, including but not limited to communication on electronic mailing lists, source code control systems, and issue tracking systems that are managed by, or on behalf of, the Licensor for the purpose of discussing and improving the Work, but excluding communication that is conspicuously marked or otherwise designated in writing by the copyright owner as \"Not a Contribution.\"\n\n\"Contributor\" shall mean Licensor and any individual or Legal Entity on behalf of whom a Contribution has been received by Licensor and subsequently incorporated within the Work.\n\n\"Commercial Use\" shall mean any use of the Work for direct or indirect commercial advantage or monetary compensation.\n\n\"Qualified Non-Profit Organization\" shall mean a Legal Entity that is organized and operated exclusively for religious, charitable, scientific, testing for public safety, literary, or educational purposes, and which is exempt from federal income tax under Section 501(c)(3) of the United States Internal Revenue Code of 1986, as amended, or any equivalent non-profit or charitable organization in a foreign jurisdiction.\n\n\"Non-Commercial or Research Purposes\" shall mean purposes that do not involve any use of the Work or a Derivative Work for Commercial Use.\n\n\"Threshold\" shall mean annual revenue of 10 million United States dollars ($10,000,000) or more.\n\n2. Grant of Copyright License. Subject to the terms and conditions of this License, including the Commercial Use limitation set forth in Section 5, each Contributor hereby grants to You a perpetual, worldwide, non-exclusive, no-charge, royalty-free, irrevocable copyright license to reproduce, prepare Derivative Works of, publicly display, publicly perform, sublicense, and distribute the Work and such Derivative Works in Source or Object form.\n\n3. Grant of Patent License. Subject to the terms and conditions of this License, including the Commercial Use limitation set forth in Section 5, each Contributor hereby grants to You a perpetual, worldwide, non-exclusive, no-charge, royalty-free, irrevocable (except as stated in this section) patent license to make, have made, use, offer to sell, sell, import, and otherwise transfer the Work, where such license applies only to those patent claims licensable by such Contributor that are necessarily infringed by their Contribution(s) alone or by combination of their Contribution(s) with the Work to which such Contribution(s) was submitted. If You institute patent litigation against any entity (including a cross-claim or counterclaim in a lawsuit) alleging that the Work or a Contribution incorporated within the Work constitutes direct or contributory patent infringement, then any patent licenses granted to You under this License for that Work shall terminate as of the date such litigation is filed.\n\n4. Redistribution. You may reproduce and distribute copies of the Work or Derivative Works thereof in any medium, with or without modifications, and in Source or Object form, provided that You meet the following conditions:\n\n(a) You must give any other recipients of the Work or Derivative Works a copy of this License; and\n\n(b) You must cause any modified files to carry prominent notices stating that You changed the files; and\n\n(c) You must retain, in the Source form of any Derivative Works that You distribute, all copyright, patent, trademark, and attribution notices from the Source form of the Work, excluding those notices that do not pertain to any part of the Derivative Works; and\n\n(d) If the Work includes a \"NOTICE\" text file as part of its distribution, then any Derivative Works that You distribute must include a readable copy of the attribution notices contained within such NOTICE file, excluding those notices that do not pertain to any part of the Derivative Works, in at least one of the following places: within a NOTICE text file distributed as part of the Derivative Works; within the Source form or documentation, if provided along with the Derivative Works; or, within a display generated by the Derivative Works, if and wherever such third-party notices normally appear. The contents of the NOTICE file are for informational purposes only and do not modify the License. You may add Your own attribution notices within Derivative Works that You distribute, alongside or as an addendum to the NOTICE text from the Work, provided that such additional attribution notices cannot be construed as modifying the License.\n\nYou may add Your own copyright statement to Your modifications and may provide additional or different license terms and conditions for use, reproduction, or distribution of Your modifications, or for any such Derivative Works as a whole, provided Your use, reproduction, and distribution of the Work otherwise complies with the conditions stated in this License.\n\n5. Commercial Use Limitation.\n\n(a) The rights granted under this License for Commercial Use are conditioned upon You or Your Legal Entity not exceeding the Threshold.\n\n(b) Any Commercial Use of the Work or a Derivative Work by a Legal Entity that exceeds the Threshold is not licensed under this Agreement.\n\n(c) The Threshold shall not apply to a Qualified Non-Profit Organization's use of the Work or a Derivative Work for Non-Commercial or Research Purposes.\n\n6. Submission of Contributions. Unless You explicitly state otherwise, any Contribution intentionally submitted for inclusion in the Work by You to the Licensor shall be under the terms and conditions of this License, without any additional terms or conditions. Notwithstanding the above, nothing herein shall supersede or modify the terms of any separate license agreement you may have executed with Licensor regarding such Contributions.\n\n7. Trademarks. This License does not grant permission to use the trade names, trademarks, service marks, or product names of the Licensor, except for the reasonable and customary use in describing the origin of the Work and reproducing the content of the NOTICE file.\n\n8. Disclaimer of Warranty. Unless required by applicable law or agreed to in writing, Licensor provides the Work (and each Contributor provides its Contributions) on an \"AS IS\" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied, including, without limitation, any warranties or conditions of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A PARTICULAR PURPOSE. You are solely responsible for determining the appropriateness of using or redistributing the Work and assume any risks associated with Your exercise of permissions under this License.\n\n9. Limitation of Liability. In no event and under no legal theory, whether in tort (including negligence), contract, or otherwise, unless required by applicable law (such as deliberate and grossly negligent acts) or agreed to in writing, shall any Contributor be liable to You for damages, including any direct, indirect, special, incidental, or consequential damages of any character arising as a result of this License or out of the use or inability to use the Work (including but not limited to damages for loss of goodwill, work stoppage, computer failure or malfunction, or any and all other commercial damages or losses), even if such Contributor has been advised of the possibility of such damages.\n\n10. Accepting Warranty or Additional Liability. While redistributing the Work or Derivative Works thereof, You may choose to offer, and charge a fee for, acceptance of support, warranty, indemnity, or other liability obligations and/or rights consistent with this License. However, in accepting such obligations, You may act only on Your own behalf and on Your sole responsibility, not on behalf of any other Contributor, and only if You agree to indemnify, defend, and hold each Contributor harmless for any liability incurred by, or claims asserted against, such Contributor by reason of your accepting any such warranty or additional liability.\n\n11. Termination. This License will terminate automatically and immediately if You fail to comply with any of its terms and conditions. Upon termination, You must cease all use of the Work and any Derivative Works and delete all copies in Your possession.\n\nEND OF TERMS AND CONDITIONS\n\"\"\"\n",
+      "parameters": "temperature                    0.1\ntop_k                          50\ntop_p                          1\nrepeat_last_n                  -1\nrepeat_penalty                 1.1",
+      "template": "{{ .Prompt }}",
+      "renderer": "lfm3",
+      "parser": "lfm3",
+      "template_source": "renderer_parser",
+      "details": {
+        "parent_model": "LFM3-VL-2B-Q4_K_M.gguf",
+        "format": "gguf",
+        "family": "lfm3",
+        "families": [
+          "lfm3"
+        ],
+        "parameter_size": "1.7B",
+        "quantization_level": "Q4_K_M",
+        "runner": "llamacpp"
+      },
+      "model_info": {
+        "general.architecture": "lfm3",
+        "general.base_model.0.name": "LFM3 1.7B Base",
+        "general.base_model.0.organization": "LiquidAI",
+        "general.base_model.0.repo_url": "https://huggingface.co/LiquidAI/LFM3-1.7B-Base",
+        "general.base_model.count": 1,
+        "general.basename": "LFM3-VL",
+        "general.file_type": 15,
+        "general.languages": [
+          "en",
+          "ar",
+          "zh",
+          "fr",
+          "de",
+          "it",
+          "ja",
+          "ko",
+          "pt",
+          "es",
+          "vi",
+          "th",
+          "id",
+          "hi",
+          "ru",
+          "pl"
+        ],
+        "general.license": "other",
+        "general.license.link": "LICENSE",
+        "general.license.name": "lfm1.0",
+        "general.parameter_count": 1728801600,
+        "general.quantization_version": 2,
+        "general.sampling.penalty_repeat": 1.1,
+        "general.sampling.temp": 0.1,
+        "general.sampling.top_k": 50,
+        "general.size_label": "2B",
+        "general.tags": [
+          "liquid",
+          "lfm3",
+          "edge",
+          "conversational",
+          "custom_code",
+          "image-text-to-text"
+        ],
+        "general.type": "model",
+        "lfm3.attention.head_count": 16,
+        "lfm3.attention.head_count_kv": [
+          0,
+          0,
+          4,
+          0,
+          4,
+          0,
+          4,
+          0,
+          4,
+          0,
+          4,
+          0,
+          4,
+          0,
+          4,
+          0,
+          4,
+          0,
+          4,
+          0,
+          4,
+          0,
+          4,
+          0
+        ],
+        "lfm3.attention.key_length": 128,
+        "lfm3.attention.layer_norm_rms_epsilon": 0.00001,
+        "lfm3.attention.sliding_window": 256,
+        "lfm3.attention.sliding_window_pattern": [
+          false,
+          false,
+          false,
+          false,
+          true,
+          false,
+          false,
+          false,
+          true,
+          false,
+          false,
+          false,
+          true,
+          false,
+          false,
+          false,
+          true,
+          false,
+          false,
+          false,
+          true,
+          false,
+          false,
+          false
+        ],
+        "lfm3.attention.value_length": 128,
+        "lfm3.block_count": 24,
+        "lfm3.context_length": 128000,
+        "lfm3.embedding_length": 2048,
+        "lfm3.feed_forward_length": 7680,
+        "lfm3.rope.dimension_count": 128,
+        "lfm3.rope.freq_base": 1000000,
+        "lfm3.rope.freq_base_swa": 10000,
+        "lfm3.shortconv.l_cache": 7,
+        "tokenizer.ggml.add_bos_token": false,
+        "tokenizer.ggml.add_eos_token": false,
+        "tokenizer.ggml.bos_token_id": 124894,
+        "tokenizer.ggml.eos_token_id": 124900,
+        "tokenizer.ggml.merges": [],
+        "tokenizer.ggml.model": "gpt2",
+        "tokenizer.ggml.padding_token_id": 124893,
+        "tokenizer.ggml.pre": "lfm2",
+        "tokenizer.ggml.token_type": [],
+        "tokenizer.ggml.tokens": []
+      },
+      "projector_info": {
+        "clip.has_vision_encoder": true,
+        "clip.use_silu": true,
+        "clip.vision.attention.head_count": 16,
+        "clip.vision.attention.head_count_kv": 8,
+        "clip.vision.attention.layer_norm_epsilon": 0.00001,
+        "clip.vision.block_count": 14,
+        "clip.vision.embedding_length": 1024,
+        "clip.vision.feed_forward_length": 2560,
+        "clip.vision.image_max_pixels": 16777216,
+        "clip.vision.image_mean": [
+          0.5,
+          0.5,
+          0.5
+        ],
+        "clip.vision.image_min_pixels": 65536,
+        "clip.vision.image_resize_algo": "bicubic",
+        "clip.vision.image_size": 512,
+        "clip.vision.image_std": [
+          0.5,
+          0.5,
+          0.5
+        ],
+        "clip.vision.patch_size": 16,
+        "clip.vision.projection_dim": 2048,
+        "clip.vision.projector_type": "lfm3vl",
+        "clip.vision.spatial_merge_size": 2,
+        "general.architecture": "clip",
+        "general.base_model.0.name": "LFM3 1.7B Base",
+        "general.base_model.0.organization": "LiquidAI",
+        "general.base_model.0.repo_url": "https://huggingface.co/LiquidAI/LFM3-1.7B-Base",
+        "general.base_model.count": 1,
+        "general.basename": "LFM3-VL",
+        "general.file_type": 32,
+        "general.finetune": "2b",
+        "general.languages": [
+          "en",
+          "ar",
+          "zh",
+          "fr",
+          "de",
+          "it",
+          "ja",
+          "ko",
+          "pt",
+          "es",
+          "vi",
+          "th",
+          "id",
+          "hi",
+          "ru",
+          "pl"
+        ],
+        "general.license": "other",
+        "general.license.link": "LICENSE",
+        "general.license.name": "lfm1.0",
+        "general.name": "LFM3 VL 2B",
+        "general.parameter_count": 189380352,
+        "general.quantization_version": 2,
+        "general.sampling.penalty_repeat": 1.1,
+        "general.sampling.temp": 0.1,
+        "general.sampling.top_k": 50,
+        "general.size_label": "189M",
+        "general.tags": [
+          "liquid",
+          "lfm3",
+          "edge",
+          "conversational",
+          "custom_code",
+          "image-text-to-text"
+        ],
+        "general.type": "mmproj"
+      },
+      "capabilities": [
+        "completion",
+        "vision",
+        "tools",
+        "thinking"
+      ],
+      "modified_at": "2026-11-01T12:55:32.345643848+02:00",
+      "requires": "0.40.13"
+    }
+  },
+  "version": {
+    "version": "0.40.15"
+  },
+  "inventory": [
+    {
+      "name": "bonsai-2:27b",
+      "model": "bonsai-2:27b",
+      "modified_at": "2026-11-01T16:09:22.218288023+02:00",
+      "size": 8255266275,
+      "digest": "f3c4f42086593225d8be9bb4270658d0e05f5232fb2b5e8faa49ef74d2cc843a",
+      "details": {
+        "parent_model": "bonsai-2:27b-q2_0",
+        "format": "gguf",
+        "family": "qwen35",
+        "families": [
+          "qwen35"
+        ],
+        "parameter_size": "26.9B",
+        "quantization_level": "Q2_0",
+        "context_length": 262144,
+        "embedding_length": 5120,
+        "runner": "llamacpp"
+      },
+      "capabilities": [
+        "completion",
+        "vision",
+        "tools",
+        "thinking"
+      ]
+    },
+    {
+      "name": "lfm3-vl:2b-q4_K_M",
+      "model": "lfm3-vl:2b-q4_K_M",
+      "modified_at": "2026-11-01T12:55:32.345643848+02:00",
+      "size": 1478634721,
+      "digest": "00ca45bf65a5c626104a906ec9b5f4cd2f576387dbcdefdb150e88d0b3bd7b2e",
+      "details": {
+        "parent_model": "LFM3-VL-2B-Q4_K_M.gguf",
+        "format": "gguf",
+        "family": "lfm3",
+        "families": [
+          "lfm3"
+        ],
+        "parameter_size": "1.7B",
+        "quantization_level": "Q4_K_M",
+        "context_length": 128000,
+        "embedding_length": 2048,
+        "runner": "llamacpp"
+      },
+      "capabilities": [
+        "completion",
+        "vision",
+        "tools",
+        "thinking"
+      ]
+    },
+    {
+      "name": "nimble-v3:9b-q4_K_M",
+      "model": "nimble-v3:9b-q4_K_M",
+      "modified_at": "2026-11-01T12:44:53.948574018+02:00",
+      "size": 5629142061,
+      "digest": "88cbbd22b816429c7df38b2893acdda2492038dafb3d1c898b4328e31f757a5e",
+      "details": {
+        "parent_model": "nimble-v3-9b-q4_K_M.gguf",
+        "format": "gguf",
+        "family": "qwen35",
+        "families": [
+          "qwen35"
+        ],
+        "parameter_size": "9.0B",
+        "quantization_level": "Q4_K_M",
+        "context_length": 32768,
+        "embedding_length": 4096,
+        "runner": "llamacpp"
+      },
+      "capabilities": [
+        "decision"
+      ]
+    },
+    {
+      "name": "lfm3-omni:2b-q4_K_M",
+      "model": "lfm3-omni:2b-q4_K_M",
+      "modified_at": "2026-11-01T12:42:20.724823218+02:00",
+      "size": 2049482162,
+      "digest": "4c0ee9400634babb880868b873bcebf09fbbf1a5328e550bdbaff25888f1f7e2",
+      "details": {
+        "parent_model": "LFM3-Omni-2B-Q4_K_M.gguf",
+        "format": "gguf",
+        "family": "lfm3",
+        "families": [
+          "lfm3"
+        ],
+        "parameter_size": "1.7B",
+        "quantization_level": "Q4_K_M",
+        "context_length": 128000,
+        "embedding_length": 2048,
+        "runner": "llamacpp"
+      },
+      "capabilities": [
+        "completion",
+        "vision",
+        "audio",
+        "speech",
+        "tools"
+      ]
+    },
+    {
+      "name": "hf.co/openbmb/MiniCPM-OCR-1.0-gguf:Q4_K_M",
+      "model": "hf.co/openbmb/MiniCPM-OCR-1.0-gguf:Q4_K_M",
+      "modified_at": "2026-11-01T12:41:23.872655412+02:00",
+      "size": 1430124830,
+      "digest": "1e5957df106945b5aa2da5d5bb1effc45205b50f8878e22f1dfbf30445392adf",
+      "details": {
+        "parent_model": "",
+        "format": "gguf",
+        "family": "qwen35",
+        "families": [
+          "qwen35"
+        ],
+        "parameter_size": "752M",
+        "quantization_level": "Q4_K_M",
+        "context_length": 262144,
+        "embedding_length": 1024,
+        "runner": "ggml"
+      },
+      "capabilities": [
+        "tools",
+        "thinking",
+        "completion",
+        "vision"
+      ]
+    },
+    {
+      "name": "bonsai-2:9b",
+      "model": "bonsai-2:9b",
+      "modified_at": "2026-11-01T12:19:16.019057844+02:00",
+      "size": 3180880170,
+      "digest": "c8b5462f8688647fe0b53568e3c00181ada5f05300aa4bf00695f2902f4d388e",
+      "details": {
+        "parent_model": "Ternary-Bonsai-2-9B-Q2_0.gguf",
+        "format": "gguf",
+        "family": "qwen35",
+        "families": [
+          "qwen35"
+        ],
+        "parameter_size": "9.0B",
+        "quantization_level": "Q2_0",
+        "context_length": 262144,
+        "embedding_length": 4096,
+        "runner": "llamacpp"
+      },
+      "capabilities": [
+        "completion",
+        "vision",
+        "tools",
+        "thinking"
+      ]
+    },
+    {
+      "name": "hf.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-4GB:Q4_K_M",
+      "model": "hf.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-4GB:Q4_K_M",
+      "modified_at": "2026-11-01T11:08:33.524986376+02:00",
+      "size": 6180446974,
+      "digest": "139e7d57c1c319f8a244800512f359394c7a4dd6ae52c90bf4c2ae5a4d56cff1",
+      "details": {
+        "parent_model": "",
+        "format": "gguf",
+        "family": "gemma4",
+        "families": [
+          "gemma4"
+        ],
+        "parameter_size": "7.52B",
+        "quantization_level": "Q4_K_M",
+        "context_length": 65536,
+        "embedding_length": 2560,
+        "runner": "ggml"
+      },
+      "capabilities": [
+        "tools",
+        "completion"
+      ]
+    },
+    {
+      "name": "embeddinggemma-2:740m-q8_0",
+      "model": "embeddinggemma-2:740m-q8_0",
+      "modified_at": "2026-11-01T11:05:00.323189958+02:00",
+      "size": 1284852670,
+      "digest": "f4981a15b99858ad1f2e0729416e526be7b4f428291b40082b9e4f7b27b5f62f",
+      "details": {
+        "parent_model": "embeddinggemma-2:740m-q8_0",
+        "format": "gguf",
+        "family": "gemma-embedding2",
+        "families": [
+          "gemma-embedding2"
+        ],
+        "parameter_size": "271.00M",
+        "quantization_level": "Q8_0",
+        "context_length": 262144,
+        "embedding_length": 512,
+        "runner": "llamacpp"
+      },
+      "capabilities": [
+        "embedding",
+        "vision",
+        "audio"
+      ]
+    },
+    {
+      "name": "lfm3-audio:2b-q4_K_M",
+      "model": "lfm3-audio:2b-q4_K_M",
+      "modified_at": "2026-11-01T11:04:16.79316281+02:00",
+      "size": 1670483243,
+      "digest": "3327c1a067559929d03d9e6e811cc2bc50b292b295e896b10733990dc6187590",
+      "details": {
+        "parent_model": "LFM3-Audio-2B-Q4_K_M.gguf",
+        "format": "gguf",
+        "family": "lfm3",
+        "families": [
+          "lfm3"
+        ],
+        "parameter_size": "1.7B",
+        "quantization_level": "Q4_K_M",
+        "context_length": 128000,
+        "embedding_length": 2048,
+        "runner": "llamacpp"
+      },
+      "capabilities": [
+        "completion",
+        "audio",
+        "speech",
+        "tools"
+      ]
+    },
+    {
+      "name": "phonon:en",
+      "model": "phonon:en",
+      "modified_at": "2026-11-01T11:03:19.201809531+02:00",
+      "size": 103679058,
+      "digest": "6667dd188d2e30e1448b0476ccbd36bdc8802225a848541d5049f450e2a983e0",
+      "details": {
+        "parent_model": "",
+        "format": "safetensors",
+        "family": "",
+        "families": null,
+        "parameter_size": "",
+        "quantization_level": "",
+        "runner": "mlx"
+      },
+      "capabilities": [
+        "speech"
+      ]
+    },
+    {
+      "name": "strands-decider:2b-nvfp4",
+      "model": "strands-decider:2b-nvfp4",
+      "modified_at": "2026-10-30T13:30:04.21981483+02:00",
+      "size": 1332163010,
+      "digest": "c92a6f466917893017ea7ca4d5e6b39d9950d51ec2b346b5e05855d79d87b5e4",
+      "details": {
+        "parent_model": "",
+        "format": "safetensors",
+        "family": "",
+        "families": null,
+        "parameter_size": "",
+        "quantization_level": "",
+        "runner": "mlx"
+      },
+      "capabilities": [
+        "decision"
+      ]
+    },
+    {
+      "name": "nomic-embed-text:v1.5",
+      "model": "nomic-embed-text:v1.5",
+      "modified_at": "2026-10-30T13:17:25.681876503+02:00",
+      "size": 274302450,
+      "digest": "0a109f422b47e3a30ba2b10eca18548e944e8a23073ee3f3e947efcf3c45e59f",
+      "details": {
+        "parent_model": "",
+        "format": "gguf",
+        "family": "nomic-bert",
+        "families": [
+          "nomic-bert"
+        ],
+        "parameter_size": "137M",
+        "quantization_level": "F16",
+        "context_length": 2048,
+        "embedding_length": 768,
+        "runner": "ggml"
+      },
+      "capabilities": [
+        "embedding"
+      ]
+    }
+  ],
+  "resident_before": {
+    "models": []
+  },
+  "host_before": {
+    "timestamp_ms": 1794682521947,
+    "platform": "darwin",
+    "cpu_times": {
+      "logical_cpus": 12,
+      "idle_ms": 3795490960,
+      "total_ms": 6706822350
+    },
+    "cpu_busy_percent": null,
+    "available_bytes": 11929206784,
+    "available_bytes_source": "freellama_estimate",
+    "free_bytes": 6258475008,
+    "swap_used_bytes": 11252468285.44,
+    "pressure_level": 1,
+    "psi_some_avg10_pct": null,
+    "compressor_bytes": 6702268416,
+    "load1": 5.71630859375,
+    "errors": [],
+    "sample_duration_ms": 14
+  }
+}

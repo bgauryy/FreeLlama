@@ -7,8 +7,13 @@ schema_version = 1
 # Qwen 3.8 passed all five injected code-repair tasks in the dated local
 # repository-agent smoke suite. Keep diagnosis-only `coding` and general
 # `tools` unqualified: it failed those explanation and lookup tasks.
+# This is an illustrative policy, not portable qualification. Replace each
+# placeholder below with the artifact digest recorded by your correctness
+# evaluation; a tag name alone never qualifies the installed artifact.
+# Prefer `freellama policy from-eval` after repeated held-out trials.
 [policies.code_repair]
 qualified_models = ["qwen3.8:27b-mlx"]
+model_digests = { "qwen3.8:27b-mlx" = "REPLACE_WITH_EVALUATED_ARTIFACT_DIGEST" }
 
 # Optional request defaults for one exact model tag on this task: think and
 # num_predict (at least 1). Unset keys keep the generic task profile; caller
@@ -24,9 +29,11 @@ num_predict = 512
 # them. The exploratory browser smoke test is not sufficient evidence.
 # [policies.browser]
 # qualified_models = ["qwen3.8:27b-mlx"]
+# model_digests = { "qwen3.8:27b-mlx" = "REPLACE_WITH_EVALUATED_ARTIFACT_DIGEST" }
 
 [policies.embedding]
 qualified_models = ["nomic-embed-text:latest"]
+model_digests = { "nomic-embed-text:latest" = "REPLACE_WITH_EVALUATED_ARTIFACT_DIGEST" }
 
 # Completion, coding, tools, browser, vision, and long-context candidates remain
 # intentionally absent until their private held-out suites qualify them.

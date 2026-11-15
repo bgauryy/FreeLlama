@@ -1,8 +1,10 @@
 # Every FreeLlama API
 
-FreeLlama exposes one engine through several doors. Pick the door that matches your client. Each
-section below lists everything behind it and links to the guide that owns the details. Everything
-here was checked against the code (2026-11-10).
+FreeLlama exposes one Rust management core through several interfaces. Ollama has the complete
+managed API; an explicit local llama.cpp adapter supports bounded text tasks. Other configured
+OpenAI-compatible engines use passthrough. Pick the interface for your client, then check the
+[engine support limits](LLAMACPP.md#supported-contract-and-limits). This inventory was reviewed
+against the checkout on 2026-11-14.
 
 ## Which one to use
 
@@ -24,8 +26,10 @@ flowchart LR
     H --> API["serve control API<br/>/_freellama/v1/*"]
     CLI["freellama CLI"] --> API
     API --> O["Ollama :11434"]
+    API -->|"explicit bounded text task"| LC["Local llama.cpp"]
     RAW["Ollama-compatible client"] --> PX["serve passthrough<br/>/api/*, /v1/*"]
     PX --> O
+    PX -->|"configured /v1 model"| EXT["OpenAI-compatible upstream"]
 ```
 
 Ports: Ollama `11434`, `freellama serve` `11435`, the CPU backend that `serve --spawn-cpu-backend`
@@ -126,9 +130,13 @@ Every route needs the bearer token when one is configured, except `GET /_freella
 | Deferred jobs | `GET jobs`, `GET jobs/{id}` (`?wait_ms=N` long-polls up to 5 s: it answers when the job changes), `DELETE jobs/{id}`, `POST jobs/{id}/cancel` |
 | Monitoring | `GET metrics`, `GET status`, `GET usage`, `GET config`, `POST config/reload`, and the `GET /_freellama/ui` page |
 
+The catalog and general readiness endpoint remain Ollama-oriented. Explicit llama.cpp
+`routes` and `tasks` calls work without a reachable Ollama server, but its adapter refuses tools,
+images, embeddings, streaming and lifecycle operations. See [Managed llama.cpp](LLAMACPP.md).
+
 Request shapes are in [Architecture](ARCHITECTURE.md#request-shapes); monitoring fields are in
 [Monitoring](MONITORING.md). `POST tasks` with `"stream": true` answers with server-sent events
-(`route`, `admission`, `delta`, then `done` with the usual receipt):
+(`route`, `admission`, `delta`, then `done` with the usual receipt) on supported Ollama tasks:
 
 ```sh
 curl -N http://127.0.0.1:11435/_freellama/v1/tasks -H 'content-type: application/json' \
@@ -137,8 +145,8 @@ curl -N http://127.0.0.1:11435/_freellama/v1/tasks -H 'content-type: application
 
 ## Ollama-compatible passthrough
 
-Every path outside `/_freellama/*` on `serve` is forwarded to the primary Ollama byte for byte,
-with raw admission, host-pressure holds and usage telemetry
+By default, paths outside `/_freellama/*` on `serve` are forwarded to the primary Ollama with
+byte-preserving streaming, raw admission, host-pressure holds and usage telemetry
 ([sidecar](ARCHITECTURE.md#ollama-sidecar)). It covers Ollama's native `/api/*`, its
 OpenAI-compatible `/v1/*`, and the Anthropic-compatible `/v1/messages`. A few paths get special
 handling:

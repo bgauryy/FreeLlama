@@ -6,6 +6,32 @@ use anyhow::{Context, Result};
 use reqwest::Client;
 use serde_json::{Value, json};
 
+/// Internal model lists, residency observations, version and model metadata share one byte cap.
+/// Client-facing passthrough responses do not use this buffered control-plane reader.
+pub(crate) const MAX_METADATA_BODY_BYTES: usize = 4 * 1024 * 1024;
+
+pub(crate) async fn bounded_metadata_json(
+    response: reqwest::Response,
+    path: &str,
+) -> Result<Value> {
+    let mut response = response.error_for_status()?;
+    anyhow::ensure!(
+        response
+            .content_length()
+            .is_none_or(|length| length <= MAX_METADATA_BODY_BYTES as u64),
+        "{path} body exceeds metadata limit"
+    );
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        anyhow::ensure!(
+            chunk.len() <= MAX_METADATA_BODY_BYTES.saturating_sub(body.len()),
+            "{path} body exceeds metadata limit"
+        );
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).with_context(|| format!("invalid {path} JSON"))
+}
+
 /// Join an endpoint and an absolute path without doubling the slash.
 #[must_use]
 pub fn url(endpoint: &str, path: &str) -> String {
@@ -46,7 +72,7 @@ pub(crate) async fn resident(
     let Ok(response) = client.get(url(endpoint, "/api/ps")).send().await else {
         return (None, None);
     };
-    let Ok(value) = response.json::<Value>().await else {
+    let Ok(value) = bounded_metadata_json(response, "/api/ps").await else {
         return (None, None);
     };
     find_ps_entry(&value, model).map_or((None, None), |entry| {
@@ -152,14 +178,14 @@ pub(crate) fn find_ps_entry_by_digest<'a>(
 }
 
 pub(crate) async fn server_version(client: &Client, endpoint: &str) -> Result<String> {
-    let value: Value = client
+    let response = client
         .get(url(endpoint, "/api/version"))
         .send()
         .await
         .context("connect to Ollama")?
         .error_for_status()
-        .context("Ollama version request")?
-        .json()
+        .context("Ollama version request")?;
+    let value = bounded_metadata_json(response, "/api/version")
         .await
         .context("decode Ollama version")?;
     value

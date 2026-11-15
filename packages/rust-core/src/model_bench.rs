@@ -14,6 +14,9 @@ use crate::ollama_http::{millis, resident, unload};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+mod provenance;
+pub use provenance::BenchmarkMachine;
+
 const RED_PIXEL_PNG: &[u8] = &[
     0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
     0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x40, 0x08, 0x02, 0x00, 0x00, 0x00, 0x25, 0x0b, 0xe6,
@@ -171,6 +174,11 @@ pub struct BenchConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AllModelsReport {
     pub schema_version: u32,
+    /// Absent on old reports and remote endpoints: they cannot qualify local throughput.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<BenchmarkMachine>,
+    #[serde(default)]
+    pub measured_at_unix_seconds: u64,
     pub endpoint: String,
     pub server_version: String,
     pub profile: String,
@@ -262,6 +270,11 @@ pub struct RankingEntry {
 ///
 /// Returns an error when Ollama cannot be reached or its discovery responses are invalid.
 pub async fn benchmark_all(config: &BenchConfig) -> Result<AllModelsReport> {
+    let machine = if crate::net::is_loopback_url(&config.endpoint) {
+        tokio::task::spawn_blocking(BenchmarkMachine::current).await?
+    } else {
+        None
+    };
     let client = crate::net::build_http_client(|builder| {
         builder.timeout(Duration::from_secs(config.timeout_seconds))
     })
@@ -277,6 +290,12 @@ pub async fn benchmark_all(config: &BenchConfig) -> Result<AllModelsReport> {
     .to_owned();
     let models = discover_models(&client, &config.endpoint).await?;
     ensure!(config.trials > 0, "benchmark requires at least one trial");
+    for name in &config.include {
+        ensure!(
+            models.iter().any(|model| &model.name == name),
+            "benchmark requires an exact installed tag: {name}"
+        );
+    }
     let selected = models
         .into_iter()
         .filter(|model| {
@@ -290,57 +309,24 @@ pub async fn benchmark_all(config: &BenchConfig) -> Result<AllModelsReport> {
 
     let mut results = Vec::with_capacity(selected.len());
     for model in selected {
-        eprintln!(
-            "benchmark model={} capabilities={:?}",
-            model.name, model.capabilities
-        );
-        let plan = benchmark_plan(&model);
-        let mut unload_errors = Vec::new();
-        if let Err(error) = unload(&client, &config.endpoint, &model.name).await {
-            unload_errors.push(format!("before cold start: {error:#}"));
-        }
-        let cold_start = if let Some(case) = plan.first() {
-            Some(run_case(&client, &config.endpoint, &model, case).await)
-        } else {
-            None
-        };
-        let mut cases = Vec::with_capacity(
-            plan.len()
-                .saturating_mul(usize::try_from(config.trials).unwrap_or(usize::MAX)),
-        );
-        for trial in 1..=config.trials {
-            for case in &plan {
-                let mut result = run_case(&client, &config.endpoint, &model, case).await;
-                result.id = format!("{}/trial-{trial}", result.id);
-                cases.push(result);
-            }
-        }
-        let (resident_size, resident_vram) = resident(&client, &config.endpoint, &model.name).await;
-        if let Err(error) = unload(&client, &config.endpoint, &model.name).await {
-            unload_errors.push(format!("after trials: {error:#}"));
-        }
-        results.push(ModelBenchResult {
-            metadata: model,
-            cold_start,
-            cases,
-            resident_size,
-            resident_vram,
-            unload_errors,
-        });
+        results.push(benchmark_model(&client, config, model).await);
     }
     let rankings = build_rankings(&results);
     Ok(AllModelsReport {
-        schema_version: 1,
+        schema_version: 2,
+        machine,
+        measured_at_unix_seconds: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
         endpoint: config.endpoint.clone(),
         server_version,
-        profile: "sequential_mac_balanced_v1".to_owned(),
+        profile: "sequential_local_balanced_v2".to_owned(),
         configuration: BenchmarkConfiguration {
             warm_trials_per_case: config.trials,
             ..BenchmarkConfiguration::default()
         },
         methodology: vec![
             "Models run sequentially to avoid unified-memory contention.".to_owned(),
-            format!("One cold-start request is reported but excluded from ranking; each case then runs {} warm trials.", config.trials),
+            format!("A first request is reported separately only when /api/ps initially shows the model absent; each case then runs {} trials. Existing resident models are never unloaded by this benchmark.", config.trials),
             "Large artifacts use an 8K evaluation context; medium 16K; small 32K, capped by the advertised context.".to_owned(),
             "The deterministic screen uses temperature 0, seed 42, thinking disabled, and a 128-token response-envelope budget.".to_owned(),
             "Decision models answer one fixed state on /v1/systemone (no options) with a clearly true and a clearly false noul question; both must be answered confidently and correctly.".to_owned(),
@@ -351,6 +337,75 @@ pub async fn benchmark_all(config: &BenchConfig) -> Result<AllModelsReport> {
         models: results,
         rankings,
     })
+}
+
+async fn benchmark_model(
+    client: &Client,
+    config: &BenchConfig,
+    model: ModelMetadata,
+) -> ModelBenchResult {
+    eprintln!(
+        "benchmark model={} capabilities={:?}",
+        model.name, model.capabilities
+    );
+    let plan = benchmark_plan(&model);
+    // Only clean up a model this run found absent before it warmed it. Never evict an
+    // operator's already-loaded runner to manufacture a cold timing.
+    let initially_absent = get_json(
+        client,
+        &crate::ollama_http::url(&config.endpoint, "/api/ps"),
+    )
+    .await
+    .ok()
+    .and_then(|value| {
+        value.get("models").and_then(Value::as_array).map(|models| {
+            !models
+                .iter()
+                .any(|entry| crate::ollama_http::ps_entry_name(entry) == Some(model.name.as_str()))
+        })
+    })
+    .unwrap_or(false);
+    let mut unload_errors = Vec::new();
+    let cold_start = if initially_absent && let Some(case) = plan.first() {
+        Some(run_case(client, &config.endpoint, &model, case).await)
+    } else {
+        None
+    };
+    let mut cases = Vec::with_capacity(
+        plan.len()
+            .saturating_mul(usize::try_from(config.trials).unwrap_or(usize::MAX)),
+    );
+    for trial in 1..=config.trials {
+        for case in &plan {
+            let mut result = run_case(client, &config.endpoint, &model, case).await;
+            result.id = format!("{}/trial-{trial}", result.id);
+            cases.push(result);
+        }
+    }
+    let (resident_size, resident_vram) = resident(client, &config.endpoint, &model.name).await;
+    let completed = cold_start
+        .as_ref()
+        .into_iter()
+        .chain(&cases)
+        .any(|case| case.error.is_none());
+    if initially_absent && completed {
+        match verify_dispatch_identity(client, &config.endpoint, &model).await {
+            Ok(()) => {
+                if let Err(error) = unload(client, &config.endpoint, &model.name).await {
+                    unload_errors.push(format!("after trials: {error:#}"));
+                }
+            }
+            Err(error) => unload_errors.push(format!("cleanup skipped: {error}")),
+        }
+    }
+    ModelBenchResult {
+        metadata: model,
+        cold_start,
+        cases,
+        resident_size,
+        resident_vram,
+        unload_errors,
+    }
 }
 
 async fn discover_models(client: &Client, endpoint: &str) -> Result<Vec<ModelMetadata>> {
@@ -441,17 +496,23 @@ async fn run_case(
         _ => client.post(crate::ollama_http::url(endpoint, "/api/chat"))
             .json(&chat_request(model, case)).send().await,
     };
-    let client_ms = millis(started.elapsed());
     let value = match response {
         Ok(response) => match response.error_for_status() {
             Ok(response) => match response.json::<Value>().await {
                 Ok(value) => value,
-                Err(error) => return failed(case, client_ms, format!("decode response: {error}")),
+                Err(error) => {
+                    return failed(
+                        case,
+                        millis(started.elapsed()),
+                        format!("decode response: {error}"),
+                    );
+                }
             },
-            Err(error) => return failed(case, client_ms, format!("HTTP: {error}")),
+            Err(error) => return failed(case, millis(started.elapsed()), format!("HTTP: {error}")),
         },
-        Err(error) => return failed(case, client_ms, format!("request: {error}")),
+        Err(error) => return failed(case, millis(started.elapsed()), format!("request: {error}")),
     };
+    let client_ms = millis(started.elapsed());
     let note = match verify_completion_identity(client, endpoint, model).await {
         Ok(note) => note,
         Err(error) => return failed(case, client_ms, error),
@@ -914,227 +975,4 @@ fn f64_count(value: usize) -> f64 {
 }
 
 #[cfg(test)]
-mod cache_metric_tests {
-    use super::*;
-
-    #[test]
-    fn correct_text_cannot_pass_without_a_complete_error_free_assistant_message() {
-        let case = BenchCase {
-            id: "exact",
-            capability: Capability::Completion,
-            num_ctx: 2048,
-            kind: CaseKind::Exact,
-        };
-        let complete = json!({"done":true,"message":{"role":"assistant","content":"FREELLAMA_OK"}});
-        assert!(grade_completed_case(&case, 100, &complete).passed);
-        for completion in [json!(false), Value::Null, json!("true")] {
-            let mut incomplete = complete.clone();
-            incomplete["done"] = completion;
-            let result = grade_completed_case(&case, 100, &incomplete);
-            assert!(!result.passed, "{incomplete}");
-            assert!(result.error.unwrap().contains("done:true"));
-        }
-        for error in [
-            json!("generation failed"),
-            json!({"message":"generation failed"}),
-        ] {
-            let mut failed = complete.clone();
-            failed["error"] = error;
-            assert!(!grade_completed_case(&case, 100, &failed).passed);
-        }
-        for message in [
-            json!({"role":"user","content":"FREELLAMA_OK"}),
-            json!({"content":"FREELLAMA_OK"}),
-            json!({"role":"assistant","content":42}),
-        ] {
-            let mut invalid = complete.clone();
-            invalid["message"] = message;
-            assert!(!grade_completed_case(&case, 100, &invalid).passed);
-        }
-    }
-
-    #[test]
-    fn embedding_benchmark_keeps_its_non_chat_completion_contract() {
-        let case = BenchCase {
-            id: "embedding",
-            capability: Capability::Embedding,
-            num_ctx: 2048,
-            kind: CaseKind::Embedding,
-        };
-        let mut response = json!({"embeddings":[[0.1,0.2],[0.2,0.3]]});
-        assert!(grade_completed_case(&case, 100, &response).passed);
-        response["error"] = json!("embedding failed");
-        assert!(!grade_completed_case(&case, 100, &response).passed);
-    }
-
-    fn decision_case() -> BenchCase {
-        BenchCase {
-            id: "decision/noul",
-            capability: Capability::Decision,
-            num_ctx: 2048,
-            kind: CaseKind::Decision,
-        }
-    }
-
-    fn decision_answer(stopped: &Value, moving: &Value) -> Value {
-        json!({
-            "model": "d",
-            "answers": {
-                "stopped": {"type": "noul", "noul": stopped},
-                "moving": {"type": "noul", "noul": moving}
-            },
-            "usage": {"input_tokens": 179, "output_tokens": 0}
-        })
-    }
-
-    #[test]
-    fn decision_case_passes_only_on_confident_correct_probabilities() {
-        let case = decision_case();
-        // Live shape from Ollama 0.40.15 `/v1/systemone` with strands-decider.
-        let correct = decision_answer(&json!(0.95), &json!(0.07));
-        let result = grade_completed_case(&case, 50, &correct);
-        assert!(result.passed, "{result:?}");
-        assert_eq!(result.prompt_tokens, Some(179));
-        assert_eq!(result.output_tokens, Some(0));
-        assert_eq!(
-            result.output_excerpt.as_deref(),
-            Some("stopped=0.950 moving=0.070")
-        );
-
-        for (stopped, moving) in [
-            (json!(0.07), json!(0.95)), // inverted
-            (json!(0.9), json!(0.9)),   // always yes
-            (json!(0.55), json!(0.45)), // hedging
-            (json!(1.5), json!(0.0)),   // not a probability
-            (json!("0.9"), json!(0.1)), // not a number
-            (Value::Null, json!(0.1)),
-        ] {
-            let result = grade_completed_case(&case, 50, &decision_answer(&stopped, &moving));
-            assert!(!result.passed, "{result:?}");
-            assert!(result.error.is_some());
-        }
-
-        let mut missing = correct.clone();
-        missing["answers"].as_object_mut().unwrap().remove("moving");
-        assert!(!grade_completed_case(&case, 50, &missing).passed);
-        let mut wrong_type = correct.clone();
-        wrong_type["answers"]["moving"]["type"] = json!("choice");
-        assert!(!grade_completed_case(&case, 50, &wrong_type).passed);
-        let mut upstream_error = correct;
-        upstream_error["error"] = json!("model is not a decision model");
-        assert!(!grade_completed_case(&case, 50, &upstream_error).passed);
-    }
-
-    /// The bench must send what the platform's decision tasks send to `/v1/systemone`: a state
-    /// and named questions, with no chat or option fields the endpoint does not read.
-    #[test]
-    fn decision_request_uses_the_systemone_task_shape() {
-        let model = ModelMetadata {
-            name: "strands-decider:2b-nvfp4".to_owned(),
-            digest: Some("sha".to_owned()),
-            size: 1,
-            format: String::new(),
-            family: String::new(),
-            parameter_size: String::new(),
-            quantization: String::new(),
-            capabilities: vec![Capability::Decision],
-            model_type: ModelType::Decision,
-            advertised_context: None,
-        };
-        let request = decision_request(&model);
-        let keys = request
-            .as_object()
-            .unwrap()
-            .keys()
-            .map(String::as_str)
-            .collect::<BTreeSet<_>>();
-        assert_eq!(
-            keys,
-            BTreeSet::from(["keep_alive", "model", "questions", "state"])
-        );
-        for name in [DECISION_TRUE_QUESTION, DECISION_FALSE_QUESTION] {
-            assert_eq!(request["questions"][name]["type"], "noul");
-        }
-    }
-
-    #[test]
-    fn digest_observation_considers_every_same_name_entry() {
-        let listing = json!({"models": [
-            {"name": "m:1", "digest": "old"},
-            {"name": "m:1", "digest": "new"},
-            {"model": "n:1", "digest": "new"},
-            {"name": "o:1"}
-        ]});
-        let observe = |name| observe_digest(Some(&listing), name, "new");
-        assert_eq!(observe("m:1"), DigestObservation::Matches);
-        assert_eq!(observe("n:1"), DigestObservation::Matches);
-        assert_eq!(
-            observe_digest(Some(&listing), "m:1", "other"),
-            DigestObservation::Differs
-        );
-        assert_eq!(observe("o:1"), DigestObservation::Absent);
-        assert_eq!(observe("absent:1"), DigestObservation::Absent);
-        assert_eq!(
-            observe_digest(Some(&json!({"error": "x"})), "m:1", "new"),
-            DigestObservation::Unavailable
-        );
-        assert_eq!(
-            observe_digest(None, "m:1", "new"),
-            DigestObservation::Unavailable
-        );
-    }
-
-    /// A model evicted by another client after a complete response is still graded when
-    /// `/api/tags` names the same digest; any observed different digest fails, and a digest that
-    /// neither endpoint shows fails with its own message.
-    #[test]
-    fn completion_identity_falls_back_to_tags_only_for_an_unobserved_runner() {
-        use DigestObservation::{Absent, Differs, Matches, Unavailable};
-        assert_eq!(completion_identity(Matches, Unavailable), Ok(None));
-        let evicted = completion_identity(Absent, Matches).unwrap().unwrap();
-        assert!(evicted.contains("evicted after the response completed"));
-        let ps_down = completion_identity(Unavailable, Matches).unwrap().unwrap();
-        assert!(ps_down.contains("/api/ps was unavailable"));
-        for (resident, listed) in [
-            (Differs, Unavailable),
-            (Differs, Matches),
-            (Absent, Differs),
-        ] {
-            assert_eq!(
-                completion_identity(resident, listed),
-                Err(DIGEST_CHANGED.to_owned())
-            );
-        }
-        for (resident, listed) in [
-            (Absent, Absent),
-            (Absent, Unavailable),
-            (Unavailable, Unavailable),
-            (Unavailable, Absent),
-        ] {
-            assert_eq!(
-                completion_identity(resident, listed),
-                Err(DIGEST_UNOBSERVED.to_owned())
-            );
-        }
-        assert_ne!(DIGEST_CHANGED, DIGEST_UNOBSERVED);
-    }
-
-    #[test]
-    fn benchmark_prefill_rate_uses_uncached_tokens() {
-        let mut value = json!({"prompt_eval_count":10,"prompt_eval_duration":1_000_000_000});
-        assert_eq!(
-            rate(&value, "prompt_eval_count", "prompt_eval_duration"),
-            None
-        );
-        value["prompt_eval_cached_count"] = json!(4);
-        assert_eq!(
-            rate(&value, "prompt_eval_count", "prompt_eval_duration"),
-            Some(6.0)
-        );
-        value["prompt_eval_cached_count"] = json!(11);
-        assert_eq!(
-            rate(&value, "prompt_eval_count", "prompt_eval_duration"),
-            None
-        );
-    }
-}
+mod tests;

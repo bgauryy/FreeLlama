@@ -1,5 +1,8 @@
 //! The cooperative admission governor: cached sampling, pressure holds and memory reservations.
 
+#[cfg(test)]
+mod audit_tests;
+
 use std::{
     sync::{
         Arc, Mutex as StdMutex, OnceLock,

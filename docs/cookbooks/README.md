@@ -1,6 +1,11 @@
 # FreeLlama cookbooks
 
-Short recipes for one job each: when to use it, which model, the exact call, and how to check the result. To see what is installed and fits right now, ask `models {view:"catalog"}` or run `freellama catalog`.
+Short recipes for one job each: when to use it, which model, the exact call, and how to check the result. To inspect installed candidates and memory previews, ask `models {view:"catalog"}` or run `freellama catalog`.
+
+Job/workflow calls without `model` use [machine-local calibrated routing](../MODEL_SELECTION.md#turn-measurements-into-routing-evidence)
+before the portable catalog fallback. Explicit model tags in recipes are examples, not proof of
+installation or current fit. Read the [check-line and tool-calling evidence](../RELIABILITY.md)
+when deciding how to verify a result.
 
 | Job | Recipe |
 |---|---|
@@ -21,4 +26,4 @@ Short recipes for one job each: when to use it, which model, the exact call, and
 
 From a shell, each `run_task` job runs with `freellama run -j <job>` (or `-w <workflow>`); the speech, research and sweep recipes run with `freellama tool audio|delegate_research|sweep '<arguments>'` ([agent CLI](../AGENT_CLI.md)).
 
-Every call here is checked against the tool schemas by a test. Measured results come from one machine: an Apple M2 Pro with 32 GB. Measure on yours before you rely on them.
+The [cookbook integration test](../../packages/mcp/test/integration/cookbooks.test.ts) checks the JSON calls against tool schemas; it does not execute their inference or verify model quality. Measured results come from one machine: an Apple M2 Pro with 32 GB. Measure on yours before you rely on them.

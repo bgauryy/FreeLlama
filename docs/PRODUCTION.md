@@ -1,8 +1,9 @@
 # Prepare FreeLlama for production
 
 This runbook prepares the FreeLlama management layer for agents using local models in a
-single-operator or trusted-team deployment. Configure the Ollama backends, model evidence,
-authentication, and resource limits before agents submit work.
+single-operator or trusted-team deployment. Configure inference endpoints, model evidence,
+authentication, and resource limits before agents submit work. The full lifecycle and automatic
+routing path uses Ollama; [managed llama.cpp](LLAMACPP.md) is an explicit bounded text path.
 
 FreeLlama supports authenticated nonloopback listeners. Put TLS and tenant-specific rate limits
 at an external ingress when traffic crosses a machine boundary; FreeLlama's bearer token does
@@ -10,7 +11,9 @@ not provide tenant isolation or billing.
 
 ## Meet the prerequisites
 
-- Install one Ollama CLI and server version. Run `freellama doctor` and resolve any mismatch.
+- For Ollama-managed workloads, install matching Ollama CLI and server versions. Run
+  `freellama doctor` and resolve any mismatch. A llama.cpp-only deployment uses its explicit
+  route preview for engine readiness; general `ready` remains Ollama-oriented.
 - Install Node.js 22 or later for MCP and npm distribution use.
 - Use the release artifacts for your operating system, or build with Rust 1.89 or later.
 - Preinstall and benchmark exact model tags. Discovery never authorizes a pull.
@@ -37,8 +40,10 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Version VERSION 
 Without a version, both scripts install the latest release: the npm package when npm is on PATH,
 otherwise the binary.
 
-The repository has no CI or release workflows; they were removed (see git history). Release from a
-clean checkout: `yarn release:version <version>`, `yarn release:build` (builds each target's
+The [CI workflow](../.github/workflows/ci.yml) defines Linux, macOS and Windows contract lanes,
+with strict Rust lint on Linux and a read-only live memory check on Windows. Workflow presence is
+not evidence that a hosted run passed, nor is it live GPU qualification. Automated publication is
+not configured. Release from a clean checkout: `yarn release:version <version>`, `yarn release:build` (builds each target's
 executable and addon into `release-artifacts/<target>/`), `node scripts/assemble-release.mjs
 release-artifacts release`, then `yarn release:verify:publish`. The publish verifier checks that
 `FREELLAMA_RELEASE_TAG`, when set, matches the workspace version. It also requires every addon and
@@ -199,15 +204,18 @@ url = "https://api.example.com/v1"
 api_key_file = "keys/cloud.key"      # mode 0600; sent only over HTTPS or to this machine
 ```
 
-Only OpenAI-compatible paths (`/v1/...`) route by model: `name/model` goes to that engine as
+By default, OpenAI-compatible paths (`/v1/...`) route by model: `name/model` goes to that engine as
 `model`; a bare name goes to Ollama when Ollama has it, else to the first engine whose `/v1/models`
 lists it. `GET /v1/models` merges every list and names unreachable engines. A request to an engine is
 sent once (no retries), streams through unchanged, carries the `x-freellama-upstream` header and is
 counted in usage. An engine on this machine waits out host holds as a loaded Ollama model would; a
-remote one does not. Managed tasks, residency and the memory budget cover Ollama only, and there is no
-automatic failover from one engine to another. A managed task can name an explicit
-[fallback chain](FEATURES.md#fallback-chains) of Ollama models, tried only after a refusal before
-execution.
+remote one does not. A local llama.cpp server can opt into [managed text tasks](LLAMACPP.md) with
+`[upstream.llamacpp]`; those tasks share weighted admission and host memory reservations. Other
+engines remain passthrough-only, and engine lifecycle remains operator-owned. There is no automatic
+failover from one engine to another. A managed task can name an explicit
+[fallback chain](FEATURES.md#fallback-chains), tried only after an eligible refusal before
+execution. Each candidate must support the original task's fields; an external engine's transport
+or generation failure does not trigger fallback.
 
 Everything the server learns lives in one `SQLite` database, `~/.octocode/freellama/freellama.sqlite`
 (`--home` or `FREELLAMA_HOME` moves the home): measured runner sizes, placement feedback, the usage
@@ -220,6 +228,20 @@ a corrupt or unknown-version snapshot starts empty with a stderr warning and `/h
 another schema version is refused with its path; move or delete it to start a new one. Use
 `--ephemeral` only for disposable tests.
 
+## Failure and availability boundary
+
+An explicit [fallback chain](FEATURES.md#fallback-chains) advances only after a refusal proving no
+execution occurred. HTTP generation errors, transport timeouts, accepted-request disconnects and
+unknown outcomes do not authorize retry on another model or engine. Durable jobs retain receipts;
+they do not resume inference after restart. FreeLlama does not provide active/standby takeover,
+automatic cross-engine failover, or distributed execution leases. An external service manager can
+restart the process, but must not replay uncertain work.
+
+Resource-waiting managed tasks retain bounded queue tickets while releasing execution units.
+Cancellation releases local permits; physical cancellation remains the inference server's job.
+Multiple FreeLlama processes may share SQLite evidence, but their admission pools and memory
+reservations are process-local. Use one coordinating authority for a shared inference topology.
+
 ## Bound conversation history and residency
 
 Scope histories and sessions are process-local and are discarded on restart. Deferred jobs are
@@ -228,8 +250,8 @@ terminal receipts survive a restart, an unfinished job reads back as an unknown 
 is replayed (see [Deferred jobs and recovery](DEFERRED_JOBS.md)). Receipt persistence is not
 executable recovery: nothing resumes an interrupted inference. Configure
 `[scopes]` and `[warming]` limits in the runtime file from measured workload needs; finite history
-bounds and automatic retention remain separate from host-memory reserves. Warm loads use the same
-admission and placement checks as tasks. See [Scope history and model warming](SCOPES_AND_WARMING.md)
+bounds and automatic retention remain separate from host-memory reserves. Ollama warm loads use the same
+admission and placement checks as its tasks. External-engine lifecycle is operator-owned. See [Scope history and model warming](SCOPES_AND_WARMING.md)
 for expected revisions, forks, explicit history reads, and residency precedence.
 
 Usage persistence is asynchronous best effort. Inspect pending, dropped, failed, and error evidence
@@ -262,6 +284,9 @@ Ollama's known default covers it.
 
 ## Verify lifecycle and placement
 
+These checks apply to Ollama. llama.cpp returns configured assignment and unknown physical
+placement, and refuses warm, unload and observed-placement requirements.
+
 `keep_alive:0` preserves placement evidence. FreeLlama temporarily holds the runner,
 observes `/api/ps`, records eligible feedback, explicitly unloads it, and verifies that it is no
 longer resident before returning. Inspect both `execution.observation` and
@@ -287,9 +312,11 @@ accelerator acceptance is separate because build machines do not necessarily rep
 GPU drivers or memory topology. Prepare Apple Metal, NVIDIA Linux, AMD Linux, and NVIDIA Windows
 hosts, then run a hardware acceptance check directly on each host.
 
-The portable hardware runners were removed from the repository; they remain in git history.
+The portable hardware runners remain in git history; the current CI contract lanes do not
+replace hardware acceptance. Retain the runner, configuration, version and raw results used for
+each live hardware claim.
 
-Do not mark a hardware row validated until its archived receipt says `verdict: accept`. Missing
+Do not mark a hardware row validated until its archived acceptance evidence supports that claim. Missing
 hardware is an explicit release gap, not a result that documentation can waive.
 
 ## Promotion checklist
@@ -298,14 +325,17 @@ Promote a release only when all conditions pass:
 
 1. `cargo fmt --all --check`, Clippy, Rust tests, typecheck, unit, integration, and live E2E pass.
 2. Release packaging contains every declared target and `SHA256SUMS` verifies.
-3. The active CLI and Ollama server versions match.
-4. Reboot-persistent service definitions carry the explicit Ollama settings and FreeLlama args.
-5. Health reports authentication, atomic feedback persistence, and current placement contracts.
-6. Restart testing proves feedback reloads and a corrupt snapshot fails startup.
-7. Immediate unload reports verified pre-unload placement and verified post-unload absence.
+3. For Ollama workloads, the active CLI and server versions match.
+4. Reboot-persistent service definitions carry the explicit inference-server settings and FreeLlama args.
+5. Health reports authentication, feedback persistence state and the relevant engine contracts;
+   observed placement is required only where the engine can supply it.
+6. Restart testing proves feedback reloads; a corrupt or unsupported feedback snapshot yields
+   `feedback.persistence.last_error`, starts with empty feedback and is not silently overwritten.
+   An unsupported database schema remains a separate startup refusal.
+7. For Ollama lifecycle support, immediate unload reports verified pre-unload placement and verified post-unload absence.
 8. Every claimed hardware row has a real archived acceptance receipt.
 9. The MCP schemas match the published tool surface and pass its context-budget contract.
 
 Rollback by returning the listener to loopback, stopping the new service, and starting the prior
-checksummed binary with the same policy and feedback snapshot. Never downgrade across an unsupported
+checksummed binary with compatible policy, database and feedback state preserved together. Never downgrade across an unsupported
 feedback schema without preserving the old binary and snapshot together.

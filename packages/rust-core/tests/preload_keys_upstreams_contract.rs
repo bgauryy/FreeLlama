@@ -395,6 +395,60 @@ async fn engine(engine: Engine) -> (String, tokio::task::JoinHandle<()>) {
     serve(router).await
 }
 
+#[tokio::test]
+async fn oversized_external_model_lists_are_unknown_and_recover_on_the_next_read() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (upstream, ollama_server) = ollama(Mock::default()).await;
+    let oversized = Arc::new(AtomicBool::new(true));
+    let toggle = oversized.clone();
+    let models = Router::new().route(
+        "/v1/models",
+        get(move || {
+            let toggle = toggle.clone();
+            async move {
+                let mut value = json!({"data":[{"id":"external-model"}]});
+                if toggle.load(Ordering::SeqCst) {
+                    value["padding"] = json!("x".repeat(4 * 1024 * 1024));
+                }
+                Json(value)
+            }
+        }),
+    );
+    let (engine_url, engine_server) = serve(models).await;
+    let router = app(
+        &config(upstream, false).with_upstreams(vec![OpenAiUpstream {
+            name: "bounded".into(),
+            base_url: format!("{engine_url}/v1"),
+            api_key: None,
+            llamacpp: None,
+        }]),
+    )
+    .unwrap();
+    let request = || Request::get("/v1/models").body(Body::empty()).unwrap();
+    let (status, _, first) = call(&router, request()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(first["unreachable"], json!(["bounded"]));
+    assert!(
+        !first["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|model| model["id"] == "bounded/external-model")
+    );
+    oversized.store(false, Ordering::SeqCst);
+    let (_, _, recovered) = call(&router, request()).await;
+    assert!(recovered.get("unreachable").is_none());
+    assert!(
+        recovered["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|model| model["id"] == "bounded/external-model")
+    );
+    engine_server.abort();
+    ollama_server.abort();
+}
+
 /// `/v1/...` requests go to the engine that serves their model; the caller's bearer token never
 /// reaches it, and the merged model list names each engine's models.
 #[tokio::test]
@@ -406,6 +460,7 @@ async fn openai_requests_route_to_the_engine_that_serves_their_model() {
     let router = app(&config(upstream, false)
         .with_auth_token(operator.clone())
         .with_upstreams(vec![OpenAiUpstream {
+            llamacpp: None,
             name: "lm".into(),
             base_url: format!("{lm_url}/v1"),
             api_key: Some("engine-key".into()),

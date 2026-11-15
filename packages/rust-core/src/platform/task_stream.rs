@@ -12,7 +12,7 @@
 //! | `error` | refused or failed | the error body, `status` and `retry_safe` |
 //!
 //! Fallback models advance only before generation starts, as without streaming. A client that
-//! disconnects aborts the task, which drops the upstream request so Ollama stops generating; the
+//! disconnects aborts the task and drops the upstream request to request cancellation; the
 //! work is not replayed.
 use std::{
     pin::Pin,
@@ -50,7 +50,10 @@ pub(crate) enum TaskEvent {
     Thinking(String),
 }
 
-pub(crate) type EventSink = mpsc::UnboundedSender<TaskEvent>;
+pub(crate) type EventSink = mpsc::Sender<TaskEvent>;
+
+const EVENT_CAPACITY: usize = 32;
+const FRAME_CAPACITY: usize = 16;
 
 /// The pipeline's progress reporter: a deferred job's status, a stream's events, or both.
 #[derive(Debug, Clone)]
@@ -66,7 +69,8 @@ impl Progress {
 
     pub(crate) fn update(&self, status: JobStatus, reason: &'static str, detail: Option<Value>) {
         if let Some(events) = &self.events {
-            let _ = events.send(TaskEvent::Phase {
+            // Status is best effort under backpressure; generated text uses awaited sends.
+            let _ = events.try_send(TaskEvent::Phase {
                 status,
                 reason,
                 detail: detail.clone(),
@@ -77,12 +81,14 @@ impl Progress {
         }
     }
 
-    pub(crate) fn route(&self, model: &str, backend: &str) {
+    pub(crate) async fn route(&self, model: &str, backend: &str) {
         if let Some(events) = &self.events {
-            let _ = events.send(TaskEvent::Route {
-                model: model.to_owned(),
-                backend: backend.to_owned(),
-            });
+            let _ = events
+                .send(TaskEvent::Route {
+                    model: model.to_owned(),
+                    backend: backend.to_owned(),
+                })
+                .await;
         }
         if let Some(job) = &self.job {
             job.route(model, backend);
@@ -94,7 +100,7 @@ impl Progress {
 /// `{generated_tokens, tokens_per_second}` at most about once a second, so a caller polling the
 /// job (MCP `run_task` progress) sees liveness without receiving the text.
 pub(crate) fn job_token_counter(job: JobProgress) -> EventSink {
-    let (events, mut received) = mpsc::unbounded_channel::<TaskEvent>();
+    let (events, mut received) = mpsc::channel::<TaskEvent>(EVENT_CAPACITY);
     tokio::spawn(async move {
         let mut tokens = 0_u64;
         let mut started = None;
@@ -211,37 +217,47 @@ fn error_frame(error: ApiError, generated: bool) -> Bytes {
 
 /// Start the task and answer with its event stream.
 pub(crate) fn respond(state: PlatformState, mut input: TaskInput) -> Response {
-    let (frames, receiver) = mpsc::unbounded_channel::<Bytes>();
-    let (events, mut task_events) = mpsc::unbounded_channel::<TaskEvent>();
+    let (frames, receiver) = mpsc::channel::<Bytes>(FRAME_CAPACITY);
+    let (events, mut task_events) = mpsc::channel::<TaskEvent>(EVENT_CAPACITY);
     input.stream_events = Some(events);
+    // The execution task must keep polling its deadline while a connected reader stops consuming
+    // frames. A separate bounded forwarder provides backpressure without suspending that timer.
+    input
+        .timeout_seconds
+        .get_or_insert_with(|| super::platform_task_timeout().as_secs());
+    let mut work = tokio::spawn(super::execution::execute_task(State(state), Json(input)));
+    let cancel_work = AbortTaskOnDrop(work.abort_handle());
     let task = tokio::spawn(async move {
-        let work = super::execution::execute_task(State(state), Json(input));
-        tokio::pin!(work);
+        let _cancel_work = cancel_work;
         let mut generated = false;
-        let mut send = |event: TaskEvent| {
-            let (bytes, delta) = event_frame(event);
-            generated |= delta;
-            frames.send(bytes).is_ok()
-        };
         let result = loop {
             tokio::select! {
                 biased;
                 Some(event) = task_events.recv() => {
-                    if !send(event) {
+                    let (bytes, delta) = event_frame(event);
+                    generated |= delta;
+                    if frames.send(bytes).await.is_err() {
                         return;
                     }
                 }
-                result = &mut work => break result,
+                result = &mut work => break result.unwrap_or_else(|error| {
+                    Err(ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error)
+                        .with_upstream_response("task_worker_failed", json!({"done":false}), None))
+                }),
             }
         };
         while let Ok(event) = task_events.try_recv() {
-            send(event);
+            let (bytes, delta) = event_frame(event);
+            generated |= delta;
+            if frames.send(bytes).await.is_err() {
+                return;
+            }
         }
         let last = match result {
             Ok(Json(receipt)) => frame("done", &receipt),
             Err(error) => error_frame(error, generated),
         };
-        let _ = frames.send(last);
+        let _ = frames.send(last).await;
     });
     let mut response = Response::new(Body::new(EventBody {
         frames: receiver,
@@ -260,10 +276,19 @@ pub(crate) fn respond(state: PlatformState, mut input: TaskInput) -> Response {
 }
 
 /// The response body: frames as the task produces them. Dropping it (the client went away)
-/// aborts the task, which drops its upstream request and stops generation.
+/// aborts the task, dropping its upstream request and releasing local execution capacity.
 struct EventBody {
-    frames: mpsc::UnboundedReceiver<Bytes>,
+    frames: mpsc::Receiver<Bytes>,
     task: AbortHandle,
+}
+
+/// Aborting a forwarder must not detach the task that owns admission and resource reservations.
+struct AbortTaskOnDrop(AbortHandle);
+
+impl Drop for AbortTaskOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 impl Drop for EventBody {

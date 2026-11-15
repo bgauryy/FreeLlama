@@ -4,7 +4,16 @@
 
 **Skip it when** the change spans files, needs judgment you must stand behind, or is shorter than describing it. Local code review is unreliable: verify every finding.
 
-**Model:** `bonsai-2:9b` (3.2 GB, about 10.3 GB available needed). It answered every workflow case in the 2026-11-12 field test, with proper SEARCH/REPLACE edits and correct tool calls. Nemotron-3.5-Bolt scored best on 25 small questions (68 right over three rounds, against 55) but needs about 13.5 GB available. `lfm3:1.7b` is no longer a pick: it scored 61 on the questions, then answered workflows with tool calls nobody asked for. Run `models {view:"catalog", job:"coding"}` for what fits now.
+**Historical starting point:** `bonsai-2:9b` (3.2 GB file; the dated catalog preview asked for
+10.3 GB available). It answered every case in one 2026-11-12 field-test round, with SEARCH/REPLACE
+edits and tool calls; that result does not establish general coding or tool reliability.
+Nemotron-3.5-Bolt scored best on 25 small questions (68 right over three rounds, against 55) but its
+preview asked for 13.5 GB available. `lfm3:1.7b` scored 61 on the questions, then answered workflows
+with tool calls nobody asked for, so it was removed from the portable picks.
+
+Inspect `models {view:"catalog", job:"coding"}` for current candidates. Workflows without `model`
+use [local calibration before fallback](../MODEL_SELECTION.md#turn-measurements-into-routing-evidence);
+the [newer tool-calling smoke results](../RELIABILITY.md#measured-on-2026-11-14) are separate evidence.
 
 Pass the code by path:
 

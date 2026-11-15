@@ -8,18 +8,23 @@ prompts, and new loads held until they fit in memory, for your coding agent and 
 FreeLlama sits between you (or your agent) and [Ollama](https://ollama.com). Ollama runs the
 models; FreeLlama decides which model, how, and whether there is room for it.
 
+An optional [managed llama.cpp engine](https://github.com/bgauryy/FreeLlama/blob/main/docs/LLAMACPP.md) also supports explicitly selected,
+bounded text tasks through the Rust service. Automatic model selection, workflows and lifecycle
+management still use Ollama. See the [current assessment](https://github.com/bgauryy/FreeLlama/blob/main/docs/ASSESSMENT.md) for ratings,
+validation coverage and remaining gaps.
+
 **In numbers** ([benchmark](https://github.com/bgauryy/FreeLlama/blob/main/docs/BENCHMARK.md), one Apple M2 Pro, 2026-11-14):
 
 | | Measured |
 |---|---|
 | Speed | 274 ms median per task against 272 ms for Ollama alone; first streamed token 95 vs 93 ms |
 | Cost of the layer | 3.7 ms per task (p95 9.8 ms), 9.7 ms of CPU, 26–31 MB of RAM |
-| Answers | Built-in workflow prompts passed 98% of graded cases where one-line prompts passed 52%, faster and with 36% fewer tokens |
+| Answers | Built-in workflow prompts passed 45/46 completed graded cases (98%; 45/48 planned, 94%), against 25/48 (52%) for one-line prompts; mean output used 36% fewer tokens |
 | Memory | A 7.2 GB load with 4.2 GB free was refused with the programs holding memory, instead of swapping |
 
 ```mermaid
 flowchart LR
-    ask["A request:<br/>workflow, job or model"] --> pick["1. Pick<br/>a tested model that is<br/>installed and fits now"]
+    ask["An Ollama request:<br/>workflow, job or model"] --> pick["1. Pick<br/>a qualified local calibration,<br/>else a catalog or capability fallback"]
     pick --> tune["2. Tune<br/>the model card's settings<br/>+ tested workflow prompt"]
     tune --> gate{"3. Gate<br/>does the load fit<br/>in free memory?"}
     gate -->|yes| run["Ollama runs it"]
@@ -45,6 +50,7 @@ flowchart LR
         serve["freellama serve<br/>127.0.0.1:11435<br/>routing, admission, memory gate"]
     end
     ollama[("Ollama<br/>Metal, CUDA, ROCm, CPU")]
+    cpp[("Optional llama.cpp server<br/>explicit bounded text tasks")]
 
     agent -->|"MCP"| mcp
     you --> cli
@@ -53,25 +59,28 @@ flowchart LR
     mcp -->|"managed tasks"| serve
     gw -->|"virtual models: pick, prompts, admitted load"| serve
     serve --> ollama
+    serve --> cpp
 ```
 
 ## Why not call Ollama directly?
 
-Ollama runs whatever tag you name, with the model's default settings. Three things go wrong that a
-caller cannot see. FreeLlama addresses each one; the answer is still yours to check.
+Ollama runs the tag and settings you request. Choosing well on a shared workstation requires
+metadata inspection, host observations and coordination. FreeLlama supplies that layer; the answer
+is still yours to check. The [end-to-end review](https://github.com/bgauryy/FreeLlama/blob/main/docs/OLLAMA_REVIEW.md) explains the architecture,
+implemented repairs and remaining evidence gaps.
 
 | What goes wrong with a direct call | What FreeLlama does | What we measured |
 |---|---|---|
-| **The wrong model for this machine.** A tag name says nothing about capability, context or memory. One load too many and the machine starts swapping. | Picks the tested model for the job that is installed *and fits now*. A load that does not fit waits, then is refused with the reason and the programs holding the memory. | With 6.5 GB free, a code review moved from a 10 GB model to one that fit. A yes/no question ran on a 1.2 GB decision model instead of a 14.5 GB one that would have been refused. |
-| **Default settings waste tokens.** Thinking models reason before every answer. Small models pad their output. | Applies each model card's documented sampling and think setting, plus step-by-step workflow prompts that were tested on the models. | A direct call spent 61 tokens (0.92 s) thinking before answering "OK"; FreeLlama answered in 2 tokens (0.47 s). Built-in workflow prompts passed 98% of graded cases where one-line prompts passed 52%. |
-| **No way to tell a good answer from a bad one.** Answers loop, pad, invent facts, or come back empty. | Returns `check:` lines (filler, invented facts, edits that do not match the file) and a receipt with the model, timing, cache hits and GPU/CPU placement. | An empty "thinking-only" answer exits 1 with the fix (`--think=false`) instead of looking like success. |
+| **The wrong model for this machine.** A tag name says nothing about capability, context or memory. One load too many and the machine starts swapping. | Uses a qualifying [machine-local route](https://github.com/bgauryy/FreeLlama/blob/main/docs/MODEL_SELECTION.md#turn-measurements-into-routing-evidence) first, then catalog or capability fallbacks. Throughput does not prove quality. A load that does not fit waits, then is refused with the reason and the programs holding the memory. | With 6.5 GB free, a code review moved from a 10 GB model to one that fit. A yes/no question ran on a 1.2 GB decision model instead of a 14.5 GB one that would have been refused. |
+| **Default settings waste tokens.** Thinking models reason before every answer. Small models pad their output. | Applies each model card's documented sampling and think setting, plus step-by-step workflow prompts that were tested on the models. | A direct call spent 61 tokens (0.92 s) thinking before answering "OK"; FreeLlama answered in 2 tokens (0.47 s). Workflow prompts passed 45/46 completed cases against 25/48 for one-line prompts. |
+| **No way to tell a good answer from a bad one.** Answers loop, pad, invent facts, or come back empty. | Returns `check:` lines for filler, numbers or quoted text absent from the source, and edits that do not match the file, plus execution receipts. [Measured misses and false alarms](https://github.com/bgauryy/FreeLlama/blob/main/docs/RELIABILITY.md) remain visible; clean checks do not prove accuracy. | An empty "thinking-only" answer exits 1 with the fix (`--think=false`) instead of looking like success. |
 
 Over a session it also keeps the machine efficient:
 
 | Mechanism | Effect | Measured |
 |---|---|---|
 | **Prompt cache kept** | Reuses a loaded model's context window and settings, so Ollama's prompt cache survives between turns | A second question about a 3,144-token document took 5.1 s instead of 11.9 s (attention models; Ollama does not cache hybrid models such as `lfm3` across turns) |
-| **Admitted loads only** | Every model load through FreeLlama, streamed requests included, goes through the memory gate (direct calls to Ollama bypass it) | — |
+| **Managed local admission** | Managed Ollama loads, including streams, pass the memory gate; managed llama.cpp tasks reserve their configured memory budget. Direct engine calls and external server startup are outside this gate | — |
 | **Indexed code search** | A repeated search embeds only the chunks that changed | `packages/mcp/src`: 55.9 s first, 0.13 s next |
 | **Long tasks as jobs** | A long task returns a job id at once; the agent polls and stays free | Job id in 29 ms; an interactive task behind 8 queued ones answered in 1.40 s instead of 3.52 s |
 
@@ -85,7 +94,7 @@ The name means less metered inference, not only Meta's Llama models.
 
 | You need | Why |
 |---|---|
-| [Ollama](https://ollama.com/download) running (`ollama list` works) with at least one model | FreeLlama manages Ollama and never downloads a model without your approval. Only the one-line installer below offers to install Ollama, and only after asking you |
+| [Ollama](https://ollama.com/download) running (`ollama list` works) with at least one model | Required for the agent workflows below. FreeLlama never downloads a model without your approval. Only the one-line installer offers to install Ollama, and only after asking you |
 | Node.js 22 or newer | Runs the MCP server, the agent commands (`run`, `chat`, `gateway`…) and the npm launcher |
 | One of the platforms below | npm installs the matching prebuilt binary as an optional dependency; do not install with `--omit=optional` |
 
@@ -100,6 +109,11 @@ The name means less metered inference, not only Meta's Llama models.
 Intel Macs and musl Linux (such as Alpine) have no prebuilt binary: [build from source](https://github.com/bgauryy/FreeLlama/blob/main/docs/BUILD_AND_NOTES.md#build-from-source)
 with Rust 1.89 or newer. A second, CPU-only Ollama for small helper models is optional
 ([CPU/GPU routing](https://github.com/bgauryy/FreeLlama/blob/main/docs/CPU_GPU_ROUTING.md)).
+
+Published npm installs on supported platforms use prebuilt Rust binaries; they need Node 22+,
+not a Rust toolchain. Source builds need Rust and, for the agent commands and MCP, Node. The
+[explicit llama.cpp operator path](https://github.com/bgauryy/FreeLlama/blob/main/docs/LLAMACPP.md) can run without Ollama; `run`, `chat`,
+`gateway` and global readiness still depend on Ollama.
 
 When Ollama is missing, every command that needs it stops at once and says what to do:
 
@@ -171,7 +185,7 @@ Or name a workflow. FreeLlama then picks the model and gives it step-by-step ins
 
 | Call | Returns |
 |---|---|
-| `models {view:"catalog", job}` | The tested picks for a job: installed or not, fits now or not |
+| `models {view:"catalog", job}` | Shipped recommendations for a job, with current installation and estimated fit; automatic execution can use a qualifying local calibration first |
 | `run_task {preview:true}` | The route, without running or reserving anything |
 
 ### From the terminal
@@ -180,7 +194,7 @@ Or name a workflow. FreeLlama then picks the model and gives it step-by-step ins
 only the answer in a pipe.
 
 ```bash
-freellama catalog                                          # tested picks per job: installed, fits now
+freellama catalog                                          # catalog recommendations: installed, estimated fit
 git diff | freellama run -w summarize-diff                 # review summary from the pick that fits
 freellama run -w fix-bug -f src/parser.ts "drops the last token"
 freellama run --ask "Is a refund requested?" < ticket.txt  # a yes/no answer with its probability
@@ -224,16 +238,17 @@ FreeLlama's admission and telemetry.
 
 | Area | What it does | Where |
 |---|---|---|
-| **Model choice** | Tested picks per job (coding, summarizing, OCR, image questions, classification, code search, duplicates), each marked installed or not and fitting now or not. Strong-model workflows take the strongest pick that fits, light work the job's default; short memory falls back to a model that fits | `freellama catalog`, `models {view:"catalog"}` |
-| **Streaming with receipts** | Managed tasks stream their tokens as server-sent events (`route`, `admission`, `delta`, then `done` with the full receipt); first token as fast as Ollama's (95 vs 93 ms). MCP shows "generating on MODEL: N tokens, R tok/s" while a job runs | `POST /_freellama/v1/tasks {stream:true}`, [Every API](https://github.com/bgauryy/FreeLlama/blob/main/docs/API.md) |
+| **Model choice** | A qualifying machine-local Rust route takes priority over the shipped catalog. Capable workflows and OCR also require task-quality evidence for that route; otherwise catalog and capability fallbacks apply. The receipt names the selection and any caveats | [Model selection](https://github.com/bgauryy/FreeLlama/blob/main/docs/MODEL_SELECTION.md), `freellama catalog`, `models {view:"catalog"}` |
+| **Second engine** | Explicit local llama.cpp text tasks share the Rust admission pools and resource governor. The operator starts the server and supplies context, output and memory bounds; placement remains unverified | [Managed llama.cpp](https://github.com/bgauryy/FreeLlama/blob/main/docs/LLAMACPP.md) |
+| **Streaming with receipts** | Managed Ollama tasks stream tokens as server-sent events (`route`, `admission`, `delta`, then `done` with the full receipt); measured first token 95 vs 93 ms for direct Ollama. MCP shows "generating on MODEL: N tokens, R tok/s" while a job runs | `POST /_freellama/v1/tasks {stream:true}`, [Every API](https://github.com/bgauryy/FreeLlama/blob/main/docs/API.md) |
 | **Where the time went** | Each receipt's `timing` splits a task by phase (discover, admission, Ollama's answer, placement, learning…) and gives FreeLlama's own `overhead_ms` | `--json`, `response_file`, [Architecture](https://github.com/bgauryy/FreeLlama/blob/main/docs/ARCHITECTURE.md#request-shapes) |
-| **Workflows** | 15 tested instructions for small models: `fix-bug`, `change-code`, `implement`, `write-tests`, `review-code`, `explain-code`, `summarize-log`, `summarize-text`, `summarize-diff`, `extract-json`, `read-text`, `read-table`, `read-fields`, `answer-image`, `describe-screen`. Sampling comes from each model's card; prompts are checked by an eval (98% of graded cases against 52% for one-line prompts, [measured](https://github.com/bgauryy/FreeLlama/blob/main/docs/BENCHMARK.md#built-in-prompts-measured)) | `-w NAME`, `run_task {workflow}`, `scripts/local-test/workflows.mjs` |
+| **Workflows** | 15 tested instructions for small models: `fix-bug`, `change-code`, `implement`, `write-tests`, `review-code`, `explain-code`, `summarize-log`, `summarize-text`, `summarize-diff`, `extract-json`, `read-text`, `read-table`, `read-fields`, `answer-image`, `describe-screen`. Sampling comes from each model's card; the dated eval reports 45/46 completed passes against 25/48 for one-line prompts, with [denominators and limits](https://github.com/bgauryy/FreeLlama/blob/main/docs/BENCHMARK.md#built-in-prompts-measured) | `-w NAME`, `run_task {workflow}`, `scripts/local-test/workflows.mjs` |
 | **Your own workflows** | A Markdown file per workflow (job, title, instructions) in `~/.octocode/freellama/workflows/`. It runs like a built-in, replaces one of the same name, and the receipt names the file and its digest; a bad file is skipped with the reason | [Your own workflows](https://github.com/bgauryy/FreeLlama/blob/main/docs/PROMPTS.md#your-own-workflows), `freellama workflows` |
 | **Fallback chains** | Up to 4 models to try in order, each only after the one before was refused before it ran (no room, input over its context, not installed). Never after a model started; every attempt is in the receipt | `run_task {fallbackModels}`, `--fallback TAG` |
 | **Structured output** | A field list (`'name, age int, tags list'`) or a JSON schema | `--schema` |
 | **Decisions** | Yes/no, one of a list, or a level, with a probability | `--ask`, `--choice`, `--level` |
 | **Embeddings and completion** | Shorter vectors; fill-in-the-middle on models that support it | `--dimensions`, `--suffix` |
-| **Checkable answers** | `check:` lines flag padding, numbers or names missing from the source, edits that do not match the file, leaked `<think>` text, instructions hidden in the input, and fields an extraction left empty. Receipts record the model and why, queue and load times, tokens (cached ones too) and GPU or CPU placement | stderr; MCP `response_file` ([local prompts](https://github.com/bgauryy/FreeLlama/blob/main/docs/PROMPTS.md)) |
+| **Checkable answers** | Heuristics flag some padding, numbers or quoted text absent from the source, invalid edits, leaked thinking, input instructions, empty extraction fields and malformed tool calls. They miss errors and produce false alarms; a clean result still needs verification. Receipts distinguish configured from observed placement | stderr; MCP `response_file`; [measured reliability and limits](https://github.com/bgauryy/FreeLlama/blob/main/docs/RELIABILITY.md) |
 | **Memory safety** | A model loads only if it fits with a reserve; idle models unload first, otherwise the load waits, then is refused with the reason | [The memory gate](https://github.com/bgauryy/FreeLlama/blob/main/docs/ARCHITECTURE.md#managed-task-execution) |
 | **Fair sharing** | One queue per backend weights interactive, normal and background work 3:2:1; holds apply when the machine is busy, hot or swapping. An optional CPU-only Ollama runs helper models beside the GPU | [Monitoring](https://github.com/bgauryy/FreeLlama/blob/main/docs/MONITORING.md) |
 | **Long answers** | Saved whole and returned as a short view | [Where an answer goes](https://github.com/bgauryy/FreeLlama/blob/main/packages/mcp/CONFIGURATION.md#where-an-answer-goes) |
@@ -262,7 +277,7 @@ work on a machine that is also doing other work:
 
 - admission against live host signals (free memory with a reserve, OS pressure, swap, CPU load,
   heat) that holds a cold load but lets a loaded model keep serving;
-- a per-job pick that is installed and fits now, with tested workflow prompts;
+- per-job selection using qualifying local calibration, with catalog fallbacks and tested workflow prompts;
 - compact answers with `check:` lines and a receipt of what ran, where and why.
 
 | Choose | When |
@@ -275,7 +290,8 @@ work on a machine that is also doing other work:
 | llama.cpp, oMLX, vLLM | You want engine-level control: batching, KV caches, kernels |
 
 FreeLlama does not make Ollama decode faster, has no chat UI, no automatic failover between engines
-and no scheduling across machines.
+and no scheduling across machines. It does not automatically escalate failed checks to a cloud
+model; the caller owns that decision. The second engine is currently limited to explicit text tasks.
 
 ### Benchmarks
 
@@ -294,6 +310,10 @@ FreeLlama keeps Ollama's speed and adds what an agent needs on a shared machine:
 
 ![FreeLlama's features measured: built-in prompts pass 98% of graded cases against 52% for one-line prompts; an interactive task behind 8 queued answers in 1.40 s instead of 3.52 s; a repeated code search takes 0.13 s instead of 55.9 s; a repeated sweep 18 ms instead of 49.8 s; a long task returns a job id in 29 ms](https://raw.githubusercontent.com/bgauryy/FreeLlama/main/docs/assets/benchmark-features.png)
 
+The historical charts use completed-case accuracy: 45/46 (98%) for workflow prompts. Relative to
+the nominal 48 planned cases, that is 45/48 (94%), with two completions missing from the retained
+aggregate; the baseline is 25/48 (52%). This small public workload does not estimate general accuracy.
+
 llama.cpp and llama-swap serve concurrent clients faster with Ollama's default settings, and
 LocalAI trades speed for breadth. What to use for what you are building, and how every number was
 measured: [Benchmark](https://github.com/bgauryy/FreeLlama/blob/main/docs/BENCHMARK.md).
@@ -307,7 +327,10 @@ Rust core: route, admit, load, run, observe. Nothing is decided from a model's n
 |---|---|
 | Your agent, or you | Decides what to run, writes the request, verifies the answer |
 | FreeLlama | Picks the model, queues fairly, checks memory and host signals, coordinates loads, writes the receipt |
-| Ollama | Stores models, loads runners, generates tokens |
+| Ollama, or the explicitly configured llama.cpp server | Executes inference; Ollama also supplies discovery, lifecycle operations and observed placement |
+
+The sequence below shows the default Ollama workflow. The [llama.cpp guide](https://github.com/bgauryy/FreeLlama/blob/main/docs/LLAMACPP.md)
+describes its narrower execution path and unsupported controls.
 
 ```mermaid
 sequenceDiagram
@@ -318,7 +341,7 @@ sequenceDiagram
     participant O as Ollama
     A->>F: a workflow, job or model, plus the request
     F->>S: managed task (or a streamed request)
-    Note over S: Route: installed models by capability,<br/>context window and fit; the tested pick first
+    Note over S: Route: installed models by capability,<br/>context window, policy and local calibration
     Note over S: Admit: fair queue, then memory, swap,<br/>CPU-load and heat checks
     alt no room before the wait budget
         S-->>F: 503 naming the hold and what holds memory
@@ -357,6 +380,8 @@ gate, admission and routing are described in [Architecture](https://github.com/b
 | Topic | Page |
 |---|---|
 | All guides | [Documentation index](https://github.com/bgauryy/FreeLlama/blob/main/docs/README.md) |
+| Current ratings, evidence and remaining priorities | [Assessment](https://github.com/bgauryy/FreeLlama/blob/main/docs/ASSESSMENT.md) |
+| End-to-end feature review and Ollama resource strategy | [Ollama review](https://github.com/bgauryy/FreeLlama/blob/main/docs/OLLAMA_REVIEW.md) |
 | Every API on one page: MCP tools, agent commands, gateway, CLI, control API | [Every API](https://github.com/bgauryy/FreeLlama/blob/main/docs/API.md) |
 | `freellama run`, `chat`, `gateway`: flags, virtual models, endpoints | [Agent commands](https://github.com/bgauryy/FreeLlama/blob/main/docs/AGENT_CLI.md) |
 | Operator commands (`serve`, `doctor`, `catalog`…) and flags | [CLI](https://github.com/bgauryy/FreeLlama/blob/main/docs/CLI.md) |
@@ -365,6 +390,8 @@ gate, admission and routing are described in [Architecture](https://github.com/b
 | Features, routing and admission in depth | [Features](https://github.com/bgauryy/FreeLlama/blob/main/docs/FEATURES.md) |
 | Actual vendor checks, numbers, limits and protocol | [Benchmark](https://github.com/bgauryy/FreeLlama/blob/main/docs/BENCHMARK.md) |
 | Choosing a model | [Model selection](https://github.com/bgauryy/FreeLlama/blob/main/docs/MODEL_SELECTION.md), [local model catalog](https://github.com/bgauryy/FreeLlama/blob/main/docs/LOCAL_MODELS.md) |
+| Explicit bounded text tasks on a second engine | [Managed llama.cpp](https://github.com/bgauryy/FreeLlama/blob/main/docs/LLAMACPP.md) |
+| Check accuracy and public local-model tool-calling results | [Reliability](https://github.com/bgauryy/FreeLlama/blob/main/docs/RELIABILITY.md) |
 | Model forms, measured results | [Model forms and results](https://github.com/bgauryy/FreeLlama/blob/main/docs/MODEL_FORMS_AND_RESULTS.md) |
 | Recipes per job | [Cookbooks](https://github.com/bgauryy/FreeLlama/blob/main/docs/cookbooks/README.md) |
 | CPU/GPU setup and placement | [CPU/GPU routing](https://github.com/bgauryy/FreeLlama/blob/main/docs/CPU_GPU_ROUTING.md) |
@@ -375,6 +402,7 @@ gate, admission and routing are described in [Architecture](https://github.com/b
 | History, affinity, warming | [Scopes and warming](https://github.com/bgauryy/FreeLlama/blob/main/docs/SCOPES_AND_WARMING.md) |
 | Deployment and releases | [Production](https://github.com/bgauryy/FreeLlama/blob/main/docs/PRODUCTION.md) |
 | Build from source, tests and evals | [Build and notes](https://github.com/bgauryy/FreeLlama/blob/main/docs/BUILD_AND_NOTES.md), [Testing](https://github.com/bgauryy/FreeLlama/blob/main/docs/TESTING.md) |
+| Production panic/lock review and Windows memory evidence | [Rust resource audit](https://github.com/bgauryy/FreeLlama/blob/main/docs/RUST_RESOURCE_AUDIT.md) |
 | Architecture and ownership | [Architecture](https://github.com/bgauryy/FreeLlama/blob/main/docs/ARCHITECTURE.md) |
 | Embedding the Rust core | [Rust core](https://github.com/bgauryy/FreeLlama/blob/main/packages/rust-core/README.md) |
 

@@ -1,10 +1,14 @@
 # Model forms and measured results
 
-Moved from the root README. Dated measurements describe one machine and workload.
+Dated measurements describe one machine and workload. Current job/workflow selection uses
+[machine-local calibration](MODEL_SELECTION.md#turn-measurements-into-routing-evidence) before
+catalog fallback; the historical ratings below do not determine that choice. Newer
+[tool-calling evidence](RELIABILITY.md#measured-on-2026-11-14) covers two models with one trial on
+each of seven public cases, separately from the older single-call examples below.
 
 ## Model forms
 
-Managed forms get routing, admission and a receipt; passthrough forms reach Ollama through `serve`
+Ollama-managed forms get routing, admission and a receipt; passthrough forms reach Ollama through `serve`
 with the raw stream cap and memory checks but no routing or receipt.
 
 | Form | Ollama endpoint | Through FreeLlama | Measured here |
@@ -19,21 +23,25 @@ with the raw stream cap and memory checks but no routing or receipt.
 | Transcription and translation | `/v1/audio/transcriptions`, `/v1/audio/translations` | MCP `audio`, through the passthrough's memory checks; LFM3 audio needs Ollama 0.40.12+ | `lfm3-audio:2b-q4_K_M` transcription 7.5% word error over 5 sentences; translation not measured |
 | Image generation | removed from Ollama in 0.32.6 | not available | — |
 
-Find any of these with `models {view:"library", capabilities:["decision"]}` (or `audio`,
+The [managed llama.cpp adapter](LLAMACPP.md) also supports explicit bounded text tasks; it does
+not inherit Ollama's modalities, automatic catalog discovery or placement evidence.
+
+Find Ollama forms with `models {view:"library", capabilities:["decision"]}` (or `audio`,
 `embedding`, `vision`...), or a Hugging Face GGUF build with a `query`.
 
 ### Local models, measured
 
 One Apple M2 Pro (32 GB), Ollama 0.40.8, FreeLlama 0.6.1, 2026-10-30, while other builds kept the
 one-minute load near 14 on 12 cores. Each check has a known answer; the batteries are small, so read
-the ratings as a first screen for these exact tags, not a benchmark.
+the ratings as historical editorial judgments for these exact tags, not a benchmark score or
+a measured probability of success. They predate the auditable [reliability corpus](RELIABILITY.md).
 
 | Model | Download | Forms | Result | Speed (warm) | Rating | Use it for |
 |---|---:|---|---|---|---:|---|
-| `gpt-oss:20b` | 13.8 GB | text, tools, thinking, JSON | 7/7: exact output, arithmetic, bat-and-ball, code reading, JSON extraction, tool call, 9/9 ticket routing | 1.4 s per routed ticket; 12 s first call with load | 9/10 | General agent work and tool calls when quality matters |
+| `gpt-oss:20b` | 13.8 GB | text, tools, thinking, JSON | 7/7: exact output, arithmetic, bat-and-ball, code reading, JSON extraction, tool call, 9/9 ticket routing | 1.4 s per routed ticket; 12 s first call with load | 9/10 | Candidate for the measured text tasks; broader tool reliability unmeasured in that round |
 | `nomic-embed-text:v1.5` | 274 MB | embedding | Retrieval 4/4 top-1; ticket routing 9/9 from two examples per team | 51 ms per item, batched | 9/10 | Search, deduplication, cheap classification |
 | `strands-decider:2b-nvfp4` | 1.3 GB | decision | Ticket routing 9/9, return-policy yes/no 3/3, damage rubric 2/3 | 0.17 s per question | 8/10 | Fast routing and policy checks with probabilities; rubric scores run low at the top level |
-| `glm-ocr:latest` | 2.2 GB | vision (OCR) | 4/4 phrases read from a dense report strip; 0/7 on text tasks | 11 s per strip at a 400-token cap | 8/10 OCR, 1/10 text | Reading screenshots and scans only |
+| `glm-ocr:latest` | 2.2 GB | vision (OCR) | 4/4 phrases read from a dense report strip; 0/7 on text tasks | 11 s per strip at a 400-token cap | 8/10 OCR, 1/10 text | OCR candidate for screenshots; scans were not measured |
 
 ### What they did for a coding agent
 

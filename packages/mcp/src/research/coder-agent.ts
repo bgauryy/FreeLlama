@@ -3,7 +3,7 @@
 // Same loop as the research adapters (agent-loop.ts): repeat suppression, cited-path grounding
 // and forced finalization; the finish reports work done, so it is not asked for a "Source:".
 // The result adds `coder`: the agent's diff against HEAD plus the caller's uncommitted changes,
-// the changed files and the last run outputs. The caller reviews it and applies it with `git apply`.
+// the changed files, bounded recent previews and full raw audit references for every run. The caller reviews it and applies it with `git apply`.
 //
 // Run as `node coder-agent.js` with the research adapter environment plus
 // FREELLAMA_MCP_ALLOW_CODER=1 (operator opt-in), FREELLAMA_CODER_COMMANDS (a JSON array of exact
@@ -31,8 +31,9 @@ import { forgetWorkspaceIndex, validateRead, validateSearch } from "./structured
 import { structuredCall } from "./structured-call.js";
 import { trimSpace } from "./text.js";
 import { workspaceOverview } from "./workspace-overview.js";
-import { escapesRoot } from "./workspace-path.js";
+import { escapesRoot, resolvePath } from "./workspace-path.js";
 import { isEntry } from "./entry.js";
+import { DEFAULT_COMMAND_OUTPUT_BYTES, MAX_COMMAND_OUTPUT_BYTES } from "./coder-output.js";
 
 export const OPT_IN_ENV = "FREELLAMA_MCP_ALLOW_CODER";
 const ACTIONS = ["search", "read", "list", "shell", "edit", "write", "run", "page", "finish"];
@@ -81,6 +82,9 @@ export interface CoderOptions {
   container?: string;
   /** Where the raw patch is written, when set. */
   patchPath?: string;
+  /** Controlled results directory outside the source/copy; raw logs survive cleanup. */
+  logDir?: string;
+  maxOutputBytes?: number;
   runTimeoutSeconds?: number;
   maxCopyBytes?: number;
   /** Directories outside the copy that allowed commands may also write (operator-named). */
@@ -108,6 +112,8 @@ export function coderOptionsFromEnv(env: Env): CoderOptions {
     commands: normalizeAllowedCommands(commands),
     container: env.FREELLAMA_CODER_COPY_DIR || undefined,
     patchPath: env.FREELLAMA_CODER_PATCH || undefined,
+    logDir: env.FREELLAMA_CODER_LOG_DIR || undefined,
+    maxOutputBytes: Math.floor(positiveNumber(env.FREELLAMA_CODER_MAX_OUTPUT_BYTES, DEFAULT_COMMAND_OUTPUT_BYTES, MAX_COMMAND_OUTPUT_BYTES)),
     runTimeoutSeconds: positiveNumber(env.FREELLAMA_CODER_RUN_TIMEOUT_SECONDS, DEFAULT_RUN_TIMEOUT_SECONDS, MAX_RUN_TIMEOUT_SECONDS),
     maxCopyBytes: positiveNumber(env.FREELLAMA_CODER_MAX_COPY_BYTES, DEFAULT_MAX_COPY_BYTES, Number.MAX_SAFE_INTEGER),
     writable: (env.FREELLAMA_CODER_WRITABLE ?? "").split(path.delimiter).filter(Boolean),
@@ -149,10 +155,14 @@ class CoderSession implements AdapterSession {
   constructor(readonly source: string, readonly copy: IsolatedCopy, private readonly options: CoderOptions) {
     this.workspace = copy.root;
     const extra = writableDirs(options.writable ?? [], source);
+    const logDir = options.logDir === undefined ? undefined : resolvePath(options.logDir);
+    if (logDir && [source, copy.container, ...extra].some((directory) => !escapesRoot(logDir, directory) || !escapesRoot(directory, logDir))) {
+      throw new ValidationError("coder log directory must be outside the caller workspace, disposable copy container and sandbox-writable directories");
+    }
     this.shell = new ReadOnlyShell(copy.root, { readPaths: copy.commonDir ? [copy.commonDir] : [] }).enter();
     try {
       this.runner = new CommandRunner(copy.root, [copy.top, copy.tmp, ...extra], runEnvironment(process.env, copy.tmp), {
-        privateDir: copy.privateDir, osSandbox: options.osSandbox ?? "auto", allowUnsandboxed: options.allowUnsandboxedRun === true,
+        privateDir: copy.privateDir, logDir, maxOutputBytes: options.maxOutputBytes, osSandbox: options.osSandbox ?? "auto", allowUnsandboxed: options.allowUnsandboxedRun === true,
         // A secret location that holds the workspace or the copy would hide the work itself.
         hidden: secretPaths(process.env).filter((secret) => escapesRoot(source, secret) && escapesRoot(copy.top, secret)),
       }).enter();
@@ -215,6 +225,7 @@ class CoderSession implements AdapterSession {
           const outcome = await this.runner.run(command, this.options.runTimeoutSeconds ?? DEFAULT_RUN_TIMEOUT_SECONDS);
           this.runs.push(outcome);
           this.changed();
+          if (!outcome.audit.complete) throw new ValidationError(describeRun(outcome));
           return describeRun(outcome);
         },
         record: { name: "run", raw_name: "run", arguments: { command: requested } },
@@ -238,6 +249,8 @@ class CoderSession implements AdapterSession {
       ...(outcome.signal ? { signal: outcome.signal } : {}),
       timed_out: outcome.timedOut,
       duration_ms: outcome.durationMs,
+      failed: outcome.failed,
+      output_audit: outcome.audit,
       ...(index >= this.runs.length - KEPT_RUN_OUTPUTS ? { output: outcome.kept } : {}),
     }));
     const base = {

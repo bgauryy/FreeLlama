@@ -9,9 +9,10 @@ const fixture = vi.hoisted(() => ({
   live: vi.fn(),
   route: vi.fn(),
   warm: vi.fn(),
+  getJob: vi.fn(),
 }));
 vi.mock("../../src/serve-client.js", () => ({
-  runTaskRequest: fixture.run, getTaskJob: vi.fn(), cancelTaskJob: vi.fn(), route: (...args: unknown[]) => fixture.route(...args),
+  runTaskRequest: fixture.run, getTaskJob: fixture.getJob, cancelTaskJob: vi.fn(), route: (...args: unknown[]) => fixture.route(...args),
   createSession: vi.fn(), deleteSession: vi.fn(), killSession: vi.fn(), listModels: vi.fn(), warmModelRequest: (...args: unknown[]) => fixture.warm(...args),
   listTaskJobs: vi.fn(), createScope: vi.fn(), getScope: vi.fn(), forkScope: vi.fn(), deleteScope: vi.fn(),
 }));
@@ -58,6 +59,7 @@ beforeEach(() => {
   fixture.route.mockResolvedValue(JSON.stringify({ selected_model: "bonsai-2:9b", options: { num_ctx: 4096 } }));
   fixture.warm.mockReset();
   fixture.warm.mockResolvedValue(JSON.stringify({ status: "warmed", model: "bonsai-2:9b" }));
+  fixture.getJob.mockReset();
 });
 
 describe("freellama run flags", () => {
@@ -230,6 +232,15 @@ describe("freellama output", () => {
     const rendered = renderResult({ structuredContent: { deferred: true, job: { id: "abc", status: "queued" } } }, render);
     expect(rendered).toEqual({ stdout: "abc", stderr: ["deferred; wait for it with: freellama job abc --wait"], exitCode: 0 });
   });
+
+  it("preserves a deferred lookup refusal and its retryable exit status", async () => {
+    fixture.getJob.mockRejectedValue(new Error(JSON.stringify({ code: "resource_admission_unavailable", error: "serve temporarily unavailable", retry_after_seconds: 3 })));
+    const out = vi.fn(), err = vi.fn();
+    expect(await main(["job", "00000000-0000-4000-8000-000000000001", "--wait", "--endpoint", "http://127.0.0.1:9"], { out, err })).toBe(75);
+    expect(out).not.toHaveBeenCalled();
+    expect(err.mock.calls.flat().join("\n")).toContain("resource_admission_unavailable");
+    expect(err.mock.calls.flat().join("\n")).toContain("retry after 3s");
+  });
 });
 
 describe("freellama tool registry", () => {
@@ -364,6 +375,7 @@ describe("gateway over HTTP", () => {
   // What the fake Ollama reports as loaded (`/api/ps`).
   let loaded: Array<{ name: string; context_length: number }> = [];
   let serve: import("node:http").Server;
+  const calibrationRequests: Array<Record<string, unknown>> = [];
   beforeAll(async () => {
     const http = await import("node:http");
     serve = http.createServer((request, response) => {
@@ -377,6 +389,11 @@ describe("gateway over HTTP", () => {
         if (request.url === "/_freellama/v1/config") {
           response.writeHead(200, { "content-type": "application/json" });
           return void response.end(JSON.stringify({ effective: { context: { context_shift: "off" } } }));
+        }
+        if (request.url === "/_freellama/v1/routes") {
+          calibrationRequests.push(JSON.parse(raw || "{}"));
+          return void response.writeHead(200, { "content-type": "application/json" })
+            .end(JSON.stringify({ task_evidence: "unknown" }));
         }
         upstream.push({ path: request.url ?? "", body: JSON.parse(raw || "{}"), headers: request.headers });
         if (request.url === "/api/chat") {
@@ -412,7 +429,7 @@ describe("gateway over HTTP", () => {
     await gateway.close();
     await new Promise<void>((resolve) => serve.close(() => resolve()));
   });
-  beforeEach(() => { upstream.length = 0; loaded = []; });
+  beforeEach(() => { upstream.length = 0; calibrationRequests.length = 0; loaded = []; });
   const post = (path: string, body: unknown, headers: Record<string, string> = {}, signal?: AbortSignal) =>
     fetch(`${gateway.url}${path}`, { method: "POST", body: JSON.stringify(body), headers, signal });
 
@@ -421,6 +438,7 @@ describe("gateway over HTTP", () => {
     const lines = (await reply.text()).trim().split("\n").map((line) => JSON.parse(line));
     expect(lines.map((line) => line.message?.content)).toEqual(["Fi", "xed.", ""]);
     expect(lines.at(-1)).toMatchObject({ done: true, freellama: { model: "bonsai-2:9b", job: "coding", num_ctx: 4096 } });
+    expect(calibrationRequests).toEqual([{ task: "coding", objective: "quality", required_capabilities: [] }]);
     const sent = upstream[0]!;
     expect(sent.path).toBe("/api/chat");
     expect(sent.body.model).toBe("bonsai-2:9b");
@@ -557,6 +575,7 @@ describe("freellama run streaming", () => {
   let serve: import("node:http").Server;
   let endpoint = "";
   const sent: Array<Record<string, any>> = [];
+  const calibrationRequests: Array<Record<string, unknown>> = [];
   let reply: string[] = [];
   beforeAll(async () => {
     const http = await import("node:http");
@@ -566,6 +585,11 @@ describe("freellama run streaming", () => {
       request.on("end", () => {
         if (request.url === "/api/ps") return void response.end(JSON.stringify({ models: [] }));
         if (request.url === "/_freellama/v1/config") return void response.end(JSON.stringify({ context_shift: "off" }));
+        if (request.url === "/_freellama/v1/routes") {
+          calibrationRequests.push(JSON.parse(raw || "{}"));
+          return void response.writeHead(200, { "content-type": "application/json" })
+            .end(JSON.stringify({ task_evidence: "unknown" }));
+        }
         sent.push({ ...JSON.parse(raw || "{}"), _path: request.url });
         response.writeHead(200, { "content-type": "application/x-ndjson" });
         response.end(reply.map((line) => `${line}\n`).join(""));
@@ -577,6 +601,7 @@ describe("freellama run streaming", () => {
   afterAll(() => new Promise<void>((resolve) => serve.close(() => resolve())));
   beforeEach(() => {
     sent.length = 0;
+    calibrationRequests.length = 0;
     reply = [
       JSON.stringify({ message: { role: "assistant", content: "Hel" }, done: false }),
       JSON.stringify({ message: { role: "assistant", content: "lo" }, done: false }),
@@ -593,6 +618,7 @@ describe("freellama run streaming", () => {
     const { out, io } = capture();
     const code = await streamRun(streamTarget({ model: "bonsai-2:9b", prompt: "hi" })!, { model: "bonsai-2:9b", prompt: "hi", endpoint }, render, io, new AbortController().signal, false);
     expect(code).toBe(0);
+    expect(calibrationRequests).toEqual([]);
     expect(out.join("")).toBe("Hello\n");
     expect(sent[0]).toMatchObject({ model: "bonsai-2:9b", stream: true, shift: false, messages: [{ role: "user", content: "hi" }] });
     expect(fixture.warm).toHaveBeenCalledTimes(1);
@@ -601,6 +627,7 @@ describe("freellama run streaming", () => {
   it("streams a workflow on its pick with the workflow's system prompt, and prints stats with --verbose", async () => {
     const { err, io } = capture();
     await streamRun(streamTarget({ workflow: "summarize-text", prompt: "text" })!, { workflow: "summarize-text", prompt: "text", endpoint }, { ...render, verbose: true }, io, new AbortController().signal, false);
+    expect(calibrationRequests).toEqual([{ task: "completion", objective: "quality", required_capabilities: [] }]);
     expect(sent[0]!.messages[0].role).toBe("system");
     expect(err.at(-1)).toMatch(/output 2 tokens, 20\.0 tokens\/s/);
   });
@@ -611,10 +638,10 @@ describe("freellama run streaming", () => {
       JSON.stringify({ response: "", done: true, done_reason: "stop" }),
     ];
     const { out, io } = capture();
-    const args = { model: "qwen-coder:1", prompt: "def add(a, b):\n", suffix: "\n\nprint(add(1, 2))", endpoint };
+    const args = { model: "qwen-coder:1", prompt: "def add(a, b):\n", suffix: "\n\nprint(add(1, 2))", systemPrompt: "Return only the missing function body.", endpoint };
     expect(await streamRun(streamTarget(args)!, args, render, io, new AbortController().signal, false)).toBe(0);
     expect(out.join("")).toBe("  return a + b\n");
-    expect(sent[0]).toMatchObject({ _path: "/api/generate", model: "qwen-coder:1", prompt: "def add(a, b):\n", suffix: "\n\nprint(add(1, 2))" });
+    expect(sent[0]).toMatchObject({ _path: "/api/generate", model: "qwen-coder:1", prompt: "def add(a, b):\n", suffix: "\n\nprint(add(1, 2))", system: "Return only the missing function body." });
     expect(streamTarget({ suffix: "x", prompt: "y" })).toBeUndefined();
     expect(() => parseRunArgs(["-w", "fix-bug", "--suffix", "x", "y"])).toThrow(/fills in the middle/);
   });
@@ -628,6 +655,39 @@ describe("freellama run streaming", () => {
     expect(streamTarget({ prompt: "x", tools: [{}] })).toBeUndefined();
     expect(streamTarget({ prompt: "x", defer: true })).toBeUndefined();
   });
+
+  it("fails a stream that closes after partial output without done:true", async () => {
+    reply = [JSON.stringify({ message: { role: "assistant", content: "partial" }, done: false })];
+    const { out, err, io } = capture();
+    const args = { model: "m:1", prompt: "x", endpoint };
+    expect(await streamRun(streamTarget(args)!, args, render, io, new AbortController().signal, false)).toBe(1);
+    expect(out.join("")).toBe("partial\n");
+    expect(err.join("\n")).toMatch(/incomplete|done:true/);
+  });
+
+  it("keeps routing, placement and scheduling controls on the managed path even with --stream", async () => {
+    const { io } = capture();
+    expect(await main(["run", "-m", "m:1", "hi", "--endpoint", endpoint, "--stream",
+      "--priority", "interactive", "--timeout", "30", "--max-wait", "2", "--prefer", "cpu",
+      "--min-confidence", "medium", "--objective", "quality"], io)).toBe(0);
+    expect(fixture.run).toHaveBeenCalledTimes(1);
+    expect(fixture.run.mock.calls[0]![1]).toMatchObject({
+      priority: "interactive", timeout_seconds: 30, max_wait_seconds: 2,
+      execution_preference: "prefer_cpu", min_confidence: "medium", objective: "quality",
+    });
+    expect(sent).toHaveLength(0);
+  });
+
+  it.each(["--defer", "--json", "--each", "--no-stream", "--preview", "--timeout"])(
+    "does not silently run suffix generation instead of %s", (flag) => {
+      const args = ["m:1", "prefix", "--suffix", "suffix", flag, ...(flag === "--timeout" ? ["30"] : flag === "--each" ? ["-f", "a.ts"] : [])];
+      if (flag === "--preview") {
+        const preview = parseRunArgs(args).args;
+        expect(preview.suffix).toBeUndefined();
+        expect(streamTarget(preview)).toBeUndefined();
+      } else expect(() => parseRunArgs(args)).toThrow(/suffix.*cannot|cannot.*suffix/i);
+    },
+  );
 });
 
 describe("agent guide", () => {

@@ -11,13 +11,16 @@
 // headers are refused, as Ollama does, which also blocks DNS rebinding.
 import { createHash } from "node:crypto";
 import http from "node:http";
+import https from "node:https";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import type { ReadableStream } from "node:stream/web";
 import { DEFAULT_SERVE_ENDPOINT } from "../config.js";
 import { ensureServe } from "../serve.js";
+import { serveAuthHeaders } from "../serve-http.js";
 import { answerText, fromOllamaRequest, fromOpenAiRequest, ollamaResponse, openAiCompletion, runManagedChat } from "./managed.js";
 import { record, withoutUndefined, type Fields } from "./util.js";
+import { boundedResponseBytes, boundedResponseText, ResponseLimitError } from "./response-limit.js";
 import { GatewayError, prepareForward, streamChecks, virtualModel, virtualModels, type Resolution, type VirtualModel } from "./virtual.js";
 
 type GatewayOptions = {
@@ -89,8 +92,14 @@ async function serveReady(endpoint: string | undefined): Promise<void> {
 
 /** Forward a request to serve as is, streaming both ways; the upstream request ends when the client leaves. */
 async function proxy(request: http.IncomingMessage, response: http.ServerResponse, serveEndpoint: string, body?: Buffer): Promise<void> {
-  const target = new URL(request.url ?? "/", serveEndpoint);
-  const upstream = http.request(target, { method: request.method, headers: { ...request.headers, host: target.host } });
+  // Absolute-form request targets still name a path on the selected serve, never another origin.
+  const incoming = new URL(request.url ?? "/", "http://gateway");
+  const target = new URL(serveEndpoint);
+  target.pathname = incoming.pathname;
+  target.search = incoming.search;
+  target.hash = "";
+  const requestUpstream = target.protocol === "https:" ? https.request : http.request;
+  const upstream = requestUpstream(target, { method: request.method, headers: { ...request.headers, ...(await serveAuthHeaders()), host: target.host } });
   response.on("close", () => { if (!response.writableFinished) upstream.destroy(); });
   const reply = await new Promise<http.IncomingMessage>((resolve, reject) => {
     upstream.once("response", resolve);
@@ -106,8 +115,8 @@ async function proxy(request: http.IncomingMessage, response: http.ServerRespons
 
 async function serveJson(serveEndpoint: string, pathname: string): Promise<Fields | undefined> {
   try {
-    const reply = await fetch(new URL(pathname, serveEndpoint), { signal: AbortSignal.timeout(5_000) });
-    return reply.ok ? record(await reply.json()) : undefined;
+    const reply = await fetch(new URL(pathname, serveEndpoint), { headers: await serveAuthHeaders(), signal: AbortSignal.timeout(5_000), redirect: "error" });
+    return reply.ok ? record(JSON.parse(await boundedResponseText(reply))) : undefined;
   } catch {
     return undefined;
   }
@@ -182,7 +191,8 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{ url:
       const value = request.headers[name];
       if (typeof value === "string") headers[name] = value;
     }
-    const reply = await fetch(new URL(path, serveEndpoint), { method: "POST", headers, body: JSON.stringify(rewritten), signal });
+    Object.assign(headers, await serveAuthHeaders());
+    const reply = await fetch(new URL(path, serveEndpoint), { method: "POST", headers, body: JSON.stringify(rewritten), signal, redirect: "error" });
     if (!reply.body) {
       response.writeHead(reply.status);
       return void response.end();
@@ -201,7 +211,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{ url:
       return pipeline(Readable.fromWeb(reply.body as ReadableStream<Uint8Array>), sseWithReceipt(path, requested, resolution, tools), response);
     }
     if (reply.ok && SSE_PATHS.has(path) && type.includes("json")) {
-      const text = await reply.text();
+      const text = await boundedResponseText(reply);
       let payload: Fields | undefined;
       try {
         payload = record(JSON.parse(text));
@@ -212,7 +222,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{ url:
       return void response.end(payload ? JSON.stringify(jsonWithReceipt(path, requested, resolution, tools, payload)) : text);
     }
     response.writeHead(reply.status, replyHeaders);
-    return pipeline(Readable.fromWeb(reply.body as ReadableStream<Uint8Array>), response);
+    return pipeline(Readable.fromWeb(reply.body as ReadableStream<Uint8Array>), async function* (source) { yield* boundedResponseBytes(source); }, response);
   }
 
   const server = http.createServer(async (request, response) => {
@@ -254,7 +264,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{ url:
     } catch (error) {
       // A client that left mid-stream needs no answer.
       if (abort.signal.aborted) return void response.destroy();
-      const status = error instanceof GatewayError ? error.status : 500;
+      const status = error instanceof GatewayError ? error.status : error instanceof ResponseLimitError ? 502 : 500;
       log(`error ${status}: ${(error as Error).message.slice(0, 300)}`);
       if (!response.headersSent) sendJson(response, status, { error: (error as Error).message });
       else response.destroy();
@@ -345,7 +355,7 @@ export function withChecksOnDone(path: string, requested: string, resolution: Re
       }
       yield `${JSON.stringify({ ...chunk, freellama })}\n`;
     }
-    for await (const bytes of source) {
+    for await (const bytes of boundedResponseBytes(source)) {
       pending += decoder.decode(bytes, { stream: true });
       const lines = pending.split("\n");
       pending = lines.pop() ?? "";
@@ -391,7 +401,7 @@ function sseTransform(handler: SseHandler) {
       }
       return flush();
     }
-    for await (const bytes of source) {
+    for await (const bytes of boundedResponseBytes(source)) {
       pending += decoder.decode(bytes, { stream: true });
       const parts = pending.split("\n");
       pending = parts.pop() ?? "";

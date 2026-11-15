@@ -11,7 +11,7 @@ import {
 } from "../../src/research/coder-actions.js";
 import { coderAdapter, parseAction, type CoderOptions } from "../../src/research/coder-agent.js";
 import { WORKTREE_NAME, createIsolatedCopy, removeIsolatedCopy } from "../../src/research/isolated-copy.js";
-import { coderRefusal } from "../../src/tools/coder.js";
+import { coderRefusal, prepareCoderRun, withCoderAudit } from "../../src/tools/coder.js";
 
 const temp = (prefix: string) => realpathSync(mkdtempSync(path.join(tmpdir(), prefix)));
 
@@ -230,6 +230,8 @@ describe("coder session in an isolated copy", () => {
     expect(coder.diff).toContain("-beta\n+BETA\n");
     expect(coder.diff).not.toContain("notes.txt");
     expect(coder.runs).toMatchObject([{ command: "cat file.txt", exit_code: 0, timed_out: false }]);
+    expect(readFileSync(coder.runs[0].output_audit.path, "utf8")).toBe("alpha\nBETA\ngamma\n");
+    expect(coder.runs[0].output_audit.complete).toBe(true);
     expect(result.tool_calls.map((call: { name: string; status: string }) => `${call.name}:${call.status}`)).toEqual(["edit:ok", "shell:ok", "run:ok", "run:error"]);
     // The user's tree is untouched, and the copy and its worktree entry are gone.
     expect(readFileSync(path.join(repo, "file.txt"), "utf8")).toBe("alpha\nbeta\ngamma\n");
@@ -240,6 +242,66 @@ describe("coder session in an isolated copy", () => {
     // The saved patch applies to the user's tree as it is.
     expect(coder.patch_file).toMatch(/agent\.patch$/);
     git(repo, "apply", "--check", coder.patch_file);
+  });
+
+  it("keeps audit references for earlier runs after the bounded inline previews expire", async () => {
+    const repo = callerRepo();
+    const { result } = await session(repo, [
+      ...Array.from({ length: 4 }, () => ({ action: "run", command: "cat file.txt" })),
+      { action: "finish", answer: "Read file.txt four times." },
+    ]);
+    expect(result.coder.runs).toHaveLength(4);
+    expect(result.coder.runs[0].output).toBeUndefined();
+    for (const run of result.coder.runs) {
+      expect(run.output_audit.complete).toBe(true);
+      expect(readFileSync(run.output_audit.path, "utf8")).toBe("alpha\nbeta\ngamma\n");
+    }
+    expect(worktrees(repo)).toEqual([`worktree ${repo}`]);
+  });
+
+  it("marks capped output as a tool error with retained failed-command metadata", async () => {
+    const repo = callerRepo();
+    const command = "yes output";
+    const { result } = await session(repo, [{ action: "run", command }, { action: "finish", answer: "Output cap stopped the command." }],
+      { commands: [command], maxOutputBytes: 128 });
+    expect(result.tool_calls[0]).toMatchObject({ name: "run", status: "error" });
+    expect(result.coder.runs[0]).toMatchObject({ failed: true, output_audit: { bytes: 128, complete: false, end_reason: "output_limit" } });
+    expect(readFileSync(result.coder.runs[0].output_audit.path).length).toBe(128);
+  });
+
+  it("keeps controlled command logs when MCP cleanup has no patch to retain", async () => {
+    const repo = callerRepo();
+    const run = await prepareCoderRun([]);
+    const logs = run.env.FREELLAMA_CODER_LOG_DIR!;
+    mkdirSync(logs, { recursive: true });
+    writeFileSync(path.join(logs, "retained.log"), "full audit");
+    run.cleanup(repo);
+    expect(readFileSync(path.join(logs, "retained.log"), "utf8")).toBe("full audit");
+    expect(existsSync(run.patchPath)).toBe(false);
+    const failure = withCoderAudit({ isError: true, structuredContent: {}, content: [{ type: "text", text: "adapter interrupted" }] }, run);
+    expect(failure.structuredContent).toMatchObject({ commandAuditDirectory: logs });
+    expect(failure.content[0]!.text).toContain("command_audit_directory:");
+  });
+
+  it("rejects audit directories overlapping the caller tree before creating them", () => {
+    const repo = callerRepo(), logDir = path.join(repo, "logs");
+    const adapter = coderAdapter({ commands: [], logDir });
+    expect(() => adapter.open!(repo)).toThrow(/log directory must be outside/);
+    expect(existsSync(logDir)).toBe(false);
+    expect(worktrees(repo)).toEqual([`worktree ${repo}`]);
+  });
+
+  it.each(["logs", "tmp/logs", "private/logs"])("rejects retained logs inside the disposable copy container: %s", async (relative) => {
+    const repo = callerRepo(), container = temp("freellama-coder-log-container-");
+    const logDir = path.join(container, relative);
+    const adapter = coderAdapter({ commands: [], container, logDir });
+    let opened: ReturnType<NonNullable<typeof adapter.open>> | undefined;
+    try {
+      expect(() => { opened = adapter.open!(repo); }).toThrow(/log directory must be outside/);
+      expect(existsSync(logDir)).toBe(false);
+      expect(existsSync(container)).toBe(false);
+      expect(worktrees(repo)).toEqual([`worktree ${repo}`]);
+    } finally { await (await opened)?.close?.(); }
   });
 
   it("lets an allowed command write the copy but, under an OS sandbox, nothing outside it", async () => {

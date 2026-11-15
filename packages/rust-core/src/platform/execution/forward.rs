@@ -39,7 +39,8 @@ fn queue_feedback_write(state: &PlatformState, store: crate::store::Store) {
         let written = tokio::task::spawn_blocking(move || persist_feedback(&store, &snapshot))
             .await
             .unwrap_or_else(|error| Err(anyhow::anyhow!("feedback writer panicked: {error}")));
-        *state.feedback_persistence_error.write().await = written.err().map(|error| error.to_string());
+        *state.feedback_persistence_error.write().await =
+            written.err().map(|error| error.to_string());
     });
 }
 
@@ -186,8 +187,15 @@ pub(crate) async fn forward_managed_task(
         let (events, stop_on_loop) = stream
             .as_ref()
             .map_or((None, true), |out| (Some(&out.events), out.stop_on_loop));
-        post_streaming_chat_with_retries(state, &execution.upstream, path, &body, events, stop_on_loop)
-            .await
+        post_streaming_chat_with_retries(
+            state,
+            &execution.upstream,
+            path,
+            &body,
+            events,
+            stop_on_loop,
+        )
+        .await
     } else {
         post_json_with_retries(state, &execution.upstream, path, &body).await
     };
@@ -439,7 +447,6 @@ pub(crate) async fn forward_managed_task(
     Ok(Json(receipt))
 }
 
-
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -555,7 +562,10 @@ mod tests {
                 .unwrap();
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["feedback"]["accepted"], true, "{body}");
-        assert_eq!(body["feedback"]["persistence"]["persisted"], "queued", "{body}");
+        assert_eq!(
+            body["feedback"]["persistence"]["persisted"], "queued",
+            "{body}"
+        );
         // (Reading the store here would wait on the stalled connection itself.)
         release.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {

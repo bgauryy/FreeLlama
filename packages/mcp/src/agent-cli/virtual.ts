@@ -12,6 +12,8 @@ import { refusalOf } from "./output.js";
 import { callTool, resultText } from "./registry.js";
 import { record, withoutEmpty, type Fields } from "./util.js";
 import { DEFAULT_SERVE_ENDPOINT } from "../config.js";
+import { serveAuthHeaders } from "../serve-http.js";
+import { boundedResponseText } from "./response-limit.js";
 
 export const VIRTUAL_PREFIX = "freellama/";
 /** The job whose picks serve a general chat: its picks are the tested chat models. */
@@ -195,9 +197,9 @@ function estimatedTokens(turns: Turn[], options: Fields | undefined): number {
 /** The context `model` is loaded with now, from Ollama's `/api/ps` through serve; undefined when not loaded. */
 export async function residentContext(model: string, serveEndpoint = DEFAULT_SERVE_ENDPOINT): Promise<number | undefined> {
   try {
-    const reply = await fetch(new URL("/api/ps", serveEndpoint), { signal: AbortSignal.timeout(3_000) });
+    const reply = await fetch(new URL("/api/ps", serveEndpoint), { headers: await serveAuthHeaders(), signal: AbortSignal.timeout(3_000), redirect: "error" });
     if (!reply.ok) return undefined;
-    const models = record(await reply.json())?.models;
+    const models = record(JSON.parse(await boundedResponseText(reply)))?.models;
     const entry = (Array.isArray(models) ? models : []).map(record).find((item) => item?.name === model || item?.model === model);
     return typeof entry?.context_length === "number" ? entry.context_length : undefined;
   } catch {
@@ -237,29 +239,32 @@ export async function admitRunner(resolution: Resolution, profile: { numCtx?: nu
   return "warmed";
 }
 
-const shiftSettings = new Map<string, Promise<boolean>>();
+const shiftSettings = new Map<string, { at: number; value: Promise<boolean> }>();
+const SHIFT_SETTINGS_FRESH_MS = 5000;
 
 /**
  * Whether serve's managed requests turn Ollama's context shift off (its default: a conversation
  * that outgrows the window fails instead of silently losing its start). `shift` is a runner load
  * option in Ollama, so a request that differs from the loaded runner reloads it; forwarded native
- * requests send serve's value to share the runner. Read once per serve endpoint.
+ * requests send serve's value to share the runner. Refresh per endpoint after five seconds so
+ * runtime reloads and transient observation failures do not pin a stale setting indefinitely.
  */
 export function managedShiftOff(serveEndpoint = DEFAULT_SERVE_ENDPOINT): Promise<boolean> {
   let setting = shiftSettings.get(serveEndpoint);
-  if (!setting) {
-    setting = (async () => {
+  if (!setting || Date.now() - setting.at >= SHIFT_SETTINGS_FRESH_MS) {
+    const value = (async () => {
       try {
-        const reply = await fetch(new URL("/_freellama/v1/config", serveEndpoint), { signal: AbortSignal.timeout(3_000) });
-        const value = findKey(await reply.json(), "context_shift");
-        return value === undefined ? true : value !== "on" && value !== true;
+        const reply = await fetch(new URL("/_freellama/v1/config", serveEndpoint), { headers: await serveAuthHeaders(), signal: AbortSignal.timeout(3_000), redirect: "error" });
+        const value = findKey(JSON.parse(await boundedResponseText(reply)), "context_shift");
+        return value === undefined ? true : value !== "ollama_default" && value !== "on" && value !== true;
       } catch {
         return true;
       }
     })();
+    setting = { at: Date.now(), value };
     shiftSettings.set(serveEndpoint, setting);
   }
-  return setting;
+  return setting.value;
 }
 
 function findKey(value: unknown, key: string): unknown {
@@ -271,6 +276,8 @@ function findKey(value: unknown, key: string): unknown {
   } else if (value && typeof value === "object") {
     const fields = value as Fields;
     if (key in fields && (typeof fields[key] !== "object" || fields[key] === null)) return fields[key];
+    const setting = record(fields[key]);
+    if (setting && "value" in setting) return setting.value;
     for (const child of Object.values(fields)) {
       const found = findKey(child, key);
       if (found !== undefined) return found;

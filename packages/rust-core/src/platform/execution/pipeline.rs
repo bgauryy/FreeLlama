@@ -8,7 +8,7 @@ use std::{
 use axum::{Json, extract::State, http::StatusCode};
 use serde_json::{Value, json};
 
-use super::super::error::{ApiError, MemoryFigures};
+use super::super::error::ApiError;
 use super::super::{
     PlatformState, TaskInput, TaskKind, host_has_unified_memory, require_active_session, resources,
 };
@@ -19,6 +19,11 @@ use super::{
     make_room, memory_kv_preflight, requests_immediate_unload, reserve_task_resources,
     select_managed_route, task_cost_for, task_has_images, transition_timeout,
 };
+
+mod guidance;
+#[cfg(test)]
+use guidance::fitting_models_hint;
+use guidance::refusal_guidance;
 
 /// The caller's wait and the operator cap when the cap lowered it (`None` otherwise).
 pub(super) fn wait_limit(
@@ -45,6 +50,11 @@ pub(super) async fn run_session_task(
     State(state): State<PlatformState>,
     Json(input): Json<TaskInput>,
 ) -> Result<Json<Value>, ApiError> {
+    if let Some(upstream) = super::llamacpp::target(&state, input.route.model.as_deref()) {
+        return super::llamacpp::execute(&state, upstream, &input)
+            .await
+            .map(Json);
+    }
     let limit = {
         let tunables = state.tunables();
         let source = tunables
@@ -73,78 +83,6 @@ pub(super) async fn run_session_task(
         Err(error) if error.is_wait_deadline() => Err(error.with_wait_limit(limit)),
         Err(error) => Err(error),
     }
-}
-
-/// A memory refusal tells an agent what to do: the figures, who holds the memory, and which
-/// installed models with the same task capability would fit the free memory now (or that none
-/// does). Other errors pass through unchanged.
-async fn refusal_guidance(
-    state: &PlatformState,
-    route: &super::super::RouteInput,
-    error: ApiError,
-) -> ApiError {
-    if !error.is_resource_wait() || !error.memory_held() {
-        return error;
-    }
-    let snapshot = state.resources.snapshot().await;
-    let figures = error.assessed_memory().or_else(|| {
-        error
-            .deadline_required_bytes()
-            .map(|required| MemoryFigures {
-                required_with_reserve: required.saturating_add(snapshot.hold_reserve_bytes),
-                reserve: snapshot.hold_reserve_bytes,
-                free: snapshot.effective_available_bytes,
-            })
-    });
-    let free = figures
-        .and_then(|figures| figures.free)
-        .or(snapshot.effective_available_bytes);
-    let reserve = figures.map_or(snapshot.hold_reserve_bytes, |figures| figures.reserve);
-    let alternatives = match (free, super::super::catalog::discover_models(state).await) {
-        (Some(free), Ok(models)) => Some(fitting_models_hint(route, &models, free, reserve)),
-        _ => None,
-    };
-    let holders = resources::memory_holders_now().await;
-    error.with_memory_guidance(figures, holders, alternatives)
-}
-
-/// Installed models that satisfy the route's task capability and whose file size plus the
-/// reserve fits `free`. File size is a lower bound (context memory comes on top), so the hint
-/// says "by file size".
-fn fitting_models_hint(
-    route: &super::super::RouteInput,
-    models: &[super::super::CatalogModel],
-    free: u64,
-    reserve: u64,
-) -> String {
-    let mut request = route.clone();
-    request.model = None;
-    let task = serde_json::to_value(request.task)
-        .ok()
-        .and_then(|value| value.as_str().map(str::to_owned))
-        .unwrap_or_default();
-    let mut fitting = super::super::routing::eligible_models(&request, models)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|model| model.size.saturating_add(reserve) <= free)
-        .collect::<Vec<_>>();
-    fitting.sort_by_key(|model| std::cmp::Reverse(model.size));
-    if fitting.is_empty() {
-        return format!(
-            "no installed `{task}` model fits {} free after the reserve; free memory (close the programs listed) or retry later",
-            resources::gb(free)
-        );
-    }
-    let names = fitting
-        .iter()
-        .take(5)
-        .map(|model| format!("{} ({})", model.name, resources::gb(model.size)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!(
-        "installed `{task}` models that fit {} free by file size (context memory is extra): {names}; pin one with `model`",
-        resources::gb(free)
-    )
 }
 
 #[expect(
@@ -238,10 +176,12 @@ async fn run_admitted_task(
     execution_receipt["model_digest"] = json!(managed.model.digest);
     super::identity::verify_requested(&input, &managed, &mut execution_receipt)?;
     if let Some(progress) = &progress {
-        progress.route(
-            &managed.route.selected_model,
-            managed.execution.placement.as_str(),
-        );
+        progress
+            .route(
+                &managed.route.selected_model,
+                managed.execution.placement.as_str(),
+            )
+            .await;
     }
     clock.lap("prepare_ms");
     let resource_model = managed.model;
@@ -993,115 +933,6 @@ async fn reserve_opportunistic(
     Ok((permit, footprint))
 }
 
-#[cfg(test)]
-mod lifecycle_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn a_resident_task_holds_no_backend_lock_while_its_watch_runs() {
-        let lock = Arc::new(tokio::sync::Mutex::new(()));
-        let mut transition = Some(TransitionPermit::Resident);
-        // A deferred resident request runs the same watch as a cold request. Readiness must
-        // not conjure or release anything: another model can load at any time.
-        runner_ready(&mut transition);
-        assert!(matches!(transition, Some(TransitionPermit::Resident)));
-        assert!(lock.try_lock().is_ok());
-    }
-
-    #[tokio::test]
-    async fn a_cold_watch_releases_the_load_lock_when_the_runner_is_ready() {
-        let lock = Arc::new(tokio::sync::Mutex::new(()));
-        let mut transition = Some(TransitionPermit::Loading(
-            Arc::clone(&lock).lock_owned().await,
-        ));
-        assert!(lock.try_lock().is_err());
-        runner_ready(&mut transition);
-        assert!(matches!(transition, Some(TransitionPermit::Resident)));
-        assert!(lock.try_lock().is_ok(), "the next load may start");
-        runner_ready(&mut transition);
-        assert!(matches!(transition, Some(TransitionPermit::Resident)));
-    }
-
-    #[tokio::test]
-    async fn a_cancelled_loader_releases_the_load_lock() {
-        let lock = Arc::new(tokio::sync::Mutex::new(()));
-        let transition = Some(TransitionPermit::Loading(
-            Arc::clone(&lock).lock_owned().await,
-        ));
-        assert!(lock.try_lock().is_err());
-        drop(transition); // The request was cancelled before its runner became ready.
-        assert!(lock.try_lock().is_ok());
-    }
-}
-
-#[cfg(test)]
-mod wait_limit_tests {
-    use super::{Duration, wait_limit};
-
-    #[test]
-    fn a_wait_lowered_by_the_operator_cap_is_reported_and_others_are_not() {
-        let cap = Duration::from_secs(120);
-        let limit = wait_limit(Some(1800), cap, "default").expect("1800 s exceeds the cap");
-        assert_eq!(limit["requested_seconds"], 1800);
-        assert_eq!(limit["effective_seconds"], 120.0);
-        assert_eq!(limit["cap_source"], "default");
-        assert!(
-            limit["note"]
-                .as_str()
-                .unwrap()
-                .contains("lowered the requested 1800 s")
-        );
-        assert!(wait_limit(Some(120), cap, "default").is_none());
-        assert!(wait_limit(Some(30), cap, "env").is_none());
-        assert!(wait_limit(None, cap, "default").is_none());
-    }
-}
-
-#[cfg(test)]
-mod memory_refusal_tests {
-    use super::fitting_models_hint;
-    use crate::platform::{CatalogModel, RouteInput};
-    use serde_json::json;
-
-    const GIB: u64 = 1024 * 1024 * 1024;
-
-    fn model(name: &str, capability: &str, size: u64) -> CatalogModel {
-        serde_json::from_value(json!({
-            "name":name,"digest":name,"size":size,"capabilities":[capability],
-            "advertised_context":32768,"resident":false,"benchmark":{},"policy_rank":{}
-        }))
-        .unwrap()
-    }
-
-    fn route(task: &str) -> RouteInput {
-        serde_json::from_value(json!({"task": task})).unwrap()
-    }
-
-    #[test]
-    fn the_hint_lists_same_capability_models_that_fit_and_skips_the_rest() {
-        let models = [
-            model("big-decider", "decision", 9 * GIB),
-            model("small-decider", "decision", GIB),
-            model("chat", "completion", GIB),
-        ];
-        let hint = fitting_models_hint(&route("decision"), &models, 4 * GIB, GIB);
-        assert!(hint.contains("`decision`"), "{hint}");
-        assert!(hint.contains("small-decider (1.0 GB)"), "{hint}");
-        assert!(!hint.contains("big-decider"), "{hint}");
-        assert!(!hint.contains("chat"), "{hint}");
-    }
-
-    #[test]
-    fn the_hint_says_none_fits_when_nothing_does() {
-        let models = [model("big-decider", "decision", 9 * GIB)];
-        let hint = fitting_models_hint(&route("decision"), &models, 4 * GIB, GIB);
-        assert!(
-            hint.starts_with("no installed `decision` model fits 4.0 GB free"),
-            "{hint}"
-        );
-    }
-}
-
 /// A receipt's admission and revalidation usually read the very host sample the route already
 /// reported (only its age differs). Keep that sample once: a repeat names the one it equals and
 /// keeps its own age, while a fresh sample taken in between stays whole. About 3.4 KB per task.
@@ -1123,28 +954,4 @@ fn dedupe_sample(receipt: &mut Value, key: &str) {
 }
 
 #[cfg(test)]
-mod sample_tests {
-    use super::dedupe_sample;
-    use serde_json::json;
-
-    #[test]
-    fn a_repeated_host_sample_is_kept_once_and_a_fresh_one_stays_whole() {
-        let sample = json!({"available_memory_bytes": 10, "sample_age_ms": 0});
-        let mut receipt = json!({
-            "resource_snapshot": sample,
-            "resource_admission": {"status": "admitted", "snapshot": {"available_memory_bytes": 10, "sample_age_ms": 1}},
-            "resource_revalidation": {"status": "admitted", "snapshot": {"available_memory_bytes": 7, "sample_age_ms": 0}},
-        });
-        dedupe_sample(&mut receipt, "resource_admission");
-        dedupe_sample(&mut receipt, "resource_revalidation");
-        assert_eq!(
-            receipt["resource_admission"]["snapshot"],
-            json!({"same_sample_as": "resource_snapshot", "sample_age_ms": 1})
-        );
-        assert_eq!(receipt["resource_admission"]["status"], "admitted");
-        assert_eq!(
-            receipt["resource_revalidation"]["snapshot"]["available_memory_bytes"],
-            7
-        );
-    }
-}
+mod tests;

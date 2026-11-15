@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { residentModelsText } from "../../src/result-text.js";
+import { residentModelsText, routeText } from "../../src/result-text.js";
 
 describe("residentModelsText", () => {
   it("shows Ollama's placement label once", () => {
@@ -12,5 +12,14 @@ describe("residentModelsText", () => {
     expect(text).not.toContain("100% GPU 100% GPU");
     expect(text).toContain("48%/52% CPU/GPU");
     expect(text).toContain("c:1b  size 1.0 GiB  0% GPU");
+  });
+});
+
+describe("routeText", () => {
+  it("distinguishes observed residency from absent evidence", () => {
+    expect(routeText({ resident: true })).toContain(" (resident)");
+    expect(routeText({ resident: false })).toContain(" (not resident)");
+    expect(routeText({})).toContain(" (residency unknown)");
+    expect(routeText({})).not.toContain(" (not resident)");
   });
 });

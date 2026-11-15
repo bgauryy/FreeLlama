@@ -5,6 +5,11 @@ model needs preparation before related work. FreeLlama manages these controls th
 admission and memory checks as task execution. The calling agent owns conversation instructions,
 task dependencies, and verification.
 
+Scope history is a core facility; the selected engine still validates every retained message.
+The [llama.cpp adapter](LLAMACPP.md) accepts only text messages and its fixed context contract.
+The warming, eviction, preload and adaptive keep-alive behavior in this guide applies to Ollama;
+external-engine warm and unload requests are refused.
+
 ## Ownership
 
 | State | Owner | Lifetime and meaning |
@@ -85,8 +90,9 @@ not append history.
 
 Limits reject an oversized transcript instead of silently deleting earlier instructions. If a task
 cannot fit, narrow its input, create a compact replacement scope, or fork a suitable snapshot. The
-caller owns any semantic summary and its verification. Stored history also contributes to managed
-context sizing; the selected model's context boundary still applies. Scoped image or audio input
+caller owns any semantic summary and its verification. Stored history also contributes to Ollama-managed
+context sizing; the selected model's context boundary still applies. llama.cpp uses its configured
+fixed window and does not verify exact input-token fit. Scoped image or audio input
 requires explicit `context_tokens` (`contextTokens` through MCP). Its context receipt estimates
 text and reports total multimodal token cost as unknown. Encoded media is retained in history,
 but its bytes are not counted as text tokens. Text plus the finite output reserve must fit the
@@ -226,8 +232,9 @@ The runtime file's `[preload]` table loads models without a caller asking:
   say which devices that Ollama process may allocate on, and nothing in FreeLlama verifies it
   (`gpu_capacity_scope` stays `host_aggregate_not_verified_for_backend`), so a speculative load
   could displace work on a pool it cannot see. The skip reason is `GPU device eligibility for this
-  Ollama backend is unverified` (`opportunistic_warm_skipped`). Unified-memory hosts and the CPU
-  backend, where host memory is the budget, still predict. Explicit warms, startup preloads and
+  Ollama backend is unverified` (`opportunistic_warm_skipped`). A local primary backend on a
+  unified-memory or CPU-only host can still predict using host memory as its budget. A dedicated
+  secondary CPU backend does not predict. Explicit warms, startup preloads and
   managed tasks on a discrete GPU run through ordinary admission.
 
 Each preload is a background warm under the usual admission, memory and pressure rules, and the
@@ -244,7 +251,7 @@ npx @octocodeai/freellama warm --model MODEL_TAG \
 
 ## Adaptive keep-alive
 
-When a managed request omits `keep_alive`, FreeLlama selects a finite duration from measured reuse
+When an Ollama-managed request omits `keep_alive`, FreeLlama selects a finite duration from measured reuse
 and load cost, within the runtime `[warming]` bounds. Explicit per-call values take precedence,
 including immediate unload (`"0"`) and indefinite residency (`"-1"`). Use
 `--keep-alive=-1` in the CLI so the negative value remains attached to its flag. The configured eviction policy and available

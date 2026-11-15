@@ -4,13 +4,15 @@ To offload a task, select an installed model with the required capabilities and 
 then check its memory fit under the intended concurrency. FreeLlama applies model eligibility
 and admission; the calling agent still verifies the output.
 
-The measurements in this guide come from single machines and are not compiled into routing:
+The dated tables in this guide describe single machines; they do not qualify live routing on
+another host. Current job selection uses [machine-local evidence](#turn-measurements-into-routing-evidence)
+first, then the portable catalog fallback. The historical sources are:
 [Recommended starting points](#recommended-starting-points-by-form) from an Apple M2 Pro with 32 GB,
 the sections after it from an Apple M4 Pro with 48 GB unified memory. Re-run
 `npx @octocodeai/freellama doctor`, `models`, `bench-all`, and your quality suite on the target hardware.
 `doctor.machine.memory_bytes` is host RAM; a discrete GPU's usable VRAM must be observed separately.
 
-For the best model per job measured on one machine, with newer candidates, see the [local model catalog](LOCAL_MODELS.md).
+For a dated per-job comparison and candidates from one machine, see the [local model catalog](LOCAL_MODELS.md).
 
 For supported features and sourced publisher use-case guidance, inspect
 `models {view:"installed", includeLibrary:true}` through MCP. [Model metadata](#model-metadata) explains digest matching, variant capabilities,
@@ -19,7 +21,7 @@ custom-model fallbacks, and how to read family claims without treating them as q
 ```mermaid
 flowchart TD
     T{"What must the task do?"}
-    T -->|"Generate text, code, or inspect images"| L["Start with one qualified large multimodal model"]
+    T -->|"Generate text, code, or inspect images"| L["Inspect installed models with the required capabilities"]
     T -->|"Create retrieval vectors"| E["Use a small embedding model"]
     T -->|"Classify, route, or answer yes/no"| D["Use a small decision model"]
     T -->|"Transcribe or speak"| A["Use an audio or speech model"]
@@ -166,6 +168,33 @@ this machine and workload, not a universal model-placement rule. Follow
 
 ## Turn measurements into routing evidence
 
+Run `freellama bench-all --include EXACT_INSTALLED_TAG` on the serving machine, repeating
+`--include` for other installed tags. The default output is `benchmark-report.json` in the
+FreeLlama home (`FREELLAMA_HOME`, otherwise `~/.octocode/freellama`), which `serve` discovers on
+its next start. `--output` chooses a different report path. No models are downloaded. Existing
+resident models are left loaded; only models this run successfully warmed are eligible for cleanup.
+
+Schema 2 reports record an observation timestamp, server version, artifact digests, OS, CPU,
+RAM, available GPU identity and a domain-separated hash of the OS machine identifier. Raw machine
+identifiers and hostnames are not included. Routing requires the same host/hardware signature,
+exact endpoint (apart from a trailing slash), and current model digest. Remote endpoints, unknown
+machine identity, reports from another host, and older reports remain readable but do not qualify
+local throughput. Regenerate them on this machine. Primary-endpoint scores never qualify a separate
+CPU-assigned runner. GPU details absent from the OS remain unknown; server settings and upgrades can
+change performance without changing this signature, so rerun after those changes.
+
+Job and workflow selection first asks the Rust router for a locally benchmarked model. Ordinary
+jobs request the fastest route; capable workflows require a task quality policy as well. OCR also
+requires quality evidence, and image search requires vision-capable embeddings. Without matching
+evidence, selection falls back to installed catalog picks and their live memory preview. If no
+tested catalog pick is installed, a capability-qualified installed model may run with an untested
+warning. A conservative preview miss can still reach the authoritative runtime admission gate,
+which admits, waits or refuses; selection never reserves memory. An explicit caller `model` wins.
+The result states when local throughput guided the choice; a throughput screen alone does not
+establish job accuracy. `models {view:"catalog"}` shows portable starting points, not the final
+calibrated decision. This calibrated-first path applies to `run_task` jobs/workflows and virtual
+gateway models; `delegate_research` has its own [catalog-and-routing sequence](cookbooks/research-agent.md).
+
 `bench-all` measures local performance. A quality benchmark measures correctness. FreeLlama needs
 both the generated task policy and local benchmark data before grading a route medium confidence.
 See the [CLI reference](CLI.md#earn-medium-routing-confidence) for the commands.
@@ -211,7 +240,7 @@ feature with `capability`, `use`, `reason`, and `basis:"supported_feature"`;
 | Feature | Supported workflow | What to evaluate separately |
 |---|---|---|
 | `completion` | Text generation | Coding, summarization, reasoning, and instruction-following accuracy |
-| `tools` | Tool calls | Argument correctness, tool selection, and agent-loop reliability |
+| `tools` | Tool calls | Argument correctness, tool selection, and agent-loop reliability; see the [bounded public smoke evidence](RELIABILITY.md#public-tool-calling-smoke-suite) |
 | `vision` | Image input | OCR and visual understanding accuracy |
 | `audio` | Audio workflows advertised by the model | Supported audio task and accuracy |
 | `embedding` | Retrieval and similarity vectors | Retrieval quality on your documents |

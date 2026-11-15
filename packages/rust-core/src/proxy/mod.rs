@@ -38,7 +38,7 @@ pub use hooks::{
 pub use retry::RestartAction;
 pub(crate) use retry::{MAX_ATTEMPTS, retry_delay};
 pub(crate) use upstreams::validate as validate_upstreams;
-pub use upstreams::{OpenAiUpstream, load_upstreams};
+pub use upstreams::{LlamaCppConfig, OpenAiUpstream, load_upstreams};
 
 /// Establishing a loopback connection is instant; a long connect wait only delays the
 /// connection-refused handling that restarts or reports a stopped Ollama.

@@ -119,7 +119,7 @@ fn deduplicated(
     if existing.input_hash != input_hash {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
-            "idempotency_key was already used with different input",
+            "idempotency_key was already used with different input or managed-engine configuration; inspect the original job before submitting new work",
         )
         .with_code("task_job_idempotency_conflict"));
     }

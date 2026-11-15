@@ -34,4 +34,8 @@ JSON receipt; the answers are under `.response.answers`.
 **Read the result:** from MCP and `freellama run`, one line per question, such as
 `kind: bug (p 0.95, confidence 0.79)`.
 
-**Check it:** spot-check 3 to 5 answers, and treat a low probability as unknown. Add an explicit `other` option when no listed label may fit. Do not use this model's `score` answers for severity.
+**Check it:** compare representative answers with labeled examples. A `noul` probability near
+zero means a confident **no**, not unknown; values in the 0.35–0.65 band are flagged for review.
+Choice probabilities and reported confidence need model-specific calibration. Add an explicit
+`other` option when no listed label may fit. The historical severity rubric was weak; evaluate
+your own rubric before using `score` for it. See [check-line limits](../RELIABILITY.md#accuracy-of-result-checks).

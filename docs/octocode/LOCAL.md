@@ -1,7 +1,8 @@
 Octocode is a read-only code research CLI: it finds code in a directory so you read a few exact lines, not whole files.
-Call: octocode <tool> '{"queries":[{...}]}'  (1-5 queries per call; paths relative to the working directory)
-Result: lines of findings, then "#" notes. Exit 0 found, 1 nothing found, 2 bad input (the message names the field), 3 path not found.
-More: copy a printed {"cursor":"..."} as the whole input. No cursor means the result is complete.
+Call: octocode <tool> '{"queries":[{...}]}'  (paths relative to the working directory)
+Result: text findings and "#" notes by default; --json returns JSON. Exits: 0 success, 1 empty, 2 invalid input, 3 not found, 5 execution error, 130 interrupted.
+More: run printed responsePagination.next, then every next.* continuation unchanged; isPartial or terminalLimit still means incomplete coverage.
+Checked with local CLI 20.2.0; use octocode <tool> --help before its first call, or schema <tool> for fields.
 
 structureSearch: see the layout or list files, when you do not know where to look.
   {"operation":"tree","path":".","maxDepth":2}
@@ -17,7 +18,7 @@ astSearch: find code by shape, not by text. Use it to find where something is de
   {"operation":"symbols","path":".","symbolFilter":{"terms":["run"],"mode":"exact"}}  declarations named run
   {"operation":"match","path":".","rule":{"pattern":"eval($X)"}}  every call of this shape
 lspSearch: who defines, uses or calls a symbol; exact where text search only guesses. Take path and line from an earlier result, never guess them.
-  {"path":"src/a.rs","symbolName":"run","line":35}  its definition
+  {"operation":"definition","path":"src/a.rs","symbolName":"run","line":35}  its definition
   {"operation":"references","path":"src/a.rs","symbolName":"run","line":35,"view":"files"}  where it is used
   {"operation":"callers","path":"src/a.rs","symbolName":"run","line":35}  also callees, hover, documentSymbols
 

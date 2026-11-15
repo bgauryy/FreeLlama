@@ -37,6 +37,7 @@ server-launch config (for example `.mcp.json`'s `env` block) or the launching sh
 | `FREELLAMA_AGENT_OCTOCODE_PACKAGE` | `octocode@19.1.0` | Pinned npm spec the Octocode adapter runs through `npx` |
 | `FREELLAMA_MCP_ALLOW_CODER` | unset (off) | `1` enables `delegate_research` `adapter:"coder"`, which edits files and runs the caller's `agent.commands` in an isolated copy of the workspace and returns a patch for the caller to review and `git apply` (see [`src/research/coder-agent.ts`](https://github.com/bgauryy/FreeLlama/blob/main/packages/mcp/src/research/coder-agent.ts)) |
 | `FREELLAMA_CODER_RUN_TIMEOUT_SECONDS` | `300` (at most `1800`) | Timeout of one coder `run`; the whole call is still bounded by `agent.timeoutSeconds` (coder default at least 600 s) |
+| `FREELLAMA_CODER_MAX_OUTPUT_BYTES` | `16777216` (16 MiB; at most 256 MiB) | Retained raw stdout/stderr cap per coder command. Overflow or a log-write error terminates the command and reports incomplete output. Model previews remain bounded separately; retained files have no aggregate cross-session quota |
 | `FREELLAMA_CODER_MAX_COPY_BYTES` | `209715200` (200 MB) | Size cap of a coder copy of a workspace that is not a git repository (`node_modules`, `target`, `dist` and `.git` excluded) |
 | `FREELLAMA_CODER_WRITABLE` | unset | Platform-separated extra directories the coder's allowed commands may write, such as `~/.cargo` for `cargo test`; an entry that holds or lies inside the workspace is refused |
 | `FREELLAMA_CODER_UNSANDBOXED_RUN` | unset | `1` lets the coder `run` without an OS sandbox (`sandbox-exec` or `bwrap`); without one, `run` is refused |
@@ -48,6 +49,8 @@ Serve-side placement settings (read by `freellama serve`, not the MCP process):
 | `FREELLAMA_EVICT_IDLE_MODELS` | on | Unload idle, unpinned models using reuse and load costs when a cold load needs room. `0` turns eviction off |
 | `FREELLAMA_CPU_NUM_THREAD` | half the logical cores (not set on macOS) | `num_thread` for CPU-placed tasks only; GPU tasks leave it to Ollama |
 | `FREELLAMA_MAX_QUEUE_WAIT_SECONDS` | `120` | How long a managed task queues for a slot or memory |
+| `FREELLAMA_MAX_REQUEST_BYTES` | `67108864` (64 MiB) | Managed request/response byte cap; Ollama embedding, decision, error and NDJSON response bytes share it. Buffered terminal and rewritten gateway responses use the same per-response bound before UTF-8 decoding, including SSE/JSON/error bodies; fetch may already have decompressed them. Overflow fails without replay (502 before gateway headers, stream failure afterward, CLI exit 1); raw real-tag passthrough remains pull-driven |
+| `FREELLAMA_DURABLE_JOBS` | off | `true`/`1` enables durable deferred receipts and idempotency with a file-backed store; prompts are not persisted or replayed. See [durable deferred jobs](../../docs/DEFERRED_JOBS.md) |
 | `OLLAMA_NUM_PARALLEL`, `OLLAMA_KV_CACHE_TYPE`, `OLLAMA_FLASH_ATTENTION` | Ollama's | Read as hints for the memory estimate: parallel slots multiply the KV cache, and `q8_0`/`q4_0` shrink it only with flash attention. Set them for serve the same way as for Ollama |
 
 Research-adapter settings are deployment defaults. The optional `delegate_research.agent` object
@@ -111,11 +114,31 @@ managed admission; it does not create Ollama
 slots or relax memory guards. Existing queued work keeps its captured cost. See
 [monitoring controls](https://github.com/bgauryy/FreeLlama/blob/main/docs/MONITORING.md#adaptive-concurrency).
 
-**No measurements are compiled in.** In a repository checkout, per-model research grades load from
+Research-adapter grades load at runtime. In a repository checkout, per-model research grades load from
 `packages/mcp/evidence/model-evidence.json`. A published package does not include that repository
 file, so its evidence table is empty unless you set `FREELLAMA_MCP_MODEL_EVIDENCE`. An unmeasured
 model yields a `verify` verdict, and an unreadable evidence file is reported on stderr and treated
 as empty. Tool descriptions state the rules.
+
+Job/workflow model selection first consumes the Rust router's machine-local throughput evidence,
+then falls back to the portable installed-model catalog when that evidence is unavailable or
+insufficient. Capable workflows and OCR also require a task-quality policy for a calibrated pick;
+throughput alone does not establish job accuracy. The selected model and note remain visible, and
+caller-supplied fields still win.
+
+`freellama bench-all` explicitly measures installed models and writes
+`$FREELLAMA_HOME/benchmark-report.json` by default (normally
+`~/.octocode/freellama/benchmark-report.json`). On its next start, `serve` discovers that report;
+`FREELLAMA_BENCHMARK_REPORT` can select another file. Only matching schema-2 host/hardware,
+endpoint and artifact-digest evidence qualifies throughput. CPU-assigned runners do not reuse
+the primary endpoint's report. See [machine calibration](../../docs/MODEL_SELECTION.md#turn-measurements-into-routing-evidence)
+for the complete procedure, policy files and evidence limits.
+
+Host-memory admission defaults to `require-memory` on Linux, macOS and Windows. Windows uses a
+bounded PowerShell/CIM query; CPU load, OS pressure, thermal, swap and GPU telemetry remain
+unavailable there. Failed memory observation holds local work, and `require-all` cannot be
+satisfied by the Windows collector. See [resource controls](../../docs/CLI.md#bound-admission)
+for explicit operator policy overrides.
 
 ## Research model and sweeps
 

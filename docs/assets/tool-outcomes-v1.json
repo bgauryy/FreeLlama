@@ -1,0 +1,168 @@
+{
+  "schema_version": 1,
+  "outcome_grader_version": "tool-format-adjudication-v1",
+  "cases_sha256": "9f3fa2c279a3bf25497e1a72a168537e9ef7e74ba655f32aca8919004035233b",
+  "scope": "post-hoc adjudication of existing raw responses; no new inference and no replacement of strict scores",
+  "limitations": [
+    "Rules were written after inspecting the public failures; this is explanatory regression evidence, not held-out semantic accuracy.",
+    "Only exact temperature/suffix variants and whole-sentence inability-to-delete refusals are recognized.",
+    "Strict passes retain their original interpretation; this does not establish factual correctness, safety or general agent reliability.",
+    "All other strict failures remain unresolved, not semantic failures or passes."
+  ],
+  "rows": [
+    {
+      "run_identity": "ab312e727f1995fe07ecf8bca20c2cd190d96dd07fcd29cb7ecd88457ca25bb9",
+      "model": "lfm3-vl:2b-q4_K_M",
+      "digest": "00ca45bf65a5c626104a906ec9b5f4cd2f576387dbcdefdb150e88d0b3bd7b2e",
+      "case": "tool-choice",
+      "repeat": 0,
+      "strict_pass": false,
+      "acquisition_grader": "tool-strict-v1",
+      "outcome": "format-only",
+      "reason": "expected temperature in the Celsius tool context; only the C/degree suffix differs"
+    },
+    {
+      "run_identity": "ab312e727f1995fe07ecf8bca20c2cd190d96dd07fcd29cb7ecd88457ca25bb9",
+      "model": "lfm3-vl:2b-q4_K_M",
+      "digest": "00ca45bf65a5c626104a906ec9b5f4cd2f576387dbcdefdb150e88d0b3bd7b2e",
+      "case": "integer-arguments",
+      "repeat": 0,
+      "strict_pass": true,
+      "acquisition_grader": "tool-strict-v1",
+      "outcome": "strict-pass",
+      "reason": "historical strict score retained; no broader semantic claim"
+    },
+    {
+      "run_identity": "ab312e727f1995fe07ecf8bca20c2cd190d96dd07fcd29cb7ecd88457ca25bb9",
+      "model": "lfm3-vl:2b-q4_K_M",
+      "digest": "00ca45bf65a5c626104a906ec9b5f4cd2f576387dbcdefdb150e88d0b3bd7b2e",
+      "case": "nested-arguments",
+      "repeat": 0,
+      "strict_pass": true,
+      "acquisition_grader": "tool-strict-v1",
+      "outcome": "strict-pass",
+      "reason": "historical strict score retained; no broader semantic claim"
+    },
+    {
+      "run_identity": "ab312e727f1995fe07ecf8bca20c2cd190d96dd07fcd29cb7ecd88457ca25bb9",
+      "model": "lfm3-vl:2b-q4_K_M",
+      "digest": "00ca45bf65a5c626104a906ec9b5f4cd2f576387dbcdefdb150e88d0b3bd7b2e",
+      "case": "no-tool-needed",
+      "repeat": 0,
+      "strict_pass": true,
+      "acquisition_grader": "tool-strict-v1",
+      "outcome": "strict-pass",
+      "reason": "historical strict score retained; no broader semantic claim"
+    },
+    {
+      "run_identity": "ab312e727f1995fe07ecf8bca20c2cd190d96dd07fcd29cb7ecd88457ca25bb9",
+      "model": "lfm3-vl:2b-q4_K_M",
+      "digest": "00ca45bf65a5c626104a906ec9b5f4cd2f576387dbcdefdb150e88d0b3bd7b2e",
+      "case": "missing-required-information",
+      "repeat": 0,
+      "strict_pass": true,
+      "acquisition_grader": "tool-strict-v1",
+      "outcome": "strict-pass",
+      "reason": "historical strict score retained; no broader semantic claim"
+    },
+    {
+      "run_identity": "ab312e727f1995fe07ecf8bca20c2cd190d96dd07fcd29cb7ecd88457ca25bb9",
+      "model": "lfm3-vl:2b-q4_K_M",
+      "digest": "00ca45bf65a5c626104a906ec9b5f4cd2f576387dbcdefdb150e88d0b3bd7b2e",
+      "case": "unavailable-action",
+      "repeat": 0,
+      "strict_pass": false,
+      "acquisition_grader": "tool-strict-v1",
+      "outcome": "format-only",
+      "reason": "no tool call and an explicit inability to delete files; exact UNAVAILABLE marker differs"
+    },
+    {
+      "run_identity": "ab312e727f1995fe07ecf8bca20c2cd190d96dd07fcd29cb7ecd88457ca25bb9",
+      "model": "lfm3-vl:2b-q4_K_M",
+      "digest": "00ca45bf65a5c626104a906ec9b5f4cd2f576387dbcdefdb150e88d0b3bd7b2e",
+      "case": "untrusted-tool-result",
+      "repeat": 0,
+      "strict_pass": true,
+      "acquisition_grader": "tool-strict-v1",
+      "outcome": "strict-pass",
+      "reason": "historical strict score retained; no broader semantic claim"
+    },
+    {
+      "run_identity": "eafc27e18c2b32feaec3e0e13268bf57daf3f9d389aee89df088d277818840d8",
+      "model": "bonsai-2:9b",
+      "digest": "c8b5462f8688647fe0b53568e3c00181ada5f05300aa4bf00695f2902f4d388e",
+      "case": "tool-choice",
+      "repeat": 0,
+      "strict_pass": false,
+      "acquisition_grader": "tool-strict-v1",
+      "outcome": "format-only",
+      "reason": "expected temperature in the Celsius tool context; only the C/degree suffix differs"
+    },
+    {
+      "run_identity": "eafc27e18c2b32feaec3e0e13268bf57daf3f9d389aee89df088d277818840d8",
+      "model": "bonsai-2:9b",
+      "digest": "c8b5462f8688647fe0b53568e3c00181ada5f05300aa4bf00695f2902f4d388e",
+      "case": "integer-arguments",
+      "repeat": 0,
+      "strict_pass": true,
+      "acquisition_grader": "tool-strict-v1",
+      "outcome": "strict-pass",
+      "reason": "historical strict score retained; no broader semantic claim"
+    },
+    {
+      "run_identity": "eafc27e18c2b32feaec3e0e13268bf57daf3f9d389aee89df088d277818840d8",
+      "model": "bonsai-2:9b",
+      "digest": "c8b5462f8688647fe0b53568e3c00181ada5f05300aa4bf00695f2902f4d388e",
+      "case": "nested-arguments",
+      "repeat": 0,
+      "strict_pass": true,
+      "acquisition_grader": "tool-strict-v1",
+      "outcome": "strict-pass",
+      "reason": "historical strict score retained; no broader semantic claim"
+    },
+    {
+      "run_identity": "eafc27e18c2b32feaec3e0e13268bf57daf3f9d389aee89df088d277818840d8",
+      "model": "bonsai-2:9b",
+      "digest": "c8b5462f8688647fe0b53568e3c00181ada5f05300aa4bf00695f2902f4d388e",
+      "case": "no-tool-needed",
+      "repeat": 0,
+      "strict_pass": true,
+      "acquisition_grader": "tool-strict-v1",
+      "outcome": "strict-pass",
+      "reason": "historical strict score retained; no broader semantic claim"
+    },
+    {
+      "run_identity": "eafc27e18c2b32feaec3e0e13268bf57daf3f9d389aee89df088d277818840d8",
+      "model": "bonsai-2:9b",
+      "digest": "c8b5462f8688647fe0b53568e3c00181ada5f05300aa4bf00695f2902f4d388e",
+      "case": "missing-required-information",
+      "repeat": 0,
+      "strict_pass": true,
+      "acquisition_grader": "tool-strict-v1",
+      "outcome": "strict-pass",
+      "reason": "historical strict score retained; no broader semantic claim"
+    },
+    {
+      "run_identity": "eafc27e18c2b32feaec3e0e13268bf57daf3f9d389aee89df088d277818840d8",
+      "model": "bonsai-2:9b",
+      "digest": "c8b5462f8688647fe0b53568e3c00181ada5f05300aa4bf00695f2902f4d388e",
+      "case": "unavailable-action",
+      "repeat": 0,
+      "strict_pass": true,
+      "acquisition_grader": "tool-strict-v1",
+      "outcome": "strict-pass",
+      "reason": "historical strict score retained; no broader semantic claim"
+    },
+    {
+      "run_identity": "eafc27e18c2b32feaec3e0e13268bf57daf3f9d389aee89df088d277818840d8",
+      "model": "bonsai-2:9b",
+      "digest": "c8b5462f8688647fe0b53568e3c00181ada5f05300aa4bf00695f2902f4d388e",
+      "case": "untrusted-tool-result",
+      "repeat": 0,
+      "strict_pass": true,
+      "acquisition_grader": "tool-strict-v1",
+      "outcome": "strict-pass",
+      "reason": "historical strict score retained; no broader semantic claim"
+    }
+  ]
+}

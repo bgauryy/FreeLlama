@@ -127,7 +127,9 @@ async fn installed_forecast(state: &ProxyState, model: &str) -> Option<RawForeca
     if !response.status().is_success() {
         return None;
     }
-    let tags = response.json::<serde_json::Value>().await.ok()?;
+    let tags = crate::ollama_http::bounded_metadata_json(response, "/api/tags")
+        .await
+        .ok()?;
     let entry = crate::ollama_http::find_ps_entry(&tags, model)?;
     let bytes = entry["size"].as_u64().filter(|bytes| *bytes > 0)?;
     Some(RawForecast {
@@ -151,7 +153,9 @@ async fn not_listed(state: &ProxyState, model: &str) -> bool {
             .ok()?
             .error_for_status()
             .ok()?;
-        response.json::<serde_json::Value>().await.ok()
+        crate::ollama_http::bounded_metadata_json(response, "/api/tags")
+            .await
+            .ok()
     }
     .await;
     tags.is_some_and(|tags| {
@@ -270,7 +274,11 @@ impl RawModel {
                 .get(format!("{}{path}", state.upstream.trim_end_matches('/')))
                 .send()
         };
-        let Ok(ps) = async { get("/api/ps").await?.json::<serde_json::Value>().await }.await else {
+        let Ok(ps) = async {
+            crate::ollama_http::bounded_metadata_json(get("/api/ps").await?, "/api/ps").await
+        }
+        .await
+        else {
             return false;
         };
         // Resolve exactly as Ollama will read the name it receives: the tag, else `:latest`.

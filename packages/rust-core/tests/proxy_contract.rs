@@ -28,6 +28,76 @@ impl http_body::Body for IncompleteRequestBody {
 }
 
 #[tokio::test]
+async fn oversized_internal_catalog_refuses_generation_without_limiting_raw_metadata_passthrough() {
+    let oversized = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let toggle = oversized.clone();
+    let generated = Arc::new(AtomicUsize::new(0));
+    let calls = generated.clone();
+    let tags = serde_json::json!({"models":[{"name":"bounded:latest", "digest":"d", "size":1000}],
+        "padding":"x".repeat(4 * 1024 * 1024)})
+    .to_string();
+    let expected_bytes = tags.clone().into_bytes();
+    let upstream = Router::new()
+        .route("/api/tags", any(move || {
+            let toggle = toggle.clone();
+            let tags = tags.clone();
+            async move {
+                if toggle.load(Ordering::SeqCst) { tags } else {
+                    serde_json::json!({"models":[{"name":"bounded:latest","digest":"d","size":1000}]}).to_string()
+                }
+            }
+        }))
+        .route("/api/ps", any(|| async { "{\"models\":[]}" }))
+        .route("/api/chat", any(move || {
+            let calls = calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                "{\"done\":true,\"message\":{\"content\":\"ok\"}}"
+            }
+        }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+    let load = Arc::new(Mutex::new(()));
+    let proxy = app(crate::support::proxy_config("127.0.0.1:0", endpoint, false)
+        .with_max_concurrent_requests(1)
+        .with_load_lock(load.clone()))
+    .unwrap();
+    let chat = || {
+        Request::post("/api/chat")
+            .body(Body::from(r#"{"model":"bounded:latest","stream":false}"#))
+            .unwrap()
+    };
+    let refused = proxy.clone().oneshot(chat()).await.unwrap();
+    assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let value: serde_json::Value =
+        serde_json::from_slice(&to_bytes(refused.into_body(), 4096).await.unwrap()).unwrap();
+    assert_eq!(value["code"], "model_forecast_unavailable");
+    assert_eq!(generated.load(Ordering::SeqCst), 0);
+    assert!(load.try_lock().is_ok());
+
+    // The same large metadata body is allowed when explicitly requested by a raw client:
+    // the proxy streams it and does not accumulate it as internal routing evidence.
+    let raw = proxy
+        .clone()
+        .oneshot(Request::get("/api/tags").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(raw.status(), StatusCode::OK);
+    assert_eq!(
+        to_bytes(raw.into_body(), 8 << 20).await.unwrap().as_ref(),
+        expected_bytes
+    );
+
+    oversized.store(false, Ordering::SeqCst);
+    let recovered = proxy.oneshot(chat()).await.unwrap();
+    assert_eq!(recovered.status(), StatusCode::OK);
+    drop(recovered);
+    assert_eq!(generated.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[tokio::test]
 async fn incomplete_upload_times_out_and_releases_execution_before_any_upstream_request() {
     let (upstream, calls) = spawn_flaky_upstream(0).await;
     let execution = Arc::new(Mutex::new(()));
@@ -715,8 +785,8 @@ async fn proxy_does_not_restart_ollama_for_an_ordinary_5xx_not_a_dead_process() 
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(
         calls.load(Ordering::SeqCst),
-        3,
-        "a live-but-erroring upstream must still only get the normal MAX_ATTEMPTS retries"
+        1,
+        "a generation POST may have executed before HTTP 500; never replay an uncertain result"
     );
     assert_eq!(
         restart_calls.load(Ordering::SeqCst),

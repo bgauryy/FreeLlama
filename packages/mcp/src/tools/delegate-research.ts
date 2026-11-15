@@ -31,7 +31,7 @@ import {
   researchErrorResult, verifiedResearchDigest,
 } from "../delegate.js";
 import {
-  CODER_DEFAULT_MAX_TURNS, CODER_MIN_TIMEOUT_SECONDS, coderCommandsSchema, coderRefusal, coderToolResult, prepareCoderRun, type CoderRun,
+  CODER_DEFAULT_MAX_TURNS, CODER_MIN_TIMEOUT_SECONDS, coderCommandsSchema, coderRefusal, coderToolResult, prepareCoderRun, withCoderAudit, type CoderRun,
 } from "./coder.js";
 
 const researchResultSchema = z.object({
@@ -271,7 +271,7 @@ export function registerDelegateResearchTool(server: McpServer): void {
         } catch {
           // No usable result file: a hard kill (the SIGKILL timeout above) or a crash before the
           // adapter could finish writing. Here the exec error genuinely is the best account.
-          return researchErrorResult(
+          const failure = researchErrorResult(
             adapterError ??
               new Error(
                 "research adapter exited without writing a readable result file — it was killed " +
@@ -279,6 +279,7 @@ export function registerDelegateResearchTool(server: McpServer): void {
                   "is enough for this question.",
               ),
           );
+          return withCoderAudit(failure, coder);
         }
         // Surface the evidence trail (which tool, which path) so the orchestrator can spot-check
         // *how* the answer was reached without re-deriving it — verifier independence in practice,
@@ -350,7 +351,7 @@ export function registerDelegateResearchTool(server: McpServer): void {
           if (!readPaths.has(hit.path)) citations.push(hit as unknown as (typeof citations)[number]);
         }
         if (coder) {
-          return coderToolResult({ result, adapterError, evidence, observations, model: chosenModel, workspace });
+          return withCoderAudit(coderToolResult({ result, adapterError, evidence, observations, model: chosenModel, workspace }), coder);
         }
         if (adapterError) {
           const diagnostic = `research adapter failed: ${result.final_answer}` +
@@ -408,7 +409,7 @@ export function registerDelegateResearchTool(server: McpServer): void {
           `\n(research model: ${chosenModel} (${modelReason}), ${result.tool_calls.length} tool call(s))`;
         return structuredResult(payload, { text: answerText });
       } catch (error) {
-        return researchErrorResult(error);
+        return withCoderAudit(researchErrorResult(error), coder);
       } finally {
         coder?.cleanup(workspace);
         await rm(dir, { recursive: true, force: true });

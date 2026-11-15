@@ -44,9 +44,17 @@ async fn send_with_retries(
 /// A whole response body as JSON. A failing Ollama does not always answer in JSON (a wedged
 /// runner can return a plain-text or HTML body); a strict parse would turn a truthful 500 into a
 /// misleading decode error, so a non-JSON body is carried through as text.
-async fn body_value(response: reqwest::Response) -> Result<(StatusCode, Value), ApiError> {
+async fn body_value(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<(StatusCode, Value), ApiError> {
     let status = response.status();
-    let bytes = response.bytes().await.map_err(ApiError::upstream)?;
+    let mut bytes = Vec::new();
+    let mut budget = ResponseBudget::new(limit);
+    while let Some(chunk) = response.chunk().await.map_err(ApiError::upstream)? {
+        budget.account(chunk.len(), None)?;
+        bytes.extend_from_slice(&chunk);
+    }
     let value = serde_json::from_slice::<Value>(&bytes)
         .unwrap_or_else(|_| json!({ "error": String::from_utf8_lossy(&bytes).trim().to_owned() }));
     Ok((status, value))
@@ -60,7 +68,41 @@ pub(crate) async fn post_json_with_retries(
     body: &Value,
 ) -> Result<(StatusCode, Value), ApiError> {
     let url = crate::ollama_http::url(upstream, path);
-    body_value(send_with_retries(state, &url, path, body).await?).await
+    body_value(
+        send_with_retries(state, &url, path, body).await?,
+        state.max_request_bytes,
+    )
+    .await
+}
+
+/// Bound all bytes retained from an accepted response, including framing, reasoning, tools and
+/// log probabilities. A token cap or deadline cannot bound a malformed frame or an error body.
+struct ResponseBudget {
+    limit: usize,
+    received: usize,
+}
+
+impl ResponseBudget {
+    fn new(limit: usize) -> Self {
+        Self { limit, received: 0 }
+    }
+
+    fn account(&mut self, bytes: usize, partial: Option<&StreamedMessage>) -> Result<(), ApiError> {
+        if bytes > self.limit.saturating_sub(self.received) {
+            let mut receipt = json!({"done":false, "response_limit_bytes":self.limit});
+            if let Some(partial) = partial {
+                receipt["message"] = partial.message();
+            }
+            return Err(ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                "Ollama response exceeds the managed response byte limit",
+            )
+            .with_upstream_response("upstream_response_too_large", receipt, None)
+            .after_partial_execution());
+        }
+        self.received += bytes;
+        Ok(())
+    }
 }
 
 /// The response a stopped stream reports: everything generated so far, `done:true` with the
@@ -164,15 +206,21 @@ fn parse_stream_frame(line: &[u8], partial: &StreamedMessage) -> Result<Value, V
 
 /// Forward a chunk's generated text to a streamed task's caller. A caller that went away is not
 /// an error here: its task is being aborted.
-fn send_pieces(events: &EventSink, chunk: &Value) {
+async fn send_pieces(events: &EventSink, chunk: &Value) {
     for (pointer, event) in [
-        ("/message/thinking", TaskEvent::Thinking as fn(String) -> TaskEvent),
-        ("/message/content", TaskEvent::Content as fn(String) -> TaskEvent),
+        (
+            "/message/thinking",
+            TaskEvent::Thinking as fn(String) -> TaskEvent,
+        ),
+        (
+            "/message/content",
+            TaskEvent::Content as fn(String) -> TaskEvent,
+        ),
     ] {
         if let Some(piece) = chunk.pointer(pointer).and_then(Value::as_str)
             && !piece.is_empty()
         {
-            let _ = events.send(event(piece.to_owned()));
+            let _ = events.send(event(piece.to_owned())).await;
         }
     }
 }
@@ -183,7 +231,7 @@ const LOOP_CHECK_TOKENS: u64 = 16;
 /// [`post_json_with_retries`] for a streaming `/api/chat` (`stop_on_repetition`): the same retries
 /// before the first byte, then Ollama's NDJSON chunks are accumulated into one non-streaming
 /// response. Every [`LOOP_CHECK_TOKENS`] tokens the text is checked for a repetition loop; on one,
-/// the response is dropped, which closes the connection and cancels the generation upstream, and
+/// the response is dropped, which closes the connection to request cancellation upstream, and
 /// everything generated so far is returned with `done_reason: "repetition"`. Ollama's own
 /// "token repeat limit" abort keeps the generated text too (`done_reason: "repeat_limit"`).
 ///
@@ -202,13 +250,15 @@ pub(crate) async fn post_streaming_chat_with_retries(
     let mut response = send_with_retries(state, &url, path, body).await?;
     let status = response.status();
     if !status.is_success() {
-        return body_value(response).await;
+        return body_value(response, state.max_request_bytes).await;
     }
     let mut pending = Vec::new();
     let mut streamed = StreamedMessage::default();
     let mut last = Value::Null;
     let mut checked_at = 0u64;
+    let mut budget = ResponseBudget::new(state.max_request_bytes);
     while let Some(bytes) = response.chunk().await.map_err(ApiError::upstream)? {
+        budget.account(bytes.len(), Some(&streamed))?;
         pending.extend_from_slice(&bytes);
         while let Some(end) = pending.iter().position(|byte| *byte == b'\n') {
             let line = pending.drain(..=end).collect::<Vec<_>>();
@@ -241,7 +291,7 @@ pub(crate) async fn post_streaming_chat_with_retries(
             }
             streamed.absorb(&chunk);
             if let Some(events) = events {
-                send_pieces(events, &chunk);
+                send_pieces(events, &chunk).await;
             }
             if chunk["done"] == true {
                 return Ok((status, streamed.finish(chunk)));
@@ -251,7 +301,7 @@ pub(crate) async fn post_streaming_chat_with_retries(
             if stop_on_loop && generated >= checked_at + LOOP_CHECK_TOKENS {
                 checked_at = generated;
                 if streamed.looping() {
-                    // Returning drops `response`: the connection closes and Ollama cancels.
+                    // Returning drops `response`, closing the connection to request cancellation.
                     let value = streamed_completion(
                         &last,
                         &streamed.message(),
@@ -271,7 +321,7 @@ pub(crate) async fn post_streaming_chat_with_retries(
     {
         streamed.absorb(&chunk);
         if let Some(events) = events {
-            send_pieces(events, &chunk);
+            send_pieces(events, &chunk).await;
         }
         return Ok((status, streamed.finish(chunk)));
     }
@@ -281,6 +331,9 @@ pub(crate) async fn post_streaming_chat_with_retries(
         json!({"done": false, "message": streamed.message()}),
     ))
 }
+
+#[cfg(test)]
+mod contract_tests;
 
 #[cfg(test)]
 mod streamed_tests {

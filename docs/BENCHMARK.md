@@ -2,22 +2,25 @@
 
 One run, measured on 2026-11-14 on an Apple M2 Pro (32 GB): FreeLlama against Ollama alone,
 llama.cpp, llama-swap and LocalAI, all loading the same hash-verified model file. Every one of the
-360 measured answers was correct and byte-identical.
+360 measured answers was correct and byte-identical for that single extraction fixture.
+This is separate from [result-check accuracy and local tool-calling evidence](RELIABILITY.md).
+The current explicit [managed llama.cpp text path](LLAMACPP.md) is also separate from these
+Ollama-backed FreeLlama measurements.
 
 ![Ollama, FreeLlama and the most popular local runners on six measured KPIs](assets/benchmark-overview.png)
 
 Then the [features](#features): what FreeLlama's management changes, each measured against the
 same work without it.
 
-## Bottom line
+## What the measured scenarios show
 
-FreeLlama is not an engine. It is a layer over Ollama that decides which model runs, whether the
-machine has room for it, and reports what happened. It costs Ollama's speed plus a few
-milliseconds and about 30 MB of RAM. Choose by what your system needs:
+FreeLlama manages model selection, admission and receipts around external engines. The
+FreeLlama rows below used Ollama. In this workload, its layer added a few milliseconds and
+used about 30 MB of server RSS. These results describe the recorded configurations:
 
-| You are building | Use | Why, in measured numbers |
+| Scenario | Setup measured here | Observations in this run |
 |---|---|---|
-| An agent (Claude Code, Cursor, scripts) that offloads bounded work to local models on a machine that also runs editors, browsers and builds | **FreeLlama on Ollama** | Same speed as Ollama (274 vs 272 ms median, first streamed token 95 vs 93 ms); its own work is 3.7 ms per task and its server uses 26–31 MB. Its built-in workflow prompts passed 98% of graded cases where one-line prompts passed 52%, in less time and fewer tokens. An interactive task behind 8 queued ones answered in 1.40 s instead of 3.52 s; repeated code searches and sweeps reuse saved work (55.9 s → 0.13 s, 49.8 s → 18 ms); long tasks return a job id in 29 ms. It refuses a load that would not fit and names what holds the memory (live: needed 7.2 GB, 4.2 GB free, refused), picks an installed model that fits per job, and returns a receipt with per-phase timing. 9.7 ms CPU per task. MCP server, CLI and an Ollama/OpenAI/Anthropic gateway. |
+| An agent (Claude Code, Cursor, scripts) that offloads bounded work to local models on a machine that also runs editors, browsers and builds | **FreeLlama on Ollama** | Same speed as Ollama (274 vs 272 ms median, first streamed token 95 vs 93 ms); its own work is 3.7 ms per task and its server uses 26–31 MB. Its built-in workflow prompts passed 45/46 completed graded cases versus 25/48 for one-line prompts (planned-denominator limits below), in less time and fewer tokens. An interactive task behind 8 queued ones answered in 1.40 s instead of 3.52 s; repeated code searches and sweeps reuse saved work (55.9 s → 0.13 s, 49.8 s → 18 ms); long tasks return a job id in 29 ms. It refuses a load that would not fit and names what holds the memory (live: needed 7.2 GB, 4.2 GB free, refused), selects eligible installed models with runtime admission, and returns a receipt with per-phase timing. 9.7 ms CPU per task. MCP server, CLI and an Ollama/OpenAI/Anthropic gateway. |
 | One application, one model you chose, little else running | **Ollama alone** | Fastest here by 2 ms (272 ms), one-line install, the largest model library. You size models and watch memory yourself. |
 | Many concurrent requests to one model | **llama.cpp `llama-server`** | Slower per request here (336 ms) but 291 tasks/min at 4 clients against 225 for Ollama, which serves one request at a time unless `OLLAMA_NUM_PARALLEL` is set (not measured). Model loads at process start. |
 | Several models swapped on demand behind one OpenAI endpoint, on any engine | **llama-swap** | 332 ms, the best 4-client throughput (305 tasks/min), 1.58 s to load on first request. Limits are pools you declare, not measured memory. |
@@ -130,7 +133,7 @@ turns only for attention models such as `bonsai-2:9b`, not hybrid ones such as `
 
 ### Built-in prompts, measured
 
-FreeLlama's workflows send each model a tested step-by-step prompt. To measure what that adds, the
+FreeLlama's workflows send model-specific prompts evaluated on the dated cases below. To measure what that adds, the
 workflow evaluation (`scripts/local-test/workflows.mjs`) ran the 9 text workflows' graded cases on
 `bonsai-2:9b`, 2 samples each, once with the shipped prompts and once with the one-line prompt an
 agent would write itself ([`baseline-prompts.mjs`](../scripts/local-test/baseline-prompts.mjs),
@@ -139,7 +142,8 @@ was the same. On the 24 cases graded both ways:
 
 | | Shipped workflow prompts | One-line prompts |
 |---|---:|---:|
-| Pass | **45/46 (98%)** | 25/48 (52%) |
+| Pass among completed graded samples | **45/46 (98%)** | 25/48 (52%) |
+| Pass / nominal 48 planned trials | 45/48 (94%) | 25/48 (52%) |
 | Median time per task | **2.54 s** | 3.29 s |
 | Median output tokens | **46.5** | 72.5 |
 
@@ -161,8 +165,14 @@ Per workflow (pass rate, median time per task):
 
 The one-line prompts failed by padding past length limits (a log summary of 170 words for a 90-word
 bound), inventing causes ("database" in a log that never mentions one), missing the failed step,
-and leaving out the edit block. Six shipped-prompt runs did not run at all: the memory gate held
-them while the machine had 5.0 GB free, which the scorecard counts under memory, not quality.
+and leaving out the edit block. The retained aggregates contain 46 shipped completions versus 48
+baseline completions over a nominal 48 planned trials per arm. The 98% figure is 45/46 completed
+samples; counting the two absent shipped completions as not passed gives 45/48 (93.75%). The
+individual traces for those absent samples are not in the checked-in aggregates. Earlier notes
+report six memory-held attempts, but the retained data does not reconstruct those attempts or
+explain their relationship to these two missing completions. Treat this as
+incomplete completion evidence, not a production reliability percentage. The newer
+[tool-calling smoke suite](RELIABILITY.md#public-tool-calling-smoke-suite) tests a different scope.
 
 ## Scorecard
 
@@ -172,7 +182,7 @@ FreeLlama runs on) or a fixed bar, and each value comes from this page.
 | KPI | Target | Measured | How | Result |
 |---|---|---|---|---|
 | Quality: benchmark task | Same as Ollama (100%) | 60/60 correct, byte-identical to Ollama | [KPIs](#kpis) | Met |
-| Quality: built-in prompts | Beat one-line prompts | 98% vs 52% pass | [Built-in prompts](#built-in-prompts-measured) | Met |
+| Quality: built-in prompts | Beat one-line prompts | 45/46 completed vs 25/48; nominal planned 45/48 vs 25/48 | [Denominators and limits](#built-in-prompts-measured) | Observed gain; incomplete shipped trials |
 | Time: median task | Within 5% of Ollama | 274 vs 272 ms (+0.7%) | [KPIs](#kpis) | Met |
 | Time: own overhead | p95 ≤ 15 ms | p95 9.8 ms, median 3.7 ms | [Overhead](#freellamas-overhead-profiled) | Met |
 | Time: first token | Within 10% of Ollama | 95 vs 93 ms (+2%) | [KPIs](#kpis) | Met |
@@ -249,7 +259,7 @@ them. "Partial" means the feature exists with a limit named in the cell.
 
 | System | Memory check before a load | Suggests a model that fits | MCP server for agents | OpenAI / Anthropic / Ollama API | Streaming | Prometheus metrics |
 |---|---|---|---|---|---|---|
-| FreeLlama 0.12.0 | Yes: refuses a cold load that would not fit live free memory and names what holds it | Yes: tested picks per job, installed and fitting now | Yes (13 tools), plus a CLI | Gateway: all three | Yes: managed tasks stream with their receipt (`stream: true`); gateway workflows stream through Ollama | Yes, plus a receipt per task |
+| FreeLlama 0.12.0 | Yes: refuses a cold load that would not fit live free memory and names what holds it | Yes: machine-local calibrated routing, then installed catalog fallback and runtime admission | Yes (13 tools), plus a CLI | Gateway: all three | Yes: managed tasks stream with their receipt (`stream: true`); gateway workflows stream through Ollama | Yes, plus a receipt per task |
 | Ollama 0.40.16 | Partial: splits layers to fit VRAM; refuses only when total RAM is short | Partial: featured models, not fitted to the machine | No (`ollama launch` configures agents) | Yes / partial / native | Yes | No |
 | llama.cpp 1.0.0 | Partial: `--fit` on by default; the router unloads to make room, then loads anyway | No | No (MCP client only) | Yes / yes / no | Yes | Yes (opt-in) |
 | LM Studio 0.4.28 | Yes: resource guardrails, `lms load --estimate-only` | Partial: estimates | No (MCP client) | Yes / yes / no | Yes | No |
@@ -263,12 +273,12 @@ them. "Partial" means the feature exists with a limit named in the cell.
 FreeLlama inherits Ollama's engine, formats and modalities (vision, embeddings, speech) and adds
 the gate, the pick and the receipts. Memory-aware loading is no longer rare: LocalAI, oMLX, LM
 Studio and llama.cpp's router each have their own. FreeLlama's distinct parts are a gate driven
-by live host signals, picks tied to tested job prompts, and an MCP server built for an agent that
-offloads work.
+by live host signals, [machine-local calibrated picks with catalog fallback](MODEL_SELECTION.md#turn-measurements-into-routing-evidence),
+job prompts, and an MCP server for bounded agent work. These current selection rules were not
+measured by the pinned single-model comparison above.
 
-Two systems changed after the run above. llama.cpp shipped v1.0.0 on 2026-11-13 with an
-installer, memory-aware router unloading, an Anthropic API and an MCP client; this run used build
-11960. Ollama is now 0.40.16; this run used 0.40.15.
+The dated feature snapshot above lists llama.cpp 1.0.0 (2026-11-13) and Ollama 0.40.16; the measured
+run used llama.cpp build 11960 and Ollama 0.40.15. Do not transfer the results to different versions.
 
 ## Setup
 
@@ -285,7 +295,7 @@ installer, memory-aware router unloading, an Anthropic API and an MCP client; th
 | LocalAI | 4.12.1, `llama-cpp-development` backend, `gpu_layers: 99`, reasoning off |
 | Procedure | One system at a time; 2 warm-ups, 30 measured requests per pass; forward and reversed order; then 2- and 4-client levels and 3 cold requests (forward only). After each Ollama-backed block the harness unloads the model it loaded |
 
-Since this run, llama.cpp 1.0.0 (2026-11-13) and Ollama 0.40.16 shipped; neither is measured here.
+llama.cpp 1.0.0 and Ollama 0.40.16 are outside this measured version cohort.
 
 ## Limits
 
@@ -360,9 +370,12 @@ logs, host samples and `background-load.txt`. The charts are drawn from it by
 
 ## Verification
 
-On 2026-11-14, after the new-build run: `yarn test:js` **1,280 pass** (1 skipped), `yarn
+Historical verification recorded on 2026-11-14 after the benchmark build (before the later
+calibration, engine and refactor changes): `yarn test:js` **1,280 pass** (1 skipped), `yarn
 test:bench` **112 pass**, MCP integration against live Ollama **160 pass**, and the Rust suite
 all unit tests pass (427) with **3 integration-contract failures** (293 pass), all in tests the
 earlier staged branch work did not update (digest-verified
 placement and no inference retry after a 500); none touches the changes measured here. `cargo
-clippy -D warnings` is clean. The production gate (`yarn verify:production`) was not run.
+clippy -D warnings` is clean. The production gate (`yarn verify:production`) was not run for that snapshot. These counts and
+failures are preserved as historical context; they are not the current checkout's verification
+status. Use [Testing](TESTING.md) for the current gate commands.

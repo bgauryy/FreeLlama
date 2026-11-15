@@ -1,0 +1,262 @@
+{
+  "kind": "single_managed_llamacpp_smoke",
+  "date": "2026-11-14",
+  "qualification": "One short completion only; not a throughput, correctness-rate, cancellation or physical-placement qualification.",
+  "llamacpp_version": "version: 0.8.0 (build 11960, commit 8642541b2)\nbuilt with AppleClang 21.0.0.21000334 for Darwin arm64",
+  "model": {
+    "sha256": "56dac2e192ff0d9ab8507f4f1aeb4aed0463449bbbefaac79497f041c95f21eb",
+    "bytes": 1099627808,
+    "artifact": "Existing local GGUF; no download"
+  },
+  "server_options": {
+    "alias": "managed-smoke",
+    "context_tokens": 4096,
+    "parallel": 1,
+    "gpu_layers_requested": 99,
+    "reasoning_budget": 0,
+    "warmup": false
+  },
+  "managed_config": {
+    "processor": "gpu",
+    "context_tokens": 4096,
+    "max_output_tokens": 32,
+    "memory_bytes": 2147483648
+  },
+  "primary_ollama_endpoint": "http://127.0.0.1:0",
+  "request": {
+    "model": "cpp/managed-smoke",
+    "task": "completion",
+    "prompt": "Reply with exactly the word hello.",
+    "timeout_seconds": 30,
+    "max_wait_seconds": 5,
+    "request_options": {
+      "options": {
+        "num_predict": 16,
+        "temperature": 0,
+        "seed": 42
+      }
+    }
+  },
+  "preview": {
+    "status": 200,
+    "body": {
+      "confidence": "low",
+      "engine": "llamacpp",
+      "execution": {
+        "backend": "llamacpp",
+        "context_sizing": {
+          "context_tokens": 4096,
+          "input_tokens_verified": false,
+          "source": "operator_configured"
+        },
+        "engine": "llamacpp",
+        "lifecycle": "operator_owned",
+        "memory_forecast": {
+          "required_available_bytes": 2147483648,
+          "residency_credit": false,
+          "source": "operator_configured"
+        },
+        "observation": {
+          "processor": "unknown",
+          "source": "not_observed",
+          "status": "unavailable"
+        },
+        "observed_processor": null,
+        "physical_placement": {
+          "source": "unavailable",
+          "status": "unknown"
+        },
+        "placement_evidence": "configured",
+        "preview_only": true,
+        "reason": "explicit_operator_assignment_physical_placement_unknown",
+        "requested_processor": "gpu",
+        "resource_assessment": {
+          "admissible": true,
+          "denial_reason": null,
+          "effective_available_bytes": 7983120384,
+          "held_by": [],
+          "memory_advisory": null,
+          "missing_telemetry": [],
+          "required_available_bytes": 2147483648,
+          "required_with_reserve_bytes": 4294967296,
+          "reserve_bytes": 2147483648,
+          "status": "ready"
+        },
+        "upstream": "http://127.0.0.1:50297/v1"
+      },
+      "objective": "balanced",
+      "quality_evidence": "none",
+      "reasons": [
+        "Explicit operator model; no benchmark qualification or physical placement evidence"
+      ],
+      "selected_model": "cpp/managed-smoke",
+      "selection_source": "explicit_operator_assignment",
+      "task": "completion",
+      "task_evidence": "none",
+      "upstream_name": "cpp"
+    }
+  },
+  "receipt": {
+    "status": 200,
+    "body": {
+      "admission": {
+        "cost": 2,
+        "total_wait_ms": 0
+      },
+      "execution": {
+        "backend": "llamacpp",
+        "context_sizing": {
+          "context_tokens": 4096,
+          "input_tokens_verified": false,
+          "source": "operator_configured"
+        },
+        "engine": "llamacpp",
+        "lifecycle": "operator_owned",
+        "memory_forecast": {
+          "required_available_bytes": 2147483648,
+          "residency_credit": false,
+          "source": "operator_configured"
+        },
+        "observation": {
+          "processor": "unknown",
+          "source": "not_observed",
+          "status": "unavailable"
+        },
+        "observed_processor": null,
+        "physical_placement": {
+          "source": "unavailable",
+          "status": "unknown"
+        },
+        "placement_evidence": "configured",
+        "reason": "explicit_operator_assignment_physical_placement_unknown",
+        "request_max_output_tokens": 16,
+        "requested_processor": "gpu",
+        "upstream": "http://127.0.0.1:50297/v1"
+      },
+      "metrics": {
+        "output_tokens": 4,
+        "prompt_tokens": 17
+      },
+      "resources": {
+        "assessment": {
+          "admissible": true,
+          "denial_reason": null,
+          "effective_available_bytes": 7983120384,
+          "held_by": [],
+          "memory_advisory": null,
+          "missing_telemetry": [],
+          "required_available_bytes": 2147483648,
+          "required_with_reserve_bytes": 4294967296,
+          "reserve_bytes": 2147483648,
+          "status": "ready"
+        },
+        "required_available_bytes": 2147483648,
+        "reserved_bytes": 2147483648,
+        "snapshot": {
+          "effective_available_bytes": 7983120384,
+          "healthy_samples": 0,
+          "hold_reserve_bytes": 5153960745,
+          "holding": false,
+          "observation": {
+            "available_memory_bytes": 7983120384,
+            "available_memory_kind": "free_plus_bounded_reclaimable_estimate",
+            "cgroup_memory_limit_bytes": null,
+            "compressor_bytes": 5923504128,
+            "cpu_speed_limit_percent": null,
+            "free_memory_bytes": 1006288896,
+            "gpu_activity": {
+              "devices": [
+                {
+                  "allocated_memory_bytes": 5047844864,
+                  "busy_percent": 0.0,
+                  "device": "AGXAcceleratorG14X@0x1000003fd",
+                  "memory_busy_percent": null
+                }
+              ],
+              "scope": "observed_devices_all_processes",
+              "source": "apple_ioreg_performance_statistics",
+              "window": "driver_defined"
+            },
+            "gpu_memory_free_bytes": null,
+            "gpu_memory_total_bytes": null,
+            "gpu_telemetry_source": null,
+            "load_average_one_minute": 14.67,
+            "logical_cpus": 12,
+            "memory_pressure": "normal",
+            "memory_psi_some_avg10": null,
+            "occupied_memory_bytes": 26376617984,
+            "reclaimable_memory_bytes": 6976831488,
+            "source": "macos_vm_stat_sysctl_pmset",
+            "swap_out_pages": 37170140,
+            "swap_used_bytes": 11235691069,
+            "thermal_pressure": "nominal",
+            "thermal_throttled": false,
+            "thermal_warning_level": null,
+            "total_memory_bytes": 34359738368,
+            "unavailable": []
+          },
+          "policy": {
+            "first_sample_grace": {
+              "nanos": 0,
+              "secs": 2
+            },
+            "gpu_busy": null,
+            "hold_available_min_bytes": 1073741824,
+            "hold_available_percent": 15,
+            "hold_load_per_cpu": 1.5,
+            "low_memory": "refuse",
+            "recovery_samples": 2,
+            "resume_available_min_bytes": 2147483648,
+            "resume_available_percent": 20,
+            "resume_load_per_cpu": 1.0,
+            "sample_interval": {
+              "nanos": 0,
+              "secs": 2
+            },
+            "telemetry_policy": "require_memory"
+          },
+          "reasons": [],
+          "reserved_bytes": 0,
+          "resume_reserve_bytes": 6871947660,
+          "sample_age_ms": 6,
+          "sample_count": 1,
+          "sample_generation": 0,
+          "status": "ready"
+        },
+        "status": "admitted",
+        "waited_ms": 0
+      },
+      "response": {
+        "done": true,
+        "done_reason": "stop",
+        "eval_count": 4,
+        "message": {
+          "content": "hello",
+          "role": "assistant"
+        },
+        "model": "cpp/managed-smoke",
+        "prompt_eval_count": 17
+      },
+      "route": {
+        "confidence": "low",
+        "engine": "llamacpp",
+        "objective": "balanced",
+        "quality_evidence": "none",
+        "reasons": [
+          "Explicit operator model; no benchmark qualification or physical placement evidence"
+        ],
+        "selected_model": "cpp/managed-smoke",
+        "selection_source": "explicit_operator_assignment",
+        "task": "completion",
+        "task_evidence": "none",
+        "upstream_name": "cpp"
+      }
+    }
+  },
+  "cleanup": {
+    "owned_process_exit_codes": [
+      0,
+      0
+    ]
+  }
+}

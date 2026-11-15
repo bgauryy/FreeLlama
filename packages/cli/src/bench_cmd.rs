@@ -11,8 +11,13 @@ pub(crate) async fn benchmark(
     include: Vec<String>,
     timeout_seconds: u64,
     trials: u32,
-    output: PathBuf,
+    output: Option<PathBuf>,
 ) -> Result<()> {
+    let output = output.unwrap_or_else(|| {
+        freellama::store::default_home()
+            .unwrap_or_default()
+            .join("benchmark-report.json")
+    });
     let report = benchmark_all(&BenchConfig {
         endpoint,
         include,

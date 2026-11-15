@@ -251,7 +251,10 @@ fn events(text: &str) -> Vec<(String, Value)> {
                     .unwrap_or_default()
                     .to_owned()
             };
-            (field("event: "), serde_json::from_str(&field("data: ")).unwrap())
+            (
+                field("event: "),
+                serde_json::from_str(&field("data: ")).unwrap(),
+            )
         })
         .collect()
 }
@@ -262,12 +265,24 @@ async fn a_streamed_task_sends_its_route_each_piece_and_then_the_same_receipt() 
     let (response, server) = send(&fake, json!({"stream": true})).await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()["content-type"], "text/event-stream");
-    let text = String::from_utf8(to_bytes(response.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+    let text = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
     server.abort();
     let events = events(&text);
     let names: Vec<_> = events.iter().map(|(name, _)| name.as_str()).collect();
-    let route = names.iter().position(|name| *name == "route").expect("a route event");
-    let first_delta = names.iter().position(|name| *name == "delta").expect("deltas");
+    let route = names
+        .iter()
+        .position(|name| *name == "route")
+        .expect("a route event");
+    let first_delta = names
+        .iter()
+        .position(|name| *name == "delta")
+        .expect("deltas");
     assert!(route < first_delta, "{names:?}");
     assert!(names.contains(&"admission"), "{names:?}");
     assert_eq!(names.last(), Some(&"done"), "{names:?}");
@@ -296,11 +311,16 @@ async fn a_stream_that_cannot_carry_tokens_is_refused_before_admission() {
         let fake = fake(Script::Done);
         let (response, server) = send(&fake, extra.clone()).await;
         let status = response.status();
-        let body: Value = serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
         server.abort();
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{extra} {body}");
         assert_eq!(body["code"], "stream_unsupported", "{body}");
-        assert!(fake.chats.lock().await.is_empty(), "nothing ran for {extra}");
+        assert!(
+            fake.chats.lock().await.is_empty(),
+            "nothing ran for {extra}"
+        );
     }
 }
 
@@ -308,12 +328,21 @@ async fn a_stream_that_cannot_carry_tokens_is_refused_before_admission() {
 async fn a_streamed_loop_still_stops_when_asked() {
     let fake = fake(Script::FenceLoop);
     let (response, server) = send(&fake, json!({"stream": true, "stop_on_repetition": true})).await;
-    let text = String::from_utf8(to_bytes(response.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+    let text = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
     server.abort();
     let events = events(&text);
     let (name, receipt) = events.last().unwrap();
     assert_eq!(name, "done", "{text}");
-    assert_eq!(receipt["response"]["done_reason"], "repetition", "{receipt}");
+    assert_eq!(
+        receipt["response"]["done_reason"], "repetition",
+        "{receipt}"
+    );
 }
 
 #[tokio::test]
@@ -325,7 +354,11 @@ async fn a_client_that_disconnects_stops_generation_upstream() {
     // Read until the first generated piece, then hang up.
     let mut seen = String::new();
     while !seen.contains("event: delta") {
-        let frame = body.frame().await.expect("frames until the first delta").unwrap();
+        let frame = body
+            .frame()
+            .await
+            .expect("frames until the first delta")
+            .unwrap();
         if let Ok(data) = frame.into_data() {
             seen.push_str(std::str::from_utf8(&data).unwrap());
         }
@@ -335,8 +368,15 @@ async fn a_client_that_disconnects_stops_generation_upstream() {
     let sent = fake.lines_sent.load(Ordering::SeqCst);
     tokio::time::sleep(Duration::from_millis(100)).await;
     server.abort();
-    assert_eq!(fake.lines_sent.load(Ordering::SeqCst), sent, "generation kept going after the client left");
-    assert!(sent < LOOP_LINES, "only {sent} of {LOOP_LINES} lines were generated");
+    assert_eq!(
+        fake.lines_sent.load(Ordering::SeqCst),
+        sent,
+        "generation kept going after the client left"
+    );
+    assert!(
+        sent < LOOP_LINES,
+        "only {sent} of {LOOP_LINES} lines were generated"
+    );
 }
 
 async fn run(fake: &FakeOllama, extra: Value) -> (StatusCode, Value) {

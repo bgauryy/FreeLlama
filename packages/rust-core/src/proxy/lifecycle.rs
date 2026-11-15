@@ -97,7 +97,8 @@ pub(super) async fn forward_owned_unload(
                     .send()
                     .await
                     && response.status().is_success()
-                    && let Ok(ps) = response.json::<serde_json::Value>().await
+                    && let Ok(ps) =
+                        crate::ollama_http::bounded_metadata_json(response, "/api/ps").await
                     && ps["models"].as_array().is_some_and(|entries| {
                         entries
                             .iter()
@@ -133,7 +134,7 @@ pub(super) fn raw_transition_watch(
                 .get(format!("{}/api/ps", upstream.trim_end_matches('/')))
                 .send()
                 .await
-                && let Ok(ps) = response.json::<serde_json::Value>().await
+                && let Ok(ps) = crate::ollama_http::bounded_metadata_json(response, "/api/ps").await
                 && model.transition_compatible(&ps)
             {
                 if let Some(hooks) = &hooks {
