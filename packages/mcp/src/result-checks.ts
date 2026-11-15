@@ -3,6 +3,7 @@
 // its source, which SEARCH blocks of a coding answer do not match the file. A fixed reminder is the
 // fallback only when the result offers no signal.
 import { readFileSync } from "node:fs";
+import { toolCallChecks } from "./tool-call-checks.js";
 
 type Fields = Record<string, unknown>;
 const object = (value: unknown): Fields | undefined =>
@@ -91,8 +92,13 @@ function unsupportedFacts(answer: string, sources: string[]): string[] {
   // numbers are read outside them, with file paths blanked (a path's digits are not figures).
   const quoted = [...answer.matchAll(/`([^`\n]{2,60})`/g)].map((match) => match[1]!.trim());
   const prose = answer.replace(/`[^`\n]{2,60}`/g, " ").replace(/(?:\/|\.{1,2}\/)?[\w.@-]+(?:\/[\w.@-]+)+/g, " ");
-  const numbers = [...prose.matchAll(/(?<![\w.])\d[\d,._:/-]*\d%?|(?<![\w.])\d%?(?![\w.])/g)].map((match) => match[0]);
-  const found = (fact: string) => haystack.includes(fact) || haystack.includes(fact.replace(/,/g, ""));
+  const numericTokens = (text: string) => [...text.matchAll(/(?<![\w.])\d[\d,._:/-]*\d%?|(?<![\w.])\d%?(?![\w.])/g)].map((match) => match[0]);
+  const numbers = numericTokens(prose);
+  const normalize = (value: string) => value.replace(/,/g, "");
+  const sourceNumbers = new Set(numericTokens(haystack).map(normalize));
+  // Compare complete numeric tokens: 8080 is not evidence for 80, and comma grouping is symmetric.
+  const found = (fact: string) => /^[\d][\d,._:/-]*%?$/.test(fact)
+    ? sourceNumbers.has(normalize(fact)) : haystack.includes(fact);
   // A range the model joined with a hyphen ("10:01:10-10:01:40") holds when both ends do.
   const range = (fact: string) => /^(\d[\d:.]*:\d[\d:.]*)-(\d[\d:.]*:\d[\d:.]*)$/.exec(fact);
   return [...new Set([...quoted, ...numbers].filter((fact) => fact.length > 0))]
@@ -156,71 +162,8 @@ function visionChecks(context: CheckContext): string[] {
   return checks;
 }
 
-/** Whether `value` has the JSON Schema `type` (a name or a list of names); an unknown type passes. */
-function hasType(value: unknown, type: unknown): boolean {
-  if (Array.isArray(type)) return type.some((one) => hasType(value, one));
-  switch (type) {
-    case "string": return typeof value === "string";
-    case "integer": return Number.isInteger(value);
-    case "number": return typeof value === "number";
-    case "boolean": return typeof value === "boolean";
-    case "array": return Array.isArray(value);
-    case "object": return object(value) !== undefined;
-    case "null": return value === null;
-    default: return true;
-  }
-}
-
-/**
- * A reply that is a tool call although no tools were sent is not an answer. The CLI exits 1 on it,
- * so keep this text stable.
- */
-export const TOOL_CALL_WITHOUT_TOOLS = "the model answered with a tool call although no tools were sent: discard it and rerun on a stronger pick that fits (models {view:\"catalog\", job}) or pass `model`";
-
-/**
- * Tool calls checked against the tools that were sent: a known name, arguments that are an object
- * with every required parameter, no undeclared one, and declared types and enums. Small models
- * often call a tool that was not offered, drop a required argument or pass a number as a string.
- */
-function toolCallChecks(calls: unknown[], tools: unknown[] | undefined): string[] {
-  if (!tools || tools.length === 0) return [TOOL_CALL_WITHOUT_TOOLS];
-  const schemas = new Map(tools.map((tool) => object(object(tool)?.function)).filter((fn): fn is Fields => fn !== undefined)
-    .map((fn) => [String(fn.name), object(fn.parameters) ?? {}]));
-  const problems: string[] = [];
-  calls.forEach((raw, index) => {
-    const fn = object(object(raw)?.function) ?? {};
-    const name = String(fn.name ?? "?");
-    const at = `call ${index + 1} (${name})`;
-    const schema = schemas.get(name);
-    if (!schema) {
-      problems.push(`${at} is not one of the tools sent (${[...schemas.keys()].join(", ")})`);
-      return;
-    }
-    let args: unknown = fn.arguments ?? {};
-    if (typeof args === "string") {
-      try { args = JSON.parse(args); } catch { args = undefined; }
-    }
-    const given = object(args);
-    if (!given) {
-      problems.push(`${at}: its arguments are not a JSON object`);
-      return;
-    }
-    const properties = object(schema.properties) ?? {};
-    const missing = list(schema.required).map(String).filter((key) => !(key in given));
-    if (missing.length > 0) problems.push(`${at} lacks required ${missing.join(", ")}`);
-    const extra = Object.keys(given).filter((key) => !(key in properties));
-    if (extra.length > 0 && Object.keys(properties).length > 0) problems.push(`${at} passes ${extra.join(", ")}, which the tool does not declare`);
-    for (const [key, value] of Object.entries(given)) {
-      const property = object(properties[key]);
-      if (!property) continue;
-      if (property.type !== undefined && !hasType(value, property.type)) problems.push(`${at}: ${key} is ${JSON.stringify(value)}, not ${JSON.stringify(property.type)}`);
-      else if (Array.isArray(property.enum) && !property.enum.includes(value)) problems.push(`${at}: ${key} is ${JSON.stringify(value)}, not one of ${JSON.stringify(property.enum)}`);
-    }
-  });
-  return problems.length > 0
-    ? [...problems, "fix or refuse these calls before running any; a rerun often corrects them"]
-    : [`${calls.length} tool call(s) match the tool schemas: run them, then send each result back as {role:"tool", tool_name, content} after the assistant message, with the same tools`];
-}
+/** Stable CLI failure marker; the tool-call checker owns its value. */
+export { TOOL_CALL_WITHOUT_TOOLS } from "./tool-call-checks.js";
 
 /**
  * Text in the input that addresses the model rather than describing anything: a summary, review or
@@ -288,7 +231,11 @@ export function nullFieldCheck(answer: string, input: string): string | undefine
 
 /** The checks for one finished result; empty when there is nothing specific to say. */
 export function resultChecks(context: CheckContext): string[] {
-  const calls = list(object(object(context.structured.response)?.message)?.tool_calls);
+  const rawCalls = object(object(context.structured.response)?.message)?.tool_calls;
+  if (rawCalls != null && !Array.isArray(rawCalls)) {
+    return ["response.message.tool_calls is not an array: do not execute it; inspect the raw response"];
+  }
+  const calls = list(rawCalls);
   if (calls.length > 0 || /^\s*tool_calls:/.test(context.answer)) return toolCallChecks(calls, context.tools);
   if (/^\s*\(empty answer/.test(context.answer)) return [];
   const response = object(context.structured.response);
@@ -309,7 +256,7 @@ export function resultChecks(context: CheckContext): string[] {
     const missing = unsupportedFacts(context.answer, sources);
     return [...padding, ...(missing.length > 0
       ? [`not in the source: ${missing.slice(0, 8).join(", ")}${missing.length > 8 ? ", …" : ""}; verify these before reusing them`]
-      : ["every number and quoted name in the answer appears in the source"])];
+      : ["every number and quoted name checked appears somewhere in the source; this does not verify their meaning or factual correctness"])];
   }
   return padding;
 }

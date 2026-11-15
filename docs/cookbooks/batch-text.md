@@ -1,6 +1,6 @@
 # Rewrite, summarize or extract across many texts
 
-**Use when** you have 10 or more similar short texts. Send what they share once, and name each input by path.
+**Use when** you have enough similar short texts that sharing their instructions saves work. Send what they share once, and name each input by path.
 
 **Skip it when** a pattern or script can do it exactly: checking a format with a regex beats any model.
 
@@ -16,4 +16,6 @@ Up to 64 items per call. Top-level `task`, `model`, `systemPrompt`, `questions`,
 
 **Read the result:** one `## <id>` section per item, in order.
 
-**Check it:** read 3 to 5, more where a mistake costs more.
+**Check it:** verify representative and difficult items against their sources, and every item
+whose error would matter. Read the [check-line limits](../RELIABILITY.md#accuracy-of-result-checks);
+a clean lexical check does not establish summary correctness.

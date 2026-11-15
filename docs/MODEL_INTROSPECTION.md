@@ -1,6 +1,9 @@
 # Inspecting model precision, placement and activations
 
-Reviewed 1 November 2026 against Ollama's current API documentation and source. The locally installed CLI reports 0.40.13; this session could not reach its server, so no live model or activation was inspected. The commands below are instructions, not recorded observations.
+External API review: 1 November 2026. That session's locally installed Ollama CLI reported 0.40.13;
+its server was unreachable, so no live model or activation was inspected. The commands below are
+instructions, not recorded observations. The FreeLlama integration boundary was updated on
+14 November 2026; the historical API review is not a new verification of upstream versions.
 
 ## What “which bit/neuron was enabled” can mean
 
@@ -109,7 +112,11 @@ This example was not run. It assumes a compatible research model already loaded 
 
 ## FreeLlama integration boundary
 
-Keep ordinary routing and resource control on stock Ollama. A future inspection tool can expose quantization, static tensor metadata and residency through existing endpoints. Label activation tracing unsupported unless a specific backend adapter actually provides it.
+Ordinary discovery and observed placement use stock Ollama. The optional
+[managed llama.cpp adapter](LLAMACPP.md) provides bounded text inference, not activation traces
+or verified physical placement. Neither engine path exposes hidden activations through FreeLlama.
+Static metadata and residency are separate from activation tracing; label traces unsupported
+unless a specific backend adapter actually provides them.
 
 If deeper tracing is added, use a separate explicitly enabled debug runner or an instrumented Ollama backend, with bounded capture and paged artifacts. Rust should manage jobs, limits, cancellation and trace metadata. It should not infer neuron activity from GPU utilization, memory use, token probabilities or generated reasoning text.
 

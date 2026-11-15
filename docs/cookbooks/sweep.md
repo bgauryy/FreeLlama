@@ -63,4 +63,7 @@ Re-run next week and see only what happened since:
 - Keep one model per sweep. `maxParallelism` stays 1 unless the machine has spare slots (`doctor {view:"status"}`).
 - Split a source of more than 5,000 chunks into several sweeps, for example one per directory.
 
-**Check it:** read 3 to 5 flagged chunks and 2 clear ones before trusting the rest. Raise a threshold with `atLeast` when too much is flagged, and add `verifyModel` when too little of what is flagged holds up.
+**Check it:** compare both flagged and clear chunks against labeled examples. Raising `atLeast`
+can reduce false alarms while increasing misses. `verifyModel` rechecks flagged and unsure chunks;
+it does not recover every missed clear chunk. Keep consequential decisions in the caller's review,
+and treat baseline reuse as saved work rather than new correctness evidence.

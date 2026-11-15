@@ -3,8 +3,10 @@
 // `run` (only a command the caller allowed, character for character, in an OS sandbox that may
 // write the copy and its scratch directory and nothing else, with no network).
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, statSync, writeFileSync, writeSync } from "node:fs";
 import path from "node:path";
+import { tmpdir } from "node:os";
+import { CommandOutput, DEFAULT_COMMAND_OUTPUT_BYTES, type CommandOutputAudit, type OutputEnd } from "./coder-output.js";
 import { ValidationError } from "./errors.js";
 import { which } from "./sandbox.js";
 import { escapesRoot, resolvePath } from "./workspace-path.js";
@@ -224,6 +226,9 @@ export interface RunOutcome {
   observed: string;
   /** The output kept in the result (RESULT_LINES). */
   kept: string;
+  /** Raw combined output survives copy cleanup; incomplete output is a failed command. */
+  audit: CommandOutputAudit;
+  failed: boolean;
 }
 
 /** Every descendant of `pid`, deepest last, from one `ps` listing. */
@@ -298,12 +303,16 @@ ${unreadable ? `(deny file-read* file-write*${unreadable})\n` : ""}`;
 export class CommandRunner {
   kind: "sandbox-exec" | "bwrap" | "none" = "none";
   private prefix: string[] = [];
+  private auditDirectory?: string;
+  private commandNumber = 0;
 
   constructor(
     readonly cwd: string,
     readonly writable: string[],
     readonly env: NodeJS.ProcessEnv,
-    private readonly options: { privateDir: string; osSandbox: "auto" | "off"; allowUnsandboxed: boolean; hidden?: string[] },
+    private readonly options: { privateDir: string; osSandbox: "auto" | "off"; allowUnsandboxed: boolean; hidden?: string[]; logDir?: string; maxOutputBytes?: number;
+      /** Internal I/O seam for deterministic disk-failure tests. */
+      openOutput?: (file: string, limit: number, command: string) => CommandOutput },
   ) {}
 
   enter(): this {
@@ -341,53 +350,66 @@ export class CommandRunner {
           "FREELLAMA_CODER_UNSANDBOXED_RUN=1. Finish and say the change is untested.",
       );
     }
+    if (!this.auditDirectory) {
+      const parent = this.options.logDir ?? tmpdir();
+      mkdirSync(parent, { recursive: true, mode: 0o700 });
+      this.auditDirectory = mkdtempSync(path.join(parent, "freellama-command-"));
+    }
+    // Open before spawning: inability to retain the audit must refuse execution.
+    const file = path.join(this.auditDirectory, `${++this.commandNumber}.log`);
+    const limit = this.options.maxOutputBytes ?? DEFAULT_COMMAND_OUTPUT_BYTES;
+    const output = this.options.openOutput ? this.options.openOutput(file, limit, command) : new CommandOutput(file, limit, writeSync, command);
     const started = performance.now();
     const capture = new OutputCapture();
     const argv = [...this.prefix, "/bin/sh", "-c", command];
-    const outcome = await new Promise<{ code: number | null; signal: string | null; timedOut: boolean }>((resolve, reject) => {
+    const outcome = await new Promise<{ code: number | null; signal: string | null; timedOut: boolean; end: OutputEnd; error?: string }>((resolve) => {
       const child = spawn(argv[0]!, argv.slice(1), { cwd: this.cwd, env: this.env, stdio: ["ignore", "pipe", "pipe"] });
       let timedOut = false;
+      let end: OutputEnd = "complete";
+      let failure: string | undefined;
       let grace: NodeJS.Timeout | undefined;
+      let settled = false;
       const settle = (code: number | null, signal: string | null) => {
+        if (settled) return;
+        settled = true;
         clearTimeout(timer);
         clearTimeout(grace);
-        resolve({ code, signal, timedOut });
+        // No callbacks may write after the audit descriptor closes.
+        child.stdout!.destroy(); child.stderr!.destroy();
+        resolve({ code, signal, timedOut, end, ...(failure ? { error: failure } : {}) });
       };
-      // A process that left the tree (a daemon) can hold the pipes open: stop reading shortly
-      // after the shell itself has exited.
       const release = (code: number | null, signal: string | null) => {
         grace = setTimeout(() => {
-          child.stdout!.destroy();
-          child.stderr!.destroy();
+          if (end === "complete") end = "pipes_open_after_exit";
           settle(code, signal);
         }, 2_000);
       };
-      const timer = setTimeout(() => {
-        timedOut = true;
+      const stop = () => {
         if (child.pid !== undefined) killTree(child.pid);
-        release(null, "SIGKILL");
-      }, Math.max(timeoutSeconds, 0.001) * 1000);
-      child.stdout!.on("data", (chunk: Buffer) => capture.push(chunk));
-      child.stderr!.on("data", (chunk: Buffer) => capture.push(chunk));
-      child.once("error", (error) => {
-        clearTimeout(timer);
-        clearTimeout(grace);
-        reject(error);
-      });
-      child.once("exit", (code, signal) => {
-        if (grace === undefined) release(code, signal);
-      });
+        if (grace === undefined) release(null, "SIGKILL");
+      };
+      const timer = setTimeout(() => { timedOut = true; end = "timeout"; stop(); }, Math.max(timeoutSeconds, 0.001) * 1000);
+      const consume = (chunk: Buffer) => {
+        if (settled || end !== "complete") return;
+        // Preview memory stays bounded; the separate file keeps the middle bytes too.
+        const before = output.size;
+        const retained = output.append(chunk);
+        capture.push(chunk.subarray(0, output.size - before));
+        if (!retained) { end = "output_limit"; stop(); }
+      };
+      child.stdout!.on("data", consume);
+      child.stderr!.on("data", consume);
+      child.once("error", (error) => { end = "spawn_error"; failure = error.message; settle(null, null); });
+      child.once("exit", (code, signal) => { if (grace === undefined) release(code, signal); });
       child.once("close", (code, signal) => settle(code, signal));
-    });
+    }).catch((error: unknown) => ({ code: null, signal: null, timedOut: false, end: "spawn_error" as const, error: error instanceof Error ? error.message : String(error) }));
+    const audit = output.finish(outcome.end, outcome.error, { exit_code: outcome.code, signal: outcome.signal, timed_out: outcome.timedOut });
     const { text, gap } = capture.text();
     return {
-      command,
-      exitCode: outcome.code,
-      signal: outcome.signal,
-      timedOut: outcome.timedOut,
+      command, exitCode: outcome.code, signal: outcome.signal, timedOut: outcome.timedOut,
       durationMs: Math.round(performance.now() - started),
-      observed: headTail(text, OBSERVATION_LINES, gap),
-      kept: headTail(text, RESULT_LINES, gap),
+      observed: headTail(text, OBSERVATION_LINES, gap), kept: headTail(text, RESULT_LINES, gap),
+      audit, failed: outcome.code !== 0 || outcome.timedOut || !audit.complete,
     };
   }
 }
@@ -402,7 +424,9 @@ export function describeRun(outcome: RunOutcome): string {
   const seconds = (outcome.durationMs / 1000).toFixed(1);
   const ended = outcome.timedOut ? `timed out after ${seconds} s and was killed`
     : outcome.exitCode !== null ? `exit code ${outcome.exitCode} (${seconds} s)` : `killed by ${outcome.signal ?? "a signal"} (${seconds} s)`;
-  return `$ ${outcome.command}\n${ended}\n${outcome.observed.trim() ? outcome.observed : "(no output)"}`;
+  const audit = outcome.audit;
+  const retained = `\n[audit: ${audit.path}; ${audit.bytes} bytes; ${audit.complete ? "complete" : `INCOMPLETE: ${audit.end_reason}; command failed`}; preview only]`;
+  return `$ ${outcome.command}\n${ended}\n${outcome.observed.trim() ? outcome.observed : "(no output)"}${retained}`;
 }
 
 /** The environment of an allowed command: identity, locale and toolchain homes; no FreeLlama settings or secrets. */

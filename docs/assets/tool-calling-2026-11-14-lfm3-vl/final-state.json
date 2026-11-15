@@ -1,0 +1,47 @@
+{
+  "resident_after": {
+    "models": [
+      {
+        "name": "lfm3-vl:2b-q4_K_M",
+        "model": "lfm3-vl:2b-q4_K_M",
+        "size": 1559001824,
+        "digest": "00ca45bf65a5c626104a906ec9b5f4cd2f576387dbcdefdb150e88d0b3bd7b2e",
+        "details": {
+          "parent_model": "",
+          "format": "gguf",
+          "family": "lfm3",
+          "families": [
+            "lfm3"
+          ],
+          "parameter_size": "1.7B",
+          "quantization_level": "Q4_K_M"
+        },
+        "expires_at": "2026-11-14T20:56:27.370089+02:00",
+        "size_vram": 1559001824,
+        "context_length": 4096,
+        "runner": "llamacpp"
+      }
+    ]
+  },
+  "host_after": {
+    "timestamp_ms": 1794682527371,
+    "platform": "darwin",
+    "cpu_times": {
+      "logical_cpus": 12,
+      "idle_ms": 3795524950,
+      "total_ms": 6706886890
+    },
+    "cpu_busy_percent": null,
+    "available_bytes": 8833859584,
+    "available_bytes_source": "freellama_estimate",
+    "free_bytes": 2367586304,
+    "swap_used_bytes": 11252468285.44,
+    "pressure_level": 1,
+    "psi_some_avg10_pct": null,
+    "compressor_bytes": 6582452224,
+    "load1": 5.73876953125,
+    "errors": [],
+    "sample_duration_ms": 10
+  },
+  "inference_unknown": false
+}

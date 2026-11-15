@@ -15,7 +15,7 @@ Load the section the task needs: grounded research, preview and vision controls,
 ## Preview, vision and runtime controls
 
 - `run_task {preview:true, task?, model?, executionPreference?, minPlacementEvidence?, minConfidence?}` takes routing fields only; it rejects prompts, messages, embedding input, tools, images and runtime controls, and reserves nothing. Review, then send a separate execution call.
-- `minPlacementEvidence:"observed"` refuses cold, mixed or mismatched placement. Warm once with `"configured"`, inspect the receipt, then require `"observed"`.
+- On Ollama, `minPlacementEvidence:"observed"` refuses cold, mixed or mismatched placement. Warm once with `"configured"`, inspect the receipt, then require `"observed"`. Managed llama.cpp cannot yet provide observed placement; warming it through FreeLlama is unsupported.
 - Images: name them in `files`, or send base64 without a data-URI prefix; they need a trialled vision `model` or an operator `[policies.vision]` model. A capability tag alone is refused.
 - `output_check.repetition_loop` means the model looped (one copy shown): low confidence. `stopOnRepetition:true` stops a known looper early and keeps what it generated.
 - Choose output limits and stop sequences from the output you need. "Stopped at the output limit" means the answer is cut: raise `num_predict`.

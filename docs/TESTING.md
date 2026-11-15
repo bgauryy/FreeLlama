@@ -63,17 +63,55 @@ rechecks that size and reads every installed-model page before allowing the roun
 
 ## Continuous integration
 
-[`.github/workflows/ci.yml`](../.github/workflows/ci.yml) runs the deterministic tiers on every push,
-every pull request and on demand (`gh workflow run CI`), on Ubuntu and macOS: `yarn install --immutable`, `yarn lint:rust`
-(Ubuntu), `yarn build`, `yarn typecheck`, `yarn test:js`, `yarn test:rust` and `yarn test:release`.
-It uses no Ollama and no models, so it does not replace the live tiers, Windows qualification or the
-hardware procedures; run those before a release (`yarn verify:production`).
+[`.github/workflows/ci.yml`](../.github/workflows/ci.yml) configures the deterministic tiers on every push,
+every pull request and on demand (`gh workflow run CI`), on Ubuntu, macOS and Windows:
+`yarn install --immutable`, `yarn lint:rust` (Ubuntu), `yarn build`, `yarn typecheck`,
+and `yarn test:rust`. Ubuntu and macOS run the full `yarn test:js` and `yarn test:release`; the latter's fake
+executable fixtures require a POSIX shell. The native build must reproduce the committed TypeScript
+declarations. Windows additionally runs the read-only live host-resource observation to exercise
+PowerShell/CIM, beyond parser fixtures.
+
+Windows runs the workflow's explicit JavaScript allowlist: launcher and PowerShell installer,
+agent CLI, gateway/auth/TLS/response limits, job calibration/selection, and result/tool-call checker
+contracts. Their execution uses Node, local HTTP/TLS or PowerShell fixtures, not Unix shell tools.
+This is a portable-contract lane, not the full JavaScript suite: it excludes the POSIX research and
+coder execution/path suites, the shell installer, and the benchmark/reliability script suites.
+In particular, coder execution names `/bin/sh`; restricted research shell discovery and workspace
+path semantics remain POSIX-oriented. Git Bash being installed is not a native Windows adapter
+port. Schema/checker coverage does not qualify those adapters on Windows. Linux/macOS retain the
+complete suites; native Windows adapter support needs its own implementation and validation.
+The workflow selects Node 22 and the stable Rust channel; local development uses the compiler
+in `rust-toolchain.toml`. Inspect the hosted run's toolchain and results when qualifying a release.
+The configured matrix is not evidence that each lane has completed successfully; this change was
+inspected and its selected contracts run locally on macOS, not executed on native Windows. CI uses no
+Ollama and no models, so it does not replace inference or hardware qualification;
+run the live tiers before a release (`yarn verify:production`).
+
+The local macOS verification snapshot of 2026-11-15 passed the release build, TypeScript checks,
+strict Rust lint, 781 Rust tests, 1,474 JavaScript/evaluation checks and 51 packaging contracts.
+Three JavaScript tests were skipped and four Rust tests ignored. The 21 selected cookbook,
+packaged-resource and isolated-endpoint integration contracts also passed. This records local
+deterministic checks, not a completed `verify:production`, a hosted Linux/Windows run, or a new
+inference/hardware qualification. The [end-to-end review](OLLAMA_REVIEW.md#validation-of-this-revision)
+records the repaired baseline failures and the limits of these results.
+
+`yarn test:reliability` reproduces the labeled result-check accuracy report and exercises the
+tool-calling grader offline. It is included in `yarn test:js`. See [reliability evidence](RELIABILITY.md)
+for false positives, false negatives, live model results, raw transcripts and reproduction commands.
+The [Rust resource audit](RUST_RESOURCE_AUDIT.md) records the production panic/lock review and its limits.
 
 ## Comparative benchmark
 
 Comparing FreeLlama with Ollama alone and other local stacks is a separate, manual programme:
-protocol, measured results and limits are in [Benchmark](BENCHMARK.md). One warm extraction case
-has been run; contention, cold-load and agent-token scenarios have not.
+protocol, measured results and limits are in [Benchmark](BENCHMARK.md). The recorded 2026-11-14
+Apple M2 Pro run covers warm extraction, two- and four-client contention, and cold-request
+observations for one hash-verified model. llama.cpp's startup-loaded first request is marked
+non-comparable. Separate feature observations cover queue priority, workflow prompts,
+reused searches/sweeps, deferred jobs and memory refusal. These are historical results for the
+recorded builds, configurations and workloads; they do not qualify every current routing or engine
+path. The cross-stack memory-pressure comparison and agent-token meter remain unrun. See the
+[benchmark limits](BENCHMARK.md#limits) and
+[incomplete workflow-trial denominators](BENCHMARK.md#built-in-prompts-measured).
 
 `yarn test:bench` checks the sequential vendor runner, streamed timing, exact JSON grading and
 host-counter parsing using deterministic fixtures. It is included in `yarn test:js`. These checks
@@ -95,7 +133,7 @@ The fixture tests perform no inference, pulls, or deletions. See the
 
 ```bash
 cargo fmt --all --check
-cargo clippy --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
 Routing regressions run in the default Rust suite; none are hidden behind `#[ignore]`. Add a
@@ -114,6 +152,21 @@ that uncertain inference is never replayed and ordinary keep-alive requests reta
 The local-agent tier runs all context fitting, compaction, pagination, repeat-suppression, and
 strict action-shape contracts. It is included in `yarn test:all`, so adapter regressions cannot be
 missed by the root release matrix.
+
+Focused source modules keep contracts close to their owner: benchmark fixtures live in
+`src/model_bench/tests.rs`, profile-matching fixtures in `src/model_bench/provenance.rs`, Windows
+memory fixtures in `src/platform/resources/tests/windows.rs`, and panic/poison fault injection in
+`src/platform/resources/governor/audit_tests.rs` (paths relative to `packages/rust-core/`). These
+are ordinary enabled tests. Other resource tests remain in `resources/tests.rs`; this was a
+targeted split, not a claim that every large test file has been reorganized.
+
+Benchmark fixtures reject foreign hosts/endpoints and legacy reports, bind scores to artifact
+digests, and keep primary-endpoint throughput out of CPU-assigned models. They also cover
+existing-runner preservation and failure/identity checks before benchmark cleanup in
+`packages/rust-core/tests/model_bench_contract.rs`. The managed
+llama.cpp tests use a mock HTTP server; they establish its bounded text contract, not live
+llama-server performance or observed processor placement. See the
+[engine contract](LLAMACPP.md) and [machine calibration](MODEL_SELECTION.md#turn-measurements-into-routing-evidence).
 
 `yarn test:all` does not run formatting, Clippy, a release build, or package inspection. Use
 `yarn verify:production` for the complete local promotion gate.
@@ -172,6 +225,22 @@ protocols, including a client that leaves mid-stream. The
 protocol integration contracts verify that spawn failure leaves the MCP connection usable and that
 fixture-backed library requests fail on unexpected product errors. External catalog availability
 is separate from these deterministic checks.
+
+`agent-cli-auth.test.ts` uses token-protected local HTTP fixtures to exercise terminal streams,
+residency/config reads, real-model lists, passthrough and virtual SSE. It also checks that absolute
+request URLs stay on the configured serve origin and generation redirects are refused.
+The HTTPS passthrough fixture requires a real TLS handshake and verifies that an untrusted local
+certificate returns 502 before the server receives HTTP credentials; it changes no TLS defaults.
+Response-budget fixtures count UTF-8 wire bytes, accept the exact limit, cancel oversized
+NDJSON/SSE/JSON and error bodies even without a newline, and fail after partial terminal output.
+They also require raw real-tag passthrough to remain byte-preserving above the rewrite budget.
+CLI regressions require `done:true` before reporting stream success, preserve explicit managed controls
+under `--stream`, and retain a deferred lookup's error and retryable exit status.
+Installer fixtures are platform-specific: `install-script.test.ts` exercises the POSIX installer
+on Unix, and `install-powershell.test.ts` exercises Windows checksum acceptance/refusal with local
+release files and a replaced HTTP cmdlet. Each suite skips the other OS; neither performs a
+network install or runs the fixture executable. Launcher tests select `.exe` on Windows so a
+built release is checked there rather than silently skipped. Windows execution still requires its lane.
 
 Launcher fixtures use `process.execPath` to avoid an extra PATH-resolved shell wrapper. After the
 MCP fixture's real executable-permission refusal, a test-only transport launches that exact fixture
@@ -266,7 +335,8 @@ yarn release:smoke            # packed-install smoke of the host platform packag
 
 Build every claimed CLI/native target in a clean environment, assemble `SHA256SUMS`, run the full
 deterministic suite, and inspect every platform package dry run before publishing explicitly.
-Publish the eight `@octocodeai/freellama-native-*` packages before `@octocodeai/freellama` and `@octocodeai/freellama-mcp-server`, all
+Publish the five `@octocodeai/freellama-native-*` packages listed in
+[`scripts/release-platforms.mjs`](../scripts/release-platforms.mjs) before `@octocodeai/freellama` and `@octocodeai/freellama-mcp-server`, all
 at the exact same version, then the crates with `cargo publish --workspace` (`--dry-run` first packages
 and compiles both crates from their published sources). A successful local pack dry run proves package contents; it does not
 prove registry publication or another hardware class. Both release scripts require

@@ -1,0 +1,781 @@
+{
+  "schema_version": 1,
+  "suite_version": "tool-calling-v1",
+  "started_at": "2026-11-14T18:55:21.847Z",
+  "endpoint": "http://127.0.0.1:11434",
+  "provenance": {
+    "git_commit": "9933d95315b46b2e8d0b584ee3b55b55fbecc751",
+    "dirty_files": "M docs/ARCHITECTURE.md\n M docs/FEATURES.md\n M docs/MONITORING.md\n M docs/PRODUCTION.md\n M docs/README.md\n M package.json\n M packages/cli/src/args.rs\n M packages/cli/src/bench_cmd.rs\n M packages/mcp/src/job-mode.ts\n M packages/mcp/src/result-checks.ts\n M packages/mcp/test/unit/job-mode.test.ts\n M packages/mcp/test/unit/result-checks.test.ts\n M packages/rust-core/src/model_bench.rs\n M packages/rust-core/src/platform/catalog.rs\n M packages/rust-core/src/platform/config.rs\n M packages/rust-core/src/platform/discovery.rs\n M packages/rust-core/src/platform/execution/forward.rs\n M packages/rust-core/src/platform/execution/mod.rs\n M packages/rust-core/src/platform/execution/pipeline.rs\n M packages/rust-core/src/platform/execution/upstream.rs\n M packages/rust-core/src/platform/mod.rs\n M packages/rust-core/src/platform/resources/governor.rs\n M packages/rust-core/src/platform/resources/mod.rs\n M packages/rust-core/src/platform/resources/sampling.rs\n M packages/rust-core/src/platform/resources/tests.rs\n M packages/rust-core/src/platform/warming.rs\n M packages/rust-core/src/proxy/mod.rs\n M packages/rust-core/src/proxy/upstreams.rs\n M packages/rust-core/tests/main.rs\n M packages/rust-core/tests/preload_keys_upstreams_contract.rs\n M packages/rust-core/tests/repetition_stop_contract.rs\n?? .github/\n?? docs/LLAMACPP.md\n?? docs/RUST_RESOURCE_AUDIT.md\n?? docs/assets/result-check-accuracy.json\n?? packages/mcp/src/job-calibration.ts\n?? packages/mcp/src/tool-call-checks.ts\n?? packages/mcp/test/unit/job-calibration.test.ts\n?? packages/mcp/test/unit/tool-call-checks.test.ts\n?? packages/rust-core/src/model_bench/\n?? packages/rust-core/src/platform/execution/llamacpp.rs\n?? packages/rust-core/src/platform/resources/governor/\n?? packages/rust-core/src/platform/resources/tests/\n?? packages/rust-core/src/platform/resources/windows.rs\n?? packages/rust-core/tests/llamacpp_contract.rs\n?? scripts/reliability/",
+    "harness_sha256": "e33a0b83ebc5dfbce29b11c2a8eb3100fe48f2c2ed3948e6eb102e5c90609e44",
+    "cases_sha256": "9f3fa2c279a3bf25497e1a72a168537e9ef7e74ba655f32aca8919004035233b",
+    "node": "v26.4.0",
+    "platform": "darwin",
+    "arch": "arm64",
+    "os_release": "25.5.0",
+    "total_memory_bytes": 34359738368,
+    "free_memory_bytes": 6328205312,
+    "load_average": [
+      5.71630859375,
+      18.5,
+      28.26318359375
+    ]
+  },
+  "limitations": [
+    "Public synthetic smoke suite; prompt/fixture exposure is known. No production reliability or factual-accuracy claim.",
+    "Exact final strings and expected arguments are deliberately strict; inspect raw trials before interpreting failures.",
+    "Direct Ollama model behavior only; does not measure FreeLlama routing, result-check accuracy or physical placement.",
+    "Each planned case remains in the denominator after errors; unattempted cases never count as passes. No retries.",
+    "A timeout or uncertain inference stops all further generation; aborting HTTP does not prove engine quiescence."
+  ],
+  "models": [
+    {
+      "model": "bonsai-2:27b",
+      "digest": "f3c4f42086593225d8be9bb4270658d0e05f5232fb2b5e8faa49ef74d2cc843a",
+      "size_bytes": 8255266275,
+      "capabilities": null,
+      "status": "unmeasured",
+      "planned": 0,
+      "attempted": 0,
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "not_attempted": 0,
+      "tool_choice": {
+        "passed": 0,
+        "total": 0
+      },
+      "arguments": {
+        "passed": 0,
+        "total": 0
+      },
+      "followup": {
+        "passed": 0,
+        "total": 0
+      },
+      "cases": {
+        "tool-choice": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "integer-arguments": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "nested-arguments": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "no-tool-needed": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "missing-required-information": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "unavailable-action": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "untrusted-tool-result": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        }
+      }
+    },
+    {
+      "model": "lfm3-vl:2b-q4_K_M",
+      "digest": "00ca45bf65a5c626104a906ec9b5f4cd2f576387dbcdefdb150e88d0b3bd7b2e",
+      "size_bytes": 1478634721,
+      "capabilities": [
+        "completion",
+        "vision",
+        "tools",
+        "thinking"
+      ],
+      "status": "measured-smoke",
+      "planned": 7,
+      "attempted": 7,
+      "passed": 5,
+      "failed": 2,
+      "errors": 0,
+      "not_attempted": 0,
+      "tool_choice": {
+        "passed": 4,
+        "total": 4
+      },
+      "arguments": {
+        "passed": 4,
+        "total": 4
+      },
+      "followup": {
+        "passed": 3,
+        "total": 4
+      },
+      "cases": {
+        "tool-choice": {
+          "passed": 0,
+          "attempted": 1,
+          "planned": 1
+        },
+        "integer-arguments": {
+          "passed": 1,
+          "attempted": 1,
+          "planned": 1
+        },
+        "nested-arguments": {
+          "passed": 1,
+          "attempted": 1,
+          "planned": 1
+        },
+        "no-tool-needed": {
+          "passed": 1,
+          "attempted": 1,
+          "planned": 1
+        },
+        "missing-required-information": {
+          "passed": 1,
+          "attempted": 1,
+          "planned": 1
+        },
+        "unavailable-action": {
+          "passed": 0,
+          "attempted": 1,
+          "planned": 1
+        },
+        "untrusted-tool-result": {
+          "passed": 1,
+          "attempted": 1,
+          "planned": 1
+        }
+      }
+    },
+    {
+      "model": "nimble-v3:9b-q4_K_M",
+      "digest": "88cbbd22b816429c7df38b2893acdda2492038dafb3d1c898b4328e31f757a5e",
+      "size_bytes": 5629142061,
+      "capabilities": null,
+      "status": "unmeasured",
+      "planned": 0,
+      "attempted": 0,
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "not_attempted": 0,
+      "tool_choice": {
+        "passed": 0,
+        "total": 0
+      },
+      "arguments": {
+        "passed": 0,
+        "total": 0
+      },
+      "followup": {
+        "passed": 0,
+        "total": 0
+      },
+      "cases": {
+        "tool-choice": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "integer-arguments": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "nested-arguments": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "no-tool-needed": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "missing-required-information": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "unavailable-action": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "untrusted-tool-result": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        }
+      }
+    },
+    {
+      "model": "lfm3-omni:2b-q4_K_M",
+      "digest": "4c0ee9400634babb880868b873bcebf09fbbf1a5328e550bdbaff25888f1f7e2",
+      "size_bytes": 2049482162,
+      "capabilities": null,
+      "status": "unmeasured",
+      "planned": 0,
+      "attempted": 0,
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "not_attempted": 0,
+      "tool_choice": {
+        "passed": 0,
+        "total": 0
+      },
+      "arguments": {
+        "passed": 0,
+        "total": 0
+      },
+      "followup": {
+        "passed": 0,
+        "total": 0
+      },
+      "cases": {
+        "tool-choice": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "integer-arguments": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "nested-arguments": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "no-tool-needed": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "missing-required-information": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "unavailable-action": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "untrusted-tool-result": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        }
+      }
+    },
+    {
+      "model": "hf.co/openbmb/MiniCPM-OCR-1.0-gguf:Q4_K_M",
+      "digest": "1e5957df106945b5aa2da5d5bb1effc45205b50f8878e22f1dfbf30445392adf",
+      "size_bytes": 1430124830,
+      "capabilities": null,
+      "status": "unmeasured",
+      "planned": 0,
+      "attempted": 0,
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "not_attempted": 0,
+      "tool_choice": {
+        "passed": 0,
+        "total": 0
+      },
+      "arguments": {
+        "passed": 0,
+        "total": 0
+      },
+      "followup": {
+        "passed": 0,
+        "total": 0
+      },
+      "cases": {
+        "tool-choice": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "integer-arguments": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "nested-arguments": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "no-tool-needed": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "missing-required-information": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "unavailable-action": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "untrusted-tool-result": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        }
+      }
+    },
+    {
+      "model": "bonsai-2:9b",
+      "digest": "c8b5462f8688647fe0b53568e3c00181ada5f05300aa4bf00695f2902f4d388e",
+      "size_bytes": 3180880170,
+      "capabilities": null,
+      "status": "unmeasured",
+      "planned": 0,
+      "attempted": 0,
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "not_attempted": 0,
+      "tool_choice": {
+        "passed": 0,
+        "total": 0
+      },
+      "arguments": {
+        "passed": 0,
+        "total": 0
+      },
+      "followup": {
+        "passed": 0,
+        "total": 0
+      },
+      "cases": {
+        "tool-choice": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "integer-arguments": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "nested-arguments": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "no-tool-needed": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "missing-required-information": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "unavailable-action": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "untrusted-tool-result": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        }
+      }
+    },
+    {
+      "model": "hf.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-4GB:Q4_K_M",
+      "digest": "139e7d57c1c319f8a244800512f359394c7a4dd6ae52c90bf4c2ae5a4d56cff1",
+      "size_bytes": 6180446974,
+      "capabilities": null,
+      "status": "unmeasured",
+      "planned": 0,
+      "attempted": 0,
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "not_attempted": 0,
+      "tool_choice": {
+        "passed": 0,
+        "total": 0
+      },
+      "arguments": {
+        "passed": 0,
+        "total": 0
+      },
+      "followup": {
+        "passed": 0,
+        "total": 0
+      },
+      "cases": {
+        "tool-choice": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "integer-arguments": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "nested-arguments": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "no-tool-needed": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "missing-required-information": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "unavailable-action": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "untrusted-tool-result": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        }
+      }
+    },
+    {
+      "model": "embeddinggemma-2:740m-q8_0",
+      "digest": "f4981a15b99858ad1f2e0729416e526be7b4f428291b40082b9e4f7b27b5f62f",
+      "size_bytes": 1284852670,
+      "capabilities": null,
+      "status": "unmeasured",
+      "planned": 0,
+      "attempted": 0,
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "not_attempted": 0,
+      "tool_choice": {
+        "passed": 0,
+        "total": 0
+      },
+      "arguments": {
+        "passed": 0,
+        "total": 0
+      },
+      "followup": {
+        "passed": 0,
+        "total": 0
+      },
+      "cases": {
+        "tool-choice": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "integer-arguments": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "nested-arguments": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "no-tool-needed": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "missing-required-information": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "unavailable-action": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "untrusted-tool-result": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        }
+      }
+    },
+    {
+      "model": "lfm3-audio:2b-q4_K_M",
+      "digest": "3327c1a067559929d03d9e6e811cc2bc50b292b295e896b10733990dc6187590",
+      "size_bytes": 1670483243,
+      "capabilities": null,
+      "status": "unmeasured",
+      "planned": 0,
+      "attempted": 0,
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "not_attempted": 0,
+      "tool_choice": {
+        "passed": 0,
+        "total": 0
+      },
+      "arguments": {
+        "passed": 0,
+        "total": 0
+      },
+      "followup": {
+        "passed": 0,
+        "total": 0
+      },
+      "cases": {
+        "tool-choice": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "integer-arguments": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "nested-arguments": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "no-tool-needed": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "missing-required-information": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "unavailable-action": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "untrusted-tool-result": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        }
+      }
+    },
+    {
+      "model": "phonon:en",
+      "digest": "6667dd188d2e30e1448b0476ccbd36bdc8802225a848541d5049f450e2a983e0",
+      "size_bytes": 103679058,
+      "capabilities": null,
+      "status": "unmeasured",
+      "planned": 0,
+      "attempted": 0,
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "not_attempted": 0,
+      "tool_choice": {
+        "passed": 0,
+        "total": 0
+      },
+      "arguments": {
+        "passed": 0,
+        "total": 0
+      },
+      "followup": {
+        "passed": 0,
+        "total": 0
+      },
+      "cases": {
+        "tool-choice": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "integer-arguments": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "nested-arguments": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "no-tool-needed": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "missing-required-information": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "unavailable-action": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "untrusted-tool-result": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        }
+      }
+    },
+    {
+      "model": "strands-decider:2b-nvfp4",
+      "digest": "c92a6f466917893017ea7ca4d5e6b39d9950d51ec2b346b5e05855d79d87b5e4",
+      "size_bytes": 1332163010,
+      "capabilities": null,
+      "status": "unmeasured",
+      "planned": 0,
+      "attempted": 0,
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "not_attempted": 0,
+      "tool_choice": {
+        "passed": 0,
+        "total": 0
+      },
+      "arguments": {
+        "passed": 0,
+        "total": 0
+      },
+      "followup": {
+        "passed": 0,
+        "total": 0
+      },
+      "cases": {
+        "tool-choice": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "integer-arguments": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "nested-arguments": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "no-tool-needed": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "missing-required-information": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "unavailable-action": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "untrusted-tool-result": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        }
+      }
+    },
+    {
+      "model": "nomic-embed-text:v1.5",
+      "digest": "0a109f422b47e3a30ba2b10eca18548e944e8a23073ee3f3e947efcf3c45e59f",
+      "size_bytes": 274302450,
+      "capabilities": null,
+      "status": "unmeasured",
+      "planned": 0,
+      "attempted": 0,
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "not_attempted": 0,
+      "tool_choice": {
+        "passed": 0,
+        "total": 0
+      },
+      "arguments": {
+        "passed": 0,
+        "total": 0
+      },
+      "followup": {
+        "passed": 0,
+        "total": 0
+      },
+      "cases": {
+        "tool-choice": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "integer-arguments": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "nested-arguments": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "no-tool-needed": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "missing-required-information": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "unavailable-action": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        },
+        "untrusted-tool-result": {
+          "passed": 0,
+          "attempted": 0,
+          "planned": 0
+        }
+      }
+    }
+  ]
+}

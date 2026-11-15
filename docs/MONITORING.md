@@ -55,6 +55,16 @@ token and keeps it only for the browser tab.
   plus counts by state; `task_jobs {action:"list"}` lists them all. States cover discovery, admission, resources, runner
   transitions, loading, execution, and completion. Metadata excludes the original payload.
 
+On Windows, host memory comes from a bounded, unprivileged PowerShell CIM query. The
+`windows_cim` observation converts `Win32_OperatingSystem.TotalVisibleMemorySize` and
+`FreePhysicalMemory` from KiB to bytes; available memory is the latter, with kind
+`windows_free_physical_memory`. Missing, malformed, overflowing, or inconsistent readings remain
+unknown. See [Microsoft's field definitions](https://learn.microsoft.com/en-us/windows/win32/cimwin32prov/win32-operatingsystem).
+The default `require-memory` policy holds admission when this observation fails, as on Linux and
+macOS. CPU load, OS pressure, thermal, swap and GPU measurements remain unavailable on Windows;
+`require-all` therefore holds admission. An operator can explicitly choose `best-effort` to admit
+with unknown memory telemetry; observed low memory still follows the configured low-memory policy.
+
 A task receipt explains its own wait. `admission.mode` is `resident_shared` (the runner was
 reused without the backend load lock) or `nonresident_transition_exclusive` (this task loaded the
 runner under it). `admission.reason` says why a present runner could not be shared when its identity
@@ -69,7 +79,9 @@ Use `run_task {defer:true}` in MCP or `task --defer` in the CLI to get a job han
 status request omits results; fetching one ID returns its retained result or structured failure.
 Terminal states are `completed`, `failed`, `cancelled`, and `expired`. Cancellation is per task,
 waits for local permits to be released, and does not unload a shared runner. Process-local job
-retention limits are documented in [CLI controls](CLI.md#execute-tasks).
+retention limits are documented in [CLI controls](CLI.md#execute-tasks). The optional durable-job
+mode retains receipts/results in the file-backed store without replaying inference; its recovery
+and idempotency rules are in [durable deferred jobs](DEFERRED_JOBS.md).
 
 Removal uses the same exact job ID. It cancels active work before discarding the record, returns
 `{id, removed:true, status, scope:"process_memory"}`, and omits the saved result. The ID then returns
@@ -90,6 +102,13 @@ including after an Ollama restart. Each config receipt includes `observed_at` an
 invalidates the use of measurements taken under different parallelism or KV cache settings.
 FreeLlama admission limits remain governed by its runtime configuration.
 
+These Ollama residency and process-setting observations do not apply to the optional managed
+llama.cpp adapter. Its receipt identifies `execution.engine:"llamacpp"`, an operator-configured
+memory forecast and processor assignment, with physical placement unknown. Its bounded text
+tasks share admission pools and the host-memory governor; their results do not train Ollama
+placement, residency or preload facts. See the [engine contract](LLAMACPP.md) for supported tasks
+and the single live protocol smoke's limits.
+
 `host.gpu_activity` is nullable. When available, it identifies its `source`,
 `scope: "observed_devices_all_processes"`, `window: "driver_defined"`, and individual `devices`.
 Each device has an identity, nullable `busy_percent`, and nullable `memory_busy_percent`. Apple
@@ -107,8 +126,9 @@ efficiency. They are diagnostic by default. The opt-in GPU headroom guard below 
 busy counters to hold new GPU work.
 
 Each backend's admission `queue_depth` includes both `slot_waiters` and `resource_waiters`.
-A resource waiter returns its execution slot after two seconds but remains in the bounded queue
-until capacity recovers, its deadline expires, or it is cancelled.
+An Ollama resource waiter returns its execution slot after at most two seconds; llama.cpp yields
+after its initial bounded probe. Both remain in the bounded queue until capacity recovers, their
+deadline expires, or they are cancelled.
 
 Model affinity is bounded: `affinity_max_skips` (4) and `affinity_max_wait_ms` (2000) in the same
 receipt are how often, and how long, an older waiter can be passed over before its class is served
@@ -120,6 +140,20 @@ process-wide memory for request bodies being read or held by running requests,
 `FREELLAMA_MAX_BUFFERED_BYTES` (256 MiB by default). When it is full, a new upload waits up to the
 queue wait and is then refused with 503 `request_body_budget_exhausted`; raise it, or lower
 `FREELLAMA_MAX_REQUEST_BYTES`, when large uploads are normal.
+
+Managed response buffering also uses `FREELLAMA_MAX_REQUEST_BYTES` (64 MiB by default) as a
+per-response byte ceiling. Ollama JSON, embedding and decision responses, error bodies, and total
+NDJSON stream bytes share this limit. Oversized Ollama output returns `502` with
+`code:"upstream_response_too_large"`, `retry_safe:false` and `execution_outcome:"unknown"`;
+do not replay it automatically. This ceiling is separate from the shared request-body budget
+and does not represent total process heap usage. See [stream bounds](ARCHITECTURE.md#request-shapes)
+for backpressure and cancellation behavior.
+
+The management catalog and compatibility proxy share a separate 4 MiB cap for internal model lists,
+`/api/show`, residency observations and server versions. Oversized or failed observations remain
+unknown; they cannot establish a model's residency or allocation forecast. An oversized external
+engine model list appears under `unreachable` in the merged list. Direct raw metadata requests
+still stream their upstream responses unchanged.
 
 ## Record usage
 
@@ -249,9 +283,9 @@ model do not count. Set `breaker_failures = 0` to disable it.
 ## Adaptive concurrency
 
 Managed task costs are configurable through the runtime file's `[task_costs]` table. Valid keys
-are `completion`, `coding`, `code_repair`, `tools`, `browser`, `vision`, `embedding`, and
+are `completion`, `coding`, `code_repair`, `tools`, `browser`, `vision`, `embedding`, `decision`, and
 `long_context`. Each value is a positive integer through 4294967295. Omitted kinds retain their
-defaults: vision four, embeddings one, and other tasks two. Embeddings multiply their base by
+defaults: vision four, embeddings and decisions one, and other tasks two. Embeddings multiply their base by
 `ceil(input_items/4)`; the acquired charge cannot exceed the pool's current limit.
 
 For a qualified light OCR workload, `[task_costs]` with `vision = 2` permits two vision requests

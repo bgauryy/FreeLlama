@@ -1,7 +1,7 @@
 # Agent commands: `freellama run`, `chat`, `gateway`
 
 `freellama run` works like `ollama run`, with FreeLlama on every request:
-- the tested model for the job that fits in memory now
+- a machine-calibrated Rust route when suitable evidence is available, otherwise a portable catalog pick
 - the job's documented prompts and options
 - the memory gate
 - `check:` lines that say what to verify
@@ -15,9 +15,14 @@ Anthropic clients. [Every API](API.md) shows every surface.
 npm install -g @octocodeai/freellama     # one command: freellama
 ```
 
+The npm launcher requires Node.js 22+ and installs a matching prebuilt platform package; no Rust
+compiler is needed. Source builds use Yarn and the pinned Rust toolchain instead; see
+[build from source](BUILD_AND_NOTES.md#build-from-source). Ollama and installed models are needed
+for Ollama-backed inference.
+
 | Command | Runs in | Needs |
 |---|---|---|
-| `freellama serve`, `doctor`, `init`, `catalog`, `task`, `jobs`, `bench-all`… | The Rust binary | Nothing else |
+| `freellama serve`, `doctor`, `init`, `catalog`, `task`, `jobs`, `bench-all`… | The prebuilt Rust binary | Node.js 22+ for the npm launcher; no Rust compiler |
 | `freellama run`, `chat`, `gateway`, `workflows`, `job`, `tool`, `tools` | Node, from `@octocodeai/freellama-mcp-server` (installed as a dependency) | Node.js 22+ |
 | `freellama status` | Human view on a terminal; JSON when piped or with `--json` | — |
 
@@ -70,7 +75,7 @@ freellama run -w review-code --each -f 'src/*.ts'          # one answer per file
 ```mermaid
 flowchart TD
     A["freellama run …"] --> B{"-w, -j, -t or -m given?"}
-    B -->|"-w / -j"| P["Job's tested pick that fits now<br/>+ workflow prompts and options"]
+    B -->|"-w / -j"| P["Calibrated route or portable catalog pick<br/>+ workflow prompts and options"]
     B -->|"-m TAG"| T["That tag"]
     B -->|"no"| F{"First word an installed tag?"}
     F -->|"yes"| T
@@ -93,8 +98,18 @@ flowchart TD
 | stdin | Piped or redirected input is read: the `state` of a decision, one item per line for an embedding job, else after the prompt. An agent harness's open socket never hangs the call; a socket is read only if data arrives within 250 ms |
 | Image path in the prompt | Attached as an image, as in `ollama run` |
 | `--ask` with no model | Runs on the `classify` job's tested pick; answers are named after the question (`refund-requested: true (p 0.89)`) |
-| Always managed | Decisions, embeddings, tools, batches (`--each`), `--defer`, `--preview`, `--save-as` |
+| Always managed | Decisions, embeddings, tools, batches (`--each`), `--defer`, `--preview`, `--save-as`, and explicit routing, placement or scheduling controls (`--objective`, `--prefer`, `--min-confidence`, `--priority`, `--timeout`, `--max-wait`, `--session`) |
 | serve | Started once in the background if nothing answers (log `~/.octocode/freellama/serve.log`, PID on stderr); `FREELLAMA_MCP_AUTOSTART_SERVE=0` turns it off |
+
+Job selection first asks the Rust router for a model with matching machine-local throughput
+evidence. Capable workflows also require task-quality evidence; OCR requires it too, and image
+search requires vision support. If calibration is missing, insufficient, refused or unavailable,
+selection uses the installed portable catalog picks and their live capability/memory preflight.
+The job's note identifies the choice. A throughput screen does not establish the job's accuracy:
+read `check:` lines and verify the answer. Generate calibration explicitly with
+`freellama bench-all` as described in [machine calibration](MODEL_SELECTION.md#turn-measurements-into-routing-evidence).
+Catalog ordering remains a starting point for unmeasured machines, rather than a machine-specific
+performance ranking.
 
 ### Flags
 
@@ -102,7 +117,7 @@ flowchart TD
 |---|---|
 | Same as `ollama run` | `--format json\|SCHEMA`, `--think[=true\|false\|LEVEL]`, `--hidethinking`, `--keepalive`, `--verbose`, `--ask` / `--choice` / `--level`, `--dimensions N`, `--nowordwrap`, `--insecure` |
 | Choose the work | `-w/--workflow`, `-j/--job`, `-m/--model`, `--fallback TAG` (repeatable: tried in order only after a refusal before running), `-t/--task`, `--objective`, `--prefer cpu\|gpu`, `--min-confidence` |
-| Inputs | `-f/--file PATH\|GLOB` (repeatable), `--image`, `-s/--system TEXT\|@FILE`, `--tools JSON\|@FILE`, `--suffix TEXT\|@FILE` (fill in the middle) |
+| Inputs | `-f/--file PATH\|GLOB` (repeatable), `--image`, `-s/--system TEXT\|@FILE` (also preserved with `--suffix`), `--tools JSON\|@FILE`, `--suffix TEXT\|@FILE` (fill in the middle) |
 | Model controls | `-o/--option k=v`, `--ctx N`, `--top N` (embedding matches) |
 | Output | `--schema 'name, age int, tags list'\|JSON\|@FILE`, `-x/--extract` (first code block), `--json` (full receipt), `-q/--quiet`, `--stream` / `--no-stream` |
 | Scheduling | `--each`, `--defer`, `--idempotency-key KEY` (with `--defer`, on a serve with durable jobs), `--preview`, `--save-as NAME`, `--session`, `--priority`, `--timeout`, `--max-wait`, `--endpoint URL` |
@@ -110,6 +125,17 @@ flowchart TD
 `freellama run --help` lists every flag. `--think=LEVEL` must be a level the model lists
 (`ollama show MODEL`). `--suffix` needs a model with Ollama's `insert` capability. `-x` extracts
 text; it is not a patch.
+
+Explicit managed controls remain effective with `--stream`; these requests return one managed
+answer. Fill-in-the-middle `--suffix` uses streamed completion instead and rejects managed-only
+controls, deferred/batch modes, `--json`, `--extract` and `--no-stream`; a preview still discards
+payload fields and executes nothing. A stream that ends without `done:true` exits 1 even if partial
+text has already reached stdout. Treat that partial text as incomplete.
+Buffered terminal and rewritten gateway responses share `FREELLAMA_MAX_REQUEST_BYTES` (64 MiB
+by default). It counts received bytes before decoding, including incomplete NDJSON/SSE records and
+error bodies. Overflow cancels the upstream read and fails without replay; a gateway stream that
+already started closes with an error. This per-response bound also covers buffered JSON replies;
+raw real-tag passthrough stays a pull-driven byte stream.
 
 ### Exit codes
 
@@ -196,5 +222,13 @@ flowchart TD
 | Security | Loopback only; non-loopback Origin or Host refused; no files read and no URLs fetched over HTTP (images must be base64) |
 | Errors | 503 when waiting can fix it (capacity, memory, Ollama, no pick that fits), else 500 |
 
-Local models are 2–9B: they serve bounded tasks well and long agent loops poorly. Anthropic does
-not support routing Claude Code to non-Claude models.
+Set `FREELLAMA_AUTH_TOKEN_FILE` for a token-protected `serve`. Terminal streams, gateway discovery,
+residency/config reads and forwarded generation use this same credential as managed calls. A
+configured serve credential takes precedence over an incoming SDK placeholder bearer; without it,
+gateway forwarding retains the caller's headers. Forwarding stays on the configured serve origin,
+and authenticated fetches refuse redirects. Forwarded native requests refresh the server's
+context-shift policy within five seconds, including `ollama_default` after a runtime reload.
+
+The shipped workflows target bounded local-model tasks; their dated evaluation results do not
+qualify arbitrary models, hardware or long agent loops. Verify each answer using its checks.
+See [reliability evidence](RELIABILITY.md) for the measured workloads and limits.

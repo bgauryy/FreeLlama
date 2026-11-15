@@ -28,6 +28,9 @@ pub(super) struct JobJournal {
     owner: String,
     workers: Arc<Semaphore>,
     secret: Arc<JobSecret>,
+    /// Non-secret execution settings participate in input identity, not the lookup namespace.
+    /// A changed engine must conflict with retained work rather than silently execute it again.
+    managed_execution: Option<String>,
 }
 
 /// Request identity and input hashes for one submission.
@@ -144,6 +147,35 @@ fn hex(bytes: &[u8]) -> String {
         .collect()
 }
 
+fn managed_execution(config: &PlatformConfig) -> serde_json::Result<Option<String>> {
+    let engines = config
+        .upstreams
+        .iter()
+        .filter_map(|upstream| {
+            upstream.llamacpp.as_ref().map(|limits| {
+                (
+                    upstream.name.as_str(),
+                    (
+                        &upstream.base_url,
+                        &limits.model,
+                        limits.processor,
+                        limits.context_tokens,
+                        limits.max_output_tokens,
+                        limits.memory_bytes,
+                    ),
+                )
+            })
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    // Preserve existing Ollama-only hashes. Credential rotation and declaration order do not
+    // alter execution identity. Include every managed mapping because scopes can inherit models.
+    if engines.is_empty() {
+        Ok(None)
+    } else {
+        serde_json::to_vec(&engines).map(|bytes| Some(hash(&bytes)))
+    }
+}
+
 impl JobJournal {
     pub(super) fn configured(config: &PlatformConfig) -> Result<Option<Self>> {
         if !config.durable_jobs_enabled()? {
@@ -175,6 +207,7 @@ impl JobJournal {
             owner: Uuid::new_v4().to_string(),
             workers: WORKERS.get_or_init(|| Arc::new(Semaphore::new(4))).clone(),
             secret: Arc::new(secret),
+            managed_execution: managed_execution(config)?,
         }))
     }
 
@@ -189,9 +222,18 @@ impl JobJournal {
         input: &[u8],
     ) -> serde_json::Result<Identity> {
         let request = serde_json::to_vec(&(client, caller_key.unwrap_or(id)))?;
+        let input_digest = self.secret.hash("input", input);
+        let input_hash = if let Some(execution) = &self.managed_execution {
+            self.secret.hash(
+                "input-managed-v1",
+                &serde_json::to_vec(&(execution, &input_digest))?,
+            )
+        } else {
+            input_digest
+        };
         Ok(Identity {
             request_key: self.secret.hash("request", &request),
-            input_hash: self.secret.hash("input", input),
+            input_hash,
         })
     }
 
@@ -312,6 +354,9 @@ pub(super) fn recovered_receipt(record: &JobRecord) -> Result<Value, ApiError> {
     receipt["recovered"] = json!(true);
     Ok(receipt)
 }
+
+#[cfg(test)]
+mod managed_tests;
 
 #[cfg(test)]
 mod tests {

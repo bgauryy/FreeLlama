@@ -11,7 +11,9 @@ use std::sync::{
 };
 use std::time::Instant;
 
-fn healthy() -> HostResources {
+mod windows;
+
+pub(super) fn healthy() -> HostResources {
     HostResources {
         source: "fixture".into(),
         total_memory_bytes: Some(32 * GIB),
@@ -24,8 +26,7 @@ fn healthy() -> HostResources {
         ..HostResources::default()
     }
 }
-/// Pins the Linux/macOS telemetry default so these contracts hold on Windows too, whose default
-/// is best-effort, and pins the advisory low-memory mode (the macOS default) on every platform.
+/// Pins required memory and advisory low-memory mode independently of platform defaults.
 fn quick_policy() -> ResourcePolicy {
     ResourcePolicy {
         sample_interval: Duration::from_millis(5),
@@ -35,7 +36,7 @@ fn quick_policy() -> ResourcePolicy {
     }
 }
 
-fn refusing_policy() -> ResourcePolicy {
+pub(super) fn refusing_policy() -> ResourcePolicy {
     ResourcePolicy {
         low_memory: LowMemoryMode::Refuse,
         ..quick_policy()
@@ -736,7 +737,10 @@ async fn a_stale_sample_is_refreshed_in_the_background_without_waiting() {
     tokio::time::sleep(Duration::from_millis(60)).await;
     let started = Instant::now();
     let stale = governor.snapshot().await;
-    assert!(started.elapsed() < Duration::from_millis(25), "a stale read must not wait for sampling");
+    assert!(
+        started.elapsed() < Duration::from_millis(25),
+        "a stale read must not wait for sampling"
+    );
     assert_eq!(stale.sample_count, first.sample_count);
     // The next reader after the background sample finished absorbs it.
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1005,7 +1009,7 @@ fn live_host_resource_observation() {
     let sample = sample_host_resources();
     eprintln!("{}", serde_json::to_string_pretty(&sample).unwrap());
     assert!(started.elapsed() < Duration::from_secs(3));
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     assert!(sample.total_memory_bytes.is_some_and(|bytes| bytes > 0));
 }
 

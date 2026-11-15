@@ -733,11 +733,9 @@ pub(crate) enum Command {
         timeout_seconds: u64,
         #[arg(long, default_value_t = 3)]
         trials: u32,
-        #[arg(
-            long,
-            default_value = ".octocode/evals/evidence/latest-all-models.json"
-        )]
-        output: PathBuf,
+        /// Report path; defaults to `benchmark-report.json` in the `FreeLlama` home, which serve discovers.
+        #[arg(long)]
+        output: Option<PathBuf>,
     },
     /// Verify that an Ollama server exposes the required diagnostic APIs.
     Doctor {

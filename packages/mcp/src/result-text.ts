@@ -169,7 +169,7 @@ export function routeText(route: Fields): string {
   const assessment = obj(execution.resource_assessment);
   const lines = [
     `route: ${String(route.task ?? route.profile ?? "?")} -> ${String(route.selected_model ?? "no model")}` +
-      `${route.resident === true ? " (resident)" : " (not resident)"}; confidence ${String(route.confidence ?? "?")}, ` +
+      `${route.resident === true ? " (resident)" : route.resident === false ? " (not resident)" : " (residency unknown)"}; confidence ${String(route.confidence ?? "?")}, ` +
       `evidence ${String(route.evidence ?? "?")}; context ${String(obj(route.options)?.num_ctx ?? "?")} tokens, ${String(route.context_window_fit ?? "?")}.`,
   ];
   const reasons = list(route.reasons).map(String);

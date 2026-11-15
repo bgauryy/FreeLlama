@@ -23,6 +23,21 @@ pub struct OpenAiUpstream {
     /// The API root that `/v1/...` paths continue, such as `http://127.0.0.1:1234/v1`.
     pub base_url: String,
     pub api_key: Option<String>,
+    /// Explicit opt-in to bounded managed text tasks through llama.cpp.
+    pub llamacpp: Option<LlamaCppConfig>,
+}
+
+/// Operator limits for one local llama-server. These are configuration, not placement evidence.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LlamaCppConfig {
+    pub model: String,
+    pub processor: crate::platform::Backend,
+    pub context_tokens: u64,
+    pub max_output_tokens: u64,
+    /// Conservative per-request reservation covering model load and runtime buffers. No
+    /// residency credit is taken because the adapter cannot verify physical allocation.
+    pub memory_bytes: u64,
 }
 
 impl std::fmt::Debug for OpenAiUpstream {
@@ -31,6 +46,7 @@ impl std::fmt::Debug for OpenAiUpstream {
             .debug_struct("OpenAiUpstream")
             .field("name", &self.name)
             .field("base_url", &self.base_url)
+            .field("llamacpp", &self.llamacpp)
             .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
             .finish()
     }
@@ -50,6 +66,7 @@ struct UpstreamEntry {
     url: String,
     /// Owner-only file holding the API key; relative paths are read from this file's folder.
     api_key_file: Option<std::path::PathBuf>,
+    llamacpp: Option<LlamaCppConfig>,
 }
 
 /// Read an upstreams file (TOML `[[upstream]]` tables: `name`, `url`, optional `api_key_file`).
@@ -83,6 +100,7 @@ pub fn load_upstreams(path: &Path) -> Result<Vec<OpenAiUpstream>> {
                 name: entry.name,
                 base_url: entry.url.trim_end_matches('/').to_owned(),
                 api_key,
+                llamacpp: entry.llamacpp,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -116,6 +134,26 @@ pub(crate) fn validate(upstreams: &[OpenAiUpstream]) -> Result<()> {
             "upstream {} url must be http or https",
             upstream.name
         );
+        if let Some(engine) = &upstream.llamacpp {
+            ensure!(
+                url.host_str().is_some_and(crate::net::is_loopback_host)
+                    && url.path() == "/v1"
+                    && url.query().is_none()
+                    && url.fragment().is_none()
+                    && url.username().is_empty()
+                    && url.password().is_none(),
+                "managed llama.cpp upstream {} must use a loopback /v1 URL without credentials, query or fragment",
+                upstream.name
+            );
+            ensure!(
+                !engine.model.trim().is_empty()
+                    && engine.context_tokens > 0
+                    && engine.max_output_tokens > 0
+                    && engine.max_output_tokens < engine.context_tokens
+                    && engine.memory_bytes > 0,
+                "managed llama.cpp needs an exact model, positive memory/context/output limits and output below context"
+            );
+        }
         ensure!(
             upstream.api_key.is_none()
                 || url.scheme() == "https"
@@ -309,7 +347,9 @@ async fn get(client: &Client, url: &str, key: Option<&str>) -> Option<Value> {
     if !response.status().is_success() {
         return None;
     }
-    response.json().await.ok()
+    crate::ollama_http::bounded_metadata_json(response, "model listing")
+        .await
+        .ok()
 }
 
 #[cfg(test)]
@@ -321,6 +361,7 @@ mod tests {
             name: name.into(),
             base_url: url.into(),
             api_key: key.then(|| "k".into()),
+            llamacpp: None,
         }
     }
 

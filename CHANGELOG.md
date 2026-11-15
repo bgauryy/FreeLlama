@@ -8,10 +8,42 @@ packages) and the Rust crates share one version, set with `yarn release:version 
 
 ### Added
 
+- **End-to-end Ollama review.** A dated [architecture and feature review](docs/OLLAMA_REVIEW.md)
+  compares product directions, checks primary Ollama sources, records concrete repairs and
+  separates deterministic contracts from retained model results and unobserved hardware lanes.
+- **Retained coder command audits.** Private raw logs and per-command metadata survive isolated
+  copy cleanup, including no-patch and interrupted runs. Bounded model previews reference the
+  full audit; a byte cap or write failure terminates the command and marks output incomplete.
+  [Limits and retention](docs/cookbooks/research-agent.md).
+- **Managed llama.cpp text engine.** An operator-configured loopback server can run explicit
+  `name/model` completion, coding and long-context tasks through the Rust admission pools and
+  resource governor, with bounded context, output, response size and time. Its own server owns
+  model loading; physical placement remains unknown. Tools, vision, embeddings, streaming and
+  Ollama lifecycle controls are not supported on this path. An ambiguous inference failure is
+  never replayed. [Setup and retained live smoke](docs/LLAMACPP.md).
+- **Machine-local calibration.** `bench-all` schema 2 records host and hardware provenance;
+  routing uses throughput evidence only when the local endpoint and model artifact also match.
+  Job selection asks the Rust router first, requiring quality evidence for capable workflows
+  and OCR, then falls back to the shipped catalog and capability selection. Explicit models
+  still win; speed does not qualify task quality. [Selection rules](docs/MODEL_SELECTION.md).
+- **Reproducible reliability evidence.** A 30-case labeled corpus measures `check:` misses and
+  false alarms. A public tool-calling harness retains prompts, settings, digests, trials and
+  deterministic grading; the first two seven-case model smoke runs score 6/7 and 5/7. Other
+  cataloged audit tags remain unmeasured. Tool-call checks validate the supported schema subset
+  and report unsupported constraints as unchecked. These small public suites do not establish
+  general model reliability. [Reports and limits](docs/RELIABILITY.md).
+- **Cross-platform contract CI.** GitHub Actions is configured for Linux, macOS and Windows,
+  including Windows host-memory observation, Rust lint on Linux and packaging fixtures on
+  POSIX. Local checks passed on macOS; hosted CI and the complete production release gate have
+  not been observed for this change. [Validation scope](docs/TESTING.md).
+- **Current project assessment.** A dated [readiness scorecard](docs/ASSESSMENT.md) rates each
+  implemented priority and the remaining gaps separately from historical model benchmarks.
+
 - **Streamed managed tasks.** `POST /_freellama/v1/tasks` with `"stream": true` answers with
   server-sent events: `route`, `admission` phases, a `delta` per generated piece, then `done` with
   the same receipt a non-streaming call returns (or `error` with `retry_safe`). Fallback, admission
-  and the memory gate are unchanged; a client that disconnects stops generation upstream. Only
+  and the memory gate are unchanged; a client that disconnects releases local execution permits
+  and closes the upstream request to request cancellation. Only
   generating tasks stream; anything else is refused with 422 `stream_unsupported`.
 - **Token progress for MCP `run_task`.** A deferred chat job counts its tokens, and MCP progress
   reads "generating on MODEL: N tokens, R tok/s" instead of a bare "running".
@@ -35,6 +67,44 @@ packages) and the Rust crates share one version, set with `yarn release:version 
   second copy would compete with an existing install for port 11434.
 
 ### Changed
+
+- **Bounded response handling.** Managed Ollama output and transformed/collected agent CLI and
+  gateway responses now enforce the configured wire-byte limit, including error bodies and
+  malformed partial records. Internal catalog and proxy metadata share a 4 MiB reader. Managed
+  streams use bounded channels and retain their execution deadline under slow readers. These
+  are per-response limits, not a global heap budget. [Resource boundaries](docs/MONITORING.md).
+- **Agent protocol correctness.** Direct CLI/gateway calls carry configured operator auth,
+  refuse redirects and off-origin forwarding, verify HTTPS certificates and honor managed
+  controls. Terminal streams fail on missing completion evidence while preserving partial
+  output; uncertain inference is not replayed. Windows launcher and installer fixtures now
+  cover their platform-specific paths. [Agent CLI](docs/AGENT_CLI.md).
+- **Durable managed-engine identity.** Changing a configured llama.cpp execution mapping
+  conflicts with a retained idempotency key while preserving access to the original receipt.
+  Key rotation and declaration order do not invalidate identity. [Migration](docs/DEFERRED_JOBS.md#idempotency).
+- **Checks and evidence integrity.** Numeric-token matching and malformed tool-call warnings
+  close specific missed checks. Reliability reports verify captured requests, reject duplicate
+  acquisitions and count failed continuations as failures. New versioned reports preserve the
+  original raw trials and strict scores. [Evidence and limitations](docs/RELIABILITY.md).
+- **Single source for Octocode instructions.** Build-time Markdown imports replace drifting
+  embedded copies; existing equality and size checks continue to enforce the compact contract.
+- **Windows memory admission.** Bounded CIM sampling supplies checked total/free physical
+  memory, and Windows now defaults to requiring memory telemetry. Missing or malformed values
+  remain unknown; CPU load, pressure, swap and thermal signals are still unavailable. Fixture
+  coverage is local; native Windows execution awaits the configured CI check.
+- **Benchmark ownership and defaults.** `bench-all` writes to the FreeLlama home by default,
+  validates exact `--include` tags before generation, preserves pre-existing residents and
+  cleans up only eligible models it benchmarked. It calls Ollama directly, so the operator must
+  choose a quiet machine and bounded inventory.
+- **Focused Rust and handler refactoring.** Split benchmark provenance, pipeline helpers,
+  several large test modules and MCP result construction from their owning files. The targeted
+  panic/lock audit found no production `unwrap_used` or `await_holding_lock` lint hits; 30
+  explicit `expect` sites remain a documented review boundary. Poison, sampler panic and
+  subprocess cleanup tests cover selected failures, not a proof of all lock ordering.
+  [Audit](docs/RUST_RESOURCE_AUDIT.md).
+- **Documentation reconciled with implementation.** Guides and agent instructions distinguish
+  the llama.cpp text subset, machine-local selection, Windows telemetry, caller verification,
+  published prebuilt installs and source prerequisites. The historical 98% workflow result is
+  qualified as 45/46 completed cases (45/48 nominally planned), against 25/48 for the baseline.
 
 - **Managed-path overhead down about 6×.** Profiling with the new `timing` field found three costs
   on every request: an `/api/tags` read for a pinned model (Ollama reads every manifest, 13–43 ms),
@@ -86,7 +156,8 @@ packages) and the Rust crates share one version, set with `yarn release:version 
 - **A measured scorecard.** FreeLlama is rated on 11 measured KPIs (quality, time, first token,
   load, switching, CPU, memory, GPU placement), each against parity with Ollama or a fixed bar:
   9 met, 2 missed (cold request +7%, one unverified placement). The built-in workflow prompts were
-  measured against one-line prompts on `bonsai-2:9b`: 98% vs 52% of graded cases
+  measured against one-line prompts on `bonsai-2:9b`: 45/46 completed passes (98%; 45/48 nominally
+  planned) vs 25/48 (52%) for the baseline
   (`scripts/local-test/baseline-prompts.mjs`).
 - **Feature comparison.** [Benchmark](docs/BENCHMARK.md#features-beyond-speed) compares ten runners
   on memory checks, model suggestions, MCP, APIs, streaming and metrics, checked against their

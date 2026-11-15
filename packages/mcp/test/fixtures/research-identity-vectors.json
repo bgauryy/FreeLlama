@@ -34,7 +34,7 @@
       },
       "url": "http://127.0.0.1:11435/_freellama/v1/models",
       "result": {
-        "identity": "0c90cdced074a5a35aeab55e13f0c368b31266b28ce727da914f00a7ec2fbec3",
+        "identity": "ecdc3a13b58c19b3a51bc4c5751a45bb938df67072d6253e913aba26e4ed9a98",
         "verified": true,
         "scope": "manifest_digest_and_system_prompt",
         "digest": "abcdef0000000000000000000000000000000000000000000000000000000000"

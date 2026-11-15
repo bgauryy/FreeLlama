@@ -1,6 +1,6 @@
 # Turn a recording into text
 
-**Use when** a WAV recording must become text. You cannot hear audio yourself, so this has no self-service alternative.
+**Use when** a WAV recording needs searchable text or a translation.
 
 **Model:** `lfm3-audio:2b-q4_K_M` (1.7 GB), or `lfm3-omni:2b-q4_K_M` (2.0 GB), which also does images.
 

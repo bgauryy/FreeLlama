@@ -401,7 +401,7 @@ fn learn_default_context(state: &ProxyState, model: &str) {
         let Ok(response) = client.get(url).send().await else {
             return;
         };
-        let Ok(ps) = response.json::<serde_json::Value>().await else {
+        let Ok(ps) = crate::ollama_http::bounded_metadata_json(response, "/api/ps").await else {
             return;
         };
         if let Some(context) = crate::ollama_http::find_ps_entry(&ps, &model)

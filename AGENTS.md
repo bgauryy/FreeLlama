@@ -1,8 +1,9 @@
 # Agents
 
-FreeLlama exposes a management layer that lets AI agents offload bounded tasks to local Ollama
-models. Keep model routing and resource coordination in the Rust core; the calling agent owns
-prompts, task dependencies, judgment, and verification. Ollama and the host execute physical work.
+FreeLlama exposes a management layer that lets AI agents offload bounded tasks to local models.
+Ollama supplies the default workflows; explicitly configured llama.cpp servers support bounded
+text tasks. Keep model routing and resource coordination in the Rust core; the calling agent owns
+prompts, task dependencies, judgment, and verification. The engine and host execute physical work.
 
 ## Repository operating index
 
@@ -10,6 +11,10 @@ prompts, task dependencies, judgment, and verification. Ollama and the host exec
 |---|---|
 | Install, run, and find a guide | [README](README.md), [documentation index](docs/README.md) |
 | Architecture and ownership | [Architecture](docs/ARCHITECTURE.md) |
+| Current ratings, evidence and gaps | [Assessment](docs/ASSESSMENT.md) |
+| Machine-local calibration and model qualification | [Model selection](docs/MODEL_SELECTION.md) |
+| Managed llama.cpp capabilities and limits | [Managed llama.cpp](docs/LLAMACPP.md) |
+| Check accuracy and tool-calling evidence | [Reliability](docs/RELIABILITY.md) |
 | MCP tool choice, request shapes, and agent workflow | [MCP reference](packages/mcp/README.md) |
 | Every API surface on one page | [Every API](docs/API.md) |
 | Shell access and Ollama, OpenAI and Anthropic protocol access to jobs and workflows | [agent commands and gateway](docs/AGENT_CLI.md) |
@@ -30,6 +35,11 @@ prompts, task dependencies, judgment, and verification. Ollama and the host exec
   delete only an exact installed tag the user names.
 - CPU eligibility is operator-owned. Preferences cannot move arbitrary models to another backend.
   Configured assignment is intent; require returned observed evidence when placement matters.
+- Machine-local throughput evidence must match the host, endpoint and model artifact. It does not
+  establish task quality; quality policies require correctness evidence. Catalog recommendations
+  remain fallbacks. An explicit caller model wins over automatic selection.
+- Managed llama.cpp is an explicit bounded text path. Do not infer Ollama lifecycle, streaming,
+  tools, embeddings, vision or observed placement support from OpenAI-compatible transport.
 - `delegate_research` is bounded read-only lookup. The caller retains decomposition, judgment,
   mutation authority, and final verification. Discard an `escalate` result. The one writing
   adapter, `coder`, is operator opt-in (`FREELLAMA_MCP_ALLOW_CODER=1`): it edits and runs only
@@ -37,7 +47,8 @@ prompts, task dependencies, judgment, and verification. Ollama and the host exec
   applies it. It never writes the caller's tree.
 - `run_task {job}` is an explicit opt-in to FreeLlama's model pick and local prompts
   (`packages/mcp/src/local-prompts.ts`, the single owner of local-model instructions); any field
-  the caller sends wins. Act on a result's `check:` lines before relying on it.
+  the caller sends wins. Act on a result's `check:` lines before relying on it. Clean checks do not
+  prove correctness; retain caller verification and report unmeasured models as unmeasured.
 - An empty LSP result is ambiguous. Retry or search instead; a cold zero does not prove a language
   is unsupported. Structural code search requires `pattern` or `rule`, not `keywords` alone.
 - The agent commands (`freellama run`, `chat`, `gateway`, `tool`…) add a door, not authority:

@@ -1,5 +1,8 @@
 # Build from source and operating notes
 
+Published npm installs need Node.js 22+ and the matching prebuilt platform package; they do not
+compile Rust. Use the [installation guide](../README.md) for that path. The commands below are for
+developing this checkout or building your own executable and addon.
 
 ## Good to know
 
@@ -21,7 +24,9 @@
 
 ## Build from source
 
-Requires Rust 1.89+ (`rust-toolchain.toml` pins the compiler) and Node.js 22.12+ with Corepack.
+Requires Node.js 22.12+ with Corepack and the Rust compiler selected by `rust-toolchain.toml`
+(currently 1.99.0). `Cargo.toml` declares a 1.89 minimum; that floor is separate from the pinned
+development compiler and needs its own check before claiming minimum-version compatibility.
 
 ```bash
 corepack enable && yarn install && yarn build
@@ -31,4 +36,5 @@ node packages/cli/bin/freellama.js run --help   # the agent commands (run, chat,
 ```
 
 npm releases can lag this checkout. [Testing](TESTING.md) describes the checks; the release gate
-is `yarn verify:production`.
+is `yarn verify:production`. It includes live-system tiers and all-platform release artifacts;
+building successfully on the current host does not satisfy that complete gate.

@@ -76,6 +76,12 @@ model; see [client keys and other engines](PRODUCTION.md#client-keys). The runti
 `[preload]` table loads models at startup and predicts the next one; see
 [Preload](SCOPES_AND_WARMING.md#preload).
 
+An upstream with an explicit `[upstream.llamacpp]` configuration also supports bounded managed
+text tasks through an exact `--model NAME/MODEL` assignment. It requires fixed context/output
+limits and a conservative memory reservation; physical placement and benchmark confidence stay
+unknown. It does not participate in automatic job selection or Ollama model lifecycle controls.
+See [managed llama.cpp](LLAMACPP.md) for setup and supported fields.
+
 `serve` exposes both managed routes under `/_freellama/v1/*` and byte-preserving Ollama routes under
 `/api/*` and `/v1/*`. Use `proxy` when you need only the latter. See
 [Architecture](ARCHITECTURE.md) for the request flow.
@@ -96,9 +102,11 @@ Or let `serve` start and own the CPU process (stopped when `serve` exits; a port
 is refused):
 
 ```bash
-npx @octocodeai/freellama serve --spawn-cpu-backend --cpu-model nomic-embed-text:latest \
-  [--cpu-backend-port 11436] [--ollama-binary /path/to/ollama]
+npx @octocodeai/freellama serve --spawn-cpu-backend \
+  --cpu-model nomic-embed-text:latest --cpu-backend-port 11436
 ```
+
+Use `--ollama-binary /absolute/path/to/ollama` if the intended executable is not `ollama` on `PATH`.
 
 FreeLlama rejects a CPU upstream with no assignments, `--cpu-model` without `--cpu-upstream` or
 `--spawn-cpu-backend`, both of those together, and a CPU upstream that is the same Ollama endpoint as
@@ -124,7 +132,7 @@ runtime-file value it defaults to 2 units per `OLLAMA_NUM_PARALLEL` slot of
 the Ollama server (read from its process environment where visible; Ollama's own default is 1, so 2).
 `freellama config` shows the effective value and where it came from.
 `--cpu-max-concurrent-tasks` controls the independent CPU pool and defaults to 1. Default base costs
-are embedding 1, chat 2, and vision 4. Embeddings multiply their base by `ceil(input_items/4)`;
+are embedding and decision 1, chat 2, and vision 4. Embeddings multiply their base by `ceil(input_items/4)`;
 the acquired charge is capped to the selected backend's pool. Configure overrides in `[task_costs]`;
 see [monitoring controls](MONITORING.md#adaptive-concurrency). A saturated GPU pool does
 not consume CPU permits. `--max-queue-wait-seconds` defaults to 120; when no permit becomes
@@ -132,6 +140,8 @@ available, FreeLlama refuses the task with HTTP 503 (`admission_timeout`) instea
 A task can ask for a shorter wait with `max_wait_seconds` (`maxWaitSeconds` in MCP); it can never
 exceed the configured one. Omit it to use the server's waiting budget.
 That deadline covers weighted admission, host-resource waiting, and model-transition locking together.
+`FREELLAMA_MAX_REQUEST_BYTES` also caps each managed Ollama response at 64 MiB by default, including
+embedding, decision, error and NDJSON wire bytes; an oversized response fails with nonretryable 502.
 `--max-queued-tasks` (default 16) and `--cpu-max-queued-tasks` (default 8) also bound how many
 parsed requests can be retained per backend; a full queue receives 429 (`admission_queue_full`)
 immediately, and cancelled clients release their waiter. Every capacity refusal carries a
@@ -163,15 +173,15 @@ unknown measurements, and reserved memory. These flags do not change Ollama or O
 When effective available RAM does not cover already-reserved bytes, the task's estimated bytes and the
 reserve, FreeLlama first unloads idle unpinned runners, then holds the new load with
 `held_insufficient_capacity` until capacity returns, refusing with 503 at its deadline. This is the
-default on every platform: Linux and Windows available RAM already counts reclaimable cache (and is
-the hard cap in a container), and on macOS effective available RAM is free memory plus a bounded
-reclaimable estimate. A load already resident is never held by it. `--low-memory advisory` (or
+default on every platform: Linux uses kernel `MemAvailable` capped by a smaller cgroup limit,
+Windows uses CIM `FreePhysicalMemory`, and macOS adds a bounded reclaimable estimate to free RAM.
+A load already resident is never held by this capacity check. `--low-memory advisory` (or
 `FREELLAMA_LOW_MEMORY=advisory`) instead dispatches such a load: the receipt reports
 `status: "admitted_low_memory_estimate"` and `assessment.memory_advisory: "below_reserve"` with
 `required_with_reserve_bytes` and `effective_available_bytes`, and Ollama and the OS decide whether
 it fits.
 OS memory pressure holds new loads where the OS reports it (macOS, and Linux when the kernel
-exposes `/proc/pressure/memory`; Windows has no host collector yet), and holds already-resident
+exposes `/proc/pressure/memory`; Windows does not expose this signal through its collector), and holds already-resident
 runners too only at the critical level: a warning is what a large load itself raises. Active
 swapping and low RAM hold new loads only: an already-resident runner adds no memory and stays
 admitted, for raw passthrough requests too when the request's `model` is in Ollama's `/api/ps`. The CPU-load hold (one-minute load at
@@ -184,15 +194,17 @@ request on a runner already resident on the GPU proceeds. The receipt's `resourc
 lists the holds that applied to the request.
 Both `serve` and `proxy` accept `--resource-telemetry-policy`:
 
-- `require-memory` (default on Linux and macOS): wait or refuse local inference when available RAM is
+- `require-memory` (default on Linux, macOS and Windows): wait or refuse local inference when available RAM is
   unknown, including raw requests with zero forecast bytes. Missing thermal data alone does not block
   this policy.
 - `require-all`: require all signals applicable to the collector. The built-in Linux collector reads
   OS memory pressure from `/proc/pressure/memory` when the kernel provides it, but has no thermal
   signal and marks it as unsupported; custom collectors must provide it. Unsupported signals are not
   evidence of healthy hardware.
-- `best-effort`: explicitly permit unknown telemetry unless an observed pressure hold is active. This
-  is the default on Windows, which has no built-in memory collector.
+- `best-effort`: explicitly permit unknown telemetry unless an observed pressure hold is active.
+  Unsupported platforms without a collector use this default. Windows instead requires its bounded
+  PowerShell/CIM memory observation; its CPU-load, OS-pressure, thermal, swap and GPU signals remain
+  unknown, so `require-all` holds work there. See [Windows memory telemetry](MONITORING.md#read-the-live-status).
 
 Remote upstreams bypass local host policy. Raw metadata and empty unload requests remain available
 during a hold. Route receipts separate `queue_readiness` from `resource_readiness`, and include
@@ -307,10 +319,13 @@ through MCP `task_jobs`.
 Cancellation and removal wait for local execution permits to be released; they do not unload a shared model
 or confirm that the physical runner has stopped.
 
-Jobs stay in server memory: at most 64 receipts, 16 MiB per input (64 MiB across queued and running
+By default jobs stay in server memory: at most 64 receipts, 16 MiB per input (64 MiB across queued and running
 jobs), and 2 MiB per retained result or error. Finished receipts expire after 10 minutes and can be evicted earlier to make room for new
 work. A restart discards all jobs. Admission queue limits still apply, and deferred work can fail
 after acceptance. See [monitoring](MONITORING.md) for states and waiting reasons.
+Opt-in durable receipts retain terminal results and idempotency records in the file-backed store;
+they never replay prompts after restart. See [durable deferred jobs](DEFERRED_JOBS.md) before
+enabling `FREELLAMA_DURABLE_JOBS` or using an idempotency key.
 
 Create a session with `session`, then pass its identifier to related `route` or `task` calls. A
 route preview honors an existing affinity but does not create or change one. Only a successfully
@@ -352,6 +367,15 @@ npx @octocodeai/freellama bench-all --output benchmark-report.json
 npx @octocodeai/freellama serve
 ```
 
+Without `--output`, `bench-all` writes `benchmark-report.json` in the FreeLlama home so the next
+`serve` start discovers it automatically. Use repeated `--include EXACT_TAG` flags to bound the run.
+Reports qualify only their measured host/hardware, endpoint and artifact digests; old or foreign
+reports do not qualify routing. Schema-2 reports record a hashed machine identity and observed
+hardware; missing identity or remote endpoints cannot establish machine-local throughput. A primary
+endpoint report does not qualify a separately assigned CPU runner. Throughput screens do not
+establish job accuracy; that requires task-quality evidence and verification. See
+[machine calibration](MODEL_SELECTION.md#turn-measurements-into-routing-evidence).
+
 `serve` resolves each file in this order: the explicit flag, its environment variable, the working
 directory, then the FreeLlama home (`~/.octocode/freellama`, or `--home` / `FREELLAMA_HOME`). The home also holds
 `runtime.toml`, read when neither `--runtime-config` nor `FREELLAMA_RUNTIME_CONFIG` is set.
@@ -369,6 +393,10 @@ schema_version = 1
 [policies.code_repair]
 qualified_models = ["qwen3.8:27b-mlx"]   # best first; quality-qualified only
 
+# Preserve the digest recorded by the evaluation, never substitute today's tag digest.
+[policies.code_repair.model_digests]
+"qwen3.8:27b-mlx" = "sha256:REPLACE_WITH_EVALUATED_DIGEST"
+
 # Optional request defaults for one exact tag on this task: think and num_predict (>= 1).
 [policies.code_repair.model_options."qwen3.8:27b-mlx"]
 think = false
@@ -381,11 +409,12 @@ num_predict = 512
 [platform.example.toml](https://github.com/bgauryy/FreeLlama/blob/main/platform.example.toml).
 
 The MCP server autostarts `serve` with its own environment and an arbitrary working directory, so
-put a machine-wide policy in the config directory or set the variables in the MCP client's `env`.
+put a machine-wide policy in the FreeLlama home or set the variables in the MCP client's `env`.
 `serve` prints each file it picked up.
 
 `policy from-eval` reads `pass_at_1`, not the throughput produced by `bench-all`. It refuses
-expired aggregates and fewer than three trials unless `--allow-smoke` is explicit, and it skips
+expired aggregates and fewer than three trials unless `--allow-smoke` is explicit. That flag
+produces smoke-only output for inspection, which `serve` refuses as a routing policy. It skips
 models that are not installed on `--ollama-endpoint` (default `FREELLAMA_OLLAMA_ENDPOINT`, then
 `http://127.0.0.1:11434`). This prevents speed data from being mislabeled as quality evidence.
 It accepts the task kinds `route` accepts, with `-` or `_` (`code-repair` or `code_repair`), writes

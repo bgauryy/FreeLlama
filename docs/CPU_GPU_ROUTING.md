@@ -4,6 +4,10 @@ To separate GPU work from CPU helpers, configure two Ollama processes and assign
 tags to the secondary process. FreeLlama routes managed tasks within those assignments, applies
 `num_gpu: 0` to CPU requests, and reports both the selected backend and observed processor placement.
 
+This guide describes the Ollama backend contract. The [llama.cpp adapter](LLAMACPP.md) shares
+CPU/GPU admission pools by operator assignment, but does not inject Ollama controls, observe
+physical placement, manage lifecycle, or participate in automatic placement learning.
+
 The calling agent submits tasks and placement preferences. FreeLlama coordinates admission,
 memory checks, and model transitions for each backend; the operator configures the processes and
 eligible tags. A configured CPU backend is intent: inspect the placement observation before
@@ -56,8 +60,10 @@ flowchart TB
     CP --> CPU["CPU runner"]
 ```
 
-FreeLlama does not rewrite raw passthrough request bodies or route them by model. A direct Ollama client that
-needs model-aware CPU placement must use the managed task endpoint instead.
+Native Ollama passthrough does not apply `--cpu-model` assignments; a direct Ollama client that
+needs model-aware CPU placement must use managed tasks. Configured OpenAI-compatible `/v1/*`
+upstreams are a separate model-routing path, and `/v1/systemone` has an asset-translation exception.
+See [API passthrough](API.md#ollama-compatible-passthrough).
 
 ## Start the backends
 
@@ -150,6 +156,9 @@ The defaults above admit one ordinary primary-backend chat (cost 2) and one CPU 
 at the same time. They are conservative workload units for the common `OLLAMA_NUM_PARALLEL=1`
 layout, not a profile of the development Mac. Increase them only after measuring queue wait,
 resident memory, and Ollama's own parallel setting on the target host.
+A task waiting for host memory releases execution units while retaining one bounded queue
+registration; returning to admission transfers that ticket atomically. Cancellation removes it.
+This protects execution capacity without creating an uncounted memory-wait backlog.
 Queue cardinality and wait time are separate bounds: excess waiters are refused immediately, while
 an admitted waiter may remain until `--max-queue-wait-seconds`. Automatic backend selection checks
 that the actual task cost fits the current slot snapshot before following historical speed.
@@ -274,7 +283,7 @@ the entire pool's ceiling. Default vision weight four can serialize two vision r
 four-unit budget even when Ollama has two slots. A lower weight requires a qualified workload;
 it does not add engine slots or relax memory checks. See
 [monitoring controls](MONITORING.md#adaptive-concurrency).
-Raw generation requests follow the same rules on the primary backend. A raw request for a runner
+Raw Ollama generation requests follow the same rules on the primary backend. A raw request for a runner
 Ollama already holds at a matching digest and context takes no lock. A raw load takes the load lock
 and receives 503 (`proxy busy: another model load is active`) if it stays busy past the raw queue
 wait. Metadata GET/HEAD, `/api/show`, model-store calls (pull, push, copy, delete), and empty
@@ -312,9 +321,10 @@ The rules that follow:
 - Observing runner readiness wakes resource waiters to re-size their demand. A same-model follower
   waiting for a cold-load forecast can then share the runner while its first request still decodes.
 
-A cold task reads `/api/ps` six times in all: discovery, the receipt's capacity preview, the
-dispatch-time forecast, the observation before the lock, the observation after winning it, and the
-placement observation after the run. A resident task skips the post-lock read.
+Ollama residency is observed during discovery, capacity planning, dispatch preparation and
+post-run placement checks. The cold path rechecks after acquiring the load lock; a resident task
+skips that read. Revalidation and readiness polling can add observations, so the count is not a
+fixed per-task API contract.
 
 ### Degraded runner identity
 
@@ -347,7 +357,7 @@ alike (`PlacementRule`). Placement is judged from the same `/api/ps` entry's `si
 
 ### Raw generation whose allocation cannot be forecast
 
-A raw generation is admitted only with a memory forecast. When the model's metadata cannot be read
+A raw Ollama generation is admitted only with a memory forecast. When the model's metadata cannot be read
 in time, or the request body names a model the proxy cannot resolve (a multipart body, say) and
 could still load one, nothing could size or serialize that load. It is refused with HTTP 503,
 `Retry-After: 1` and `code: "model_forecast_unavailable"` instead of being admitted with a zero-byte
@@ -391,7 +401,8 @@ cold load: when the faster backend's model is not loaded but the other backend's
 the loaded one runs (`resident_backend_avoids_cold_load`); warm the faster model to switch. The CLI
 keeps the bounded, versioned, prompt-free snapshot in the shared database by default; `--ephemeral`
 opts into reset-on-restart behavior. Aggregate duration counters are diagnostic only and do not
-qualify learned hints; a snapshot of another schema version is refused. Health's
+qualify learned hints. A corrupt or unsupported feedback snapshot is rejected with a warning;
+the server starts with empty feedback and preserves the rejected snapshot. Health's
 `decision_ready` describes the stored profile window; the current request must independently
 match it before routing can use its speed. `GET /_freellama/v1/health` exposes profile identity,
 profile sample counts, persistence status, and per-backend admission capacity. Task receipts include
@@ -483,7 +494,9 @@ If an assigned model does not appear, check the following conditions:
 
 A configured but unreachable CPU backend causes model discovery to fail closed. GPU-managed tasks
 can also be unavailable until the secondary server returns. Raw passthrough to the primary server
-continues to work because it does not depend on catalog discovery.
+continues to work because it does not depend on catalog discovery. Explicit configured llama.cpp
+previews and tasks also bypass Ollama catalog discovery; use their route preview rather than the
+Ollama-oriented overall readiness endpoint.
 
 For the surrounding Ollama settings, see [Production](PRODUCTION.md#configure-ollama-explicitly). For
 all `serve` flags, see the [CLI reference](CLI.md).

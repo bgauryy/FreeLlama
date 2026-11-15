@@ -1,4 +1,4 @@
-//! Host resource sampling: Linux /proc and cgroups, NVIDIA, and macOS `vm_stat/sysctl`, behind bounded commands.
+//! Host resource sampling: Linux /proc and cgroups, NVIDIA, macOS and Windows, behind bounded commands.
 
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
 use std::collections::BTreeMap;
@@ -21,7 +21,11 @@ pub fn sample_host_resources() -> HostResources {
     {
         sample_linux()
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(target_os = "windows")]
+    {
+        super::windows::sample_windows()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         HostResources {
             source: "unsupported_platform".into(),
@@ -528,8 +532,27 @@ pub(crate) fn run_bounded(
         .spawn()?;
     // Drain pipes while the child runs: reading only after exit let a child with more than a
     // pipe buffer of output block on write until the deadline killed it.
-    let stdout = child.stdout.take().map(|pipe| capped_reader(pipe, cap));
-    let stderr = child.stderr.take().map(|pipe| capped_reader(pipe, cap));
+    let readers = (|| -> std::io::Result<_> {
+        let stdout = child
+            .stdout
+            .take()
+            .map(|pipe| capped_reader(pipe, cap))
+            .transpose()?;
+        let stderr = child
+            .stderr
+            .take()
+            .map(|pipe| capped_reader(pipe, cap))
+            .transpose()?;
+        Ok((stdout, stderr))
+    })();
+    let (stdout, stderr) = match readers {
+        Ok(readers) => readers,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
     let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
@@ -576,24 +599,26 @@ type CappedReader = (
     std::thread::JoinHandle<()>,
 );
 
-fn capped_reader(mut pipe: impl Read + Send + 'static, cap: u64) -> CappedReader {
+fn capped_reader(mut pipe: impl Read + Send + 'static, cap: u64) -> std::io::Result<CappedReader> {
     let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = std::sync::Arc::clone(&buffer);
-    let handle = std::thread::spawn(move || {
-        let cap = usize::try_from(cap).unwrap_or(usize::MAX);
-        let mut chunk = [0_u8; 8192];
-        loop {
-            match pipe.read(&mut chunk) {
-                Ok(0) | Err(_) => break,
-                Ok(read) => {
-                    let mut kept = sink
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let room = cap.saturating_sub(kept.len());
-                    kept.extend_from_slice(&chunk[..read.min(room)]);
+    let handle = std::thread::Builder::new()
+        .name("freellama-command-reader".into())
+        .spawn(move || {
+            let cap = usize::try_from(cap).unwrap_or(usize::MAX);
+            let mut chunk = [0_u8; 8192];
+            loop {
+                match pipe.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => {
+                        let mut kept = sink
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let room = cap.saturating_sub(kept.len());
+                        kept.extend_from_slice(&chunk[..read.min(room)]);
+                    }
                 }
             }
-        }
-    });
-    (buffer, handle)
+        })?;
+    Ok((buffer, handle))
 }

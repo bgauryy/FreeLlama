@@ -1,12 +1,16 @@
 # FreeLlama architecture
 
-FreeLlama is the management layer between an AI agent and local Ollama models. Agents offload
+FreeLlama is the management layer between an AI agent and local inference servers. Agents offload
 bounded tasks through MCP, the CLI, or the control API. FreeLlama selects eligible models,
 coordinates resources, and returns results with execution evidence.
 
+Ollama supports the complete managed model lifecycle. The [llama.cpp adapter](LLAMACPP.md) supports
+explicitly selected bounded text tasks on an operator-run server, sharing core admission and
+memory policy. Its unsupported capabilities are refused before generation.
+
 The calling agent owns task decomposition, prompts, and answer verification. FreeLlama owns managed
 admission, memory checks, residency coordination, and routing within operator-configured CPU/GPU
-backends. Ollama owns model storage, runner loading, inference engines, and token generation;
+backends. The configured inference server owns model storage, runner loading, and token generation;
 the operating system and drivers schedule physical work.
 
 ## Responsibility boundary
@@ -16,15 +20,17 @@ This is the canonical ownership rule; other guides link here.
 | Responsibility | Owner |
 |---|---|
 | Goal decomposition, prompts, system messages, task dependencies, and answer verification | Calling agent |
-| Ollama processes and endpoints, exact `--cpu-model` assignments, runtime settings, and approval of pulls, stops, and deletes | Operator |
-| Prompt templates and model defaults | Ollama model metadata or a `Modelfile` |
+| Inference processes and endpoints, exact Ollama `--cpu-model` assignments, llama.cpp limits, runtime settings, and approval of pulls, stops, and deletes | Operator |
+| Prompt templates and model defaults | Inference-server configuration; Ollama model metadata or a `Modelfile` on the Ollama path |
 | Physical CPU/GPU scheduling and memory | OS, drivers, and accelerator runtime |
-| Model files, runners, Metal, MLX, llama.cpp, and token generation | Ollama |
-| Native `/api/*` and OpenAI-compatible `/v1/*` semantics | Ollama |
-| Installed-model discovery and capability normalization | FreeLlama |
+| Model files, runner loading, inference kernels, and token generation | Configured inference server (Ollama or explicit llama.cpp adapter) |
+| Native `/api/*` semantics | Ollama |
+| OpenAI-compatible `/v1/*` semantics | Selected inference server, within its supported protocol |
+| Ollama installed-model discovery and capability normalization | FreeLlama |
 | Task routing, advertised-context compatibility, advisory K/V estimates, evidence policy, and model rejection reasons | FreeLlama |
 | Managed admission, session affinity, bounded scope history, and model-transition coordination | FreeLlama |
-| Forecast memory reservations, host-pressure holds, and requests to unload idle unpinned models | FreeLlama managed execution |
+| Forecast memory reservations and host-pressure holds | FreeLlama managed execution and native local raw Ollama loads; external raw upstreams have narrower pressure gating |
+| Requests to unload idle unpinned Ollama models | FreeLlama Ollama lifecycle coordination |
 | Explicit per-model CPU/GPU backend assignment | FreeLlama and separate Ollama processes |
 | Grounded research adapters, citations, and verification verdicts | FreeLlama MCP server |
 | Bearer authentication of every route except the static `/_freellama/ui` shell | FreeLlama; external ingress owns TLS and tenant authorization |
@@ -46,6 +52,7 @@ flowchart LR
     F -->|"managed primary task"| G
     F -->|"managed assigned task"| U["Optional CPU Ollama"]
     F -->|"/v1 for an engine's model"| O["Optional OpenAI-compatible engines<br/>LM Studio, llama.cpp, vLLM, cloud"]
+    F -->|"explicit managed text task"| LC["Operator-run local llama.cpp"]
     G --> E["Metal, MLX, CUDA, ROCm, Vulkan, or CPU runner"]
     U --> E2["CPU runner"]
 ```
@@ -97,6 +104,8 @@ flowchart TB
     RAW --> PX
     API --> GPU
     API --> CPU
+    API -->|"explicit bounded text"| LC["Local llama.cpp"]
+    PX -->|"configured /v1 model"| EXT["OpenAI-compatible engines"]
     PX --> GPU
     MCP --> ADAPTER
     ADAPTER --> FILES
@@ -120,7 +129,7 @@ The listener classifies requests by path before any model-aware work occurs:
 flowchart TD
     IN["Request to FreeLlama"] --> P{"Path starts with<br/>/_freellama/v1/?"}
     P -->|"No"| RAW["Stream through compatibility proxy"]
-    RAW --> PRIMARY["Primary Ollama"]
+    RAW --> PRIMARY["Primary Ollama or configured /v1 upstream"]
     P -->|"Yes"| C{"Control endpoint"}
     C -->|"health, machine, models"| READ["Read local and Ollama state"]
     C -->|"routes"| DECIDE["Decide without inference"]
@@ -160,6 +169,11 @@ Status, usage, metrics, and runtime-config (`config`, `config/reload`) endpoints
 
 ### Request shapes
 
+The fields and stream behavior below describe Ollama tasks. Explicit `name/model` requests for a
+configured llama.cpp adapter use the narrower [text contract](LLAMACPP.md#supported-contract-and-limits);
+unsupported controls are refused rather than forwarded or ignored. Its normalized receipt names
+`execution.engine:"llamacpp"` and reports physical placement as unknown.
+
 The control API uses snake_case JSON. A managed task body is the routing fields plus the payload:
 
 ```json
@@ -180,7 +194,7 @@ installed tag of that family; an unknown or ambiguous name is refused with the i
 `request_options.options`. `stop_on_repetition` (on by default when no `num_predict` caps the output,
 `false` to turn it off) streams the chat from Ollama and stops as soon
 as the output repeats its unit twice after the first copy over 96+ characters: the connection
-closes, which cancels generation upstream, and everything generated is kept with
+closes to request cancellation upstream, and everything generated is kept with
 `done_reason: "repetition"`. An Ollama "token repeat limit" abort is kept the same way
 (`done_reason: "repeat_limit"`). A stopped stream has no Ollama timing fields, so it trains no
 throughput feedback. The receipt holds `route`, `admission` (`queue_wait_ms`,
@@ -194,7 +208,7 @@ where the task's time went inside `serve`, in milliseconds: `discover_ms`, `rout
 (`feedback.persistence.persisted: "queued"`); a failed write shows in health.
 
 `stream: true` answers with server-sent events (`text/event-stream`) instead of one JSON body. The
-task runs exactly as without it: same route, fallback chain, admission, memory gate and receipt.
+task uses the same routing, fallback chain, admission, memory gate and receipt as a JSON response.
 
 | Event | When | `data` |
 |---|---|---|
@@ -207,11 +221,25 @@ task runs exactly as without it: same route, fallback chain, admission, memory g
 Only generating tasks stream (`completion`, `coding`, `code_repair`, `vision`, `long_context`),
 without `defer`, `tools`, `questions`, `input` or `nearest`; anything else is refused before
 admission with 422 `stream_unsupported`. Fallback models advance only before generation starts. A
-client that disconnects aborts the task, which closes the upstream request so Ollama stops
-generating; nothing is replayed. `stop_on_repetition` keeps its meaning: streaming does not turn the
+client that disconnects aborts the task and closes the upstream request to request cancellation;
+local permit release is not proof of physical stop, and nothing is replayed. `stop_on_repetition` keeps its meaning: streaming does not turn the
 loop stop on. A deferred chat job without tools reads Ollama's output the same way and shows
 `{generated_tokens, tokens_per_second}` in its status detail (reason `generating`), which MCP
 `run_task` reports as progress.
+
+Managed Ollama responses have a byte ceiling equal to `FREELLAMA_MAX_REQUEST_BYTES` (64 MiB by
+default). It covers the complete JSON response or cumulative NDJSON bytes, including reasoning,
+tools, log probabilities, malformed frames and error bodies. Crossing it closes the response and
+returns `upstream_response_too_large` with `retry_safe:false`; any retained prefix is incomplete.
+This is a per-response wire bound, not a process-wide heap limit. The raw compatibility proxy
+continues forwarding response bytes without accumulating a complete answer.
+
+Managed SSE uses bounded queues between execution and the response body. A slow reader applies
+backpressure to generated text and route events; admission progress updates are best effort while
+the queue is full. The execution worker continues enforcing the task deadline independently of
+the reader and releases local permits on expiry. Streams without a caller deadline use the server
+task timeout. Dropping the response aborts that worker; an unread bounded result may remain until
+the client reads or closes the connection.
 
 `fallback_models` (up to 4 tags) is an explicit fallback chain run in the core
 (`platform/execution/fallback.rs`): the next model replaces `model` only when the attempt before it
@@ -240,11 +268,12 @@ architecture, and disk. `memory_bytes` is portable host RAM. `memory_kind` is `u
 when host and accelerator memory are known to share a pool; host RAM must not be treated as
 discrete GPU VRAM. Ollama's `/api/ps` remains the placement authority.
 
-All other paths use the compatibility proxy. It buffers request bodies up to 64 MB for admission
+All other paths use the compatibility proxy. It buffers request bodies up to 64 MiB by default for admission
 and forwarding, then streams the upstream response. Requests are replayed only when execution
 is proven not to have started; buffering bytes does not make an inference retry safe. It removes hop-by-hop headers, adds
-`x-freellama-proxy: 1`, always targets the primary upstream, and does not apply CPU model
-assignment. Existing Ollama clients keep predictable compatibility; clients that opt into the
+`x-freellama-proxy: 1`, and does not apply CPU model assignments. Native Ollama paths target
+the primary upstream; configured OpenAI-compatible `/v1/*` requests can route by model to other
+engines, and `/v1/systemone` has asset translation. Existing Ollama clients keep predictable compatibility; clients that opt into the
 managed API receive routing and policy behavior.
 
 ## Model discovery
@@ -297,7 +326,7 @@ See [Model metadata](MODEL_SELECTION.md#model-metadata) for the public contract 
 ## Deterministic routing
 
 Routing defaults to ordinary `completion`; explicit profiles refine selection. Supported task kinds are `completion`, `coding`,
-`code_repair`, `tools`, `browser`, `vision`, `embedding`, and `long_context`.
+`code_repair`, `tools`, `browser`, `vision`, `embedding`, `long_context`, and `decision`.
 
 ```mermaid
 flowchart TD
@@ -338,6 +367,13 @@ placement evidence; Ollama remains authoritative for actual runner allocation an
 
 ### Confidence evidence
 
+Ollama benchmark rankings qualify only when a schema-2 report matches the current host identity,
+observed hardware profile, exact loopback endpoint and installed model digest. Missing identity,
+legacy schema, a different machine/endpoint, or an ambiguous/mismatched model artifact supplies no
+ranking evidence. A matching throughput report still does not establish task accuracy. Quality
+policy evidence independently matches exact model digests and excludes smoke-only policies.
+See [model selection](MODEL_SELECTION.md) for calibration and quality qualification.
+
 Confidence is a grade derived from independent evidence dimensions:
 
 | Policy evidence | Benchmark evidence | Confidence | Meaning |
@@ -361,9 +397,16 @@ configuration, discovery, and shared state; extracting these owners preserves th
 Managed tasks combine routing with admission and backend-aware transition coordination. With
 `defer:true`, the server returns HTTP `202` and a process-local job handle, then runs the same task
 path. The bounded registry owns receipts and cancellation, while the existing governor owns
-admission. Batch items cannot defer. Per-task `timeout_seconds` bounds discovery, waiting, loading,
+admission. Optional durable storage retains terminal receipts without replaying unfinished work
+([deferred jobs](DEFERRED_JOBS.md)). Batch items cannot defer. Per-task `timeout_seconds` bounds discovery, waiting, loading,
 and inference together, capped by the server task timeout. See [CLI controls](CLI.md#execute-tasks)
 for retention limits and [monitoring](MONITORING.md) for the observable lifecycle.
+
+The Ollama path below includes model discovery, context sizing, transition locks and placement
+learning. The explicit [llama.cpp path](LLAMACPP.md) shares admission pools, the resource governor,
+job/deadline handling and usage accounting, while using operator-set memory and output bounds.
+It checks the ready single-model endpoint and never performs lifecycle operations, auto-selection,
+physical-placement claims or Ollama feedback learning. It sends one generation POST with no retry.
 
 ```mermaid
 flowchart TD
@@ -375,9 +418,9 @@ flowchart TD
     B -->|"Primary"| GL{"GPU runner resident<br/>at expected identity?"}
     B -->|"CPU assignment"| CO["Add num_gpu: 0"]
     CO --> CL{"CPU runner resident<br/>at expected identity?"}
-    GL -->|"Yes"| GR["GPU shared lock"]
+    GL -->|"Yes"| GR["GPU model use lease; no load lock"]
     GL -->|"No"| GX["GPU load lock until runner observed"]
-    CL -->|"Yes"| CR["CPU shared lock"]
+    CL -->|"Yes"| CR["CPU model use lease; no load lock"]
     CL -->|"No"| CX["CPU load lock until runner observed"]
     GR --> OQ["Send to selected Ollama queue"]
     GX --> OQ
@@ -392,7 +435,8 @@ flowchart TD
 ```
 
 Admission is independent per backend and uses weighted fair round robin: interactive gets three
-turns, normal two, and background one, preserving FIFO inside each class and preventing starvation.
+turns, normal two, and background one. Within a class, bounded model affinity can temporarily
+reorder FIFO; capacity reservation and aging bound repeated bypasses.
 The primary/GPU pool defaults to two weighted units per observed `OLLAMA_NUM_PARALLEL` slot,
 falling back to two. The optional CPU pool defaults to one. A saturated GPU burst therefore cannot
 consume the permit held for a small CPU helper. With one parallel slot, those values represent one
@@ -424,8 +468,9 @@ times, or queued for two seconds, restores FIFO order for its class. Affinity us
 own record of admitted work, never an Ollama call. Each pool's receipt counts
 `affinity_promotions`; health reports the bounds under `admission.priority_fairness.model_affinity`.
 
-A task waiting for host resources returns its execution slot after two seconds and continues
-waiting within the same deadline. It remains counted against the backend's bounded queue, so
+An Ollama task waiting for host resources returns its execution slot after at most two seconds
+of slot-held resource waiting. A llama.cpp task yields after its initial bounded telemetry probe.
+Both continue waiting within the same queue deadline and remain counted against the pool's bounded queue, so
 memory pressure cannot create an invisible backlog. Health reports slot and resource waiters
 separately. Returning to slot admission transfers the existing queue registration atomically;
 new arrivals and a smaller reloaded queue limit cannot displace accepted work. Expired deadlines
@@ -438,7 +483,8 @@ load, which takes the load lock and observes once more after winning it (a same-
 finished meanwhile is then shared).
 See [Load lock and use lease](CPU_GPU_ROUTING.md#load-lock-and-use-lease). Session affinity is bound only
 after successful upstream execution, so refused and failed tasks cannot change later routing.
-An explicit `done:false` chat response or a reported upstream error is a failure, even with HTTP 200.
+An Ollama chat response requires boolean `done:true`; missing, non-boolean or false completion
+markers and reported upstream errors are failures, even with HTTP 200.
 It cannot train runtime feedback or bind affinity. Completed failed exchanges retain the raw response
 and honor a requested immediate unload. Transport failures also attempt that unload and return its
 lifecycle receipt, but a disconnected inference response alone does not prove upstream cancellation.
@@ -448,7 +494,8 @@ data, including per-item batch failures.
 `POST /_freellama/v1/task-batches` is for caller-declared independent work only: every item has a
 stable ID and `independent:true`; dependent workflow execution is rejected before any upstream call.
 It bounds local dispatch and returns ordered per-item success/error receipts. Every child still
-passes the same global admission and transition path above.
+passes its engine's capability checks and the shared admission/resource limits. Ollama children
+also use the transition path above.
 
 The K/V preflight derives single-sequence F16 K+V bytes-per-token for any architecture whose
 metadata declares the block count and head counts. Explicit key/value dimensions take precedence
@@ -493,10 +540,11 @@ admits such a load with a `memory_advisory` instead, after unloading idle runner
 Each pressure signal recovers independently after two fresh samples that meet its recovery
 threshold. A recovered CPU-load signal therefore clears even while RAM remains low.
 
-On Linux and macOS the default `require_memory` telemetry policy holds local inference when
-available RAM is missing, even when a raw request has no model-footprint estimate. Windows and other
-platforms have no host collector, so they default to `best_effort` and admit with
-`admitted_telemetry_unknown`; elsewhere `best_effort` is an explicit opt-in;
+On Linux, macOS and Windows the default `require_memory` telemetry policy holds local inference when
+available RAM is missing, even when a raw request has no model-footprint estimate. Windows uses a
+bounded PowerShell CIM query for total and available physical RAM; its CPU load, OS-pressure,
+thermal, swap and GPU signals remain unavailable. Other platforms have no host collector, so they
+default to `best_effort` and admit with `admitted_telemetry_unknown`; elsewhere `best_effort` is an explicit opt-in;
 `require_all` additionally requires the collector's applicable load, OS-pressure, and thermal signals.
 Unsupported Linux collector signals remain explicitly unavailable rather than being fabricated.
 The pure `ResourceSnapshot::assess_capacity` calculation is shared by admission and previews.
@@ -535,7 +583,7 @@ transition path rather than claiming verified runner compatibility.
 A compatible resident runner needs no backend lock: nonempty model digest and effective context must
 match the observed runner (a request that sends no `num_ctx` also accepts a runner whose context
 `/api/ps` omits). Name-only residency is insufficient, and `admission.reason` names the degraded
-identity. Every task holds a per-model use lease for its whole request, which keeps its runner from
+identity. Every managed Ollama task holds a per-model use lease for its whole request, which keeps its runner from
 being evicted or unloaded. Forecast release invalidates the
 host sample generation so an older available-memory observation cannot spend released capacity.
 A task that must load or reload a runner takes that backend's load lock until the runner is
@@ -612,15 +660,16 @@ Execution receipts expose `completion_planning`, including estimated costs and w
 influenced selection. Ollama's cached-token counts inform prefill-rate learning; FreeLlama does not
 export or manage KV tensors.
 
-Raw proxy traffic always uses the primary upstream. For setup and runtime verification, see
+Raw Ollama traffic uses the primary upstream; configured OpenAI-compatible upstreams are the
+separate `/v1/*` model-routing exception. For setup and runtime verification, see
 [Run models on CPU and GPU](CPU_GPU_ROUTING.md).
 
 ## MCP tool flow
 
 The MCP server keeps general model work (`run_task`), file-backed research (`delegate_research`, a
-confined adapter subprocess), and destructive lifecycle operations (`ollama_manage`,
-`ollama_delete`) in separate tools, so `run_task` never acquires file access and lifecycle
-operations are not hidden inside a generic action. Tool schemas and security annotations
+confined adapter subprocess), and lifecycle operations (`ollama_manage`, `ollama_delete`) in
+separate tools. `run_task` can read caller-named `files` through its input handler; it does not gain
+the research adapter's tool loop. Lifecycle mutation is not hidden inside generic task execution. Tool schemas and security annotations
 are registered in `packages/mcp/src/tools/registrations.ts`; the tool list is in
 [API](API.md#mcp-tools). `freellama tool NAME JSON` calls the same handlers from a shell.
 
@@ -713,20 +762,26 @@ FreeLlama keeps these values in memory:
 
 Sessions are bounded (default 1024) and expire after idle time (default one hour); they store only
 model affinity, never prompts or Ollama KV. Restarting `freellama serve` clears sessions and the catalog cache. Persisted placement feedback is
-reloaded; `--ephemeral` intentionally resets it. Ollama owns model residency, so loaded
-models survive a FreeLlama restart. Scope histories and their revisions do not survive restart.
+reloaded; `--ephemeral` intentionally resets it. Inference servers own model residency, so
+restarting only FreeLlama does not itself unload their models. Scope histories and their revisions do not survive restart.
 They store messages independently from affinity and append only a successful generation at the
 expected revision. Warming uses ordinary admission and fit checks; omitted residency controls use
 a finite measured policy. See [Scope history and model warming](SCOPES_AND_WARMING.md) for the
 public contract and configured limits.
 
-In `serve`, raw generation traffic shares the primary load lock and use leases and receives
-host-pressure gating, while managed tasks also reserve forecast memory. Direct Ollama callers bypass
+In `serve`, native local raw generation traffic shares the primary load lock, use leases and governor;
+cold loads require forecast memory reservations and resident reuse receives host-pressure gating.
+External raw upstreams have a narrower pressure gate because local telemetry cannot reserve remote
+memory. Managed tasks also apply model selection and context controls. Direct Ollama callers bypass
 these controls. FreeLlama cannot preempt inference or constrain other processes. A configured but
-unreachable CPU backend makes managed catalog discovery fail closed; raw primary passthrough remains
-usable. Runtime feedback is task-specific, token-normalized, and warm-only: it can steer unpinned
+unreachable CPU backend makes managed Ollama catalog discovery fail closed; raw primary
+passthrough and explicit configured llama.cpp tasks remain usable independently of that catalog. Runtime feedback is task-specific, token-normalized, and warm-only: it can steer unpinned
 `fastest` or `balanced` work after three samples per backend and a greater-than-10% advantage, but
 cannot change CPU eligibility or steer quality routing.
+
+Admission pools, use leases and memory reservations are process-local. Sharing SQLite shares
+records and learned evidence, not a distributed execution lock or a host-wide reservation ledger.
+The governor cannot control direct engine clients or allocations made by other processes.
 
 The design fails closed when it cannot establish a required contract. Examples include an
 unreachable configured backend, an unknown confidence grade, a policy without qualified models, an

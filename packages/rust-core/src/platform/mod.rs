@@ -131,6 +131,7 @@ struct PlatformState {
     last_eviction: Arc<std::sync::Mutex<Option<Value>>>,
     client: Client,
     upstream: String,
+    managed_upstreams: Arc<[proxy::OpenAiUpstream]>,
     cpu_upstream: Option<String>,
     cpu_models: Arc<BTreeSet<String>>,
     benchmark: Arc<discovery::BenchmarkEvidence>,
@@ -279,7 +280,7 @@ pub fn app(config: &PlatformConfig) -> Result<Router> {
 )]
 fn build(config: &PlatformConfig) -> Result<(Router, PlatformState)> {
     config.validate()?;
-    let benchmark = load_benchmark(config.benchmark_report.as_ref())?;
+    let benchmark = load_benchmark(config.benchmark_report.as_ref(), &config.upstream)?;
     let policies = load_policies(config.policy_file.as_ref())?;
     let ollama = ollama_env::probe(&config.upstream);
     let cpu_ollama = config.cpu_upstream.as_deref().map(ollama_env::probe);
@@ -349,6 +350,7 @@ fn build(config: &PlatformConfig) -> Result<(Router, PlatformState)> {
         })
         .context("build platform HTTP client")?,
         upstream: config.upstream.clone(),
+        managed_upstreams: Arc::from(config.upstreams.clone()),
         cpu_upstream: config.cpu_upstream.clone(),
         cpu_models: Arc::new(config.cpu_models.clone()),
         benchmark: Arc::new(benchmark),
@@ -805,6 +807,11 @@ async fn route(
     Json(input): Json<RouteInput>,
 ) -> Result<Json<Value>, ApiError> {
     require_active_session(&state, input.session_id.as_deref()).await?;
+    if let Some(upstream) = execution::llamacpp::target(&state, input.model.as_deref()) {
+        return execution::llamacpp::preview(&state, upstream, &input)
+            .await
+            .map(Json);
+    }
     let models = catalog::discover_for_route(&state, input.model.as_deref()).await?;
     // Snapshot the small affinity map so no lock is held across routing's Ollama calls.
     let sessions = state.sessions.read().await.clone();

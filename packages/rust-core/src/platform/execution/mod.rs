@@ -20,6 +20,7 @@ mod fallback;
 mod feedback;
 mod forward;
 mod identity;
+pub(super) mod llamacpp;
 mod memory;
 pub(super) mod nearest;
 mod observe;
@@ -125,6 +126,12 @@ pub(super) async fn unload_resident_model(
     model: &str,
     wait: Duration,
 ) -> Result<Option<Value>, ApiError> {
+    if llamacpp::target(state, Some(model)).is_some() {
+        return Err(ApiError::bad_request(
+            "external engine lifecycle is operator-owned; unload is unsupported",
+        )
+        .with_code("engine_capability_unsupported"));
+    }
     let execution = execution_target(state, model);
     let backend = execution.placement.as_str();
     let deadline = tokio::time::Instant::now() + wait;
@@ -294,19 +301,32 @@ pub(super) fn task_deadline(seconds: Option<u64>) -> Result<Duration, ApiError> 
     Ok(seconds.map_or(ceiling, Duration::from_secs).min(ceiling))
 }
 
+fn execution_timeout(
+    state: &PlatformState,
+    input: &TaskInput,
+) -> Result<Option<Duration>, ApiError> {
+    Ok(input
+        .timeout_seconds
+        .map(|seconds| task_deadline(Some(seconds)))
+        .transpose()?
+        .or_else(|| {
+            (input.scope_id.is_some()
+                || llamacpp::target(state, input.route.model.as_deref()).is_some()
+                || input
+                    .fallback_models
+                    .iter()
+                    .any(|model| llamacpp::target(state, Some(model)).is_some())
+                || matches!(input.operation, super::ManagedOperation::Warm))
+            .then(super::platform_task_timeout)
+        }))
+}
+
 pub(super) async fn execute_task(
     State(state): State<PlatformState>,
     Json(mut input): Json<TaskInput>,
 ) -> Result<Json<Value>, ApiError> {
     super::jobs::validate_synchronous(&input)?;
-    let timeout = input
-        .timeout_seconds
-        .map(|seconds| task_deadline(Some(seconds)))
-        .transpose()?
-        .or_else(|| {
-            (input.scope_id.is_some() || matches!(input.operation, super::ManagedOperation::Warm))
-                .then(super::platform_task_timeout)
-        });
+    let timeout = execution_timeout(&state, &input)?;
     let cancellation = input
         .job_progress
         .as_ref()
@@ -406,6 +426,14 @@ fn finish_task(
     operation: super::ManagedOperation,
     result: &mut Result<Json<Value>, ApiError>,
 ) {
+    if result
+        .as_ref()
+        .is_ok_and(|value| value.0["execution"]["engine"] == "llamacpp")
+    {
+        // Engine-specific facts must not train Ollama residency, preload or adaptive placement.
+        state.telemetry.record_task(record);
+        return;
+    }
     let served = (record.outcome == "ok" && matches!(operation, super::ManagedOperation::Generate))
         .then(|| (record.backend.clone(), record.model.clone()));
     record_completion(

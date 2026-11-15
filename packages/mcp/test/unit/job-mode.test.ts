@@ -13,9 +13,11 @@ const fixture = vi.hoisted(() => {
   return { run: (() => undefined) as any, live: (() => undefined) as any, handlers: new Map<string, (...args: any[]) => Promise<any>>() };
 });
 vi.mock("../../src/serve-client.js", () => ({ runTaskRequest: (...args: any[]) => fixture.run(...args), getTaskJob: vi.fn(), cancelTaskJob: vi.fn(), route: vi.fn() }));
+vi.mock("../../src/job-calibration.js", () => ({ calibratedJobPick: vi.fn() }));
 vi.mock("../../src/model-library.js", () => ({ catalogLiveState: (...args: any[]) => fixture.live(...args) }));
 
 import { applyJob, pickJobModel, pickJobModelDetailed, familyMatch } from "../../src/job-mode.js";
+import { calibratedJobPick } from "../../src/job-calibration.js";
 import { MODEL_CATALOG } from "../../src/model-catalog.js";
 import { BUILTIN_WORKFLOWS, LOCAL_JOBS, OCR_PROMPTS, RUN_TASK_JOBS, WORKFLOWS } from "../../src/local-prompts.js";
 import { registerRunTaskTool } from "../../src/tools/run-task.js";
@@ -245,8 +247,17 @@ describe("run_task with job", () => {
     } } as unknown as McpServer);
   });
   beforeEach(() => {
+    vi.mocked(calibratedJobPick).mockReset();
     fixture.live = vi.fn(async () => [installed("bonsai-2:9b", "hf.co/openbmb/MiniCPM-OCR-1.0-gguf:Q4_K_M"), 12 * GB]);
     fixture.run = vi.fn(async (_target: string, request: any) => receipt(request.model, "- step 2 failed: exit 1"));
+  });
+
+  it("prefers machine-calibrated routing over the static catalog and exposes its evidence note", async () => {
+    vi.mocked(calibratedJobPick).mockResolvedValueOnce({ model: "my-local:3b", note: "local throughput only: verify" });
+    const result = await call({ job: "summarize", prompt: "Which steps failed?" });
+    expect(fixture.live).not.toHaveBeenCalled();
+    expect(fixture.run.mock.calls[0][1].model).toBe("my-local:3b");
+    expect(JSON.stringify(result)).toContain("local throughput only: verify");
   });
 
   it("sends the picked model with the job's system prompt and reports what it filled in", async () => {

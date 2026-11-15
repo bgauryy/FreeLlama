@@ -360,6 +360,14 @@ export function parseRunArgs(argv: string[], stdin?: string): RunPlan & { help: 
   if (args.suffix !== undefined && (job !== undefined || values.workflow !== undefined || questions !== undefined)) {
     throw new UsageError("--suffix fills in the middle on one model: name it (freellama run MODEL PREFIX --suffix SUFFIX), without -w, -j or --ask.");
   }
+  if (args.suffix !== undefined && !values.preview) {
+    const conflicts = ["defer", "each", "json", "extract", "no-stream", "save-as", "session", "tools", "dimensions",
+      "idempotency-key", "priority", "timeout", "max-wait", "min-confidence", "prefer", "objective"]
+      .filter((name) => values[name as keyof typeof values] !== undefined && values[name as keyof typeof values] !== false);
+    if (conflicts.length > 0 || (task !== undefined && task !== "completion")) {
+      throw new UsageError(`--suffix uses streamed completion and cannot be combined with ${conflicts.length ? conflicts.map((name) => `--${name}`).join(", ") : `--task ${task}`}; remove --suffix to use managed execution.`);
+    }
+  }
 
   if (kind === "decision") {
     // The question is about the input: stdin, a file, or the prompt words.

@@ -2,6 +2,10 @@
 
 Build, test, and release notes for the [FreeLlama MCP server](README.md).
 
+Published npm installs require Node.js 22+ and use a prebuilt platform package; they do not compile
+Rust. This guide's build commands are for repository development. Use the repository's pinned
+Rust toolchain and Node.js 22.12+ with Corepack for source builds.
+
 ## Build
 
 Build the native addon from the repository root and this package in place.
@@ -48,12 +52,26 @@ Vitest, in three tiers (all TypeScript, under `test/`):
 |---|---|---|---|
 | `test/unit/` | `yarn test` (watch: `yarn test:watch`) | pure functions straight from `src/*.ts` — no build step, this is the TDD loop | nothing, a few seconds |
 | `test/integration/` | `yarn test:integration` | the built server over the real MCP protocol: tool contract, structured content, guardrails; rebuilds `dist/` itself | Ollama at `FREELLAMA_OLLAMA_ENDPOINT` (default :11434) |
-| `test/e2e/` | `yarn test:e2e` | every tool against the live system: real routing/execution, pull → delete round trip (net-zero), a real delegated research run | serve + Ollama + models, ~40s |
+| `test/e2e/` | `yarn test:e2e` | live routing/execution, delegated research and an explicitly approved pull → delete round trip | serve + Ollama + models; lifecycle test additionally requires exact tag/size opt-in |
 
 The same commands work from the repository root (`yarn test` there also runs the CLI package's tests
 and the Rust suite).
 The integration/e2e tiers fail fast with a readable message when Ollama is down, and the lifecycle
-test refuses to delete a model already installed on the test system.
+test refuses to delete a model already installed on the test system. The lifecycle opt-in variables
+and readiness skips are documented in [test tiers](../../docs/TESTING.md#run-the-test-tiers).
+
+[CI](../../.github/workflows/ci.yml) configures build, typecheck and Rust contracts on Ubuntu,
+macOS and Windows. Ubuntu/macOS run the full JS/evaluation suite; Windows runs an explicit portable
+CLI/protocol/checker allowlist, excluding the POSIX research/coder and script suites. This does not
+qualify native Windows research/coder execution. Strict Rust lint runs on Ubuntu; release packaging
+contracts run on Ubuntu/macOS; Windows adds a read-only PowerShell/CIM memory smoke. Inspect the hosted run before
+claiming a lane passed. The local macOS checks recorded in [Testing](../../docs/TESTING.md#continuous-integration)
+do not replace those runs or live inference qualification.
+
+The Rust benchmark unit tests now live in `packages/rust-core/src/model_bench/tests.rs`; Windows
+parser fixtures and resource panic/poison tests have separate modules. `job-calibration.test.ts`
+checks calibrated-first selection and fallback without inference. The
+[resource audit](../../docs/RUST_RESOURCE_AUDIT.md) states the lock review's scope and gaps.
 
 For default-endpoint autostart, the server starts `freellama serve` in the background at launch and
 logs a failure to stderr. On a tool call, a spawn failure, early exit, or readiness timeout rejects the
@@ -68,11 +86,15 @@ package has one npm optional dependency per platform in `scripts/release-platfor
 arm64, Linux arm64/x64 with glibc, Windows arm64/x64 with MSVC). `native/index.js` tries the checkout artifact first,
 then the host's optional package. A release is supported only when every artifact package passes
 the publish verifier; an installation made with `--omit=optional` cannot load the addon. `engines`
-requires Node >= 20.
+requires Node >= 22. The matrix currently contains five targets; macOS x64 and Linux musl are not
+published targets. A successful host build does not validate another target or registry install.
 
 Machine discovery distinguishes total host memory (`memory_bytes`) from known unified memory
 (`memory_kind: "unified"`). Library-tag `fitsInMemory` is a conservative host-memory preflight and
 includes `fitScope: "host_memory_budget_only"`; inspect `/api/ps` for actual accelerator placement.
+Windows host admission now requires bounded CIM memory telemetry by default; missing pressure,
+CPU-load, thermal and GPU measurements stay unknown. Parser fixtures run on every host, while the
+Windows CI smoke exercises the real collector.
 
 Start the serve-backed tools' dependency from the repository root:
 
@@ -82,6 +104,10 @@ cargo run --release -- serve
 
 `freellama proxy` only forwards raw `/api/*` calls; only `serve` has the `/_freellama/v1/*` routes
 these tools call.
+
+Automatic job calibration remains Ollama-backed. The optional managed llama.cpp adapter accepts
+only explicitly configured bounded text tasks and does not supply observed placement, throughput
+qualification or automatic job picks. See the [engine contract](../../docs/LLAMACPP.md).
 
 ## Publish
 

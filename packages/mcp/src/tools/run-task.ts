@@ -15,14 +15,15 @@ import {
   parseBatchTask, taskAnswerText, taskMessages, taskParam, withRequiredCapability,
 } from "../helpers.js";
 import { applyTaskFiles, inputLabels, type FileReceipt } from "../task-files.js";
-import { nearestText, validateEmbeddingVectors, type NearestRequest } from "../nearest.js";
+import { validateEmbeddingVectors, type NearestRequest } from "../nearest.js";
 import { applyJob, mergeProfiles, neededCapabilities, pickLiveJobModel, pickLiveJobModelDetailed, type JobProfile } from "../job-mode.js";
 import { LOCAL_JOBS, RUN_TASK_JOBS, WORKFLOW_NAMES, WORKFLOWS, workflowSource, type JobName, type WorkflowName } from "../local-prompts.js";
-import { checkOutputPath, HANDOFF_NAME, summaryOf, writeHandoff } from "../handoffs.js";
+import { checkOutputPath, HANDOFF_NAME } from "../handoffs.js";
 import { outputInput } from "../tool-results.js";
-import { fallbackCheck, injectionCheck, inputData, nullFieldCheck, resultChecks, withChecks } from "../result-checks.js";
-import { tablesToMarkdown } from "../table-markdown.js";
+import { injectionCheck, inputData, nullFieldCheck, withChecks } from "../result-checks.js";
 import { EmbeddingIndex, embedIndexEnabled, rankByQuery } from "../embed-index.js";
+import { asWorkflowOutput, rankedResult, withBatchChecks, withCheck, withJob } from "./run-task-results.js";
+export { withJob } from "./run-task-results.js";
 
 // Typed where the agent acts on a field (model, fit, the deferred job, saved files); every other
 // receipt field stays open, so the schema an agent pays for in tools/list stays small.
@@ -911,31 +912,6 @@ async function withBatchJob(job: JobName, items: BatchItem[], endpoint: string |
   return { items: filled, profile: mergeProfiles(job, profiles) };
 }
 
-type Shown = { content?: Array<{ type: string; text?: string }>; structuredContent?: Fields; isError?: boolean };
-
-/**
- * A finished result with `job_profile` (what job mode filled in) and, for `saveAs`, the answer text
- * written as a handoff whose path is `handoff_file`. Errors pass through: there is nothing to hand on.
- */
-export function withJob<R>(result: R, profile: JobProfile | undefined, saveAs?: string, dir?: string): R {
-  const shown = result as Shown;
-  if (shown.isError || !shown.structuredContent || (profile === undefined && saveAs === undefined)) return result;
-  const structuredContent: Fields = { ...shown.structuredContent, ...(profile ? { job_profile: profile } : {}) };
-  let content = shown.content;
-  if (saveAs !== undefined) {
-    // The answer as the agent reads it, without its `[model · lifecycle]` label.
-    const answer = (content ?? []).map((part) => part.text ?? "").join("\n").replace(/^\[[^\]\n]*\] /, "");
-    const model = profile?.model ?? object(structuredContent.route)?.selected_model ?? structuredContent.selected_model;
-    const file = writeHandoff(saveAs, {
-      source: `From run_task${profile ? ` job ${profile.job}` : ""}${typeof model === "string" ? `, model ${model}` : ""}`,
-      summary: summaryOf(answer), result: answer,
-    }, dir);
-    structuredContent.handoff_file = file;
-    content = (content ?? []).map((part, index) => (index === 0 && part.type === "text" ? { ...part, text: `${part.text ?? ""}\nhandoff_file: ${file}` } : part));
-  }
-  return { ...result, structuredContent, content } as R;
-}
-
 /** An embedding result the core ranked by `nearest`: labelled matches inline, vectors only on request. */
 type IndexedSearch = {
   model: string; items: string[]; labels: string[]; query: string; top?: number; minScore?: number;
@@ -1018,70 +994,4 @@ async function indexedNearest(target: string, search: IndexedSearch, report: ((m
       embedding_slices: receipts, accepted_job_ids: [...new Set(acceptedJobs)],
       execution_outcome: receipts.length > 0 ? "unknown" : cause?.execution_outcome ?? "unknown", retry_safe: false, cause }));
   }
-}
-
-function rankedResult(
-  finished: { structuredContent: Record<string, unknown>; content?: unknown },
-  withQuery: boolean,
-  itemCount: number,
-) {
-  const ranked = finished.structuredContent.nearest as Parameters<typeof nearestText>[0] | undefined;
-  if (!ranked) return errorResult(new Error("serve returned no nearest ranking for the embedding task"));
-  const header = withQuery ? `closest of ${itemCount} items to the query:` : `most similar pairs among ${itemCount} items:`;
-  return { ...finished, content: [{ type: "text" as const, text: `${header}\n${nearestText(ranked)}` }] };
-}
-
-
-/**
- * Per-item checks for a batch: each item's result is read the way a single call's is, and only
- * items with something specific to check are listed, so 50 confident answers stay one line.
- */
-function withBatchChecks<R>(result: R, job: string | undefined, items: BatchItem[]): R {
-  const shown = result as { content?: Array<{ type: string; text?: string }>; structuredContent?: Fields; isError?: boolean };
-  const rows = Array.isArray(shown.structuredContent?.results) ? shown.structuredContent.results as unknown[] : [];
-  if (shown.isError || rows.length === 0) return result;
-  const taskOf = new Map(items.map((item) => [item.id, String(item.task.task ?? "completion")]));
-  const toolsOf = new Map(items.map((item) => [item.id, item.task.tools as unknown[] | undefined]));
-  const flagged: string[] = [];
-  const checks: Record<string, string[]> = {};
-  for (const raw of rows) {
-    const row = object(raw);
-    if (!row || row.ok !== true) continue;
-    const id = String(row.id);
-    const receipt = object(row.response) ?? {};
-    const ordinary = resultChecks({ job, task: taskOf.get(id), answer: taskAnswerText(receipt) ?? "", structured: receipt, tools: toolsOf.get(id) });
-    const quiet = ordinary.length === 0 || /^every answer is outside|^every number and quoted name|^all \d+ SEARCH|^\d+ tool call\(s\) match/.test(ordinary[0]!);
-    const fallback = fallbackCheck(receipt);
-    const lines = [...(fallback ? [fallback] : []), ...(quiet ? [] : ordinary)];
-    if (lines.length === 0) continue;
-    checks[id] = lines;
-    flagged.push(`${id}: ${lines.join("; ")}`);
-  }
-  if (flagged.length === 0) return result;
-  const content = (shown.content ?? []).map((part, index) => (index === 0 && part.type === "text"
-    ? { ...part, text: `${part.text ?? ""}\n\ncheck these items first:\n${flagged.slice(0, 20).map((line) => `- ${line}`).join("\n")}${flagged.length > 20 ? `\n- … ${flagged.length - 20} more in structuredContent.checks` : ""}` }
-    : part));
-  return { ...result, structuredContent: { ...shown.structuredContent, checks }, content } as R;
-}
-
-/**
- * A workflow's promised output shape, applied to the shown answer only (structuredContent keeps
- * the model's raw text): read-table promises Markdown, and OCR models answer in OTSL or HTML.
- */
-function asWorkflowOutput<R>(result: R, workflow: WorkflowName | undefined): R {
-  const shown = result as { content?: Array<{ type: string; text?: string }>; isError?: boolean };
-  if (workflow !== "read-table" || shown.isError || !shown.content) return result;
-  // A table starts on its own line, after the `[model] ` label.
-  const table = (text: string) => tablesToMarkdown(text).replace(/^(\[[^\]\n]*\] )\|/, "$1\n|");
-  return { ...result, content: shown.content.map((part) => (part.type === "text" ? { ...part, text: table(part.text ?? "") } : part)) } as R;
-}
-
-/** More `check:` lines, after the result's own checks. */
-function withCheck<R>(result: R, ...extra: Array<string | undefined>): R {
-  const shown = result as { content?: Array<{ type: string; text?: string }>; structuredContent?: Record<string, unknown>; isError?: boolean };
-  const added = extra.filter((check): check is string => check !== undefined);
-  if (added.length === 0 || shown.isError || !shown.structuredContent) return result;
-  const checks = [...((shown.structuredContent.checks as string[] | undefined) ?? []), ...added];
-  const content = (shown.content ?? []).map((part, index) => (index === 0 && part.type === "text" ? { ...part, text: `${part.text ?? ""}${added.map((check) => `\ncheck: ${check}`).join("")}` } : part));
-  return { ...result, structuredContent: { ...shown.structuredContent, checks }, content } as R;
 }

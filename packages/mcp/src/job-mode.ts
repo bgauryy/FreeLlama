@@ -4,6 +4,7 @@
 // caller passes always wins; `job_profile.applied` names every field job mode filled in.
 import { catalogView, type InstalledModel } from "./model-catalog.js";
 import { catalogLiveState } from "./model-library.js";
+import { calibratedJobPick } from "./job-calibration.js";
 import { EMBEDDING_PREFIXES, isOcrModel, LOCAL_JOBS, WORKFLOWS, workflowSource, type JobName, type LocalJob, type ModelProfile, type Prefixes, type Workflow, type WorkflowName } from "./local-prompts.js";
 
 /** `workflow_source`: the user file (path and digest) whose instructions ran, when not a built-in. */
@@ -152,6 +153,9 @@ export async function pickLiveJobModel(job: JobName, endpoint: string | undefine
 
 /** pickLiveJobModel with the note a capable workflow's caller should see. */
 export async function pickLiveJobModelDetailed(job: JobName, endpoint: string | undefined, prefer: "default" | "capable" = "default", needs: readonly string[] = []): Promise<JobPick> {
+  const calibrated = await calibratedJobPick(endpoint, LOCAL_JOBS[job].task, prefer,
+    job === "image-search" ? [...needs, "vision"] : needs, job === "ocr");
+  if (calibrated) return calibrated;
   const [installed, available] = await catalogLiveState(endpoint, undefined);
   return pickJobModelDetailed(job, installed, available, prefer, needs);
 }

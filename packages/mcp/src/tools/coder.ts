@@ -42,6 +42,7 @@ export interface CoderRun {
   /** Adapter environment: the allowed commands, the copy directory and the patch path. */
   env: Record<string, string>;
   patchPath: string;
+  logDirectory: string;
   /** Remove the copy (and the patch directory when no patch was written). Never throws. */
   cleanup: (workspace: string) => void;
 }
@@ -50,18 +51,30 @@ export async function prepareCoderRun(commands: string[] | undefined): Promise<C
   const container = await realpath(await mkdtemp(path.join(tmpdir(), "freellama-coder-")));
   const patchDir = await realpath(await mkdtemp(path.join(tmpdir(), "freellama-patch-")));
   const patchPath = path.join(patchDir, "coder.patch");
+  const logDir = path.join(patchDir, "commands");
   return {
     env: {
       FREELLAMA_CODER_COMMANDS: JSON.stringify(commands ?? []),
       FREELLAMA_CODER_COPY_DIR: container,
       FREELLAMA_CODER_PATCH: patchPath,
+      FREELLAMA_CODER_LOG_DIR: logDir,
     },
     patchPath,
+    logDirectory: logDir,
     cleanup: (workspace) => {
       removeIsolatedCopy(workspace, container);
-      if (!existsSync(patchPath)) rmSync(patchDir, { recursive: true, force: true });
+      if (!existsSync(patchPath) && !existsSync(logDir)) rmSync(patchDir, { recursive: true, force: true });
     },
   };
+}
+
+/** Keep raw-log discovery even when an adapter is killed before it can write result.json. */
+export function withCoderAudit<R>(result: R, run: CoderRun | undefined): R {
+  if (!run || !existsSync(run.logDirectory)) return result;
+  const shown = result as { structuredContent?: Record<string, unknown>; content?: Array<{ type: string; text?: string }> };
+  const note = `command_audit_directory: ${run.logDirectory}; inspect per-command metadata; interrupted outputs are incomplete`;
+  return { ...result, structuredContent: { ...shown.structuredContent, commandAuditDirectory: run.logDirectory },
+    content: (shown.content ?? []).map((part, i) => i === 0 && part.type === "text" ? { ...part, text: `${part.text ?? ""}\n${note}` } : part) } as R;
 }
 
 const coderReportSchema = z.object({

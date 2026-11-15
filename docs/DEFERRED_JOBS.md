@@ -1,6 +1,6 @@
 # Deferred jobs and recovery
 
-FreeLlama's deferred jobs keep one accepted task identity through polling, cancellation and result retrieval. A missing result or an uncertain outcome never authorizes automatic inference replay. Ollama still owns execution and physical cancellation; these records coordinate the FreeLlama worker.
+FreeLlama's deferred jobs keep one accepted task identity through polling, cancellation and result retrieval. A missing result or an uncertain outcome never authorizes automatic inference replay. The configured inference server owns execution and physical cancellation; these records coordinate the FreeLlama worker. The [llama.cpp adapter](LLAMACPP.md) supports only its documented bounded text subset, even when deferred.
 
 ## Enable durable receipts
 
@@ -14,9 +14,9 @@ The journal persists receipts, bounded results/errors, and keyed hashes of reque
 
 `POST /_freellama/v1/tasks` with `defer:true` returns `deferred:true`, a `job` containing its `id`, and `retention` limits. Use `GET /_freellama/v1/jobs/{id}` for its result and `GET /_freellama/v1/jobs` for a metadata-only list. The list strips result/error payloads in SQLite before loading recovered records into the control plane.
 
-An embedding task may carry `nearest` (`{query?, top?, min_score?, labels?}`, with `return_embeddings` to keep the vectors). The core embeds the items (the query first, in slices of 32 pinned to one verified runner identity), ranks them by cosine similarity and stores `nearest: {mode, matches|pairs}` in place of vectors, so a deferred job's result is ranked and small. The whole input is one job and must fit the 16 MiB job input limit; without a query at most 4,000 items are compared pairwise. A malformed `nearest` is refused at submission. Through MCP, `run_task {defer:true, tasks:[...]}` submits every item as its own job and returns `{deferred:true, jobs:[{id, job}]}`; the HTTP `/tasks/batch` endpoint still refuses deferred items.
+An embedding task may carry `nearest` (`{query?, top?, min_score?, labels?}`, with `return_embeddings` to keep the vectors). The core embeds the items (the query first, in slices of 32 pinned to one verified runner identity), ranks them by cosine similarity and stores `nearest: {mode, matches|pairs}` in place of vectors, so a deferred job's result is ranked and small. The whole input is one job and must fit the 16 MiB job input limit; without a query at most 4,000 items are compared pairwise. A malformed `nearest` is refused at submission. Through MCP, `run_task {defer:true, tasks:[...]}` submits every item as its own job and returns `{deferred:true, jobs:[{id, job}]}`; the HTTP `/task-batches` endpoint still refuses deferred items.
 
-`POST /_freellama/v1/jobs/{id}/cancel` requests cancellation and waits for the attached worker to settle and release local permits. It also waits for pending terminal persistence. A result already committed by the execution path retains its completed status. Acknowledged local cancellation is not proof that Ollama physically stopped accepted work.
+`POST /_freellama/v1/jobs/{id}/cancel` requests cancellation and waits for the attached worker to settle and release local permits. It also waits for pending terminal persistence. A result already committed by the execution path retains its completed status. Acknowledged local cancellation is not proof that the inference server physically stopped accepted work.
 
 `DELETE /_freellama/v1/jobs/{id}` first settles locally owned work, then hides the record and removes its retained payload. With persistence enabled, its idempotency tombstone remains until expiry. An unattached worker with an unknown outcome cannot be removed early. A failed terminal database commit also prevents removal of its still-unfinished durable record.
 
@@ -29,6 +29,19 @@ MCP task cancellation and managed research use addressable jobs regardless of wh
 With persistence enabled, the HTTP task request may include `idempotency_key`, containing 1–128 UTF-8 bytes. It requires `defer:true`; synchronous requests and servers without durable jobs reject the field. MCP passes it as `run_task {defer:true, idempotencyKey}` and the agent commands as `freellama run --defer --idempotency-key KEY`; both refuse a key without `defer`. A batch (`tasks`, `--each`) takes no key: each item is its own job.
 
 Keys are hashed (HMAC-SHA256, see [request hashes](#request-hashes)) with authenticated caller identity and scoped to a server topology: listen address, primary endpoint, CPU endpoint and configured CPU model list. Keep that configuration and caller identity stable when recovering jobs. Task input is serialized and hashed after removing the key, together with the set of explicitly supplied fields. Retries must preserve both values and field presence: omission can inherit scope defaults while an explicit default overrides them. Reusing a key with changed input returns `task_job_idempotency_conflict`.
+
+Managed llama.cpp configuration participates in the **input hash**, while the lookup namespace
+stays stable. The fingerprint covers each managed engine's name, URL, model, processor and
+context/output/memory bounds, sorted by name. Declaration order, API-key rotation and passthrough-only
+upstreams do not change it. Adding, removing or changing a managed mapping returns a conflict for a
+retained key instead of returning a result from different settings or silently running new work.
+The old job remains readable by ID. All managed mappings are included conservatively because a
+scope can inherit a model: even changing an unrelated managed engine can invalidate a retry.
+
+Ollama-only installations preserve their existing input hashes. After upgrading an installation
+with managed engines from a version without this fingerprint, retained keys conflict; retrieve
+and inspect the original job first. Use a new key only for intentionally new work. The fingerprint
+describes operator configuration, not a llama.cpp weight digest or physical execution attestation.
 
 A repeated key returns the original job, including a retained terminal result, before checking local registry capacity. Claiming the key and reserving its durable record is one transaction. Concurrent requests cannot both claim that key. A new durable claim rejected by local capacity is recorded as failed with `execution_outcome:"not_started"` and `retry_safe:true`; repeating the key returns that original refusal instead of starting work.
 

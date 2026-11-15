@@ -62,7 +62,7 @@ afterEach(() => {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-describe("scripts/install.sh", () => {
+describe.skipIf(process.platform === "win32")("scripts/install.sh (POSIX shell)", () => {
   it("installs the npm package by default and only prints the Ollama command without a terminal", async () => {
     const box = sandbox({ npm: true });
     const { code, out } = await box.run();

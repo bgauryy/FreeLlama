@@ -1,0 +1,47 @@
+{
+  "resident_after": {
+    "models": [
+      {
+        "name": "bonsai-2:9b",
+        "model": "bonsai-2:9b",
+        "size": 2542167653,
+        "digest": "c8b5462f8688647fe0b53568e3c00181ada5f05300aa4bf00695f2902f4d388e",
+        "details": {
+          "parent_model": "",
+          "format": "gguf",
+          "family": "qwen35",
+          "families": [
+            "qwen35"
+          ],
+          "parameter_size": "9.0B",
+          "quantization_level": "Q2_0"
+        },
+        "expires_at": "2026-11-14T20:57:59.035808+02:00",
+        "size_vram": 2542167653,
+        "context_length": 4096,
+        "runner": "llamacpp"
+      }
+    ]
+  },
+  "host_after": {
+    "timestamp_ms": 1794682619044,
+    "platform": "darwin",
+    "cpu_times": {
+      "logical_cpus": 12,
+      "idle_ms": 3795993800,
+      "total_ms": 6707983160
+    },
+    "cpu_busy_percent": null,
+    "available_bytes": 4636000256,
+    "available_bytes_source": "freellama_estimate",
+    "free_bytes": 554614784,
+    "swap_used_bytes": 11252468285.44,
+    "pressure_level": 1,
+    "psi_some_avg10_pct": null,
+    "compressor_bytes": 9687105536,
+    "load1": 10.49609375,
+    "errors": [],
+    "sample_duration_ms": 17
+  },
+  "inference_unknown": false
+}

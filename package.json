@@ -30,7 +30,7 @@
     "lint:rust": "cargo fmt --all --check && cargo clippy --workspace --all-targets --all-features -- -D warnings",
     "format": "cargo fmt --all",
     "test": "yarn test:js && yarn test:rust",
-    "test:js": "vitest run && yarn test:bench",
+    "test:js": "vitest run && yarn test:bench && yarn test:reliability",
     "test:bench": "node --test scripts/bench/*.test.mjs scripts/local-test/workflow-json-grade.test.mjs",
     "test:integration": "vitest run -c packages/mcp/vitest.integration.config.ts",
     "test:e2e": "vitest run -c packages/mcp/vitest.e2e.config.ts",
@@ -45,7 +45,9 @@
     "test:release": "node scripts/sync-readmes.mjs --check && node --test scripts/test-release-packages.mjs scripts/test-release-registry.mjs",
     "docs:sync-readmes": "node scripts/sync-readmes.mjs",
     "release:smoke": "node scripts/smoke-packed-install.mjs",
-    "release:verify:registry": "node scripts/verify-release-registry.mjs"
+    "release:verify:registry": "node scripts/verify-release-registry.mjs",
+    "test:reliability": "node --test scripts/reliability/*.test.mjs",
+    "reliability:tools": "node scripts/reliability/tool-calling.mjs"
   },
   "devDependencies": {
     "@napi-rs/cli": "^3.10.9",

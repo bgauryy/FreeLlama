@@ -1,8 +1,8 @@
 Octocode's GitHub tools research public and private repositories without cloning them: find a repo, its code, its history, and its packages.
-Call: octocode <tool> '{"queries":[{...}]}'  (1-5 queries per call)
-Result: JSON with results[].data. Exit 0 found, 1 nothing found, 2 bad input (the message names the field), 3 not found, 4 not logged in (octocode auth login), 7 rate limited (wait).
-More: follow a printed next or {"cursor":"..."}; no next and no hasMore means the result is complete.
-
+Call: octocode <tool> '{"queries":[{...}]}'  (default text; add --json for JSON)
+Result: findings plus status/notes; --json gives results[].data. Exits: 0 success, 1 empty, 2 invalid input, 3 not found, 4 auth required (octocode auth login), 5 execution error, 7 rate limited, 130 interrupted.
+More: run responsePagination.next, then every next.* continuation unchanged; report isPartial, terminalLimit and provider/index limits rather than assuming completeness.
+Checked with local CLI 20.2.0; use octocode <tool> --help before its first call, or schema <tool> for fields.
 ghSearchRepo: find a repository when you do not know its owner or name.
   {"operation":"search","keywords":["local llm router"],"filters":{"language":"Rust"}}
   {"operation":"get","owner":"ollama","repo":"ollama"}  one repo: description, stars, default branch

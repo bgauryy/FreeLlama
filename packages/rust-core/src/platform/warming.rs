@@ -179,6 +179,10 @@ pub(super) async fn warm(
 ) -> Result<Response, ApiError> {
     let Json(input) = input.map_err(|error| ApiError::invalid_task_request(&error))?;
     let mut input = input;
+    if execution::llamacpp::target(&state, Some(input.model.trim())).is_some() {
+        return Err(ApiError::bad_request("managed external engines have operator-owned lifecycle; warm and unload are unsupported")
+            .with_code("engine_capability_unsupported"));
+    }
     let unload = execution::requests_immediate_unload(input.keep_alive.as_deref())
         && input.messages.as_ref().is_none_or(Vec::is_empty)
         && input.defer != Some(true);

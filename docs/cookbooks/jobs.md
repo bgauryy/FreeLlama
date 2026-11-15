@@ -1,10 +1,10 @@
 # Let FreeLlama pick the model and prompt (job mode)
 
-**Use when** one of the jobs below fits the work and you would rather not write the local model's prompt, options and embedding prefixes yourself. Pass `job` to `run_task`: FreeLlama runs the job's first catalog pick that is installed and fits now, with its own prompt for that job. Any field you pass wins, and `job_profile.applied` in the result lists what job mode filled in.
+**Use when** one of the jobs below fits the work and you would rather not write the local model's prompt, options and embedding prefixes yourself. Pass `job` to `run_task`: FreeLlama first asks the Rust router for a qualifying [machine-local calibrated pick](../MODEL_SELECTION.md#turn-measurements-into-routing-evidence), then falls back to the installed catalog or a capability-qualified untested model. It supplies its own prompt for that job; runtime admission remains authoritative. Any field you pass wins, and `job_profile.applied` in the result lists what job mode filled in.
 
 **Skip it when** you need your own wording or decoding: pass `model`, `prompt` and `options` yourself, as the other recipes do.
 
-| `job` | Task | First pick | What job mode fills in |
+| `job` | Task | Catalog fallback default | What job mode fills in |
 |---|---|---|---|
 | `classify` | decision | `strands-decider:2b-nvfp4` | task and model; you send `questions` |
 | `find-code` | embedding | `embeddinggemma-2:740m-q8_0` | `task: code retrieval \| query: ` before your query, `title: none \| text: ` before each chunk |
@@ -15,7 +15,7 @@
 | `coding` | coding | `bonsai-2:9b` | a system prompt asking for SEARCH/REPLACE edits, and the card's sampling; you send the change as `prompt` |
 | `summarize` | completion | `bonsai-2:9b` | a short-bullets system prompt that quotes numbers and names and says "not stated" rather than guess |
 
-The later picks of each job are the catalog's (`models {view:"catalog", job}`). Every value, with the model card it comes from, is in [local-prompts.ts](../../packages/mcp/src/local-prompts.ts); a sampling value is used only where the model's own card documents it.
+The table names portable catalog defaults, not a guaranteed live choice. `models {view:"catalog", job}` lists its alternatives and memory previews; ordinary calibrated jobs request throughput evidence, while capable workflows and OCR also require quality evidence. Every value, with the model card it comes from, is in [local-prompts.ts](../../packages/mcp/src/local-prompts.ts); a sampling value is used only where the model's own card documents it.
 
 Read the text in one image:
 
@@ -53,8 +53,8 @@ Draft one small change:
 {"tool": "run_task", "arguments": {"job": "coding", "files": ["/Users/me/.octocode/freellama/handoffs/build-failures.md", "scripts/build.mjs"], "prompt": "Fix the first failure the summary names."}}
 ```
 
-**When nothing fits now,** the refusal lists each pick, the memory it needs and what is free. Tell the user; pass `model` for an installed model with the same capability, or ask them to approve pulling one exact tag at its size.
+**When selection or admission refuses,** inspect the returned reason and current memory. A catalog preview miss alone may still reach the runtime gate, which can admit, wait or refuse; it reserves nothing during selection. Tell the user; pass `model` for an installed model with the same capability, or ask them to approve pulling one exact tag at its size.
 
 **MCP prompts.** Clients that show prompts (often as slash commands) list one per workflow (`read-text`, `read-table`, `read-fields`, `answer-image`, `describe-screen`, `change-code`, `fix-bug`, `implement`, `write-tests`, `review-code`, `explain-code`, `summarize-log`, `summarize-text`, `summarize-diff`, `extract-json`), plus `classify`, `find-code`, `duplicates`, `research`, `github-research` and `sweep`. Each returns the exact call to make; `freellama` explains when to offload and how to check results. From a shell, `freellama run -w <workflow>` or `freellama run -j <job>` makes the same call, and `freellama workflows` lists them.
 
-**Check it:** as the job's own recipe says; read 3 to 5 results before relying on the rest.
+**Check it:** follow the job's recipe and the [limits of automated checks](../RELIABILITY.md#accuracy-of-result-checks). Test representative and difficult examples; verify every consequential output before using it.
