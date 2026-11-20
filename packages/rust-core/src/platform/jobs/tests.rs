@@ -344,16 +344,34 @@ fn a_sliced_jobs_status_names_the_slice_that_waits_again() {
     };
     let receipt = || progress.job.lock().unwrap().receipt(false);
 
-    progress.update(JobStatus::Loading, "forwarding_to_ollama", Some(json!({"model": "m"})));
-    assert_eq!(receipt()["detail"], json!({"model": "m"}), "an unsliced job's detail is unchanged");
+    progress.update(
+        JobStatus::Loading,
+        "forwarding_to_ollama",
+        Some(json!({"model": "m"})),
+    );
+    assert_eq!(
+        receipt()["detail"],
+        json!({"model": "m"}),
+        "an unsliced job's detail is unchanged"
+    );
 
     progress.slice(1, 3);
-    assert_eq!(receipt()["detail"], json!({"model": "m", "slice": {"index": 1, "count": 3}}));
+    assert_eq!(
+        receipt()["detail"],
+        json!({"model": "m", "slice": {"index": 1, "count": 3}})
+    );
     progress.slice(2, 3);
-    progress.update(JobStatus::WaitingForAdmission, "waiting_for_backend_capacity", None);
+    progress.update(
+        JobStatus::WaitingForAdmission,
+        "waiting_for_backend_capacity",
+        None,
+    );
     let waiting = receipt();
     assert_eq!(waiting["status"], "waiting_for_admission");
-    assert_eq!(waiting["detail"], json!({"slice": {"index": 2, "count": 3}}));
+    assert_eq!(
+        waiting["detail"],
+        json!({"slice": {"index": 2, "count": 3}})
+    );
 }
 
 fn job(finished: Option<Instant>) -> Job {
