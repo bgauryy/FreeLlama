@@ -87,6 +87,7 @@ pub(super) fn prepare(
         backend: None,
         reason: "discovering_model",
         detail: None,
+        slice: None,
         created_at: crate::platform::telemetry::now_seconds(),
         timeout_seconds: timeout.as_secs(),
         finished: None,

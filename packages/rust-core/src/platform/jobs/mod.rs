@@ -66,6 +66,9 @@ struct Job {
     backend: Option<String>,
     reason: &'static str,
     detail: Option<Value>,
+    /// `(index, count)` of the slice a sliced job runs now: each slice queues for admission again,
+    /// so its status steps back to waiting, and the detail says which slice is waiting.
+    slice: Option<(usize, usize)>,
     created_at: u64,
     timeout_seconds: u64,
     finished: Option<Instant>,

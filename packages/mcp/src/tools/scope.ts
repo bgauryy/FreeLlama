@@ -8,11 +8,11 @@ import { endpointParam, errorResult, messageParam, objectResultSchema, parsedRes
 // exposes neither `route_defaults` nor `limits`.
 export function registerScopeTool(server: McpServer): void {
   server.registerTool("scope", {
-    description: "Use when: a multi-turn local chat should keep its history on the server: create returns scope_id and revision 0; send run_task {scopeId, scopeRevision} (always together), then the next scopeRevision is that result's structuredContent.scope.revision; fork (needs `revision`, the scope's current one) returns a new scope_id at revision 0 with the same history. Do not use when: you only want one model kept warm (session) or a one-shot task. Returns: scope id and revision; history only with includeMessages:true.",
+    description: "Use when: a multi-turn local chat should keep its history on the server: create returns scope_id at revision 0; send run_task {scopeId, scopeRevision} (always together), then the next scopeRevision is the result's structuredContent.scope.revision; fork branches it. Do not use when: you only want one model kept warm (session) or a one-shot task. Returns: scope id and revision.",
     inputSchema: z.object({
       action: z.enum(["create", "get", "fork", "delete"]), endpoint: endpointParam,
-      scopeId: z.string().uuid().optional(), revision: z.number().int().nonnegative().optional(),
-      messages: z.array(messageParam).optional(), includeMessages: z.boolean().optional(),
+      scopeId: z.string().uuid().optional(), revision: z.number().int().nonnegative().optional().describe("fork needs the scope's current revision; returns a new scope_id at revision 0 with the same history"),
+      messages: z.array(messageParam).optional(), includeMessages: z.boolean().optional().describe("get: return the history too (otherwise only scope id and revision)"),
     }).strict(),
     // delete forgets only a scope this client created (its id), as session kill and task_jobs
     // remove act only on the caller's own work, so none of them is marked destructive.

@@ -212,7 +212,7 @@ export function injectionCheck(input: string, unsplit = ""): string | undefined 
 export function nullFieldCheck(answer: string, input: string): string | undefined {
   let parsed: unknown;
   try {
-    parsed = JSON.parse(answer.replace(/^\[[^\]\n]*\]\s*/, "").replace(/^```(?:json)?\s*|\s*```\s*$/g, "").trim());
+    parsed = JSON.parse(jsonText(answer));
   } catch {
     return undefined;
   }
@@ -229,8 +229,44 @@ export function nullFieldCheck(answer: string, input: string): string | undefine
   return found.length > 0 ? `null although the input names a value: ${found.join(", ")}; check the extraction` : undefined;
 }
 
+/** The answer without its `[model]` header and code fence: the text a JSON answer should parse as. */
+const jsonText = (answer: string): string =>
+  answer.replace(/^\[[^\]\n]*\]\s*/, "").replace(/^```(?:json)?\s*|\s*```\s*$/g, "").trim();
+
+/**
+ * A requested JSON answer (format json or a schema) that does not parse: usually cut off at the
+ * output limit or wrapped in prose. Tool calls and empty answers are reported elsewhere.
+ */
+export function invalidJsonCheck(answer: string): string | undefined {
+  const text = jsonText(answer);
+  if (!text || /^(?:tool_calls:|\(empty)/.test(text)) return undefined;
+  try {
+    JSON.parse(text);
+    return undefined;
+  } catch {
+    return "the answer is not valid JSON: do not parse it as is; rerun it (with a larger options.num_predict if it was cut off)";
+  }
+}
+
+/**
+ * An answer that stopped at its output limit (Ollama done_reason "length") is cut off however
+ * clean the rest reads: a truncated summary drops its last points, truncated JSON does not parse.
+ */
+export function truncationCheck(structured: Fields): string | undefined {
+  const response = object(structured.response);
+  if (response?.done_reason !== "length") return undefined;
+  const budget = object(object(structured.request_options)?.options)?.num_predict ?? response.eval_count;
+  return `the answer stopped at its output limit${typeof budget === "number" ? ` (${budget} tokens)` : ""} and is cut off: rerun with a larger options.num_predict before relying on it`;
+}
+
 /** The checks for one finished result; empty when there is nothing specific to say. */
 export function resultChecks(context: CheckContext): string[] {
+  const cut = truncationCheck(context.structured);
+  const checks = answerChecks(context);
+  return cut ? [cut, ...checks] : checks;
+}
+
+function answerChecks(context: CheckContext): string[] {
   const rawCalls = object(object(context.structured.response)?.message)?.tool_calls;
   if (rawCalls != null && !Array.isArray(rawCalls)) {
     return ["response.message.tool_calls is not an array: do not execute it; inspect the raw response"];

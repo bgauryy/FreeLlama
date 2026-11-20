@@ -14,6 +14,19 @@ use crate::platform::error::ApiError;
 use super::registry::fits_retention_limit;
 use super::{Job, JobStatus, MAX_RESULT_BYTES};
 
+/// `detail` with `"slice": {"index", "count"}` added when the job runs in slices.
+fn with_slice(detail: Option<Value>, slice: Option<(usize, usize)>) -> Option<Value> {
+    let Some((index, count)) = slice else {
+        return detail;
+    };
+    let mut detail = match detail {
+        Some(Value::Object(map)) => Value::Object(map),
+        _ => json!({}),
+    };
+    detail["slice"] = json!({ "index": index, "count": count });
+    Some(detail)
+}
+
 #[derive(Debug, Clone)]
 pub(in crate::platform) struct JobProgress {
     pub(super) job: Arc<Mutex<Job>>,
@@ -68,7 +81,21 @@ impl JobProgress {
         if !job.status.terminal() && job.status != JobStatus::Cancelling {
             job.status = status;
             job.reason = reason;
-            job.detail = detail;
+            job.detail = with_slice(detail, job.slice);
+            job.changed.notify_waiters();
+        }
+    }
+
+    /// Mark the job as running slice `index` of `count` (1-based); every later update carries it.
+    pub(in crate::platform) fn slice(&self, index: usize, count: usize) {
+        let mut job = self
+            .job
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !job.status.terminal() && job.status != JobStatus::Cancelling {
+            job.slice = Some((index, count));
+            let detail = job.detail.take();
+            job.detail = with_slice(detail, job.slice);
             job.changed.notify_waiters();
         }
     }

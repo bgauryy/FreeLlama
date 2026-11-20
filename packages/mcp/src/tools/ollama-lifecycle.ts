@@ -11,7 +11,7 @@ import {
   isStructuredSuccess, lifecycleText, ollamaFetch, parsedResult, structuredResult, systemPromptParam, taskMessages, taskParam,
 } from "../helpers.js";
 import { runWithJobProgress } from "../job-progress.js";
-import { progressSink, type ToolExtra } from "../progress.js";
+import { progressSink, type ToolExtra, warningSink } from "../progress.js";
 import { serveUnload } from "../serve-http.js";
 import { installedMatch, type InstalledModel } from "../model-catalog.js";
 import { installedInventory, libraryTagSize, type TagSizeLookup } from "../model-library.js";
@@ -171,12 +171,11 @@ export function registerOllamaLifecycleTools(server: McpServer, pullDependencies
     "ollama_pull",
     {
       description:
-        "Use when: the user approved downloading one exact tag at its reported size (models{view:\"library\", model:<family>} lists tags with sizeBytes). " +
-        "Pass that size as approvedSizeBytes: the pull is refused when the tag is unknown or its current size differs by more than 5%. " +
-        "Do not use when: you only found or recommended a model (search is not approval), or the tag is installed. Returns: a receipt with status and progress.",
+        "Use when: the user approved downloading one exact tag at its reported size (models{view:\"library\", model:<family>} lists tags with sizeBytes); pass it as approvedSizeBytes. " +
+        "Do not use when: you only found or recommended a model, or the tag is installed. Returns: a receipt with status and progress.",
       inputSchema: z.object({
         model: z.string().min(1).describe("exact tag, e.g. family:tag or hf.co/owner/repo:quant"),
-        approvedSizeBytes: z.number().int().positive().describe("the download size the user approved, in bytes"),
+        approvedSizeBytes: z.number().int().positive().describe("the download size the user approved, in bytes; the pull is refused when the tag is unknown or its current size differs by more than 5%"),
         ollamaEndpoint: ollamaEndpointParam,
         timeoutSeconds: z.number().int().positive().optional(),
       }).strict(),
@@ -241,7 +240,7 @@ export function registerOllamaLifecycleTools(server: McpServer, pullDependencies
     "ollama_manage",
     {
       description:
-        "Use when: loading or freeing a model. warm loads an installed model before a burst and evaluates an optional systemPrompt/messages into the prompt cache, which later run_task calls reuse only with the same model, contextTokens and an identical systemPrompt/messages prefix; " +
+        "Use when: loading or freeing a model: warm loads an installed one before a burst and evaluates an optional systemPrompt/messages into the prompt cache, which later run_task calls reuse only with the same model, contextTokens and an identical systemPrompt/messages prefix; " +
         "unload frees memory (a model you warmed or the user named). " +
         "Do not use when: downloading (ollama_pull; action pull is deprecated and refused), deleting (ollama_delete) or searching (models). Returns: a receipt with status.",
       inputSchema: z.object({
@@ -299,7 +298,7 @@ export function registerOllamaLifecycleTools(server: McpServer, pullDependencies
               cancel: (id) => cancelTaskJob(endpoint, id),
               // Reached only when serve refused the job before running it (registry full).
               sync: () => warmModelRequest(endpoint, request),
-            }, progressSink(extra) ?? (() => undefined), { signal: extra.signal }));
+            }, progressSink(extra) ?? (() => undefined), { signal: extra.signal, warn: warningSink(extra) }));
           // One line for the model; the receipt with its execution diagnostics stays structured.
           return isStructuredSuccess(warmed)
             ? structuredResult(warmed.structuredContent, { text: lifecycleText("warm", model, warmed.structuredContent) })

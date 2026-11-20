@@ -56,6 +56,16 @@ describe("task_jobs get", () => {
     expect(size(result)).toBeLessThan(1_500);
   });
 
+  it("gives a finished job's answer the same check: lines as a direct run_task answer", async () => {
+    job.value = { id: "j", status: "completed", task: "completion", result: {
+      selected_model: "m", request_options: { options: { num_predict: 500 } },
+      response: { done_reason: "length", eval_count: 500, message: { content: '{"terms": [' } },
+    } };
+    const result = await get({});
+    expect(result.content[0]!.text).toMatch(/\ncheck: the answer stopped at its output limit \(500 tokens\)/);
+    expect(result.structuredContent.checks).toEqual([expect.stringMatching(/output limit/)]);
+  });
+
   it("leaves a job without a result alone", async () => {
     job.value = { id: "j", status: "running" };
     const result = await get({});

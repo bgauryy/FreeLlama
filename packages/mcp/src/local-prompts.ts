@@ -138,7 +138,11 @@ export type Workflow = {
   prefer?: "capable";
   /** Thinking for this kind of task; false for bounded output, where reasoning only adds time and can leak into the answer. */
   think?: boolean;
-  /** Output ceiling (num_predict) with thinking off: about 8x the eval answers' median tokens (2026-11-12). */
+  /**
+   * Output ceiling (num_predict) with thinking off: a guard against looping, set well above what a
+   * real answer needs (about 8x the eval answers' median), since an answer that reaches it is cut
+   * off; result checks flag that (done_reason length).
+   */
   maxOutput?: number;
 };
 
@@ -254,7 +258,9 @@ ${MATERIAL}`,
     // 2-4x over length on all three, padding every category with "not stated"; a no-padding rule
     // took it to 2/3. bonsai-2:9b and Nemotron Bolt pass 3/3 either way, hence capable.
     prefer: "capable",
-    maxOutput: 400, job: "summarize", title: "Summarize text for someone who will act on it", input: "files: the text; prompt: what you need from it (optional)",
+    // 400 cut a summary of a 30 KB reference page mid-list (bonsai-2:9b, 2026-11-15); repetition
+    // stop stays on for free text, so the ceiling only bounds an unusually long honest answer.
+    maxOutput: 1200, job: "summarize", title: "Summarize text for someone who will act on it", input: "files: the text; prompt: what you need from it (optional)",
     system: `Summarize the text for someone who will act on it: its decisions, numbers, deadlines and open questions, plus whatever the request asks for.
 Use as few short bullets as the text needs; one is right for one sentence, and the summary is shorter than the text.
 Write a bullet only for something the text states; for something the request explicitly asks for that the text lacks, write "not stated". Copy facts as written.
@@ -271,7 +277,9 @@ ${MATERIAL}`,
   },
   "extract-json": {
     think: false,
-    maxOutput: 500, job: "summarize", title: "Extract named fields from text into JSON", input: "files: the text; prompt: the field names (or a JSON schema)",
+    // 500 cut an 18-field extraction at field 9 into unterminated JSON; it needed 803 (bonsai-2:9b,
+    // 2026-11-15). JSON turns repetition stop off, so this ceiling is its only loop guard.
+    maxOutput: 1500, job: "summarize", title: "Extract named fields from text into JSON", input: "files: the text; prompt: the field names (or a JSON schema)",
     system: `Extract the fields the request names from the text into one JSON object.
 Copy each value as the text gives it, without its label or unit: "Ticket #88 for 4.75 GBP" gives id "88", amount 4.75 and currency "GBP". Use null for a field the text does not give.
 Output only the JSON object.`,

@@ -2,10 +2,31 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as z from "zod";
 import { outputInput } from "../tool-results.js";
+import { fallbackCheck, resultChecks } from "../result-checks.js";
 import { cancelTaskJob, getTaskJob, listTaskJobs, removeTaskJob } from "../serve-client.js";
 import {
   endpointParam, errorResult, isStructuredSuccess, jobsText, objectResultSchema, parsedResult, structuredResult, summarizeEmbeddings,
+  taskAnswerText,
 } from "../helpers.js";
+
+/** A finished job's answer gets the check: lines run_task gives a direct answer (cut off, unsupported facts, unsure decisions). */
+function jobChecks(content: Record<string, unknown>): string[] {
+  const job = content.job as Record<string, unknown> | undefined;
+  const receipt = job?.result;
+  if (!job || !receipt || typeof receipt !== "object" || Array.isArray(receipt)) return [];
+  const structured = receipt as Record<string, unknown>;
+  const answer = (taskAnswerText(structured) ?? "").replace(/^\[[^\]\n]*\] /, "");
+  const fallback = fallbackCheck(structured);
+  const task = typeof job.task === "string" ? job.task : undefined;
+  return [...(fallback ? [fallback] : []), ...resultChecks({ task, answer, structured })];
+}
+
+/** The job's status and answer as text, its check: lines after them; the whole receipt stays structuredContent. */
+function jobResult(content: Record<string, unknown>) {
+  const checks = jobChecks(content);
+  const text = [jobsText(content), ...checks.map((check) => `check: ${check}`)].filter(Boolean).join("\n");
+  return structuredResult(checks.length > 0 ? { ...content, checks } : content, { text });
+}
 
 export function registerTaskJobsTool(server: McpServer): void {
   server.registerTool(
@@ -13,7 +34,7 @@ export function registerTaskJobsTool(server: McpServer): void {
     {
       description:
         "Use when: following run_task {defer:true} work (jobId is its job_id, or one of accepted_job_ids): list, get (result), cancel, or remove (cancels first) a job. " +
-        "Do not use when: submitting work or killing a session. Returns: the job's status, then its answer, ranking or error as text, then response_file (read_response opens the full receipt).",
+        "Do not use when: submitting work or killing a session. Returns: the job's status, then its answer, ranking or error as text, then response_file.",
       inputSchema: z.object({
         endpoint: endpointParam,
         action: z.enum(["list", "get", "cancel", "remove"]),
@@ -46,14 +67,10 @@ export function registerTaskJobsTool(server: McpServer): void {
           const job = result.structuredContent.job as Record<string, unknown> | undefined;
           if (job?.result && typeof job.result === "object") {
             const trimmed = summarizeEmbeddings(job.result as Record<string, unknown>);
-            if (trimmed) {
-              const content = { ...result.structuredContent, job: { ...job, result: trimmed } };
-              return structuredResult(content, { text: jobsText(content) });
-            }
+            if (trimmed) return jobResult({ ...result.structuredContent, job: { ...job, result: trimmed } });
           }
         }
-        // The text is the job's status and its answer; the whole receipt is structuredContent.
-        return isStructuredSuccess(result) ? structuredResult(result.structuredContent, { text: jobsText(result.structuredContent) }) : result;
+        return isStructuredSuccess(result) ? jobResult(result.structuredContent) : result;
       } catch (error) {
         return errorResult(error);
       }

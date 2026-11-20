@@ -93,11 +93,10 @@ export function registerSweepTool(server: McpServer): void {
     {
       description:
         "Use when: a large divisible check (code tree, logs, docs site) should run chunk by chunk on a local model in the background; " +
-        "each result is saved and you read only flagged chunks. start returns at once; wait (<=50 s) follows it; results pages " +
-        "flagged|unsure (within 0.15 below a flag threshold)|failed|changed|all; resume continues after a restart; `baseline` reuses an earlier sweep for unchanged chunks. " +
+        "each result is saved and you read only flagged or changed chunks. results pages by `filter` (unsure: within 0.15 below a flag threshold). " +
         "Clear chunks are screened, not proven clean: verify flagged ones and treat the rest as unaudited. Do not use when: a few items (run_task tasks), or finding related files (embedding + nearest). Returns: status; results cite path:Lstart-Lend or url#n.",
       inputSchema: z.object({
-        action: z.enum(["start", "status", "wait", "results", "cancel", "resume", "list"]),
+        action: z.enum(["start", "status", "wait", "results", "cancel", "resume", "list"]).describe("start returns at once; wait follows it for up to 50 s; resume continues after a restart"),
         sweepId: z.string().length(36).optional(),
         name: z.string().min(1).max(120).optional(),
         files: z.array(z.string().min(1)).min(1).max(2_000).optional().describe("paths or globs, as run_task files"),
@@ -115,7 +114,7 @@ export function registerSweepTool(server: McpServer): void {
         explainPrompt: z.string().min(1).optional().describe("with explainModel: a note per confirmed flag"),
         chunkBytes: z.number().int().min(500).max(16_000).optional().describe("default 3000"),
         maxParallelism: z.number().int().positive().max(4).optional().describe("default 1"),
-        baseline: z.string().length(36).optional().describe("an earlier sweepId"),
+        baseline: z.string().length(36).optional().describe("an earlier sweepId: its results are reused for unchanged chunks"),
         filter: z.enum(["flagged", "unsure", "failed", "changed", "all"]).optional(),
         cursor: z.string().min(1).optional(),
         saveAs: z.string().regex(HANDOFF_NAME).optional().describe("results: all of filter to handoffs/<name>.md"),

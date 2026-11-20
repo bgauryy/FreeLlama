@@ -2,7 +2,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { editBlocks, resultChecks, withChecks } from "../../src/result-checks.js";
+import { editBlocks, invalidJsonCheck, resultChecks, withChecks } from "../../src/result-checks.js";
 
 const dir = mkdtempSync(path.join(tmpdir(), "freellama-checks-"));
 const source = path.join(dir, "config.ts");
@@ -148,6 +148,27 @@ describe("result-derived checks", () => {
     const result = withChecks({ content: [{ type: "text", text: "[m] - timeout 30 s" }], structuredContent: { ...read } }, undefined, "completion");
     expect(result.content[0]!.text).toMatch(/\ncheck: not in the source: 30/);
     expect((result.structuredContent as Record<string, unknown>).checks).toHaveLength(1);
+  });
+});
+
+describe("output limit and JSON checks", () => {
+  it("puts a cut-off answer first, naming the output budget, ahead of a clean source check", () => {
+    const structured = { ...read, request_options: { options: { num_predict: 400 } }, response: { done_reason: "length", eval_count: 400 } };
+    const checks = resultChecks({ answer: "- port 8080", structured });
+    expect(checks[0]).toMatch(/output limit \(400 tokens\).*options\.num_predict/);
+    expect(checks).toHaveLength(2);
+    expect(resultChecks({ answer: "- port 8080", structured: { ...structured, response: { done_reason: "stop" } } })).toHaveLength(1);
+  });
+
+  it("falls back to eval_count when the request budget is absent", () => {
+    expect(resultChecks({ answer: "partial", structured: { response: { done_reason: "length", eval_count: 512 } } })[0]).toMatch(/\(512 tokens\)/);
+  });
+
+  it("flags JSON that does not parse and accepts fenced or headed JSON", () => {
+    expect(invalidJsonCheck('{"terms": [{"term": "a"},')).toMatch(/not valid JSON/);
+    expect(invalidJsonCheck('[m] ```json\n{"a": 1}\n```')).toBeUndefined();
+    expect(invalidJsonCheck("tool_calls: []")).toBeUndefined();
+    expect(invalidJsonCheck("")).toBeUndefined();
   });
 });
 

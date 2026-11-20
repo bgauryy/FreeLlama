@@ -96,7 +96,8 @@ export const objectiveParam = z
   .describe("quality needs a task policy or an explicit model");
 export const executionPreferenceParam = z
   .enum(["auto", "prefer_cpu", "prefer_gpu"])
-  .optional();
+  .optional()
+  .describe("CPU/GPU placement is operator-configured; this only chooses among eligible backends");
 export const minPlacementEvidenceParam = z
   .enum(["configured", "observed"])
   .describe("observed: refuse unless /api/ps proves where the model runs")

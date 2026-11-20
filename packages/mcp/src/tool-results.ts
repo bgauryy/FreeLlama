@@ -200,7 +200,7 @@ export const AUTO_INLINE_CHARS = 8000;
 /** Input fields of the tools whose answers `output` and `outputPath` apply to. */
 export const outputInput = {
   output: z.enum(["auto", "inline", "file"]).optional()
-    .describe("auto (default): inline up to 8,000 chars, else a summary and where the rest is"),
+    .describe("auto (default): inline up to 8,000 chars, else a summary plus output_file holding the rest; inline: the whole answer"),
   outputPath: z.string().min(1).optional()
     .describe("also write the answer here as Markdown (inside the readable roots)"),
 };
