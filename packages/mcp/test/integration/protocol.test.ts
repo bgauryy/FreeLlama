@@ -66,7 +66,7 @@ describe("tool contract", () => {
       "never stop their processes", "one exact tag (name:tag) and its reported size", "approvedSizeBytes", "search results are not permission",
       "Unload only a model you warmed", "delete only a tag the user names",
       // Results and state.
-      "check isError first", "page.next_cursor", "next_offset", "FREELLAMA_DURABLE_JOBS=1", "executionPreference only chooses among eligible backends", "freellama://docs/index",
+      "check isError first", "FREELLAMA_DURABLE_JOBS=1", "freellama://docs/index",
     ]) expect(instructions, `instructions should keep: ${contract}`).toContain(contract);
 
     const description = (name: string) => byName.get(name)!.description ?? "";
@@ -75,7 +75,13 @@ describe("tool contract", () => {
       [description("run_task"), "up to 64 independent items"],
       [description("run_task"), "`preview:true`"],
       [description("run_task"), "`defer:true`"],
-      [description("run_task"), "per-item fields override top-level defaults"],
+      [field("run_task", "tasks"), "per-item fields override top-level defaults"],
+      [field("run_task", "tasks"), "go once at top level"],
+      [field("run_task", "maxParallelism"), "caps dispatch"],
+      [field("run_task", "defer"), "progress every 10 s"],
+      [field("run_task", "executionPreference"), "only chooses among eligible backends"],
+      [field("models", "cursor"), "page.next_cursor"],
+      [field("read_response", "offset"), "next_offset"],
       [field("run_task", "preview"), "never executes"],
       [field("run_task", "images"), "vision `model`"],
       [field("run_task", "files"), "4 MiB per text file, 8 MiB per image, 32 MiB total"],
@@ -159,7 +165,7 @@ describe("tool contract", () => {
     expect(schema.properties.maxParallelism.maximum).toBe(64);
     expect(schema.properties.maxParallelism.exclusiveMinimum).toBe(0);
     expect(byName.get("run_task")!.description).toMatch(/independent items/);
-    expect(byName.get("run_task")!.description).toMatch(/`maxParallelism` caps dispatch/);
+    expect(byName.get("run_task")!.inputSchema.properties.maxParallelism.description).toMatch(/caps dispatch/);
   });
 
   it("lists only the per-item batch fields yet accepts and checks every run_task field", async () => {
@@ -599,15 +605,17 @@ describe("tool contract", () => {
     // 6,992 before and 7,440 after the 2026-11-14 interview fixes: one sentence per gap that two of three
     // Haiku interviews raised (session/scope ids, job ids, cache reuse, sweep and audio links); they lifted
     // the round-4 scenario score from 52/54 to 54/54. Trim elsewhere before raising the budget.
+    // 7,441 before and 7,059 after the prose pass that said each point once (parameter mechanics sit in
+    // field notes, shared rules only in the instructions).
     const modelFacing = tools.map(({ name, description, inputSchema }) => ({ name, description, inputSchema }));
     const surfaceTokens = Math.round(
       (JSON.stringify(modelFacing).length + (client.getInstructions() ?? "").length) / 4,
     );
-    expect(surfaceTokens, `model-facing surface grew to ~${surfaceTokens} tokens`).toBeLessThan(7450);
+    expect(surfaceTokens, `model-facing surface grew to ~${surfaceTokens} tokens`).toBeLessThan(7200);
     // The whole tools/list payload, output schemas included (7,522 tokens on 2026-11-01, 6,412 on 2026-11-07,
     // 7,846 on 2026-11-08 with sweep and ollama_pull, 7,890 before and 8,055 after job mode, 8,503 with output and outputPath).
     const wireTokens = Math.round((JSON.stringify(tools).length + (client.getInstructions() ?? "").length) / 4);
-    expect(wireTokens, `tools/list grew to ~${wireTokens} tokens`).toBeLessThan(8600);
+    expect(wireTokens, `tools/list grew to ~${wireTokens} tokens`).toBeLessThan(7850);
   });
 
   it("offers one prompt per job, each returning the exact call, and the freellama guide", async () => {

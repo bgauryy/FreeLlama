@@ -115,7 +115,11 @@ pub(super) async fn run(
     let mut vectors: Vec<Vec<f64>> = Vec::new();
     let mut identity: Option<Value> = None;
     let sliced = all_items.len() > ITEMS_PER_SLICE;
-    for slice in all_items.chunks(ITEMS_PER_SLICE) {
+    let slice_count = all_items.len().div_ceil(ITEMS_PER_SLICE);
+    for (index, slice) in all_items.chunks(ITEMS_PER_SLICE).enumerate() {
+        if sliced && let Some(progress) = &input.job_progress {
+            progress.slice(index + 1, slice_count);
+        }
         let mut next = input.clone();
         next.input = Some(Value::Array(slice.to_vec()));
         if let Some(pinned) = &identity {

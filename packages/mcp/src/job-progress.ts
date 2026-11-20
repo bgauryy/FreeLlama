@@ -31,6 +31,11 @@ export type CallError = { status?: number; body?: Fields };
 export type CancellationState = "acknowledged" | "requested" | "unknown";
 
 export type JobOptions = {
+  /**
+   * Called once for each memory or host-pressure hold that lasts HOLD_WARN_MS, while the job still
+   * waits: a person may free memory or let the machine cool, which progress alone does not ask for.
+   */
+  warn?: (message: string) => void;
   /** Aborting it cancels the job. */
   signal?: AbortSignal;
   wait?: Wait;
@@ -68,6 +73,10 @@ const FIRST_POLL_MS = 25;
  * the call alive, and a person sees it is not stuck.
  */
 const HEARTBEAT_MS = 10_000;
+/** Changes within one phase (a streaming job's token count) are reported at most this often. */
+const SAME_PHASE_REPORT_MS = 3_000;
+/** A hold for memory or host pressure lasting this long is sent as a warning during the call. */
+const HOLD_WARN_MS = 2_000;
 const MAX_POLL_MS = 2_000;
 /**
  * How long one read may wait for the job to change on a serve that long-polls. A change answers
@@ -81,6 +90,25 @@ const CANCEL_ATTEMPTS = 3;
 const CANCEL_BACKOFF_MS = 250;
 /** The longest an abort waits for its cancel attempts before reporting what is known. */
 const CANCEL_REPORT_MS = 5_000;
+
+/**
+ * Cancels for the jobs this process follows. The SDK's stdio transport does not watch stdin end, so
+ * a request's abort signal never fires when the client goes away; shutdown cancels these instead.
+ */
+const openJobs = new Set<() => Promise<CancellationState>>();
+
+/** Ask serve to cancel every followed job, waiting at most `timeoutMs` for the requests. */
+export async function cancelOpenJobs(timeoutMs: number): Promise<void> {
+  const pending = [...openJobs].map((cancel) => cancel().catch(() => "unknown" as const));
+  if (pending.length === 0) return;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const capped = new Promise<void>((resolve) => { timer = setTimeout(resolve, timeoutMs); });
+  try {
+    await Promise.race([Promise.allSettled(pending), capped]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 const object = (value: unknown): Fields | undefined =>
   value !== null && typeof value === "object" && !Array.isArray(value) ? (value as Fields) : undefined;
@@ -120,6 +148,14 @@ function holdersSuffix(detail: Record<string, unknown> | undefined): string {
 }
 
 export function jobProgressMessage(job: Fields): string {
+  // A sliced job queues for admission again per slice, so its status steps back: name the slice.
+  const slice = object(object(job.detail)?.slice);
+  const index = number(slice?.index);
+  const count = number(slice?.count);
+  return index !== undefined && count !== undefined ? `slice ${index}/${count}: ${phaseMessage(job)}` : phaseMessage(job);
+}
+
+function phaseMessage(job: Fields): string {
   const status = typeof job.status === "string" ? job.status : "queued";
   const reason = typeof job.reason === "string" ? job.reason : "";
   const detail = object(job.detail);
@@ -227,7 +263,7 @@ export async function runWithJobProgress(
   report: ProgressSink,
   options: JobOptions = {},
 ): Promise<string> {
-  const { signal, wait = defaultWait, describe = describeNapiError, onJob } = options;
+  const { signal, wait = defaultWait, describe = describeNapiError, onJob, warn } = options;
   const aborted = (id?: string, cancellation?: CancellationState) => options.aborted?.(id, cancellation) ?? new Error(id
     ? cancellation === "unknown"
       ? `run_task was cancelled by the client; cancellation acknowledgement is unknown for deferred job ${id}, which may still be running. ` +
@@ -288,6 +324,11 @@ export async function runWithJobProgress(
   const cancel = () => {
     cancellation ??= requestCancellation();
   };
+  const cancelOnShutdown = () => {
+    cancel();
+    return cancellation!;
+  };
+  openJobs.add(cancelOnShutdown);
   /** The cancellation's state once its attempts finish, or `unknown` if they outlast the report cap. */
   const cancellationState = async (): Promise<CancellationState | undefined> => {
     if (!cancellation) return undefined;
@@ -304,6 +345,7 @@ export async function runWithJobProgress(
   try {
     let lastMessage = "";
     let lastPhase = "";
+    let warnedPhase = "";
     let lastReportAt = Date.now();
     let phaseStartedAt = lastReportAt;
     let delay = FIRST_POLL_MS;
@@ -316,13 +358,19 @@ export async function runWithJobProgress(
       }
       const now = Date.now();
       const phase = `${String(job.status)}|${String(job.reason)}`;
-      if (phase !== lastPhase) {
+      const newPhase = phase !== lastPhase;
+      if (newPhase) {
         lastPhase = phase;
         phaseStartedAt = now;
         delay = FIRST_POLL_MS;
       }
       const message = jobProgressMessage(job);
-      if (message !== lastMessage) {
+      if (warn && warnedPhase !== phase && job.status === "waiting_for_resources" && job.reason !== "checking_host_resources"
+        && now - phaseStartedAt >= HOLD_WARN_MS) {
+        warnedPhase = phase;
+        warn(`${message} (${seconds(now - phaseStartedAt)} so far)`);
+      }
+      if (message !== lastMessage && (newPhase || TERMINAL.has(String(job.status)) || now - lastReportAt >= SAME_PHASE_REPORT_MS)) {
         report(message);
         lastMessage = message;
         lastReportAt = now;
@@ -402,5 +450,7 @@ export async function runWithJobProgress(
     throw options.failure?.(failure, status) ?? new Error(JSON.stringify(failure));
   } finally {
     signal?.removeEventListener("abort", cancel);
+    // Once the run ends, the job is settled or its cancellation was already requested.
+    openJobs.delete(cancelOnShutdown);
   }
 }

@@ -165,13 +165,13 @@ export function registerReadResponseTool(server: McpServer): void {
     {
       description:
         "Use when: a result's response_file holds what the inline view lacks. Do not use when: the inline result answers. " +
-        "Returns: one section (a `sections` name, a structuredContent field or a JSON pointer such as /result/structuredContent/route), paged by offset/limit " +
-        "(characters, array items or JSON text; next_offset continues). Array pages also cap serialized text; an oversized record returns an explicit preview and its record_section to page. Omit section for an outline.",
+        "Returns: one section (a `sections` name, a structuredContent field or a JSON pointer such as /result/structuredContent/route), paged by offset/limit. " +
+        "An oversized record returns a preview and its record_section to page. Omit section for an outline.",
       inputSchema: z.object({
         file: z.string().min(1),
         section: z.string().min(1).optional(),
-        offset: z.number().int().nonnegative().optional(),
-        limit: z.number().int().positive().optional(),
+        offset: z.number().int().nonnegative().optional().describe("next_offset from the previous page, unchanged"),
+        limit: z.number().int().positive().optional().describe("characters, array items or JSON text; array pages also cap serialized text"),
       }).strict(),
       outputSchema: objectResultSchema,
       annotations: { readOnlyHint: true },

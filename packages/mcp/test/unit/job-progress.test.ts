@@ -1,6 +1,6 @@
 import { getEventListeners } from "node:events";
 import { describe, expect, it, vi } from "vitest";
-import { jobProgressMessage, runWithJobProgress, type JobCalls } from "../../src/job-progress.js";
+import { cancelOpenJobs, jobProgressMessage, runWithJobProgress, type JobCalls } from "../../src/job-progress.js";
 import { progressSink } from "../../src/progress.js";
 
 const ID = "6f1c1c1e-1111-4111-8111-111111111111";
@@ -44,6 +44,8 @@ describe("job progress messages", () => {
     expect(jobProgressMessage({ status: "running", reason: "generating", detail: { generated_tokens: 1, tokens_per_second: null } }))
       .toBe("generating on model: 1 tokens");
     expect(jobProgressMessage({ status: "running", selected_model: "m" })).toBe("running m");
+    expect(jobProgressMessage({ status: "waiting_for_admission", reason: "waiting_for_backend_capacity", detail: { slice: { index: 2, count: 19 } } }))
+      .toBe("slice 2/19: waiting for backend capacity");
   });
 });
 
@@ -394,5 +396,82 @@ describe("long poll", () => {
     expect(reads.every((ms) => typeof ms === "number" && ms > 0)).toBe(true);
     // Only the first read sleeps; after `long_poll` serve does the waiting.
     expect(sleeps).toHaveLength(1);
+  });
+});
+
+describe("progress rate and hold warnings", () => {
+  it("reports a streaming job's token count at most every 3 s within one phase", async () => {
+    const generating = (tokens: number) => ({ status: "running", reason: "generating", selected_model: "m", detail: { generated_tokens: tokens } });
+    const calls = scripted([generating(1), generating(2), generating(3), { status: "completed", result: {} }]);
+    const messages: string[] = [];
+    await runWithJobProgress(calls, (message) => messages.push(message), { wait: noWait });
+    expect(messages.filter((message) => message.startsWith("generating"))).toEqual(["generating on m: 1 tokens"]);
+  });
+
+  it("warns once while a memory hold lasts 2 s, and not for a brief one", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const hold = { status: "waiting_for_resources", reason: "waiting_for_safe_memory_and_pressure",
+        detail: { pressure_reasons: ["thermal_throttling"], required_available_bytes: 9e9, effective_available_bytes: 6e9 } };
+      const secondEach = vi.fn(async () => { vi.setSystemTime(Date.now() + 1_000); });
+      const warned: string[] = [];
+      await runWithJobProgress(scripted([hold, hold, hold, hold, { status: "completed", result: {} }]), () => undefined,
+        { wait: secondEach, warn: (message) => warned.push(message) });
+      expect(warned).toHaveLength(1);
+      expect(warned[0]).toMatch(/^waiting for memory: need 9\.0 GB, 6\.0 GB available \(host: thermal_throttling\) \(2\.0 s so far\)$/);
+
+      warned.length = 0;
+      await runWithJobProgress(scripted([hold, { status: "completed", result: {} }]), () => undefined,
+        { wait: secondEach, warn: (message) => warned.push(message) });
+      expect(warned).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("cancelOpenJobs", () => {
+  it("cancels a job still followed at shutdown, and nothing once its run has ended", async () => {
+    let cancelled = false;
+    const calls = {
+      submit: vi.fn(async () => JSON.stringify({ deferred: true, job: { id: ID, status: "running" } })),
+      get: vi.fn(async () => receipt(cancelled ? { status: "cancelled" } : { status: "running", selected_model: "m" })),
+      cancel: vi.fn(async () => { cancelled = true; return receipt({ status: "cancelled" }); }),
+      sync: vi.fn(async () => "{}"),
+    } satisfies JobCalls;
+    const run = runWithJobProgress(calls, () => undefined, { wait: () => new Promise((resolve) => setTimeout(resolve, 1)) })
+      .catch((error: unknown) => error);
+    await vi.waitFor(() => expect(calls.get).toHaveBeenCalled());
+
+    await cancelOpenJobs(1_000);
+    expect(calls.cancel).toHaveBeenCalledWith(ID);
+    expect(String(await run)).toContain("cancelled");
+
+    calls.cancel.mockClear();
+    await cancelOpenJobs(1_000);
+    expect(calls.cancel).not.toHaveBeenCalled();
+  });
+
+  it("returns within its limit when serve does not answer the cancel", async () => {
+    let answerCancel: (body: string) => void = () => undefined;
+    const calls = {
+      submit: vi.fn(async () => JSON.stringify({ deferred: true, job: { id: ID, status: "running" } })),
+      get: vi.fn(async () => receipt({ status: "running" })),
+      cancel: vi.fn(() => new Promise<string>((resolve) => { answerCancel = resolve; })),
+      sync: vi.fn(async () => "{}"),
+    } satisfies JobCalls;
+    const controller = new AbortController();
+    const run = runWithJobProgress(calls, () => undefined, {
+      signal: controller.signal, wait: () => new Promise((resolve) => setTimeout(resolve, 1)),
+    }).catch(() => undefined);
+    await vi.waitFor(() => expect(calls.get).toHaveBeenCalled());
+
+    const started = Date.now();
+    await cancelOpenJobs(50);
+    expect(Date.now() - started).toBeLessThan(1_000);
+    expect(calls.cancel).toHaveBeenCalledWith(ID);
+    controller.abort();
+    answerCancel(receipt({ status: "cancelled" }));
+    await run;
   });
 });

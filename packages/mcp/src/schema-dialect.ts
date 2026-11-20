@@ -16,10 +16,34 @@ function openObjectsAsTrue(schema: unknown): void {
   for (const value of Object.values(node)) openObjectsAsTrue(value);
 }
 
+const MAX_SAFE = Number.MAX_SAFE_INTEGER;
+
 /**
- * Normalize every tool schema in a tools/list answer: drop the `$schema` dialect URI the SDK's zod
- * converter adds (MCP fixes the dialect, so it only costs tokens on each tools/list), and publish
- * open objects as `additionalProperties: true`, the form clients have always received.
+ * Drop what the JSON Schema or MCP defaults already say: `propertyNames: {type: "string"}` (object
+ * keys are always strings) and the safe-integer bounds zod writes for every `.int()` (a JSON number
+ * past them is not exact anyway; the server still validates). Other bounds stay.
+ */
+function dropImpliedKeywords(schema: unknown): void {
+  if (Array.isArray(schema)) {
+    for (const item of schema) dropImpliedKeywords(item);
+    return;
+  }
+  if (!schema || typeof schema !== "object") return;
+  const node = schema as Record<string, unknown>;
+  const names = node.propertyNames;
+  if (names && typeof names === "object" && JSON.stringify(names) === '{"type":"string"}') delete node.propertyNames;
+  if (node.type === "integer") {
+    if (node.maximum === MAX_SAFE) delete node.maximum;
+    if (node.minimum === -MAX_SAFE) delete node.minimum;
+  }
+  for (const value of Object.values(node)) dropImpliedKeywords(value);
+}
+
+/**
+ * Normalize every tool in a tools/list answer: drop the `$schema` dialect URI the SDK's zod
+ * converter adds (MCP fixes the dialect, so it only costs tokens on each tools/list), publish open
+ * objects as `additionalProperties: true`, the form clients have always received, drop the
+ * keywords the defaults imply, and omit `execution.taskSupport: "forbidden"` (the MCP default).
  */
 export function normalizeToolSchemas(message: JSONRPCMessage): JSONRPCMessage {
   const tools = (message as { result?: { tools?: unknown } }).result?.tools;
@@ -29,6 +53,12 @@ export function normalizeToolSchemas(message: JSONRPCMessage): JSONRPCMessage {
       if (!schema) continue;
       delete schema.$schema;
       openObjectsAsTrue(schema);
+      dropImpliedKeywords(schema);
+    }
+    const execution = tool.execution;
+    if (execution?.taskSupport === "forbidden") {
+      delete execution.taskSupport;
+      if (Object.keys(execution).length === 0) delete tool.execution;
     }
   }
   return message;

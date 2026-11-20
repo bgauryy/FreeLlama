@@ -1,6 +1,10 @@
 // Process lifecycle: delegate subprocess tracking and shutdown cleanup.
 import { type ChildProcess, spawn } from "node:child_process";
+import { cancelOpenJobs } from "./job-progress.js";
 import { stopAutostartedServe } from "./serve.js";
+
+/** How long shutdown waits for serve to accept the cancels of jobs this process still follows. */
+const SHUTDOWN_CANCEL_MS = 2_000;
 
 // `delegate_research` spawns a Node adapter subprocess that can run for minutes. If this server goes
 // away first — client disconnect, Ctrl-C, a supervisor restart — an untracked child keeps a local
@@ -116,6 +120,21 @@ function killLiveDelegates(): void {
   liveDelegates.clear();
 }
 
+let shuttingDown = false;
+
+/**
+ * Leave without stranding work: kill delegates, ask serve to cancel the jobs nobody will read (an
+ * independently started serve would otherwise keep their models busy), then exit.
+ */
+async function shutdown(stopServe: boolean): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  killLiveDelegates();
+  await cancelOpenJobs(SHUTDOWN_CANCEL_MS);
+  if (stopServe) stopAutostartedServe();
+  process.exit(0);
+}
+
 /** Install exit, stdin-close, signal, and EPIPE handlers. Call once from the server entry point. */
 export function installProcessLifecycle(): void {
   // A client that disappears mid-response leaves the stdio transport writing to a closed pipe.
@@ -136,15 +155,8 @@ export function installProcessLifecycle(): void {
   });
   // A client that closes stdin without a signal (most MCP hosts on shutdown) left this process
   // alive until every running delegate finished, holding a model loaded for nobody.
-  process.stdin.on("close", () => {
-    killLiveDelegates();
-    stopAutostartedServe();
-    process.exit(0);
-  });
+  process.stdin.on("close", () => void shutdown(true));
   for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
-    process.on(signal, () => {
-      killLiveDelegates();
-      process.exit(0);
-    });
+    process.on(signal, () => void shutdown(false));
   }
 }

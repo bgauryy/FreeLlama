@@ -87,17 +87,17 @@ export function registerDelegateResearchTool(server: McpServer): void {
     "delegate_research",
     {
       description:
-        "Use when: a read-only question about files under workspacePath (where is X, what calls Y) would take several searches; without `model` it uses the catalog's research-agent pick that is installed and fits now. " +
-        "Do not use when: editing (adapter:\"coder\" edits an isolated copy, if the operator enabled it), facts outside the workspace (GitHub excepted: adapter:\"github\", which needs no `workspacePath`), final judgment, or a question one search answers; run_task embedding with `nearest` finds files faster. " +
-        "Up to 8 turns, killed after 180 s by default plus 20 s per GB of model above 4 GB (at most 1,200 s; agent.timeoutSeconds sets it, up to 1,800); no defer (a host that cuts calls near 60 s may drop it). " +
+        "Use when: a read-only question about files under workspacePath (where is X, what calls Y) would take several searches; without `model`, the catalog's research-agent pick. " +
+        "Do not use when: editing (adapter:\"coder\" only), facts outside the workspace (GitHub excepted: adapter:\"github\"), final judgment, or a question one search answers (run_task embedding with `nearest` finds files faster). " +
+        "Up to 8 turns, killed after 180 s by default (more for large models; agent.timeoutSeconds sets it); no defer (a host that cuts calls near 60 s may drop it). " +
         "Returns: citations/answer; discard verification.recommendation=escalate, otherwise verify citations. coder: review structuredContent.diff, then run structuredContent.applyCommand.",
       inputSchema: z.object({
         question: z.string().min(1),
         workspacePath: z.string().min(1).optional().describe(
-          "directory to research, under FREELLAMA_MCP_ALLOWED_ROOTS; absolute, or relative to the server's working directory. Required except for adapter github",
+          "directory under FREELLAMA_MCP_ALLOWED_ROOTS, absolute or relative to the server's working directory; required except for adapter github",
         ),
-        adapter: z.enum(["bash", "octocode", "github", "coder"]).optional().describe("bash (default) or octocode search workspacePath; github searches GitHub"),
-        model: z.string().min(1).optional(),
+        adapter: z.enum(["bash", "octocode", "github", "coder"]).optional().describe("bash (default) or octocode search workspacePath; github searches GitHub; coder edits an isolated copy, only if the operator enabled it"),
+        model: z.string().min(1).optional().describe("omitted: the catalog's research-agent pick that is installed and fits now"),
         endpoint: endpointParam,
         agent: z
           .object({
@@ -105,7 +105,7 @@ export function registerDelegateResearchTool(server: McpServer): void {
             contextTokens: z.number().int().positive().optional(),
             outputTokens: z.number().int().positive().optional(),
             timeoutSeconds: z.number().int().positive().max(MAX_DELEGATE_TIMEOUT_SECONDS).optional()
-              .describe("overrides the default above"),
+              .describe("overrides the default: 180 s plus 20 s per GB of model above 4 GB, at most 1,200 s; up to 1,800 s"),
             commands: coderCommandsSchema,
           })
           .strict()
@@ -114,7 +114,8 @@ export function registerDelegateResearchTool(server: McpServer): void {
           .enum(["compact", "full"])
           .optional()
           .describe("compact (default): trail at response_file; full: inline"),
-        ...outputInput,
+        output: outputInput.output,
+        outputPath: outputInput.outputPath,
       }).strict(),
       outputSchema: researchResultSchema,
       // Read-only lookup; adapter "github" searches GitHub over the internet, so the tool is

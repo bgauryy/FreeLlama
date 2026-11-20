@@ -273,13 +273,13 @@ export function registerModelsTool(server: McpServer): void {
     "models",
     {
       description:
-        "Use when: choosing a model (view:catalog: tested picks per job, what is installed and fits now), listing installed or loaded models, inspecting one, or searching ollama.com and Hugging Face GGUF repos (view:library). " +
+        "Use when: choosing a model (view:catalog: tested picks per job, installed, fits now), listing installed or loaded models, inspecting one, or searching ollama.com and Hugging Face GGUF repos (view:library). " +
         "Do not use when: running work (run_task) or pulling (ollama_pull). Returns: models; library lists families, then one family's tags.",
       inputSchema: z.object({
         view: z
           .enum(["catalog", "installed", "resident", "detail", "raw", "library"])
           .optional()
-          .describe("installed: tags, capabilities, fit; resident: loaded now, GPU/CPU split; detail: one tag; raw: Ollama /api/tags, paged; library: search (query) or one family's tags"),
+          .describe("installed: tags, capabilities, fit; resident: loaded now, GPU/CPU split; detail: one tag; raw: Ollama /api/tags, paged; library: search (query) or one family's tags; catalog: fits_now is a conservative preview (serve's memory gate measures the real need)"),
         job: z.enum(CATALOG_JOBS as [string, ...string[]]).optional().describe("catalog: one job's measured picks that fit now"),
         model: z.string().min(1).optional().describe("detail: the tag; library: a family or hf.co/owner/repo, to list its tags with sizeBytes"),
         includeVerbose: z
@@ -298,7 +298,7 @@ export function registerModelsTool(server: McpServer): void {
           .optional(),
         source: z.enum(["ollama", "huggingface"]).optional(),
         limit: z.number().int().positive().max(50).optional(),
-        cursor: z.string().min(1).optional(),
+        cursor: z.string().min(1).optional().describe("page.next_cursor from the previous page, unchanged"),
         endpoint: endpointParam,
         ollamaEndpoint: ollamaEndpointParam,
       }).strict(),

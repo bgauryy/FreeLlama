@@ -5,7 +5,7 @@ import { DEFAULT_SERVE_ENDPOINT } from "../config.js";
 import { cancelTaskJob, getTaskJob, route, runTaskRequest } from "../serve-client.js";
 import { withBatchTelemetry, withTaskTelemetry } from "../telemetry.js";
 import { runWithJobProgress, type CancellationState } from "../job-progress.js";
-import { notice, progressSink, taskNotices, type ToolExtra } from "../progress.js";
+import { notice, progressSink, taskNotices, type ToolExtra, warningSink } from "../progress.js";
 import { ensureServe } from "../serve.js";
 import { deferText, routeText, withText } from "../result-text.js";
 import {
@@ -20,7 +20,7 @@ import { applyJob, mergeProfiles, neededCapabilities, pickLiveJobModel, pickLive
 import { LOCAL_JOBS, RUN_TASK_JOBS, WORKFLOW_NAMES, WORKFLOWS, workflowSource, type JobName, type WorkflowName } from "../local-prompts.js";
 import { checkOutputPath, HANDOFF_NAME } from "../handoffs.js";
 import { outputInput } from "../tool-results.js";
-import { injectionCheck, inputData, nullFieldCheck, withChecks } from "../result-checks.js";
+import { injectionCheck, inputData, invalidJsonCheck, nullFieldCheck, withChecks } from "../result-checks.js";
 import { EmbeddingIndex, embedIndexEnabled, rankByQuery } from "../embed-index.js";
 import { asWorkflowOutput, rankedResult, withBatchChecks, withCheck, withJob } from "./run-task-results.js";
 export { withJob } from "./run-task-results.js";
@@ -137,7 +137,7 @@ function cancellationError(jobId?: string, cancellation: CancellationState = "re
  */
 async function runManagedTask(
   target: string, request: Fields, report: ((message: string) => void) | undefined, signal: AbortSignal,
-  onJob?: (id: string) => void,
+  onJob?: (id: string) => void, warn?: (message: string) => void,
 ): Promise<string> {
   if (signal.aborted) throw cancellationError();
   if (request.defer === true) return runTaskRequest(target, request);
@@ -158,7 +158,7 @@ async function runManagedTask(
           execution_outcome: "not_started", retry_safe: true,
         }));
       },
-    }, report ?? (() => undefined), { signal, aborted: (id, cancellation) => id ? cancellationError(id, cancellation) : new Error(JSON.stringify({
+    }, report ?? (() => undefined), { signal, warn, aborted: (id, cancellation) => id ? cancellationError(id, cancellation) : new Error(JSON.stringify({
       code: "task_cancelled", error: "Client cancelled while submitting; no job handle was received and execution outcome is unknown. The task was not replayed.",
       execution_outcome: "unknown", retry_safe: false,
     })), onJob: (id, open) => {
@@ -310,7 +310,7 @@ const BATCH_PRIORITY_WEIGHTS = { interactive: 3, normal: 2, background: 1 } as c
 /** Independent jobs keep cancellation addressable without depending on a progress token. */
 async function runCancellableBatch(
   target: string, tasks: { id: string; independent: boolean; task: Fields }[], maxParallelism: number | undefined,
-  signal: AbortSignal, report?: (message: string) => void,
+  signal: AbortSignal, report?: (message: string) => void, warn?: (message: string) => void,
 ): Promise<string> {
   const parallelism = Math.max(1, Math.min(maxParallelism ?? 8, tasks.length, 64));
   const results: Fields[] = new Array(tasks.length);
@@ -346,7 +346,8 @@ async function runCancellableBatch(
         const itemReport = report ? (message: string) => report(`${item.id}: ${message}`) : undefined;
         const response = JSON.parse(await (item.task.task === "embedding" && Array.isArray(item.task.input) && item.task.input.length > EMBEDDINGS_PER_JOB
           ? embedInSlices(target, item.task, item.task.input, itemReport, signal)
-          : runManagedTask(target, item.task, itemReport, signal, (id) => jobIds.push(id))));
+          : runManagedTask(target, item.task, itemReport, signal, (id) => jobIds.push(id),
+            warn && ((message: string) => warn(`${item.id}: ${message}`)))));
         if (!object(response)) throw new Error("task returned no managed receipt");
         if (typeof object(response)?.error === "string") throw new Error(JSON.stringify(response));
         if (item.task.task === "embedding") validateEmbeddingVectors(object(response.response)?.embeddings,
@@ -446,7 +447,7 @@ async function runBatch(
   };
   const target = endpoint ?? DEFAULT_SERVE_ENDPOINT;
   if (defer) return withText(parsedResult(await submitDeferredBatch(target, payload.tasks, maxParallelism, extra.signal)), deferText);
-  const raw = await runCancellableBatch(target, payload.tasks, maxParallelism, extra.signal, progressSink(extra));
+  const raw = await runCancellableBatch(target, payload.tasks, maxParallelism, extra.signal, progressSink(extra), warningSink(extra));
   return withBatchTelemetry(parsedResult(raw));
 }
 
@@ -488,19 +489,19 @@ export function registerRunTaskTool(server: McpServer): void {
     "run_task",
     {
       description:
-        "Use when: bounded work for a local model: a workflow or job, decision, embedding + `nearest`, vision, tools (returns tool_calls you run). " +
+        "Use when: bounded work for a local model: a workflow or job, decision (`state` + `questions`), embedding + `nearest`, vision, tools (returns tool_calls you run). " +
         "Do not use when: you must stand behind the judgment or need edits across files. " +
-        "`tasks` = up to 64 independent items; per-item fields override top-level defaults (workflow and job apply to the whole batch); one `model` per batch avoids a cold load per model; `maxParallelism` caps dispatch; `preview:true` routes only. " +
-        "Hosts cut calls near 60 s: for long work pass `defer:true` (with `tasks`, one job per item) and poll task_jobs get. " +
-        "Returns: the answer text, its check: lines and response_file (read_response opens the receipt; receipt:\"full\" inlines it).",
+        "`tasks` = up to 64 independent items; `preview:true` routes only. " +
+        "Long work: `defer:true`, then poll task_jobs get. " +
+        "Returns: the answer text, its check: lines and response_file (read_response).",
       inputSchema: z.object({
         endpoint: endpointParam,
         task: taskParam.removeDefault().optional(),
-        job: z.enum(RUN_TASK_JOBS).optional().describe("picks the model that fits now and fills prompts and options; your fields win"),
-        workflow: z.enum(WORKFLOW_NAMES as [WorkflowName, ...WorkflowName[]]).optional().describe("step-by-step instructions for the local model; implies its job"),
+        job: z.enum(RUN_TASK_JOBS).optional().describe("picks the model that fits now, fills prompts and options; your fields win"),
+        workflow: z.enum(WORKFLOW_NAMES as [WorkflowName, ...WorkflowName[]]).optional().describe("step-by-step local-model instructions; implies its job"),
         objective: objectiveParam,
-        model: z.string().min(1).optional().describe("exact tag; omitted, routing picks by capability only, so name the catalog's pick for the job"),
-        fallbackModels: fallbackModelsParam.describe("tried in order only when the model before was refused before it ran (no room, input over its context, not installed, wrong capability); never after it started. The receipt's fallback lists each attempt"),
+        model: z.string().min(1).optional().describe("exact tag; omitted, routing picks by capability only: name the catalog's pick"),
+        fallbackModels: fallbackModelsParam.describe("tried in order only if the previous model was refused before it ran (no room, input over its context, not installed, wrong capability), never after it started; the receipt's fallback lists each attempt"),
         // Shown as plain strings (zod's UUID pattern alone is ~180 characters each); checked below.
         sessionId: z.string().length(36).optional(),
         scopeId: z.string().length(36).optional(),
@@ -519,10 +520,10 @@ export function registerRunTaskTool(server: McpServer): void {
         files: filesParam.describe("paths or globs the server reads (4 MiB per text file, 8 MiB per image, 32 MiB total): text under prompt, images as images; embedding: ~1.5 KB chunks; decision: the state"),
         state: z.unknown().optional().describe("decision: the text or JSON the questions are about"),
         questions: z.record(z.string(), z.object({ type: z.enum(["noul", "choice", "score"]) }).loose()).optional()
-          .describe("decision: {name:{type, instructions, criteria}}; choice picks one criteria label, noul is the probability of yes, score a level from 2-10 descriptions"),
+          .describe("decision: {name:{type, instructions, criteria}}; choice: one criteria label, noul: probability of yes, score: a level from 2-10 descriptions"),
         messages: z.array(z.object({ role: z.string() }).loose()).optional().describe("Caller system prompts; no injected task instructions. Overrides prompt."),
         input: z.unknown().optional().describe("embedding: text, or {text|image|audio} items"),
-        tools: localToolsParam.describe("Returns tool_calls for you to run; check them, since small models call a tool when none is needed. With `tasks`: a shared default"),
+        tools: localToolsParam.describe("check the returned tool_calls: small models call a tool when none is needed. With `tasks`: a shared default"),
         keepAlive: z.string().min(1).optional().describe('"0" unloads, "-1" pins'),
         format: z
           .union([z.literal("json"), z.record(z.string(), z.unknown())])
@@ -547,15 +548,15 @@ export function registerRunTaskTool(server: McpServer): void {
         receipt: z
           .enum(["compact", "full"])
           .optional()
-          .describe("compact (default) or full"),
-        defer: z.boolean().optional(),
-        idempotencyKey: z.string().min(1).max(128).optional().describe("defer:true on a serve with durable jobs (FREELLAMA_DURABLE_JOBS=1): resubmitting the same key and input returns the original job instead of running it again"),
+          .describe("default compact"),
+        defer: z.boolean().optional().describe("with `tasks`, one job per item. run_task sends progress every 10 s; defer if your host still cuts long calls, or for a large batch"),
+        idempotencyKey: z.string().min(1).max(128).optional().describe("with defer:true on a serve with durable jobs (FREELLAMA_DURABLE_JOBS=1): resubmitting the same key and input returns the original job, not a rerun"),
         saveAs: z.string().regex(HANDOFF_NAME).optional().describe("save the answer as handoffs/<name>.md"),
         ...outputInput,
         returnEmbeddings: z.boolean().optional(),
         dimensions: z.number().int().positive().optional().describe("embedding: shorten vectors (models trained for it)"),
         nearest: z.object({}).loose().optional()
-          .describe("embedding: {query?, top? (default 5, max 100), minScore?, documentPrefix?}: the items closest to `query`, or the most similar pairs"),
+          .describe("embedding: {query?, top? (default 5, max 100), minScore?, documentPrefix?}: the items closest to `query`, or (no query) the most similar pairs; one embedding pass, no model call per chunk"),
         preview: z
           .boolean()
           .optional()
@@ -565,8 +566,8 @@ export function registerRunTaskTool(server: McpServer): void {
           .min(1)
           .max(64)
           .optional()
-          .describe("independent items; per-item fields override top-level ones; one ## <id> section each"),
-        maxParallelism: z.number().int().positive().max(64).optional(),
+          .describe("per-item fields override top-level defaults (workflow and job apply to the whole batch); fields the items share (task, model, systemPrompt, questions, tools, format, options) go once at top level; one ## <id> section per item"),
+        maxParallelism: z.number().int().positive().max(64).optional().describe("caps dispatch"),
       }).strict(),
       outputSchema: taskResultSchema,
       annotations: { destructiveHint: false },
@@ -709,6 +710,7 @@ export function registerRunTaskTool(server: McpServer): void {
             // scanned too; a caller's own prompt ("You are now a translator") is theirs.
             pickNote, injectionCheck(input, input === "" && workflow !== undefined ? request : ""),
             builtinFlow === "extract-json" ? nullFieldCheck(answerOf(result).split("\ncheck: ")[0]!, input || request) : undefined,
+            format !== undefined ? invalidJsonCheck(answerOf(result).split("\ncheck: ")[0]!) : undefined,
           ];
         };
         const finish = <R,>(result: R): R => withJob(withCheck(withChecks(asWorkflowOutput(result, builtinFlow), job, task ?? "completion", tools, builtinFlow), ...extraChecks(result)), profile, saveAs);
@@ -857,7 +859,7 @@ export function registerRunTaskTool(server: McpServer): void {
         // registry can retain, runWithJobProgress returns an explicit failure without replay.
         const result = parsedResult(slicedEmbedding
           ? await embedInSlices(target, request, input as unknown[], report, extra.signal)
-          : await runManagedTask(target, request, report, extra.signal));
+          : await runManagedTask(target, request, report, extra.signal, undefined, warningSink(extra)));
         if (isStructuredSuccess(result) && result.structuredContent.deferred === true) return finish(withText(result, deferText));
         if (request.task === "embedding" && nearestRequest === undefined && isStructuredSuccess(result)) {
           validateEmbeddingVectors(object(result.structuredContent.response)?.embeddings, Array.isArray(input) ? input.length : 1);

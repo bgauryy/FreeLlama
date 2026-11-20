@@ -30,6 +30,18 @@ export function useLogLevelFilter(filter: (level: string, sessionId?: string) =>
 }
 
 /**
+ * Filter `notice` by the level the SDK stored for `logging/setLevel`. It reads the SDK's private
+ * `isMessageIgnored`, since 1.x has no public reader; test/unit/log-level.test.ts fails if it moves.
+ */
+export function installLogLevelFilter(server: { server: unknown }): boolean {
+  const core = server.server as { isMessageIgnored?: (level: string, sessionId?: string) => boolean };
+  if (typeof core.isMessageIgnored !== "function") return false;
+  const ignored = core.isMessageIgnored.bind(core);
+  useLogLevelFilter((level, sessionId) => ignored(level, sessionId));
+  return true;
+}
+
+/**
  * A sink that sends `notifications/progress` when the client sent a progressToken, else
  * `undefined` so callers keep their silent path. Each message advances the progress count by one,
  * as MCP requires it to increase; a failed notification never fails the tool.
@@ -55,6 +67,9 @@ export function notice(extra: Partial<ToolExtra> | undefined, level: "info" | "w
   void extra?.sendNotification?.({ method: "notifications/message", params: { level, logger: "freellama", data: message } })
     .catch(() => undefined);
 }
+
+/** Warnings during a call (a long memory or host-pressure hold), sent whether or not the client asked for progress. */
+export const warningSink = (extra: Partial<ToolExtra> | undefined): ProgressSink => (message) => notice(extra, "warning", message);
 
 const seconds = (ms: number) => `${(ms / 1000).toFixed(1)} s`;
 
