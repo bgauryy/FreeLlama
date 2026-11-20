@@ -20,7 +20,7 @@ name = "freellama"
 path = "src/main.rs"
 
 [dependencies]
-freellama = { package = "freellama-core", version = "0.12.1", path = "../rust-core", features = ["cli"] }
+freellama = { package = "freellama-core", version = "0.13.0", path = "../rust-core", features = ["cli"] }
 anyhow.workspace = true
 base64.workspace = true
 clap.workspace = true
